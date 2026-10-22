@@ -1,0 +1,43 @@
+#!/bin/sh
+#
+# packaging/linux/debian/postrm
+#
+# Runs as root, via dpkg/apt, after this package's files are removed.
+#
+# `dpkg -r`/`apt remove` only ever removes files this package owns
+# (/usr/bin/yadorilink, /usr/bin/yadorilink-daemon,
+# /usr/lib/systemd/user/yadorilink-daemon.service) -- it has no concept of,
+# and cannot reach into, a *specific logged-in user's* systemd --user
+# session to disable/stop a unit that user may have enabled themselves
+# (see systemd/yadorilink-daemon.service's header comment on why this is
+# never auto-enabled by postinst in the first place). That per-user
+# stop/disable step is exactly what ../uninstall.sh does; this postrm only
+# prints a reminder so nobody is left with a dangling "enabled but binary
+# missing" user unit without knowing why.
+#
+# On "remove" (package uninstalled, config/state not purged) and "purge"
+# alike, tell the user what to do; take no destructive action here since
+# this runs as root and cannot safely touch another user's session state.
+
+set -e
+
+case "$1" in
+    remove|purge)
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+        cat <<'EOF'
+yadorilink binaries removed. If you had enabled the daemon's systemd
+--user unit (`systemctl --user enable --now yadorilink-daemon`), that
+per-user service is still enabled -- dpkg/apt cannot reach a specific
+user's systemd --user session to disable it for you. Run, as that user:
+
+    systemctl --user disable --now yadorilink-daemon
+
+Or use packaging/linux/uninstall.sh (run as your normal user, before
+removing the package) to do this automatically next time.
+EOF
+        ;;
+esac
+
+exit 0

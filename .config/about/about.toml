@@ -1,0 +1,67 @@
+# cargo-about configuration.
+#
+# Generates the third-party license notice that ships with distributed
+# artifacts (list of dependencies grouped by license, plus the full text of
+# every required license):
+#
+#   .github/release/generate-third-party-licenses.sh THIRD-PARTY-LICENSES [--target TRIPLE] [Cargo.toml ...]
+#
+# (cargo-about emits JSON per package; third-party-licenses.py merges them into
+# the plain-text notice, deterministically.)
+#
+# `accepted` lists every license that may legitimately appear in the dependency
+# graph, in priority order — cargo-about resolves each crate to the first
+# accepted license in its SPDX expression. MIT / Apache-2.0 are first so that
+# multi-licensed crates (e.g. `X OR MIT`) render under a permissive license and
+# we never emit a copyleft variant when a permissive alternative is offered.
+#
+# This list is intentionally broader than .config/deny.toml's policy: .config/deny.toml gates
+# what we allow into the tree (permissive globally + narrow per-crate
+# exceptions), while this list only governs which license texts the notice can
+# render for what is already present.
+
+accepted = [
+    "MIT",
+    # First-party crates (this workspace's own licence). They resolve like any
+    # crate and are then left out of the notice by third-party-licenses.py.
+    "AGPL-3.0-only",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "0BSD",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "MPL-2.0",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "OFL-1.1",
+    # Non-SPDX Ubuntu Font License, carried only by epaint_default_fonts; its
+    # text is supplied via the clarify entry below.
+    "LicenseRef-UFL-1.0",
+]
+
+# Work around private-registry / workspace crates having no license metadata
+# to fetch: our own crates are first-party and excluded from the notice.
+private.ignore = true
+
+# `epaint_default_fonts` is `(MIT OR Apache-2.0) AND OFL-1.1 AND
+# LicenseRef-UFL-1.0`. The Ubuntu Font License 1.0 is not an SPDX identifier, so
+# cargo-about cannot synthesize its text; the clarify entry points it at the
+# license files shipped inside the crate (checksums pin the exact texts).
+[epaint_default_fonts.clarify]
+license = "(MIT OR Apache-2.0) AND OFL-1.1 AND LicenseRef-UFL-1.0"
+
+[[epaint_default_fonts.clarify.files]]
+path = "fonts/OFL.txt"
+license = "OFL-1.1"
+checksum = "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2"
+
+[[epaint_default_fonts.clarify.files]]
+path = "fonts/UFL.txt"
+license = "LicenseRef-UFL-1.0"
+checksum = "2f0015108d68627bd788d313f529c21ff4da2c2c42a5e1f3883acc83480f9002"

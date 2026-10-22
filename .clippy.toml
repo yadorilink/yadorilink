@@ -1,0 +1,29 @@
+# Complexity thresholds.
+#
+# These are a ratchet for new code, not a mandate to rewrite existing code.
+# Pre-existing violations carry a local `#[allow(..)]` with a reason explaining
+# why that particular item is better left whole.
+#
+# STAGED ROLLOUT — these are stage 1 of 3. The intended path is:
+#
+#     stage 1 (now)  nesting 6 / lines 200   ~91 pre-existing sites
+#     stage 2        nesting 5 / lines 150   tighten once stage 1 is worked down
+#     stage 3        nesting 4 / lines 120   the eventual target
+#
+# Stage 3 is not the starting point because at nesting 4 / lines 120 this
+# workspace reports 577 over-nested blocks and 84 over-long
+# functions, which would need roughly 330 `#[allow]` attributes. At that volume
+# the attribute stops meaning "this case is genuinely better left alone" and
+# becomes a blanket silencer, which both defeats the ratchet and buries the
+# sites that are actually worth fixing. Measured counts at each nesting
+# threshold: 4 -> 577, 5 -> 208, 6 -> 64, 7 -> 23, 8 -> 3.
+#
+# Tighten a stage only after the current stage's allow list has been worked
+# down, so each step stays small enough to review case by case.
+#
+# `cognitive_complexity` is deliberately NOT enabled. Clippy itself moved it out
+# of the default set because its score is widely misread as a measure of how
+# hard code actually is to understand. Line count and nesting depth are crude,
+# but they are honest about what they measure.
+too-many-lines-threshold = 200
+excessive-nesting-threshold = 6

@@ -1,0 +1,28 @@
+[package]
+name = "yadorilink-os-keychain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# macOS only: generic-password items in the Data Protection Keychain, in the one
+# keychain access group that the host app, the daemon helper and the CLI share
+# (see src/lib.rs). The credential store and the device-key mirror both use it,
+# which is why it is a crate of its own: `yadorilink-fapi-client` and
+# `yadorilink-transport` do not depend on each other.
+#
+# The logic (which attributes a query carries, update-or-add, not-found as
+# absence) is platform independent and tested with an in-memory backend; only
+# `sec.rs`, the SecItem* calls, is macOS-gated. On any other target the crate
+# builds without the system backend and nothing in the product uses it.
+
+[dependencies]
+thiserror.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Both already resolved in Cargo.lock; no new crate enters the tree.
+# OSX_10_15: kSecUseDataProtectionKeychain.
+security-framework-sys = { version = "2", features = ["OSX_10_15"] }
+core-foundation = "0.10"
+
+[lints]
+workspace = true

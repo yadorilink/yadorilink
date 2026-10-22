@@ -1,0 +1,7 @@
+# postinst/prerm/postrm call `systemctl daemon-reload`, `try-restart` and
+# `stop` of the headless unit only -- never enable, start, or mask any unit (see those scripts' own header comments:
+# this package deliberately never auto-enables the per-user daemon unit).
+# `daemon-reload` is the safe, policy-compliant case this tag's real
+# violations (enabling/starting without a trigger, bypassing debhelper's
+# unit lifecycle) don't cover -- not something to restructure around.
+yadorilink: maintainer-script-calls-systemctl

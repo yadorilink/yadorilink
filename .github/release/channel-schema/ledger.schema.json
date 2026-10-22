@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Channel ledger (.github/channels/<channel>.json)",
+  "description": "Reviewed state of one update channel. The unsigned manifest body is a pure function of this file, the release records and the trust chain; channel_ledger.py is the validator.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "channel", "minimum_supported_version", "entries", "reason", "history"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "channel": { "enum": ["nightly", "beta"] },
+    "minimum_supported_version": { "type": "string" },
+    "reason": { "type": "string", "minLength": 1, "description": "A version moves back only with a reason starting 'yank <bad version>'." },
+    "entries": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "enum": ["script", "app_bundle", "microsoft_store"] },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["version", "rollout_percentage", "kill_switch"],
+        "properties": {
+          "version": { "type": "string" },
+          "rollout_percentage": { "type": "integer", "minimum": 0, "maximum": 100 },
+          "kill_switch": { "type": "boolean" }
+        }
+      }
+    },
+    "history": {
+      "type": "object",
+      "description": "Every version ever served per install_source; append only.",
+      "additionalProperties": { "type": "array", "items": { "type": "string" } }
+    },
+    "withdrawn_versions": { "type": "array", "items": { "type": "string" }, "description": "Yanked versions; append only; carried into the manifest body." }
+  }
+}

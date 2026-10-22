@@ -1,0 +1,11 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: yadorilink
+Source: https://github.com/yadorilink/yadorilink
+
+Files: *
+Copyright: 2026 Jumpei Takiyasu
+License: AGPL-3.0-only
+
+License: AGPL-3.0-only
+ See /usr/share/doc/yadorilink/LICENSE (installed from this
+ repository's LICENSE at build time).

@@ -1,0 +1,50 @@
+#!/bin/sh
+#
+# packaging/linux/debian/postinst
+#
+# Runs as root, via dpkg/apt, right after this package's files are placed:
+#   /usr/bin/yadorilink
+#   /usr/bin/yadorilink-daemon
+#   /usr/lib/systemd/user/yadorilink-daemon.service
+#
+# Deliberately does NOT run `systemctl --user enable --now
+# yadorilink-daemon` here -- see systemd/yadorilink-daemon.service's header
+# comment: this script runs as root with no
+# specific logged-in user's session to target (unlike a `postinst` that
+# manages a *system* unit), and a per-user unit generally shouldn't be
+# silently enabled by a package install. This is only a printed reminder;
+# it changes no state.
+#
+# `systemctl daemon-reload` (system-wide) is run so that any *running*
+# system manager immediately notices the new unit file exists in
+# /usr/lib/systemd/user/ -- harmless and idempotent if systemd isn't
+# running at all (e.g. inside a minimal container image being built).
+
+set -e
+
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    # An upgrade replaces the binaries under a running always-on service
+    # (see headless/install-headless.sh); restart it onto the new build. Does
+    # nothing when the service is not running, and never enables or starts it.
+    systemctl try-restart yadorilink-headless.service >/dev/null 2>&1 || true
+fi
+
+cat <<'EOF'
+yadorilink installed: /usr/bin/yadorilink, /usr/bin/yadorilink-daemon
+
+A systemd --user unit was installed but NOT enabled automatically. To
+start the sync daemon now and have it start at every login with
+crash-restart supervision, run this as your normal (non-root) user:
+
+    systemctl --user enable --now yadorilink-daemon
+
+For an always-on box with no login (NAS, home server), set up the system
+service instead, as root:
+
+    sudo /usr/share/yadorilink/headless/install-headless.sh
+
+See packaging/linux/README.md or `yadorilink --help` to get started.
+EOF
+
+exit 0

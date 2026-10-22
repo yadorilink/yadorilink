@@ -1,0 +1,18 @@
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        informational: true
+
+    patch:
+      default:
+        target: auto
+        informational: true
+
+comment:
+  layout: "diff, files"
+  require_changes: true
+
+github_checks:
+  annotations: true

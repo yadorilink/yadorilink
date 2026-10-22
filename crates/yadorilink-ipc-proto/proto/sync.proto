@@ -1,0 +1,159 @@
+syntax = "proto3";
+package yadorilink.sync.v1;
+
+// Messages exchanged directly between devices on their stream lanes (not
+// gRPC — only the coordination plane uses gRPC). There is no control-stream
+// envelope: each message here is the whole of one length-prefixed frame on
+// the stream that carries it.
+
+// Per-payload wire encoding for selected sync payloads, chosen by the
+// sender for that one payload (e.g. raw when compression would inflate a
+// block) -- not a peer capability. `COMPRESSION_NONE` is the proto3
+// zero-value.
+enum Compression {
+  COMPRESSION_NONE = 0;
+  COMPRESSION_ZSTD = 1;
+}
+
+// The first message on a block stream, sent by the requester.
+//
+// One block request is one bidirectional QUIC stream, so this carries no
+// correlation id: the response arrives on the stream the request went out
+// on, and nothing else does. The `request_id` this used to carry existed
+// only because several requests and their answers shared one byte stream.
+message BlockRequestHeader {
+  string folder_group_id = 1;
+  string file_path = 2;
+  // The plaintext content hash of the requested block.
+  bytes block_hash = 3;
+}
+
+// The block bytes follow this response on the same stream: exactly `size`
+// raw bytes, then FIN. `size` is what is actually on the wire, so it is the
+// post-compression length when `compression` is not `COMPRESSION_NONE`.
+message BlockFound {
+  uint64 size = 1;
+  // The block's plaintext content hash, echoed from the request. The
+  // requester already knows it, so this is a cross-check rather than
+  // information: a response bound to a different hash than the one asked
+  // for is rejected rather than stored.
+  bytes hash = 2;
+  // How `size` bytes of body are encoded. Not a negotiated capability --
+  // both ends of a connection are the same generation, so both understand
+  // every value here. A sender still picks `COMPRESSION_NONE` for a block
+  // that compression would inflate.
+  Compression compression = 3;
+}
+
+// This peer's serve queue for the requested block is at its in-flight
+// credit limit (per-peer, per-group, or global) right now, not permanently
+// absent. The requester must retry no sooner than `retry_after_ms` rather
+// than treating this as `dont_have` or a timeout.
+message BlockBusy {
+  uint32 retry_after_ms = 1;
+  // How many requests are currently ahead of a hypothetical new one in this
+  // peer's serve queue, for the requester's own source-selection judgment.
+  uint32 queue_depth = 2;
+}
+
+// The request itself could not be honored for a reason other than
+// not-having-it or being-busy (e.g. the requester is not authorized for the
+// group, or the request was structurally malformed) -- distinct from
+// `dont_have` so a requester does not mistake a hard rejection for "keep
+// retrying, it might show up."
+message BlockRejected {
+  string reason = 1;
+}
+
+// The second message on a block stream, sent by the responder.
+//
+// The admission-control outcomes are exactly the ones the previous inline
+// reply carried; what changed is where they are carried, not what they
+// mean. A same-generation peer always sets exactly one of these -- an
+// absent `outcome` is malformed for this generation, not a legitimate
+// forward-incompatible case, and is rejected at decode time rather than
+// treated as `dont_have`.
+message BlockResponseHeader {
+  // Field 4 was the `redirect` oneof case (`BlockRedirect`) -- steering a
+  // requester toward another peer believed to hold the block. No production
+  // code ever constructed one (the multi-peer hydration dispatcher that
+  // would act on it was never built); removed rather than carried as a wire
+  // case nothing sends. A real redirect mechanism, if built, gets a
+  // deliberate wire representation in the generation that adds it.
+  reserved 4;
+  reserved "redirect";
+  oneof outcome {
+    BlockFound found = 1;
+    // Set `true` when the responder has looked and genuinely does not
+    // (and, unlike `BlockBusy`, is not merely temporarily unable to) hold
+    // this block -- the requester should stop waiting on this peer for it.
+    bool dont_have = 2;
+    BlockBusy busy = 3;
+    BlockRejected rejected = 5;
+  }
+}
+
+// Change-history DAG exchange, the sole metadata-convergence path: the
+// mtime index-exchange engine that once backed it up is gone, along with the
+// `full_index`/`index_update` messages it ran on. The receiver diffs the announced heads against its own store, requests the hashes it is missing,
+// walks the returned changes' parents, and repeats until closed — so the
+// bytes moved are proportional to the divergence between the replicas, not
+// to folder or total-history size.
+//
+// A change hash is the 32-byte SHA-256 of a change's canonical encoding; an
+// encoded change is its canonical encoding followed by its 64-byte Ed25519
+// signature (`yadorilink_replica_domain::change::Change::to_wire_bytes`), so a
+// relayed change carries its original signature and cannot be forged or
+// altered by an intermediary without detection at the receiver.
+
+// One Merkle inclusion proof binding a single `PublishedChange`'s hash to
+// its referenced `AuthorizationCheckpointEnvelope.checkpoint`'s
+// `merkle_root` -- see
+// `yadorilink_replica_domain::authorization_checkpoint::MerkleProof`, whose
+// canonical Rust shape this mirrors field-for-field.
+message AuthorizationMerkleProof {
+  uint64 leaf_index = 1;
+  uint64 leaf_count = 2;
+  repeated bytes siblings = 3;   // each = 32-byte sibling hash, leaf to root
+}
+
+// A self-contained authorization checkpoint, carried alongside the Changes
+// it covers rather than referenced out of band, so there is no separate
+// evidence frame (and no Change/evidence split-arrival state machine with
+// its own retransmission logic). `author_signing_public_key` is what
+// makes verification possible without the receiver already holding a local
+// pin for this author: a fresh device, or one that only later joins a
+// group, must be able to verify history from an author since revoked and
+// forgotten. The checkpoint's own signature already commits to
+// `signing_key_fingerprint`, so carrying the raw key here needs no
+// independent trust -- a receiver simply confirms
+// `SHA256(author_signing_public_key) == checkpoint.signing_key_fingerprint`
+// before trusting it for anything (see
+// `yadorilink_replica_domain::authorization_checkpoint::verify_change_admission`).
+// A page is self-contained: if a page references `checkpoint_hash` H, that
+// page carries H's envelope even when another page carried it earlier --
+// deduplication is a batch-local table (`checkpoints` below), not a
+// cross-page cache a receiver must maintain.
+message AuthorizationCheckpointEnvelope {
+  // SHA256(checkpoint || signature) -- what `PublishedChange.checkpoint_hash`
+  // references. A receiver recomputes this from `checkpoint`/`signature`
+  // and rejects a mismatch before decoding `checkpoint` any further.
+  bytes checkpoint_hash = 1;
+  // `yadorilink_replica_domain::authorization_checkpoint::canonical_signing_bytes`'s
+  // exact output -- the checkpoint's signed preimage, not a re-serialization.
+  bytes checkpoint = 2;
+  bytes signature = 3;             // 64-byte authority Ed25519 signature
+  bytes author_signing_public_key = 4;   // 32-byte raw Ed25519 verifying key
+}
+
+// One Change, together with everything needed to verify it is authorized,
+// with no other frame or prior message required.
+message PublishedChange {
+  // `Change::to_wire_bytes()` -- canonical bytes + 64-byte signature.
+  bytes change = 1;
+  // References one entry in this same `ChangeBatch.checkpoints` by its
+  // `checkpoint_hash` -- never repeats the checkpoint's own bytes per
+  // Change.
+  bytes checkpoint_hash = 2;
+  AuthorizationMerkleProof proof = 3;
+}

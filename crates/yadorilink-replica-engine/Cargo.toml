@@ -1,0 +1,20 @@
+[package]
+name = "yadorilink-replica-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
+thiserror.workspace = true
+sha2.workspace = true
+# conflict_authoring.rs's error messages hex-encode change hashes, mirroring
+# the identical usage in yadorilink-sync-sqlite's own conflict_authoring.rs.
+hex = "0.4"
+ed25519-dalek = "3"
+
+[lints]
+workspace = true

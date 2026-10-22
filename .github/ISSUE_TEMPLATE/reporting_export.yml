@@ -1,0 +1,46 @@
+name: Report with exported YadoriLink diagnostics
+description: Share exported usage or error report JSON without direct submission.
+title: "[reporting] "
+labels:
+  - reporting
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form when you want maintainers to inspect exported report JSON without sending it to a reporting endpoint.
+
+        Generate a usage report with `yadorilink report usage --export usage-report.json` or an error report with `yadorilink report error --last --export error-report.json`.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the behavior or failure you want help with.
+    validations:
+      required: true
+  - type: dropdown
+    id: report_type
+    attributes:
+      label: Exported report type
+      options:
+        - usage
+        - error
+        - both
+        - none
+    validations:
+      required: true
+  - type: textarea
+    id: exported_report_json
+    attributes:
+      label: Exported report JSON
+      description: Paste the exported JSON, or say that you will attach it as a file. Do not add file paths, credentials, account IDs, device IDs, group IDs, tokens, keys, or file content manually.
+      render: json
+    validations:
+      required: false
+  - type: textarea
+    id: redaction_review
+    attributes:
+      label: Redaction review
+      description: Confirm that you previewed the report and did not see private data. Mention anything you removed manually.
+      placeholder: I ran --preview before exporting and did not see private data.
+    validations:
+      required: true

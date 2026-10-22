@@ -1,0 +1,55 @@
+[package]
+name = "yadorilink-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# See yadorilink-local-storage/Cargo.toml's identical section for why.
+[dependencies]
+# The durable publish of the device key file (`durable_dir::publish_durably`).
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
+thiserror.workspace = true
+tracing.workspace = true
+rand = "0.10.2"
+hex = "0.4"
+zeroize = "1"
+ed25519-dalek = "3"
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
+
+# Windows-only: tighten a freshly written private-key file's DACL to the
+# current user with inheritance disabled (the practical equivalent of unix
+# `0o600`, since a new file would otherwise inherit the parent directory's
+# weaker ACL). Same crate/version the daemon uses for its named-pipe DACL.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
+
+# OS-native credential store for storing device private keys at rest (a
+# best-effort mirror of the key file): Windows Credential Manager / Linux Secret
+# Service through `keyring`, and on macOS the Data Protection Keychain in the
+# credential access group (the same crate the coordination-token store uses).
+# Kept out of simulation builds so they never reach for a real OS keychain and
+# stay deterministic. No other target links `keyring`: without a native
+# feature it is the in-memory mock, which accepts a write and forgets it.
+[target.'cfg(all(not(turmoil), any(windows, target_os = "linux")))'.dependencies]
+keyring = { version = "3", features = ["windows-native", "linux-native"] }
+
+[target.'cfg(all(not(turmoil), target_os = "macos"))'.dependencies]
+yadorilink-os-keychain = { path = "../yadorilink-os-keychain" }
+
+# The simulated socket `sim_net` swaps in. A normal dependency rather than a
+# dev-dependency because the swap happens in this crate, but only ever under
+# `--cfg turmoil`, which no shipped build and no ordinary `cargo test` sets.
+[target.'cfg(turmoil)'.dependencies]
+turmoil = "0.7.2"
+
+[lints]
+workspace = true

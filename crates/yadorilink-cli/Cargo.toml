@@ -1,0 +1,97 @@
+[package]
+name = "yadorilink-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "yadorilink"
+path = "src/main.rs"
+
+[dependencies]
+# The daemon control-socket client, the coordination-plane client and the
+# typed operations this command line renders.
+yadorilink-client-core = { path = "../yadorilink-client-core" }
+yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
+yadorilink-local-storage = { path = "../yadorilink-local-storage" }
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
+# `uninstall` reads the stopped daemon's link registry read-only.
+yadorilink-sqlite-runtime = { path = "../yadorilink-sqlite-runtime" }
+yadorilink-root-authority = { path = "../yadorilink-root-authority" }
+yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
+yadorilink-reporting = { path = "../yadorilink-reporting" }
+tokio.workspace = true
+# Local-time rendering of timestamps in `status` (`localtime_r`).
+libc = "0.2"
+clap = { version = "4", features = ["derive"] }
+thiserror.workspace = true
+# Audit-trail logging for the `--force` durability-gate override on
+# `unlink`/`share revoke`/`device remove` (see `commands::durability_force`).
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# The credential client's error types, which this crate maps onto its exit
+# codes. The credential store itself is reached through
+# yadorilink-client-core.
+yadorilink-fapi-client.workspace = true
+serde.workspace = true
+serde_json = "1"
+# Renders `share invite`'s one-use URL as a terminal QR code
+# (`commands::share`'s `render_invite_qr`). `default-features = false`
+# drops the `image`/`svg`/`pic` default features entirely -- only the core
+# module-matrix + built-in char-based string renderer is needed, so no
+# image-decoding dependency tree comes along for the ride.
+qrcode = { version = "0.14", default-features = false }
+
+# Local-time rendering of conflict mtimes (`localtime_r` offset).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Local-time rendering and parsing (`SystemTimeToTzSpecificLocalTime`).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Time"] }
+
+[dev-dependencies]
+# The wire-contract harness decodes JWT-shaped values and parses redirect
+# URLs while playing the browser.
+base64 = { version = "0.23" }
+url = { version = "2" }
+# Integration tests wire a registered test device's change-signing key.
+yadorilink-transport = { path = "../yadorilink-transport" }
+# The offline `CoordinationAuth` the tests below build. Enabling the feature
+# here rather than in `[dependencies]` keeps it out of the shipped binary: it
+# is a composition of the crate's public API (see its `test_support` module),
+# and nothing in the product path enables it.
+yadorilink-fapi-client = { workspace = true, features = ["test-support"] }
+# Test-only: integration tests seed a `ReplicaCoordinator` fixture directly
+# (bypassing the daemon's normal write path), which requires a
+# `RootCommitPermit` -- `RootCommitPermit::for_tests()` is only compiled in
+# with this feature. `DaemonState::install_test_root_commit_authority` also
+# needs this feature to be reachable from an integration test binary in
+# this crate.
+yadorilink-daemon = { path = "../yadorilink-daemon", features = ["test-support"] }
+# Test-only: `placeholder_backend::OverrideForTest` needs this feature to be
+# reachable from an integration test binary in this crate (same
+# `#[cfg(any(test, feature = "test-support"))]` gate the module itself uses).
+yadorilink-filesystem-sync = { path = "../yadorilink-filesystem-sync", features = ["test-support"] }
+# Unit tests pin the dashboard's state-file names to the ones it writes.
+yadorilink-http-api = { path = "../yadorilink-http-api" }
+# Unit tests of `uninstall` write a link registry fixture.
+yadorilink-sqlite-runtime = { path = "../yadorilink-sqlite-runtime", features = ["test-support"] }
+tempfile = "3"
+hex = "0.4"
+sha2.workspace = true
+ed25519-dalek = "3"
+# The wire-contract harness plays the user agent for two browser legs, and a
+# browser is exactly what the cookie store is: both legs hang a
+# path-scoped `HttpOnly` cookie on the browser and verify it at the far end, so
+# a jar that ignored paths would make the harness pass where a browser would
+# not. Enabled here rather than in `[dependencies]` -- no shipped code sends a
+# cookie.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "cookies",
+] }
+
+[lints]
+workspace = true

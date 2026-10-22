@@ -1,0 +1,19 @@
+# .dockerignore
+#
+# Keeps the docker build context (packaging/docker/Dockerfile's `COPY . .`,
+# invoked from the repo root) from shipping build artifacts, VCS history,
+# and local-only machine configuration into the build.
+
+.git/
+target/
+target-*/
+.xcode-build/
+__pycache__/
+*.pyc
+
+# Local machine config -- never part of a container build.
+.cargo/
+
+# Packaging output directories from other platforms, not inputs.
+packaging/*/dist/
+packaging/*/.stage/

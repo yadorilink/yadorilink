@@ -1,0 +1,203 @@
+# DST module -> scenario impact map. Purpose: an agent (or developer) that
+# touched `src/<module>.rs` reads this file to answer "which DST scenarios
+# plausibly cover my diff, and which do I run *first*?" without reading
+# every 1300-line scenario source. It is small, reviewable data, not a
+# build-graph analysis. Two tables, both lint-enforced by
+# `tests/dst_impact_map_lint.rs`: [modules] every top-level `src/*.rs`
+# module -> the scenarios exercising it, ordered most-directly-relevant
+# first ("run-this-first"). An empty list is legal and meaningful: it says
+# "no DST scenario targets this module yet" (a coverage signal, not an
+# error). The lint fails only when a module file exists with no entry here,
+# or an entry names a module file that does not exist. [scenarios] every
+# `tests/dst_*.rs` scenario -> the oracle kinds it runs. The lint fails
+# when a `dst_*.rs` file has no entry, or an entry names a scenario file
+# that does not exist. Oracle kinds mirror
+# `dst_support::oracle::ViolationKind`. Derived from each scenario's
+# `check_*` oracle calls; keep in sync when a scenario gains/drops an
+# oracle. `dst_materialization_ crash_recovery.rs` moved to
+# `yadorilink-filesystem-sync/tests/` in the same pass and is deliberately
+# absent from both tables: it never used `mod dst_support;` (a plain,
+# unsimulated crash-injection test, not a harness scenario by this map's own
+# definition), so removing it here is not a coverage loss, only this map
+# catching up to what was already true.
+
+schema_version = 1
+
+[modules]
+# The indexing/state core is touched by every scenario.
+index = [
+    "dst_peer_reconcile_race",
+    "dst_watcher_debounce",
+]
+local_change = [
+    "dst_peer_reconcile_race",
+    "dst_watcher_debounce",
+]
+watcher = [
+    "dst_watcher_debounce",
+    "dst_peer_reconcile_race",
+]
+debounce = [
+    "dst_watcher_debounce",
+    "dst_peer_reconcile_race",
+]
+ignore_patterns = [
+    "dst_watcher_debounce",
+    "dst_peer_reconcile_race",
+]
+# The complete-dependency public wrapper over `peer_session`. Any scenario
+# that drives a real session goes through it, so it carries the same list.
+peer_session_public = [
+    "dst_peer_reconcile_race",
+]
+peer_session = [
+    "dst_peer_reconcile_race",
+]
+conflict = [
+]
+materialization = [
+]
+types = [
+]
+# The reserved-artefact predicate sits on every path-consuming entry point --
+# watcher ingestion and directory registration, the shared exclusion choke
+# point used by both scan and event processing, DAG import, and admission --
+# so a change here can alter what any scenario sees on disk or admits into
+# history. Scoped to the scenarios that actually drive those paths.
+reserved_namespace = [
+    "dst_peer_reconcile_race",
+    "dst_watcher_debounce",
+]
+# Modules with no DST scenario targeting them yet. Kept explicit so the
+# lint proves the list is complete (not silently forgotten) and so the
+# emptiness is itself a visible coverage gap. adaptive_window/chunker/hazard/
+# rate_limiter/link_preflight have unit tests in `src/` but no DST scenario
+# drives them through the simulated envelope. fs_identity/fs_capabilities
+# are empty because nothing calls them yet: they are the
+# identity/capability model for the filesystem transaction engine,
+# exercised only by their own unit tests, with no production call site
+# until a later phase wires the engine onto an actual caller. They must
+# gain scenarios at that point -- an empty list here is a coverage gap, not
+# a statement that they do not need coverage.
+adaptive_window = []
+fs_capabilities = []
+fs_identity = []
+# Records what the engine believes the disk currently reflects, as distinct
+# from what the DAG resolves a path to. Empty for the same reason as the fs_*
+# modules: nothing reads it yet. It gains scenarios when local change detection
+# starts comparing against it instead of against the newest desired target,
+# which is the behavioural switchover and is deliberately not done yet.
+materialized_generation = []
+# The transaction engine's journal: parent sagas, hierarchical path
+# reservations and placement epochs. It gains scenarios once a real caller
+# exists and the gate is turned on.
+filesystem_transaction = []
+optimistic_placement = []
+# It gains scenarios once startup wiring exists to actually crash mid-epoch
+# under DST fault injection.
+early_physical_recovery = []
+# Empty for the same reason as every other module in this engine: it
+# composes only gated primitives, its `PlanEnvironment` is implemented by
+# its own tests alone, and no production caller builds one. It gains
+# scenarios when the receiver- side environment exists and the gate opens
+# -- at which point the scenarios to name here are the ones that move a
+# path's winner while a projection is in flight, since that is the
+# staleness this loop exists to detect.
+plan_driver = []
+# Custody transfer (`CustodyTransferred`): moves a
+# commit's displaced preimage into retained custody by same-filesystem
+# rename.
+retained_obligation = []
+custody_transfer = []
+resolution_planning = []
+# It gains scenarios once a real caller exists and the gate is turned on.
+orchestrator = []
+authenticated_history = []
+block_deletion = []
+block_liveness = []
+change = []
+chunker = []
+compaction = []
+custody = []
+dag_import = []
+hazard = []
+error = []
+rate_limiter = []
+# Work-class scheduling primitive: weighted-fair-queuing
+# admission control across the six work classes, one instance per bounded
+# resource. Pure admission-control logic exercised only by its own unit
+# tests so far; no DST scenario drives it under simulated fault/contention
+# yet (it has no production caller wiring it into a real resource -- e.g.
+# gating retained-preimage classification -- yet either).
+work_class_queue = []
+rebootstrap = []
+native_snapshot = []
+# Single-pass preimage classification pipeline: exercised
+# only by its own unit tests so far; no DST scenario drives captured-change
+# authoring from a retained preimage yet.
+single_pass_capture = []
+# Captured authoring: turns a retained preimage's
+# single-pass classification into one signed change, in one SQLite
+# transaction, parented on the displaced generation's causal basis, under
+# the block liveness gate.
+captured_authoring = []
+# Sync-root single-instance OS lock: a process-lifetime mutual-exclusion
+# primitive, exercised only by its own unit tests (including a real killed
+# child process for crash-reclaim). No DST scenario drives two concurrent
+# daemon processes against one sync root yet — DST scenarios run one
+# in-process simulated daemon per node, so there is nothing today that would
+# exercise cross-process contention.
+sync_root_lock = []
+block_serve = [
+]
+materialization_jobs = [
+]
+# No DST scenario drives the retroactive conflict-copy repair loop
+# directly yet -- it lives in yadorilink-daemon (engine_wrapper.rs), not
+# reachable from this crate's own DST harness.
+retroactive_conflict = []
+# Deterministic ranking helper; no DST scenario drives it directly.
+repair_election = []
+# Internal lock-scoping helper for path-keyed writes; not directly exercised
+# by any DST scenario name.
+commit_path_locks = []
+# Capability abstraction over the OS-level placeholder provider (macOS File
+# Provider / Windows CfApi); the DST harness has no OS-level provider to
+# simulate against.
+placeholder_backend = []
+# The `RootCommitPermit` capability every local mutation now requires; every
+# existing DST scenario already exercises it transitively (it gates the same
+# mutation call sites those scenarios always drove), so no scenario name is
+# specific to it.
+root_commit = []
+
+[scenarios]
+# scenario -> oracle kinds it asserts (mirrors ViolationKind). `first_divergence`
+# is true once the scenario routes failures through the first-divergence
+# observer; currently pending the
+# triage-replay integration, so all are false. See INTEGRATION.md.
+# Strong-eventual-consistency suite for the change-history DAG reference model:
+# convergence, no resurrection, deterministic conflict-copy naming, and
+# store-and-forward semantics.
+dst_sec_convergence = { oracles = ["Convergence", "ConflictCopyAccounting"], first_divergence = false }
+dst_peer_reconcile_race = { oracles = ["NoLoss"], first_divergence = false }
+dst_watcher_debounce = { oracles = ["NoLoss"], first_divergence = false }
+# A targeted regression guard for directory-rename vs a concurrent child edit:
+# asserts the edited bytes survive in both orderings with its own assert rather
+# than a `check_*` oracle, so no ViolationKind is listed.
+# Repeated long-offline -> reconnect -> heal against the DAG heads-announce
+# catch-up. Drives its own terminal convergence assertion rather than a `check_*`
+# oracle, so no ViolationKind is listed.
+# Recursive delete and directory rename concurrent with a peer's write inside
+# the directory, on two product-stack devices. Asserts its own database-state
+# oracle (unobserved heads survive, observed versions are removed, the devices
+# converge) rather than a `check_*` oracle, so no ViolationKind is listed.
+dst_turmoil_dcf_directory = { oracles = [], first_divergence = false }
+# Three full stacks on a simulated carrier: seals and foreign-base merges
+# driven by the harness while devices are partitioned, with directory ops
+# (rm -rf, directory rename, shape conflicts, write-through of a relocated
+# copy). Oracles are its own (see the scenario's module doc): one base, one
+# Gamma, one tree, disk == project(Gamma), no content loss under the
+# observed-supersession rule, no corruption, bounded metadata after a final
+# seal, no stuck seal or install hold.
+dst_history_epoch_chaos = { oracles = ["Convergence", "NoLoss", "Corruption"], first_divergence = false }

@@ -1,0 +1,15 @@
+syntax = "proto3";
+package yadorilink.local_discovery.v1;
+
+// Local LAN broadcast announcement. Intentionally
+// unauthenticated at this level — matching Syncthing's own local-discovery
+// design — since a forged announcement still can't complete a real QUIC
+// handshake without the corresponding private key. MVP discovery
+// deliberately broadcasts the stable Ed25519 device public key as a LAN
+// privacy trade-off; receivers must rate-limit, de-duplicate, and ignore
+// keys not present in their cached authorized-peer set before acting on
+// this.
+message LocalAnnouncement {
+  bytes public_key = 1; // announcing device's Ed25519 device key
+  uint32 wg_port = 2;   // local UDP port it's listening for QUIC/mesh traffic on
+}

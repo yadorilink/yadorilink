@@ -1,0 +1,67 @@
+[package]
+name = "yadorilink-filesystem-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
+yadorilink-root-authority = { path = "../yadorilink-root-authority" }
+# `BlockReclamationStore`/`ContentHash`/`GcReport`/`StorageError` for
+# `block_deletion::sweep_globally_unreferenced_blocks` (7D-9C) — a pure leaf
+# dependency, same as `yadorilink-root-authority`'s own (this crate does not
+# depend back on `yadorilink-filesystem-sync`, so no cycle risk).
+yadorilink-local-storage = { path = "../yadorilink-local-storage" }
+# The restore value types (`RestoreOperation`/`RestoreCommitOutcome`,
+# owned by `session_state`) and `materialization_execution.rs`'s
+# `MaterializationExecutionPort` surface (7D-9C) -- already a transitive
+# dependency via `yadorilink-local-storage`/`yadorilink-root-authority`, made
+# direct now that this crate's own code names these types.
+yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
+# `MaterializationExecutionPort::reclaim_cached_blocks`'s `VerifiedCustody`
+# parameter (7D-9C) -- a pure leaf crate over `yadorilink-replica-domain`
+# only, so depending on it here carries no cycle risk (mirrors this crate's
+# existing `yadorilink-local-storage` dependency's own reasoning).
+yadorilink-replica-engine = { path = "../yadorilink-replica-engine" }
+yadorilink-peer-session = { path = "../yadorilink-peer-session" }
+thiserror.workspace = true
+tracing.workspace = true
+# `quarantine_dirty_disk_file`'s cheap on-disk `(size, mtime)` disambiguator
+# (7D-9C, `materialization_repair.rs`) -- same version pin as every other
+# workspace crate's `sha2` dependency.
+sha2.workspace = true
+hex = "0.4"
+notify = "8"
+walkdir = "2"
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+rand = "0.10.2"
+yadorilink-replica-engine = { path = "../yadorilink-replica-engine", features = ["test-support"] }
+# `materialization_repair.rs`'s own `#[cfg(test)]` module needs `create_
+# or_defer_placeholder`'s Windows-deferred-outcome failure-injection seam
+# (`set_test_force_deferred_placeholder`) to exercise its two placeholder
+# arms' Windows-only handling on any host. Same override shape as the
+# `yadorilink-replica-engine` entry just above.
+yadorilink-local-storage = { path = "../yadorilink-local-storage", features = ["test-support"] }
+tracing-subscriber.workspace = true
+yadorilink-daemon = { path = "../yadorilink-daemon", features = ["test-support"] }
+
+# The Windows root watcher (`win_watch.rs`): `ReadDirectoryChangesW`.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

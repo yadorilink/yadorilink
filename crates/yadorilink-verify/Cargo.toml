@@ -1,0 +1,20 @@
+[package]
+name = "yadorilink-verify"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "Small standalone Ed25519 signature verifier that install.sh pins by hash"
+
+# Its own workspace and lockfile on purpose: the installers pin this program's
+# hash, so its dependency set is kept to the one signature library and is
+# reproducible without the rest of the tree. Build with
+# `cargo build --release --locked --manifest-path crates/yadorilink-verify/Cargo.toml`
+# (see .github/release/build-verifier.sh for the exact reproducible flags).
+[workspace]
+
+[[bin]]
+name = "yadorilink-verify"
+path = "src/main.rs"
+
+[dependencies]
+ed25519-dalek = { version = "3", default-features = false }

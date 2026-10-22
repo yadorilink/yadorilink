@@ -1,0 +1,17 @@
+[package]
+name = "yadorilink-namespace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Pure: the authenticated namespace as a function of its nodes. Node storage
+# is a port the caller implements.
+[dependencies]
+yadorilink-replica-domain = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

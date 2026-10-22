@@ -1,0 +1,82 @@
+[package]
+name = "yadorilink-peer-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# See yadorilink-local-storage/Cargo.toml's identical section for why.
+[features]
+# `yadorilink-local-storage/test-support` forward: this crate's own tests
+# need `create_or_defer_placeholder`'s Windows-deferred-outcome
+# failure-injection seam (`set_test_force_deferred_placeholder`) to
+# exercise the Windows-only branch of its own placeholder-arm callers on
+# any host.
+test-support = ["yadorilink-root-authority/test-support", "yadorilink-local-storage/test-support"]
+
+[dependencies]
+yadorilink-transport = { path = "../yadorilink-transport" }
+yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
+yadorilink-replica-engine = { path = "../yadorilink-replica-engine" }
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
+yadorilink-root-authority = { path = "../yadorilink-root-authority" }
+yadorilink-local-storage = { path = "../yadorilink-local-storage" }
+yadorilink-sync-wire = { path = "../yadorilink-sync-wire" }
+thiserror.workspace = true
+tracing.workspace = true
+# `ports::PeerReplicaStatePort` and the stream-lane ports wrap async trait
+# methods -- a plain trait cannot name those in dyn-compatible form without
+# this.
+async-trait = "0.1"
+sha2.workspace = true
+# `ChangeAuthenticator::resolve_authority_key` and the proof-carrying
+# receive path name `VerifyingKey` directly: this crate verifies Ed25519
+# signatures itself in production.
+ed25519-dalek = "3"
+bytes.workspace = true
+# `FuturesUnordered` drives the bounded-concurrency reconcile loop.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+hex = "0.4"
+# hazard.rs's NFC/NFD sibling-collision detection.
+unicode-normalization = "0.1"
+caseless = "0.2.2"
+# Negotiated zstd compression for block and index-exchange payloads.
+zstd = { workspace = true }
+# Retry-jitter randomness and session-secret generation.
+rand = "0.10.2"
+tokio.workspace = true
+
+[dev-dependencies]
+# A real substrate endpoint for this crate's own fixtures. A dev-dependency
+# cycle (that crate depends on this one) is deliberate and permitted: a
+# session's transports are required, so a fixture has to build the real ones,
+# and a null transport would put back exactly the state production stopped
+# being able to represent.
+yadorilink-lane-ports = { path = "../yadorilink-lane-ports", features = ["test-support"] }
+tempfile = "3"
+# This crate's own #[cfg(test)] tests need `RootCommitPermit::for_tests`/
+# `RootLease::for_tests` (both `#[cfg(any(test, feature =
+# "test-support"))]` in yadorilink-root-authority), but `cfg(test)` is
+# crate-local -- building this crate's own tests does not turn on that cfg
+# inside the yadorilink-root-authority artifact this crate links against.
+# This self-referencing dev-dependency turns the feature on instead.
+yadorilink-peer-session = { path = ".", features = ["test-support"] }
+# This is a dev-only back-edge against this crate's own normal (non-dev)
+# dependency direction (`yadorilink-daemon` depends on
+# `yadorilink-peer-session`, not the reverse) -- cargo permits this:
+# building this crate's *library* never needs `yadorilink-daemon`'s lib,
+# only compiling this crate's *test* binaries does. `test-support` is
+# needed for `ReplicaCoordinator::open_in_memory`, a test-only constructor
+# (`#[cfg(any(test, feature = "test-support"))]`) that opens a standalone
+# in-memory database rather than sharing a live `SyncState`'s already-open
+# one.
+yadorilink-daemon = { path = "../yadorilink-daemon", features = ["test-support"] }
+yadorilink-sync-sqlite = { path = "../yadorilink-sync-sqlite" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+yadorilink-local-capture = { path = "../yadorilink-local-capture", features = ["test-support"] }
+yadorilink-filesystem-sync = { path = "../yadorilink-filesystem-sync" }
+yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
+prost = "0.14.4"
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[lints]
+workspace = true

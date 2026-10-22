@@ -1,0 +1,106 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/yadorilink-transport",
+    "crates/yadorilink-local-storage",
+    "crates/yadorilink-replica-domain",
+    "crates/yadorilink-namespace",
+    "crates/yadorilink-dcf-oracle",
+    "crates/yadorilink-peer-session",
+    "crates/yadorilink-replica-engine",
+    "crates/yadorilink-fs-platform",
+    "crates/yadorilink-os-keychain",
+    "crates/yadorilink-root-authority",
+    "crates/yadorilink-sqlite-runtime",
+    "crates/yadorilink-sync-sqlite",
+    "crates/yadorilink-sync-wire",
+    "crates/yadorilink-sync-substrate",
+    "crates/yadorilink-sync-protocol",
+    "crates/yadorilink-sync-runtime",
+    "crates/yadorilink-lane-ports",
+    "crates/yadorilink-local-capture",
+    "crates/yadorilink-filesystem-sync",
+    "crates/yadorilink-daemon",
+    "crates/yadorilink-send",
+    "crates/yadorilink-client-core",
+    "crates/yadorilink-client-ffi",
+    "crates/yadorilink-cli",
+    "crates/yadorilink-ipc-proto",
+    "crates/yadorilink-reporting",
+    "crates/yadorilink-http-api",
+    "crates/yadorilink-product-view",
+    "crates/yadorilink-fapi-client",
+    "crates/yadorilink-windows-provider-policy",
+]
+# Windows-only, its own Cargo workspace and Cargo.lock (Windows API types do
+# not compile elsewhere). Built with `--manifest-path`, never as a member.
+exclude = ["crates/yadorilink-shell-ext-windows"]
+
+[workspace.lints.rust]
+# Hoisted verbatim from the member crates, which all carried this same block.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(turmoil)"] }
+
+[workspace.lints.clippy]
+# `excessive_nesting` is warn-by-default already; it only starts firing once
+# `excessive-nesting-threshold` is set in .clippy.toml. `too_many_lines` is
+# pedantic, so it has to be enabled explicitly here.
+too_many_lines = "warn"
+
+[workspace.package]
+version = "0.1.0-beta.1"
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://github.com/yadorilink/yadorilink"
+
+[workspace.dependencies]
+yadorilink-ipc-proto = { path = "crates/yadorilink-ipc-proto" }
+yadorilink-local-storage = { path = "crates/yadorilink-local-storage" }
+yadorilink-transport = { path = "crates/yadorilink-transport" }
+yadorilink-replica-domain = { path = "crates/yadorilink-replica-domain" }
+yadorilink-namespace = { path = "crates/yadorilink-namespace" }
+yadorilink-replica-engine = { path = "crates/yadorilink-replica-engine" }
+yadorilink-fs-platform = { path = "crates/yadorilink-fs-platform" }
+yadorilink-root-authority = { path = "crates/yadorilink-root-authority" }
+yadorilink-peer-session = { path = "crates/yadorilink-peer-session" }
+yadorilink-sqlite-runtime = { path = "crates/yadorilink-sqlite-runtime" }
+yadorilink-sync-sqlite = { path = "crates/yadorilink-sync-sqlite" }
+yadorilink-sync-wire = { path = "crates/yadorilink-sync-wire" }
+yadorilink-local-capture = { path = "crates/yadorilink-local-capture" }
+yadorilink-filesystem-sync = { path = "crates/yadorilink-filesystem-sync" }
+yadorilink-reporting = { path = "crates/yadorilink-reporting" }
+yadorilink-send = { path = "crates/yadorilink-send" }
+yadorilink-http-api = { path = "crates/yadorilink-http-api" }
+yadorilink-fapi-client = { path = "crates/yadorilink-fapi-client" }
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2.0.18"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.11"
+# Negotiated zstd compression for sync-protocol block/index payloads —
+# scoped to `yadorilink-peer-session` only, not a dependency of any other
+# crate.
+zstd = "0.14"
+# The Swift binding for the macOS app. One exact version: the generated Swift
+# checks the library's API checksums at load time, so the bindgen and the
+# scaffolding must come from the same release.
+uniffi = "=0.32.2"
+
+# Profiling build: release-level optimization with debug symbols/line info
+# retained, so `perf`/`samply`/Instruments can resolve stacks to source
+# lines instead of raw addresses. Not used by any normal build/test/CI
+# invocation — only `--profile profiling`.
+[profile.profiling]
+inherits = "release"
+debug = 1
+
+# Line tables only: backtraces keep file:line, but test binaries shrink from
+# ~600 MB to ~165 MB each. With ~100 integration-test binaries in the daemon
+# crate alone, relinking all of them after a daemon change drops from about
+# 11-12 minutes to about 4, and a target dir from ~63 GB to ~22 GB.
+# For a debugger session with local variables, build with
+# CARGO_PROFILE_DEV_DEBUG=full.
+[profile.dev]
+debug = "line-tables-only"

@@ -1,0 +1,54 @@
+[package]
+name = "yadorilink-fs-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The generic filesystem layer: durable namespace changes, filesystem
+# capability probes, file identity, the reserved on-disk artefact namespace,
+# path folding and ignore patterns. It knows nothing about root authority,
+# leases or sync-root locks.
+[features]
+# Test-only failpoints, trace and power-loss model for `durable_dir`.
+test-support = []
+# The raw measurement primitives (`MoveFileExW`, a directory flush) for the
+# durability evidence runs. Production code never enables it.
+evidence = []
+
+[dependencies]
+yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
+thiserror.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+# `canonical_fold`'s NFC/case-fold combined equivalence key.
+unicode-normalization = "0.1"
+caseless = "0.2.2"
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"
+# This crate's own `tests/*.rs` binaries link it as an external library, so
+# `cfg(test)` is inactive for it there.
+yadorilink-fs-platform = { path = ".", features = ["test-support", "evidence"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# `durable_dir`'s Windows write-through move and volume probe.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
+[lints]
+workspace = true
+
+# The Windows evidence tests call the raw file APIs directly.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }

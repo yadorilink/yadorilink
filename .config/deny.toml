@@ -1,0 +1,101 @@
+# cargo-deny configuration.
+# Run locally with: cargo deny --config .config/deny.toml check advisories bans licenses sources
+
+[advisories]
+version = 2
+# Security vulnerabilities and yanked crates are hard failures.
+yanked = "deny"
+# Only flag *unmaintained* advisories for crates the workspace depends on
+# directly. Deep transitive UI dependencies are frequently unmaintained with no
+# safe upgrade, and gating on them would block CI on issues we cannot fix.
+# Known transitive unmaintained deps are deliberately NOT added to `ignore`
+# (so newly-unmaintained direct deps still fail); each one must be reached only
+# through a third-party dependency with no maintained drop-in replacement.
+unmaintained = "workspace"
+# Triaged, tracked vulnerability exceptions. The advisories check stays blocking
+# for every other (and future) advisory; only these specific IDs are ignored,
+# each with its dependency path, impact assessment, and the condition for
+# removing it recorded in the comment directly above the entry.
+ignore = [
+]
+
+[licenses]
+version = 2
+# Globally-accepted permissive licenses.
+allow = [
+    # This workspace's own licence (every first-party crate declares it).
+    "AGPL-3.0-only",
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+# Per-crate exceptions: these licenses are accepted ONLY for the specific crate
+# that carries them, rather than being added to the global allow-list above.
+# All are permissive or weak (file-level) copyleft and acceptable as
+# dependencies of an AGPL-3.0-only project (MPL-2.0 names AGPL-3.0 as a
+# permitted secondary licence); none impose additional restrictions on our code.
+exceptions = [
+    # Weak, file-level copyleft (MPL-2.0) — only the crate's own files are
+    # copyleft; using it as a dependency does not affect our source.
+    { crate = "attohttpc", allow = ["MPL-2.0"] },
+    { crate = "option-ext", allow = ["MPL-2.0"] },
+    # UniFFI (Mozilla) — MPL-2.0, same weak file-level copyleft; used
+    # unmodified as a dependency / build-time binding generator.
+    { crate = "uniffi", allow = ["MPL-2.0"] },
+    { crate = "uniffi_bindgen", allow = ["MPL-2.0"] },
+    { crate = "uniffi_core", allow = ["MPL-2.0"] },
+    { crate = "uniffi_internal_macros", allow = ["MPL-2.0"] },
+    { crate = "uniffi_macros", allow = ["MPL-2.0"] },
+    { crate = "uniffi_meta", allow = ["MPL-2.0"] },
+    { crate = "uniffi_pipeline", allow = ["MPL-2.0"] },
+    { crate = "uniffi_udl", allow = ["MPL-2.0"] },
+    # Boost Software License — permissive, BSD-like.
+    { crate = "clipboard-win", allow = ["BSL-1.0"] },
+    { crate = "error-code", allow = ["BSL-1.0"] },
+    # CC0-1.0 — public-domain dedication.
+    { crate = "notify", allow = ["CC0-1.0"] },
+    # Apache-2.0 with the LLVM exception — strictly more permissive than
+    # plain Apache-2.0.
+    { crate = "target-lexicon", allow = ["Apache-2.0 WITH LLVM-exception"] },
+    # Community Data License Agreement – Permissive 2.0. Covers the bundled
+    # Mozilla root-certificate data set, which is permissively licensed.
+    { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
+    # Same rationale as webpki-roots above -- another Mozilla CA
+    # root-certificate data crate, reached transitively via iroh's TLS
+    # stack. Release artifacts that bundle this data must make the
+    # CDLA-Permissive-2.0 agreement text available per its sharing terms.
+    { crate = "webpki-root-certs", allow = ["CDLA-Permissive-2.0"] },
+    # Unlicense -- OSI-approved public-domain-equivalent dedication with a
+    # permissive fallback license. Reached only through iroh-relay's
+    # WASM-only websocket transport (`cfg(all(target_family = "wasm",
+    # target_os = "unknown"))`), never compiled into the native
+    # macOS/Linux/Windows binaries this workspace actually ships.
+    { crate = "async_io_stream", allow = ["Unlicense"] },
+    { crate = "pharos", allow = ["Unlicense"] },
+    { crate = "ws_stream_wasm", allow = ["Unlicense"] },
+]
+
+[bans]
+# Duplicate versions of the same crate are reported but not blocking: they are
+# common in a large dependency tree and rarely actionable on their own.
+multiple-versions = "warn"
+# Wildcard dependencies. Every wildcard currently in the tree is an intra-
+# workspace `{ path = "..." }` dependency with no explicit version (implicitly
+# `*`). `allow-wildcard-paths` does not exempt them because these crates are not
+# marked `publish = false`. Reported as a warning rather than denied so CI is not
+# blocked on manifest changes; the durable fix (versioned path deps or
+# `publish = false`) is left to the crate owners.
+wildcards = "warn"
+allow-wildcard-paths = true
+
+[sources]
+# Only crates.io and other explicitly-allowed sources are permitted; unknown
+# registries or git sources fail.
+unknown-registry = "deny"
+unknown-git = "deny"

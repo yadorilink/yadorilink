@@ -1,0 +1,43 @@
+name: Feature request
+description: Suggest a capability, integration, or workflow improvement.
+title: "[feature] "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What are you trying to do, and where does the current project fall short?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the user-visible behavior you want.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Mention workarounds or other tools you have tried.
+    validations:
+      required: false
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - CLI
+        - Daemon / sync engine
+        - Transport / relay
+        - Desktop status app
+        - macOS integration
+        - Windows integration
+        - Packaging / install
+        - Documentation
+        - Other
+    validations:
+      required: true

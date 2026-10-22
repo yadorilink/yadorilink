@@ -1,0 +1,16 @@
+# Seeds for the topology soak lane, one per line, each kept as a permanent
+# regression check. Lines starting with '#' and blank lines are ignored.
+# A note applies only to the seed on the line directly below it.
+922972317807886136
+16612994462990444375
+14049118026691592637
+# Materialization repair asks every live peer each sweep, not only the first.
+12552500466593081697
+17132986931368163713
+3746878857549989852
+# Restarting a link's watcher retries while the previous root lock releases.
+11103395572848290591
+# An origin that explicitly refused a fetch is not exempt from refusal evidence.
+6046481562379271917
+2419847920444153969
+3905559394372262424

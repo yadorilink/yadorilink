@@ -1,0 +1,91 @@
+name: Nightly
+
+# Statistical confidence rather than per-SHA truth: multi-seed simulation,
+# chaos, and coverage measurement. Deterministic correctness lives in
+# verify.yml.
+
+on:
+  schedule:
+    - cron: "17 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  simulation-sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: nightly-simulation
+          token: ${{ github.token }}
+      # DST_SEEDS unset: each scenario runs its own default sweep.
+      - name: Turmoil sweeps
+        env:
+          RUSTFLAGS: --cfg turmoil
+        run: >-
+          cargo test --no-fail-fast -p yadorilink-daemon
+          --test dst_turmoil_substrate_case
+          -- --test-threads=1
+      - name: Turmoil scenario sweeps
+        if: always()
+        env:
+          RUSTFLAGS: --cfg turmoil
+        run: |
+          for scenario in dst_turmoil_substrate_case dst_watcher_debounce; do
+            cargo test -p yadorilink-daemon --test "$scenario"
+          done
+
+  chaos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: nightly-chaos
+          token: ${{ github.token }}
+      - run: >-
+          cargo test -p yadorilink-daemon --test monkey_chaos
+          -- --test-threads=1
+
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: nightly-coverage
+          components: llvm-tools-preview
+          token: ${{ github.token }}
+      - run: cargo install --locked --version 0.8.7 cargo-llvm-cov
+      - run: cargo llvm-cov clean --workspace
+      - name: Workspace coverage
+        run: cargo llvm-cov --no-fail-fast --workspace --exclude yadorilink-daemon --no-report
+      - name: Daemon coverage (serial)
+        if: always()
+        run: |
+          cargo llvm-cov --no-fail-fast -p yadorilink-daemon --tests --no-report -- \
+            --test-threads=1 \
+            --skip random_concurrent_operations_converge_to_an_identical_file_set \
+            --skip replay_known_failing_seeds
+      - name: Coverage summary
+        if: always()
+        run: cargo llvm-cov report --summary-only

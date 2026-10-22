@@ -1,0 +1,21 @@
+[package]
+name = "yadorilink-windows-provider-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The Windows provider host's policy, with no Win32 call anywhere in it: how
+# a stale or retryable answer is told apart, what a local change means, what a
+# walk keeps of what it has shown, how a Stage placeholder is recovered, how
+# the provider protocol is spoken and what a materialized-set report claims.
+# It builds and tests on every platform; the Windows crate
+# (`windows`) supplies the transport and the operating-system
+# calls behind the traits declared here.
+[dependencies]
+yadorilink-ipc-proto.workspace = true
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
+sha2.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

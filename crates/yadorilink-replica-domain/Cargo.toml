@@ -1,0 +1,30 @@
+[package]
+name = "yadorilink-replica-domain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Deliberately no tokio, no async, no filesystem/network -- this crate is
+# the pure, synchronous domain model (identities, the signed canonical
+# Change, file/version records, conflict policy) with nothing beneath it
+# but the standard library and cryptography. The boundary is declared in
+# `.config/architecture.toml` and enforced by `.github/checks/check-architecture.py`.
+[features]
+# Test-only constructors (`LocalAuthorKey::for_tests`) for other crates' tests.
+test-support = []
+
+[dependencies]
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+hex = "0.4"
+ed25519-dalek = "3"
+
+[dev-dependencies]
+# A same-layer, dependency-free reference oracle for the native-causal-state
+# differential tests. Test-only: never a
+# runtime dependency.
+yadorilink-dcf-oracle = { path = "../yadorilink-dcf-oracle" }
+
+[lints]
+workspace = true

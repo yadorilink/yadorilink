@@ -1,0 +1,93 @@
+[package]
+name = "yadorilink-http-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# A thin localhost HTTP/REST + SSE adapter in front of the daemon's existing
+# control-socket IPC (see `crates/yadorilink-ipc-proto/proto/daemon_control.proto`
+# and `crates/yadorilink-daemon/src/control_socket.rs`). This crate never
+# touches daemon internals directly -- it dials the control socket exactly the
+# way `yadorilink-cli`'s `control_client.rs` does (same framing, same
+# `DaemonControlRequest`/`DaemonControlResponse` wire types), so it adds no new
+# business logic, only a protocol translation.
+[features]
+# Exposes `HttpApiHandle::sse_slots_for_test` -- an internal
+# diagnostic (this run's `AppState::sse_slots` availability) this crate's
+# own integration tests need to observe SSE-poller cleanup, but production
+# callers never should. `#[cfg(test)]` alone is never active for
+# `tests/*.rs` (they link this crate as an ordinary external library), so
+# this needs the same feature-plus-self-dev-dependency shape
+# `yadorilink-daemon`'s own `test-support` feature already establishes in
+# this workspace.
+test-support = []
+
+[dependencies]
+yadorilink-ipc-proto = { workspace = true }
+tokio = { workspace = true }
+anyhow.workspace = true
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "json",
+    "query",
+    "tokio",
+] }
+serde.workspace = true
+serde_json = "1"
+tracing.workspace = true
+# Bearer-token generation. Same crate/version/API (`rand::fill`) already used
+# by `yadorilink-root-authority::root_identity::mint_root_token` for an
+# analogous "generate a fresh opaque secret" case.
+rand = "0.10.2"
+hex = "0.4"
+# Hand-rolled SSE stream (no `tokio-stream`/`async-stream` dependency exists
+# anywhere in this workspace yet): an `mpsc::Receiver` adapted into a
+# `futures_util::stream::Stream` via `stream::unfold`.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# Both already pulled in transitively by axum itself (see Cargo.lock); named
+# here directly for the pre-auth request-concurrency cap and request timeout
+# in `lib.rs::build_router` -- `limit` for `tower::limit::ConcurrencyLimitLayer`,
+# `timeout` for `tower_http::timeout::TimeoutLayer`.
+tower = { version = "0.5", default-features = false, features = ["limit"] }
+tower-http = { version = "0.6", default-features = false, features = ["timeout"] }
+# Serves device-authorized streams (`peer.rs`) inside a task `run` owns, so
+# they end with it; axum's own `serve` detaches every connection. Both are
+# already in the lock as axum's dependencies.
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio", "server", "service", "http1"] }
+
+[target.'cfg(windows)'.dependencies]
+# Named-pipe client retry-on-busy loop, mirroring
+# `yadorilink-cli`'s own `control_client.rs` exactly (same feature set).
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+# This crate's own `tests/*.rs` integration binaries link against
+# `yadorilink-http-api` as an ordinary external library, so `#[cfg(test)]`
+# is never active for it there -- this self-referencing dev-dependency
+# enables the feature half of `test-support`'s gate, same reason (and same
+# pattern) `yadorilink-daemon`'s identical self-dependency exists for.
+yadorilink-http-api = { path = ".", features = ["test-support"] }
+# Real daemon spin-up for integration tests, mirroring the pattern every
+# other daemon-backed test file in this workspace already uses (e.g.
+# `crates/yadorilink-cli/tests/materialization.rs`'s own `start_daemon()`):
+# build a real `DaemonState` + `ControlContext`, `tokio::spawn` the real
+# `control_socket::unix_transport::serve`, then drive it with a real client
+# -- here, this crate's own HTTP server plus a real `reqwest::Client`.
+yadorilink-daemon = { path = "../yadorilink-daemon", features = ["test-support"] }
+yadorilink-sync-sqlite = { path = "../yadorilink-sync-sqlite" }
+yadorilink-local-storage = { path = "../yadorilink-local-storage" }
+yadorilink-replica-domain = { workspace = true }
+yadorilink-root-authority = { path = "../yadorilink-root-authority", features = ["test-support"] }
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "stream",
+] }
+tokio = { workspace = true }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+serde_json = "1"
+
+[lints]
+workspace = true

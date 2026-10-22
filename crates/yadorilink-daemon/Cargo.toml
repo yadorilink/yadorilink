@@ -1,0 +1,305 @@
+[package]
+name = "yadorilink-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "yadorilink-daemon"
+path = "src/main.rs"
+
+[[bin]]
+# Offline release-manifest signing tool —
+# a maintainer-only helper, not shipped to end users, so it lives as a
+# second bin target in this same crate (reusing `update::manifest`'s
+# types directly) rather than a whole new workspace member.
+name = "yadorilink-sign-manifest"
+path = "src/bin/sign_manifest.rs"
+
+[features]
+# Turns the update trust-root release gate into a HARD startup tripwire: a
+# daemon built with this feature requires the release key id/public key at
+# compile time and refuses to start if they resolve to the development key (or
+# no real key), unless the explicit dev override is set. Off by default so
+# ordinary developer builds retain deterministic update fixtures. Release
+# builds MUST set YADORILINK_RELEASE_MANIFEST_KEY_ID and
+# YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX and enable this feature. See
+# `update::manifest::enforce_release_trust_root_gate`.
+enforce-release-trust-root = []
+# Exposes this crate's own `#[cfg(test)]`-only test fixtures (currently
+# just `DaemonState::install_test_root_commit_authority`) to integration
+# test binaries in OTHER crates that depend on this one as an ordinary
+# library -- `#[cfg(test)]` alone is never active for such a caller.
+# Forwards `yadorilink-root-authority/test-support` too: `RootLease::
+# for_tests`/`RootCommitPermit::for_tests` (this crate's own
+# `root_commit_authority.rs` `#[cfg(test)]` fixtures, among others) are
+# identically gated there, for the identical "cfg(test) is crate-local"
+# reason -- needed by any OTHER crate's dev-dependency on this one with
+# `features = ["test-support"]` requested (e.g.
+# `yadorilink-filesystem-sync`'s
+# `tests/dst_materialization_crash_recovery.rs`), since building that
+# crate's own test target never turns on `cfg(test)` inside this crate's
+# compiled dependency graph either. Forwards
+# `yadorilink-sqlite-runtime/test-support` too:
+# `SyncDatabase::pool_for_test` (`recovery.rs`/`recovery_snapshot.rs`'s own
+# test fixtures) is identically gated there, for the identical "cfg(test)
+# is crate-local" reason. Forwards `yadorilink-sync-sqlite/test-support`:
+# `ReplicaCoordinator`'s own `#[cfg(any(test, feature = "test-support"))]`
+# methods (`plant_malformed_membership_operation_for_test`,
+# `plant_malformed_role_loss_operation_for_test`,
+# `add_link_with_pending_enrollment_for_test`) delegate straight to
+# identically-gated methods on `yadorilink-sync-sqlite`'s own repository
+# types -- `cfg(test)` is crate-local, so building *this* crate's tests
+# never turns on sync-sqlite's `cfg(test)`, only this feature does. Reached
+# via this crate's own `[dev-dependencies]` self-reference below (mirrors
+# every other crate's identical self-dependency override in this
+# workspace): building `yadorilink-daemon`'s own test targets activates
+# `test-support` on itself through that self-dependency, which now also
+# activates it on `yadorilink-sync-sqlite`.
+# Also pulls in what `test_support::peer_session_fixture` needs, now that the
+# fixture is library code rather than one crate's test binary:
+# `dep:tempfile` for each device's root and block store, and
+# `yadorilink-lane-ports/test-support` for `testing::TestPeerNode`/
+# `TestAddressBook`, the real substrate endpoints a session's required
+# transports are built from. This is a migration/test-harness boundary, not
+# product surface: nothing outside the two cfgs can reach it.
+test-support = [
+    "dep:tempfile",
+    "dep:yadorilink-sync-wire",
+    "yadorilink-lane-ports/test-support",
+    "yadorilink-local-capture/test-support",
+    "yadorilink-peer-session/test-support",
+    "yadorilink-sync-sqlite/test-support",
+    "yadorilink-sqlite-runtime/test-support",
+    "yadorilink-root-authority/test-support",
+    "yadorilink-replica-domain/test-support",
+]
+
+[dependencies]
+async-trait = "0.1"
+# Local midnight for a timed pause that lasts until tomorrow.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+bytes.workspace = true
+yadorilink-local-capture = { path = "../yadorilink-local-capture" }
+yadorilink-sync-sqlite = { path = "../yadorilink-sync-sqlite" }
+yadorilink-sync-protocol = { path = "../yadorilink-sync-protocol" }
+yadorilink-sync-runtime = { path = "../yadorilink-sync-runtime" }
+yadorilink-lane-ports = { path = "../yadorilink-lane-ports" }
+yadorilink-sync-substrate = { path = "../yadorilink-sync-substrate" }
+# `replica_coordinator.rs`'s `ReplicaCoordinator` (Phase 7D-10.2) names
+# `SyncDatabase` directly to build its own repository/registry fields
+# against the same pooled connection/writer gate -- see that module's own
+# doc comment.
+yadorilink-sqlite-runtime = { path = "../yadorilink-sqlite-runtime" }
+yadorilink-peer-session = { path = "../yadorilink-peer-session" }
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
+yadorilink-root-authority = { path = "../yadorilink-root-authority" }
+yadorilink-filesystem-sync = { path = "../yadorilink-filesystem-sync" }
+yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
+yadorilink-replica-engine = { path = "../yadorilink-replica-engine" }
+yadorilink-transport = { path = "../yadorilink-transport" }
+yadorilink-local-storage = { path = "../yadorilink-local-storage" }
+yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
+# Track Send: `crate::send_transfer` builds and holds this device's
+# `yadorilink_send::SendService`. This crate never gains a reverse
+# dependency the other way -- `yadorilink-send` does not, and must not,
+# depend on `yadorilink-daemon`.
+yadorilink-send = { path = "../yadorilink-send" }
+yadorilink-reporting = { path = "../yadorilink-reporting" }
+# Localhost HTTP/REST + SSE adapter in front of this crate's own control
+# socket -- spawned as a non-essential background task by `app.rs`, the same
+# way NAT traversal is (`supervise::spawn_logged`), so
+# a failure to bind never takes down folder sync itself. Deliberately talks
+# to this daemon only by dialing `control_socket_path`/`control_pipe_name`
+# like any other control-socket client (see that crate's own module docs) --
+# not given an `Arc<DaemonState>`/`ControlContext`, so it can add no daemon
+# capability this crate doesn't already expose over that socket.
+yadorilink-http-api = { workspace = true }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+prost = "0.14.4"
+hex = "0.4"
+# The one credential store, and the OAuth credential manager over it. The
+# `keyring` dependency moved in here with the store: this crate no longer
+# opens a keyring entry of its own.
+yadorilink-fapi-client.workspace = true
+serde.workspace = true
+serde_json = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+r2d2 = "0.8"
+notify = "8"
+sha2.workspace = true
+uuid = { version = "1", features = ["v4"] }
+# Signed-manifest HTTPS fetch and artifact
+# download. Same rustls-tls + minimal-features shape as
+# `yadorilink-reporting`'s own `reqwest` dependency (its own HTTPS-only
+# submission client) — this crate already depends on that pattern
+# transitively, this makes it a direct, explicit dependency for the
+# update manifest/artifact fetch path specifically.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "stream",
+] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# Manifest-signature verification: Ed25519 over the exact
+# signed payload bytes, matching `yadorilink-transport`'s existing "dalek"
+# family curve/signature crate choice (x25519-dalek) rather than introducing
+# an unrelated crypto library for this one signature scheme.
+ed25519-dalek = { version = "3", features = ["rand_core"] }
+# Strict semantic-version parsing/comparison for manifest version fields
+# — already present in Cargo.lock as a transitive dependency
+# elsewhere in the workspace; this is its first direct use.
+semver = "1"
+base64 = "0.23"
+rand = "0.10.2"
+# WebSocket client for the coordination plane's `/netmap/subscribe` route,
+# the sole netmap subscription transport. rustls-tls-webpki-roots to match
+# this workspace's existing rustls-only choice (reqwest above, and
+# yadorilink-reporting's own client) rather than pulling in native-tls.
+tokio-tungstenite = { version = "0.24", default-features = false, features = [
+    "connect",
+    "rustls-tls-webpki-roots",
+] }
+# `peer_orchestrator.rs`'s http(s)->ws(s) URL rewrite (`netmap_ws_url`) --
+# deliberately not hand-rolled string splitting, which mishandled IPv6
+# literal addresses in an earlier version of this file. Same crate
+# `yadorilink-cli` uses for the same reason.
+url = { version = "2" }
+# TCP keepalive on the netmap stream, so a connection that went dead without a
+# FIN or RST (sleep/wake, Wi-Fi switch, IP change) is noticed and redialled.
+socket2 = { version = "0.6", features = ["all"] }
+fs2 = "0.4"
+# Optional, and reachable only from `test_support`, which is itself behind
+# `cfg(any(test, feature = "test-support"))`: the peer-session fixture builds
+# each device a real root directory and a real block store. A `[dev-
+# dependencies]` entry cannot serve that module, because it is library code --
+# dev-dependencies are linked into this crate's own test binaries only, not
+# into the library another crate's tests link against.
+tempfile = { version = "3", optional = true }
+# Same gate, same reason: `test_support::peer_session_fixture` builds the
+# authorization-checkpoint and published-change frames a fixture device
+# self-signs, which are this crate's wire types.
+yadorilink-sync-wire = { path = "../yadorilink-sync-wire", optional = true }
+tokio.workspace = true
+
+# The simulation substrate, selected with `RUSTFLAGS="--cfg turmoil"`. A
+# turmoil build keeps the real `tokio` this crate normally compiles against
+# and gets its determinism from turmoil's own stepped runtime. Nothing here is
+# reachable from a normal `cargo test` -- the cfg is off by default, so this
+# section contributes no dependency to a shipped build or to CI's ordinary
+# test runs.
+[target.'cfg(turmoil)'.dev-dependencies]
+turmoil = "0.7.2"
+
+[dev-dependencies]
+# The canonical product summary the daemon's status rollup must agree with (a test pins it).
+yadorilink-product-view = { path = "../yadorilink-product-view" }
+# The offline `CoordinationAuth` the tests below build. Enabling the feature
+# here rather than in `[dependencies]` keeps it out of the shipped binary: it
+# is a composition of the crate's public API (see its `test_support` module),
+# and nothing in the product path enables it.
+yadorilink-fapi-client = { workspace = true, features = ["test-support"] }
+# The runbook freshness lint (`tests/dst_runbook_freshness_lint.rs`) parses
+# `.cargo/config.toml`'s cargo aliases as TOML.
+toml = "1"
+# `sync_adapter::relay_equivalence_tests` runs an in-process relay, which lives
+# behind the substrate's `test-support` feature. A production build of this
+# crate never enables it.
+yadorilink-sync-substrate = { path = "../yadorilink-sync-substrate", features = ["test-support"] }
+# `tests/metadata_propagation.rs` sets and reads a `user.` extended attribute
+# directly, to state the invariant against the real file rather than against
+# whatever the crate's own writer believes it wrote.
+# This crate's own `tests/*.rs` integration binaries link against
+# `yadorilink-daemon` as an ordinary external library, so `#[cfg(test)]` is
+# never active for it there --
+# `DaemonState::install_test_root_commit_authority`/
+# `set_test_placeholder_pipeline_connected` (both `#[cfg(any(test, feature
+# = "test-support"))]`) need this self-referencing dev-dependency to enable
+# the feature half of that gate.
+yadorilink-daemon = { path = ".", features = ["test-support"] }
+# Test-only: the durable-namespace failpoints the trust-chain crash tests arm.
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform", features = ["test-support"] }
+# Test-only: `placeholder_backend::OverrideForTest` needs this feature to be
+# reachable from this crate's own tests, same reason as the overrides above.
+yadorilink-filesystem-sync = { path = "../yadorilink-filesystem-sync", features = ["test-support"] }
+# `materialization_execution.rs`'s own tests need `create_or_defer_
+# placeholder`'s Windows-deferred-outcome failure-injection seam
+# (`set_test_force_deferred_placeholder`) to exercise
+# `repair_interrupted_materializations`'s two placeholder-demotion arms'
+# Windows-only handling on any host. Same override shape as the two
+# entries above.
+yadorilink-local-storage = { path = "../yadorilink-local-storage", features = ["test-support"] }
+# `SessionTransports` is a required `PeerSyncSession` constructor parameter
+# now (A3/A4); this crate's own unit tests and every `tests/*.rs` integration
+# binary that builds a session directly (rather than through `SyncStack`)
+# needs a real substrate-backed pair, which lives behind lane-ports' own
+# `test-support` feature (`testing::TestPeerNode`) -- same override shape as
+# the entries above.
+yadorilink-lane-ports = { path = "../yadorilink-lane-ports", features = ["test-support"] }
+# Only so the DST support layer can name an `EndpointId` when mapping a
+# `Case`'s device indices onto the simulated carrier's endpoints. Already in
+# the lockfile as `yadorilink-sync-substrate`'s own dependency, so this adds
+# one edge and no versions.
+iroh = "1.1"
+# Track Send's real crash-recovery test needs the deterministic
+# mid-transfer abort seam (`SendService::test_abort_after_n_chunks`), same
+# override shape as the two entries above.
+yadorilink-send = { path = "../yadorilink-send", features = ["test-support"] }
+# The provider reclaim tests drive a reclaim through `verify_reclaim_custody_for_test`, the only
+# way to exercise the paths behind the lease flag before it ships.
+yadorilink-replica-engine = { path = "../yadorilink-replica-engine", features = ["test-support"] }
+tempfile = "3"
+rand = "0.10.2"
+# `tests/peer_hydration.rs` builds a real zstd payload to prove the
+# requester rejects a decompression bomb -- the encoder has to be the one
+# the wire path decodes with.
+zstd = { workspace = true }
+# The in-process fake coordination service the full-stack E2E tests point the
+# real `peer_orchestrator` at needs a WebSocket *server* (the netmap
+# subscription). The crate's own (non-dev) dependency is client-only
+# (`connect`); the `handshake` feature adds `derive_accept_key` +
+# `WebSocketStream::from_raw_socket` for accepting an upgraded connection.
+# Dev-dependency features only affect the test build, never `cargo build`.
+tokio-tungstenite = { version = "0.24", features = ["handshake"] }
+futures-util = "0.3"
+# A real local HTTP listener for
+# the daemon-side queue-retry integration tests (mirrors
+# yadorilink-reporting's own use of the same crate).
+wiremock = "0.6"
+# Acceptance-matrix freshness lint (`tests/m5a_acceptance_
+# matrix.rs`): parses each named scenario file's real syntax tree to
+# confirm a required test function exists AND is not `#[ignore]`d, rather
+# than a plain substring search (`source.contains("fn name(")`), which
+# cannot see an ignore attribute at all and could also be fooled by a
+# comment or string literal that happens to contain the same text.
+syn = { version = "3", features = ["full"] }
+
+# Raising the open-file limit at startup (`fd_limit`), and the test-only
+# `user.` xattr access in `tests/metadata_propagation.rs`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# macOS App Group container lookup (`app_group.rs`): the container token is only
+# issued to a process that asks `NSFileManager` for the group's URL.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSFileManager", "NSString", "NSURL", "NSArray", "NSError"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_CloudFilters",
+    "Win32_Storage_FileSystem",
+    "Win32_System_CorrelationVector",
+    "Win32_System_IO",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+] }
+
+[lints]
+workspace = true

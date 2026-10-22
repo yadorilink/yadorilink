@@ -1,0 +1,14 @@
+[bindings.swift]
+# The product types' generated Swift file. It is compiled into the same Swift
+# module as the binding crate's (`YadoriLinkFFI`), which refers to these types
+# directly; only the file and its C header are named after this crate.
+module_name = "YadoriLinkCore"
+
+[bindings.csharp]
+# The product types' generated C# file. The two generated files each carry
+# their own serialization helpers, so they need separate namespaces; the types
+# are public, and every symbol loads from the one library the facade crate
+# builds (shipped as `yadorilink_client_ffi.dll`).
+namespace = "YadoriLink.Native.Core"
+cdylib_name = "yadorilink_client_ffi"
+access_modifier = "public"

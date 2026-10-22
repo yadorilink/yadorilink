@@ -1,0 +1,941 @@
+syntax = "proto3";
+package yadorilink.shellipc.v1;
+
+// Local IPC between yadorilink-daemon and the OS shell extensions
+// (Windows Explorer / macOS Finder). Framed as length-prefixed messages
+// over a local transport (named pipe / Unix domain socket), not full gRPC —
+// this schema is reused for both, only the framing
+// differs from the gRPC services above.
+
+enum SyncState {
+  SYNC_STATE_UNSPECIFIED = 0;
+  SYNC_STATE_SYNCED = 1;
+  SYNC_STATE_SYNCING = 2;
+  SYNC_STATE_PENDING = 3;
+  SYNC_STATE_ERROR = 4;
+}
+
+// The one badge a shell draws for a path. The daemon decides it (a shell never derives it from
+// `state` and `local_state`): `ERROR` wins; otherwise `ONLINE_ONLY` when the daemon knows the
+// path's local state, its current content is not here and nothing is moving; otherwise the
+// sync state.
+enum ShellBadge {
+  SHELL_BADGE_UNSPECIFIED = 0;
+  SHELL_BADGE_SYNCED = 1;
+  SHELL_BADGE_SYNCING = 2;
+  SHELL_BADGE_PENDING = 3;
+  SHELL_BADGE_ERROR = 4;
+  SHELL_BADGE_ONLINE_ONLY = 5;
+}
+
+enum ContextAction {
+  CONTEXT_ACTION_UNSPECIFIED = 0;
+  CONTEXT_ACTION_VIEW_STATUS = 1;
+  CONTEXT_ACTION_PAUSE_ITEM = 2;
+  CONTEXT_ACTION_RESUME_ITEM = 3;
+  // 4 was `CONTEXT_ACTION_PIN_ITEM`, removed with pinning.
+  reserved 4;
+  reserved "CONTEXT_ACTION_PIN_ITEM";
+  // Evict from the shell extension context menus.
+  CONTEXT_ACTION_EVICT_ITEM = 5;
+}
+
+// What stands on this device for one path, as two independent facts plus the
+// transition the daemon is in the middle of.
+//
+// `local_object_present`: a physical local object stands (or is being detached)
+// at the path -- the row is `Present`, or `Evicting` (its object is being
+// removed and may still stand). A `Hydrating` row is producing its object and
+// reports false; a `Remote` row has none.
+//
+// `current_content_present`: a usable proof names the CURRENT version and its
+// bytes are usable here. It implies `local_object_present`, and it is false
+// for an older object under a newer row, for anything that is being hydrated
+// or evicted, and whenever the daemon could not read the evidence (it fails
+// closed: an unreadable proof is never "current"). A directory's object is its
+// own content, so a present directory is current.
+//
+// A message that is absent means the daemon knows nothing about the path.
+message LocalState {
+  bool local_object_present = 1;
+  bool current_content_present = 2;
+  LocalTransition transition = 3;
+}
+
+enum LocalTransition {
+  LOCAL_TRANSITION_NONE = 0;
+  LOCAL_TRANSITION_HYDRATING = 1;
+  LOCAL_TRANSITION_EVICTING = 2;
+}
+
+message StatusQuery {
+  string path = 1;
+}
+
+message StatusResponse {
+  string path = 1;
+  SyncState state = 2;
+  // Field 3 was the `MaterializationState` enum (HYDRATED/PLACEHOLDER/...).
+  reserved 3;
+  reserved "materialization_state";
+  // Field 4 was `string open_elsewhere_device_id`, removed with the
+  // edit-presence-awareness capability.
+  reserved 4;
+  reserved "open_elsewhere_device_id";
+  LocalState local_state = 6;
+  // Why the path is in `state`, when the state alone does not say it --
+  // e.g. a directory whose delete was applied but that is kept on disk
+  // because it holds local content that was never synced
+  // ("retained: local untracked content"). Empty otherwise.
+  string status_detail = 5;
+  // The user paused exactly this path (or the root itself): Resume applies to it.
+  bool item_paused = 7;
+  // An item above this path is paused and this path is not itself: neither Pause nor Resume
+  // would change anything for it.
+  bool paused_by_ancestor = 8;
+  // Field 9 was `bool reclaim_supported`; the daemon now answers the whole question below.
+  reserved 9;
+  reserved "reclaim_supported";
+  // Free Up Space is available for this path right now: a file whose current content is on this
+  // device, with nothing moving, not kept, under a root the daemon's eviction gate accepts. The
+  // daemon would accept the request; a shell offers the action only when this is true.
+  bool free_up_space_offered = 10;
+  // The badge to draw for this path (see `ShellBadge`).
+  ShellBadge badge = 11;
+  // The daemon tracks this path (a file or folder under a linked folder with a known sync
+  // state), so Pause/Resume/Free Up Space can apply to it. False for an untracked path and
+  // whenever the daemon could not tell: a shell then offers no YadoriLink mutation action.
+  bool actions_available = 12;
+}
+
+// Daemon-initiated push so the shell extension can serve most queries from
+// a local cache instead of round-tripping per file manager call.
+message StatusPush {
+  string path = 1;
+  SyncState state = 2;
+  // Field 3 was the `MaterializationState` enum (HYDRATED/PLACEHOLDER/...).
+  reserved 3;
+  reserved "materialization_state";
+  // Field 4 was `string open_elsewhere_device_id`, removed with the
+  // edit-presence-awareness capability.
+  reserved 4;
+  reserved "open_elsewhere_device_id";
+  LocalState local_state = 5;
+}
+
+// The OS virtual-filesystem callback path
+// (Windows cfapi's `CF_CALLBACK_TYPE_FETCH_DATA`, macOS's
+// `fetchContentsForItemWithIdentifier:`) asks the daemon to synchronously
+// hydrate one placeholder file before completing the OS's own callback.
+message HydrateRequest {
+  string path = 1;
+}
+
+message HydrateResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+message ContextActionRequest {
+  string path = 1;
+  ContextAction action = 2;
+}
+
+message ContextActionResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+// `daemon_control.proto`'s `ListLinks`
+// reports per-folder-group aggregates but never a per-file
+// listing, which a platform virtual-filesystem provider (Windows cfapi)
+// needs in order to know which local paths to register as
+// sync roots and which files to create placeholders for. Rather than
+// invent a whole new IPC surface, this reuses the existing shell-IPC
+// persistent connection (already the shell extension's channel to the
+// daemon) with two small additional request/response pairs, matching the
+// existing `StatusQuery`/`HydrateRequest` request-response style on the
+// same connection.
+enum HydrationPolicy {
+  HYDRATION_POLICY_UNSPECIFIED = 0;
+  HYDRATION_POLICY_ON_DEMAND = 1;
+  HYDRATION_POLICY_EAGER = 2;
+}
+
+// Every provider-bound root. Replaces ListOnDemandFolders*. A macOS provider root has
+// no daemon-visible directory, so there is no `local_path`.
+message ListProviderFoldersRequest {
+  // The app group container the host app resolved through the OS (empty: none). The daemon adopts it, once,
+  // as the place of its provider temp root (`<container>/provider`); it knows no path of its own.
+  string app_group_container = 1;
+}
+
+message ProviderFolder {
+  bytes root_id = 1;            // domain identifier; minted per root, new on rebootstrap
+  bytes group_id = 2;           // semantic group (informational for the app; never a domain id)
+  string display_name = 3;      // domain display name and root item filename (non-empty)
+  HydrationPolicy hydration_policy = 4;
+  // Registration order: the OS caches an EMPTY root listing if the domain is registered
+  // before the namespace is queryable, and later signals do not re-trigger root
+  // enumeration. false => the app must NOT register a new domain and must NOT delete an
+  // existing one. The daemon sets true once the root's children are queryable.
+  bool registration_ready = 5;
+  // Replayable evidence STATE, not an event: the latest handoff sequence. The host reads it here
+  // on connect BEFORE it starts the materialized enumeration; ProviderEvidenceTick is only the
+  // push for later changes.
+  uint64 latest_evidence_seq = 6;
+  // This device is not a writer of the group (a Reader, or a group whose policy is not yet
+  // verified): the root and everything under it is read-only. The SAME rule and value as
+  // `ProviderItem.read_only`, available here so an empty or not-yet-enumerated root knows its role.
+  // Current state at each listing; a role change shows on the next ListProviderFolders. Absent or
+  // false (an older daemon) means writable, as before; the daemon refuses a Reader's change anyway.
+  bool read_only = 7;
+}
+
+message ListProviderFoldersResponse {
+  repeated ProviderFolder folders = 1;
+  // Explicit success signal, not merely "folders is empty" -- the daemon sets this true
+  // only when it actually confirmed the snapshot (read the persisted tables without
+  // error). Callers that reconcile OS-level registrations against `folders` MUST treat
+  // `snapshot_available == false` like a transport failure: do not reconcile, leave
+  // existing registrations untouched.
+  bool snapshot_available = 2;
+  // Roots whose domain the daemon wants REMOVED (a durable intent written by an unlink or by a
+  // rebootstrap the daemon started). The ONLY authority to remove a domain: a domain absent from
+  // `folders` and from here is an orphan and is KEPT (the host reports it, never removes it).
+  repeated ProviderRemoval removals = 3;
+}
+
+message ProviderRemoval {
+  bytes root_id = 1;
+  string display_name = 2;
+}
+
+// Readiness evidence (no periodic heartbeat). The host app reports the domain state on
+// add, remove and at each launch.
+// What the host KNOWS about a domain. Only REMOVED is removal evidence (a domain that was observed
+// registered is confirmed gone from a readable domain list); UNKNOWN (the list could not be read) and
+// NOT_REGISTERED (not registered yet, e.g. the root is not ready) never touch the root.
+enum DomainEvidence {
+  DOMAIN_EVIDENCE_UNKNOWN = 0;
+  DOMAIN_EVIDENCE_REGISTERED = 1;
+  DOMAIN_EVIDENCE_NOT_REGISTERED = 2;
+  DOMAIN_EVIDENCE_REMOVED = 3;
+  // A domain is registered for a root the daemon does not know (a rolled-back or lost database).
+  // Reported so `status` can say so; the domain is kept, never removed on this evidence.
+  DOMAIN_EVIDENCE_ORPHAN = 4;
+  // A domain this host saw registered is missing from a readable domain list. A raw reading, not a
+  // verdict: the engine decides whether it amounts to a removal (it needs the same absence in
+  // consecutive readings from the attached host, for a root it saw registered); until then the root
+  // is untouched.
+  DOMAIN_EVIDENCE_ABSENT = 5;
+}
+
+message ProviderDomainState {
+  bytes root_id = 1;
+  reserved 2;  // was `bool registered`: a boolean could not tell "removed" from "unknown"
+  reserved "registered";
+  DomainEvidence evidence = 4;
+  // With REMOVED: where the OS kept the user's downloaded data (empty when it did not say).
+  string preserved_location = 5;
+  // Highest ProviderSignalDone.namespace_revision the app persisted (rollback detection: a
+  // daemon revision below it means the daemon's database was restored, and the root is
+  // rebootstrapped with a new root_id).
+  uint64 last_acked_namespace_revision = 3;
+}
+
+// The extension reports one handshake per process launch.
+message ExtensionHandshake {
+  bytes root_id = 1;
+  string extension_build = 2;
+}
+
+// Materialized-set observation, from the app: MEMBERSHIP only (the OS listing carries no usable
+// version). `reporter_epoch` is minted by the app each time its reporter starts; the FIRST message
+// of an epoch is a full snapshot (`full = true`, `report_seq = 1`). Deltas (`full = false`) are
+// accepted only within the same epoch and only when `report_seq == last_accepted + 1`; anything
+// else is answered with `needs_full`. `observed_after_seq` is the highest ProviderEvidenceTick (or
+// ProviderFolder.latest_evidence_seq) the app had BEFORE it began that enumeration, so an old
+// snapshot can never be combined with a newer handoff.
+message ProviderMaterializedItem {
+  bytes item_id = 1;
+}
+
+// Rules the daemon enforces (anything else is answered with needs_full and changes nothing):
+// reports are accepted only from the attached host connection; a full snapshot starts an epoch
+// strictly greater than every epoch the host used before and takes report_seq 1; a delta needs
+// the same epoch, the very next report_seq and a complete snapshot; observed_after_seq never
+// exceeds the latest evidence sequence the daemon issued and never decreases within an epoch.
+// The snapshot is dropped when the host connection ends.
+message ProviderMaterializedReport {
+  bytes root_id = 1;
+  uint64 reporter_epoch = 2;
+  uint64 report_seq = 3;
+  bool full = 4;
+  uint64 observed_after_seq = 5;
+  repeated ProviderMaterializedItem upserts = 6;
+  repeated bytes removed = 7;      // item_ids (deltas only)
+  // A full snapshot may be sent in pages so a very large set stays under the frame limit (keep
+  // each page to a few thousand items). All pages share the epoch, take consecutive report_seq
+  // values starting at 1 and carry the same observed_after_seq; every page but the last sets
+  // `more`. The snapshot counts only once its last page arrived: an incomplete snapshot grants no
+  // evidence, and a delta cannot follow it until it is complete.
+  bool more = 8;
+}
+
+// daemon -> app.
+message ProviderReportAck {
+  bytes root_id = 1;
+  uint64 reporter_epoch = 2;
+  uint64 accepted_seq = 3;
+  bool needs_full = 4;
+}
+
+// daemon -> app (push): the latest handoff sequence changed.
+message ProviderEvidenceTick {
+  bytes root_id = 1;
+  uint64 evidence_seq = 2;
+}
+
+// Publication fence (design 2.1/2.2): the daemon asks the app to evict the OS's old copy of an
+// item whose CONTENT changed, and only after it is evicted publishes the new version with a
+// signal. Evicting an already-dataless item answers NOT_MATERIALIZED (idempotent).
+enum EvictResult {
+  EVICT_RESULT_UNSPECIFIED = 0;
+  EVICT_RESULT_EVICTED = 1;
+  EVICT_RESULT_NOT_MATERIALIZED = 2;  // already dataless: counts as done
+  EVICT_RESULT_BUSY = 3;              // EBUSY: a process holds the file; the daemon retries this item only
+  EVICT_RESULT_ERROR = 4;
+}
+
+// daemon -> app (push).
+message ProviderEvictRequest {
+  bytes root_id = 1;
+  bytes item_id = 2;
+  bytes request_id = 3;
+  bytes target_version_hash = 4;   // the version being published (trace only; not a version proof)
+  // When set (a 32-byte version hash): drop the copy only if the app currently shows the item at exactly this
+  // version, otherwise answer NOT_MATERIALIZED and drop nothing. A request that arrives late must not act on
+  // content the daemon never confirmed. Empty: the publication's unconditional eviction.
+  bytes require_shown_version = 5;
+}
+
+// app -> daemon. A wire reply only: the daemon never persists the result.
+message ProviderEvictDone {
+  bytes root_id = 1;
+  bytes request_id = 2;
+  EvictResult result = 3;
+  string error = 4;
+}
+
+// daemon -> app (push): committed changes exist; signalEnumerator for these items. A message
+// naming a root the app does not know (and no items) means the set of provider folders changed
+// (a root was replaced): list the provider folders again and reconcile the domains.
+message ProviderChanged {
+  bytes root_id = 1;
+  uint64 namespace_revision = 2;   // daemon durable revision, monotonic; mapped to the real
+                                   // NSFileProviderSyncAnchor encoding (paged enumeration)
+  repeated bytes changed_item_ids = 3;
+  repeated bytes changed_parent_ids = 4;
+  bool signal_working_set = 5;
+  // Transport correlation of the acknowledgement (like an eviction's): the revision is the payload's
+  // meaning, and several signals of one root can share it (an item signal and the root signal).
+  bytes request_id = 6;
+}
+
+// app -> daemon, after signalEnumerator completes.
+message ProviderSignalDone {
+  bytes root_id = 1;
+  uint64 namespace_revision = 2;
+  bool ok = 3;
+  string error = 4;
+  bytes request_id = 5;            // echoes ProviderChanged.request_id
+}
+
+// The extension reports an explicit, fatal provider condition.
+message ProviderError {
+  bytes root_id = 1;
+  string description = 2;
+}
+
+// The ordinary (plain-folder) linked roots, for the Finder extension's
+// `directoryURLs`. Derived from the same live link table as ListFolderFiles; a provider
+// root has no folder path and is never listed here.
+message ListLinkedRootsRequest {}
+
+message ListLinkedRootsResponse {
+  // Absolute `local_path` of every live (non-orphaned) folder link.
+  repeated string local_paths = 1;
+  // Same contract as `ListProviderFoldersResponse.snapshot_available`: true only when the
+  // daemon read the link table without error. An empty `local_paths` is a confirmed "no
+  // linked folders" ONLY when this is true; false (or an absent response) means unknown and
+  // the caller keeps what it last confirmed.
+  bool snapshot_available = 2;
+}
+
+message ListFolderFilesRequest {
+  // The linked folder's `local_path` (plain roots; a provider root is addressed by
+  // `root_id` in later steps).
+  string local_path = 1;
+}
+
+message FolderFileEntry {
+  // Forward-slash-separated, relative to `local_path` — matches the
+  // convention `resolve_group_and_rel_path` already uses internally.
+  string relative_path = 1;
+  uint64 size = 2;
+  int64 mtime_unix_nanos = 3;
+  // Field 4 was the `MaterializationState` enum (HYDRATED/PLACEHOLDER/...).
+  reserved 4;
+  reserved "materialization_state";
+  LocalState local_state = 7;
+  // Set only when the entry has no current content and no transition under
+  // way (`!current_content_present`, `LOCAL_TRANSITION_NONE`), the CfAPI generation token the daemon has minted (and
+  // persisted in its own index) for this placeholder — cfapi-host encodes
+  // this EXACT value into the real placeholder's `FileIdentity` when it
+  // creates one, rather than minting its own. `optional`, not a bare
+  // `uint64` defaulting to 0: 0 is a value this daemon could mint, so
+  // "absent" (the daemon hasn't minted one yet for this path, or this
+  // entry isn't a placeholder at all) must be distinguishable from
+  // "generation zero" — a cfapi-host that treated absence as literal 0
+  // would create a placeholder for the WRONG generation the very first
+  // time a real mint raced ahead of a stale poll response.
+  optional uint64 placeholder_generation = 5;
+  // What this entry is. An explicit (tracked) directory is listed as its own
+  // entry, so a shell that synthesizes directories from path prefixes must
+  // not create a second node for it. `ENTRY_KIND_UNSPECIFIED` is only the
+  // proto3 default; the daemon always sets a real kind.
+  EntryKind kind = 6;
+  // Opaque stable provider-layer item id (empty for a plain root). Field 7 is `local_state`.
+  bytes item_id = 8;
+}
+
+enum EntryKind {
+  ENTRY_KIND_UNSPECIFIED = 0;
+  ENTRY_KIND_FILE = 1;
+  ENTRY_KIND_DIRECTORY = 2;
+  ENTRY_KIND_SYMLINK = 3;
+}
+
+message ListFolderFilesResponse {
+  repeated FolderFileEntry entries = 1;
+  // Same contract as `ListProviderFoldersResponse.snapshot_available`: the
+  // daemon sets this true only when it actually confirmed the folder's file
+  // listing (found the live link and read its file index and every entry's
+  // materialization state without error). An empty `entries` is an
+  // authoritative "this folder has zero files" ONLY when this is true. A
+  // DB read failure, a `local_path` that names no live link, a decode/
+  // framing failure, or a response that omits the field all read as false.
+  // Callers MUST treat `snapshot_available == false` like a transport
+  // failure: the macOS File Provider ends the enumeration with an error
+  // rather than reporting an empty folder, and cfapi-host skips that
+  // folder's placeholder sync for the poll.
+  bool snapshot_available = 2;
+}
+
+enum LocalWriteKind {
+  LOCAL_WRITE_KIND_UNSPECIFIED = 0;
+  LOCAL_WRITE_KIND_CREATED_OR_MODIFIED = 1;
+  LOCAL_WRITE_KIND_DELETED = 2;
+}
+
+// The OS virtual-filesystem's own create/modify/delete callbacks
+// (macOS `NSFileProviderReplicatedExtension`'s `createItem`/`modifyItem`/
+// `deleteItem`) notify the daemon that a local write already landed on
+// disk under `local_path`/`relative_path` -- the daemon re-observes the
+// live file itself (never trusts the OS-supplied `contents`/metadata) and
+// routes it through the EXACT same local-change/DAG admission path a
+// filesystem watcher's own `CreatedOrModified`/`Removed` event would take
+// (`yadorilink_local_capture::LocalChangeProcessor::process_event`). This
+// is purely a second *signal source* for that one existing path -- no
+// File-Provider-specific sync logic exists anywhere in the daemon.
+message LocalWriteRequest {
+  // Must match a linked folder's `local_path`,
+  // same resolution convention as `ListFolderFilesRequest.local_path`.
+  string local_path = 1;
+  // Forward-slash-separated, relative to `local_path` -- same convention
+  // as `FolderFileEntry.relative_path`.
+  string relative_path = 2;
+  LocalWriteKind kind = 3;
+}
+
+message LocalWriteResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+// The daemon-initiated counterpart to `HydrateRequest` -- native
+// Windows eviction must confirm real on-disk dehydration (`CfDehydrate
+// Placeholder`) happened before the daemon commits the row to `Placeholder`
+// and reclaims blocks, so (unlike every other message pair above, all of
+// which are shell-extension-initiated) this one flows daemon -> cfapi-host.
+// cfapi-host is the only process that reliably owns the sync root's CfAPI
+// connection (see `placeholder_inspect_windows.rs`'s doc comment on why a
+// *read-only* query is willing to bet otherwise, and why a *mutating*,
+// data-destructive call like dehydrate is not), so this is carried on a
+// SEPARATE named pipe that cfapi-host itself serves and the daemon dials
+// into as a client -- reusing this same envelope/framing for consistency,
+// even though that connection only ever exchanges this one request/response
+// pair.
+message DehydrateRequest {
+  // Absolute local path, same convention as `HydrateRequest.path`.
+  string path = 1;
+  // The generation the daemon has recorded for this file's placeholder
+  // identity (persists unchanged across the create-then-hydrate cycle, see
+  // `MaterializationExecutionPort::get_recorded_placeholder_identity`'s doc
+  // comment) -- cfapi-host verifies the on-disk object's current identity
+  // matches before dehydrating, refusing otherwise. Always checked: the
+  // daemon refuses to evict a row with no recorded generation before it
+  // ever sends this request.
+  uint64 expected_generation = 2;
+}
+
+message DehydrateResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+// extension -> daemon: the CURRENT version's bytes of one provider item, handed over as a
+// complete, verified file the OS can take. One body serves open-triggered reads and eager
+// downloads.
+message MaterializeToTempRequest {
+  bytes request_id = 1;             // opaque, chosen by the extension, unique per request
+  bytes root_id = 2;
+  bytes item_id = 3;
+  // Empty = current. Set and not current => VERSION_OUT_OF_DATE (old bytes are never returned).
+  bytes requested_version_hash = 4;
+  // Set: only the bytes [range_offset, range_offset + range_length) of that exact version are
+  // wanted, and `requested_version_hash` must be set too. The daemon fetches and verifies only the
+  // blocks covering the window and answers with a handoff file holding exactly those bytes (the
+  // end clamped to the file size). A ranged answer never makes the item present: the OS holds a
+  // window, not the file. A daemon that predates this field ignores it and answers with the whole
+  // file and `ranged` unset, which a caller must treat as the whole file.
+  bool ranged = 5;
+  uint64 range_offset = 6;
+  uint64 range_length = 7;
+  // Set: the daemon may send `MaterializeProgress` messages for this request before its response.
+  // A daemon that predates this field sends none, which a caller must treat as "no progress
+  // information", never as "no progress".
+  bool report_progress = 8;
+}
+
+// daemon -> extension, before the response of a request that set `report_progress`: how far the
+// daemon is in assembling and verifying the bytes it will hand over. Progress only; it carries no
+// bytes and the OS is handed nothing until the response says the file is complete and verified.
+//
+// For one request the messages are monotonic (`completed` never decreases while `total` is
+// unchanged) and `completed < total` until the content is verified. Exactly one message, the last
+// one, sets `done`: it is sent only after every byte verified, has `completed == total`, and is
+// followed by the ok response. A request that fails or is cancelled never sends `done`. Units are
+// bytes of the content being handed over (the covering blocks for a ranged request). A message
+// for a request id that already answered is stale and is ignored.
+message MaterializeProgress {
+  bytes request_id = 1;
+  uint64 completed = 2;
+  uint64 total = 3;
+  bool done = 4;
+}
+
+enum MaterializeFailure {
+  MATERIALIZE_FAILURE_NONE = 0;
+  MATERIALIZE_FAILURE_NOT_FOUND = 1;
+  MATERIALIZE_FAILURE_VERSION_OUT_OF_DATE = 2;
+  MATERIALIZE_FAILURE_UNOBTAINABLE = 3;   // no reachable peer has the blocks
+  MATERIALIZE_FAILURE_LOW_DISK = 4;
+  MATERIALIZE_FAILURE_NOT_READY = 5;
+  MATERIALIZE_FAILURE_CANCELLED = 6;
+  // The publication fence is on for the item: the extension answers .cannotSynchronize.
+  MATERIALIZE_FAILURE_PUBLICATION_PENDING = 7;
+  // A ranged request whose offset is past the end of the version, or that did not name a version.
+  MATERIALIZE_FAILURE_RANGE_NOT_SATISFIABLE = 8;
+}
+
+message MaterializeToTempResponse {
+  bytes request_id = 1;             // echoes the request
+  bool ok = 2;
+  MaterializeFailure failure = 3;
+  string error = 4;
+  // A single path component the extension joins to the fixed handoff directory of the daemon's
+  // temp root. Set ONLY when the file is fully written, fsynced and verified; no absolute path is
+  // ever on the wire.
+  string handoff_name = 5;
+  bytes version_hash = 6;           // the version these bytes are
+  uint64 size = 7;
+  // The 40-byte item version identifier these bytes are PAIRED with: `version_hash` and the item
+  // generation read in the same transaction that recorded the handoff. The extension stores it
+  // with the bytes and echoes it as the base of a later edit or delete; it must never combine a
+  // hash and a generation taken at different moments.
+  bytes content_version = 8;
+  // Set when the handoff file holds only the window [range_offset, range_offset + range_length)
+  // of the version (the request's range clamped to the file size). `size` is then still the size
+  // of the whole version, `content_version` is empty (only a whole-version handoff is paired with
+  // an item generation), and the item is NOT recorded as handed over to the OS or as served.
+  bool ranged = 9;
+  uint64 range_offset = 10;
+  uint64 range_length = 11;
+}
+
+// Cancels one in-flight request, by request_id only.
+message MaterializeCancel {
+  bytes request_id = 1;
+}
+
+// Eager driver: a QUERY, not a cursor. The app keeps at most 2 downloads outstanding and sends
+// their item ids as exclusions; the daemon recomputes the best candidates each time (smallest
+// first) and answers which exclusions no longer need a download.
+message NextProviderDownloadsRequest {
+  bytes root_id = 1;
+  repeated bytes exclude_item_ids = 2;  // currently outstanding at the app, at most 2
+  uint32 max = 3;                       // 2 - outstanding
+}
+
+message ProviderDownload {
+  bytes item_id = 1;
+  bytes version_hash = 2;               // the version wanted (backoff key, logs)
+}
+
+enum DriverState {
+  DRIVER_STATE_UNSPECIFIED = 0;
+  DRIVER_STATE_RUNNING = 1;
+  DRIVER_STATE_PAUSED_LOW_DISK = 2;
+  DRIVER_STATE_WAITING_PEERS = 3;
+  DRIVER_STATE_WAITING_PROVIDER = 4;
+  DRIVER_STATE_DONE = 5;
+}
+
+message NextProviderDownloadsResponse {
+  repeated ProviderDownload downloads = 1;
+  repeated bytes settled_item_ids = 2;  // subset of the exclusions that no longer need a download
+  DriverState state = 3;
+}
+
+// app -> daemon: the OS rejected a download request before any fetch (not a fetch failure).
+message ProviderDownloadRejected {
+  bytes root_id = 1;
+  bytes item_id = 2;
+  string error = 3;
+}
+
+// ---- The provider write path ----
+
+enum ProviderChangeKind {
+  PROVIDER_CHANGE_KIND_UNSPECIFIED = 0;
+  PROVIDER_CHANGE_KIND_CREATE = 1;
+  PROVIDER_CHANGE_KIND_MODIFY = 2;   // contents, metadata, rename and move, in any combination
+  PROVIDER_CHANGE_KIND_DELETE = 3;
+}
+
+message ProviderXattr {
+  string name = 1;
+  bytes value = 2;
+}
+
+// Metadata the OS reports. Absent = unchanged (MODIFY) or default (CREATE). Only replicated
+// xattrs are kept; Finder flags and tags are ignored.
+message ProviderItemMetadata {
+  optional uint32 unix_mode = 1;           // low 12 bits
+  optional int64 mtime_unix_nanos = 2;     // absent = the daemon's clock
+  bool replace_xattrs = 3;                 // true: `xattrs` is the complete replicated set
+  repeated ProviderXattr xattrs = 4;
+}
+
+// Where the OS-supplied bytes were put by the extension: one file name inside the daemon's fixed
+// `ingest/` directory; never a path.
+message ProviderContentSource {
+  string ingest_name = 1;                  // [A-Za-z0-9][A-Za-z0-9._-]{0,127}
+  uint64 size = 2;                         // the length the extension wrote; must equal the file's
+  // SHA-256 of the whole copy, computed by the extension. Verified by the daemon against the
+  // bytes it ingests the first time; used to compare replays without re-ingesting.
+  bytes sha256 = 3;
+}
+
+message ProviderApplyChangeRequest {
+  bytes request_id = 1;                    // per ATTEMPT: cancel and in-flight dedupe
+  // The LOGICAL operation: one distinct pair per logical OS action, generated by the extension and
+  // stored with the pending action so every retry carries the same pair.
+  bytes session_id = 2;                    // 16 random bytes per domain installation
+  uint64 operation_seq = 3;                // strictly increasing per session, from 1
+  bytes root_id = 4;
+  ProviderChangeKind kind = 5;
+  bytes item_id = 6;                       // MODIFY, DELETE: the item. CREATE: empty
+  // CREATE: the parent (empty = the root container). MODIFY: set only when moving.
+  optional bytes parent_item_id = 7;
+  // CREATE: the name. MODIFY: set only when renaming. A single path component.
+  optional string name = 8;
+  EntryKind entry_kind = 9;                // CREATE only: FILE, DIRECTORY or SYMLINK
+  // MODIFY/DELETE: the version the user saw, EXACTLY the 40-byte `content_version` the daemon
+  // sent for the item (32-byte content hash, then the item generation, big endian); the
+  // generation inside it is the base generation (`base_generation`, if also set, must equal it).
+  // Empty = the extension has none: the base is UNKNOWN, an edit is kept beside the file and a
+  // delete leaves the file. Any other length = INVALID_BASE. A well-formed identifier the daemon
+  // does not know is an opaque stale base.
+  bytes base_version_hash = 10;
+  ProviderContentSource content = 11;      // CREATE file / MODIFY with new contents; else unset
+  bytes symlink_target = 12;               // CREATE symlink, or MODIFY of a symlink's target
+  ProviderItemMetadata metadata = 13;
+  bool recursive = 14;                     // DELETE of a directory
+  // The generations of what the OS saw (an item version identifier is hash || generation, 40
+  // bytes). ABSENT means UNKNOWN and is never trusted by the hash alone.
+  optional uint64 base_generation = 15;         // the item the operation is based on
+  optional uint64 parent_generation = 16;       // the folder a rename or move LEAVES (place generation)
+  // 17 was `destination_generation`, removed: a create or move destination is the folder's item id,
+  // a stable identity, not a generation-fenced view.
+  reserved 17;
+  optional uint64 observed_revision = 18;       // the domain version the OS had observed (a hint)
+}
+
+enum ProviderApplyFailure {
+  PROVIDER_APPLY_FAILURE_NONE = 0;
+  PROVIDER_APPLY_FAILURE_NOT_FOUND = 1;
+  PROVIDER_APPLY_FAILURE_NOT_READY = 2;
+  PROVIDER_APPLY_FAILURE_INVALID_NAME = 3;
+  PROVIDER_APPLY_FAILURE_NAME_COLLISION = 4;
+  PROVIDER_APPLY_FAILURE_DIRECTORY_NOT_EMPTY = 5;
+  PROVIDER_APPLY_FAILURE_INGEST_REJECTED = 6;
+  PROVIDER_APPLY_FAILURE_INGEST_UNSTABLE = 7;
+  PROVIDER_APPLY_FAILURE_TOO_LARGE = 8;
+  PROVIDER_APPLY_FAILURE_LOW_DISK = 9;
+  PROVIDER_APPLY_FAILURE_NOT_AUTHORIZED = 10;
+  PROVIDER_APPLY_FAILURE_CANCELLED = 11;
+  PROVIDER_APPLY_FAILURE_RETRY = 12;
+  PROVIDER_APPLY_FAILURE_INVALID_BASE = 13;
+  PROVIDER_APPLY_FAILURE_KEEP_LOCAL = 14;          // retired or unknown item: keep the bytes, re-send as a new item
+  PROVIDER_APPLY_FAILURE_OPERATION_MISMATCH = 15;
+  PROVIDER_APPLY_FAILURE_STALE_OPERATION = 16;
+  PROVIDER_APPLY_FAILURE_STALE_VIEW = 17;          // a generation does not match: nothing authored, retry after refresh
+}
+
+enum ProviderApplyOutcome {
+  PROVIDER_APPLY_OUTCOME_UNSPECIFIED = 0;
+  PROVIDER_APPLY_OUTCOME_APPLIED = 1;
+  reserved 2;  // was REPLAYED: a replay keeps its stored outcome and sets `replayed` instead
+  PROVIDER_APPLY_OUTCOME_CONCURRENT = 3;
+  PROVIDER_APPLY_OUTCOME_FILE_SURVIVED = 4;
+}
+
+// The item as the OS must adopt it, read back from the committed rows.
+message ProviderAppliedItem {
+  bytes item_id = 1;
+  bytes parent_item_id = 2;                // empty = root container
+  string name = 3;
+  EntryKind entry_kind = 4;
+  bytes content_version = 5;
+  bytes metadata_version = 6;
+  uint64 size = 7;
+  int64 mtime_unix_nanos = 8;
+  uint32 unix_mode = 9;
+  bool current = 10;                       // content_version is also the daemon's current version
+  uint64 namespace_revision = 11;
+  uint64 parent_generation = 12;           // as `ProviderItem.parent_generation`
+}
+
+message ProviderApplyChangeResponse {
+  bytes request_id = 1;
+  bytes session_id = 2;
+  uint64 operation_seq = 3;
+  bool ok = 4;
+  ProviderApplyFailure failure = 5;
+  string error = 6;
+  ProviderApplyOutcome outcome = 7;
+  ProviderAppliedItem item = 8;            // unset for a completed DELETE
+  // This answer is the STORED result of an operation applied before (a replay): `outcome` is the
+  // original outcome, never replaced, so a lost conflict response replays as a conflict.
+  bool replayed = 10;
+  string suggested_name = 9;               // KEEP_LOCAL: the conflict-copy name to re-send the bytes under
+}
+
+message ProviderApplyCancel {
+  bytes request_id = 1;
+}
+
+// ---- parent-scoped lazy enumeration (daemon side) ----
+
+enum ActivityKind {
+  ACTIVITY_KIND_UNSPECIFIED = 0;
+  ACTIVITY_KIND_ENUMERATE = 1;
+  ACTIVITY_KIND_FETCH = 2;
+}
+message ProviderActivity {         // extension -> daemon on each container enumeration / fetch
+  bytes root_id = 1;
+  bytes item_id = 2;               // the folder enumerated or the item fetched (empty = the root)
+  ActivityKind activity_kind = 3;
+}
+message ProviderPrefetchControl {  // daemon -> app
+  bytes root_id = 1;
+  bool paused = 2;
+}
+
+// An item AS THE OS IS SHOWN IT (the shown view: the announced version when one is in flight,
+// else the published one, else the current one for an item never shown).
+message ProviderItem {
+  bytes item_id = 1;
+  bytes parent_item_id = 2;               // empty = the root container
+  string name = 3;                        // a single path component, at most 255 bytes
+  EntryKind entry_kind = 4;
+  uint64 size = 5;
+  int64 mtime_unix_nanos = 6;
+  uint32 unix_mode = 7;                   // low 12 bits
+  bytes content_version = 8;              // the shown content version identifier (40 bytes: hash, generation)
+  bytes metadata_version = 9;             // the shown metadata version identifier (40 bytes)
+  bool content_pending = 10;              // a newer content version is fenced; a signal follows
+  bytes symlink_target = 11;              // symlinks only, at most 4096 bytes
+  // The generation of the folder this item is shown in (0 for the root container). The extension
+  // stores it WITH the item and sends it back as `parent_generation` when the item is renamed or
+  // moved: the source folder is the one the user saw, not the one read at callback time.
+  uint64 parent_generation = 12;
+  // This device is not a writer of the group (a Reader): the extension reports the item without
+  // the writing, renaming, deleting and adding capabilities. The daemon refuses the change anyway.
+  bool read_only = 13;
+  // The engine permits the OS to drop its local copy of this item on its own ("Remove Download").
+  // Absent or false means not allowed, so a host that does not know the field never grants it.
+  // Decided by the engine each time the item is served; a file the user keeps on this device, or a
+  // folder holding one, is never allowed.
+  bool eviction_allowed = 14;
+}
+
+enum EnumerateFailure {
+  ENUMERATE_FAILURE_NONE = 0;
+  ENUMERATE_FAILURE_NOT_READY = 1;        // root unknown, not Ready, or namespace not queryable
+  ENUMERATE_FAILURE_NOT_FOUND = 2;        // the parent / item is not live (retired or unknown)
+  ENUMERATE_FAILURE_NOT_A_DIRECTORY = 3;
+  ENUMERATE_FAILURE_TOKEN_INVALID = 4;    // malformed or foreign page token
+  ENUMERATE_FAILURE_ANCHOR_EXPIRED = 5;   // full enumeration required
+  ENUMERATE_FAILURE_RETRY = 6;            // transient (database busy)
+}
+
+message EnumerateChildrenRequest {
+  bytes root_id = 1;
+  bytes parent_item_id = 2;               // empty = the root container
+  bytes page_token = 3;                   // empty = first page
+  uint32 limit = 4;                       // clamped to 1..=1000; 0 = 500
+}
+message EnumerateChildrenResponse {
+  bool ok = 1;
+  EnumerateFailure failure = 2;
+  string error = 3;
+  repeated ProviderItem items = 4;        // by name bytes ascending (the keyset order)
+  bytes next_page_token = 5;              // empty = last page
+  uint64 anchor = 6;                      // the event sequence read by the FIRST page
+}
+
+message ProviderItemRequest { bytes root_id = 1; bytes item_id = 2; }   // item(for:)
+message ProviderItemResponse {
+  bool ok = 1;
+  EnumerateFailure failure = 2;
+  string error = 3;
+  ProviderItem item = 4;
+  uint64 anchor = 5;
+}
+
+enum ChangeScope {
+  CHANGE_SCOPE_UNSPECIFIED = 0;
+  CHANGE_SCOPE_WORKING_SET = 1;
+  CHANGE_SCOPE_CONTAINER = 2;
+}
+message EnumerateChangesRequest {
+  bytes root_id = 1;
+  ChangeScope scope = 2;
+  bytes parent_item_id = 3;               // CONTAINER only
+  uint64 since_anchor = 4;                // an event sequence; 0 never valid
+  uint32 limit = 5;                       // events scanned per page, clamped to 1..=1000; 0 = 500
+}
+message EnumerateChangesResponse {
+  bool ok = 1;
+  EnumerateFailure failure = 2;
+  string error = 3;
+  repeated ProviderItem upserts = 4;
+  repeated bytes removed_item_ids = 5;
+  uint64 next_anchor = 6;                 // the LAST EVENT SEQUENCE this page consumed
+  bool more = 7;
+}
+
+message EnumerateWorkingSetRequest {
+  bytes root_id = 1;
+  bytes page_token = 2;
+  uint32 limit = 3;
+}
+message EnumerateWorkingSetResponse {
+  bool ok = 1;
+  EnumerateFailure failure = 2;
+  string error = 3;
+  repeated ProviderItem items = 4;        // item_id ascending
+  bytes next_page_token = 5;
+  uint64 anchor = 6;                      // the anchor to hand the OS when the walk completes
+}
+
+message ProviderPrefetchHint {
+  bytes root_id = 1;
+  uint64 hint_id = 2;
+  repeated bytes folder_item_ids = 3;     // exactly 1 in v1
+}
+enum PrefetchResult {
+  PREFETCH_RESULT_UNSPECIFIED = 0;
+  PREFETCH_RESULT_DONE = 1;
+  PREFETCH_RESULT_SKIPPED = 2;
+  PREFETCH_RESULT_FAILED = 3;
+}
+message ProviderPrefetchDone {
+  bytes root_id = 1;
+  uint64 hint_id = 2;
+  bytes folder_item_id = 3;
+  PrefetchResult result = 4;
+}
+
+message ShellIpcMessage {
+  reserved 8, 9;  // ListOnDemandFolders{Request,Response}, replaced by ListProviderFolders
+  // 25 was ProviderRebootstrapRequired: a lost or rolled-back root is replaced by one with a NEW
+  // root_id, and the host removes the old domain because it is absent from the next
+  // ListProviderFolders snapshot (on connect and at every launch), which cannot be lost.
+  reserved 25;
+  oneof payload {
+    StatusQuery status_query = 1;
+    StatusResponse status_response = 2;
+    StatusPush status_push = 3;
+    ContextActionRequest context_action_request = 4;
+    ContextActionResponse context_action_response = 5;
+    HydrateRequest hydrate_request = 6;
+    HydrateResponse hydrate_response = 7;
+    ListFolderFilesRequest list_folder_files_request = 10;
+    ListFolderFilesResponse list_folder_files_response = 11;
+    LocalWriteRequest local_write_request = 12;
+    LocalWriteResponse local_write_response = 13;
+    DehydrateRequest dehydrate_request = 14;
+    DehydrateResponse dehydrate_response = 15;
+    ListProviderFoldersRequest list_provider_folders_request = 16;
+    ListProviderFoldersResponse list_provider_folders_response = 17;
+    ProviderDomainState provider_domain_state = 18;
+    ExtensionHandshake extension_handshake = 19;
+    ProviderError provider_error = 20;
+    ProviderEvictRequest provider_evict_request = 21;
+    ProviderEvictDone provider_evict_done = 22;
+    ProviderChanged provider_changed = 23;
+    ProviderSignalDone provider_signal_done = 24;
+    ProviderMaterializedReport provider_materialized_report = 26;
+    ProviderReportAck provider_report_ack = 27;
+    ProviderEvidenceTick provider_evidence_tick = 28;
+    MaterializeToTempRequest materialize_to_temp_request = 29;
+    MaterializeToTempResponse materialize_to_temp_response = 30;
+    MaterializeCancel materialize_cancel = 31;
+    ProviderApplyChangeRequest provider_apply_change_request = 32;
+    ProviderApplyChangeResponse provider_apply_change_response = 33;
+    ProviderApplyCancel provider_apply_cancel = 34;
+    NextProviderDownloadsRequest next_provider_downloads_request = 35;
+    NextProviderDownloadsResponse next_provider_downloads_response = 36;
+    ProviderDownloadRejected provider_download_rejected = 37;
+    ProviderActivity provider_activity = 38;
+    ProviderPrefetchControl provider_prefetch_control = 39;
+    EnumerateChildrenRequest enumerate_children_request = 40;
+    EnumerateChildrenResponse enumerate_children_response = 41;
+    ProviderItemRequest provider_item_request = 42;
+    ProviderItemResponse provider_item_response = 43;
+    EnumerateChangesRequest enumerate_changes_request = 44;
+    EnumerateChangesResponse enumerate_changes_response = 45;
+    EnumerateWorkingSetRequest enumerate_working_set_request = 46;
+    EnumerateWorkingSetResponse enumerate_working_set_response = 47;
+    ProviderPrefetchHint provider_prefetch_hint = 48;
+    ProviderPrefetchDone provider_prefetch_done = 49;
+    ListLinkedRootsRequest list_linked_roots_request = 50;
+    ListLinkedRootsResponse list_linked_roots_response = 51;
+    MaterializeProgress materialize_progress = 52;
+  }
+}

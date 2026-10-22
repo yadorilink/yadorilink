@@ -1,0 +1,50 @@
+[package]
+name = "yadorilink-root-authority"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# See yadorilink-local-storage/Cargo.toml's identical section for why.
+[features]
+test-support = ["yadorilink-fs-platform/test-support"]
+
+[dependencies]
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
+yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
+thiserror.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+serde.workspace = true
+# `root_identity.rs`'s on-disk marker (plain, human-legible JSON).
+serde_json = "1"
+# `root_identity.rs`'s opaque root-token minting.
+rand = "0.10.2"
+hex = "0.4"
+fs2 = "0.4"
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+# This crate's own `tests/*.rs` integration binaries link against
+# `yadorilink-root-authority` as an ordinary external library, so
+# `cfg(test)` is never active for it there --
+# `RootCommitPermit::for_tests`/
+# `read_root_marker_for_test`/`write_root_marker_for_test` (all
+# `#[cfg(any(test, feature = "test-support"))]`) need this self-referencing
+# dev-dependency to enable the feature half of that gate.
+yadorilink-root-authority = { path = ".", features = ["test-support"] }
+# This is a dev-only back-edge against `yadorilink-daemon`'s own normal
+# (non-dev) dependency on this crate -- the same shape
+# `yadorilink-local-capture`'s own dev-dependency on `yadorilink-daemon`
+# already uses for its own fixtures.
+yadorilink-daemon = { path = "../yadorilink-daemon", features = ["test-support"] }
+# `yadorilink-replica-domain` (`FileRecord`/`BlockInfo` fixtures) and `sha2`
+# (`the_live_root_does_not_inherit_the_orphaned_roots_token`'s content hash)
+# are already ordinary [dependencies] above, so no dev-dependency override
+# is needed for either.
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

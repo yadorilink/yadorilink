@@ -1,0 +1,66 @@
+name: Bug report
+description: Report a reproducible problem in YadoriLink.
+title: "[bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Do not include credentials, tokens, private keys, recovery codes, or file contents. For vulnerabilities, email the address in .github/SECURITY.md instead of opening a public issue.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: List the smallest set of commands or actions that reproduce the issue.
+      placeholder: |
+        1. Run `...`
+        2. Create/link `...`
+        3. Observe `...`
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: YadoriLink version or commit
+      placeholder: v0.x.y or commit SHA
+    validations:
+      required: false
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or diagnostics
+      description: Paste only redacted output. Prefer `yadorilink diagnose preview` or the reporting export template for JSON diagnostics.
+      render: text
+    validations:
+      required: false

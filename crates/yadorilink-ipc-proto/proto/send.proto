@@ -1,0 +1,120 @@
+syntax = "proto3";
+package yadorilink.send.v1;
+
+// Track Send's own peer-to-peer wire protocol: a one-shot file
+// send/receive exchanged directly between devices over a connection on the
+// device's iroh endpoint that negotiated the ALPN `yadorilink/send/v1`,
+// never the sync protocol's ALPN (`yadorilink/sync/v1`). Nothing defined
+// here is admitted into the sync change DAG or read by any sync handler;
+// the two protocols share only the iroh endpoint (the device's Ed25519 key
+// is its endpoint id) and each has its own admission.
+//
+// Every stream a Track Send connection opens starts with one
+// length-prefixed `SendEnvelope`, the same length-prefix framing the sync
+// protocol uses for its block-request headers -- so the accepting side can
+// tell, from one read, whether the stream is an inbound manifest offer or a
+// chunk pull.
+
+// One file's identity and content layout within a transfer -- ephemeral,
+// held only in this transfer's own local store, never turned into a
+// change-DAG `FileRecord`/`BlockInfo`.
+message SendFileEntry {
+  string relative_path = 1;
+  uint64 size = 2;
+  uint32 chunk_size = 3;
+  // SHA-256 of each fixed-size chunk, in order -- same hash function
+  // `yadorilink_local_storage::hash_block_bytes` uses, so a receiver
+  // verifying a pulled chunk needs no second hash implementation.
+  repeated bytes chunk_hashes = 4;
+}
+
+// Pushed by the sending device to offer a transfer. The peer's identity is
+// never trusted from this message -- it comes from the already-verified
+// Ed25519 key the QUIC handshake authenticated the connection with.
+message SendManifest {
+  string transfer_id = 1;
+  repeated SendFileEntry files = 2;
+  uint64 total_size = 3;
+  int64 offered_at_unix_nanos = 4;
+}
+
+// The receiving device's reply to a `SendManifest`, on the same stream.
+// `accepted = true` means the offer was durably recorded as a pending
+// inbox entry before this reply was sent -- an acknowledged offer is never
+// lost to a crash between recording it and answering.
+message SendManifestAck {
+  bool accepted = 1;
+  string reason = 2; // set only when accepted = false
+}
+
+// Opens one bidirectional QUIC stream to pull one file's remaining
+// chunks, starting at `start_chunk_index` -- the receiver's own durable
+// resume checkpoint for that file, so a re-issued pull after a crash never
+// re-requests a chunk this device has already confirmed written to disk.
+message ChunkPullRequest {
+  string transfer_id = 1;
+  uint32 file_index = 2;
+  uint32 start_chunk_index = 3;
+}
+
+// Sent by the receiving device to the sender once it has written every file of an accepted
+// transfer, on its own stream; the sender answers with a `SendManifestAck`. This is the only
+// way the sender learns a transfer finished: a receiver may already hold some of the content
+// and never pull it, so the pulls alone say nothing. Best effort and only informational (it moves
+// the sender's list entry to completed); it grants nothing.
+message TransferDone {
+  string transfer_id = 1;
+}
+
+// The very first message an accepting device sends on either kind of
+// stream it can receive -- lets one accept loop dispatch by payload type
+// rather than needing two different framings for the two exchanges.
+message SendEnvelope {
+  oneof payload {
+    SendManifest manifest = 1;
+    ChunkPullRequest pull = 2;
+    TransferDone done = 5;
+  }
+  // Required (both non-empty) on EVERY `manifest` offer, unconditionally --
+  // the coordination plane's short-lived, sender+receiver-bound Track Send
+  // rendezvous grant (`POST /send/authorization`) that authorizes this
+  // exact offer. An offer with an empty `grant_id`, or one that fails to
+  // validate, is rejected -- ordinary netmap/sync authorization between the
+  // two devices is never sufficient on its own, even when one exists. Never
+  // present on a `pull`: a pull's authorization comes from being dialed
+  // back by a device this one already durably accepted an offer's grant
+  // from (see the daemon-side `send_transfer` module's own doc comment),
+  // not a second grant presentation.
+  string grant_id = 3;
+  string grant_nonce = 4;
+}
+
+// One chunk's header, written immediately before that chunk's raw body
+// bytes on a pull stream -- the block-stream convention
+// (`yadorilink_transport::block_stream`'s length framing) applied to a
+// sequence of chunks on one stream instead of one request/response pair.
+message ChunkHeader {
+  uint32 chunk_index = 1;
+  uint32 size = 2;
+  // Set on the last chunk this response will carry -- the receiver's
+  // authoritative "no more chunks are coming on this stream" signal,
+  // checked instead of inferring it from the stream's own end-of-file.
+  bool last_chunk = 3;
+}
+
+// Sent instead of any `ChunkHeader` when a pull cannot be served at all --
+// an unknown/unauthorized `transfer_id`, a `file_index` outside the
+// manifest, or a `start_chunk_index` past the file's own chunk count.
+message ChunkPullRejected {
+  string reason = 1;
+}
+
+// The first message a pull stream's accepting side (the file's sender)
+// writes back, before any chunk data -- one `header`/`rejected` per
+// stream, never both.
+message ChunkStreamMessage {
+  oneof payload {
+    ChunkHeader header = 1;
+    ChunkPullRejected rejected = 2;
+  }
+}

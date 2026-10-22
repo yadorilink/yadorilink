@@ -1,0 +1,29 @@
+[package]
+name = "yadorilink-sqlite-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# See yadorilink-local-storage/Cargo.toml's identical section for why.
+[features]
+test-support = []
+
+[dependencies]
+# The durable publish of the database creation marker (`durable_dir::publish_durably`).
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
+thiserror.workspace = true
+tracing.workspace = true
+rusqlite = { version = "0.31", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.24"
+# The version r2d2 0.8 itself builds its worker pool from; named directly
+# only so `build_pool` can choose that pool's drop behavior.
+scheduled-thread-pool = "0.2.7"
+# `write_immediate_offloaded` runs a commit on the blocking pool.
+tokio = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

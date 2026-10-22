@@ -1,0 +1,76 @@
+[package]
+name = "yadorilink-client-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The client application layer every YadoriLink front end shares: the one
+# control-socket client for the local daemon, the coordination-plane client
+# (credential store, request helpers, device identity file), and the typed
+# operations the command-line and desktop front ends drive. It returns typed
+# results and never prints, prompts or exits; rendering belongs to each front
+# end.
+
+[dependencies]
+# The durable publish of the small private state files (`durable_dir::publish_durably`).
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
+yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
+yadorilink-local-storage = { path = "../yadorilink-local-storage" }
+# The device's Ed25519 signing key, generated and registered by
+# `ops::devices::register_device`.
+yadorilink-transport = { path = "../yadorilink-transport" }
+yadorilink-fapi-client.workspace = true
+# The diagnostics redaction the daemon applies, reused for the bundle a
+# client assembles when the daemon is not reachable.
+yadorilink-reporting = { path = "../yadorilink-reporting" }
+# The folder, conflict and device view derivations the product types wrap.
+yadorilink-product-view = { path = "../yadorilink-product-view" }
+# Only with the `ffi` feature: derives the foreign-language binding for the
+# product types. The binding crate enables it; every other front end builds
+# without it.
+uniffi = { workspace = true, optional = true }
+tokio.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json = "1"
+# HTTP client for the coordination plane. rustls rather than native-tls, the
+# same choice yadorilink-reporting makes, so there is no system OpenSSL
+# dependency.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+] }
+# Coordination-address validation parses the configured address rather than
+# splitting strings, which mishandles IPv6 literals such as
+# `http://[::1]:8787`.
+url = { version = "2" }
+# Encodes the device's public signing key for the coordination plane's JSON
+# device-registration route.
+base64 = { version = "0.23" }
+
+[features]
+default = []
+ffi = ["dep:uniffi"]
+
+[dev-dependencies]
+tempfile = "3"
+ed25519-dalek = "3"
+# `set_package_identity_for_test`: a test process claims package identity on any platform.
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform", features = ["test-support"] }
+# Paused time, so a request that waits out its deadline finishes at once.
+tokio = { workspace = true, features = ["test-util"] }
+# The offline `CoordinationAuth` the request tests build; enabled here, not in
+# `[dependencies]`, so it never reaches a shipped binary.
+yadorilink-fapi-client = { workspace = true, features = ["test-support"] }
+# A local HTTP listener standing in for the coordination plane.
+wiremock = "0.6"
+
+# The user id a LaunchAgent is addressed by (`launchctl kickstart gui/<uid>/...`).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+
+[lints]
+workspace = true

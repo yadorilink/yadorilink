@@ -1,0 +1,20 @@
+# The C# binding generator (uniffi-bindgen-cs) that generate-csharp-binding.sh
+# builds and runs. It is a separate tool from the UniFFI the workspace links,
+# and each of its releases reads libraries from exactly one UniFFI minor, so
+# csharp-binding.py pin-check fails when `uniffi_rs` differs from Cargo.lock.
+#
+# The last upstream release (0.11.1+v0.31.0) reads UniFFI 0.31 only and cannot
+# open a library built with the workspace's 0.32. This pin is the open upstream
+# pull request that ports the generator to 0.32 (NordSecurity/uniffi-bindgen-cs,
+# "Upgrade to uniffi-rs 0.32.0"), pinned by commit because it is not merged or
+# released. Move it to the upstream release tag as soon as one targets the
+# workspace's UniFFI minor.
+#
+# This is external code: it is built and run only in the unprivileged
+# `engine-build` job of the release workflow (no environment, no secrets), never
+# in the protected signing job. check-release-gates.py fails if any other job
+# references a binding generator.
+repository=https://github.com/dennisameling/uniffi-bindgen-cs
+rev=cf0aa7a8fb59358a846708730a58a02bf206ac05
+version=0.12.0+v0.32.0
+uniffi_rs=0.32

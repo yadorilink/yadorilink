@@ -1,0 +1,72 @@
+[package]
+name = "yadorilink-sync-sqlite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# See yadorilink-local-storage/Cargo.toml's identical section for why.
+[features]
+# Exposes test-only helpers to OTHER crates' test builds.
+test-support = ["yadorilink-replica-domain/test-support"]
+
+[dependencies]
+yadorilink-sqlite-runtime = { path = "../yadorilink-sqlite-runtime" }
+yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
+yadorilink-replica-engine = { path = "../yadorilink-replica-engine" }
+# The `RootCommitPermit` gate on the `materialization_intents`
+# crash-recovery journal writes. No cycle: yadorilink-root-authority only
+# depends on yadorilink-replica-domain (already a dependency here).
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
+yadorilink-root-authority = { path = "../yadorilink-root-authority" }
+# `StorageError` and `PlaceholderDiskIdentity`. It depends on no
+# persistence crate, so there is no cycle.
+yadorilink-local-storage = { path = "../yadorilink-local-storage" }
+# The namespace node store and subtree operations run over the authenticated
+# namespace.
+yadorilink-namespace = { path = "../yadorilink-namespace" }
+thiserror.workspace = true
+tracing.workspace = true
+rusqlite = { version = "0.31", features = ["bundled"] }
+r2d2 = "0.8"
+serde.workspace = true
+serde_json = "1"
+hex = "0.4"
+# `dag_store::causal_basis`'s content-addressed causal-basis-set hashing.
+sha2 = "0.11"
+rand = "0.10.2"
+# A returning state's headers are verified under their authors' keys.
+ed25519-dalek = "3"
+
+# The recovery area opens its files with `O_NOFOLLOW`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Windows: a protected current-user-only DACL on the recovery area.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+# `hooks` for the progress handler the scale tests count SQLite's work
+# with: a count, unlike a timing, does not move with machine load.
+# `functions` for the crash sweeps' failpoint counter, which must survive
+# the statement rollback the injected failure causes.
+rusqlite = { version = "0.31", features = ["bundled", "functions", "hooks", "trace"] }
+# Feature-unifies with the `[dependencies]` entry above to enable
+# `RootCommitPermit::for_tests`/`RootLease::for_tests` for this crate's own
+# `dag_store` test fixtures.
+yadorilink-root-authority = { path = "../yadorilink-root-authority", features = ["test-support"] }
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform", features = ["test-support", "evidence"] }
+# Integration tests need the crate's own and replica-domain's test-only helpers
+# (previously enabled by feature unification through a daemon dev-dependency).
+yadorilink-sync-sqlite = { path = ".", features = ["test-support"] }
+yadorilink-replica-domain = { path = "../yadorilink-replica-domain", features = ["test-support"] }
+
+[lints]
+workspace = true

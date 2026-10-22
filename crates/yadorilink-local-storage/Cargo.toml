@@ -1,0 +1,74 @@
+[package]
+name = "yadorilink-local-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Exposes `materialize_write::set_test_force_deferred_placeholder`
+# (normally `#[cfg(test)]`-only) to OTHER crates' test builds --
+# `create_or_defer_placeholder`'s Windows-deferred branch is otherwise
+# unreachable in a test built on a non-Windows host, so any consumer
+# whose own tests need to exercise that branch's caller-side handling
+# (e.g. `yadorilink-peer-session`, `yadorilink-filesystem-sync`) needs
+# this, since `cfg(test)` alone is not active for an ordinary dependency
+# of another crate's own test build. Same shape as every other
+# test-support feature in this workspace.
+test-support = ["yadorilink-root-authority/test-support"]
+
+[dependencies]
+serde.workspace = true
+serde_json = "1"
+yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
+# `fs_identity::bytes_to_target` for symlink-target byte<->OS-path
+# conversion in `materialize_write::materialize_symlink*`. A
+# pure leaf crate over `yadorilink-replica-domain` only -- no cycle risk.
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
+yadorilink-root-authority = { path = "../yadorilink-root-authority" }
+# The block store's persistent index is a SQLite database, opened through
+# the workspace's one SQLite runtime (pool, in-process writer gate, WAL +
+# `synchronous = FULL`) rather than a second, differently-configured one.
+# A leaf crate over `rusqlite`/`r2d2` only -- no cycle risk.
+yadorilink-sqlite-runtime = { path = "../yadorilink-sqlite-runtime" }
+# Needed directly for the index's own statements; the feature set (notably
+# `bundled`) comes from `yadorilink-sqlite-runtime`, which must stay the
+# single place that decides it.
+rusqlite = "0.31"
+thiserror.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+hex = "0.4"
+# Unpredictable temp file names.
+rand = "0.10.2"
+fastcdc = "5.0.0"
+# Portable free-space queries
+# (`available_space`/`total_space`) for the disk-headroom preflight check —
+# no existing dependency in this crate (or anywhere else in the workspace,
+# confirmed via search) exposed this; `std` has no stable cross-platform
+# API for it.
+fs2 = "0.4"
+walkdir = "2"
+tokio.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+] }
+
+# `chunker::read_replicated_xattrs`'s raw `listxattr`/`getxattr` calls on
+# Linux -- already a workspace dependency elsewhere (e.g.
+# yadorilink-filesystem-sync, yadorilink-root-authority), not a new one.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# The durable-move trace and failpoints the publish tests drive.
+yadorilink-root-authority = { path = "../yadorilink-root-authority", features = ["test-support"] }
+tempfile = "3"
+# Failpoints of the durable publish: power-loss tests of the small records written through it.
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform", features = ["test-support"] }
+
+[lints]
+workspace = true

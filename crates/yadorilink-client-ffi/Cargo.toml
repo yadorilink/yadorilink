@@ -1,0 +1,46 @@
+[package]
+name = "yadorilink-client-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The platform-neutral UniFFI binding of the client layer. It exports the
+# product facade (`ClientCore`, `LoginSession`, `StatusWatch`) and owns the
+# one long-lived async runtime every call runs on. Nothing here adds
+# behavior: each method forwards to yadorilink-client-core. The macOS app
+# links the static library and compiles the generated Swift; the Windows app
+# loads the dynamic library through the generated C#.
+
+[lib]
+# UniFFI derives every exported symbol (`uniffi_<lib>_fn_*`, `ffi_<lib>_*`) and
+# its API checksums from this library name, and the platform artifacts take it
+# too (`libyadorilink_client_ffi.a`, `yadorilink_client_ffi.dll`). Renaming it
+# is an ABI switch: regenerate every binding and bundle layout with it.
+name = "yadorilink_client_ffi"
+# `staticlib` is what the macOS app links, `cdylib` is what the Windows app
+# loads, and `lib` lets the bindgen and the tests use the crate as an
+# ordinary Rust library.
+crate-type = ["staticlib", "cdylib", "lib"]
+
+[[bin]]
+# Generates the Swift binding from the built library:
+# `.github/release/generate-swift-binding.sh` runs it. The C# binding uses the
+# separate `uniffi-bindgen-cs` tool (`.github/release/generate-csharp-binding.sh`).
+name = "uniffi-bindgen-swift"
+path = "src/bin/uniffi-bindgen-swift.rs"
+required-features = ["bindgen"]
+
+[features]
+default = []
+bindgen = ["uniffi/cli"]
+
+[dependencies]
+yadorilink-client-core = { path = "../yadorilink-client-core", features = ["ffi"] }
+uniffi.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

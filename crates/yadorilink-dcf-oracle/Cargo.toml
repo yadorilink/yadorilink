@@ -1,0 +1,15 @@
+[package]
+name = "yadorilink-dcf-oracle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# A reference oracle for differential tests of signed per-path bases. It is
+# deliberately independent of every workspace crate (in particular of the
+# production kernel) so that it cannot share a bug with what it checks.
+[dependencies]
+
+[lints]
+workspace = true

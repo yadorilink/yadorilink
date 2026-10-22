@@ -1,0 +1,18 @@
+# Seeds for crates/yadorilink-daemon/tests/monkey_chaos.rs that
+# previously produced a failing run, one per line. Automatically appended
+# to by that test on failure (see `record_failing_seed`); always replayed
+# by the `replay_known_failing_seeds` test in the same file, regardless
+# of whether the underlying bug has since
+# been fixed -- once fixed, the entry becomes a permanent regression
+# check rather than being deleted.
+#
+# Lines starting with '#' and blank lines are ignored.
+1254137095109609298
+12788561176311549428
+18036069142062588829
+7130163079425790866
+11628226161925181928
+5320844737226071939
+1079752644454605084
+4768114271623059329
+9338441722958211174

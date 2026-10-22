@@ -1,0 +1,8 @@
+# This package's entire purpose is registering the yadorilink APT
+# repository -- installing /etc/apt/sources.list.d/yadorilink.sources is
+# not an accident this tag exists to catch, it is the one thing this
+# package does (see build-keyring-deb.sh's header comment). The sources
+# entry is also marked as a conffile (DEBIAN/conffiles), so a later
+# key-rotation upgrade prompts on local edits instead of silently
+# overwriting them, same as any other conffile-owned config.
+yadorilink-archive-keyring: package-installs-apt-sources

@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Engine identity",
+  "description": "Identifies one engine artifact: the public source commit it was built from and the API version host apps must match.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "public_commit_sha",
+    "engine_api_version",
+    "artifact_sha256",
+    "channel",
+    "kind",
+    "build_config_digest",
+    "bundle_sha256"
+  ],
+  "properties": {
+    "public_commit_sha": {
+      "description": "Commit of the public source tree the artifact was built from.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "engine_api_version": {
+      "description": "PROVIDER_HOST_API_VERSION of the engine.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "artifact_sha256": {
+      "description": "SHA-256 of the engine artifact.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "channel": {
+      "description": "Release channel the artifact is built for; one artifact per channel.",
+      "type": "string",
+      "enum": ["stable", "beta", "dev"]
+    },
+    "kind": {
+      "description": "release: built for distribution (channel stable or beta). dev: a development engine (channel dev) that release and production build paths must refuse; it is always exactly the dev channel.",
+      "type": "string",
+      "enum": ["release", "dev"]
+    },
+    "build_config_digest": {
+      "description": "SHA-256 of the build configuration (features, targets, toolchain).",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "bundle_sha256": {
+      "description": "SHA-256 of the bundle's SHA256SUMS file, which lists every bundle file except SHA256SUMS and engine-identity.json.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "source": {
+      "description": "Where the bundle is published: a zip asset on a GitHub Release. Required in a consumer's engine.lock; optional inside the bundle's own identity file.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "release_tag", "asset_name"],
+      "properties": {
+        "repository": {
+          "description": "GitHub owner/name that hosts the release.",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+        },
+        "release_tag": {
+          "description": "Release tag the asset is attached to.",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+        },
+        "asset_name": {
+          "description": "File name of the zip bundle asset.",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*\\.zip$"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,16 @@
+# Test runs must be hermetic with respect to the OS keychain: a test that
+# reaches the real login keychain can block on a permission dialog (measured:
+# hangs of 14 min to 6,919 s) and leaks `yadorilink` items. This setup script
+# exports the two switches to every test process of every profile run:
+#   YADORILINK_DISABLE_OS_KEYRING=1  device-key mirror: file at rest only
+#   YADORILINK_CREDENTIAL_STORE=file credential store: owner-only file backend
+# Plain `cargo test` does not read this file; set the same variables yourself
+# when running it.
+experimental = ["setup-scripts"]
+
+[scripts.setup.hermetic-keychain]
+command = 'sh -c "echo YADORILINK_DISABLE_OS_KEYRING=1 >> $NEXTEST_ENV; echo YADORILINK_CREDENTIAL_STORE=file >> $NEXTEST_ENV"'
+
+[[profile.default.scripts]]
+filter = 'all()'
+setup = 'hermetic-keychain'

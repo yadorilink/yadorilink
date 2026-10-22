@@ -1,0 +1,199 @@
+name: Sign manifest
+
+# The only workflow that signs an update manifest, and the only place the manifest signing key
+# exists. It is started by hand (workflow_dispatch); no push, tag, schedule or pull request can
+# reach it. Three jobs with three responsibilities:
+#
+#   build-signer  no environment, no secret: builds the signing tool from this commit.
+#   sign          bound to the release-signing Environment. Its required reviewer must
+#                 approve the run before any secret is released; the Environment is also
+#                 restricted to main. It checks the request against the digest the approver
+#                 was shown, signs, and writes the bundle.
+#   attest        no environment, no secret: attests the exact bundle bytes, so the
+#                 distribution workflow can verify who produced them (workflow, repository, commit).
+#
+# Distribution (object storage) is a separate workflow (channel-publish, outside this
+# repository): it holds no signing key and accepts a bundle only from a successful run of this workflow plus its attestation.
+# The request is produced by the channel-plan workflow. This repository signs production only. The signing_digest input is the
+# digest of everything that will be signed (body, per-version snapshots, appcast) printed there;
+# the reviewer compares it with the plan before approving.
+# .github/release/check-signing-workflow.py enforces this shape.
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Channel the request is for
+        type: choice
+        options: [nightly, beta]
+        required: true
+      signing_digest:
+        description: Digest of everything to be signed, as printed by channel-plan (compare before approving)
+        type: string
+        required: true
+      request_b64gz:
+        description: The signing request from channel-plan (base64 of gzip)
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sign-manifest-${{ inputs.channel }}
+  cancel-in-progress: false
+
+jobs:
+  build-signer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      signer_sha256: ${{ steps.hash.outputs.sha256 }}
+    steps:
+      - name: Refuse a run that is not on main
+        shell: bash
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$REF" != refs/heads/main ]; then
+            echo "production signing runs from main only" >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ github.token }}
+
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master @ 2026-06-30
+        with:
+          toolchain: stable
+
+      - name: Build the signing tool
+        run: cargo build --release --locked -p yadorilink-daemon --bin yadorilink-sign-manifest
+
+      - id: hash
+        name: Hash the signing tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir signer
+          cp target/release/yadorilink-sign-manifest signer/
+          echo "sha256=$(sha256sum signer/yadorilink-sign-manifest | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: manifest-signer
+          path: signer/yadorilink-sign-manifest
+          if-no-files-found: error
+
+  sign:
+    needs: build-signer
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release-signing
+    permissions:
+      contents: read
+    outputs:
+      bundle_sha256: ${{ steps.bundle.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the verifier dependency
+        run: python3 -m pip install --quiet --disable-pip-version-check cryptography
+
+      - name: Download the signing tool
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: manifest-signer
+          path: signer
+
+      - name: Check the signing tool
+        shell: bash
+        env:
+          EXPECTED: ${{ needs.build-signer.outputs.signer_sha256 }}
+        run: |
+          set -euo pipefail
+          actual="$(sha256sum signer/yadorilink-sign-manifest | cut -d' ' -f1)"
+          [ -n "$EXPECTED" ] && [ "$actual" = "$EXPECTED" ] || { echo "the signing tool does not match the build" >&2; exit 1; }
+          chmod +x signer/yadorilink-sign-manifest
+
+      - name: Decode the request
+        env:
+          REQUEST_B64GZ: ${{ inputs.request_b64gz }}
+        run: python3 .github/release/sign_request.py decode --b64gz-env REQUEST_B64GZ --out request.json
+
+      - name: Sign
+        env:
+          MANIFEST_SIGNING_KEY: ${{ secrets.MANIFEST_SIGNING_KEY }}
+          MANIFEST_SIGNING_KEY_ID: ${{ secrets.MANIFEST_SIGNING_KEY_ID }}
+          ROOT_KEY_ID: ${{ vars.RELEASE_MANIFEST_KEY_ID }}
+          ROOT_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
+          CHANNEL: ${{ inputs.channel }}
+          SIGNING_DIGEST: ${{ inputs.signing_digest }}
+        run: |
+          set -euo pipefail
+          mkdir bundle
+          python3 .github/release/sign_request.py sign \
+            --request request.json --channel "$CHANNEL" --target production --signing-digest "$SIGNING_DIGEST" \
+            --sign-tool signer/yadorilink-sign-manifest \
+            --root-key-id "$ROOT_KEY_ID" --root-public-key-hex "$ROOT_PUBLIC_KEY_HEX" \
+            --release-dir .github/release --out bundle/bundle.json
+
+      - id: bundle
+        name: Hash the bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "sha256=$(sha256sum bundle/bundle.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: signed-bundle
+          path: bundle/bundle.json
+          if-no-files-found: error
+
+  attest:
+    needs: sign
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download the signed bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: signed-bundle
+          path: bundle
+
+      - name: Check the bundle is the one that was signed
+        shell: bash
+        env:
+          EXPECTED: ${{ needs.sign.outputs.bundle_sha256 }}
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+          actual="$(sha256sum bundle/bundle.json | cut -d' ' -f1)"
+          [ -n "$EXPECTED" ] && [ "$actual" = "$EXPECTED" ] || { echo "the bundle changed after signing" >&2; exit 1; }
+          {
+            echo "### Signed bundle: $CHANNEL (production)"
+            echo "sha256 \`$actual\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest the bundle
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: bundle/bundle.json

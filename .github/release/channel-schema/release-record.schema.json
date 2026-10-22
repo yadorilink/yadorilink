@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Release record (.github/channels/releases/<version>.json)",
+  "description": "Facts the publisher verified for one version. Immutable once merged; channel_ledger.py is the validator. Targets are keyed <platform>-<arch>.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "version", "tag", "public_commit_sha", "build_lane", "release_id", "engine_api_version", "state_schema", "protocol_generation"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "version": { "type": "string" },
+    "tag": { "type": "string" },
+    "public_commit_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "build_lane": { "enum": ["dev", "beta"] },
+    "release_id": { "type": "string" },
+    "engine_api_version": { "type": "string" },
+    "state_schema": { "type": "string" },
+    "protocol_generation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "rpc_version"],
+      "properties": { "protocol_version": { "type": "integer" }, "rpc_version": { "type": "integer" } }
+    },
+    "script": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["asset", "sha256", "size", "bundle_sha256", "attestation_digest", "github_url"],
+        "properties": {
+          "asset": { "type": "string" }, "sha256": { "type": "string" }, "size": { "type": "integer" },
+          "bundle_sha256": { "type": "string" }, "attestation_digest": { "type": "string" },
+          "github_url": { "type": "string" }, "publisher_identity": { "type": "string" }
+        }
+      }
+    },
+    "app_bundle": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file", "sha256", "size", "sparkle_build", "notarization_evidence_sha256", "engine_release_id"],
+        "properties": {
+          "file": { "type": "string" }, "sha256": { "type": "string" }, "size": { "type": "integer" },
+          "sparkle_build": { "type": "string" }, "notarization_evidence_sha256": { "type": "string" },
+          "engine_release_id": { "type": "string", "description": "Must equal release_id." },
+          "publisher_identity": { "type": "string" }
+        }
+      }
+    },
+    "microsoft_store": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["package_version", "submission_id", "upload_sha256", "upload_size"],
+        "properties": {
+          "package_version": { "type": "string" }, "submission_id": { "type": "string" },
+          "upload_sha256": { "type": "string" }, "upload_size": { "type": "integer" },
+          "publisher_identity": { "type": "string" }
+        }
+      }
+    },
+    "verifier": { "$ref": "#/$defs/asset" },
+    "installers": { "type": "object", "additionalProperties": { "$ref": "#/$defs/asset" } }
+  },
+  "$defs": {
+    "asset": {
+      "type": "object", "additionalProperties": false, "required": ["asset", "sha256"],
+      "properties": { "asset": { "type": "string" }, "sha256": { "type": "string" } }
+    }
+  }
+}

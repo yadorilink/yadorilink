@@ -1,0 +1,15 @@
+{"seed":0,"kind":"convergence","detail":"seed 0 (Star): tombstoned path 'notes/c (conflicted copy, 1970-01-01-000000, device-3, 78fb886c).txt' was resurrected into the state"}
+{"seed":17,"kind":"convergence","detail":"seed 17 (Star): tombstoned path 'notes/c (conflicted copy, 1970-01-01-000000, device-2, bc839dd5).txt' was resurrected into the state"}
+{"seed":20,"kind":"convergence","detail":"seed 20 (Chain): tombstoned path 'a (conflicted copy, 1970-01-01-000000, device-2, db68d1f6).txt' was resurrected into the state"}
+{"seed":21,"kind":"convergence","detail":"seed 21 (Split): tombstoned path 'notes/d (conflicted copy, 1970-01-01-000000, device-3, bb4669b4).txt' was resurrected into the state"}
+{"seed":30,"kind":"convergence","detail":"seed 30 (Dynamic): tombstoned path 'b (conflicted copy, 1970-01-01-000000, device-1, 36414426).txt' was resurrected into the state"}
+{"seed":53,"kind":"convergence","detail":"seed 53 (Chain): tombstoned path 'a (conflicted copy, 1970-01-01-000000, device-3, 36414426).txt' was resurrected into the state"}
+{"seed":65,"kind":"convergence","detail":"seed 65 (Dynamic): tombstoned path 'notes/c (conflicted copy, 1970-01-01-000000, device-2, 78f1b77e).txt' was resurrected into the state"}
+{"seed":71,"kind":"convergence","detail":"seed 71 (Split): tombstoned path 'notes/d (conflicted copy, 1970-01-01-000000, device-1, 2c45e3c4).txt' was resurrected into the state"}
+{"seed":95,"kind":"convergence","detail":"seed 95 (Dynamic): tombstoned path 'notes/c (conflicted copy, 1970-01-01-000000, device-1, 3c9b2f6e).txt' was resurrected into the state"}
+{"seed":106,"kind":"convergence","detail":"seed 106 (Chain): tombstoned path 'notes/c (conflicted copy, 1970-01-01-000000, device-3, d7f74341).txt' was resurrected into the state"}
+{"seed":122,"kind":"convergence","detail":"seed 122 (Dynamic): tombstoned path 'notes/c (conflicted copy, 1970-01-01-000000, device-0, 5320db4f).txt' was resurrected into the state"}
+{"seed":138,"kind":"convergence","detail":"seed 138 (Dynamic): tombstoned path 'notes/d (conflicted copy, 1970-01-01-000000, device-1, 91ae30f2).txt' was resurrected into the state"}
+{"seed":139,"kind":"convergence","detail":"seed 139 (Star): tombstoned path 'notes/c (conflicted copy, 1970-01-01-000000, device-2, 3c9b2f6e).txt' was resurrected into the state"}
+{"seed":150,"kind":"convergence","detail":"seed 150 (Dynamic): tombstoned path 'a (conflicted copy, 1970-01-01-000000, device-0, 78fb886c).txt' was resurrected into the state"}
+{"seed":159,"kind":"convergence","detail":"seed 159 (Dynamic): tombstoned path 'notes/c (conflicted copy, 1970-01-01-000000, device-1, b3e9c421).txt' was resurrected into the state"}

@@ -1,0 +1,73 @@
+[package]
+name = "yadorilink-send"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Track Send: one-shot P2P file send/receive, deliberately separate from the sync DAG/materialization lane."
+
+# See yadorilink-local-storage/Cargo.toml's identical section for why.
+[features]
+# A deterministic mid-transfer "crash" hook for `receive_transfer`, used
+# only by real crash-recovery tests (see `session.rs`'s own doc comment on
+# `test_abort_after_n_chunks`) -- never compiled into a production binary.
+test-support = []
+
+[dependencies]
+# The device's iroh endpoint, reached only through Track Send's own ALPN
+# (`yadorilink/send/v1`): same identity, NAT traversal and relays as sync,
+# never a sync lane. This crate never depends on `yadorilink-sync-wire`,
+# `yadorilink-sync-sqlite`, `yadorilink-peer-session`, or any other DAG/
+# materialization-facing crate.
+yadorilink-sync-substrate = { path = "../yadorilink-sync-substrate" }
+# Only the generic length-prefix framing helpers (`block_stream`), which
+# define Track Send's message framing on the wire.
+yadorilink-transport = { path = "../yadorilink-transport" }
+# `chunker::chunk_file`/`FsBlockStore`/`materialize_write::reconstruct_file`
+# -- a clean, DAG-independent leaf crate (see that crate's own module doc:
+# moved out of the sync engine specifically because it had zero DAG
+# dependency). Track Send uses its own, separate `FsBlockStore` roots
+# (never the daemon's production `block_store_root`), so nothing this
+# crate writes is visible to that store's DAG-driven GC liveness sweep.
+yadorilink-local-storage = { path = "../yadorilink-local-storage" }
+# `BlockInfo` only -- the plain, DAG-independent data shape
+# `chunk_file`/`reconstruct_file` already use as their public API. Pure
+# domain types crate, nothing beneath it but std + crypto (see that
+# crate's own Cargo.toml comment); no DAG/change-history code reached
+# through this dependency.
+yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
+# The generic, domain-agnostic pooled-SQLite-connection/PRAGMA/writer-gate
+# runtime (WAL + synchronous=FULL, busy_timeout, retry-on-locked) that
+# `yadorilink-sync-sqlite` also builds on -- but Track Send supplies its
+# own, wholly separate schema (`store.rs`) and its own separate database
+# file (`send.db`, never the sync index database), so no sync/DAG table
+# is ever touched or even visible to this crate.
+yadorilink-sqlite-runtime = { path = "../yadorilink-sqlite-runtime" }
+# Track Send's own peer-to-peer wire messages (`send.proto`), a sibling
+# message family to `sync.proto` inside this same protobuf crate -- never
+# the `sync`/`daemonctl` modules this crate has no need of decoding.
+yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
+prost = "0.14.4"
+# `DeviceDirectory`'s `request_grant`/`consume_grant` are the only async
+# methods on a trait this crate uses as `Arc<dyn DeviceDirectory>` -- dyn
+# compatibility needs the `Pin<Box<dyn Future>>` transform this provides.
+# Same version already used by `yadorilink-daemon` for the identical reason.
+async-trait = "0.1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+r2d2 = "0.8"
+thiserror.workspace = true
+tracing.workspace = true
+hex = "0.4"
+uuid = { version = "1", features = ["v4"] }
+# Recursive directory walk for `send <dir> <target-device>` -- already a
+# workspace-established dependency (`yadorilink-local-storage`'s own
+# `link_preflight.rs` uses it for the identical purpose), not a new one.
+walkdir = "2"
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+yadorilink-sync-substrate = { path = "../yadorilink-sync-substrate", features = ["test-support"] }
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[lints]
+workspace = true

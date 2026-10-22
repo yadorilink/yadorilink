@@ -1,0 +1,122 @@
+[package]
+name = "yadorilink-shell-ext-windows"
+version = "0.1.0-beta.1"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+# spike: not a member of the root workspace —
+# this crate only builds on Windows (windows-rs COM bindings don't
+# typecheck on other targets), and the primary dev machine for this
+# project is not Windows. Build on a Windows machine with
+# `cargo build --release --manifest-path crates/yadorilink-shell-ext-windows/Cargo.toml`
+# from the repository root (or `cargo build --release` from this directory). The empty [workspace] table below marks
+# this as its own workspace root, so Cargo doesn't try to fold it into
+# the parent repo's workspace just because it's nested under it.
+[workspace]
+
+[lib]
+name = "yadorilink_shell_ext"
+crate-type = ["cdylib", "rlib"]
+
+# 6.3: the Cloud Filter API sync-root
+# registration/placeholder/fetch-data-callback logic runs in a separate,
+# long-lived host process (`yadorilink-cfapi-host`), not inside the
+# `yadorilink_shell_ext` COM DLL (`cdylib`) that loads into every
+# Explorer.exe process. Two reasons: (a) `CfConnectSyncRoot`'s callback
+# registration needs to stay alive for as long as the sync root is meant
+# to serve fetch-data callbacks, which does not match a COM DLL's
+# load/unload lifecycle inside Explorer (`DllCanUnloadNow` here already
+# reports "always unloadable", intentionally, per the overlay identifiers'
+# stateless-per-call design — pinning it open just for cfapi would change
+# that contract for the whole DLL); (b) this mirrors how every real cfapi
+# sync provider (OneDrive, Dropbox) is structured: a background sync
+# engine process owns the sync root connection, while the shell extension
+# DLL is a thin, frequently-loaded/unloaded UI-only client. The `rlib`
+# crate-type lets this new binary reuse `ipc_client`/`cfapi` from the same
+# crate without duplicating the IPC plumbing.
+[[bin]]
+name = "yadorilink-cfapi-host"
+path = "src/bin/cfapi_host.rs"
+
+[dependencies]
+sha2 = "0.11"
+yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
+# The provider host's Win32-free policy: it builds and tests on every platform in the root
+# workspace; this crate keeps the pipe transport and the operating-system calls.
+yadorilink-windows-provider-policy = { path = "../yadorilink-windows-provider-policy" }
+# `durable_dir`: the durable publish, move and removal of the host's own state
+# files and of the user's files it keeps under another name.
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
+# `macros` (for `#[tokio::test]`) is only exercised by this crate's own
+# tests but declared here rather than a dev-dependency override, matching
+# the macOS app's own reasoning.
+# `sync` is required by the production dehydrate server's bounded
+# `tokio::sync::Semaphore` admission gate.
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "time", "io-util", "macros", "sync"] }
+# The `#[implement]` macro's generated code references `windows_core::...`
+# at the crate root directly, not through `windows::core` — an explicit
+# dependency (not just relying on `windows`'s re-export) is required for
+# that to resolve. A dependency scanner cannot see this: no source line
+# names the crate, so `cargo machete` reports it as unused. It is not --
+# removing it fails the Windows build with `cannot find windows_core in
+# the crate root`.
+windows-core = "0.58"
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "implement",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Ole",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+    # 6.3: Cloud Filter API (CfRegisterSyncRoot,
+    # CfCreatePlaceholders, CfConnectSyncRoot, CfExecute, the
+    # CF_CALLBACK_* family) plus its Win32_Storage_FileSystem/
+    # Win32_System_IO/Win32_System_CorrelationVector prerequisites (several
+    # cfapi structs, e.g. CF_OPERATION_INFO/CF_CALLBACK_REGISTRATION, are
+    # `#[cfg]`-gated behind these in windows-rs's generated bindings).
+    "Win32_Storage_CloudFilters",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_CorrelationVector",
+]
+
+# `yadorilink-daemon`'s own Windows-only cfapi/named-pipe-server code
+# (`placeholder_inspect_windows.rs`, `windows_pipe_security.rs`) uses
+# `windows-sys` (raw FFI, manual HRESULT/`GetLastError` checks), not the
+# higher-level `windows` crate above -- and that code has actually been
+# exercised against real cfapi on a Windows 11 VM (see those modules' own
+# doc comments), unlike any `windows`-crate-idiomatic binding for
+# `CfGetPlaceholderInfo`/`CfDehydratePlaceholder`, which nothing in this
+# codebase has ever called through the `windows` crate before. The new
+# dehydrate pipe server (`dehydrate_server.rs`) and its `CfGetPlaceholderInfo`/
+# `CfDehydratePlaceholder` calls (`cfapi.rs`) reuse the SAME already-proven
+# `windows-sys` patterns verbatim rather than gambling on unverified
+# `windows`-crate signatures for functions this crate has never bound.
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_CloudFilters",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+]
+
+[profile.release]
+lto = true

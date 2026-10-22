@@ -1,0 +1,30 @@
+name: Set up Rust
+description: Toolchain, protoc and cargo cache shared by the CI workflows.
+inputs:
+  cache-key:
+    description: rust-cache key
+    required: true
+  components:
+    description: Extra rustup components
+    default: ""
+  protoc:
+    description: Install protoc
+    default: "true"
+  token:
+    description: Token for the protoc download
+    required: true
+runs:
+  using: composite
+  steps:
+    - if: inputs.protoc == 'true'
+      uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+      with:
+        repo-token: ${{ inputs.token }}
+    - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master @ 2026-06-30
+      with:
+        toolchain: stable
+        components: ${{ inputs.components }}
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        key: ${{ inputs.cache-key }}
+        save-if: ${{ github.ref == 'refs/heads/main' }}

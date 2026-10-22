@@ -1,0 +1,1242 @@
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]*']
+  workflow_dispatch:
+
+concurrency:
+  group: public-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # What the corresponding-source pointer shipped in every artifact names: the
+  # tag for a tagged build, otherwise the exact commit.
+  YADORILINK_SOURCE_REF: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || github.sha }}
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Release tag matches shipped versions
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: bash .github/release/check-release-version.sh "$GITHUB_REF_NAME"
+
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master @ 2026-06-30
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Tag builds publish what they build: never write the shared cache.
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          key: ${{ matrix.os }}-public-ci
+
+      - name: Check formatting
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Clippy
+        if: matrix.os != 'ubuntu-latest'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo build --workspace --all-targets
+
+      - name: Build
+        if: matrix.os != 'ubuntu-latest'
+        run: cargo build --workspace --all-targets
+
+      # Two yadorilink-local-capture lib tests install a process-wide scan
+      # hook and must never observe a sibling test's own hook -- they serialize
+      # against each other internally, but running alongside the rest of a
+      # multi-threaded workspace pass under host load has been observed to
+      # hang the whole `cargo test` invocation, not just flake. Skipped here
+      # (workspace-wide, but these two names are unique enough that this
+      # can't accidentally skip anything unrelated) and run on their own
+      # below instead.
+      - name: Test (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test --workspace --exclude yadorilink-daemon -- --skip startup_barrier_prevents_stale_overwrite_of_concurrent_peer_change --skip startup_scan_stale_overwrites_concurrent_peer_change_without_barrier
+
+      - name: Test
+        if: matrix.os == 'macos-latest'
+        run: cargo test --workspace --exclude yadorilink-daemon -- --skip startup_barrier_prevents_stale_overwrite_of_concurrent_peer_change --skip startup_scan_stale_overwrites_concurrent_peer_change_without_barrier
+
+      - name: Test
+        if: matrix.os == 'windows-latest'
+        run: cargo test --workspace --exclude yadorilink-daemon -- --test-threads=4 --skip startup_barrier_prevents_stale_overwrite_of_concurrent_peer_change --skip startup_scan_stale_overwrites_concurrent_peer_change_without_barrier
+
+      # tests/release_manifest_chain.rs drives the Python manifest verifier,
+      # which needs the cryptography package. setup-python gives a Python
+      # that pip may install into (the runner images' own may not allow it).
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Python cryptography for the release manifest chain test
+        run: python3 -m pip install --quiet --disable-pip-version-check cryptography
+
+      # yadorilink-daemon's integration tests spin up multiple real
+      # in-process daemons over real loopback UDP/Unix sockets and real
+      # SQLite databases; run concurrently with the rest of the workspace's
+      # tests (or with each other), they contend for those real resources
+      # and can flake under host load -- the same reason the daemon's own
+      # dev-side CI runs them in an isolated single-threaded lane instead of
+      # folding them into a workspace-wide test run. Excluded above and run
+      # here alone, single-threaded, so this job's pass/fail signal never
+      # depends on that contention.
+      - name: Daemon tests (isolated from the rest of the workspace, single-threaded)
+        run: cargo test -p yadorilink-daemon -- --test-threads=1
+
+      # These real-UDP-peer-session/crash-recovery integration tests (moved
+      # out of the now-deleted yadorilink-sync-core crate to
+      # yadorilink-peer-session/yadorilink-daemon) carry the same class of
+      # real-socket/real-disk timing-sensitive assertions as the daemon
+      # crate above -- their own dev-side CI runs a matching isolated
+      # single-threaded lane for exactly this reason. NOT excluded from the
+      # main Test step above: cheap enough that the redundancy of also
+      # running them in the main multi-threaded pass is worth the extra
+      # reliability.
+      - name: Wire integration tests (isolated, single-threaded)
+        run: |
+          cargo test -p yadorilink-peer-session --test peer_session -- --test-threads=1
+          cargo test -p yadorilink-daemon --test watcher_decompose_conformance -- --test-threads=1
+
+      # The two lib tests skipped above, run alone and single-threaded so
+      # their internal scan-hook serialization is never itself the thing
+      # contending with the rest of the workspace under host load.
+      - name: Scan-hook lib tests (isolated, single-threaded)
+        run: cargo test -p yadorilink-local-capture --lib -- --test-threads=1 startup_barrier_prevents_stale_overwrite_of_concurrent_peer_change startup_scan_stale_overwrites_concurrent_peer_change_without_barrier
+
+  # Required gates for everything this workflow publishes or builds for release:
+  # the development manifest key is rejected by the release packagers, release
+  # builds enforce the real trust root, and the gate script itself is proven to
+  # fail when any of that is bypassed. Jobs that hold the release environment
+  # additionally run `check-release-gates.py --config` against the real key.
+  # Deliberately unconditional and without continue-on-error.
+  release-gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: python3 .github/release/check-release-gates.py
+      - run: python3 .github/release/check-release-gates.py --self-test
+      - run: python3 .github/release/build-engine-bundle.py --self-test
+      - run: python3 .github/release/csharp-binding.py --self-test
+      - run: python3 .github/release/third-party-licenses.py --self-test
+      - run: python3 .github/release/csharp-binding.py pin-check
+      - run: python3 .github/checks/validate-engine-identity.py --self-test
+      - run: python3 .github/checks/check-engine-artifact.py --self-test
+      - run: python3 .github/checks/check-release-dir-secrets.py
+      - run: python3 .github/checks/check-release-dir-secrets.py --self-test
+      - run: python3 -m pip install --quiet --disable-pip-version-check cryptography
+      - run: python3 .github/release/check-signing-workflow.py
+      - run: python3 .github/release/check-signing-workflow.py --self-test
+      - run: python3 .github/release/test_sign_request.py
+
+  shell-ext-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master @ 2026-06-30
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Tag builds publish what they build: never write the shared cache.
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          workspaces: crates/yadorilink-shell-ext-windows
+
+      - name: Check formatting
+        working-directory: crates/yadorilink-shell-ext-windows
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        working-directory: crates/yadorilink-shell-ext-windows
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        working-directory: crates/yadorilink-shell-ext-windows
+        run: cargo build --release
+
+  cargo-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master @ 2026-06-30
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
+      - name: Audit
+        run: cargo audit
+
+  linux-artifacts:
+    runs-on: ubuntu-latest
+    env:
+      # Release binaries talk to the production coordination service by default.
+      # Users can still override it with YADORILINK_COORDINATION_ADDR.
+      YADORILINK_DEFAULT_COORDINATION_ADDR: https://control.yadori.link
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master @ 2026-06-30
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Tag builds publish what they build: never write the shared cache.
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          key: ubuntu-release
+
+      - name: Build release binaries
+        run: cargo build --workspace --release
+
+      - name: Package Linux binary archive
+        run: |
+          set -euo pipefail
+          version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+          arch="$(uname -m)"
+          mkdir -p release/linux/bin
+          cp target/release/yadorilink \
+             target/release/yadorilink-daemon \
+             release/linux/bin/
+          bash .github/release/write-source-notice.sh "$YADORILINK_SOURCE_REF" release/linux/bin
+          tar -C release/linux/bin -czf "release/linux/yadorilink-${version}-linux-${arch}-binaries.tar.gz" .
+          python3 .github/release/generate-release-checksums.py \
+            --sidecars \
+            "release/linux/yadorilink-${version}-linux-${arch}-binaries.tar.gz"
+
+      - name: Build Debian package
+        run: ./packaging/linux/build-deb.sh
+
+      - name: Install lintian
+        run: sudo apt-get update && sudo apt-get install -y lintian
+
+      - name: Verify Debian package
+        run: |
+          set -euo pipefail
+          deb_file="$(find packaging/linux/dist -maxdepth 1 -name '*.deb' -print -quit)"
+          if [ -z "$deb_file" ]; then
+            echo "No .deb file found under packaging/linux/dist" >&2
+            exit 1
+          fi
+          ./packaging/linux/verify-deb.sh "$deb_file"
+
+      - name: Collect Linux artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p release/linux
+          cp packaging/linux/dist/*.deb packaging/linux/dist/*.deb.sha256 release/linux/
+          version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+          arch="$(uname -m)"
+          python3 .github/release/generate-release-checksums.py \
+            --out release/linux/SHA256SUMS \
+            "release/linux/yadorilink-${version}-linux-${arch}-binaries.tar.gz" \
+            release/linux/*.deb
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: yadorilink-linux-artifacts
+          path: release/linux
+          if-no-files-found: error
+
+  # Multi-arch (amd64+arm64) yadorilink-daemon image, published to GHCR --
+  # see packaging/docker/Dockerfile's header for what it contains and why.
+  # Gated like the other publishing jobs: this pushes
+  # to a registry (not just an unpublished build-health artifact), so fork
+  # PRs must never reach it. Unlike that job this needs no protected
+  # Environment secret -- GITHUB_TOKEN's per-job `packages: write`
+  # permission is already scoped to this one run by GitHub, not a
+  # long-lived credential this workflow manages.
+  docker-artifacts:
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Nightly (rolling, main) gets a single floating `nightly` tag,
+      # matching the nightly-release job's rolling-tag/`--clobber` model.
+      # A stable version tag gets both an immutable `<version>` tag and a
+      # floating `latest`; a pre-release tag (vX.Y.Z-beta.N) gets only the
+      # immutable tag and never `latest`, matching beta-release's "immutable, never
+      # force-moved" GitHub Release model for the version tag itself --
+      # `latest` is the one floating exception, same as every other image
+      # registry's convention.
+      - name: Compute image tags
+        id: tags
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${{ github.repository_owner }}/yadorilink-daemon"
+          printf 'tags=%s\n' "$(bash .github/release/docker-image-tags.sh "$image" "$REF")" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: packaging/docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            YADORILINK_DEFAULT_COORDINATION_ADDR=https://control.yadori.link
+            YADORILINK_SOURCE_REF=${{ env.YADORILINK_SOURCE_REF }}
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+
+  windows-build-health:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master @ 2026-06-30
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Tag builds publish what they build: never write the shared cache.
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          key: windows-release
+
+      - name: Build release binaries
+        run: cargo build --workspace --release
+
+      - name: Build Windows shell extension
+        working-directory: crates/yadorilink-shell-ext-windows
+        run: cargo build --release
+
+      - name: Package Windows binary archive
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"$').Matches[0].Groups[1].Value
+          New-Item -ItemType Directory -Force -Path release/windows/bin | Out-Null
+          Copy-Item target/release/yadorilink.exe,
+                    target/release/yadorilink-daemon.exe -Destination release/windows/bin
+          Copy-Item crates/yadorilink-shell-ext-windows/target/release/yadorilink_shell_ext.dll,
+                    crates/yadorilink-shell-ext-windows/target/release/yadorilink-cfapi-host.exe -Destination release/windows/bin
+          bash .github/release/write-source-notice.sh $env:YADORILINK_SOURCE_REF release/windows/bin
+          $zipPath = "release/windows/yadorilink-$version-windows-x86_64-binaries.zip"
+          Compress-Archive -Path release/windows/bin/* -DestinationPath $zipPath -Force
+          py -3 .github/release/generate-release-checksums.py --sidecars $zipPath
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: yadorilink-windows-build-health
+          path: release/windows
+          if-no-files-found: error
+
+  macos-build-health:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master @ 2026-06-30
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Tag builds publish what they build: never write the shared cache.
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          key: macos-release
+
+      - name: Build release binaries
+        run: cargo build --workspace --release
+
+      - name: Package macOS binary archive (CI-internal, never released)
+        run: |
+          set -euo pipefail
+          version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+          arch="$(uname -m)"
+          mkdir -p release/macos/bin
+          cp target/release/yadorilink \
+             target/release/yadorilink-daemon \
+             release/macos/bin/
+          bash .github/release/write-source-notice.sh "$YADORILINK_SOURCE_REF" release/macos
+          cat > release/macos/README.txt <<'EOF'
+          This tar.gz contains the bare, unsigned macOS binaries for build-health checks.
+          This build-health artifact is always unsigned and receives no signing secrets.
+          The signed macOS app is built from its own repository against the engine bundle.
+          EOF
+          tar -C release/macos -czf "release/macos/yadorilink-${version}-macos-${arch}-binaries.tar.gz" bin README.txt LICENSE SOURCE.txt
+          python3 .github/release/generate-release-checksums.py \
+            --sidecars \
+            "release/macos/yadorilink-${version}-macos-${arch}-binaries.tar.gz"
+          python3 .github/release/generate-release-checksums.py \
+            --out release/macos/SHA256SUMS \
+            "release/macos/yadorilink-${version}-macos-${arch}-binaries.tar.gz"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: yadorilink-macos-build-health
+          path: release/macos
+          if-no-files-found: error
+
+  # Per-channel engine bundle (zip), built from this tree with the real release
+  # trust root. This job is deliberately unprivileged: no environment, no
+  # secrets, read-only token. It is the only place the pinned third-party
+  # binding generators are built and run, so external code never executes in
+  # the protected signing job below (check-release-gates.py enforces this). The
+  # bundle and its SHA-256 sidecar leave it as a workflow artifact that
+  # engine-attest attests it and engine-bundle checks that attestation.
+  engine-build:
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    needs:
+      - release-gates
+      - build-and-test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+            triple: x86_64-unknown-linux-gnu
+            bin_dir: target/release
+          - os: windows-latest
+            target: windows-x86_64
+            triple: x86_64-pc-windows-msvc
+            bin_dir: target/release
+          - os: macos-latest
+            target: macos-aarch64
+            triple: aarch64-apple-darwin
+            bin_dir: target/aarch64-apple-darwin/release
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      # Same production default as the other release builds.
+      YADORILINK_DEFAULT_COORDINATION_ADDR: https://control.yadori.link
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Verify the release key
+        env:
+          YADORILINK_RELEASE_MANIFEST_KEY_ID: ${{ vars.RELEASE_MANIFEST_KEY_ID }}
+          YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
+        shell: bash
+        run: python3 .github/release/check-release-gates.py --config
+
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ github.token }}
+
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master @ 2026-06-30
+        with:
+          toolchain: stable
+
+      # The programs embed the identity of the build they are part of, so a caller never
+      # infers its build from where it is installed. The settings here must equal the ones
+      # given to `build` below; `build --expect-release-id` refuses the bundle if they differ.
+      - name: Compute the release identity the binaries embed
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          TAGGED: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          PUBLIC_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$TAGGED" = "true" ]; then channel=beta; else channel=dev; fi
+          release_id="$(python3 .github/release/build-engine-bundle.py release-id \
+            --channel "$channel" \
+            --target "$TARGET" \
+            --public-commit-sha "$PUBLIC_SHA" \
+            --build-config "features=yadorilink-daemon/enforce-release-trust-root" \
+            --build-config "coordination_addr=${YADORILINK_DEFAULT_COORDINATION_ADDR}" \
+            --build-config "rustc=$(rustc -V)" \
+            --build-config "cargo_lock_sha256=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open("Cargo.lock","rb").read()).hexdigest())')")"
+          echo "YADORILINK_RELEASE_ID=$release_id" >> "$GITHUB_ENV"
+          echo "YADORILINK_CHANNEL=$channel" >> "$GITHUB_ENV"
+
+      - name: Build engine binaries with the enforced trust root
+        if: matrix.target != 'macos-aarch64'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          YADORILINK_RELEASE_MANIFEST_KEY_ID: ${{ vars.RELEASE_MANIFEST_KEY_ID }}
+          YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
+        run: |
+          set -euo pipefail
+          packages=(-p yadorilink-cli -p yadorilink-daemon)
+          if [ "$TARGET" = "windows-x86_64" ]; then packages+=(-p yadorilink-client-ffi); fi
+          cargo build --release --locked "${packages[@]}" \
+            --features yadorilink-daemon/enforce-release-trust-root
+
+      # The Windows shell extension and CfAPI host are their own workspace.
+      - name: Build the Windows shell extension
+        if: matrix.target == 'windows-x86_64'
+        working-directory: crates/yadorilink-shell-ext-windows
+        shell: bash
+        run: cargo build --release --locked
+
+      # The macOS app links the static library and compiles the Swift binding
+      # generated from it; the bundle ships both, built together here.
+      - name: Build macOS engine, static library and Swift binding
+        if: matrix.target == 'macos-aarch64'
+        shell: bash
+        env:
+          YADORILINK_RELEASE_MANIFEST_KEY_ID: ${{ vars.RELEASE_MANIFEST_KEY_ID }}
+          YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target aarch64-apple-darwin \
+            -p yadorilink-cli -p yadorilink-daemon -p yadorilink-client-ffi \
+            --features yadorilink-daemon/enforce-release-trust-root
+          .github/release/generate-swift-binding.sh --out "$RUNNER_TEMP/swift-binding"
+
+      # The Windows app loads the client facade library through the C# generated
+      # from that same library; the bundle ships both, built together here.
+      - name: Generate the C# binding
+        if: matrix.target == 'windows-x86_64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          .github/release/generate-csharp-binding.sh \
+            --library target/release/yadorilink_client_ffi.dll \
+            --out "$RUNNER_TEMP/csharp-binding"
+
+      - name: Install cargo-about
+        uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
+        with:
+          tool: cargo-about@0.9.2
+
+      - name: Generate the third-party license notice
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          # The licence notice for the crates compiled into this bundle, from
+          # Cargo.lock for this platform's packages. Unprivileged job only: the
+          # tool reads third-party crate sources.
+          set -euo pipefail
+          manifests=(crates/yadorilink-cli/Cargo.toml crates/yadorilink-daemon/Cargo.toml)
+          if [ "$TARGET" != "linux-x86_64" ]; then manifests+=(crates/yadorilink-client-ffi/Cargo.toml); fi
+          if [ "$TARGET" = "windows-x86_64" ]; then manifests+=(crates/yadorilink-shell-ext-windows/Cargo.toml); fi
+          .github/release/generate-third-party-licenses.sh "$RUNNER_TEMP/THIRD-PARTY-LICENSES" --target "$TRIPLE" "${manifests[@]}"
+
+      - name: Build bundle, checksums and identity
+        id: bundle
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BIN_DIR: ${{ matrix.bin_dir }}
+          TAGGED: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          REF_NAME: ${{ github.ref_name }}
+          PUBLIC_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$TAGGED" = "true" ]; then
+            channel=beta
+            release_tag="$REF_NAME"
+          else
+            channel=dev
+            release_tag=nightly
+          fi
+          python3 .github/release/build-engine-bundle.py build \
+            --channel "$channel" \
+            --target "$TARGET" \
+            --root "bin=$BIN_DIR" \
+            --root "shell=crates/yadorilink-shell-ext-windows/target/release" \
+            --root "generated=${RUNNER_TEMP}/swift-binding/Generated" \
+            --root "csharp=${RUNNER_TEMP}/csharp-binding" \
+            --root "ipc=crates/yadorilink-ipc-proto" \
+            --third-party-licenses "$RUNNER_TEMP/THIRD-PARTY-LICENSES" \
+            --public-commit-sha "$PUBLIC_SHA" \
+            --expect-release-id "$YADORILINK_RELEASE_ID" \
+            --repository "$REPOSITORY" \
+            --release-tag "$release_tag" \
+            --build-config "features=yadorilink-daemon/enforce-release-trust-root" \
+            --build-config "coordination_addr=${YADORILINK_DEFAULT_COORDINATION_ADDR}" \
+            --build-config "rustc=$(rustc -V)" \
+            --build-config "cargo_lock_sha256=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open("Cargo.lock","rb").read()).hexdigest())')" \
+            --out-dir engine-bundle
+          ls -la engine-bundle
+
+      - name: Verify the bundle before anything from it runs
+        shell: bash
+        env:
+          TAGGED: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          TARGET: ${{ matrix.target }}
+          # The daemon's path inside the bundle (see engine-bundle-layout.md).
+          DAEMON: ${{ matrix.target == 'windows-x86_64' && 'yadorilink-daemon.exe' || matrix.target == 'macos-aarch64' && 'bin/yadorilink-daemon' || 'yadorilink-daemon' }}
+        run: |
+          set -euo pipefail
+          zip="$(ls engine-bundle/*.zip)"
+          expected="$(cut -d' ' -f1 "${zip}.sha256")"
+          # A tagged release accepts only a release bundle; the nightly build is a dev bundle.
+          release=()
+          if [ "$TAGGED" = "true" ]; then release=(--release); fi
+          python3 .github/release/build-engine-bundle.py verify "$zip" --target "$TARGET" --expect-zip-sha256 "$expected" ${release[@]+"${release[@]}"}
+          mkdir engine-bundle-check
+          python3 -m zipfile -e "$zip" engine-bundle-check
+          # zipfile extraction drops the executable bit recorded in the archive.
+          chmod +x "engine-bundle-check/$DAEMON"
+          # Only after every hash matched: the daemon's digest and host api.
+          python3 .github/checks/check-engine-artifact.py --require-embedded-id \
+            engine-bundle-check/engine-identity.json \
+            "engine-bundle-check/$DAEMON"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: engine-build-${{ matrix.target }}
+          path: engine-bundle
+          if-no-files-found: error
+
+  # Attestation half: the only job with id-token/attestations. It downloads
+  # just this run's engine-build artifact, re-verifies it by hash (nothing from
+  # it runs) and has GitHub sign a build-provenance attestation for the zip.
+  # No environment, no secrets, no generator, no build step belongs here
+  # (check-release-gates.py enforces it). The attestation proves which workflow
+  # run on which commit produced these bytes, not that the generators that ran
+  # in engine-build were harmless.
+  engine-attest:
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    needs:
+      - release-gates
+      - engine-build
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [linux-x86_64, windows-x86_64, macos-aarch64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # Same workflow run only: no run-id, repository or token inputs.
+      - name: Download the unprivileged build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: engine-build-${{ matrix.target }}
+          path: engine-unverified
+
+      - name: Re-verify the bundle by hash only
+        shell: bash
+        env:
+          TAGGED: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          zips=(engine-unverified/*.zip)
+          [ "${#zips[@]}" -eq 1 ] || { echo "expected exactly one bundle zip" >&2; exit 1; }
+          zip="${zips[0]}"
+          expected="$(cut -d' ' -f1 "${zip}.sha256")"
+          # A tagged release accepts only a release bundle; the nightly build is a dev bundle.
+          release=()
+          if [ "$TAGGED" = "true" ]; then release=(--release); fi
+          python3 .github/release/build-engine-bundle.py verify "$zip" --target "$TARGET" --expect-zip-sha256 "$expected" ${release[@]+"${release[@]}"}
+
+      # The one-line installers are released as the files of the tagged source and attested here
+      # with the bundle (the attestation is verified before they are vendored anywhere else).
+      # The pin block is checked first: both installers must pin the same trust set and no
+      # development key.
+      - name: Check the installer pins
+        run: python3 packaging/install/pins.py check
+
+      # A tagged release ships installers that pin the verifier: publish verifier-N first, pin
+      # its hash (pins.py set --verifier-sha) and tag the commit that carries the pins.
+      - name: Require the verifier pins on a release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: python3 packaging/install/pins.py check --require-verifier
+
+      - name: Attest the bundle
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            engine-unverified/*.zip
+            packaging/install/install.sh
+            packaging/install/install.ps1
+
+  # Protected half: only downloads the engine-build artifact, checks its
+  # attestation, re-verifies it by
+  # hash (verify mode hashes and compares; nothing from the artifact runs),
+  # then writes and signs the provenance statement. No toolchain, no generator,
+  # no build step belongs here (check-release-gates.py enforces it).
+  engine-bundle:
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    needs:
+      - release-gates
+      - build-and-test
+      - engine-build
+      - engine-attest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [linux-x86_64, windows-x86_64, macos-aarch64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release-signing
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Verify the release key
+        env:
+          YADORILINK_RELEASE_MANIFEST_KEY_ID: ${{ vars.RELEASE_MANIFEST_KEY_ID }}
+          YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
+        shell: bash
+        run: python3 .github/release/check-release-gates.py --config
+
+      - name: Download the unprivileged build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: engine-build-${{ matrix.target }}
+          path: engine-unverified
+
+      - name: Verify the attestation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          zips=(engine-unverified/*.zip)
+          [ "${#zips[@]}" -eq 1 ] || { echo "expected exactly one bundle zip" >&2; exit 1; }
+          gh attestation verify "${zips[0]}" \
+            --repo ${{ github.repository }} \
+            --signer-workflow ${{ github.repository }}/.github/workflows/release.yml \
+            --source-digest ${{ github.sha }} \
+            --source-ref ${{ github.ref }} \
+            --format json > "$RUNNER_TEMP/attestation.json"
+
+      - name: Re-verify the bundle by hash only
+        shell: bash
+        env:
+          TAGGED: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          zips=(engine-unverified/*.zip)
+          [ "${#zips[@]}" -eq 1 ] || { echo "expected exactly one bundle zip" >&2; exit 1; }
+          zip="${zips[0]}"
+          expected="$(cut -d' ' -f1 "${zip}.sha256")"
+          # A tagged release accepts only a release bundle; the nightly build is a dev bundle.
+          release=()
+          if [ "$TAGGED" = "true" ]; then release=(--release); fi
+          python3 .github/release/build-engine-bundle.py verify "$zip" --target "$TARGET" --expect-zip-sha256 "$expected" ${release[@]+"${release[@]}"}
+          mkdir engine-bundle
+          cp "$zip" "${zip}.sha256" engine-bundle/
+
+      - name: Write and sign provenance
+        shell: bash
+        env:
+          TAGGED: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          TARGET: ${{ matrix.target }}
+          PUBLIC_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          # Optional hook: a command that signs the provenance statement it is
+          # given by writing `<statement>.sig`. Unset means unsigned provenance.
+          PROVENANCE_SIGN_CMD: ${{ vars.ENGINE_PROVENANCE_SIGN_CMD }}
+        run: |
+          set -euo pipefail
+          sign=()
+          if [ -n "${PROVENANCE_SIGN_CMD:-}" ]; then sign=(--sign-cmd "$PROVENANCE_SIGN_CMD"); fi
+          release=()
+          if [ "$TAGGED" = "true" ]; then release=(--release); fi
+          python3 .github/release/build-engine-bundle.py provenance engine-bundle/*.zip \
+            ${release[@]+"${release[@]}"} \
+            --target "$TARGET" \
+            --public-commit-sha "$PUBLIC_SHA" \
+            --repository "$REPOSITORY" \
+            --attestation-json "$RUNNER_TEMP/attestation.json" \
+            --gate release-gates \
+            --gate release-config \
+            "${sign[@]}" \
+            --out-dir engine-bundle
+          ls -la engine-bundle
+
+      # The lock a consumer pins (Apple Engine/update-pin.sh, Windows engine.lock):
+      # the verified bundle's own engine identity, released next to the zip as
+      # engine.lock.<target>.json. Its public_commit_sha is the tagged commit.
+      - name: Write the engine.lock asset
+        shell: bash
+        env:
+          TAGGED: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          TARGET: ${{ matrix.target }}
+          PUBLIC_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          release=()
+          if [ "$TAGGED" = "true" ]; then release=(--release); fi
+          python3 .github/release/build-engine-bundle.py lock engine-bundle/*.zip \
+            ${release[@]+"${release[@]}"} \
+            --target "$TARGET" \
+            --public-commit-sha "$PUBLIC_SHA" \
+            --out-dir engine-bundle
+          ls -la engine-bundle
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: engine-bundle-${{ matrix.target }}
+          path: engine-bundle
+          if-no-files-found: error
+
+  nightly-release:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs:
+      - release-gates
+      - engine-bundle
+      - build-and-test
+      - shell-ext-windows
+      - windows-build-health
+      - cargo-audit
+      - linux-artifacts
+      - macos-build-health
+    runs-on: ubuntu-latest
+    # Main pushes wait for an explicit reviewer before the rolling nightly release is
+    # published. This job writes release assets only: it never generates, signs or
+    # publishes an update manifest (sign-manifest.yml is the only signer; the separate
+    # channel-publish workflow is the only distributor).
+    environment: release-signing
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1  # zizmor: ignore[artipacked] -- pushes the rolling nightly tag with git
+
+      - name: Verify the release key
+        env:
+          YADORILINK_RELEASE_MANIFEST_KEY_ID: ${{ vars.RELEASE_MANIFEST_KEY_ID }}
+          YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
+        run: python3 .github/release/check-release-gates.py --config
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: release-assets
+
+      - name: Flatten release assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find release-assets/yadorilink-linux-artifacts -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
+          cp release-assets/yadorilink-linux-artifacts/SHA256SUMS dist/SHA256SUMS-linux
+          cp dist/yadorilink-*-linux-x86_64-binaries.tar.gz dist/yadorilink-linux-x86_64.tar.gz
+          cp dist/yadorilink_*_amd64.deb dist/yadorilink-linux-amd64.deb
+          sidecar_targets=(
+            dist/yadorilink-linux-x86_64.tar.gz
+            dist/yadorilink-linux-amd64.deb
+          )
+          python3 .github/release/generate-release-checksums.py --sidecars "${sidecar_targets[@]}"
+          ls -la dist
+
+      - name: Add engine bundles
+        run: |
+          set -euo pipefail
+          # Each bundle zip, its checksum sidecar and its provenance statement
+          # (and signature, when the signing hook ran) are released as-is: the
+          # zip bytes are what the consumers' lock files pin.
+          for d in release-assets/engine-bundle-*; do
+            find "$d" -maxdepth 1 -type f -exec cp {} dist/ \;
+          done
+          ls dist/yadorilink-engine-*.zip
+
+      - name: Create or update nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f nightly "$GITHUB_SHA"
+          git push origin refs/tags/nightly --force
+
+          notes="Approved build from main at ${GITHUB_SHA}. Pre-1.0 development build. Release installers are produced only by protected code-signing jobs."
+          if gh release view nightly >/dev/null 2>&1; then
+            gh release edit nightly \
+              --title "Nightly build" \
+              --notes "$notes" \
+              --prerelease \
+              --target "$GITHUB_SHA"
+          else
+            gh release create nightly \
+              --title "Nightly build" \
+              --notes "$notes" \
+              --prerelease \
+              --target "$GITHUB_SHA"
+          fi
+
+          # README.txt was only ever produced by macos-build-health's tar.gz,
+          # which stopped being published here once macos-artifacts became
+          # the source of the macOS archive -- `gh release upload --clobber`
+          # only adds/overwrites, it never removes an asset that stops being
+          # generated, so a rolling release like `nightly` would otherwise
+          # keep serving this stale, now-inaccurate file forever. Safe to run
+          # every time: a no-op once the asset is already gone.
+          gh release delete-asset nightly README.txt --yes || true
+          # Same for the raw macOS tar.gz, no longer an official asset.
+          gh release view nightly --json assets --jq '.assets[].name' \
+            | grep -E '^yadorilink(-.*-macos-.*-binaries|-macos)\.tar\.gz(\.sha256)?$' \
+            | while read -r asset; do gh release delete-asset nightly "$asset" --yes; done || true
+          # Installers, the Windows binary zip and the update manifest are no
+          # longer built here; retire the ones an earlier nightly published so
+          # they are not served as part of this build. Whatever this run
+          # produces is uploaded again below.
+          gh release view nightly --json assets --jq '.assets[].name' \
+            | grep -E '^(yadorilink-macos\.pkg|yadorilink-[0-9][^ ]*\.pkg|yadorilink-[0-9][^ ]*-unsigned\.pkg|yadorilink-setup(-unsigned)?\.exe|yadorilink-windows-x86_64\.zip|yadorilink-.*-windows-x86_64-binaries\.zip|SHA256SUMS-(macos|windows)|manifest-nightly\.json)(\.sha256|\.provenance\.json)?$' \
+            | while read -r asset; do gh release delete-asset nightly "$asset" --yes; done || true
+
+          gh release upload nightly dist/* --clobber
+
+  beta-release:
+    # Versioned, immutable beta releases are cut by pushing a semver tag
+    # (v*). Never force-moved; never overwritten.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - release-gates
+      - engine-bundle
+      - build-and-test
+      - shell-ext-windows
+      - windows-build-health
+      - cargo-audit
+      - linux-artifacts
+      - macos-build-health
+    runs-on: ubuntu-latest
+    # Environment-bound for the APT archive key only. The update manifest is not built,
+    # signed or published here (sign-manifest.yml signs, the separate channel-publish
+    # workflow distributes); a tag push alone never signs or distributes a manifest.
+    environment: release-signing
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve tag and enforce immutability
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          version="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # A prior runner failure can leave an invisible draft. It is owned by
+          # this tag-triggered workflow and is safe to remove before retrying.
+          # Published releases remain immutable and are never deleted here.
+          if release_json="$(gh release view "$tag" --json isDraft 2>/dev/null)"; then
+            if [ "$(printf '%s' "$release_json" | jq -r '.isDraft')" = "true" ]; then
+              echo "Removing incomplete draft from a previous $tag attempt."
+              gh release delete "$tag" --yes
+              if gh release view "$tag" >/dev/null 2>&1; then
+                echo "Incomplete draft $tag still exists after deletion; refusing to continue." >&2
+                exit 1
+              fi
+            else
+              echo "Refusing to publish: release $tag already exists (beta releases are immutable)." >&2
+              exit 1
+            fi
+          fi
+
+      - name: Verify beta release gate is complete
+        env:
+          GATE_ACK: ${{ vars.BETA_RELEASE_GATE_ACK }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Promotion nightly -> beta requires the beta-release-gate checklist
+          # complete with pass/fail evidence. CI cannot execute
+          # the manual gate; it enforces an explicit, per-tag human sign-off:
+          # the repo variable BETA_RELEASE_GATE_ACK must equal the tag being
+          # published (set it after recording gate evidence). This blocks a
+          # beta tag whose gate has not been acknowledged.
+          if [ "${GATE_ACK:-}" != "$TAG" ]; then
+            echo "beta-release-gate not acknowledged for $TAG." >&2
+            echo "Set repo variable BETA_RELEASE_GATE_ACK=$TAG after completing the beta release gate checklist." >&2
+            exit 1
+          fi
+
+      - name: Extract CHANGELOG section for this tag
+        id: notes
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="$TAG"
+          # Pull the section whose heading references this tag; require it to
+          # exist so every beta ships human-readable notes + a CHANGELOG entry.
+          notes="$(awk -v tag="$tag" '
+            $0 ~ "^## \\[" tag "\\]" {grab=1; next}
+            grab && /^## \[/ {exit}
+            grab {print}
+          ' CHANGELOG.md)"
+          if [ -z "$(echo "$notes" | tr -d '[:space:]')" ]; then
+            echo "No CHANGELOG.md section for $tag. Add a '## [$tag] - YYYY-MM-DD' entry." >&2
+            exit 1
+          fi
+          {
+            echo "body<<EOF_NOTES"
+            echo "$notes"
+            echo "EOF_NOTES"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify the release key
+        env:
+          YADORILINK_RELEASE_MANIFEST_KEY_ID: ${{ vars.RELEASE_MANIFEST_KEY_ID }}
+          YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
+        run: python3 .github/release/check-release-gates.py --config
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: release-assets
+
+      - name: Flatten release assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find release-assets/yadorilink-linux-artifacts -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
+          cp dist/yadorilink-*-linux-x86_64-binaries.tar.gz dist/yadorilink-linux-x86_64.tar.gz
+          cp dist/yadorilink_*_amd64.deb dist/yadorilink-linux-amd64.deb
+          sidecar_targets=(
+            dist/yadorilink-linux-x86_64.tar.gz
+            dist/yadorilink-linux-amd64.deb
+          )
+          python3 .github/release/generate-release-checksums.py --sidecars "${sidecar_targets[@]}"
+
+      - name: Add engine bundles
+        run: |
+          set -euo pipefail
+          # Each bundle zip, its checksum sidecar and its provenance statement
+          # (and signature, when the signing hook ran) are released as-is: the
+          # zip bytes are what the consumers' lock files pin.
+          for d in release-assets/engine-bundle-*; do
+            find "$d" -maxdepth 1 -type f -exec cp {} dist/ \;
+          done
+          ls dist/yadorilink-engine-*.zip
+
+      # The installers are the files of this tag, attested by engine-attest on the same commit.
+      # They are re-checked against that attestation here and released with a .sha256 sidecar.
+      - name: Add the installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 packaging/install/pins.py check
+          for f in install.sh install.ps1; do
+            gh attestation verify "packaging/install/$f" \
+              --repo ${{ github.repository }} \
+              --signer-workflow ${{ github.repository }}/.github/workflows/release.yml \
+              --source-digest ${{ github.sha }} \
+              --source-ref ${{ github.ref }}
+            cp "packaging/install/$f" "dist/$f"
+          done
+          python3 .github/release/generate-release-checksums.py --sidecars dist/install.sh dist/install.ps1
+
+      - name: Publish immutable beta release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          NOTES: ${{ steps.notes.outputs.body }}
+        run: |
+          set -euo pipefail
+          created_draft=0
+          cleanup_failed_draft() {
+            status=$?
+            if [ "$status" -ne 0 ] && [ "$created_draft" -eq 1 ]; then
+              echo "Release publication failed; deleting incomplete draft $TAG." >&2
+              gh release delete "$TAG" --yes || true
+            fi
+            exit "$status"
+          }
+          trap cleanup_failed_draft EXIT
+
+          printf '%s\n' "$NOTES" > release-notes.md
+          # Keep the release invisible until every required asset is present.
+          # No --target force-move; the tag already exists (this job runs on it).
+          gh release create "$TAG" \
+            --title "yadorilink $TAG" \
+            --notes-file release-notes.md \
+            --draft \
+            --prerelease \
+            --verify-tag
+          created_draft=1
+          gh release upload "$TAG" dist/*
+          gh release edit "$TAG" --draft=false --prerelease
+          created_draft=0
+
+      # --- Package-manager distribution wiring ----------------------------
+
+      - name: Require APT signing configuration
+        id: apt
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$APT_SIGNING_KEY" ]; then
+            echo "::warning::APT_SIGNING_KEY not configured in the release-signing Environment; skipping APT repository publish. See packaging/linux/apt/README.md's 'Signing key custody' section."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # packaging/linux/apt/README.md: this is the "stable" apt suite --
+      # only immutable, gated beta-release tags publish here, never the
+      # rolling nightly build (an apt repo's stable suite is not the place
+      # for unvetted dev builds).
+      - name: Build and publish the APT repository
+        if: steps.apt.outputs.enabled == 'true'
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          export GNUPGHOME="$RUNNER_TEMP/apt-gnupg"
+          mkdir -p "$GNUPGHOME"
+          chmod 700 "$GNUPGHOME"
+          printf '%s\n' "$APT_SIGNING_KEY" | gpg --batch --import
+          key_id="$(gpg --batch --with-colons --list-secret-keys | awk -F: '/^sec/{print $5; exit}')"
+
+          # arm64 packages join this invocation once ARM64 validation
+          # (packaging/linux/README.md) lands a real arm64 linux-artifacts
+          # build; today only amd64 exists.
+          bash packaging/linux/apt/build-apt-repo.sh --out-dir apt-repo --gpg-key-id "$key_id" -- dist/yadorilink_*_amd64.deb
+
+          gpg --batch --armor --export "$key_id" > apt-repo/yadorilink-archive-keyring.asc
+          cp packaging/linux/apt/install.sh apt-repo/install.sh
+
+          ARMORED_PUBLIC_KEY_PATH="$(pwd)/apt-repo/yadorilink-archive-keyring.asc" \
+            bash packaging/linux/apt/build-keyring-deb.sh
+          cp packaging/linux/apt/dist/yadorilink-archive-keyring_*_all.deb apt-repo/
+
+          if [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            # Publish order matters and failures must not be silently
+            # swallowed (set -euo pipefail above already aborts this step
+            # on the first failed `r2 object put` -- no per-file ||
+            # fallback here, unlike an earlier version of this script,
+            # which only logged a ::warning:: and let the job report
+            # success with a partially-published repository).
+            #
+            # Order: pool/ + Packages(.gz) first, then Release +
+            # Release.gpg, and dists/stable/InRelease strictly last. apt
+            # fetches InRelease first and treats its presence as "this
+            # repository is ready"; publishing files in arbitrary
+            # filesystem order (as an earlier version of this script did,
+            # via a plain `find | while read`) could publish InRelease
+            # before the Packages.gz it hashes has finished uploading,
+            # opening a window where a concurrent `apt-get update` sees a
+            # hash mismatch against a real signed InRelease.
+            publish_file() {
+              local f="$1"
+              local key="${f#apt-repo/}"
+              npx --yes wrangler@3 r2 object put "yadorilink-apt/${key}" --file "$f" --remote
+            }
+            while IFS= read -r f; do
+              publish_file "$f"
+            done < <(find apt-repo -type f ! -name Release ! -name Release.gpg ! -name InRelease)
+            publish_file apt-repo/dists/stable/Release
+            publish_file apt-repo/dists/stable/Release.gpg
+            publish_file apt-repo/dists/stable/InRelease
+          else
+            echo "::warning::Cloudflare creds absent; APT repository built but not published to R2."
+          fi
+
+      - name: Tear down APT signing key
+        if: always()
+        run: rm -rf "${RUNNER_TEMP}/apt-gnupg" packaging/linux/apt/dist

@@ -1,0 +1,8 @@
+# Force LF line endings for text files regardless of the checking-out
+# machine's own git config (Git for Windows commonly defaults to
+# core.autocrlf=true, which silently converts LF to CRLF on checkout) --
+# found because crates/yadorilink-reporting/src/builder.rs's fixture tests
+# compare an include_str!'d file's actual on-disk bytes against
+# in-memory-generated JSON (always LF), and failed on their first-ever
+# real Windows CI run for exactly this reason.
+* text=auto eol=lf

@@ -1,0 +1,21 @@
+#!/bin/sh
+#
+# packaging/linux/debian/prerm
+#
+# Runs as root before the package's files are removed. Stops the always-on
+# system service (headless/install-headless.sh) so it is not left running
+# without its binary. Only on "remove": an upgrade is handled by postinst's
+# try-restart. Never touches state, credentials or the account; the
+# per-user unit is the user's own to stop (see ../uninstall.sh).
+
+set -e
+
+case "$1" in
+    remove)
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl stop yadorilink-headless.service >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+exit 0

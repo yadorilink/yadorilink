@@ -1,0 +1,114 @@
+[package]
+name = "yadorilink-fapi-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The product's credential manager, and the one place credentials are stored.
+#
+# It began as a FAPI 2.0 client -- private_key_jwt, pushed authorization
+# requests, PKCE S256, DPoP-sender-constrained access tokens -- and now also
+# owns dynamic client registration, the RFC 8628 device grant, the
+# access-token cache that keeps a long-running daemon authenticated across a
+# five-minute token lifetime, and the credential store both `yadorilink-cli`
+# and `yadorilink-daemon` read and write.
+#
+# There is exactly one credential-store implementation in this workspace and it
+# is `store/`. The two `token_store.rs` modules that used to hold one each are
+# now thin re-exports of it.
+
+[features]
+# One offline credential for tests that need *a* `CoordinationAuth` and not
+# *this* one -- see `src/test_support.rs`. Composed entirely from this crate's
+# ordinary public API, so it adds no capability; it exists so the same twenty
+# lines are not copied into four test scopes across two crates. Nothing in the
+# product enables it.
+test-support = []
+
+[dependencies]
+# The durable publish of the credential file (`durable_dir::publish_durably`).
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
+# ES256 (ECDSA over P-256) is the *only* client-authentication signature
+# algorithm this Authorization Server accepts -- it advertises
+# `token_endpoint_auth_signing_alg_values_supported: ["ES256"]` and rejects
+# anything else at client *registration* time. That makes P-256 mandatory, so
+# the workspace's existing `ed25519-dalek` cannot serve here.
+#
+# Pinned exactly: this crate's signatures are the client's authentication
+# credential and its proof of possession, so the code that produces them does
+# not move without a deliberate review.
+#
+# `ecdsa` gives deterministic (RFC 6979) nonces, so signing does not depend on
+# the OS RNG at call time. If this is ever swapped for a randomized-nonce
+# backend, the nonce-reuse footgun comes back -- see `jws::sign_compact`.
+p256 = { version = "=0.14.0", default-features = false, features = [
+    "ecdsa",
+    "std",
+] }
+# SHA-256 for the PKCE S256 challenge, the DPoP `ath` claim, and the RFC 7638
+# thumbprint. Already a workspace dependency (`sha2 = "0.11"`, locked at
+# 0.11.0); taking it from the workspace keeps one hash stack in the tree
+# rather than adding a second `=`-pin that would silently constrain every
+# other member crate.
+sha2 = { workspace = true }
+# base64url, unpadded, for every JOSE segment. Resolved at 0.23.1.
+base64 = "0.23"
+serde = { workspace = true }
+serde_json = "1"
+# The PKCE verifier's entropy. Already resolved at 0.4.3.
+getrandom = "0.4"
+# `jti` on both the client assertion and the DPoP proof. Both are
+# replay-detected server-side, so every request needs a fresh one.
+uuid = { version = "1", features = ["v4"] }
+thiserror = { workspace = true }
+url = "2"
+# Same version/feature set as this workspace's four other `reqwest` users, so
+# nothing new enters the lock. `rustls-tls` rather than native TLS, matching
+# `yadorilink-cli`.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+] }
+# Only `time` (the device-grant poll interval and the credential lock's
+# bounded wait) and `sync` (the single-flight refresh mutex). Deliberately not
+# `full`: the narrower the surface, the less this client can come to depend
+# on. Nothing here spawns, and nothing calls `spawn_blocking` -- the
+# credential lock is a bounded `try_lock` retry loop precisely so it needs no
+# blocking pool to exist.
+tokio = { version = "1", default-features = false, features = ["time", "sync"] }
+# Advisory whole-file locking for refresh-token rotation, across processes and
+# across platforms (flock on Unix, LockFileEx on Windows). Already a direct
+# dependency of `yadorilink-daemon`, so nothing new enters the lock file.
+fs2 = "0.4"
+tracing = { workspace = true }
+
+# The OS-native credential store backend on Windows and Linux. macOS does not
+# use `keyring` at all (its legacy-keychain item is bound to the creating code
+# identity and prompts per signer): it uses the Data Protection Keychain crate
+# below. No other target links `keyring`: without a native feature it would be
+# the in-memory mock, which loses a saved credential at the next process start.
+[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
+keyring = { version = "3", features = ["windows-native", "linux-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+yadorilink-os-keychain = { path = "../yadorilink-os-keychain" }
+
+[dev-dependencies]
+# This crate's own integration tests are external crates, so they see exactly
+# the public API a product caller sees. `CredentialManager::with_client` and
+# `::seed` are `pub(crate)` (see `src/test_support.rs`), and the two runtime
+# proofs -- `five_minute_boundary` and `cross_process_rotation` -- reach them
+# through `test_support::manager_over`. Enabling the feature on ourselves here
+# is what makes that module visible to `tests/` without making it visible to
+# anything that links this crate normally.
+yadorilink-fapi-client = { path = ".", features = ["test-support"] }
+tokio = { workspace = true }
+tempfile = "3"
+# A local HTTP server for the endpoints the hosted service does not serve yet (client
+# bootstrap, the device grant) and for driving the token cache's refresh clock
+# without waiting five real minutes. Already a dev-dependency of
+# `yadorilink-cli`.
+wiremock = "0.6"
+
+[lints]
+workspace = true

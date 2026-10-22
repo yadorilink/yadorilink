@@ -1,0 +1,1345 @@
+# API surface of the generated C# binding (see csharp-binding.py).
+# Regenerate on purpose with: .github/release/generate-csharp-binding.sh --out DIR --update-snapshot
+## yadorilink_client_core.cs
+contract_version 30
+namespace YadoriLink.Native.Core
+public class UniffiException: System.Exception
+public UniffiException(): base()
+public UniffiException(string message): base(message)
+public class UndeclaredErrorException: UniffiException
+public UndeclaredErrorException(string message): base(message)
+public class PanicException: UniffiException
+public PanicException(string message): base(message)
+public class AllocationException: UniffiException
+public AllocationException(string message): base(message)
+public class InternalException: UniffiException
+public InternalException(string message): base(message)
+public class InvalidEnumException: InternalException
+public InvalidEnumException(string message): base(message)
+public class UniffiContractVersionException: UniffiException
+public UniffiContractVersionException(string message): base(message)
+public class UniffiContractChecksumException: UniffiException
+public UniffiContractChecksumException(string message): base(message)
+public record AcceptInviteOutcome (
+string GroupId,
+string LocalPath,
+bool AwaitingApproval
+public record AccountDeletionRequest (
+string ConfirmationToken
+public record AccountDeletionStatus (
+AccountDeletionState State,
+DateTime? GraceExpiresAt,
+TimeSpan? Remaining
+public record AccountStatus (
+SignInState SignIn,
+string? ClientId,
+string? ThisDeviceId,
+bool DeviceRegistered,
+string DefaultDeviceName,
+bool? HasLinkedFolders,
+bool StartOverPending
+public record AttentionArg (
+string Name,
+string Value
+public record AttentionReason (
+AttentionCategory Category,
+string Subject,
+string? FolderLocalPath,
+string Raw,
+AttentionKind Kind,
+ProductAction PrimaryAction,
+ProductAction? SecondaryAction,
+string Key,
+AttentionArg[] Args,
+AttentionSeverity Severity,
+string Identity
+public record AvailabilitySummary (
+Availability Availability,
+string[] ReachableDeviceIds,
+string[] OfflineDeviceIds,
+string[] UpdateRequiredDeviceIds
+public record BandwidthLimits (
+ulong? UploadBytesPerSec,
+ulong? DownloadBytesPerSec
+public record BandwidthStatus (
+BandwidthLimits Limits,
+ulong CurrentUploadBytesPerSec,
+ulong CurrentDownloadBytesPerSec
+public record ConflictSummary (
+string LocalPath,
+string Path,
+ulong Size,
+DateTime? ModifiedAt,
+string CurrentPath,
+string? LoserDeviceId,
+string? ConflictTimestamp,
+EntryKind Kind,
+ConflictReason Reason,
+bool CanResolve,
+string? OriginDeviceId,
+string Identity
+public record CoreConfig (
+DaemonLaunch DaemonLaunch
+public record DaemonIdentity (
+string Version,
+uint EngineApiVersion,
+string? ReleaseId,
+string InstallSource,
+string InstallRoot,
+DaemonOwner Owner,
+DataAreaOwnership Ownership,
+uint Pid,
+DateTime? StartedAt
+public record DefaultFolder (
+string Name,
+string Path
+public record DeviceRegistration (
+string DeviceId
+public record DeviceSummary (
+string DeviceId,
+string DisplayName,
+bool Online,
+DateTime? LastSeen,
+bool IsThisDevice,
+bool IsCallerAccount,
+bool CanManage
+public record DiagnosticsExport (
+string Path,
+DiagnosticsCollectionMode CollectionMode,
+uint RedactionCount
+public record EvictOutcome (
+bool Evicted,
+ulong BlocksReclaimed,
+ulong BytesReclaimed
+public record FileAvailability (
+bool Tracked,
+MaterializationState State,
+FileAction[] Actions
+public record FileRetention (
+RetentionPolicy Policy,
+bool Inherited
+public record FileVersion (
+long VersionSeq,
+ulong Size,
+DateTime? ModifiedAt,
+string State,
+string? OriginDeviceId,
+uint? UnixMode,
+bool IsCurrent,
+EntryKind Kind
+public record FolderDetail (
+FolderSummary Summary,
+HeldFile[] HeldFiles,
+ReplicaCopy[] CompleteCopies
+public record FolderRestoreFailure (
+string Path,
+string Error
+public record FolderRestoreOutcome (
+string[] RestoredPaths,
+FolderRestoreFailure[] Failed,
+bool Partial
+public record FolderSummary (
+string LocalPath,
+string GroupId,
+string Name,
+FolderMode Mode,
+FolderState State,
+bool Paused,
+DateTime? PausedUntil,
+ulong ConflictCount,
+ulong HydratedFileCount,
+ulong PlaceholderFileCount,
+ulong HydratingFileCount,
+ulong HeldFileCount,
+ulong SkippedSymlinkCount,
+FolderTransferProgress? Transfer,
+DurabilityStatus Durability,
+DurabilityEvidence DurabilityEvidence,
+LocalStorageState LocalStorage,
+FetchAvailability FetchAvailability,
+AvailabilitySummary Availability,
+ProtectionSummary Protection,
+ProductSummary Product,
+string[] FullReplicaDeviceIds,
+bool PolicyStale,
+bool Ambiguous,
+string[] AmbiguousLocalPaths,
+bool Degraded,
+string? DegradedReason,
+VolumeSummary? Volume,
+bool Provider,
+ProviderRootStatus? ProviderStatus,
+uint PendingApprovals,
+ulong ReclaimableBytes,
+UnreadableFile[] UnreadableFiles,
+ulong UnreadableFilesMore
+public record FolderTransferProgress (
+ulong BytesDone,
+ulong BytesTotal,
+ulong BlocksDone,
+ulong BlocksTotal,
+TimeSpan? Eta
+public record FreeSpace (
+ulong AvailableBytes,
+ulong TotalBytes,
+ulong HeadroomBytes,
+FreeSpaceState State
+public record GcReport (
+bool DryRun,
+ulong BlocksDeleted,
+ulong BytesReclaimed
+public record GroupSummary (
+string GroupId,
+string Name
+public record HandoffSummary (
+string TargetDeviceId,
+long MembershipGeneration,
+string? LeaseId
+public record HeldFile (
+string Path,
+string Reason,
+DateTime? HeldSince
+public record IncomingFile (
+string RelativePath,
+ulong Size
+public record IncomingTransfer (
+string TransferId,
+string SenderDeviceId,
+IncomingFile[] Files,
+ulong TotalSize,
+DateTime? OfferedAt,
+IncomingTransferStatus Status,
+TransferFailure? Failure,
+bool CanRetry
+public record InviteSummary (
+string InviteId,
+string Code,
+string Url,
+string GroupId,
+ShareRole Role,
+DateTime ExpiresAt,
+bool RequiresApproval
+public record LinkOutcome (
+string GroupId,
+string LocalPath,
+FolderMode Mode
+public record LoginOptions (
+LoginFlow Flow,
+TimeSpan? OverallTimeout
+public record MemberSummary (
+string DeviceId,
+string DeviceName,
+ShareRole Role,
+MemberRelationship Relationship,
+MemberStorage Storage,
+bool Online,
+DateTime? LastSeen
+public record MembershipHandoff (
+string GroupId,
+string TargetDeviceId,
+string LeaseId,
+ulong MembershipGeneration
+public record MembershipOutcome (
+MembershipHandoff[] Handoffs,
+string[] ForcedGroupIds,
+string? UnknownScopeOperationId
+public record NotRejoined (
+string LocalPath,
+string GroupId,
+string Message
+public record OutgoingTransfer (
+string TransferId,
+string TargetDeviceId,
+IncomingFile[] Files,
+ulong TotalSize,
+DateTime? CreatedAt,
+OutgoingTransferStatus Status,
+TransferFailure? Failure,
+bool CanRetry
+public record OwnershipRecordSummary (
+DaemonOwner Owner,
+string InstallSource,
+string InstallRoot,
+string? ReleaseId,
+DateTime? WrittenAt
+public record PeerSummary (
+string DeviceId,
+PeerReachability Reachability,
+UnreachableCategory? UnreachableCategory,
+RouteKind Route
+public record PendingApprovalSummary (
+string GroupId,
+string GroupName,
+string DeviceId,
+ShareRole? RequestedRole
+public record PendingInviteSummary (
+string InviteId,
+string GroupId,
+string GroupName,
+ShareRole Role,
+DateTime ExpiresAt,
+InviteStatus Status
+public record PinOutcome (
+FileRetention Retention,
+string? DownloadError
+public record PreflightResult (
+string ResolvedPath,
+bool PathExists,
+bool IsDirectory,
+ulong EntryCount,
+ulong IgnoredEntryCount,
+ulong TotalSizeBytes,
+bool ScanTruncated,
+FreeSpace? FreeSpace,
+PreflightIssue[] Issues,
+bool RequiresAcknowledgement
+public record ProductSummary (
+ProductState State,
+ulong AttentionCount,
+ulong PausedCount,
+ulong SyncingCount,
+ulong WaitingCount,
+ulong? BytesRemaining,
+ProductAction? NextAction
+public record ProtectionSummary (
+Protection Protection,
+string[] DeviceIds
+public record ProviderCount (
+ulong Count,
+TimeSpan? Oldest
+public record ProviderCounters (
+ProviderEagerProgress? Eager,
+ProviderStuckFile[] Stuck,
+ProviderCount KeptEdits,
+ProviderCount PendingPublications,
+ProviderCount UnconfirmedPublications
+public record ProviderEagerProgress (
+string State,
+ulong Remote,
+ulong Hydrating,
+ulong Current
+public record ProviderFolderOutcome (
+string GroupId,
+string RootId,
+string DisplayName,
+FolderMode Mode,
+bool AlreadyExisted
+public record ProviderRootStatus (
+string RootId,
+string DisplayName,
+string Readiness,
+ProviderCounters? Counters
+public record ProviderStuckFile (
+string Path,
+uint Failures
+public record ReceivedTransfer (
+string DestinationDir,
+string[] FilesReceived,
+ulong BytesReceived
+public record RecentError (
+string Category,
+DateTime? At,
+string Context
+public record ReplicaCopy (
+string DeviceId,
+PeerReachability Reachability,
+RouteKind Route
+public record RetainedOriginal (
+string GroupId,
+string Path,
+ulong Size,
+bool Reachable,
+bool GroupRemoved
+public record RetainedRelease (
+string Path,
+RetainedReleaseOutcome Outcome,
+string Detail
+public record RewindPreview (
+long TargetUnixNanos,
+ulong RestoreCount,
+ulong RemoveCount,
+ulong UnavailableCount,
+string UnavailableMessage,
+byte[] PlanId
+public record RewindRun (
+string RunId,
+RewindRunState State,
+RewindFailure? Failure,
+ulong StepsTotal,
+ulong StepsDone,
+ulong Restored,
+ulong Removed,
+string Message
+public record SentTransfer (
+string TransferId,
+string[] FilesOffered,
+ulong TotalSize
+public record ShareSummary (
+string EdgeId,
+string GroupId,
+string GroupName,
+string DeviceId,
+ShareEdgeState State,
+ShareRole? Role
+public record SignOutOutcome (
+SignOutKind Kind
+public record SpaceManagement (
+bool Enabled
+public record SpaceReclaimPreview (
+SpaceReclaimPreviewItem[] Items,
+uint UnreadableRoots
+public record SpaceReclaimPreviewItem (
+string GroupId,
+string Path,
+SpaceReclaimVerdict Verdict
+public record StartOverReport (
+string RetiredDeviceId,
+string NewDeviceId,
+string[] Rejoined,
+NotRejoined[] NotRejoined,
+bool Complete
+public record StatusSnapshot (
+DateTime CapturedAt,
+OverallState Overall,
+AttentionReason[] AttentionReasons,
+string? ThisDeviceId,
+AccountStatus Account,
+uint? EngineApiVersion,
+FolderSummary[] Folders,
+AvailabilitySummary Availability,
+ProtectionSummary Protection,
+ProductSummary Product,
+PeerSummary[] Peers,
+TransferSummary[] Transfers,
+BandwidthStatus Bandwidth,
+VolumeSummary[] Volumes,
+StorageSummary Storage,
+UpdateBadge Update,
+RecentError[] RecentErrors
+public record StorageModeOutcome (
+bool Changed,
+HandoffSummary? Handoff
+public record StorageSummary (
+ulong BlockStoreTotalBytes,
+ulong BlockCount,
+DateTime? LastGcAt,
+ulong ReclaimableEstimateBytes
+public record TransferSummary (
+string GroupId,
+string? FolderLocalPath,
+string Path,
+ulong BytesDone,
+ulong BytesTotal,
+ulong BlocksDone,
+ulong BlocksTotal,
+string SourceDeviceId,
+DateTime? StartedAt
+public record TrashedFile (
+string LocalPath,
+string Path,
+long VersionSeq,
+ulong LastKnownSize,
+string? OriginDeviceId,
+DateTime? DeletedAt,
+EntryKind Kind,
+string? DeletedByOperation
+public record UnlinkOutcome (
+HandoffSummary? Handoff
+public record UnreadableFile (
+string Path,
+UnreadableFileReason Reason,
+string AdviceKey
+public record UpdateBadge (
+UpdateState State,
+string? AvailableVersion,
+bool Mandatory,
+string? LastErrorCategory,
+string Channel,
+string InstallSource,
+string? HoldbackReason
+public record UpdateConfig (
+bool AutomaticChecks
+public record UpdateDownloadGuidance (
+string Guidance,
+string? Url
+public record UpdateStatus (
+string CurrentVersion,
+string Channel,
+string InstallSource,
+DateTime? LastCheckedAt,
+UpdateState State,
+string? AvailableVersion,
+string? ReleaseNotesUrl,
+bool Mandatory,
+string? HoldbackReason,
+string? LastErrorCategory,
+string? LastErrorMessage,
+bool PackageManaged,
+UpdateConfig Config
+public record VolumeSummary (
+string Path,
+FreeSpaceState State,
+ulong AvailableBytes,
+ulong HeadroomBytes,
+ulong ReclaimableBytes
+public record AccountDeletionState
+public record Active: AccountDeletionState
+public record Requested: AccountDeletionState
+public record Grace: AccountDeletionState
+public record Other (
+string Raw
+) : AccountDeletionState
+public record ApproveOutcome
+public record Approved: ApproveOutcome
+public record AlreadyActive: ApproveOutcome
+public record Unrecognized (
+string Raw
+) : ApproveOutcome
+public enum AssignableRole: int
+Viewer,
+Editor
+public enum AttentionCategory: int
+Degraded,
+DurabilityAtRisk,
+DurabilityUnknown,
+FetchUnavailable,
+FetchAvailabilityUnknown,
+Conflict,
+Held,
+StrandedDirectory,
+LowDiskCritical,
+LowDisk,
+PeerDisconnected,
+RecentError,
+UpdateFailed,
+Ambiguous,
+OwnershipLost,
+VolumeChanged,
+VolumeUnconfirmed,
+ProviderNotReady,
+ProviderStuck,
+KeptEdits,
+ProviderOrphanDomain,
+UpdateRequired,
+Unrecognized
+public enum AttentionKind: int
+Waiting,
+Retryable,
+Permanent
+public enum AttentionSeverity: int
+Info,
+Warning,
+Critical
+public enum Availability: int
+Available,
+UpdateRequired,
+WaitingForPeer,
+WaitingForExactContent,
+Unknown
+public enum BrowserPurpose: int
+ApproveDevice,
+SignIn
+public enum ConflictChoice: int
+KeepThis,
+KeepBoth
+public enum ConflictReason: int
+ConcurrentEdit,
+FolderAtPath
+public record DaemonLaunch
+public record SpawnBinary (
+string? Path
+) : DaemonLaunch
+public record LaunchAgent (
+string Label
+) : DaemonLaunch
+public record ScheduledTask (
+string Name
+) : DaemonLaunch
+public enum DaemonOwner: int
+Cli,
+Gui
+public enum DaemonStartOutcome: int
+AlreadyRunning,
+Started
+public record DaemonUnavailableReason
+public record NotRunning: DaemonUnavailableReason
+public record Unresponsive: DaemonUnavailableReason
+public record ProtocolMismatch (
+uint ClientVersion,
+uint DaemonVersion
+) : DaemonUnavailableReason
+public record EngineMismatch (
+EngineMismatchKind Kind,
+EngineMismatchDirection Direction,
+string AppVersion,
+string EngineVersion,
+string AppReleaseId,
+string EngineReleaseId,
+uint AppApiVersion,
+uint EngineApiVersion
+) : DaemonUnavailableReason
+public record DataAreaOwnership
+public record Recorded (
+OwnershipRecordSummary Record
+) : DataAreaOwnership
+public record NotRecorded: DataAreaOwnership
+public record Unreadable (
+string Detail
+) : DataAreaOwnership
+public class DesktopException: UniffiException
+DesktopException() : base()
+DesktopException(String @Message) : base(@Message)
+public class NotSignedIn : DesktopException
+public class DaemonUnavailable : DesktopException
+public class Network : DesktopException
+public class PermissionDenied : DesktopException
+public class DurabilityBlocked : DesktopException
+public class InvalidInput : DesktopException
+public class Internal : DesktopException
+public class Refused : DesktopException
+public enum DiagnosticsCollectionMode: int
+Daemon,
+DaemonPartial,
+OfflineFallback
+public enum DurabilityEvidence: int
+None,
+CorroboratedIndex,
+VerifiedPayload,
+Unknown
+public enum DurabilityStatus: int
+Protected,
+Protecting,
+AtRisk,
+Unknown
+public enum EngineMismatchDirection: int
+EngineOlder,
+EngineNewer,
+Unknown
+public enum EngineMismatchKind: int
+ApiVersion,
+Build,
+AppInstallation
+public enum EntryKind: int
+File,
+Directory,
+Symlink
+public enum FetchAvailability: int
+AvailableNow,
+UnavailableNow,
+Unknown
+public enum FileAction: int
+Download,
+FreeUpSpace,
+KeepOnDevice,
+StopKeeping
+public enum FolderMode: int
+KeepAll,
+OnDemand
+public enum FolderState: int
+UpToDate,
+Syncing,
+Paused,
+Blocked,
+Attention
+public enum FreeSpaceState: int
+Ok,
+Low,
+Critical,
+Unknown
+public record IncomingTransferStatus
+public record Pending: IncomingTransferStatus
+public record InProgress: IncomingTransferStatus
+public record Completed: IncomingTransferStatus
+public record Failed: IncomingTransferStatus
+public record Canceled: IncomingTransferStatus
+public record Other (
+string Raw
+) : IncomingTransferStatus
+public record InviteStatus
+public record Pending: InviteStatus
+public record Other (
+string Raw
+) : InviteStatus
+public enum LocalStorageState: int
+FullCopy,
+PartiallyMaterialized,
+OnDemand,
+Unknown
+public record LoginEvent
+public record Enrolling: LoginEvent
+public record OpenBrowser (
+string Url,
+BrowserPurpose Purpose
+) : LoginEvent
+public record WaitingForApproval (
+TimeSpan ExpiresIn
+) : LoginEvent
+public record WaitingForAuthorization: LoginEvent
+public record ShowDeviceCode (
+string VerificationUri,
+string UserCode
+) : LoginEvent
+public record SignedIn (
+AccountStatus Account
+) : LoginEvent
+public record Failed (
+DesktopException Error
+) : LoginEvent
+public record Cancelled: LoginEvent
+public enum LoginFlow: int
+Loopback,
+DeviceCode
+public enum MaterializationState: int
+Hydrated,
+Placeholder,
+Hydrating,
+Evicting,
+Unknown
+public enum MemberRelationship: int
+You,
+YourOtherDevice,
+OwnersDevice,
+Invited
+public enum MemberStorage: int
+FullCopy,
+OnDemand
+public enum NasAdminFailure: int
+Offline,
+Unavailable,
+CouldNotOpen
+public enum NestedLinkRelation: int
+Ancestor,
+Descendant,
+Same
+public enum NetworkErrorKind: int
+Unreachable,
+RateLimited,
+ActivationPendingReconciliation
+public record OutgoingTransferStatus
+public record Offered: OutgoingTransferStatus
+public record Accepted: OutgoingTransferStatus
+public record Completed: OutgoingTransferStatus
+public record Declined: OutgoingTransferStatus
+public record Canceled: OutgoingTransferStatus
+public record Other (
+string Raw
+) : OutgoingTransferStatus
+public enum OverallState: int
+Healthy,
+Attention,
+Degraded,
+Unknown
+public enum PauseDuration: int
+UntilResumed,
+ThirtyMinutes,
+OneHour,
+UntilTomorrow
+public enum PeerReachability: int
+Connecting,
+Connected,
+Unreachable,
+Unknown
+public enum PermissionDeniedReason: int
+SessionRejected,
+Forbidden,
+QuotaExceeded,
+CredentialStoreUnusable
+public record PreflightIssue
+public record PathMissing: PreflightIssue
+public record IgnoreRulesUnreadable: PreflightIssue
+public record NotEmpty (
+ulong EntryCount,
+bool ScanTruncated
+) : PreflightIssue
+public record LowFreeSpace (
+ulong AvailableBytes,
+ulong HeadroomBytes
+) : PreflightIssue
+public record CriticalFreeSpace (
+ulong AvailableBytes,
+ulong HeadroomBytes
+) : PreflightIssue
+public record NestedLink (
+string OtherPath,
+NestedLinkRelation Relation
+) : PreflightIssue
+public record CloudProviderFolder (
+string Provider
+) : PreflightIssue
+public record FilesystemRoot: PreflightIssue
+public record HomeDirectory: PreflightIssue
+public record ReservedName (
+string Path
+) : PreflightIssue
+public enum ProductAction: int
+Retry,
+ReviewConflict,
+FreeUpSpace,
+RevealPath,
+OpenSettings,
+DownloadUpdate,
+ViewDetails,
+ConfirmDisk,
+Resume,
+StartOverAsNewDevice,
+ReviewApproval
+public enum ProductState: int
+UpToDate,
+Syncing,
+Waiting,
+NeedsAttention,
+Paused
+public enum Protection: int
+Protected,
+AtRisk,
+Pending,
+Unknown
+public enum RefusalReason: int
+DiskFull,
+PathNotAllowed,
+InviteExpired,
+InviteAlreadyUsed,
+UnrecordedLocalChanges,
+ConflictNotResolvable,
+StateDirUnusable,
+StartOverNotConfirmed,
+DatabaseNotRestored,
+StartOverInProgress,
+ManagedElsewhere,
+GroupMismatch
+public enum RetainedReleaseOutcome: int
+Removed,
+Gone,
+StillRetained,
+SavedThenRemoved,
+SavedStillRetained,
+Left,
+Unknown
+public enum RetentionPolicy: int
+Reclaimable,
+Pinned
+public record RevokeEdgeOutcome
+public record Revoked (
+MembershipOutcome Outcome
+) : RevokeEdgeOutcome
+public record AlreadyRevoked: RevokeEdgeOutcome
+public enum RewindFailure: int
+ContentUnavailable,
+DevicesOffline,
+FolderChanged,
+CannotChangeFolder,
+Interrupted
+public enum RewindRefusal: int
+UnavailableFiles,
+RunActive,
+NotAuthorized,
+FolderFrozen,
+UnknownFolder,
+InsufficientSpace,
+FolderSettling,
+Other
+public enum RewindRunState: int
+Gathering,
+Rewinding,
+Done,
+Interrupted,
+Failed
+public record RewindStartOutcome
+public record Started (
+string RunId
+) : RewindStartOutcome
+public record FolderChanged (
+string Message
+) : RewindStartOutcome
+public record Refused (
+RewindRefusal Reason,
+string Message
+) : RewindStartOutcome
+public enum RouteKind: int
+Direct,
+Relay,
+Unknown
+public enum SafeStopBusyReason: int
+WritesInProgress,
+CheckpointFailed,
+AnotherRequestInProgress
+public record SafeStopOutcome
+public record Stopping (
+bool AlreadyInProgress
+) : SafeStopOutcome
+public record Busy (
+SafeStopBusyReason Reason,
+uint RetryAfterSecs,
+string Detail
+) : SafeStopOutcome
+public record ShareEdgeState
+public record Active: ShareEdgeState
+public record PendingApproval: ShareEdgeState
+public record Other (
+string Raw
+) : ShareEdgeState
+public record ShareRole
+public record Owner: ShareRole
+public record Editor: ShareRole
+public record Viewer: ShareRole
+public record Other (
+string Raw
+) : ShareRole
+public record SignInState
+public record SignedOut: SignInState
+public record SignedIn: SignInState
+public record CredentialStoreUnusable (
+string Message
+) : SignInState
+public record SignOutKind
+public record Revoked (
+uint GrantsRevoked
+) : SignOutKind
+public record AlreadyRevoked: SignOutKind
+public record ConfirmedRevokedAfterRejection: SignOutKind
+public enum SpaceReclaimVerdict: int
+Eligible,
+Pinned,
+UnsupportedRoot,
+CustodyUnavailable,
+Busy,
+Changed,
+SafetyBlocked
+public record StartOverProgress
+public record SignInRequired (
+string RetiredDeviceId
+) : StartOverProgress
+public record Finished (
+StartOverReport Report
+) : StartOverProgress
+public record StatusUpdate
+public record Snapshot (
+StatusSnapshot SnapshotValue
+) : StatusUpdate
+public record Unavailable (
+DesktopException Error
+) : StatusUpdate
+public record TransferFailure
+public record Unreachable: TransferFailure
+public record Declined: TransferFailure
+public record SenderCanceled: TransferFailure
+public record NotAccepted: TransferFailure
+public record Rejected: TransferFailure
+public record VerificationFailed: TransferFailure
+public record LocalStorage: TransferFailure
+public record Stalled: TransferFailure
+public record Interrupted: TransferFailure
+public record Other (
+string Raw
+) : TransferFailure
+public enum UnreachableCategory: int
+NoCandidates,
+NoResponse,
+UdpBlocked,
+HandshakeRefused
+public enum UnreadableFileReason: int
+PermissionDenied,
+NotARegularFile,
+ReadFailed,
+Unknown
+public record UpdateState
+public record Idle: UpdateState
+public record Checking: UpdateState
+public record Available: UpdateState
+public record HeldBack: UpdateState
+public record KillSwitched: UpdateState
+public record Downloading: UpdateState
+public record Downloaded: UpdateState
+public record Verified: UpdateState
+public record Installing: UpdateState
+public record Failed: UpdateState
+public record Deferred: UpdateState
+public record UpToDate: UpdateState
+public record Unknown (
+string Raw
+) : UpdateState
+public static class YadorilinkClientCoreMethods
+## yadorilink_client_ffi.cs
+checksum uniffi_yadorilink_client_ffi_checksum_constructor_clientcore_new 64227
+checksum uniffi_yadorilink_client_ffi_checksum_method_adminsession_close 17541
+checksum uniffi_yadorilink_client_ffi_checksum_method_adminsession_ended 52124
+checksum uniffi_yadorilink_client_ffi_checksum_method_adminsession_local_url 39552
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_accept_invite 38974
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_account_deletion_status 30289
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_account_status 40213
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_acknowledge_possible_loss 42994
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_approve_request 50646
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_bandwidth_limits 44095
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_cancel_account_deletion 28944
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_cancel_invite 32316
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_cancel_transfer 17447
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_change_member_role 45657
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_check_for_updates 18893
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_confirm_account_deletion 61970
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_create_default_folder 26493
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_create_group_and_link 34891
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_create_provider_folder 62686
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_daemon_identity 4474
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_default_folder 23999
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_deny_request 11366
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_download_guidance 19462
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_engine_api_version 48387
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_evict_file 17304
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_export_account_data 43844
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_export_diagnostics 32945
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_file_availability 20998
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_file_retention 1547
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_folder_detail 48729
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_folder_peer_counts 12548
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_hydrate_file 7475
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_join_group_and_link 58293
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_join_provider_folder 9236
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_link_folder 30635
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_account_devices 10996
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_conflicts 14685
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_folder_devices 10144
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_inbox 34764
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_invites 22916
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_joinable_groups 36210
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_members 49525
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_owned_groups 21681
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_pending_approvals 11750
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_retained_originals 24344
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_sent_transfers 58315
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_shares 7537
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_trash 56677
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_versions 18481
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_mint_invite 44921
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_nas_admin_failure_message 44660
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_new_login_session 52708
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_open_nas_admin 48154
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_parse_invite_link 48852
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_pause_all 57662
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_pause_folder 52327
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_pin_file 43711
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_preview_space_reclaim 8104
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_readopt_folder 2078
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_receive_transfer 53281
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_register_device 41656
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_release_retained_originals 39245
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_remove_device 51074
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_request_account_deletion 3
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_request_safe_stop 10837
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_resolve_conflict 19033
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_restore_from_trash 38694
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_restore_trash_operation 65487
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_restore_version 27017
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_resume_all 18216
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_resume_folder 25511
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_retry_sent_transfer 16324
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_retry_transfer 43982
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_revoke_member 55967
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_revoke_share_edge 24933
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_rewind_execute 14068
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_rewind_follow 46430
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_rewind_latest 13152
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_rewind_preview 18821
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_run_gc 57994
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_run_preflight 10809
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_send_to_device 35923
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_set_automatic_update_checks 6313
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_set_bandwidth_limits 43383
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_set_space_management 43502
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_set_storage_mode 53289
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_sign_out 42902
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_space_management 58236
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_start_daemon 56596
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_start_over_as_new_device 490
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_status_snapshot 49064
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_stop_daemon 59400
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_unlink_folder 45559
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_unpin_file 1027
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_update_status 9610
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_watch_status 60949
+checksum uniffi_yadorilink_client_ffi_checksum_method_loginsession_begin 41090
+checksum uniffi_yadorilink_client_ffi_checksum_method_loginsession_cancel 46738
+checksum uniffi_yadorilink_client_ffi_checksum_method_loginsession_next_event 20169
+checksum uniffi_yadorilink_client_ffi_checksum_method_statuswatch_cancel 17078
+checksum uniffi_yadorilink_client_ffi_checksum_method_statuswatch_next 46615
+checksum uniffi_yadorilink_client_ffi_checksum_method_statuswatch_refresh 60577
+contract_version 30
+namespace YadoriLink.Native
+public class UniffiException: System.Exception
+public UniffiException(): base()
+public UniffiException(string message): base(message)
+public class UndeclaredErrorException: UniffiException
+public UndeclaredErrorException(string message): base(message)
+public class PanicException: UniffiException
+public PanicException(string message): base(message)
+public class AllocationException: UniffiException
+public AllocationException(string message): base(message)
+public class InternalException: UniffiException
+public InternalException(string message): base(message)
+public class InvalidEnumException: InternalException
+public InvalidEnumException(string message): base(message)
+public class UniffiContractVersionException: UniffiException
+public UniffiContractVersionException(string message): base(message)
+public class UniffiContractChecksumException: UniffiException
+public UniffiContractChecksumException(string message): base(message)
+public interface IAdminSession
+void Close();
+Task Ended();
+string LocalUrl();
+public class AdminSession : IAdminSession, IDisposable
+protected ulong pointer;
+private int _wasDestroyed = 0;
+private long _callCounter = 1;
+public AdminSession(ulong pointer)
+~AdminSession()
+protected void FreeRustArcPtr()
+protected ulong CloneRustArcPtr()
+public void Destroy()
+public void Dispose()
+private void IncrementCallCounter()
+private void DecrementCallCounter()
+internal void CallWithPointer(Action<ulong> action)
+internal T CallWithPointer<T>(Func<ulong, T> func)
+public void Close()
+public string LocalUrl()
+public interface IClientCore
+Task<AcceptInviteOutcome> AcceptInvite(string @codeOrUrl, string @localPath, FolderMode @mode, bool @acknowledgeRisks);
+Task<AccountDeletionStatus> AccountDeletionStatus();
+Task<AccountStatus> AccountStatus();
+Task<bool> AcknowledgePossibleLoss();
+Task<ApproveOutcome> ApproveRequest(string @groupId, string @deviceId);
+Task<BandwidthLimits> BandwidthLimits();
+Task<AccountDeletionStatus> CancelAccountDeletion();
+Task CancelInvite(string @inviteId);
+Task CancelTransfer(string @transferId);
+Task ChangeMemberRole(string @groupId, string @deviceId, AssignableRole @role);
+Task<UpdateStatus> CheckForUpdates();
+Task<AccountDeletionStatus> ConfirmAccountDeletion(string @confirmationToken);
+Task<LinkOutcome> CreateDefaultFolder(FolderMode @mode);
+Task<LinkOutcome> CreateGroupAndLink(string @groupName, string @localPath, FolderMode @mode, bool @acknowledgeRisks);
+Task<ProviderFolderOutcome> CreateProviderFolder(string @groupName, string @displayName, FolderMode @mode);
+Task<DaemonIdentity> DaemonIdentity();
+DefaultFolder DefaultFolder();
+Task<MembershipOutcome> DenyRequest(string @groupId, string @deviceId);
+Task<UpdateDownloadGuidance> DownloadGuidance();
+uint EngineApiVersion();
+Task<EvictOutcome> EvictFile(string @absolutePath);
+Task<string> ExportAccountData();
+Task<DiagnosticsExport> ExportDiagnostics(string @destinationPath);
+Task<FileAvailability> FileAvailability(string @absolutePath);
+Task<FileRetention> FileRetention(string @absolutePath);
+Task<FolderDetail> FolderDetail(string @localPath);
+Task<Dictionary<string, uint>> FolderPeerCounts();
+Task HydrateFile(string @absolutePath);
+Task<LinkOutcome> JoinGroupAndLink(string @groupId, string @groupName, string @localPath, FolderMode @mode, bool @acknowledgeRisks);
+Task<ProviderFolderOutcome> JoinProviderFolder(string @groupId, string @groupName, string @displayName, FolderMode @mode);
+Task<LinkOutcome> LinkFolder(string @localPath, string @groupId, FolderMode @mode, bool @acknowledgeRisks);
+Task<DeviceSummary[]> ListAccountDevices();
+Task<ConflictSummary[]> ListConflicts(string? @localPath);
+Task<DeviceSummary[]> ListFolderDevices();
+Task<IncomingTransfer[]> ListInbox();
+Task<PendingInviteSummary[]> ListInvites();
+Task<GroupSummary[]> ListJoinableGroups();
+Task<MemberSummary[]> ListMembers(string @groupId);
+Task<GroupSummary[]> ListOwnedGroups();
+Task<PendingApprovalSummary[]> ListPendingApprovals();
+Task<RetainedOriginal[]> ListRetainedOriginals();
+Task<OutgoingTransfer[]> ListSentTransfers();
+Task<ShareSummary[]> ListShares();
+Task<TrashedFile[]> ListTrash(string? @localPath);
+Task<FileVersion[]> ListVersions(string @absolutePath);
+Task<InviteSummary> MintInvite(string @groupId, AssignableRole? @role, TimeSpan? @ttl, bool @requireApproval);
+string NasAdminFailureMessage(NasAdminFailure @failure);
+LoginSession NewLoginSession(LoginOptions @options);
+Task<NasAdminOpening> OpenNasAdmin(string @deviceId);
+string ParseInviteLink(string @input);
+Task PauseAll(PauseDuration @duration);
+Task PauseFolder(string @localPath, PauseDuration @duration, string? @expectedGroupId);
+Task<PinOutcome> PinFile(string @absolutePath);
+Task<SpaceReclaimPreview> PreviewSpaceReclaim();
+Task ReadoptFolder(string @localPath);
+Task<ReceivedTransfer> ReceiveTransfer(string @transferId, string? @destinationDir);
+Task<DeviceRegistration> RegisterDevice(string @name);
+Task<RetainedRelease[]> ReleaseRetainedOriginals(string @groupId);
+Task<MembershipOutcome> RemoveDevice(string @deviceId, bool @force);
+Task<AccountDeletionRequest> RequestAccountDeletion();
+Task<SafeStopOutcome> RequestSafeStop(uint? @deadlineSecs);
+Task<string> ResolveConflict(string @copyPath, ConflictChoice @choice);
+Task RestoreFromTrash(string @absolutePath);
+Task<FolderRestoreOutcome> RestoreTrashOperation(string @absolutePath);
+Task RestoreVersion(string @absolutePath, long? @versionSeq);
+Task ResumeAll();
+Task ResumeFolder(string @localPath, string? @expectedGroupId);
+Task<SentTransfer> RetrySentTransfer(string @transferId);
+Task<ReceivedTransfer> RetryTransfer(string @transferId);
+Task<MembershipOutcome> RevokeMember(string @groupId, string @deviceId, bool @force);
+Task<RevokeEdgeOutcome> RevokeShareEdge(string @edgeId, bool @force);
+Task<RewindStartOutcome> RewindExecute(string @groupId, long @targetUnixNanos, byte[] @planId);
+Task<RewindRun> RewindFollow(string @groupId, string @runId);
+Task<RewindRun?> RewindLatest(string @groupId);
+Task<RewindPreview> RewindPreview(string @groupId, DateTime @at);
+Task<GcReport> RunGc(bool @dryRun);
+Task<PreflightResult> RunPreflight(string @localPath);
+Task<SentTransfer> SendToDevice(string @sourcePath, string @targetDeviceId);
+Task<UpdateConfig> SetAutomaticUpdateChecks(bool @enabled);
+Task<BandwidthLimits> SetBandwidthLimits(BandwidthLimits @limits);
+Task<SpaceManagement> SetSpaceManagement(bool @enabled);
+Task<StorageModeOutcome> SetStorageMode(string @groupId, FolderMode @mode);
+Task<SignOutOutcome> SignOut();
+Task<SpaceManagement> SpaceManagement();
+Task<DaemonStartOutcome> StartDaemon();
+Task<StartOverProgress> StartOverAsNewDevice(bool @confirmed, string @name);
+Task<StatusSnapshot> StatusSnapshot();
+Task StopDaemon();
+Task<UnlinkOutcome> UnlinkFolder(string @localPath, bool @force, string? @expectedGroupId);
+Task<FileRetention> UnpinFile(string @absolutePath);
+Task<UpdateStatus> UpdateStatus();
+StatusWatch WatchStatus(TimeSpan @interval);
+public class ClientCore : IClientCore, IDisposable
+protected ulong pointer;
+private int _wasDestroyed = 0;
+private long _callCounter = 1;
+public ClientCore(ulong pointer)
+~ClientCore()
+public ClientCore(CoreConfig @config) :
+this(
+))
+protected void FreeRustArcPtr()
+protected ulong CloneRustArcPtr()
+public void Destroy()
+public void Dispose()
+private void IncrementCallCounter()
+private void DecrementCallCounter()
+internal void CallWithPointer(Action<ulong> action)
+internal T CallWithPointer<T>(Func<ulong, T> func)
+public async Task<AcceptInviteOutcome> AcceptInvite(string @codeOrUrl, string @localPath, FolderMode @mode, bool @acknowledgeRisks)
+public async Task<AccountDeletionStatus> AccountDeletionStatus()
+public async Task<AccountStatus> AccountStatus()
+public async Task<bool> AcknowledgePossibleLoss()
+public async Task<ApproveOutcome> ApproveRequest(string @groupId, string @deviceId)
+public async Task<BandwidthLimits> BandwidthLimits()
+public async Task<AccountDeletionStatus> CancelAccountDeletion()
+public async Task<UpdateStatus> CheckForUpdates()
+public async Task<AccountDeletionStatus> ConfirmAccountDeletion(string @confirmationToken)
+public async Task<LinkOutcome> CreateDefaultFolder(FolderMode @mode)
+public async Task<LinkOutcome> CreateGroupAndLink(string @groupName, string @localPath, FolderMode @mode, bool @acknowledgeRisks)
+public async Task<ProviderFolderOutcome> CreateProviderFolder(string @groupName, string @displayName, FolderMode @mode)
+public async Task<DaemonIdentity> DaemonIdentity()
+public DefaultFolder DefaultFolder()
+public async Task<MembershipOutcome> DenyRequest(string @groupId, string @deviceId)
+public async Task<UpdateDownloadGuidance> DownloadGuidance()
+public uint EngineApiVersion()
+public async Task<EvictOutcome> EvictFile(string @absolutePath)
+public async Task<string> ExportAccountData()
+public async Task<DiagnosticsExport> ExportDiagnostics(string @destinationPath)
+public async Task<FileAvailability> FileAvailability(string @absolutePath)
+public async Task<FileRetention> FileRetention(string @absolutePath)
+public async Task<FolderDetail> FolderDetail(string @localPath)
+public async Task<Dictionary<string, uint>> FolderPeerCounts()
+public async Task<LinkOutcome> JoinGroupAndLink(string @groupId, string @groupName, string @localPath, FolderMode @mode, bool @acknowledgeRisks)
+public async Task<ProviderFolderOutcome> JoinProviderFolder(string @groupId, string @groupName, string @displayName, FolderMode @mode)
+public async Task<LinkOutcome> LinkFolder(string @localPath, string @groupId, FolderMode @mode, bool @acknowledgeRisks)
+public async Task<DeviceSummary[]> ListAccountDevices()
+public async Task<ConflictSummary[]> ListConflicts(string? @localPath)
+public async Task<DeviceSummary[]> ListFolderDevices()
+public async Task<IncomingTransfer[]> ListInbox()
+public async Task<PendingInviteSummary[]> ListInvites()
+public async Task<GroupSummary[]> ListJoinableGroups()
+public async Task<MemberSummary[]> ListMembers(string @groupId)
+public async Task<GroupSummary[]> ListOwnedGroups()
+public async Task<PendingApprovalSummary[]> ListPendingApprovals()
+public async Task<RetainedOriginal[]> ListRetainedOriginals()
+public async Task<OutgoingTransfer[]> ListSentTransfers()
+public async Task<ShareSummary[]> ListShares()
+public async Task<TrashedFile[]> ListTrash(string? @localPath)
+public async Task<FileVersion[]> ListVersions(string @absolutePath)
+public async Task<InviteSummary> MintInvite(string @groupId, AssignableRole? @role, TimeSpan? @ttl, bool @requireApproval)
+public string NasAdminFailureMessage(NasAdminFailure @failure)
+public LoginSession NewLoginSession(LoginOptions @options)
+public async Task<NasAdminOpening> OpenNasAdmin(string @deviceId)
+public string ParseInviteLink(string @input)
+public async Task<PinOutcome> PinFile(string @absolutePath)
+public async Task<SpaceReclaimPreview> PreviewSpaceReclaim()
+public async Task<ReceivedTransfer> ReceiveTransfer(string @transferId, string? @destinationDir)
+public async Task<DeviceRegistration> RegisterDevice(string @name)
+public async Task<RetainedRelease[]> ReleaseRetainedOriginals(string @groupId)
+public async Task<MembershipOutcome> RemoveDevice(string @deviceId, bool @force)
+public async Task<AccountDeletionRequest> RequestAccountDeletion()
+public async Task<SafeStopOutcome> RequestSafeStop(uint? @deadlineSecs)
+public async Task<string> ResolveConflict(string @copyPath, ConflictChoice @choice)
+public async Task<FolderRestoreOutcome> RestoreTrashOperation(string @absolutePath)
+public async Task<SentTransfer> RetrySentTransfer(string @transferId)
+public async Task<ReceivedTransfer> RetryTransfer(string @transferId)
+public async Task<MembershipOutcome> RevokeMember(string @groupId, string @deviceId, bool @force)
+public async Task<RevokeEdgeOutcome> RevokeShareEdge(string @edgeId, bool @force)
+public async Task<RewindStartOutcome> RewindExecute(string @groupId, long @targetUnixNanos, byte[] @planId)
+public async Task<RewindRun> RewindFollow(string @groupId, string @runId)
+public async Task<RewindRun?> RewindLatest(string @groupId)
+public async Task<RewindPreview> RewindPreview(string @groupId, DateTime @at)
+public async Task<GcReport> RunGc(bool @dryRun)
+public async Task<PreflightResult> RunPreflight(string @localPath)
+public async Task<SentTransfer> SendToDevice(string @sourcePath, string @targetDeviceId)
+public async Task<UpdateConfig> SetAutomaticUpdateChecks(bool @enabled)
+public async Task<BandwidthLimits> SetBandwidthLimits(BandwidthLimits @limits)
+public async Task<SpaceManagement> SetSpaceManagement(bool @enabled)
+public async Task<StorageModeOutcome> SetStorageMode(string @groupId, FolderMode @mode)
+public async Task<SignOutOutcome> SignOut()
+public async Task<SpaceManagement> SpaceManagement()
+public async Task<DaemonStartOutcome> StartDaemon()
+public async Task<StartOverProgress> StartOverAsNewDevice(bool @confirmed, string @name)
+public async Task<StatusSnapshot> StatusSnapshot()
+public async Task<UnlinkOutcome> UnlinkFolder(string @localPath, bool @force, string? @expectedGroupId)
+public async Task<FileRetention> UnpinFile(string @absolutePath)
+public async Task<UpdateStatus> UpdateStatus()
+public StatusWatch WatchStatus(TimeSpan @interval)
+public interface ILoginSession
+void Begin();
+void Cancel();
+Task<LoginEvent?> NextEvent();
+public class LoginSession : ILoginSession, IDisposable
+protected ulong pointer;
+private int _wasDestroyed = 0;
+private long _callCounter = 1;
+public LoginSession(ulong pointer)
+~LoginSession()
+protected void FreeRustArcPtr()
+protected ulong CloneRustArcPtr()
+public void Destroy()
+public void Dispose()
+private void IncrementCallCounter()
+private void DecrementCallCounter()
+internal void CallWithPointer(Action<ulong> action)
+internal T CallWithPointer<T>(Func<ulong, T> func)
+public void Begin()
+public void Cancel()
+public async Task<LoginEvent?> NextEvent()
+public interface IStatusWatch
+void Cancel();
+Task<StatusUpdate?> Next();
+void Refresh();
+public class StatusWatch : IStatusWatch, IDisposable
+protected ulong pointer;
+private int _wasDestroyed = 0;
+private long _callCounter = 1;
+public StatusWatch(ulong pointer)
+~StatusWatch()
+protected void FreeRustArcPtr()
+protected ulong CloneRustArcPtr()
+public void Destroy()
+public void Dispose()
+private void IncrementCallCounter()
+private void DecrementCallCounter()
+internal void CallWithPointer(Action<ulong> action)
+internal T CallWithPointer<T>(Func<ulong, T> func)
+public void Cancel()
+public async Task<StatusUpdate?> Next()
+public void Refresh()
+public record NasAdminOpening: IDisposable
+public record Opened (
+AdminSession Session
+) : NasAdminOpening
+public record Failed (
+NasAdminFailure Failure,
+string Message
+) : NasAdminOpening
+public void Dispose()
+public static class YadorilinkClientFfiMethods

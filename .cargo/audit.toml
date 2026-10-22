@@ -1,0 +1,15 @@
+# cargo-audit configuration.
+#
+# Triaged vulnerability exceptions. Mirrors the same two IDs `.config/deny.toml`'s
+# `[advisories] ignore` carries for the workspace's cargo-deny check; see that
+# file's comment for the dependency-path and impact-assessment rationale.
+# Both are quick-xml DoS advisories pulled in
+# only through the Linux desktop UI's build-time/local-XML paths
+# (wayland-scanner, zbus_xml/atspi), not reachable from untrusted network
+# input. The fix needs an upstream egui/winit/wayland/accesskit bump that
+# cannot be done via the lockfile alone; remove these once that bump lands.
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]

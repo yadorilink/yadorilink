@@ -1,0 +1,14 @@
+[package]
+name = "yadorilink-product-view"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No GUI toolchain dependency on purpose (no eframe/tao/tray-icon) — this
+# crate stays unit-testable headlessly and reusable by yadorilink-cli
+# itself.
+[dependencies]
+yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
+# Deliberately no yadorilink-cli: the coordination-plane member listing is
+# fetched by the caller and handed in as `DeviceSummary` values (see
+# `src/device.rs`), so the view models never reach up into an interface crate.

@@ -1,0 +1,159 @@
+name: Verifier release
+
+# Publishes the small standalone Ed25519 verifier (crates/yadorilink-verify) that
+# install.sh downloads and runs only after its SHA-256 matches the pin in the
+# script. A release is a tag `verifier-<N>`; its assets are
+# `yadorilink-verify-<target>` plus a `.sha256` sidecar per target, each with a
+# build-provenance attestation. The structure is enforced by
+# .github/release/check-verifier-workflow.py, in the same three halves as the
+# engine release: an unprivileged build, an attestation-only job, a publish job.
+
+on:
+  push:
+    tags: ['verifier-[0-9]*']
+
+concurrency:
+  group: verifier-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned: the hash the installers pin is only reproducible with the same compiler.
+  VERIFIER_RUST_TOOLCHAIN: "1.99.1"
+
+jobs:
+  # Unprivileged half: read-only token, no environment, no secrets. Builds the
+  # verifier twice, from two different source paths, and refuses unless the
+  # bytes are identical; then proves the built program on the RFC 8032 vectors.
+  verifier-build:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/verifier-')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+          - os: macos-latest
+            target: macos-aarch64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master @ 2026-06-30
+        with:
+          toolchain: ${{ env.VERIFIER_RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target == 'macos-aarch64' && 'aarch64-apple-darwin' || 'x86_64-unknown-linux-gnu' }}
+
+      - name: Test the verifier
+        run: cargo test --locked --manifest-path crates/yadorilink-verify/Cargo.toml
+
+      - name: Build twice from different paths and compare
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: python3 .github/release/check-verifier-reproducible.py "$TARGET" verifier-out
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verifier-build-${{ matrix.target }}
+          path: verifier-out
+          if-no-files-found: error
+
+  # Attestation half: the only job with id-token/attestations. It downloads just
+  # this run's verifier-build artifact, re-verifies it by hash (nothing from it
+  # runs) and has GitHub sign a build-provenance attestation. No environment, no
+  # secrets, no cargo and no build step belong here.
+  verifier-attest:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/verifier-')
+    needs:
+      - verifier-build
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [linux-x86_64, macos-aarch64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download the unprivileged build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: verifier-build-${{ matrix.target }}
+          path: verifier-unverified
+
+      - name: Re-verify the build by hash only
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cd verifier-unverified
+          [ "$(find . -maxdepth 1 -type f | wc -l)" -eq 2 ] || { echo "expected exactly the binary and its sidecar" >&2; exit 1; }
+          sha256sum --check "yadorilink-verify-${TARGET}.sha256"
+
+      - name: Attest the verifier
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: verifier-unverified/yadorilink-verify-${{ matrix.target }}
+
+  # Publish half: checks each attestation against this repository, this workflow
+  # and the tagged commit, re-verifies by hash, then creates the GitHub Release.
+  # No toolchain and no build step belong here, and it has no id-token.
+  verifier-publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/verifier-')
+    needs:
+      - verifier-build
+      - verifier-attest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download the linux build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: verifier-build-linux-x86_64
+          path: verifier-release
+
+      - name: Download the macOS build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: verifier-build-macos-aarch64
+          path: verifier-release
+
+      - name: Verify attestations and hashes, then publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd verifier-release
+          for target in linux-x86_64 macos-aarch64; do
+            gh attestation verify "yadorilink-verify-${target}" \
+              --repo ${{ github.repository }} \
+              --signer-workflow ${{ github.repository }}/.github/workflows/verifier-release.yml \
+              --source-digest ${{ github.sha }} \
+              --source-ref ${{ github.ref }}
+            sha256sum --check "yadorilink-verify-${target}.sha256"
+          done
+          gh release create "$TAG" yadorilink-verify-* \
+            --repo ${{ github.repository }} \
+            --verify-tag \
+            --title "$TAG" \
+            --notes "Standalone Ed25519 verifier pinned by hash in install.sh. Each asset has a build-provenance attestation; its SHA-256 is in the .sha256 file beside it."

@@ -1,0 +1,22 @@
+[package]
+name = "yadorilink-sync-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+yadorilink-sync-protocol = { path = "../yadorilink-sync-protocol" }
+yadorilink-sync-substrate = { path = "../yadorilink-sync-substrate" }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# `testing::SharedAddressBook` stands in for the coordination plane: nodes are
+# dialled by endpoint id now, so a test needs somewhere for them to publish and
+# resolve addresses.
+yadorilink-sync-substrate = { path = "../yadorilink-sync-substrate", features = ["test-support"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+iroh = "1.1"

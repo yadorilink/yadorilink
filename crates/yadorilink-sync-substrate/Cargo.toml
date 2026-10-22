@@ -1,0 +1,54 @@
+[package]
+name = "yadorilink-sync-substrate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+# Deterministic relay infrastructure for tests: an in-process relay server and
+# the configurations that force traffic through it. Never enabled in a
+# production build -- see `testing::InProcessRelay`'s own doc comment for why a
+# relay test must not reach for public infrastructure.
+# Also enables iroh's custom-transport seam, which is how a deterministic
+# simulation gives this crate's endpoints a datagram carrier that binds no OS
+# socket. It is `unstable-custom-transports = []` upstream -- a pure gate with
+# no dependencies of its own -- so enabling it changes nothing in the lockfile
+# and nothing in a production build, which never turns this feature on.
+#
+# iroh documents that API as outside its semver guarantees. That is why it is
+# named here and nowhere else: `node.rs`'s `test-support` block is the single
+# place this crate mentions it, so an upstream change lands in one file.
+test-support = ["iroh/test-utils", "iroh/unstable-custom-transports", "dep:iroh-relay"]
+
+[dependencies]
+iroh = "1.1"
+# The exact stream type `iroh::address_lookup::AddressLookup::resolve` returns.
+# Already in the lock as one of iroh's own dependencies, at iroh's version --
+# this names it rather than adding anything new to the build.
+n0-future = "0.3"
+# test-support only: `CaTlsConfig` is not re-exported by `iroh`, and a test
+# relay serves a self-signed certificate that a client has to be told to
+# accept. Optional so a production build never links the relay server at all.
+iroh-relay = { version = "1.1", optional = true }
+# Same-LAN address lookup for iroh endpoints (mDNS). Resolves addresses only;
+# who a discovered endpoint is and whether it may be dialled stays with the
+# admission policy -- see `lan`.
+iroh-mdns-address-lookup = "0.5"
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
+# This crate's own tests use the in-process relay, which lives behind
+# `test-support`. Gating that code on the feature alone (rather than on
+# `cfg(test)` too) keeps the optional `iroh-relay` dependency genuinely
+# optional: without the feature there is nothing referring to it, in a test
+# build or otherwise.
+yadorilink-sync-substrate = { path = ".", features = ["test-support"] }
+# NAS management tests prove a WebSocket upgrade and its frames pass through
+# a management stream untouched. Both already in the lock.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }

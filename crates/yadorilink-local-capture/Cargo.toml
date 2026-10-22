@@ -1,0 +1,84 @@
+[package]
+name = "yadorilink-local-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# See yadorilink-local-storage/Cargo.toml's identical section for why.
+[features]
+# Exposes test-only helpers to OTHER crates' test builds. Propagates to
+# yadorilink-root-authority's (`RootLease::for_tests`/
+# `RootCommitPermit::for_tests`, and `write_root_marker_for_test`) and to
+# yadorilink-filesystem-sync's (the snapshot install reconciliation's
+# step hook this crate's tests use to race a user write against it).
+test-support = [
+    "yadorilink-replica-domain/test-support",
+    "yadorilink-root-authority/test-support",
+    "yadorilink-filesystem-sync/test-support",
+]
+
+[dependencies]
+# See `yadorilink_filesystem_sync::debounce`'s own doc comment.
+yadorilink-filesystem-sync = { path = "../yadorilink-filesystem-sync" }
+yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
+yadorilink-root-authority = { path = "../yadorilink-root-authority" }
+yadorilink-local-storage = { path = "../yadorilink-local-storage" }
+yadorilink-sync-sqlite = { path = "../yadorilink-sync-sqlite" }
+thiserror.workspace = true
+tracing.workspace = true
+walkdir = "2"
+tokio.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+# `local_change.rs`'s own local-origin zero-work-proof regression needs
+# `PathResolution` to call `SqliteSyncStore::dag_desired_resolved_path_
+# state_hash`'s test-facing delegate directly -- this crate's production
+# code has no `PathResolution`-shaped dependency of its own.
+yadorilink-replica-engine = { path = "../yadorilink-replica-engine" }
+# Signs test fixture changes (`ensure_initial_import`'s `ChangeEmitter`
+# construction in this crate's own tests).
+ed25519-dalek = "3"
+rand = "0.10.2"
+hex = "0.4"
+# This crate's own `#[cfg(test)]` tests need
+# `root_identity::write_root_marker_for_test`
+# (`#[cfg(any(test, feature = "test-support"))]` in yadorilink-root-authority),
+# but `cfg(test)` is crate-local -- building this crate's own tests does not
+# turn on that cfg inside the yadorilink-root-authority artifact this crate
+# links against. This self-referencing dev-dependency turns the feature on
+# instead. Mirrors yadorilink-peer-session's own identical dev-dependency
+# override for the same reason.
+yadorilink-local-capture = { path = ".", features = ["test-support"] }
+# Dev-only back-edge: this crate's own `#[cfg(test)]`/`tests/`
+# suites build a real `yadorilink-daemon::replica_coordinator::
+# ReplicaCoordinator` fixture (`ReplicaCoordinator::open_in_memory`,
+# `force_second_live_link_for_test` via its `link_repository()` accessor)
+# and simulate the daemon's restart-reconcile sequence
+# (`offline_edit_after_existing_dag_history_must_append_new_head_on_restart`
+# and its siblings) against it, re-running the idempotent initial import
+# exactly as `yadorilink-daemon`'s own restart path does, via
+# `yadorilink_daemon::dag_import::ensure_initial_import`. This is a dev-only
+# back-edge against this crate's own normal (non-dev) dependency direction
+# (`yadorilink-daemon` depends on `yadorilink-local-capture`, not the
+# reverse) -- cargo permits this: building this crate's *library* never
+# needs `yadorilink-daemon`'s lib, only compiling this crate's *test*
+# binaries does. Same dev-only back-edge shape as `yadorilink-peer-session`'s
+# existing identical back-edge onto `yadorilink-daemon`. `test-support` IS
+# needed here (unlike the pre-deletion `SyncState` fixture): `ReplicaCoordinator::
+# open_in_memory` and friends are `#[cfg(any(test, feature = "test-support"))]`
+# in `yadorilink-daemon`, and `cfg(test)` is crate-local the same way it is
+# for `yadorilink-root-authority` above.
+yadorilink-daemon = { path = "../yadorilink-daemon", features = ["test-support"] }
+# `test_support::TestReplica` (this crate's own `#[cfg(test)]`-only
+# `LocalMutationStore` fixture wrapper, see that module's own doc comment)
+# names `yadorilink_sqlite_runtime::DatabaseError` in
+# `ReplicaCoordinator::open_in_memory`/`open`'s own `Result` type directly.
+yadorilink-sqlite-runtime = { path = "../yadorilink-sqlite-runtime" }
+
+[lints]
+workspace = true

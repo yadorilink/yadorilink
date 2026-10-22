@@ -1,0 +1,49 @@
+# packaging/linux/systemd/yadorilink-daemon.service
+#
+# a systemd --user service unit for
+# yadorilink-daemon (the sync daemon), packaged by packaging/linux's .deb
+# into /usr/lib/systemd/user/ (see packaging/linux/README.md).
+#
+# WHY A USER UNIT, NOT A SYSTEM UNIT: the daemon needs the interactive
+# user's own XDG data dir (~/.local/share/yadorilink — device.json, the
+# block store, sync state DB, control socket) and will
+# eventually need that same user's Secret Service session (gnome-keyring/
+# kwallet) for `keyring`'s linux-native credential storage — a system-wide
+# root service has neither.
+#
+# WHY Restart=on-failure: restarts the daemon after a crash.
+#
+# NOT enabled or started automatically by the .deb's postinst script: a
+# per-user systemd unit generally shouldn't be silently enabled by a package
+# installed as root. This is a deliberate, documented manual step — after
+# installing the package, each user who
+# wants the daemon to start at login and survive crashes runs:
+#
+#   systemctl --user enable --now yadorilink-daemon
+#
+# Inspect/control it afterwards with:
+#
+#   systemctl --user status yadorilink-daemon
+#   journalctl --user -u yadorilink-daemon
+#   Systemctl --user disable --now yadorilink-daemon # stop autostart
+#
+# `systemctl --user` units also require "lingering" (`loginctl enable-linger
+# <user>`) if the daemon should keep running after the user logs out of
+# their graphical/terminal session entirely — not enabled by default here,
+# since most users run this while logged in. Enable it for headless/server
+# use.
+
+[Unit]
+Description=YadoriLink sync daemon
+Documentation=https://github.com/yadorilink/yadorilink
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/yadorilink-daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,788 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>YadoriLink</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f6f8;
+    --panel: #ffffff;
+    --text: #1a1d23;
+    --muted: #6b7280;
+    --border: #e2e5ea;
+    --ok: #1b8a5a;
+    --warn: #b7791f;
+    --bad: #c0392b;
+    --accent: #2f6feb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115;
+      --panel: #171a21;
+      --text: #e6e8ee;
+      --muted: #9aa1ad;
+      --border: #2a2e37;
+      --ok: #3fbf82;
+      --warn: #e0a83e;
+      --bad: #e5605a;
+      --accent: #6ea8fe;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .conn-state { font-size: 12px; color: var(--muted); }
+  main { max-width: 1000px; margin: 0 auto; padding: 20px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; }
+  tr:last-child td { border-bottom: none; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .pill.ok { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+  .pill.warn { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+  .pill.bad { background: color-mix(in srgb, var(--bad) 18%, transparent); color: var(--bad); }
+  .empty { color: var(--muted); font-size: 13px; padding: 4px 0; }
+  #gate {
+    position: fixed; inset: 0; background: var(--bg);
+    display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 10px;
+  }
+  #gate input { font-family: monospace; padding: 8px 10px; width: 320px; max-width: 80vw; border-radius: 6px; border: 1px solid var(--border); background: var(--panel); color: var(--text); }
+  #gate button { padding: 8px 14px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
+  #gate p { color: var(--muted); font-size: 13px; max-width: 420px; text-align: center; }
+  #gate code { font-size: 12px; }
+  [hidden] { display: none !important; }
+  button.action {
+    font-size: 12px; padding: 3px 9px; border-radius: 6px; border: 1px solid var(--border);
+    background: transparent; color: var(--text); cursor: pointer;
+  }
+  button.action:hover { border-color: var(--accent); color: var(--accent); }
+  button.action:disabled { opacity: .5; cursor: default; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 6px 0; }
+  .row label { font-size: 13px; color: var(--muted); min-width: 110px; }
+  .row input[type=text], .row select {
+    font-size: 13px; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--panel); color: var(--text); flex: 1 1 260px; min-width: 0;
+  }
+  .note { font-size: 12px; color: var(--muted); }
+  ul.warnings { margin: 6px 0; padding-left: 18px; font-size: 13px; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px 16px; font-size: 13px; }
+  .stats div span { display: block; color: var(--muted); font-size: 12px; }
+  .table-wrap { overflow-x: auto; }
+  .headline { font-size: 16px; font-weight: 600; margin: 10px 0 4px; }
+  .meter { height: 8px; border-radius: 4px; background: var(--border); overflow: hidden; margin: 6px 0; }
+  .meter > div { height: 100%; background: var(--accent); }
+  ul.attention { margin: 8px 0 0; padding-left: 18px; font-size: 13px; }
+</style>
+</head>
+<body>
+
+<div id="gate">
+  <h1 style="margin:0">YadoriLink</h1>
+  <p>
+    Paste the local API token to continue. The daemon writes a new one each
+    time it starts, to a file that (on Linux and macOS) only the account it
+    runs as can read;
+    <code>yadorilink web status</code> shows where. Stored only in this
+    browser's local storage for this page's own origin.
+  </p>
+  <input id="token-input" type="password" placeholder="local API token" autocomplete="off" spellcheck="false">
+  <button id="token-submit">Connect</button>
+  <p id="token-error" style="color:var(--bad)" hidden></p>
+</div>
+
+<div id="app" hidden>
+  <header>
+    <h1>YadoriLink</h1>
+    <span class="conn-state" id="conn-state">connecting&hellip;</span>
+  </header>
+  <main>
+    <div class="card" id="appliance">
+      <h2>Summary</h2>
+      <div id="overall-state" class="empty">loading&hellip;</div>
+      <div id="appliance-copy"></div>
+      <div id="appliance-disk"></div>
+    </div>
+
+    <div class="card">
+      <h2>Links</h2>
+      <div id="links-table"></div>
+    </div>
+
+    <div class="card">
+      <h2>Add a folder</h2>
+      <div class="row">
+        <label for="add-path">Folder on this device</label>
+        <input id="add-path" type="text" placeholder="/srv/yadorilink/Photos" autocomplete="off" spellcheck="false">
+        <button class="action" id="add-check">Check folder</button>
+      </div>
+      <div id="add-review" hidden>
+        <div id="add-findings"></div>
+        <div class="row">
+          <label for="add-kind">Connect it to</label>
+          <select id="add-kind">
+            <option value="create">A new shared folder</option>
+            <option value="join">A folder group of this account (group ID)</option>
+            <option value="invite">An invite (invite code)</option>
+            <option value="link">A folder group by ID, without enrolling</option>
+          </select>
+        </div>
+        <div class="row">
+          <label for="add-target" id="add-target-label">Name</label>
+          <input id="add-target" type="text" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="row">
+          <label for="add-mode">Files on this device</label>
+          <select id="add-mode">
+            <option value="eager">Keep a complete copy on this device</option>
+            <option value="on_demand">Download files only when opened</option>
+          </select>
+        </div>
+        <div class="row" id="add-ack-row" hidden>
+          <label></label>
+          <span><input type="checkbox" id="add-ack"> <label for="add-ack" style="min-width:0;color:var(--text)">I have read the warnings above and want to continue</label></span>
+        </div>
+        <div class="row">
+          <label></label>
+          <button class="action" id="add-submit">Add folder</button>
+          <span class="note" id="add-result"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>This device</h2>
+      <div id="device-stats"></div>
+    </div>
+
+    <div class="card">
+      <h2>Conflicts</h2>
+      <div id="conflicts-table"></div>
+    </div>
+
+    <div class="card">
+      <h2>Connections</h2>
+      <div id="connections-table"></div>
+    </div>
+  </main>
+</div>
+
+<script nonce="%%CSP_NONCE%%">
+(function () {
+  "use strict";
+
+  const TOKEN_KEY = "yadorilink-http-api-token";
+
+  // The stored token is sent only after this page has been answered 401:
+  // a page opened through the YadoriLink app is authorized by its device and
+  // never sends it anywhere.
+  let useToken = false;
+  function authHeaders() {
+    return useToken ? { "Authorization": "Bearer " + getToken() } : {};
+  }
+
+  function getToken() {
+    try { return localStorage.getItem(TOKEN_KEY) || ""; } catch (e) { return ""; }
+  }
+  function setToken(t) {
+    try { localStorage.setItem(TOKEN_KEY, t); } catch (e) { /* private-browsing etc.: token still works for this page load */ }
+  }
+
+  async function api(path, opts) {
+    opts = opts || {};
+    const headers = Object.assign({}, opts.headers, authHeaders());
+    if (opts.body) headers["Content-Type"] = "application/json";
+    const res = await fetch(path, Object.assign({}, opts, { headers }));
+    if (res.status === 401) {
+      const err = new Error("unauthorized");
+      err.unauthorized = true;
+      throw err;
+    }
+    if (!res.ok) {
+      let body;
+      try { body = await res.json(); } catch (e) { body = {}; }
+      const err = new Error(body.error || (res.status + " " + res.statusText));
+      err.status = res.status;
+      throw err;
+    }
+    return res.json();
+  }
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  function pill(text, kind) {
+    return '<span class="pill ' + kind + '">' + esc(text) + "</span>";
+  }
+
+  function folderName(link) {
+    const parts = String(link.local_path || "").split(/[\\/]/).filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : (link.group_id || "folder");
+  }
+
+  // Set to keep a complete copy (the daemon's policy for the folder).
+  function isCompleteCopy(link) {
+    return link.materialization_policy === "eager";
+  }
+
+  // Holds the complete copy right now: every file is here and the folder is
+  // on its disk and syncing. Only these count as protecting other devices.
+  function holdsCompleteCopy(link) {
+    return isCompleteCopy(link) && link.local_storage_state === "LOCAL_STORAGE_STATE_FULL_COPY" &&
+      !link.capture_volume_changed && !link.capture_volume_unconfirmed && !link.degraded && !link.ambiguous && !link.policy_stale;
+  }
+
+  // Not complete yet, not paused, on its disk and syncing: it is either
+  // downloading (the content is available) or waiting for it.
+  function isFilling(link) {
+    return isCompleteCopy(link) && !holdsCompleteCopy(link) && !link.paused &&
+      !link.capture_volume_changed && !link.capture_volume_unconfirmed && !link.degraded && !link.ambiguous && !link.policy_stale;
+  }
+
+  // The daemon says the content cannot be fetched right now: nothing is
+  // being copied. Waiting for a device means the devices that have it are
+  // offline; waiting for content means none reachable is known to have it.
+  function isWaitingForDevice(link) {
+    return isFilling(link) && link.availability === "PRODUCT_AVAILABILITY_WAITING_FOR_PEER";
+  }
+  function isWaitingForContent(link) {
+    return isFilling(link) && link.availability === "PRODUCT_AVAILABILITY_WAITING_FOR_EXACT_CONTENT";
+  }
+  function isWaiting(link) {
+    return isWaitingForDevice(link) || isWaitingForContent(link);
+  }
+
+  // Still downloading its files and able to make progress.
+  function isCopying(link) {
+    return isFilling(link) && !isWaiting(link);
+  }
+
+  // Plain words for the daemon's attention codes ("kind:subject"). The page
+  // names the subject (a folder) when it can; an unknown code reads as a
+  // generic line, never as the raw code.
+  function attentionText(code, links) {
+    const i = String(code).indexOf(":");
+    const kind = i < 0 ? code : code.slice(0, i);
+    const subject = i < 0 ? "" : code.slice(i + 1);
+    const link = links.find(function (l) { return l.group_id === subject; });
+    const folder = link ? folderName(link) : "A folder";
+    switch (kind) {
+      case "low_disk": return "Free space is running low.";
+      case "low_disk_critical": return "The disk is almost full. Syncing may stop until space is freed.";
+      case "durability_at_risk": return folder + " has no other confirmed copy yet.";
+      case "durability_unknown": return "Can't confirm another copy of " + folder + " right now.";
+      case "conflict": return folder + " has conflicting edits to review.";
+      case "approval_pending": return "A device is waiting for your approval to join " + folder + ".";
+      case "conflict_pending": return folder + " has conflicting edits waiting to be merged.";
+      case "held": return "Some files in " + folder + " are being kept as they were.";
+      case "volume_unconfirmed": return "The disk for " + folder + " changed or was remounted. Confirm it's the right disk to resume.";
+      case "volume_changed": return "The disk for " + folder + " isn't available. Reconnect it to keep the copy.";
+      case "degraded": case "ownership_lost": case "ambiguous": return folder + " is not syncing.";
+      case "fetch_unavailable": return "Files in " + folder + " can't be downloaded right now.";
+      case "peer_disconnected": return "A device can't be reached right now.";
+      case "peer_update_required": case "update_required": return "Update required: a device runs a different version, so syncing with it is paused until every device is updated.";
+      case "update_failed": return "The last update check failed.";
+      case "provider_registry_restored": return "The record of the Windows sync folders was damaged and an older copy was used.";
+      case "recent_error": return "A recent sync error was recorded.";
+      default: return "Something needs attention.";
+    }
+  }
+
+  function renderOverall(status) {
+    const el = document.getElementById("overall-state");
+    const state = status.overall_state || "unknown";
+    const kind = state === "healthy" ? "ok" : state === "attention" ? "warn" : state === "degraded" ? "bad" : "warn";
+    const word = { healthy: "Healthy", attention: "Needs attention", degraded: "Needs attention" }[state] || "Unknown";
+    let html = pill(word, kind);
+    const reasons = status.attention_reasons || [];
+    if (reasons.length) {
+      const links = status.links || [];
+      const seen = {};
+      html += '<ul class="attention">' + reasons.map(function (r) { return attentionText(r, links); })
+        .filter(function (t) { return seen[t] ? false : (seen[t] = true); })
+        .map(function (t) { return "<li>" + esc(t) + "</li>"; }).join("") + "</ul>";
+    }
+    el.innerHTML = html;
+  }
+
+  // The appliance view: which folders this device keeps a complete copy of
+  // (and so protects for the other devices), and the disk it keeps them on.
+  function renderAppliance(status) {
+    const links = status.links || [];
+    const full = links.filter(holdsCompleteCopy);
+    const protecting = full.filter(function (l) { return !l.paused; });
+    const copying = links.filter(isCopying);
+    const waitingDevice = links.filter(isWaitingForDevice);
+    const waitingContent = links.filter(isWaitingForContent);
+    const waiting = waitingDevice.concat(waitingContent);
+    const names = function (ls) { return ls.map(function (l) { return esc(folderName(l)); }).join(", "); };
+    const copy = document.getElementById("appliance-copy");
+    let html;
+    if (!links.length) {
+      html = '<div class="headline">No folders yet</div><div class="empty">Add a folder below to keep a complete copy of it here.</div>';
+    } else if (!full.length && !copying.length && !waiting.length) {
+      html = '<div class="headline">Not keeping a complete copy of any folder</div>' +
+        '<div class="empty">Folders here download files only when opened, or are not available right now, so they do not protect your other devices.</div>';
+    } else {
+      html = '<div class="headline">' + (full.length
+          ? "Keeping a complete copy of " + full.length + (full.length === 1 ? " folder" : " folders")
+          : copying.length ? "Still copying files to this device" : "Waiting to copy files to this device") + "</div>";
+      if (full.length) html += '<div class="empty">' + (protecting.length
+          ? "Protecting for your other devices: " + protecting.map(function (l) { return esc(folderName(l)); }).join(", ")
+          : "Every complete copy is paused, so nothing is being protected right now.") + "</div>";
+      if (copying.length) html += '<div class="empty">Copying\u2026 ' + names(copying) + "</div>";
+      if (waitingDevice.length) html += '<div class="empty">Waiting for a device: ' + names(waitingDevice) + "</div>";
+      if (waitingContent.length) html += '<div class="empty">Waiting for files to become available: ' + names(waitingContent) + "</div>";
+    }
+    copy.innerHTML = html;
+
+    const vols = status.volumes || [];
+    const vol = vols.find(function (v) { return v.path === "<block store>"; }) || vols[0];
+    const used = (status.block_store || {}).total_bytes || 0;
+    let disk = '<div class="empty">Where YadoriLink keeps its data</div><div class="stats">';
+    if (vol && vol.total_bytes > 0) disk += "<div><span>Disk capacity</span>" + esc(bytes(vol.total_bytes)) + "</div>";
+    if (vol) disk += "<div><span>Free space</span>" + esc(bytes(vol.available_bytes)) +
+      (vol.state && vol.state !== "ok" ? " " + pill(vol.state === "critical" ? "almost full" : "low", vol.state === "critical" ? "bad" : "warn") : "") + "</div>";
+    disk += "<div><span>Used by YadoriLink</span>" + esc(bytes(used)) + "</div></div>";
+    if (vol && vol.total_bytes > 0) {
+      const pct = Math.min(100, Math.round(used * 100 / vol.total_bytes));
+      disk += '<div class="meter" role="img" aria-label="YadoriLink uses ' + pct + ' percent of the disk"><div style="width:' + pct + '%"></div></div>';
+    }
+    // Each folder's own disk: folders whose disks report the same numbers
+    // share a line, so none is left out.
+    const groups = [];
+    vols.forEach(function (v) {
+      if (v.path === "<block store>" || !(v.total_bytes > 0)) return;
+      const l = links.find(function (x) { return x.local_path === v.path; });
+      const name = esc(l ? folderName(l) : v.path);
+      const g = groups.find(function (x) {
+        return x.v.total_bytes === v.total_bytes && x.v.available_bytes === v.available_bytes && x.v.state === v.state;
+      });
+      if (g) g.names.push(name); else groups.push({ v: v, names: [name] });
+    });
+    groups.forEach(function (g) {
+      const v = g.v;
+      disk += '<div class="empty">' + g.names.join(", ") + ": " + esc(bytes(v.available_bytes)) +
+        " free of " + esc(bytes(v.total_bytes)) +
+        (v.state && v.state !== "ok" ? " " + pill(v.state === "critical" ? "almost full" : "low", v.state === "critical" ? "bad" : "warn") : "") + "</div>";
+    });
+    document.getElementById("appliance-disk").innerHTML = disk;
+  }
+
+  // Words for the daemon's own product dimensions. The page only names
+  // what the daemon decided; it never works these out from other fields.
+  // An unset value (an older daemon) reads as unknown.
+  const AVAILABILITY_WORDS = {
+    PRODUCT_AVAILABILITY_AVAILABLE: ["Available", "ok"],
+    PRODUCT_AVAILABILITY_WAITING_FOR_PEER: ["Waiting for a device", "warn"],
+    PRODUCT_AVAILABILITY_WAITING_FOR_EXACT_CONTENT: ["Waiting for content", "warn"],
+  };
+  const PROTECTION_WORDS = {
+    DATA_PROTECTION_PROTECTED: ["Protected", "ok"],
+    DATA_PROTECTION_AT_RISK: ["At risk", "bad"],
+    DATA_PROTECTION_PENDING: ["Confirming", "warn"],
+  };
+  function dimension(words, value) {
+    const w = words[value] || ["Unknown", "warn"];
+    return pill(w[0], w[1]);
+  }
+
+  function devices(ids) {
+    return ids && ids.length ? '<div class="empty">' + ids.map(esc).join(", ") + "</div>" : "";
+  }
+
+  function when(unix) {
+    return new Date(unix * 1000).toLocaleString();
+  }
+
+  function renderLinks(links) {
+    const el = document.getElementById("links-table");
+    if (!links.length) { el.innerHTML = '<div class="empty">No linked folders.</div>'; return; }
+    let rows = links.map(function (l) {
+      const stateKind = l.degraded ? "bad" : l.paused || l.capture_volume_unconfirmed ? "warn" : "ok";
+      const stateLabel = l.degraded ? "degraded" : l.capture_volume_unconfirmed ? "disk not confirmed" : l.paused ? "paused" : "syncing";
+      const pausedUntil = l.paused && l.paused_until_unix > 0
+        ? '<div class="empty">until ' + esc(when(l.paused_until_unix)) + "</div>" : "";
+      const path = esc(l.local_path);
+      const confirmDisk = l.capture_volume_unconfirmed
+        ? '<div class="empty">Its disk was mounted again and cannot be recognised; nothing syncs until you confirm it.</div>' +
+          '<button class="action" data-action="readopt" data-path="' + path + '">Confirm disk</button> '
+        : "";
+      const control = confirmDisk + (l.paused
+        ? '<button class="action" data-action="resume" data-path="' + path + '">Resume</button>'
+        : '<select class="action" data-pause-length="' + path + '" aria-label="Pause length">' +
+            '<option value="">until resumed</option>' +
+            '<option value="PAUSE_DURATION_THIRTY_MINUTES">30 minutes</option>' +
+            '<option value="PAUSE_DURATION_ONE_HOUR">1 hour</option>' +
+            '<option value="PAUSE_DURATION_UNTIL_TOMORROW">until tomorrow</option>' +
+          "</select> " +
+          '<button class="action" data-action="pause" data-path="' + path + '">Pause</button>');
+      return "<tr>" +
+        "<td>" + path + "<div class=\"empty\">" + esc(l.group_id) + "</div></td>" +
+        "<td>" + pill(stateLabel, stateKind) + pausedUntil + "</td>" +
+        "<td>" + dimension(PROTECTION_WORDS, l.protection) + devices(l.protection_device_ids) + "</td>" +
+        "<td>" + dimension(AVAILABILITY_WORDS, l.availability) +
+          devices(l.availability_offline_device_ids && l.availability_offline_device_ids.length
+            ? l.availability_offline_device_ids.map(function (d) { return d + " (offline)"; })
+            : []) + "</td>" +
+        "<td>" + (isCompleteCopy(l) ? (holdsCompleteCopy(l) ? "Complete copy" : isWaitingForDevice(l) ? "Complete copy (waiting for a device)" : isWaitingForContent(l) ? "Complete copy (waiting for files)" : isCopying(l) ? "Complete copy (copying\u2026)" : "Complete copy (not complete yet)") : "Opened on demand") + "<div class=\"empty\">" +
+          l.hydrated_count + " on this device / " + l.placeholder_count + " online-only</div></td>" +
+        "<td>" + (l.conflict_count > 0 ? pill(l.conflict_count + " conflict(s)", "bad") : "&ndash;") + "</td>" +
+        "<td>" + control + "</td>" +
+      "</tr>";
+    }).join("");
+    el.innerHTML = '<div class="table-wrap"><table><thead><tr><th>Folder</th><th>State</th><th>Protection</th><th>Availability</th><th>Files</th><th>Conflicts</th><th></th></tr></thead><tbody>' + rows + "</tbody></table></div>";
+    el.querySelectorAll("button[data-action]").forEach(function (btn) {
+      btn.addEventListener("click", async function () {
+        btn.disabled = true;
+        const action = btn.getAttribute("data-action");
+        const path = btn.getAttribute("data-path");
+        const body = { path: path };
+        if (action === "readopt" && !confirm(
+            "Is the disk mounted at " + path + " this folder's disk? It then syncs with the disk as it is: " +
+            "files missing from it are deleted on every device.")) {
+          btn.disabled = false;
+          return;
+        }
+        if (action === "pause") {
+          const sel = Array.prototype.find.call(
+            el.querySelectorAll("select[data-pause-length]"),
+            function (s) { return s.getAttribute("data-pause-length") === path; });
+          if (sel && sel.value) body.duration = sel.value;
+        }
+        try {
+          await api("/api/" + action, { method: "POST", body: JSON.stringify(body) });
+          await refreshOnce();
+        } catch (e) {
+          alert(e.message);
+        } finally {
+          btn.disabled = false;
+        }
+      });
+    });
+  }
+
+  function bytes(n) {
+    if (!n) return "0 B";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let i = 0;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    return n.toFixed(i ? 1 : 0) + " " + units[i];
+  }
+
+  function renderDevice(status) {
+    const el = document.getElementById("device-stats");
+    const u = status.update || {};
+    let html = '<div class="stats">';
+    html += "<div><span>Updates</span>" + esc(u.state || "unknown") +
+      (u.available_version ? " &middot; " + esc(u.available_version) + " available" : "") + "</div>";
+    html += "</div>";
+    html += '<div class="row"><button class="action" id="update-check">Check for updates</button><span class="note" id="update-result"></span></div>';
+    el.innerHTML = html;
+    document.getElementById("update-check").addEventListener("click", checkForUpdates);
+  }
+
+  // Only on this click: an update check goes out to the network and records
+  // its result, so loading or refreshing the page never triggers it.
+  async function checkForUpdates() {
+    const btn = document.getElementById("update-check");
+    const out = document.getElementById("update-result");
+    btn.disabled = true;
+    out.textContent = "checking\u2026";
+    try {
+      const r = await api("/api/update/check", { method: "POST", body: "{}" });
+      out.textContent = r.available_version
+        ? r.available_version + " is available (this device runs " + r.current_version + ")"
+        : (r.last_error_message || ("Up to date (" + r.current_version + ")"));
+    } catch (e) {
+      out.textContent = e.message;
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function renderConflicts(data) {
+    const el = document.getElementById("conflicts-table");
+    if (!data.conflicts.length) { el.innerHTML = '<div class="empty">No conflicts.</div>'; return; }
+    let rows = data.conflicts.map(function (c) {
+      return "<tr><td>" + esc(c.path) + "</td><td>" + esc(c.local_path) + "</td><td>" + c.size + "</td></tr>";
+    }).join("");
+    el.innerHTML = "<table><thead><tr><th>Conflicted copy</th><th>Folder</th><th>Size</th></tr></thead><tbody>" + rows + "</tbody></table>";
+  }
+
+  function renderConnections(peers) {
+    const el = document.getElementById("connections-table");
+    if (!peers.length) { el.innerHTML = '<div class="empty">No known peers.</div>'; return; }
+    let rows = peers.map(function (p) {
+      let reach = p.reachability.replace("PEER_REACHABILITY_", "").toLowerCase();
+      // Online but on another version: not "unreachable", and not healthy either.
+      if (reach === "connected" && p.version_incompatible) reach = "update required";
+      const kind = reach === "connected" ? "ok" : reach === "unreachable" ? "bad" : "warn";
+      return "<tr><td>" + esc(p.device_id) + "</td><td>" + pill(reach, kind) + "</td>" +
+        "<td>" + esc(p.route_kind.replace("ROUTE_KIND_", "").toLowerCase()) + "</td></tr>";
+    }).join("");
+    el.innerHTML = "<table><thead><tr><th>Device</th><th>Reachability</th><th>Route</th></tr></thead><tbody>" + rows + "</tbody></table>";
+  }
+
+  function renderStatus(status) {
+    renderOverall(status);
+    renderAppliance(status);
+    // Re-rendering mid-selection would reset a pause-length choice.
+    if (!document.activeElement || !document.activeElement.matches("select[data-pause-length]")) {
+      renderLinks(status.links || []);
+    }
+    renderDeviceIfIdle(status);
+    settleAddInFlight(status.links || []);
+    renderConnections(status.peers || []);
+  }
+
+  function renderDeviceIfIdle(status) {
+    // Keep a running update check's button and result in place.
+    const btn = document.getElementById("update-check");
+    if (btn && btn.disabled) return;
+    const out = document.getElementById("update-result");
+    const kept = out ? out.textContent : "";
+    renderDevice(status);
+    document.getElementById("update-result").textContent = kept;
+  }
+
+  // Adding a folder: the daemon's own preflight first, then the request. The
+  // warnings are the daemon's, shown as given; the acknowledgement is sent
+  // only after the box is ticked, and the daemon refuses a risky folder
+  // without it whatever this page does.
+  const ADD_TARGETS = {
+    create: ["Name", "Photos", "/api/share/create", "group_name"],
+    join: ["Group ID", "", "/api/share/join", "group_id"],
+    invite: ["Invite code", "the part after yadorilink://invite/", "/api/invite/accept", "code"],
+    link: ["Group ID", "", "/api/link", "group_id"],
+  };
+  let addReview = null;
+  // A request the daemon was still working on when the adapter stopped
+  // waiting (504). Sending it again could start a second one, so the button
+  // stays off until the folder shows up in the status (or the page reloads).
+  let addInFlight = null;
+
+  function resetAdd() {
+    addReview = null;
+    document.getElementById("add-review").hidden = true;
+    document.getElementById("add-result").textContent = "";
+  }
+
+  function updateAddTarget() {
+    const t = ADD_TARGETS[document.getElementById("add-kind").value];
+    document.getElementById("add-target-label").textContent = t[0];
+    document.getElementById("add-target").placeholder = t[1];
+  }
+
+  async function checkFolder() {
+    resetAdd();
+    const path = document.getElementById("add-path").value.trim();
+    if (!path) return;
+    const findings = document.getElementById("add-findings");
+    const btn = document.getElementById("add-check");
+    btn.disabled = true;
+    try {
+      const r = await api("/api/link/preflight", { method: "POST", body: JSON.stringify({ path: path }) });
+      addReview = r;
+      let html = '<div class="row"><label>Folder</label><span>' + esc(r.resolved_path) + "</span></div>";
+      if (r.prohibitions.length) {
+        html += pill("cannot be added", "bad") + '<ul class="warnings">' + r.prohibitions.map(function (p) { return "<li>" + esc(p) + "</li>"; }).join("") + "</ul>";
+      } else if (r.warnings.length) {
+        html += pill("review before adding", "warn") + '<ul class="warnings">' + r.warnings.map(function (w) { return "<li>" + esc(w) + "</li>"; }).join("") + "</ul>";
+      } else {
+        html += pill("ready", "ok");
+      }
+      findings.innerHTML = html;
+      document.getElementById("add-ack").checked = false;
+      document.getElementById("add-ack-row").hidden = !r.warnings.length || r.prohibitions.length > 0;
+      document.getElementById("add-submit").disabled = r.prohibitions.length > 0 || addInFlight !== null;
+      document.getElementById("add-review").hidden = false;
+    } catch (e) {
+      if (e.unauthorized) { showGate("That token was rejected."); return; }
+      findings.innerHTML = "";
+      document.getElementById("add-review").hidden = true;
+      document.getElementById("add-result").textContent = "";
+      alert(e.message);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function settleAddInFlight(links) {
+    if (!addInFlight) return;
+    if (!links.some(function (l) { return l.local_path === addInFlight; })) return;
+    addInFlight = null;
+    document.getElementById("add-submit").disabled = false;
+    document.getElementById("add-result").textContent = "Added.";
+  }
+
+  async function submitAdd() {
+    if (!addReview || addInFlight) return;
+    const out = document.getElementById("add-result");
+    const kind = document.getElementById("add-kind").value;
+    const t = ADD_TARGETS[kind];
+    const target = document.getElementById("add-target").value.trim();
+    if (!target) { out.textContent = t[0] + " is required."; return; }
+    const needsAck = addReview.warnings.length > 0;
+    const acked = document.getElementById("add-ack").checked;
+    if (needsAck && !acked) { out.textContent = "Tick the box to confirm the warnings first."; return; }
+    const body = {
+      path: addReview.resolved_path,
+      on_demand: document.getElementById("add-mode").value === "on_demand",
+      acknowledge_risks: needsAck && acked,
+    };
+    body[t[3]] = target;
+    const btn = document.getElementById("add-submit");
+    btn.disabled = true;
+    out.textContent = "working\u2026";
+    try {
+      const r = await api(t[2], { method: "POST", body: JSON.stringify(body) });
+      out.textContent = r.awaiting_approval
+        ? "Added. It starts syncing once this device is approved."
+        : "Added.";
+      document.getElementById("add-target").value = "";
+      addReview = null;
+      await refreshOnce();
+    } catch (e) {
+      if (e.unauthorized) { showGate("That token was rejected."); return; }
+      if (e.status === 504) {
+        addInFlight = body.path;
+        out.textContent = "Still working on it. The folder appears in the list above once it is added; " +
+          "if it does not, reload this page before trying again.";
+        return;
+      }
+      out.textContent = e.message;
+    } finally {
+      btn.disabled = addInFlight !== null;
+    }
+  }
+
+  document.getElementById("add-check").addEventListener("click", checkFolder);
+  document.getElementById("add-path").addEventListener("input", resetAdd);
+  document.getElementById("add-kind").addEventListener("change", updateAddTarget);
+  document.getElementById("add-submit").addEventListener("click", submitAdd);
+  updateAddTarget();
+
+  async function refreshOnce() {
+    const status = await api("/api/status");
+    renderStatus(status);
+    const conflicts = await api("/api/conflicts");
+    renderConflicts(conflicts);
+  }
+
+  // Not the native `EventSource` API: it has no way to attach a header, and
+  // this API deliberately never accepts its bearer token from anywhere but
+  // the `Authorization` header (see the crate's top-level security notes --
+  // a query-string token would leak into browser history/server logs, a
+  // cookie would reopen the exact CSRF hole the header-only design closes).
+  // So this reads `/api/events` as a plain authenticated `fetch()` and
+  // parses the `text/event-stream` framing by hand.
+  function handleSseFrame(frame) {
+    let eventName = "message";
+    const dataLines = [];
+    frame.split("\n").forEach(function (line) {
+      if (line.startsWith("event:")) eventName = line.slice(6).trim();
+      else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+      // Lines starting with ":" are keep-alive comments; anything else is
+      // an SSE field this dashboard doesn't use (id/retry) -- ignored.
+    });
+    if (eventName !== "status" || !dataLines.length) return;
+    try { renderStatus(JSON.parse(dataLines.join("\n"))); } catch (e) { /* malformed frame: skip it */ }
+  }
+
+  async function connectEvents() {
+    const connState = document.getElementById("conn-state");
+    for (;;) {
+      try {
+        const res = await fetch("/api/events", { headers: authHeaders() });
+        if (res.status === 401) { showGate("That token was rejected."); return; }
+        if (!res.ok || !res.body) throw new Error("stream connect failed: " + res.status);
+        connState.textContent = "live";
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let idx;
+          while ((idx = buf.indexOf("\n\n")) !== -1) {
+            handleSseFrame(buf.slice(0, idx));
+            buf = buf.slice(idx + 2);
+          }
+        }
+      } catch (e) {
+        // fall through to reconnect below
+      }
+      connState.textContent = "reconnecting…";
+      await new Promise(function (r) { setTimeout(r, 2000); });
+    }
+  }
+
+  async function boot() {
+    document.getElementById("gate").hidden = true;
+    document.getElementById("app").hidden = false;
+    try {
+      await refreshOnce();
+    } catch (e) {
+      if (e.unauthorized) {
+        if (!useToken && getToken()) { useToken = true; return boot(); }
+        showGate(useToken ? "That token was rejected." : "");
+        return;
+      }
+      document.getElementById("overall-state").innerHTML = '<span class="pill bad">unreachable</span><div class="empty">' + esc(e.message) + "</div>";
+    }
+    connectEvents();
+  }
+
+  function showGate(message) {
+    document.getElementById("app").hidden = true;
+    document.getElementById("gate").hidden = false;
+    const err = document.getElementById("token-error");
+    if (message) { err.textContent = message; err.hidden = false; } else { err.hidden = true; }
+  }
+
+  document.getElementById("token-submit").addEventListener("click", function () {
+    const v = document.getElementById("token-input").value.trim();
+    if (!v) return;
+    setToken(v);
+    useToken = true;
+    boot();
+  });
+  document.getElementById("token-input").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") document.getElementById("token-submit").click();
+  });
+
+  // Always try first: a page opened through the YadoriLink app is already
+  // authorized by its device and never needs the token; one opened on this
+  // machine is answered 401 and shown the gate.
+  boot();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,492 @@
+name: Verify
+
+# Deterministic correctness of one SHA. Runs unchanged on pull requests and on
+# main. Anything time- or probability-dependent belongs in nightly.yml.
+#
+# Inside a job, every step after the first uses `if: always()`, so one run
+# reports every failure in that job instead of stopping at the first.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: quality
+          components: rustfmt, clippy
+          token: ${{ github.token }}
+      - run: cargo fmt --all -- --check
+      - if: always()
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Architecture and invariant checks
+        if: always()
+        run: |
+          set -e
+          python3 .github/checks/check-architecture.py --self-test
+          python3 .github/checks/check-architecture.py
+          python3 .github/checks/check-block-commit-boundary.py
+          python3 .github/checks/check-block-deletion-boundary.py
+          python3 .github/checks/check-daemon-composition-root.py
+          python3 .github/checks/check-index-read-fail-closed.py
+          python3 .github/checks/check-link-enumeration-fail-closed.py
+          python3 .github/checks/check-link-group-uniqueness.py
+          python3 .github/checks/check-link-runtime-ownership.py
+          python3 .github/checks/check-maintenance-ownership.py
+          python3 .github/checks/check-materialization-journal.py
+          python3 .github/checks/check-mutation-boundary.py
+          python3 .github/checks/check-materialization-semantic-boundary.py
+          python3 .github/checks/check-materialization-semantic-boundary.py --self-test
+          python3 .github/checks/check-stored-blocklist-fail-closed.py
+          python3 .github/checks/check-safety-invariants-doc.py --self-test
+          python3 .github/checks/check-safety-invariants-doc.py
+          python3 .github/checks/check-pre-release-compatibility-debt.py
+          python3 .github/checks/check-cutover-note.py --self-test
+          python3 .github/checks/check-cutover-note.py
+          bash .github/checks/check_removed_features.sh --self-test
+          bash .github/checks/check_removed_features.sh
+          python3 .github/release/check-release-gates.py
+          python3 .github/release/check-release-gates.py --self-test
+          python3 .github/release/check-verifier-workflow.py
+          python3 .github/release/check-verifier-workflow.py --self-test
+          python3 .github/release/build-engine-bundle.py --self-test
+          python3 .github/release/csharp-binding.py --self-test
+          python3 .github/release/csharp-binding.py pin-check
+          python3 .github/checks/validate-engine-identity.py --self-test
+          python3 .github/checks/check-engine-artifact.py --self-test
+          python3 .github/checks/check-release-dir-secrets.py
+          python3 .github/checks/check-release-dir-secrets.py --self-test
+          python3 .github/release/check-signing-workflow.py
+          python3 .github/release/check-signing-workflow.py --self-test
+      - name: Manifest signer tests
+        if: always()
+        run: |
+          set -e
+          python3 -m pip install --quiet --disable-pip-version-check cryptography
+          python3 .github/release/test_sign_request.py
+      # The verifier is its own workspace (the installers pin its hash), so the
+      # workspace-wide steps above do not reach it.
+      - name: Verifier crate
+        if: always()
+        run: |
+          set -e
+          cargo fmt --manifest-path crates/yadorilink-verify/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path crates/yadorilink-verify/Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --manifest-path crates/yadorilink-verify/Cargo.toml
+          python3 .github/release/check-verifier-reproducible.py linux-x86_64 "$RUNNER_TEMP/verifier-out"
+      - uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
+        if: always()
+        with:
+          tool: cargo-audit,cargo-deny
+      - if: always()
+        run: cargo audit
+      - if: always()
+        run: cargo audit --file crates/yadorilink-verify/Cargo.lock
+      - if: always()
+        run: cargo deny --config .config/deny.toml check
+
+  # The C# binding of the client facade (the Windows app's boundary): it must
+  # generate from the library built here, match the checked-in API surface, and
+  # on Windows compile and load against that library.
+  csharp-binding:
+    name: csharp binding (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: csharp-binding-${{ matrix.os }}
+          token: ${{ github.token }}
+      - name: Generate the binding and check its API surface
+        run: .github/release/generate-csharp-binding.sh --debug --out csharp-binding
+      - name: Compile the binding and load the library
+        if: runner.os == 'Windows'
+        run: >-
+          dotnet run -c Release --project .github/release/csharp-smoke
+          -p:BindingDir="$PWD/csharp-binding"
+          -p:NativeLibrary="$PWD/target/debug/yadorilink_client_ffi.dll"
+
+  # Platform-independent logic is verified once, on Linux, split into lanes
+  # that run in parallel. Lanes that measure wall clock or bind real sockets
+  # run single-threaded on their own runner so they never share a machine with
+  # a multi-threaded suite.
+  linux:
+    name: linux (${{ matrix.lane }})
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: workspace
+            timeout: 45
+            run: >-
+              cargo test --no-fail-fast --workspace --exclude yadorilink-daemon
+              --exclude yadorilink-transport --exclude yadorilink-lane-ports
+              --exclude yadorilink-sync-substrate --exclude yadorilink-sync-sqlite
+              --exclude yadorilink-http-api --exclude yadorilink-ipc-proto
+              --exclude yadorilink-cli
+              --
+              --skip rotation_without_the_lock_destroys_the_grant
+              --skip rotation_under_the_lock_keeps_the_grant_alive
+              --skip rotation_child
+              --skip a_process_stays_authenticated_across_the_five_minute_access_token_lifetime
+          - lane: daemon lib
+            timeout: 45
+            run: cargo test --no-fail-fast -p yadorilink-daemon --lib -- --test-threads=1
+          - lane: daemon integration
+            timeout: 90
+            python: true
+            run: >-
+              cargo test --no-fail-fast -p yadorilink-daemon --test '*' --
+              --test-threads=1
+              --skip random_concurrent_operations_converge_to_an_identical_file_set
+              --skip replay_known_failing_seeds
+          - lane: wire
+            timeout: 30
+            run: cargo test --no-fail-fast -p yadorilink-peer-session --test peer_session -- --test-threads=1
+          - lane: transport
+            timeout: 45
+            run: cargo test --no-fail-fast -p yadorilink-transport --tests -- --test-threads=1
+          - lane: lane-ports
+            timeout: 45
+            run: cargo test --no-fail-fast -p yadorilink-lane-ports --tests -- --test-threads=1
+          - lane: sync-substrate
+            timeout: 45
+            run: cargo test --no-fail-fast -p yadorilink-sync-substrate --tests -- --test-threads=1
+          - lane: http-api
+            timeout: 45
+            run: cargo test --no-fail-fast -p yadorilink-http-api --tests -- --test-threads=1
+          - lane: ipc-proto
+            timeout: 30
+            run: cargo test --no-fail-fast -p yadorilink-ipc-proto --tests -- --test-threads=1
+          # The CLI tests drive the CLI binary and in-process daemons over
+          # per-test control sockets and set process-global environment, so
+          # they run one at a time like the other socket-driven crates.
+          - lane: cli
+            timeout: 45
+            run: cargo test --no-fail-fast -p yadorilink-cli --tests -- --test-threads=1
+          - lane: sync-sqlite lib
+            timeout: 60
+            run: cargo test --no-fail-fast -p yadorilink-sync-sqlite --lib -- --test-threads=1
+          - lane: sync-sqlite integration
+            timeout: 60
+            run: cargo test --no-fail-fast -p yadorilink-sync-sqlite --test '*' -- --test-threads=1
+          # The two runtime proofs about the Coordination credential. One
+          # spends 320s of real wall clock crossing the 300s access-token
+          # lifetime; the other forks two real processes. Keep both `--test`
+          # arguments: dropping one silently drops a security proof.
+          - lane: auth runtime
+            timeout: 25
+            run: >-
+              cargo test --no-fail-fast -p yadorilink-fapi-client
+              --test cross_process_rotation --test five_minute_boundary
+              -- --test-threads=1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: linux-${{ matrix.lane }}
+          token: ${{ github.token }}
+      # tests/release_manifest_chain.rs drives the Python manifest verifier.
+      - if: matrix.python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - if: matrix.python
+        run: python3 -m pip install --quiet --disable-pip-version-check cryptography
+      - run: .github/checks/run-logged.sh ${{ matrix.run }}
+      - name: Test report
+        if: always()
+        run: python3 .github/checks/summarize-test-log.py test-output.log
+      - name: Upload the test log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-log-linux-${{ matrix.lane }}
+          path: test-output.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Deterministic simulation: one seed per scenario. Multi-seed sweeps are
+  # nightly.
+  linux-simulation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: linux-simulation
+          token: ${{ github.token }}
+      - name: Turmoil scenarios, one seed
+        env:
+          RUSTFLAGS: --cfg turmoil
+          DST_SEEDS: "1"
+        run: >-
+          .github/checks/run-logged.sh cargo test --no-fail-fast -p yadorilink-daemon
+          --test dst_turmoil_substrate_case
+          -- --test-threads=1
+      - name: Simulation harness lints and conformance
+        if: always()
+        run: >-
+          .github/checks/run-logged.sh cargo test -p yadorilink-daemon
+          --test dst_fidelity_lint
+          --test watcher_decompose_conformance
+      - name: Simulation harness unit tests
+        if: always()
+        env:
+          RUSTFLAGS: --cfg turmoil
+        run: >-
+          .github/checks/run-logged.sh cargo test -p yadorilink-daemon
+          --test dst_watcher_debounce
+          -- dst_support::
+      - name: Turmoil scenarios, one seed, reduced op budget
+        if: always()
+        env:
+          RUSTFLAGS: --cfg turmoil
+          DST_VARIATIONS: "1"
+          DST_OPS_BUDGET: "4"
+        run: |
+          for scenario in dst_turmoil_substrate_case dst_watcher_debounce; do
+            .github/checks/run-logged.sh cargo test -p yadorilink-daemon --test "$scenario"
+          done
+      - name: Test report
+        if: always()
+        run: python3 .github/checks/summarize-test-log.py test-output.log
+      - name: Upload the test log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-log-simulation
+          path: test-output.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  linux-installer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: linux-installer
+          token: ${{ github.token }}
+      - name: Unsigned installer builds
+        run: ./packaging/linux/build-deb.sh
+
+  # The one-line installers (packaging/install): the pin block is well formed, and
+  # each installer passes its suite against a local fixture release signed with a
+  # throw-away key. Nothing here touches the network or a real key.
+  script-installer:
+    name: script installer (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Pin block
+        shell: bash
+        run: |
+          python3 packaging/install/pins.py --self-test
+          python3 packaging/install/pins.py check
+      - name: sh installer suite
+        if: runner.os != 'Windows'
+        run: sh packaging/install/tests/run-tests.sh
+      - name: PowerShell installer suite
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'lp-install'
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          Copy-Item packaging/install/install.ps1, packaging/install/tests/build-fixture.py, packaging/install/tests/serve.py, packaging/install/tests/windows/Run-Tests.ps1 $root
+          powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'Run-Tests.ps1') -Root $root
+          exit $LASTEXITCODE
+
+  # macOS runs two lanes, Windows three, in parallel, so a long workspace
+  # run no longer queues the daemon work behind it. The daemon lane does not
+  # pre-build the workspace: `cargo test` builds what it needs. Each lane has
+  # its own cache key.
+  macos:
+    name: macos (${{ matrix.lane }})
+    runs-on: macos-latest
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: workspace
+            timeout: 60
+          - lane: daemon
+            timeout: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: macos-${{ matrix.lane }}
+          token: ${{ github.token }}
+      # tests/release_manifest_chain.rs drives the Python manifest verifier.
+      - if: matrix.lane == 'daemon'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - if: matrix.lane == 'daemon'
+        run: python3 -m pip install --quiet --disable-pip-version-check cryptography
+      - if: matrix.lane == 'workspace'
+        run: cargo build --workspace --all-targets
+      - name: Workspace tests
+        if: matrix.lane == 'workspace' && always()
+        run: >-
+          .github/checks/run-logged.sh cargo test --no-fail-fast --workspace --exclude yadorilink-daemon
+          --exclude yadorilink-sync-substrate --exclude yadorilink-cli
+          --
+          --skip rotation_without_the_lock_destroys_the_grant
+          --skip rotation_under_the_lock_keeps_the_grant_alive
+          --skip rotation_child
+          --skip a_process_stays_authenticated_across_the_five_minute_access_token_lifetime
+      - name: CLI tests (single-threaded)
+        if: matrix.lane == 'workspace' && always()
+        run: .github/checks/run-logged.sh cargo test --no-fail-fast -p yadorilink-cli --tests -- --test-threads=1
+      - name: Sync substrate tests (single-threaded)
+        if: matrix.lane == 'workspace' && always()
+        # Own step, one test at a time, as on Linux: the relay tests bind real
+        # endpoints and share an in-process address book.
+        run: .github/checks/run-logged.sh cargo test --no-fail-fast -p yadorilink-sync-substrate --tests -- --test-threads=1
+      - name: Daemon filesystem and runtime tests
+        if: matrix.lane == 'daemon'
+        run: >-
+          .github/checks/run-logged.sh cargo test --no-fail-fast -p yadorilink-daemon --tests --
+          --test-threads=1
+          --skip random_concurrent_operations_converge_to_an_identical_file_set
+          --skip replay_known_failing_seeds
+      - name: Test report
+        if: always()
+        run: python3 .github/checks/summarize-test-log.py test-output.log
+      - name: Upload the test log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-log-macos-${{ matrix.lane }}
+          path: test-output.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  windows:
+    name: windows (${{ matrix.lane }})
+    runs-on: windows-latest
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: workspace
+            timeout: 60
+          - lane: daemon
+            timeout: 90
+          - lane: shell
+            timeout: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: windows-${{ matrix.lane }}
+          token: ${{ github.token }}
+      - if: matrix.lane == 'daemon'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - if: matrix.lane == 'daemon'
+        run: python3 -m pip install --quiet --disable-pip-version-check cryptography
+      - if: matrix.lane == 'workspace'
+        run: cargo build --workspace --all-targets
+      - name: Workspace tests
+        if: matrix.lane == 'workspace' && always()
+        run: >-
+          .github/checks/run-logged.sh cargo test --no-fail-fast --workspace --exclude yadorilink-daemon
+          --exclude yadorilink-sync-substrate
+          -- --test-threads=4
+          --skip rotation_without_the_lock_destroys_the_grant
+          --skip rotation_under_the_lock_keeps_the_grant_alive
+          --skip rotation_child
+          --skip a_process_stays_authenticated_across_the_five_minute_access_token_lifetime
+      - name: Sync substrate tests (single-threaded)
+        if: matrix.lane == 'workspace' && always()
+        # Own step, one test at a time, as on Linux: the relay tests bind real
+        # endpoints and share an in-process address book.
+        run: .github/checks/run-logged.sh cargo test --no-fail-fast -p yadorilink-sync-substrate --tests -- --test-threads=1
+      - name: Daemon filesystem and runtime tests
+        if: matrix.lane == 'daemon'
+        run: >-
+          .github/checks/run-logged.sh cargo test --no-fail-fast -p yadorilink-daemon --tests --
+          --test-threads=1
+          --skip random_concurrent_operations_converge_to_an_identical_file_set
+          --skip replay_known_failing_seeds
+      - name: Shell extension
+        if: matrix.lane == 'shell'
+        working-directory: crates/yadorilink-shell-ext-windows
+        run: cargo build --release
+      - name: Shell extension tests
+        if: matrix.lane == 'shell'
+        # The crate is its own workspace, so the manifest is named from the root
+        # where the log is collected.
+        run: .github/checks/run-logged.sh cargo test --release --no-fail-fast --manifest-path crates/yadorilink-shell-ext-windows/Cargo.toml
+      - name: Test report
+        if: always()
+        run: python3 .github/checks/summarize-test-log.py test-output.log
+      - name: Upload the test log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-log-windows-${{ matrix.lane }}
+          path: test-output.log
+          if-no-files-found: ignore
+          retention-days: 7

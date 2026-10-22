@@ -1,0 +1,70 @@
+#!/bin/sh
+# yadorilink-svc -- run the yadorilink CLI as the headless service account,
+# against the service's state directory.
+#
+#   sudo yadorilink-svc login --device
+#   sudo yadorilink-svc status
+#
+# Needed because the daemon's control socket and credentials are owner-only
+# (the `yadorilink` account), and the CLI must use the same state directory
+# as the daemon. Reads /etc/yadorilink/headless.env, the file the service
+# itself uses. Refuses `daemon start` / `daemon stop` (use systemctl) and
+# `device register` unless the service is inactive or failed.
+set -eu
+
+ENV_FILE=${YADORILINK_HEADLESS_ENV:-/etc/yadorilink/headless.env}
+SERVICE_USER=${YADORILINK_HEADLESS_USER:-yadorilink}
+
+if [ ! -r "$ENV_FILE" ]; then
+    echo "yadorilink-svc: cannot read $ENV_FILE; run install-headless.sh first" >&2
+    exit 1
+fi
+
+if [ "$(id -u)" -ne 0 ] && [ "$(id -un)" != "$SERVICE_USER" ]; then
+    echo "yadorilink-svc: run with sudo (or as $SERVICE_USER)" >&2
+    exit 1
+fi
+
+# The service manager owns the daemon here. `daemon start` would launch a
+# second, unsupervised daemon; `daemon stop` is a clean exit systemd does not
+# restart; `device register` restarts a running daemon by stopping it and
+# launching one itself, outside the unit.
+UNIT=yadorilink-headless.service
+case "${1:-} ${2:-}" in
+"daemon start" | "daemon stop")
+    echo "yadorilink-svc: the service manager runs the daemon here; use: sudo systemctl ${2} $UNIT" >&2
+    exit 2
+    ;;
+"device register")
+    # Only inactive/failed is safe: activating (auto-restart), active,
+    # reloading and deactivating can all bring a daemon up mid-registration.
+    state=$(systemctl show -p ActiveState --value "$UNIT" 2>/dev/null || true)
+    case "$state" in
+    inactive | failed) ;;
+    *)
+        echo "yadorilink-svc: $UNIT is ${state:-in an unknown state}; stop it before registering, then start it again:" >&2
+        echo "  sudo systemctl stop $UNIT" >&2
+        echo "  sudo yadorilink-svc $*" >&2
+        echo "  sudo systemctl start $UNIT" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+esac
+
+# Well-formed YADORILINK_* assignments from the env file, one per line.
+vars=$(grep -E '^YADORILINK_[A-Z_]+=[^[:space:]]*$' "$ENV_FILE" || true)
+set -f
+# shellcheck disable=SC2086  # one assignment per line, intentional word splitting
+set -- $vars HOME=/nonexistent "${YADORILINK_BIN:-/usr/bin/yadorilink}" "$@"
+set +f
+
+if [ "$(id -un)" = "$SERVICE_USER" ]; then
+    exec env "$@"
+fi
+uid=$(id -u "$SERVICE_USER") || {
+    echo "yadorilink-svc: no account named $SERVICE_USER; run install-headless.sh first" >&2
+    exit 1
+}
+gid=$(id -g "$SERVICE_USER")
+exec setpriv --reuid "$uid" --regid "$gid" --init-groups env "$@"

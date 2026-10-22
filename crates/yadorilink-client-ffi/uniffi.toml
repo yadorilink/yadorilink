@@ -1,0 +1,14 @@
+[bindings.swift]
+# Every generated Swift file compiles into this one module, so the product
+# types and the objects that use them see each other without imports.
+module_name = "YadoriLinkFFI"
+
+[bindings.csharp]
+# The C# binding of the same facade, for the Windows app
+# (`.github/release/generate-csharp-binding.sh`). The product types it uses are
+# generated from yadorilink-client-core into `YadoriLink.Native.Core`. Every
+# symbol loads from this crate's dynamic library, which the bundle ships as
+# `yadorilink_client_ffi.dll`.
+namespace = "YadoriLink.Native"
+cdylib_name = "yadorilink_client_ffi"
+access_modifier = "public"

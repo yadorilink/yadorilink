@@ -1,0 +1,48 @@
+[package]
+name = "yadorilink-reporting"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# The durable publish of the consent file (`durable_dir::publish_durably`).
+yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
+serde.workspace = true
+serde_json = "1"
+thiserror.workspace = true
+regex = "1"
+tracing.workspace = true
+# Local reporting-storage IDs (report/candidate/reporter IDs): a plain
+# random UUIDv4, never derived from any account/device identity.
+uuid = { version = "1", features = ["v4"] }
+# HTTPS-only submission client. rustls (not
+# native-tls) so this crate never needs a system OpenSSL, and
+# default-features = false so we don't pull in reqwest's cookie jar,
+# multipart, gzip/brotli, etc. — this client only ever does one thing:
+# POST a validated JSON envelope and read a small JSON receipt back.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+] }
+# Needed only because `reqwest`'s async client must run on a Tokio
+# runtime and this module adds its own `tokio::time::timeout` guard
+# around every request (see submission.rs). Unlike the rest of the
+# workspace (`tokio.workspace = true` = `features = ["full"]`), this
+# crate is meant to stay usable without pulling in tokio's fs/process/
+# signal/net-listener machinery, so it depends on just the "time"
+# feature it actually uses.
+tokio = { version = "1", default-features = false, features = ["time"] }
+
+[dev-dependencies]
+# Real local HTTP listener for mock-endpoint tests -- dev-only, so it
+# never affects this crate's own build footprint.
+wiremock = "0.6"
+tempfile = "3"
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+] }
+
+[lints]
+workspace = true

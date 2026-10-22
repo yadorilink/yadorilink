@@ -1,0 +1,23 @@
+Package: yadorilink
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: @ARCH@
+Maintainer: yadorilink project <juntaki@users.noreply.github.com>
+Homepage: https://github.com/yadorilink/yadorilink
+Depends: libc6, libgcc-s1
+Description: Peer-to-peer file sync -- CLI and daemon
+ yadorilink is a peer-to-peer file synchronization tool. This package
+ installs the yadorilink CLI (`yadorilink`) and the yadorilink-daemon sync
+ daemon, plus a systemd --user service unit for the daemon
+ (/usr/lib/systemd/user/yadorilink-daemon.service).
+ .
+ A systemd system unit (yadorilink-headless.service) and its setup script
+ under /usr/share/yadorilink/headless/ are included for always-on headless
+ hosts; neither is enabled automatically.
+ .
+ This is a CLI/daemon-only build. See https://github.com/yadorilink/yadorilink for docs.
+ .
+ The systemd user unit is installed but NOT enabled automatically; run
+ `systemctl --user enable --now yadorilink-daemon` after installing to
+ start the daemon at login with crash-restart supervision.

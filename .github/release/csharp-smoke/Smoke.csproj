@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Compiles the generated C# binding and loads the native library through it.
+    Not shipped; CI runs it on Windows so a binding that does not compile, or
+    does not match the library built beside it, fails before a release.
+
+    Run it with dotnet run in the Release configuration, giving two properties:
+      BindingDir     the output directory given to generate-csharp-binding.sh
+      NativeLibrary  the path of yadorilink_client_ffi.dll
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="$(BindingDir)/Generated/*.cs" />
+    <!-- The binding loads the library as `yadorilink_client_ffi`, the name cargo builds it under. -->
+    <None Include="$(NativeLibrary)" Link="yadorilink_client_ffi.dll" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

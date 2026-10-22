@@ -1,0 +1,42 @@
+name: Contributor licence
+
+# Requires every external pull request author to explicitly agree to the
+# current CLA (.github/CLA.md, text in .github/legal/) before the "CLA" status
+# check passes. Signatures are stored in a dedicated branch of this repository,
+# never on the default branch.
+#
+# This workflow runs with a write token (pull_request_target). Never add a step
+# that checks out or executes code from the pull request.
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, closed, synchronize]
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+  statuses: write
+
+jobs:
+  cla:
+    name: CLA
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'pull_request_target'
+      || github.event.comment.body == 'recheck'
+      || github.event.comment.body == 'I have read and agree to the YadoriLink CLA v1.0'
+    steps:
+      - name: Contributor licence check
+        uses: contributor-license/cla-action@2e483ec09841118c52af4716e8875eb9832d1dd2 # v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          path-to-signatures: signatures/v1/cla.json
+          path-to-document: https://github.com/${{ github.repository }}/blob/main/.github/legal/CLA-v1.0.md
+          branch: cla-signatures
+          allowlist: juntaki,dependabot[bot],github-actions[bot]
+          custom-pr-sign-comment: "I have read and agree to the YadoriLink CLA v1.0"
+          lock-pullrequest-aftermerge: false
