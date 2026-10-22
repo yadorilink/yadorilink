@@ -35,7 +35,7 @@ iroh-relay = { version = "1.1", optional = true }
 # Same-LAN address lookup for iroh endpoints (mDNS). Resolves addresses only;
 # who a discovered endpoint is and whether it may be dialled stays with the
 # admission policy -- see `lan`.
-iroh-mdns-address-lookup = "0.5"
+iroh-mdns-address-lookup = "0.6"
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
