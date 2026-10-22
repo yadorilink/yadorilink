@@ -59,7 +59,7 @@ hyper-util = { version = "0.1", default-features = false, features = ["tokio", "
 [target.'cfg(windows)'.dependencies]
 # Named-pipe client retry-on-busy loop, mirroring
 # `yadorilink-cli`'s own `control_client.rs` exactly (same feature set).
-windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 # This crate's own `tests/*.rs` integration binaries link against

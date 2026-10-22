@@ -5473,15 +5473,6 @@ dependencies = [
 
 [[package]]
 name = "windows-sys"
-version = "0.59.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
-dependencies = [
- "windows-targets 0.52.6",
-]
-
-[[package]]
-name = "windows-sys"
 version = "0.60.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2f500e4d28234f72040990ec9d39e3a6b950f9f22d3dba18416c35882612bcb"
@@ -5836,7 +5827,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
  "yadorilink-client-core",
  "yadorilink-daemon",
  "yadorilink-fapi-client",
@@ -5867,7 +5858,7 @@ dependencies = [
  "tokio",
  "uniffi",
  "url",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
  "wiremock",
  "yadorilink-fapi-client",
  "yadorilink-fs-platform",
@@ -5927,7 +5918,7 @@ dependencies = [
  "turmoil",
  "url",
  "uuid",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
  "wiremock",
  "yadorilink-daemon",
  "yadorilink-fapi-client",
@@ -5999,7 +5990,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "walkdir",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
  "yadorilink-daemon",
  "yadorilink-fs-platform",
  "yadorilink-local-storage",
@@ -6021,7 +6012,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tracing",
  "unicode-normalization",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
  "yadorilink-fs-platform",
  "yadorilink-replica-domain",
 ]
@@ -6045,7 +6036,7 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
  "yadorilink-daemon",
  "yadorilink-http-api",
  "yadorilink-ipc-proto",
@@ -6062,7 +6053,7 @@ dependencies = [
  "prost",
  "prost-build",
  "tokio",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6131,7 +6122,7 @@ dependencies = [
  "tokio",
  "tracing",
  "walkdir",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
  "yadorilink-fs-platform",
  "yadorilink-replica-domain",
  "yadorilink-root-authority",
@@ -6336,7 +6327,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
  "yadorilink-fs-platform",
  "yadorilink-local-storage",
  "yadorilink-namespace",
@@ -6385,7 +6376,7 @@ dependencies = [
  "tokio",
  "tracing",
  "turmoil",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
  "yadorilink-fs-platform",
  "yadorilink-os-keychain",
  "zeroize",

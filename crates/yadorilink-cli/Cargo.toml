@@ -48,7 +48,7 @@ libc = "0.2"
 
 # Local-time rendering and parsing (`SystemTimeToTzSpecificLocalTime`).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Time"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Time"] }
 
 [dev-dependencies]
 # The wire-contract harness decodes JWT-shaped values and parses redirect
