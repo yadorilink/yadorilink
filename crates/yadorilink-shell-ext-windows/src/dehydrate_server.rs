@@ -78,7 +78,7 @@ fn create_next_pipe_server(pipe_name: &str) -> std::io::Result<NamedPipeServer> 
 /// the next server instance is created and ready to accept BEFORE the
 /// current one is handed off to its connection handler).
 pub async fn serve(pipe_name: &str) -> std::io::Result<()> {
-    eprintln!("yadorilink-cfapi-host: dehydrate pipe listening on {pipe_name}");
+    eprintln!("yadorilink-cfapi-host: dehydrate pipe listening");
     let mut server = create_first_pipe_server(pipe_name)?;
     let connection_slots = Arc::new(Semaphore::new(MAX_DEHYDRATE_CONNECTIONS));
 

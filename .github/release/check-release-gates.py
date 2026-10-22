@@ -340,7 +340,7 @@ def self_test() -> int:
     mutations: list[tuple[str, str, object]] = [
         ("generator moved into the signing job", WORKFLOW, lambda t: move_generator_to_signing_job(t)),
         ("generator job gets the signing environment", WORKFLOW, lambda t: add_to_job(t, UNPRIVILEGED_JOB, "    environment: release-signing\n")),
-        ("generator job gets a secret", WORKFLOW, lambda t: t.replace("repo-token: ${{ github.token }}", "repo-token: ${{ secrets.GITHUB_TOKEN }}", 1)),
+        ("generator job gets a secret", WORKFLOW, lambda t: t.replace("GITHUB_TOKEN: ${{ github.token }}", "GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}", 1)),
         ("generator job loses read-only permissions", WORKFLOW, lambda t: drop_in_job(t, UNPRIVILEGED_JOB, "    permissions:\n      contents: read\n")),
         ("generator job holds the signing hook", WORKFLOW, lambda t: add_to_job(t, UNPRIVILEGED_JOB, "    # ENGINE_PROVENANCE_SIGN_CMD\n").replace("# ENGINE_PROVENANCE_SIGN_CMD", "x: ${{ vars.ENGINE_PROVENANCE_SIGN_CMD }}")),
         ("signing job builds with cargo", WORKFLOW, lambda t: t.replace("      - name: Re-verify the bundle by hash only\n", "      - run: cargo build --release\n      - name: Re-verify the bundle by hash only\n")),

@@ -98,7 +98,7 @@ jobs:
           cargo clippy --locked --manifest-path crates/yadorilink-verify/Cargo.toml --all-targets -- -D warnings
           cargo test --locked --manifest-path crates/yadorilink-verify/Cargo.toml
           python3 .github/release/check-verifier-reproducible.py linux-x86_64 "$RUNNER_TEMP/verifier-out"
-      - uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         if: always()
         with:
           tool: cargo-audit,cargo-deny
@@ -234,7 +234,7 @@ jobs:
         run: python3 .github/checks/summarize-test-log.py test-output.log
       - name: Upload the test log
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-log-linux-${{ matrix.lane }}
           path: test-output.log
@@ -291,7 +291,7 @@ jobs:
         run: python3 .github/checks/summarize-test-log.py test-output.log
       - name: Upload the test log
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-log-simulation
           path: test-output.log
@@ -348,7 +348,7 @@ jobs:
           powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'Run-Tests.ps1') -Root $root
           exit $LASTEXITCODE
 
-  # macOS runs two lanes, Windows three, in parallel, so a long workspace
+  # macOS runs three lanes, Windows four, in parallel, so a long workspace
   # run no longer queues the daemon work behind it. The daemon lane does not
   # pre-build the workspace: `cargo test` builds what it needs. Each lane has
   # its own cache key.
@@ -362,7 +362,9 @@ jobs:
         include:
           - lane: workspace
             timeout: 60
-          - lane: daemon
+          - lane: daemon lib
+            timeout: 45
+          - lane: daemon integration
             timeout: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -373,11 +375,11 @@ jobs:
           cache-key: macos-${{ matrix.lane }}
           token: ${{ github.token }}
       # tests/release_manifest_chain.rs drives the Python manifest verifier.
-      - if: matrix.lane == 'daemon'
+      - if: matrix.lane == 'daemon integration'
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - if: matrix.lane == 'daemon'
+      - if: matrix.lane == 'daemon integration'
         run: python3 -m pip install --quiet --disable-pip-version-check cryptography
       - if: matrix.lane == 'workspace'
         run: cargo build --workspace --all-targets
@@ -399,10 +401,13 @@ jobs:
         # Own step, one test at a time, as on Linux: the relay tests bind real
         # endpoints and share an in-process address book.
         run: .github/checks/run-logged.sh cargo test --no-fail-fast -p yadorilink-sync-substrate --tests -- --test-threads=1
-      - name: Daemon filesystem and runtime tests
-        if: matrix.lane == 'daemon'
+      - name: Daemon unit tests
+        if: matrix.lane == 'daemon lib'
+        run: .github/checks/run-logged.sh cargo test --no-fail-fast -p yadorilink-daemon --lib -- --test-threads=1
+      - name: Daemon integration tests
+        if: matrix.lane == 'daemon integration'
         run: >-
-          .github/checks/run-logged.sh cargo test --no-fail-fast -p yadorilink-daemon --tests --
+          .github/checks/run-logged.sh cargo test --no-fail-fast -p yadorilink-daemon --test '*' --
           --test-threads=1
           --skip random_concurrent_operations_converge_to_an_identical_file_set
           --skip replay_known_failing_seeds
@@ -411,9 +416,9 @@ jobs:
         run: python3 .github/checks/summarize-test-log.py test-output.log
       - name: Upload the test log
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: test-log-macos-${{ matrix.lane }}
+          name: test-log-macos-${{ strategy.job-index }}
           path: test-output.log
           if-no-files-found: ignore
           retention-days: 7
@@ -428,7 +433,9 @@ jobs:
         include:
           - lane: workspace
             timeout: 60
-          - lane: daemon
+          - lane: daemon lib
+            timeout: 45
+          - lane: daemon integration
             timeout: 90
           - lane: shell
             timeout: 30
@@ -440,11 +447,11 @@ jobs:
         with:
           cache-key: windows-${{ matrix.lane }}
           token: ${{ github.token }}
-      - if: matrix.lane == 'daemon'
+      - if: matrix.lane == 'daemon integration'
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - if: matrix.lane == 'daemon'
+      - if: matrix.lane == 'daemon integration'
         run: python3 -m pip install --quiet --disable-pip-version-check cryptography
       - if: matrix.lane == 'workspace'
         run: cargo build --workspace --all-targets
@@ -463,10 +470,13 @@ jobs:
         # Own step, one test at a time, as on Linux: the relay tests bind real
         # endpoints and share an in-process address book.
         run: .github/checks/run-logged.sh cargo test --no-fail-fast -p yadorilink-sync-substrate --tests -- --test-threads=1
-      - name: Daemon filesystem and runtime tests
-        if: matrix.lane == 'daemon'
+      - name: Daemon unit tests
+        if: matrix.lane == 'daemon lib'
+        run: .github/checks/run-logged.sh cargo test --no-fail-fast -p yadorilink-daemon --lib -- --test-threads=1
+      - name: Daemon integration tests
+        if: matrix.lane == 'daemon integration'
         run: >-
-          .github/checks/run-logged.sh cargo test --no-fail-fast -p yadorilink-daemon --tests --
+          .github/checks/run-logged.sh cargo test --no-fail-fast -p yadorilink-daemon --test '*' --
           --test-threads=1
           --skip random_concurrent_operations_converge_to_an_identical_file_set
           --skip replay_known_failing_seeds
@@ -484,9 +494,9 @@ jobs:
         run: python3 .github/checks/summarize-test-log.py test-output.log
       - name: Upload the test log
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: test-log-windows-${{ matrix.lane }}
+          name: test-log-windows-${{ strategy.job-index }}
           path: test-output.log
           if-no-files-found: ignore
           retention-days: 7

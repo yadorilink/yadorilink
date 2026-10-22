@@ -493,3 +493,24 @@ fn a_checkpoint_of_an_in_memory_database_is_a_no_op() {
     let database = SyncDatabase::open_in_memory(schema_init).expect("open");
     database.checkpoint_truncate().expect("nothing to fold");
 }
+
+#[test]
+fn dropping_the_database_waits_for_a_connection_a_pool_worker_is_still_opening() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("closing.sqlite3");
+    let database = SyncDatabase::open(&path, |_| Ok(())).expect("open");
+    let connections = database.connections_for_test();
+    // Taking the idle connection makes the pool open a replacement on a worker thread; make that
+    // slow, then drop the database while it is still opening.
+    connections.delay_connects_for_test(std::time::Duration::from_millis(400));
+    database
+        .read::<_, DatabaseError>(
+            |conn| Ok(conn.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))?),
+        )
+        .expect("read");
+    drop(database);
+    assert_eq!(connections.live(), 0, "a connection outlived the database");
+    // Every connection is closed, so SQLite has removed the write-ahead log it kept for them.
+    assert!(!dir.path().join("closing.sqlite3-wal").exists());
+    assert!(!dir.path().join("closing.sqlite3-shm").exists());
+}

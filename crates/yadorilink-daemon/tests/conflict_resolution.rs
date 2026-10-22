@@ -128,6 +128,23 @@ async fn wait_recorded(device: &TestDevice, group_id: &str, path: &str) {
     .await;
 }
 
+/// Waits until the watcher has delivered and capture has processed every
+/// filesystem event raised so far.
+///
+/// An index row that matches the disk does not say that: the watcher journals
+/// a path dirty only when its debounce window closes, so the echo of a write
+/// (the test's own, or the daemon's) is still on its way when the row it
+/// produced is already current, and Keep this refuses while it is journaled.
+/// Events reach the watcher in order, so a file created now is captured only
+/// after the echo of everything written before it.
+async fn wait_watcher_caught_up(device: &TestDevice, group_id: &str) {
+    static BARRIERS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = BARRIERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let barrier = format!("watcher-barrier-{n}.txt");
+    std::fs::write(device.root.path().join(&barrier), "b").unwrap();
+    wait_captured(device, group_id, &barrier, 1).await;
+}
+
 fn read(device: &TestDevice, path: &str) -> String {
     std::fs::read_to_string(device.root.path().join(path)).unwrap_or_default()
 }
@@ -143,6 +160,9 @@ async fn device_with_conflict(group_id: &str) -> (TestDevice, ControlSocketHandl
     std::fs::write(a.root.path().join(COPY), "theirs!").unwrap();
     wait_captured(&a, group_id, "plan.txt", 4).await;
     wait_captured(&a, group_id, COPY, 7).await;
+    wait_watcher_caught_up(&a, group_id).await;
+    wait_recorded(&a, group_id, "plan.txt").await;
+    wait_recorded(&a, group_id, COPY).await;
     let socket = control_socket_client::start(a.state.clone()).await;
     (a, socket)
 }
@@ -250,8 +270,6 @@ async fn keep_this_replaces_the_original_and_leaves_the_copy_alone() {
     let group_id = "conflict-keep-this";
     let (a, socket) = device_with_conflict(group_id).await;
     let (replaced_seq, _) = current(&a, group_id, "plan.txt").unwrap();
-    wait_recorded(&a, group_id, "plan.txt").await;
-    wait_recorded(&a, group_id, COPY).await;
 
     let outcome = resolve(&socket, &a, COPY, ConflictResolution::KeepThis).await;
 
@@ -261,6 +279,7 @@ async fn keep_this_replaces_the_original_and_leaves_the_copy_alone() {
     assert_eq!(read(&a, COPY), "theirs!");
     assert_no_reserved_names(&a);
     // Restoring refuses while the write Keep this just made is uncaptured.
+    wait_watcher_caught_up(&a, group_id).await;
     wait_recorded(&a, group_id, "plan.txt").await;
     // Still recorded, and the list still reports it truthfully.
     assert!(current(&a, group_id, COPY).is_some_and(|(_, size)| size == 7));
@@ -305,11 +324,13 @@ async fn keep_this_retains_permissions_and_xattrs_and_can_be_repeated() {
     wait_captured(&a, group_id, "plan.txt", 4).await;
     wait_captured(&a, group_id, COPY, 7).await;
     // The chmod/xattr change is captured as a version of its own.
+    wait_watcher_caught_up(&a, group_id).await;
     wait_recorded(&a, group_id, COPY).await;
     let socket = control_socket_client::start(a.state.clone()).await;
 
     for _ in 0..2 {
         // The second round also follows the plan.txt write of the first.
+        wait_watcher_caught_up(&a, group_id).await;
         wait_recorded(&a, group_id, "plan.txt").await;
         wait_recorded(&a, group_id, COPY).await;
         let outcome = resolve(&socket, &a, COPY, ConflictResolution::KeepThis).await;
@@ -441,6 +462,9 @@ async fn keep_this_converges_on_a_second_device_and_survives_its_restart() {
     )
     .await;
 
+    wait_watcher_caught_up(&a, group_id).await;
+    wait_recorded(&a, group_id, "plan.txt").await;
+    wait_recorded(&a, group_id, COPY).await;
     let socket = control_socket_client::start(a.state.clone()).await;
     let outcome = resolve(&socket, &a, COPY, ConflictResolution::KeepThis).await;
     assert!(matches!(outcome, Outcome::KeptPath(_)), "{outcome:?}");

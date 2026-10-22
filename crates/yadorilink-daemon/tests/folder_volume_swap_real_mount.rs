@@ -26,6 +26,11 @@ use yadorilink_replica_domain::session_state::MaterializationState;
 /// A blank APFS disk image mounted at `at` for as long as the guard lives.
 struct Mounted {
     at: PathBuf,
+    /// The image's whole-disk device (`/dev/diskN`), which stays attached even
+    /// when only its filesystem is unmounted.
+    device: Option<String>,
+    /// Set once detached, so cleanup never touches a device number the OS reused.
+    detached: std::cell::Cell<bool>,
     _dir: tempfile::TempDir,
 }
 
@@ -41,7 +46,12 @@ impl Mounted {
             .output()
             .unwrap();
         assert!(made.status.success(), "hdiutil create: {made:?}");
-        let this = Mounted { at: at.to_path_buf(), _dir: dir };
+        let mut this = Mounted {
+            at: at.to_path_buf(),
+            device: None,
+            detached: std::cell::Cell::new(false),
+            _dir: dir,
+        };
         let attached = Command::new("hdiutil")
             .args(["attach", "-nobrowse", "-mountpoint"])
             .arg(at)
@@ -49,28 +59,91 @@ impl Mounted {
             .output()
             .unwrap();
         assert!(attached.status.success(), "hdiutil attach: {attached:?}");
+        let device = String::from_utf8_lossy(&attached.stdout)
+            .lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .find(|d| d.starts_with("/dev/disk"))
+            .map(str::to_owned);
+        this.device = device;
         this
     }
 
+    /// Unmount the image, retrying while the OS reports the volume busy (a
+    /// background indexer or a just-finished scan can hold it for a moment).
+    /// Every attempt's exit code and output is kept and printed on failure, and
+    /// who still holds the volume is listed, so a busy mount is diagnosable.
     fn detach(&self) {
-        for force in [false, true] {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut backoff = Duration::from_millis(250);
+        let mut log = String::new();
+        let mut attempt = 0;
+        while std::time::Instant::now() < deadline {
+            attempt += 1;
+            let force = attempt > 3;
             let mut cmd = Command::new("hdiutil");
             cmd.arg("detach");
             if force {
                 cmd.arg("-force");
             }
-            if cmd.arg(&self.at).output().map(|o| o.status.success()).unwrap_or(false) {
-                return;
+            match cmd.arg(&self.at).output() {
+                Ok(o) if o.status.success() => {
+                    self.detached.set(true);
+                    return;
+                }
+                Ok(o) => log.push_str(&format!(
+                    "attempt {attempt} (force={force}): {} stdout={:?} stderr={:?}\n",
+                    o.status,
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                )),
+                Err(e) => log.push_str(&format!("attempt {attempt}: spawn failed: {e}\n")),
             }
-            std::thread::sleep(Duration::from_secs(1));
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(Duration::from_secs(4));
         }
-        panic!("could not detach {}", self.at.display());
+        let holders = Command::new("lsof")
+            .arg("+D")
+            .arg(&self.at)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let last = Command::new("diskutil").args(["unmount", "force"]).arg(&self.at).output();
+        if matches!(&last, Ok(o) if o.status.success()) {
+            if self.eject_device() {
+                self.detached.set(true);
+            }
+            return;
+        }
+        panic!(
+            "could not detach {}\n{log}holders:\n{holders}\ndiskutil unmount force: {last:?}",
+            self.at.display()
+        );
+    }
+}
+
+impl Mounted {
+    fn eject_device(&self) -> bool {
+        match &self.device {
+            Some(device) => Command::new("hdiutil")
+                .args(["detach", "-force"])
+                .arg(device)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false),
+            None => false,
+        }
     }
 }
 
 impl Drop for Mounted {
     fn drop(&mut self) {
-        let _ = Command::new("hdiutil").args(["detach", "-force"]).arg(&self.at).output();
+        if self.detached.get() {
+            return;
+        }
+        let by_path = Command::new("hdiutil").args(["detach", "-force"]).arg(&self.at).output();
+        if !matches!(&by_path, Ok(o) if o.status.success()) {
+            self.eject_device();
+        }
     }
 }
 

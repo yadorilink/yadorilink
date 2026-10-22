@@ -515,6 +515,8 @@ mod tests {
         }
     }
 
+    // The paths are macOS layouts; elsewhere `/Applications/...` is not an absolute path.
+    #[cfg(unix)]
     #[test]
     fn the_owner_of_a_launch_is_the_distribution_of_the_daemon_it_starts() {
         let app_cli =

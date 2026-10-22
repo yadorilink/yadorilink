@@ -458,8 +458,10 @@ mod tests {
         let exe = std::path::Path::new("/opt/it's/share/yadorilink/1.2.0/bin/yadorilink");
         let prefix = prefix_from_exe(exe, false).expect("installer layout");
         assert_eq!(prefix, std::path::Path::new("/opt/it's"));
+        // The separator is the platform's, so the expectation is built from the path itself.
+        let quoted = prefix.to_str().expect("utf-8 path").replace('\'', "'\\''");
         assert!(installer_command("1.2.0", "beta", Some(&prefix), false)
-            .ends_with("--prefix '/opt/it'\\''s'"));
+            .ends_with(&format!("--prefix '{quoted}'")));
         assert_eq!(
             installer_command("1.2.0", "nightly", Some(std::path::Path::new("D:\\Y'z")), true),
             "& ([scriptblock]::Create((irm https://yadori.link/install.ps1))) -Channel nightly -Version 1.2.0 -Prefix 'D:\\Y''z'"

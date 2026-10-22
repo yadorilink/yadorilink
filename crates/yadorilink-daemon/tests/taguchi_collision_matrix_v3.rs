@@ -426,9 +426,28 @@ async fn resume_all(devices: &[TestDevice], revoked: Option<usize>) {
     let resumes = resumed
         .iter()
         .zip(controllers.iter())
-        .map(|(device, controller)| controller.resume(device.root.path().to_str().unwrap()));
-    for result in futures_util::future::join_all(resumes).await {
-        result.unwrap();
+        .map(|(device, controller)| resume_when_captured(controller, device));
+    futures_util::future::join_all(resumes).await;
+}
+
+/// Resumes one device. A resume first captures the device's pending local changes, and refuses
+/// (changing nothing) while one cannot be captured yet: a path being rewritten by a peer's
+/// content arriving at the same moment is left for the next pass. That is a "retry" answer, and
+/// a mid-row resume on a case-insensitive volume meets it, so it is retried here; any other
+/// refusal is a failure.
+async fn resume_when_captured(controller: &LinkRuntimeController, device: &TestDevice) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match controller.resume(device.root.path().to_str().unwrap()).await {
+            Ok(()) => return,
+            Err(error)
+                if error.to_string().contains("could not be captured yet")
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(error) => panic!("resume failed: {error}"),
+        }
     }
 }
 

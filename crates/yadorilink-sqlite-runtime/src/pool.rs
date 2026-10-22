@@ -2,10 +2,14 @@
 //! machinery -- no `SyncDatabase` fields live here; `SyncDatabase` owns
 //! its own `pool`/`writer_gate` and calls back into this module.
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::Connection;
 
 use crate::error::SqlOperationError;
 
@@ -29,7 +33,169 @@ pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const STATEMENT_CACHE_CAPACITY: usize = 128;
 
 /// The connection pool backing a [`crate::SyncDatabase`].
-pub type ConnectionPool = Pool<SqliteConnectionManager>;
+pub type ConnectionPool = Pool<CountedManager>;
+
+/// How long dropping a database waits for its last connection to close.
+const CLOSE_WAIT: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+struct Census {
+    /// Connections being opened or open: counted before the file is opened and until it is
+    /// closed.
+    live: usize,
+    /// The database is being dropped: no further connection may start.
+    shut: bool,
+}
+
+/// Which connections of one database exist. r2d2 opens connections on worker threads that hold the
+/// pool while they do, so dropping the pool does not close every connection: one still being made
+/// finishes after the owner is gone, and is closed there. A late close checkpoints the WAL and
+/// removes the `-wal` and `-shm` files, and a late open can take hold of files that were put back
+/// in the meantime. [`CloseBarrier`] waits for this to reach zero.
+#[derive(Default)]
+pub(crate) struct Connections {
+    census: Mutex<Census>,
+    none_left: Condvar,
+    /// Test hook: how long, in milliseconds, opening a connection takes before it starts.
+    #[cfg(test)]
+    connect_delay_ms: AtomicU64,
+}
+
+impl Connections {
+    fn census(&self) -> std::sync::MutexGuard<'_, Census> {
+        self.census.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Counts a connection about to be opened; `false` once the database is being dropped.
+    fn begin(&self) -> bool {
+        let mut census = self.census();
+        if census.shut {
+            return false;
+        }
+        census.live += 1;
+        true
+    }
+
+    fn end(&self) {
+        let mut census = self.census();
+        census.live -= 1;
+        if census.live == 0 {
+            self.none_left.notify_all();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live(&self) -> usize {
+        self.census().live
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delay_connects_for_test(&self, delay: Duration) {
+        self.connect_delay_ms.store(delay.as_millis() as u64, Ordering::SeqCst);
+    }
+}
+
+/// Dropped after the pool (declare it after the pool field): returns once every connection of the
+/// database is closed, and keeps any still-scheduled one from opening.
+pub(crate) struct CloseBarrier(pub(crate) Arc<Connections>);
+
+impl Drop for CloseBarrier {
+    fn drop(&mut self) {
+        let deadline = std::time::Instant::now() + CLOSE_WAIT;
+        let mut census = self.0.census();
+        census.shut = true;
+        while census.live > 0 {
+            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return;
+            };
+            census = self
+                .0
+                .none_left
+                .wait_timeout(census, left)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
+    }
+}
+
+/// A pooled SQLite connection that reports its close to [`Connections`].
+pub struct CountedConnection {
+    connection: Option<Connection>,
+    connections: Arc<Connections>,
+}
+
+impl std::ops::Deref for CountedConnection {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.connection.as_ref().expect("connection is present until dropped")
+    }
+}
+
+impl std::ops::DerefMut for CountedConnection {
+    fn deref_mut(&mut self) -> &mut Connection {
+        self.connection.as_mut().expect("connection is present until dropped")
+    }
+}
+
+impl Drop for CountedConnection {
+    fn drop(&mut self) {
+        // Closed before it is reported, so a waiter that sees zero sees the files released.
+        drop(self.connection.take());
+        self.connections.end();
+    }
+}
+
+/// [`SqliteConnectionManager`] that counts the connections it makes ([`Connections`]).
+pub struct CountedManager {
+    inner: SqliteConnectionManager,
+    connections: Arc<Connections>,
+}
+
+impl CountedManager {
+    pub(crate) fn new(inner: SqliteConnectionManager, connections: Arc<Connections>) -> Self {
+        Self { inner, connections }
+    }
+}
+
+impl r2d2::ManageConnection for CountedManager {
+    type Connection = CountedConnection;
+    type Error = rusqlite::Error;
+
+    fn connect(&self) -> Result<CountedConnection, rusqlite::Error> {
+        if !self.connections.begin() {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+                Some("the database is closed".to_owned()),
+            ));
+        }
+        #[cfg(test)]
+        {
+            let delay = self.connections.connect_delay_ms.load(Ordering::SeqCst);
+            if delay > 0 {
+                std::thread::sleep(Duration::from_millis(delay));
+            }
+        }
+        // From here the count is owned by the connection (or given back on failure).
+        match self.inner.connect() {
+            Ok(connection) => Ok(CountedConnection {
+                connection: Some(connection),
+                connections: Arc::clone(&self.connections),
+            }),
+            Err(error) => {
+                self.connections.end();
+                Err(error)
+            }
+        }
+    }
+
+    fn is_valid(&self, connection: &mut CountedConnection) -> Result<(), rusqlite::Error> {
+        self.inner.is_valid(connection)
+    }
+
+    fn has_broken(&self, connection: &mut CountedConnection) -> bool {
+        self.inner.has_broken(connection)
+    }
+}
 
 /// Checks out a connection from `pool`, converting whichever concrete
 /// error type the `r2d2::Pool` produces into the caller's own error type
@@ -38,7 +204,7 @@ pub(crate) fn checkout<E: SqlOperationError>(pool: &ConnectionPool) -> Result<Po
     pool.get().map(PooledConnection).map_err(E::from)
 }
 
-pub(crate) struct PooledConnection(r2d2::PooledConnection<SqliteConnectionManager>);
+pub(crate) struct PooledConnection(r2d2::PooledConnection<CountedManager>);
 
 impl std::ops::Deref for PooledConnection {
     type Target = rusqlite::Connection;
@@ -56,7 +222,9 @@ impl std::ops::DerefMut for PooledConnection {
 /// Builds the connection pool for a `SyncDatabase`.
 pub(crate) fn build_pool(
     manager: SqliteConnectionManager,
+    connections: Arc<Connections>,
 ) -> Result<ConnectionPool, crate::error::DatabaseError> {
+    let manager = CountedManager::new(manager, connections);
     // `Pool::new` (a bare `Pool::builder().build(..)`) defaults `min_idle`
     // to `None`, which r2d2 documents as "maintain as many idle connections
     // as `max_size`" -- i.e. it eagerly establishes connections up to the

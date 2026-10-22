@@ -34,7 +34,7 @@ fn identify_reports_the_documented_fields_for_every_install_layout() {
         let report = identity(exe, source, None).report();
         assert_eq!(report.install_source, source, "{exe}");
         assert_eq!(report.owner, owner, "{exe}");
-        assert_eq!(report.install_root, root, "{exe}");
+        assert_eq!(report.install_root.replace('\\', "/"), root, "{exe}");
         assert_eq!(report.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(report.engine_api_version, yadorilink_ipc_proto::PROVIDER_HOST_API_VERSION);
         assert_eq!(report.pid, 4242);

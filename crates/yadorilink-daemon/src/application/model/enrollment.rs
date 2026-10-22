@@ -9,6 +9,9 @@
 pub(crate) enum LinkRefusal {
     DiskFull,
     PathNotAllowed,
+    /// The operating system refused this program access to the folder (macOS privacy
+    /// protection, a Windows ACL, ordinary permissions).
+    AccessDenied,
 }
 
 /// Why the coordination plane will not redeem an invite.

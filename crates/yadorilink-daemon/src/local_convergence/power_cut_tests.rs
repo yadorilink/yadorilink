@@ -252,7 +252,15 @@ async fn publish_generation(
     for file in 0..scenario.files {
         let name = scenario.name(file);
         let content = format!("{generation} content of {name}, long enough to tear").into_bytes();
-        let version = source(h, &format!("{generation}-{file}"), &content).await;
+        let tag = format!("{generation}-{file}");
+        let version = source(h, &tag, &content).await;
+        // The scratch name only mints the version. Left live, it is a second holder of
+        // the content, and replacing the first version at the received name then waits
+        // until that holder is proven on disk. A volume with a coarse birth-time clock
+        // (Linux) cannot prove it, so the receive would never run.
+        let scratch = format!("zz-source-{tag}");
+        std::fs::remove_file(h.path(&scratch)).unwrap();
+        h.observe_removal(&scratch).await;
         ops.push(put(&name, version));
         contents.insert(name, content);
     }

@@ -61,13 +61,22 @@ async fn a_peer_on_another_protocol_version_is_incompatible_and_still_reachable(
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(
-            matches!(
-                alice.peer_connectivity.reachability(BOB),
-                Some(PeerReachability::Connected(_))
-            ),
-            "an incompatible peer is online: it must never read as unreachable"
-        );
+        // The path a fresh connection uses is selected a moment after it opens, so for that
+        // moment the peer reads "connecting"; it must reach "connected" and never "unreachable".
+        let connected_by = tokio::time::Instant::now() + STEP;
+        loop {
+            match alice.peer_connectivity.reachability(BOB) {
+                Some(PeerReachability::Connected(_)) => break,
+                Some(PeerReachability::Unreachable(why)) => panic!(
+                    "an incompatible peer is online: it must never read as unreachable ({why:?})"
+                ),
+                other => assert!(
+                    tokio::time::Instant::now() < connected_by,
+                    "alice never read bob as connected (last: {other:?})"
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
 

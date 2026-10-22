@@ -210,6 +210,45 @@ async fn contested_heads_are_not_forked_or_placed_until_the_freeze_ends() {
     assert_eq!(placed(&h), 2, "after the fork the winner and the copy are placed");
 }
 
+/// A fork authoring that fails part-way leaves nothing behind: no frontier position of this
+/// device names a delta whose body is not stored (a peer asking for that range is refused,
+/// and takes it for lost history).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_fork_authoring_leaves_no_frontier_position_without_its_delta() {
+    let h = Harness::new(true);
+    let a = a_version_held_here(&h, "scratch-a.bin", b"written by one peer").await;
+    let b = a_version_held_here(&h, "scratch-b.bin", b"written by the other peer").await;
+    admit_from(&h, REMOTE, vec![put("d/p", a, Vec::new())]);
+    admit_from(&h, OTHER_REMOTE, vec![put("d/p", b, Vec::new())]);
+    h.state
+        .database()
+        .write::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+            Ok(conn.execute_batch(&format!(
+                "CREATE TRIGGER fail_body BEFORE INSERT ON native_delta_bodies \
+                 WHEN NEW.author = '{}' BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+                super::growing_file_projection_tests::LOCAL_DEVICE
+            ))?)
+        })
+        .unwrap();
+
+    assert!(h.try_fork_contests().is_err(), "the injected failure did not surface");
+
+    let unbacked: i64 = h
+        .state
+        .database()
+        .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM native_author_frontier f WHERE f.author = ?1 AND NOT EXISTS ( \
+                     SELECT 1 FROM native_delta_bodies b WHERE b.group_id = f.group_id \
+                     AND b.author = f.author AND b.incarnation = f.incarnation AND b.seq = f.seq)",
+                [super::growing_file_projection_tests::LOCAL_DEVICE],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(unbacked, 0, "a frontier position was committed without its delta");
+}
+
 // --- local capture --------------------------------------------------------------------------------
 
 /// A local edit made during the freeze is not authored by any intake: not an

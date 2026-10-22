@@ -88,6 +88,11 @@ fn a_consistent_script_install_reports_no_problem() {
     assert!(rows.iter().any(|r| r.check == "update channel" && r.detail.contains("script")));
 }
 
+/// The owner record path as the messages print it (the separator is the platform's).
+fn owner_file() -> String {
+    Path::new("/cfg").join("install-owner.json").display().to_string()
+}
+
 #[test]
 fn a_consistent_app_bundle_install_reports_no_problem() {
     let m = machine();
@@ -114,7 +119,7 @@ fn a_record_that_claims_a_bundle_the_path_is_not_is_an_error_with_the_fix() {
         let errs = errors(&rows);
         assert_eq!(errs.len(), 1, "{source} {root}: {rows:?}");
         assert_eq!(errs[0].check, "install source");
-        assert!(errs[0].detail.contains("delete /cfg/install-owner.json"), "{}", errs[0].detail);
+        assert!(errs[0].detail.contains(&format!("delete {}", owner_file())), "{}", errs[0].detail);
     }
 }
 
@@ -159,7 +164,7 @@ fn a_missing_record_is_a_warning_and_an_unreadable_one_an_error() {
     let rows = run(&m, &RecordState::Unreadable("bad".into()), &LockProbe::Free, None);
     let errs = errors(&rows);
     assert_eq!(errs.len(), 1);
-    assert!(errs[0].detail.contains("delete /cfg/install-owner.json"));
+    assert!(errs[0].detail.contains(&format!("delete {}", owner_file())));
 }
 
 #[test]
@@ -204,7 +209,7 @@ fn an_owner_that_contradicts_its_install_source_is_an_error_even_with_a_matching
     let errs = errors(&rows);
     assert_eq!(errs.len(), 1, "{rows:?}");
     assert!(errs[0].detail.contains("owner cli") && errs[0].detail.contains("belongs to gui"));
-    assert!(errs[0].detail.contains("delete /cfg/install-owner.json"));
+    assert!(errs[0].detail.contains(&format!("delete {}", owner_file())));
 }
 
 fn descriptor_rows(rows: &[Finding]) -> Vec<&Finding> {

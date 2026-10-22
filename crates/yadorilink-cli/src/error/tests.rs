@@ -62,6 +62,14 @@ fn every_core_error_maps_to_the_historical_message_and_exit_code() {
             1,
         ),
         (
+            command(ApplicationErrorCode::AccessDenied),
+            "the system has not allowed YadoriLink to access this folder, so nothing was \
+             linked. On macOS, allow it in System Settings > Privacy & Security > Files and \
+             Folders (or Full Disk Access); on Windows, give your account access to the folder. \
+             Then run the command again, or choose another folder (daemon says no)",
+            1,
+        ),
+        (
             command(ApplicationErrorCode::InviteExpired),
             "this invite has expired; ask the person who sent it for a new one",
             1,

@@ -1056,9 +1056,12 @@ impl ReplicaCoordinator {
         self.local_policy_head(group_id)?;
         self.with_local_author(emitter, |author| {
             let author = local_author_of(author);
-            self.database.write::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+            // One transaction: each fork delta is several statements (frontier, log, body,
+            // heads), and outside one a stop part-way, or a peer reading between them, sees a
+            // frontier position whose delta is not stored.
+            self.database.write_immediate::<_, yadorilink_sync_sqlite::SyncSqliteError>(|tx| {
                 yadorilink_sync_sqlite::native_authoring::author_all_forks(
-                    conn, &group, &author, eligible,
+                    tx, &group, &author, eligible,
                 )
             })
         })

@@ -234,6 +234,7 @@ fn link_and_invite_refusals_carry_their_typed_reason() {
     let cases = [
         (ApplicationErrorCode::DiskFull, RefusalReason::DiskFull),
         (ApplicationErrorCode::PathNotAllowed, RefusalReason::PathNotAllowed),
+        (ApplicationErrorCode::AccessDenied, RefusalReason::AccessDenied),
         (ApplicationErrorCode::InviteExpired, RefusalReason::InviteExpired),
         (ApplicationErrorCode::InviteAlreadyUsed, RefusalReason::InviteAlreadyUsed),
         (ApplicationErrorCode::UnrecordedLocalChanges, RefusalReason::UnrecordedLocalChanges),

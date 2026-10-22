@@ -40,6 +40,16 @@ fn roots(node: &TopologyNode) -> native_replication::SummaryRoots {
     read(node, |conn| native_replication::summary_roots(conn, &FolderGroupId(GROUP.to_owned())))
 }
 
+fn author_dump(node: &TopologyNode) -> String {
+    read(node, |conn| {
+        let states = yadorilink_sync_sqlite::native_store::load_author_states(
+            conn,
+            &FolderGroupId(GROUP.to_owned()),
+        )?;
+        Ok(format!("{states:?}"))
+    })
+}
+
 fn stuck(node: &TopologyNode) -> i64 {
     read(node, |conn| {
         let count = |sql: &str| conn.query_row(sql, [], |row| row.get::<_, i64>(0));
@@ -135,7 +145,17 @@ async fn run(delay: Duration, restart_a: bool) {
     support::wait_until_with_context(
         || roots(&a) == roots(&b) && stuck(&a) + stuck(&b) == 0,
         Duration::from_secs(60),
-        || format!("roots {:?} vs {:?}, stuck {} {}", roots(&a), roots(&b), stuck(&a), stuck(&b)),
+        || {
+            format!(
+                "roots {:?} vs {:?}, stuck {} {}\nA {}\nB {}",
+                roots(&a),
+                roots(&b),
+                stuck(&a),
+                stuck(&b),
+                author_dump(&a),
+                author_dump(&b)
+            )
+        },
     )
     .await;
 

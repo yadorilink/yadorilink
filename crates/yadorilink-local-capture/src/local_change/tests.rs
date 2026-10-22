@@ -3275,7 +3275,8 @@ fn a_read_error_after_the_file_opened_is_the_files_and_a_store_fault_is_not() {
     let (proc, _state, _store_dir, root_dir) = processor();
     let root = canonical_root(&root_dir);
     std::fs::write(root.join("fine.txt"), b"readable").unwrap();
-    let eio = || std::io::Error::from_raw_os_error(5);
+    // Not a raw errno: on Windows 5 is "access denied", a permission failure.
+    let eio = || std::io::Error::other("input/output error");
     let wrap = |e: StorageError| LocalCaptureError::SyncCore(SyncSqliteError::Storage(e));
 
     let mut failed = Vec::new();

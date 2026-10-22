@@ -251,6 +251,14 @@ impl From<CoreError> for CliError {
                      again ({message})"
                 ))
             }
+            CoreError::DaemonCommand {
+                code: ApplicationErrorCode::AccessDenied, message, ..
+            } => CliError::Other(format!(
+                "the system has not allowed YadoriLink to access this folder, so nothing was \
+                     linked. On macOS, allow it in System Settings > Privacy & Security > Files \
+                     and Folders (or Full Disk Access); on Windows, give your account access to \
+                     the folder. Then run the command again, or choose another folder ({message})"
+            )),
             CoreError::DaemonCommand { code: ApplicationErrorCode::InviteExpired, .. } => {
                 CliError::Other(
                     "this invite has expired; ask the person who sent it for a new one".to_string(),

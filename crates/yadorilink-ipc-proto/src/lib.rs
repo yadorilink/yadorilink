@@ -112,7 +112,8 @@ pub mod daemonctl {
     /// `35`: adds `update_version_check` and `UpdateStatusResponse.manifest_generated_at`.
     /// `36`: transfers the device sent can be listed (`list_sent_transfers`), canceled and
     /// retried by id like received ones, and a failed received transfer lists why it stopped.
-    pub const CONTROL_PROTOCOL_VERSION: u32 = 36;
+    /// `37`: adds the code `ACCESS_DENIED`; link refuses with it when the system denies the folder.
+    pub const CONTROL_PROTOCOL_VERSION: u32 = 37;
 }
 
 #[cfg(test)]

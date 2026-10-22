@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
@@ -8,8 +8,8 @@ use rusqlite::Connection;
 use crate::error::{DatabaseError, SqlOperationError};
 use crate::job_fence::JobFence;
 use crate::pool::{
-    build_pool, checkout, retry_on_database_locked, ConnectionPool, BUSY_TIMEOUT,
-    STATEMENT_CACHE_CAPACITY,
+    build_pool, checkout, retry_on_database_locked, CloseBarrier, ConnectionPool, Connections,
+    BUSY_TIMEOUT, STATEMENT_CACHE_CAPACITY,
 };
 
 // `stats`/`reset`/`record_gate_acquisition` below are a small, permanent
@@ -260,6 +260,9 @@ pub struct SyncDatabase {
     /// each other (SQLite allows only one writer at a time even in WAL
     /// mode), handled by `BUSY_TIMEOUT` rather than an in-process mutex.
     pool: ConnectionPool,
+    /// Declared right after `pool` so it is dropped right after it: dropping the database returns
+    /// only once every connection is closed, including one a pool worker was still opening.
+    _close_barrier: CloseBarrier,
     /// In-process writer gate: every write transaction issued through this
     /// handle acquires this before touching SQLite, so two of the SAME
     /// process's own threads can never race for SQLite's single writer
@@ -408,9 +411,11 @@ impl SyncDatabase {
             apply_durability_pragmas(conn, options)?;
             Ok(())
         });
-        let pool = build_pool(manager)?;
+        let connections = Arc::new(Connections::default());
+        let pool = build_pool(manager, Arc::clone(&connections))?;
         Ok(Self {
             pool,
+            _close_barrier: CloseBarrier(connections),
             writer_gate: Mutex::new(()),
             write_transactions: AtomicU64::new(0),
             provider_liveness,
@@ -448,7 +453,8 @@ impl SyncDatabase {
         manager: SqliteConnectionManager,
         schema_init: impl FnOnce(&Connection) -> Result<(), DatabaseError>,
     ) -> Result<Self, DatabaseError> {
-        let pool = build_pool(manager)?;
+        let connections = Arc::new(Connections::default());
+        let pool = build_pool(manager, Arc::clone(&connections))?;
         let conn = checkout::<DatabaseError>(&pool)?;
         // Defense-in-depth -- see `Self::open`'s identical call and
         // `check_schema_version_supported`'s own doc comment for why.
@@ -458,10 +464,16 @@ impl SyncDatabase {
         drop(conn);
         Ok(Self {
             pool,
+            _close_barrier: CloseBarrier(connections),
             writer_gate: Mutex::new(()),
             write_transactions: AtomicU64::new(0),
             provider_liveness,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connections_for_test(&self) -> Arc<Connections> {
+        Arc::clone(&self._close_barrier.0)
     }
 
     #[cfg(any(test, feature = "test-support"))]

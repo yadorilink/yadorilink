@@ -11,7 +11,9 @@ param([string]$Root = (Split-Path -Parent $MyInvocation.MyCommand.Path))
 
 $ErrorActionPreference = 'Continue'
 $Installer = Join-Path $Root 'install.ps1'
-$T = Join-Path $env:TEMP ("yl-install-tests-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+# GetFullPath expands 8.3 short names (a runner's TEMP is C:\Users\RUNNER~1\...), as the
+# installer does to its prefix; without it the PATH entry the installer adds never matches $bin.
+$T = [System.IO.Path]::GetFullPath((Join-Path $env:TEMP ("yl-install-tests-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))))
 $Srv = Join-Path $T 'srv'
 New-Item -ItemType Directory -Force -Path $Srv | Out-Null
 $script:Pass = 0; $script:Fail = 0

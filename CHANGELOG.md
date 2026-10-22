@@ -12,6 +12,7 @@ prerelease suffix (e.g. `v0.1.0-beta.1`).
 ## [Unreleased]
 
 - Two devices that independently write identical content to the same file now converge to one file instead of leaving a conflicted copy. A difference in bytes, permissions, symlink target or extended attributes is still a conflict.
+- Updated dependencies for security advisories in the QUIC and TLS stacks (quinn-proto, rustls, rustls-webpki) and the bundled root certificate data.
 
 ## [v0.1.0-beta.1] - 2026-10-22
 

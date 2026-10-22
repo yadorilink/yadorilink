@@ -57,6 +57,11 @@ impl DaemonError {
             DaemonError::Io(e) if e.kind() == std::io::ErrorKind::StorageFull => {
                 Some(LinkRefusal::DiskFull)
             }
+            DaemonError::RootAuthority(yadorilink_root_authority::RootAuthorityError::Io(e))
+                if e.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                Some(LinkRefusal::AccessDenied)
+            }
             DaemonError::Sync(e) => e.link_refusal(),
             _ => None,
         }

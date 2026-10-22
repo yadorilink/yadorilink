@@ -51,7 +51,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master @ 2026-06-30
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master @ 2026-06-30
         with:
           toolchain: ${{ env.VERIFIER_RUST_TOOLCHAIN }}
           targets: ${{ matrix.target == 'macos-aarch64' && 'aarch64-apple-darwin' || 'x86_64-unknown-linux-gnu' }}
@@ -65,7 +65,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: python3 .github/release/check-verifier-reproducible.py "$TARGET" verifier-out
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: verifier-build-${{ matrix.target }}
           path: verifier-out

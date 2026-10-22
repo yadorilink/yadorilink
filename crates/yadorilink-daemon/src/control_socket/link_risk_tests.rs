@@ -448,6 +448,10 @@ fn enrollment_refusals_carry_their_typed_code() {
         ApplicationErrorCode::PathNotAllowed
     );
     assert_eq!(
+        code(E::LocalLinkFailed { detail: "x".into(), refusal: Some(LinkRefusal::AccessDenied) }),
+        ApplicationErrorCode::AccessDenied
+    );
+    assert_eq!(
         code(E::LocalLinkFailed { detail: "x".into(), refusal: None }),
         ApplicationErrorCode::LocalLinkFailed
     );
@@ -502,4 +506,26 @@ async fn a_low_free_space_reading_still_needs_an_acknowledgement() {
         }
         other => panic!("expected a refusal, got {other:?}"),
     }
+}
+
+/// The system refusing the folder (macOS TCC answers EPERM; a Windows ACL answers access
+/// denied) is a typed refusal, not the raw OS text.
+#[test]
+fn an_os_denied_root_is_an_access_denied_link_refusal() {
+    use crate::application::model::LinkRefusal;
+    use crate::error::DaemonError;
+    use yadorilink_root_authority::RootAuthorityError;
+    let eperm = std::io::Error::from_raw_os_error(if cfg!(windows) { 5 } else { 1 });
+    assert_eq!(eperm.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        DaemonError::RootAuthority(RootAuthorityError::Io(eperm)).link_refusal(),
+        Some(LinkRefusal::AccessDenied)
+    );
+    assert_eq!(
+        DaemonError::RootAuthority(RootAuthorityError::Io(std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )))
+        .link_refusal(),
+        None
+    );
 }

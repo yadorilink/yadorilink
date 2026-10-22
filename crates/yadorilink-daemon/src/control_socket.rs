@@ -2030,6 +2030,7 @@ fn link_refusal_code(refusal: crate::application::model::LinkRefusal) -> Applica
     match refusal {
         LinkRefusal::DiskFull => ApplicationErrorCode::DiskFull,
         LinkRefusal::PathNotAllowed => ApplicationErrorCode::PathNotAllowed,
+        LinkRefusal::AccessDenied => ApplicationErrorCode::AccessDenied,
     }
 }
 

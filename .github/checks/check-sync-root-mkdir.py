@@ -87,6 +87,9 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     # The Windows host's Stage ledger directory: the host's own state directory beside the
     # root's authoring state, never inside the user's tree.
     C + "yadorilink-windows-provider-policy/src/stage_ledger.rs": {"create_dir_all": 3},
+    # The Windows uninstall guardian's helper directory in the temporary directory: outside the
+    # package, any sync root and the user's data.
+    C + "yadorilink-shell-ext-windows/src/package_removal.rs": {"create_dir_all": 1},
     C + "yadorilink-daemon/src/provider_writer.rs": {"DirBuilder::new": 1},
     # The daemon's own log directory (default ~/Library/Logs/yadorilink, 0700; the
     # parent of an operator-set YADORILINK_LOG_FILE otherwise): the daemon's private

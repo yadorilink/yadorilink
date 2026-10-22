@@ -188,6 +188,11 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     C + "yadorilink-windows-provider-policy/src/provider_authoring.rs": {"fs::remove_file": 2},
     # The Windows side of authoring: the throwaway partial copy of a failed ingest copy, which
     # nothing refers to.
+    # The uninstall guardian's executable copy in the temporary directory, outside the package, any
+    # sync root and the user's data: copied to a partial name and renamed into place. A rename lost
+    # to a crash leaves no file at the final name, so the next start stages the copy again; a stale
+    # partial is overwritten by that copy.
+    S + "package_removal.rs": {"fs::rename": 1},
     S + "provider_authoring.rs": {"fs::remove_file": 3},
     S + "provider_namespace.rs": {
         "CfConvertToPlaceholder": 1,

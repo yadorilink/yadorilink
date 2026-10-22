@@ -8,6 +8,12 @@ updates:
     labels:
       - dependencies
       - rust
+    # One pull request per week for all minor and patch updates.
+    groups:
+      cargo-minor-and-patch:
+        update-types:
+          - minor
+          - patch
 
   - package-ecosystem: github-actions
     directory: /
@@ -17,3 +23,8 @@ updates:
     labels:
       - dependencies
       - ci
+    groups:
+      actions-minor-and-patch:
+        update-types:
+          - minor
+          - patch

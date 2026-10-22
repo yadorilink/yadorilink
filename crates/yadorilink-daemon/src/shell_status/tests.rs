@@ -7,11 +7,36 @@ use yadorilink_replica_domain::file::FileRecord;
 
 use crate::daemon_state::DaemonState;
 
+/// A rooted POSIX path such as `/home/alice` is only absolute on Windows with a
+/// drive, so the fixtures below name their link roots through the drive there.
+fn host(path: &str) -> String {
+    if cfg!(windows) && path.starts_with('/') {
+        format!("C:{path}")
+    } else {
+        path.to_owned()
+    }
+}
+
+fn resolve_status(sync_state: &ReplicaCoordinator, absolute_path: &str) -> ShellSyncState {
+    super::resolve_status(sync_state, &host(absolute_path))
+}
+
+fn resolve_status_detail(sync_state: &ReplicaCoordinator, absolute_path: &str) -> ShellStatus {
+    super::resolve_status_detail(sync_state, &host(absolute_path))
+}
+
+fn resolve_group_and_rel_path(
+    sync_state: &ReplicaCoordinator,
+    absolute_path: &str,
+) -> Option<(String, String)> {
+    super::resolve_group_and_rel_path(sync_state, &host(absolute_path))
+}
+
 fn state_with_link(local_path: &str, group_id: &str) -> Arc<DaemonState> {
     let store = Arc::new(SegmentBlockStore::new(tempfile::tempdir().unwrap().keep()).unwrap());
     let sync_state =
         Arc::new(crate::replica_coordinator::ReplicaCoordinator::open_in_memory().unwrap());
-    sync_state.link_repository().add_link(local_path, group_id).unwrap();
+    sync_state.link_repository().add_link(&host(local_path), group_id).unwrap();
     DaemonState::new("device-a".into(), sync_state, store)
 }
 
@@ -162,7 +187,11 @@ async fn orphaned_link_resolves_to_no_status() {
             &permit,
         )
         .unwrap();
-    state.replica_coordinator.link_repository().mark_link_orphaned("/home/alice/Photos").unwrap();
+    state
+        .replica_coordinator
+        .link_repository()
+        .mark_link_orphaned(&host("/home/alice/Photos"))
+        .unwrap();
 
     assert_eq!(
         resolve_status(&state.replica_coordinator, "/home/alice/Photos/vacation.jpg"),

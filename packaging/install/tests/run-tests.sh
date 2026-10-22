@@ -23,7 +23,8 @@ trap 'kill "$SRV_PID" 2>/dev/null; chmod -R u+w "$T" 2>/dev/null; rm -rf "$T"' E
 python3 "$HERE/serve.py" "$SRV" "$T/port" &
 SRV_PID=$!
 i=0
-while [ ! -s "$T/port" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+while [ ! -s "$T/port" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done
+[ -s "$T/port" ] || { echo "run-tests: the fixture server did not start" >&2; exit 2; }
 PORT=$(cat "$T/port")
 BASE=http://127.0.0.1:$PORT
 

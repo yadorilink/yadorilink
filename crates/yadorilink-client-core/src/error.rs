@@ -320,6 +320,9 @@ pub enum RefusalReason {
     /// The folder is nested in, or around, another linked folder or the
     /// daemon's recovery area. No confirmation overrides this.
     PathNotAllowed,
+    /// The system refused access to the folder (macOS privacy protection, a Windows
+    /// ACL). Nothing was linked; allow access or pick another folder, then retry.
+    AccessDenied,
     InviteExpired,
     /// Redeemed already, or cancelled.
     InviteAlreadyUsed,
@@ -517,6 +520,9 @@ fn from_command(
         Code::DiskFull => DesktopError::Refused { message, reason: RefusalReason::DiskFull },
         Code::PathNotAllowed => {
             DesktopError::Refused { message, reason: RefusalReason::PathNotAllowed }
+        }
+        Code::AccessDenied => {
+            DesktopError::Refused { message, reason: RefusalReason::AccessDenied }
         }
         Code::InviteExpired => {
             DesktopError::Refused { message, reason: RefusalReason::InviteExpired }

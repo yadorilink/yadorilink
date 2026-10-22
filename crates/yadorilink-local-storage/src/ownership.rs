@@ -538,6 +538,11 @@ mod tests {
         ));
     }
 
+    /// The owner record path as the messages print it (the separator is the platform's).
+    fn owner_file() -> String {
+        Path::new("/cfg").join("install-owner.json").display().to_string()
+    }
+
     #[test]
     fn the_mismatch_refusal_names_both_installations_and_the_fix() {
         let message = Refusal::InstallSourceMismatch {
@@ -546,7 +551,7 @@ mod tests {
         }
         .message(Path::new("/cfg"));
         assert!(message.contains("(apt)") && message.contains("script"), "{message}");
-        assert!(message.contains("delete /cfg/install-owner.json"), "{message}");
+        assert!(message.contains(&format!("delete {}", owner_file())), "{message}");
     }
 
     #[test]
@@ -554,13 +559,13 @@ mod tests {
         let app = Refusal::ManagedElsewhere { recorded: record(Owner::Gui, "app_bundle") }
             .message(Path::new("/cfg"));
         assert!(app.contains("YadoriLink app"), "{app}");
-        assert!(app.contains("/cfg/install-owner.json"), "{app}");
+        assert!(app.contains(&owner_file()), "{app}");
         let unwritable =
             Refusal::OwnerRecordUnwritable { reason: "x".into() }.message(Path::new("/cfg"));
         assert!(unwritable.contains("could not be written to"), "{unwritable}");
         assert!(!unwritable.contains("Restore or remove"), "{unwritable}");
         let unknown = Refusal::OwnerUnknown { reason: "x".into() }.message(Path::new("/cfg"));
-        assert!(unknown.contains("/cfg/install-owner.json"), "{unknown}");
+        assert!(unknown.contains(&owner_file()), "{unknown}");
         let brew = Refusal::ManagedElsewhere { recorded: record(Owner::Cli, "homebrew") }
             .message(Path::new("/cfg"));
         assert!(brew.contains("homebrew"), "{brew}");

@@ -17,10 +17,12 @@ runs:
   using: composite
   steps:
     - if: inputs.protoc == 'true'
-      uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+      uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
       with:
-        repo-token: ${{ inputs.token }}
-    - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master @ 2026-06-30
+        tool: protoc@3.26.1  # install-action numbers protoc as 3.<release>: protobuf v26.1
+      env:
+        GITHUB_TOKEN: ${{ inputs.token }}
+    - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master @ 2026-06-30
       with:
         toolchain: stable
         components: ${{ inputs.components }}

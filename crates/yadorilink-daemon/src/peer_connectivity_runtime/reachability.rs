@@ -307,6 +307,18 @@ mod tests {
     }
 
     #[test]
+    fn an_incompatible_device_whose_path_is_not_selected_yet_reads_connecting_never_unreachable() {
+        let mut links = LinkReachability::default();
+        let link = links.link_up(DEVICE, None);
+        links.mark_incompatible(DEVICE);
+        assert!(links.is_incompatible(DEVICE));
+        assert_eq!(links.get(DEVICE), Some(PeerReachability::Connecting));
+
+        links.carrier_changed(DEVICE, link, Some(Carrier::Relay));
+        assert_eq!(links.get(DEVICE), Some(PeerReachability::Connected(RouteKind::Relay)));
+    }
+
+    #[test]
     fn incompatibility_ends_with_the_connections_and_is_not_invented_for_a_device_without_one() {
         let mut links = LinkReachability::default();
         links.mark_incompatible(DEVICE);

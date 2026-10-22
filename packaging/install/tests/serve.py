@@ -25,7 +25,11 @@ class H(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/redir/"):
             self.send_response(302)
-            self.send_header("Location", self.path[len("/redir"):])
+            target = self.path[len("/redir"):]
+            if any(c in target for c in "\r\n") or not target.startswith("/"):
+                self.send_error(400)
+                return
+            self.send_header("Location", target)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
@@ -43,5 +47,8 @@ class H(http.server.SimpleHTTPRequestHandler):
 
 
 srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
-portfile.write_text(str(srv.server_address[1]))
+# Publish the port atomically so a reader never sees a missing or partial file.
+tmp = portfile.with_name(portfile.name + ".tmp")
+tmp.write_text(str(srv.server_address[1]))
+os.replace(tmp, portfile)
 srv.serve_forever()

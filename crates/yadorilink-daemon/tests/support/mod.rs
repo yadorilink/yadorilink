@@ -1617,14 +1617,12 @@ fn spawn_paired_session(
     // this same device appears in, so setting it again per-pairing is
     // harmless.
     state.set_materialization_repair_sweep_interval(std::time::Duration::from_secs(1));
-    let replaced = state
-        .peers
-        .register_session(
-            peer_device_id.to_string(),
-            session.clone(),
-            state.local_convergence_with_roots(sync_roots),
-        )
-        .is_some();
+    let displaced = state.peers.register_session(
+        peer_device_id.to_string(),
+        session.clone(),
+        state.local_convergence_with_roots(sync_roots),
+    );
+    let replaced = displaced.is_some();
     if state.disk_headroom_enforcement_enabled() {
         // The knob moved from the session to the executor beside it, so it is
         // set after registration, on the executor that registration built.
@@ -1650,7 +1648,19 @@ fn spawn_paired_session(
         // `state.peers.sessions`. Guard on `Arc::ptr_eq` rather than removing
         // by key: a newer pairing for the same peer may already have replaced
         // this entry, and removing *that* one would be wrong.
-        state_for_task.peers.remove_if_current(&peer_id, &identity_session);
+        let removed = state_for_task.peers.remove_if_current(&peer_id, &identity_session);
+        // A session the production keeper had registered first was displaced by this one, yet the
+        // keeper still holds it as its own and, believing it stands, never opens another. Closing
+        // the link ends only what the link added, so the keeper's session stands again; otherwise
+        // which of the two registered first would decide whether the device is left with no
+        // session at all.
+        if let (true, Some(keeper_session)) = (removed, displaced) {
+            state_for_task.peers.register_session_if_absent(
+                &peer_id,
+                keeper_session,
+                state_for_task.local_convergence(),
+            );
+        }
     });
     (handle, replaced)
 }
