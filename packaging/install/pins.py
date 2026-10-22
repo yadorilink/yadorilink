@@ -200,7 +200,7 @@ def self_test() -> int:
         "short key": lambda a, b: (re.sub(r'TRUST_SET="([^:]*):[0-9a-f]+', r'TRUST_SET="\1:abcd', a, count=1), b),
         "uppercase key": lambda a, b: (re.sub(r'(TRUST_SET="[^:]*:)([0-9a-f])', lambda m: m.group(1) + m.group(2).upper(), a, count=1), b),
         "extra line in block": lambda a, b: (a.replace("# <<< PINS <<<", 'EVIL="x"\n# <<< PINS <<<'), b),
-        "command substitution": lambda a, b: (a.replace('VERIFIER_SHA_linux_x86_64=""', 'VERIFIER_SHA_linux_x86_64="$(id)"'), b),
+        "command substitution": lambda a, b: (re.sub(r'VERIFIER_SHA_linux_x86_64="[^"]*"', 'VERIFIER_SHA_linux_x86_64="$(id)"', a), b),
         "missing end marker": lambda a, b: (a.replace("# <<< PINS <<<", "# end"), b),
         "two blocks": lambda a, b: (a + "\n# >>> PINS >>>\n# <<< PINS <<<\n", b),
         "wrong verifier base": lambda a, b: (a.replace("releases/download/verifier-1", "releases/download/evil"), b),

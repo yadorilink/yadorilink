@@ -65,8 +65,8 @@ set -eu
 #              accepts (a replay floor for a first install; empty = none).
 # >>> PINS >>>
 TRUST_SET="yadorilink-release-2026-10:cdaf6fbf36a6fa5c8c894fc5012a80bb6c6a73407c9285ac8623d572e9894bd8"
-VERIFIER_SHA_macos_aarch64=""
-VERIFIER_SHA_linux_x86_64=""
+VERIFIER_SHA_macos_aarch64="6f116f81a2735c49baba41e89b93b5573bce8fc19d2c9c7a8d0278812df4ee56"
+VERIFIER_SHA_linux_x86_64="75d60676afc6797e0f60f93b16ac663218c14f6e3763a17e7fa03168fb0def75"
 VERIFIER_BASE="https://github.com/yadorilink/yadorilink/releases/download/verifier-1"
 MIN_MANIFEST_GENERATED_AT=""
 # <<< PINS <<<

@@ -109,7 +109,11 @@ if [ $RC = 0 ] && version_is 0.2.0 && has "Manifest signature verified" && has "
 
 # --- verifier handling
 newhome 2
-VSHA_OVERRIDE=""; inst s1 s1; unset VSHA_OVERRIDE
+# the real installer carries the released pins, so build the "not published yet" state from it
+# (empty pins) instead of relying on what the repository currently pins
+NOPIN=$T/install-nopin.sh
+sed -E 's/^(VERIFIER_SHA_[a-z0-9_]+)=".*"$/\1=""/' "$INSTALL" > "$NOPIN"
+REAL_INSTALL=$INSTALL; INSTALL=$NOPIN; VSHA_OVERRIDE=""; inst s1 s1; unset VSHA_OVERRIDE; INSTALL=$REAL_INSTALL
 { [ $RC != 0 ] && has "no pinned Ed25519 verifier" && nothing_installed; } && ok "empty verifier pin refused" || bad "empty verifier pin" "$T/out"
 newhome 3
 VSHA_OVERRIDE=0000000000000000000000000000000000000000000000000000000000000000; inst s1 s1; unset VSHA_OVERRIDE
