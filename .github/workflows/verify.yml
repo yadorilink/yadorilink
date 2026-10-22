@@ -98,7 +98,7 @@ jobs:
           cargo clippy --locked --manifest-path crates/yadorilink-verify/Cargo.toml --all-targets -- -D warnings
           cargo test --locked --manifest-path crates/yadorilink-verify/Cargo.toml
           python3 .github/release/check-verifier-reproducible.py linux-x86_64 "$RUNNER_TEMP/verifier-out"
-      - uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         if: always()
         with:
           tool: cargo-audit,cargo-deny
