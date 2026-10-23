@@ -971,6 +971,8 @@ pub fn persist_reconstructed_file_durable(
     ledger: &dyn TempFileLedger,
     durability: Durability,
 ) -> Result<(), StorageError> {
+    #[cfg(not(unix))]
+    let _ = durability;
     let namespace = match durable_namespace_beside(out_path) {
         Ok(namespace) => namespace,
         Err(error) => {

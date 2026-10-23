@@ -864,7 +864,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
 name = "yadorilink-fs-platform"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "caseless",
  "libc",
@@ -878,7 +878,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-ipc-proto"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "prost",
  "prost-build",
@@ -888,7 +888,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-replica-domain"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -899,7 +899,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-shell-ext-windows"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "sha2",
  "tokio",
@@ -913,7 +913,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-windows-provider-policy"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "sha2",
  "tokio",

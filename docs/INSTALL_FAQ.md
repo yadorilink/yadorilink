@@ -15,7 +15,6 @@ installers behave, so you can read it before you run one.
 |---|---|---|
 | macOS or Windows desktop app | the app | the app (Check for Updates, or the Store) |
 | Debian / Ubuntu | the `.deb` | `apt` |
-| Docker | the image | pulling a newer image |
 | Any other command-line use (macOS on Apple silicon, Linux x86_64, Windows x64) | the one-line installer | `yadorilink self-update` |
 | An engine bundle you unpacked yourself | you | you |
 

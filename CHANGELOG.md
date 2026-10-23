@@ -11,7 +11,7 @@ prerelease suffix (e.g. `v0.1.0-beta.1`).
 
 ## [Unreleased]
 
-## [v0.1.0-beta.1] - 2026-10-24
+## [v0.1.0-beta.2] - 2026-10-24
 
 First public beta of YadoriLink: cloud-like file sync without cloud file
 storage. Your files stay on your own devices and move directly between your
@@ -28,32 +28,12 @@ part of this release.
 - Folder sync between your devices and with other people, with accounts,
   sharing, roles and revocation.
 - Versions and conflict copies; `yadorilink status`, `yadorilink doctor`, and
-  `yadorilink preserved list|restore|retry|discard` for items set aside during
-  a reset.
-- Supported platforms: macOS 14+ (Apple silicon; verified on macOS 27) and
-  Windows 11 25H2+ (x64) as an engine bundle (`yadorilink-engine-*.zip`), and
-  Linux x86_64 (experimental) as a `.deb` and an engine bundle.
-- Install by unpacking the bundle (or installing the `.deb`) and putting
-  `yadorilink` and `yadorilink-daemon` on your `PATH`; you start the daemon
-  yourself with `yadorilink daemon start`, and it does not start at login. To
-  uninstall, stop the daemon and delete the binaries and the YadoriLink state
-  folder; your synced folders and their files are never deleted.
-- Release builds talk to `https://control.yadori.link` by default; set
-  `YADORILINK_COORDINATION_ADDR` to use another coordination service.
-- Every download has a SHA-256 checksum, and each engine bundle carries a
-  build-provenance attestation that you can verify with `gh attestation verify`.
-  The binaries are not signed or notarized yet, so macOS or Windows may warn
-  when you first run them: check the checksum or the attestation first.
-- Updates: the updater announces new versions but does not download or install
-  them; update by installing the new release (or through your package manager).
-- Two devices that independently write identical content to the same file now converge to one file instead of leaving a conflicted copy. A difference in bytes, permissions, symlink target or extended attributes is still a conflict.
-- Updated dependencies for security advisories in the QUIC and TLS stacks (quinn-proto, rustls, rustls-webpki) and the bundled root certificate data.
+  `yadorilink preserved list|restore|retry|discard`.
+- macOS 14+ (Apple silicon), Windows 11 25H2+ (x64) and Linux x86_64
+  (experimental).
 
 ### Known limitations
 
-- **Power-loss testing on physical hardware is pending.** Crash safety is
-  verified with a deterministic simulation of power cuts and process kills;
-  verification on physical internal and external SSDs is still to come.
 - **Windows cannot rebuild a device's history after a very long absence.** If
   a device was offline so long that it needs a history rebuild from a trusted
   checkpoint, the daemon refuses to start it on Windows and reports `the

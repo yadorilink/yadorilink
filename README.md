@@ -34,9 +34,10 @@ Supported platforms: macOS 14+ (Apple silicon), Windows 11 25H2+ (x64), and Linu
 ## Get YadoriLink
 
 This repository contains the **engine**: the sync daemon and the
-`yadorilink` command line, plus the Linux package, the Docker image, and the
-Windows Explorer integration. The macOS and Windows desktop apps are
-released separately, not from this repository, and are not available yet.
+`yadorilink` command line, plus the Linux package and the Windows Explorer
+integration. A container image is not part of this release. The macOS and
+Windows desktop apps are released separately, not from this repository, and
+are not available yet.
 Watch [yadori.link](https://yadori.link/) for their release; the app will set
 up the engine for you.
 
