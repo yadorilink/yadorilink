@@ -11,10 +11,7 @@ prerelease suffix (e.g. `v0.1.0-beta.1`).
 
 ## [Unreleased]
 
-- Two devices that independently write identical content to the same file now converge to one file instead of leaving a conflicted copy. A difference in bytes, permissions, symlink target or extended attributes is still a conflict.
-- Updated dependencies for security advisories in the QUIC and TLS stacks (quinn-proto, rustls, rustls-webpki) and the bundled root certificate data.
-
-## [v0.1.0-beta.1] - 2026-10-22
+## [v0.1.0-beta.1] - 2026-10-23
 
 First public beta of YadoriLink: cloud-like file sync without cloud file
 storage. Your files stay on your own devices and move directly between your
@@ -41,6 +38,8 @@ part of this release.
   `YADORILINK_COORDINATION_ADDR` to use another coordination service.
 - Every download has a SHA-256 checksum, and each engine bundle carries a
   build-provenance attestation that you can verify with `gh attestation verify`.
+- Two devices that independently write identical content to the same file now converge to one file instead of leaving a conflicted copy. A difference in bytes, permissions, symlink target or extended attributes is still a conflict.
+- Updated dependencies for security advisories in the QUIC and TLS stacks (quinn-proto, rustls, rustls-webpki) and the bundled root certificate data.
 
 ### Known limitations
 
@@ -55,6 +54,11 @@ part of this release.
   checkpoint, the daemon refuses to start it on Windows and reports `the
   rebootstrap is blocked: DurabilityUnsupported`; the folder is left
   untouched. macOS and Linux are not affected.
+- **The binaries are not signed or notarized yet.** The macOS binaries are not
+  notarized and the Windows binaries are not Authenticode-signed, so macOS
+  Gatekeeper and Windows SmartScreen may warn when you run them. Check each
+  download against its `.sha256` file and with `gh attestation verify` before
+  running it; signed and notarized builds come in a later beta.
 - **No in-app update download yet.** The updater announces new versions but
   does not download or install them; update by installing the new release (or
   through your package manager).
