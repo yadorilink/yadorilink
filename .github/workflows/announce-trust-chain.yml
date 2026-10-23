@@ -1,0 +1,172 @@
+name: Announce trust chain
+
+# Announces a new manifest-signing public key in the update trust chain, so that clients learn
+# it before it is ever needed (a spare, or the next key of a planned rotation). The announcement
+# is a trust record signed by the current signing key; that key exists only as the secret of the
+# release-signing Environment, so the record is produced here, inside an approved run, and
+# nobody has to hold the seed. Started by hand (workflow_dispatch); no push, tag, schedule or
+# pull request can reach it. Two jobs:
+#
+#   build-signer  no environment, no secret: builds the signing tool from this commit and
+#                 records its SHA-256.
+#   announce      bound to the release-signing Environment. Its required reviewer must approve
+#                 the run before any secret is released; the Environment is also restricted to
+#                 main. It checks the inputs against the committed chain, appends one record
+#                 with the signing tool, re-checks the result with an independent
+#                 implementation of the client rules, and uploads the new trust-chain.json
+#                 (public data) as the only artifact.
+#
+# The new chain is then committed through a reviewed change; this workflow never writes to the
+# repository. The workflow summary lists the facts the signing evidence record needs.
+# .github/release/check-signing-workflow.py enforces this shape.
+
+on:
+  workflow_dispatch:
+    inputs:
+      new_key_id:
+        description: Id of the public key to announce (3-64 chars of a-z 0-9 . _ -)
+        type: string
+        required: true
+      new_public_key_hex:
+        description: Public key to announce (64 lowercase hex characters)
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: announce-trust-chain
+  cancel-in-progress: false
+
+jobs:
+  build-signer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      signer_sha256: ${{ steps.hash.outputs.sha256 }}
+    steps:
+      - name: Refuse a run that is not on main
+        shell: bash
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$REF" != refs/heads/main ]; then
+            echo "announcing a key runs from main only" >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ github.token }}
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master @ 2026-06-30
+        with:
+          toolchain: stable
+
+      - name: Build the signing tool
+        run: cargo build --release --locked -p yadorilink-daemon --bin yadorilink-sign-manifest
+
+      - id: hash
+        name: Hash the signing tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir signer
+          cp target/release/yadorilink-sign-manifest signer/
+          echo "sha256=$(sha256sum signer/yadorilink-sign-manifest | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: chain-signer
+          path: signer/yadorilink-sign-manifest
+          if-no-files-found: error
+
+  announce:
+    needs: build-signer
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release-signing
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the verifier dependency
+        run: python3 -m pip install --quiet --disable-pip-version-check cryptography
+
+      - name: Download the signing tool
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: chain-signer
+          path: signer
+
+      - name: Check the signing tool
+        shell: bash
+        env:
+          EXPECTED: ${{ needs.build-signer.outputs.signer_sha256 }}
+        run: |
+          set -euo pipefail
+          actual="$(sha256sum signer/yadorilink-sign-manifest | cut -d' ' -f1)"
+          [ -n "$EXPECTED" ] && [ "$actual" = "$EXPECTED" ] || { echo "the signing tool does not match the build" >&2; exit 1; }
+          chmod +x signer/yadorilink-sign-manifest
+
+      - name: Check the announcement
+        env:
+          NEW_KEY_ID: ${{ inputs.new_key_id }}
+          NEW_PUBLIC_KEY_HEX: ${{ inputs.new_public_key_hex }}
+          ROOT_KEY_ID: ${{ vars.RELEASE_MANIFEST_KEY_ID }}
+          ROOT_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
+        run: python3 .github/release/announce_trust_chain.py check --chain .github/release/trust-chain.json
+
+      - name: Announce
+        env:
+          MANIFEST_SIGNING_KEY: ${{ secrets.MANIFEST_SIGNING_KEY }}
+          MANIFEST_SIGNING_KEY_ID: ${{ secrets.MANIFEST_SIGNING_KEY_ID }}
+          NEW_KEY_ID: ${{ inputs.new_key_id }}
+          NEW_PUBLIC_KEY_HEX: ${{ inputs.new_public_key_hex }}
+          ROOT_KEY_ID: ${{ vars.RELEASE_MANIFEST_KEY_ID }}
+          ROOT_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
+        run: |
+          set -euo pipefail
+          mkdir announce
+          signer/yadorilink-sign-manifest trust-set \
+            --key-hex "$MANIFEST_SIGNING_KEY" --key-id "$MANIFEST_SIGNING_KEY_ID" \
+            --anchor-key-id "$ROOT_KEY_ID" --anchor-public-key-hex "$ROOT_PUBLIC_KEY_HEX" \
+            --chain .github/release/trust-chain.json \
+            --add "$NEW_KEY_ID:$NEW_PUBLIC_KEY_HEX" --out announce/trust-chain.json
+
+      - name: Verify the new chain
+        shell: bash
+        env:
+          NEW_KEY_ID: ${{ inputs.new_key_id }}
+          NEW_PUBLIC_KEY_HEX: ${{ inputs.new_public_key_hex }}
+          ROOT_KEY_ID: ${{ vars.RELEASE_MANIFEST_KEY_ID }}
+          ROOT_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
+          SIGNER_SHA256: ${{ needs.build-signer.outputs.signer_sha256 }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          python3 .github/release/announce_trust_chain.py verify \
+            --old .github/release/trust-chain.json --new announce/trust-chain.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the new trust chain
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: trust-chain
+          path: announce/trust-chain.json
+          if-no-files-found: error

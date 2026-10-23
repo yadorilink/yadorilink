@@ -164,6 +164,7 @@ jobs:
       - run: python3 .github/release/check-signing-workflow.py
       - run: python3 .github/release/check-signing-workflow.py --self-test
       - run: python3 .github/release/test_sign_request.py
+      - run: python3 .github/release/announce_trust_chain.py --self-test
 
   shell-ext-windows:
     runs-on: windows-latest

@@ -88,6 +88,7 @@ jobs:
           set -e
           python3 -m pip install --quiet --disable-pip-version-check cryptography
           python3 .github/release/test_sign_request.py
+          python3 .github/release/announce_trust_chain.py --self-test
       # The verifier is its own workspace (the installers pin its hash), so the
       # workspace-wide steps above do not reach it.
       - name: Verifier crate

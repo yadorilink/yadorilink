@@ -91,6 +91,7 @@ GATE_COMMANDS = (
     "python3 .github/release/check-signing-workflow.py",
     "python3 .github/release/check-signing-workflow.py --self-test",
     "python3 .github/release/test_sign_request.py",
+    "python3 .github/release/announce_trust_chain.py --self-test",
 )
 
 
