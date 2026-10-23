@@ -1,1 +1,7 @@
-[]
+[
+  {
+    "key_id": "yadorilink-release-2026-10",
+    "record_json": "{\"schema_version\":1,\"serial\":1,\"add\":[{\"key_id\":\"yadorilink-release-spare-2026-10\",\"public_key_hex\":\"c678beb39cff5e2cf8c4b9530eb8fee31c808dff7dfcf3b4d908221480dad2ad\"}],\"revoke\":[]}",
+    "signature_base64": "hcURWcmjDnVP1Dcqah6sH0VCjF073X3uBAWzLbj8xYdTmG/1/hIcZnOpSTU/ouWtfUVhR4oAL+f3XfcBa/sfCw=="
+  }
+]

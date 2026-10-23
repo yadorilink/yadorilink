@@ -126,6 +126,7 @@ The release workflow builds each bundle in three jobs with separate privileges:
 proves that this repository's release workflow, at that commit, produced these
 exact bytes. It does not show that the generators run in `engine-build` were
 harmless; their pins and the hash and layout verification are what bound that
-risk. GitHub artifact attestations need a public repository, or a GitHub
-Enterprise Cloud plan for a private or internal one; on other plans the
-`engine-attest` job fails and no bundle is produced.
+risk. GitHub artifact attestations are available for public repositories on all
+plans, and for private or internal repositories only on GitHub Enterprise
+Cloud. Where they are unavailable the `engine-attest` job fails and no bundle
+is produced.
