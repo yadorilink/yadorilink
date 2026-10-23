@@ -159,7 +159,7 @@ rand = "0.10.2"
 # the sole netmap subscription transport. rustls-tls-webpki-roots to match
 # this workspace's existing rustls-only choice (reqwest above, and
 # yadorilink-reporting's own client) rather than pulling in native-tls.
-tokio-tungstenite = { version = "0.24", default-features = false, features = [
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
     "connect",
     "rustls-tls-webpki-roots",
 ] }
@@ -263,7 +263,7 @@ zstd = { workspace = true }
 # (`connect`); the `handshake` feature adds `derive_accept_key` +
 # `WebSocketStream::from_raw_socket` for accepting an upgraded connection.
 # Dev-dependency features only affect the test build, never `cargo build`.
-tokio-tungstenite = { version = "0.24", features = ["handshake"] }
+tokio-tungstenite = { version = "0.30", features = ["handshake"] }
 futures-util = "0.3"
 # A real local HTTP listener for
 # the daemon-side queue-retry integration tests (mirrors
