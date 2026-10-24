@@ -11,7 +11,7 @@ prerelease suffix (e.g. `v0.1.0-beta.1`).
 
 ## [Unreleased]
 
-## [v0.1.0-beta.3] - 2026-10-24
+## [v0.1.0-beta.4] - 2026-10-24
 
 First public beta of YadoriLink: cloud-like file sync without cloud file
 storage. Your files stay on your own devices and move directly between your
