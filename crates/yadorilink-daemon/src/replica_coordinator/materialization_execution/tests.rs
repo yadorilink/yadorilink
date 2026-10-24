@@ -4255,11 +4255,13 @@ fn a_repair_reconstruct_that_fails_after_its_rename_keeps_the_object_and_the_int
 
 /// A block store whose first read takes the root's marker away: the volume
 /// under the link root disappears while a repair is assembling a file.
+#[cfg(unix)]
 struct UnmountingStore<'a> {
     inner: &'a SegmentBlockStore,
     marker: std::path::PathBuf,
 }
 
+#[cfg(unix)]
 impl yadorilink_local_storage::BlockContentStore for UnmountingStore<'_> {
     fn put(
         &self,

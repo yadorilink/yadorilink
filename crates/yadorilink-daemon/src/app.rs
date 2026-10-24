@@ -1988,6 +1988,7 @@ mod startup_config_validation_tests {
         assert!(record, "the data area's owner was recorded by the daemon that ran");
     }
 
+    #[cfg(unix)]
     fn ownership_record_of(dir: &std::path::Path) -> bool {
         matches!(
             yadorilink_local_storage::ownership::read(dir),

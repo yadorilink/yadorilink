@@ -502,6 +502,7 @@ fn unreadable_after_open() -> (tempfile::TempDir, fs::File) {
     (dir, file)
 }
 
+#[cfg(unix)]
 fn assert_source_read(error: &StorageError) {
     assert!(
         matches!(error, StorageError::SourceRead(_)),

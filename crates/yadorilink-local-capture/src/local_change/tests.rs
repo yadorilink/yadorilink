@@ -1226,7 +1226,9 @@ async fn a_scanned_offline_deletion_publishes_an_absent_actual_state_proof() {
     );
 }
 
+#[cfg(unix)]
 const LISTING_ERR_GROUP: &str = "listing-error-group";
+#[cfg(unix)]
 const LISTING_ERR_PATH: &str = "sub/still-here.bin";
 
 /// A directory listing that fails for any reason other than "it does not exist" is no
@@ -1407,6 +1409,7 @@ struct CountingBlockStore {
     /// Fails a bulk flush with `Io(PermissionDenied)` -- the store's own fault -- and, in the
     /// same instant, makes the named source file unreadable (mode 000), so the file and the
     /// store both report the same error kind at once.
+    #[cfg(unix)]
     deny_batches_and_lock: Mutex<Option<Vec<std::path::PathBuf>>>,
 }
 
@@ -1420,6 +1423,7 @@ impl CountingBlockStore {
             fail_batches: AtomicBool::new(false),
             fail_batches_not_found: AtomicBool::new(false),
             refuse_over_bytes: AtomicU64::new(0),
+            #[cfg(unix)]
             deny_batches_and_lock: Mutex::new(None),
         }
     }

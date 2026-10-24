@@ -263,7 +263,10 @@ fn identities_match(
 
 #[cfg(test)]
 mod same_volume_tests {
-    use super::{identities_match, same_volume};
+    #[cfg(unix)]
+    use super::identities_match;
+    use super::same_volume;
+    #[cfg(unix)]
     use yadorilink_fs_platform::fs_identity::VolumeIdentity;
 
     #[cfg(unix)]

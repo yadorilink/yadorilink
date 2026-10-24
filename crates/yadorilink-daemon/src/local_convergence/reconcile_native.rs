@@ -604,7 +604,7 @@ impl super::LocalConvergenceExecutor {
     }
 
     /// Waits for the barriers of the runs finished so far.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn drain_flush_barriers(
         &self,
     ) -> Vec<super::received_flush_barrier::BarrierReport> {

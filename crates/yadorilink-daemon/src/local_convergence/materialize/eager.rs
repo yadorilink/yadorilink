@@ -84,7 +84,7 @@ struct PendingContentWrite<'a> {
 /// renamed into place, or the attempt was demoted to a retriable
 /// placeholder.
 enum Reconstruction {
-    Written(WrittenObject),
+    Written(Box<WrittenObject>),
     DemotedToPlaceholder,
     /// A local write landed while the bytes were being assembled and was
     /// left in place.
@@ -177,7 +177,7 @@ impl super::super::LocalConvergenceExecutor {
         }
         let pending = self.begin_content_write(plan, target).await?;
         let written = match self.reconstruct_content(plan, pending).await? {
-            Reconstruction::Written(written) => written,
+            Reconstruction::Written(written) => *written,
             Reconstruction::DemotedToPlaceholder | Reconstruction::LocalEditDuringAssembly => {
                 return Ok(MaterializeResult::RetryRequired.into());
             }
@@ -841,12 +841,12 @@ impl super::super::LocalConvergenceExecutor {
         // landed. Dropping the guard unclear is inert -- it has no
         // `Drop` behaviour of its own, and the commit owns the clear.
         drop(intent_guard);
-        Ok(Reconstruction::Written(WrittenObject {
+        Ok(Reconstruction::Written(Box::new(WrittenObject {
             deferred_tmp,
             out_path,
             written_version,
             mutation_generation: content_write_mutation_generation,
-        }))
+        })))
     }
 
     /// Assembles the payload's bytes into a temp file beside `out_path` and
