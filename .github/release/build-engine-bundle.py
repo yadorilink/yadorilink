@@ -6,6 +6,9 @@
   build-engine-bundle.py build  --channel CH --target T --expect-release-id ID
         --root KEY=DIR [--root KEY=DIR ...] --public-commit-sha SHA
         --repository OWNER/NAME --release-tag TAG --out-dir DIR [options]
+  build-engine-bundle.py extract-executables ZIP --target T --out-dir DIR [--expect-zip-sha256 HEX] [--release]
+  build-engine-bundle.py resign ZIP --target T --replace NAME=FILE [--replace ...] --out-dir DIR
+        [--expect-zip-sha256 HEX] [--release]
   build-engine-bundle.py provenance ZIP --public-commit-sha SHA --repository OWNER/NAME
         --attestation-json FILE --out-dir DIR [--target T] [--expect-zip-sha256 HEX] [--gate NAME ...] [--sign-cmd CMD]
         [--release]
@@ -43,6 +46,15 @@ the bytes came from, not that the generators that built them were harmless. Sign
 the statement's path and must write `<statement>.sig`; no key material is
 handled here.
 
+`extract-executables` and `resign` are the two halves of code signing (macOS). Both first verify the
+zip by hash; neither runs anything from it. `extract-executables` writes the layout's executables (the
+files to be signed) under DIR at their bundle paths. `resign` writes a new zip in which every executable
+of the layout is replaced by the signed file given for it: nothing else changes, SHA256SUMS and the
+identity's `artifact_sha256`/`bundle_sha256` are recomputed, and a replacement that does not still embed
+the release identity (or equals the original) is refused. A code signature embeds a timestamp, so the
+signed zip differs between runs of the same commit: reproducibility is a property of the unsigned zip that
+`build` writes, and the signed zip's integrity comes from its own build-provenance attestation.
+
 `verify` only hashes and compares; it never executes anything from the bundle.
 `verify --release` (release and production paths) also refuses a development
 bundle. The identity's `kind` follows the channel: channel dev is kind dev, any
@@ -71,6 +83,7 @@ ROOT = HERE.parents[1]
 CHECKS = ROOT / ".github" / "checks"
 PROVENANCE_SCHEMA = "yadorilink-engine-provenance/1"
 EXCLUDED_FROM_SUMS = ("SHA256SUMS", "engine-identity.json")
+STATE_RE = re.compile(r"pub const SCHEMA_VERSION: i32 = (\d+);")
 API_RE = re.compile(r"pub const PROVIDER_HOST_API_VERSION: u32 = (\d+);")
 ZIP_DATE = (2020, 1, 1, 0, 0, 0)
 
@@ -83,6 +96,13 @@ ZIP_DATE = (2020, 1, 1, 0, 0, 0)
 #   generated  generated Swift binding directory
 #   csharp     generated C# binding directory (generate-csharp-binding.sh --out)
 #   ipc        the ipc-proto crate directory
+#   device     iOS device static library directory (aarch64-apple-ios, release)
+#   simulator  iOS simulator static library directory (aarch64-apple-ios-sim, release)
+# `slices` (iOS only): the target triple of each static library slice and its bundle path. The
+# identity records every slice's SHA-256, so a consumer pins the device and the simulator library
+# separately. `daemon` names the file `artifact_sha256` covers; the iOS bundle has no executable,
+# so it is the device slice. `trust_root: False` (iOS): the layout holds no updater, so there is no
+# release manifest trust root to enforce and a release bundle is not required to be built with it.
 _BIN = [("yadorilink", "bin"), ("yadorilink-daemon", "bin")]
 LAYOUTS = {
     "linux-x86_64": {
@@ -118,6 +138,23 @@ LAYOUTS = {
             ("swift/Generated/include/module.modulemap", "generated", "include/module.modulemap", False),
             ("ipc-proto/proto/shellipc.proto", "ipc", "proto/shellipc.proto", False),
             ("ipc-proto/src/framing.rs", "ipc", "src/framing.rs", False),
+        ],
+        "globs": [("swift/Generated/include", "generated", "include", ".h")],
+    },
+    "ios-aarch64": {
+        "trust_root": False,
+        "daemon": "lib/device/libyadorilink_mobile_ffi.a",
+        "programs": ["lib/device/libyadorilink_mobile_ffi.a", "lib/simulator/libyadorilink_mobile_ffi.a"],
+        "slices": {
+            "aarch64-apple-ios": "lib/device/libyadorilink_mobile_ffi.a",
+            "aarch64-apple-ios-sim": "lib/simulator/libyadorilink_mobile_ffi.a",
+        },
+        "files": [
+            ("lib/device/libyadorilink_mobile_ffi.a", "device", "libyadorilink_mobile_ffi.a", False),
+            ("lib/simulator/libyadorilink_mobile_ffi.a", "simulator", "libyadorilink_mobile_ffi.a", False),
+            ("swift/Generated/YadoriLinkMobileFFI.swift", "generated", "YadoriLinkMobileFFI.swift", False),
+            ("swift/Generated/include/module.modulemap", "generated", "include/module.modulemap", False),
+            ("ipc-proto/proto/shellipc.proto", "ipc", "proto/shellipc.proto", False),
         ],
         "globs": [("swift/Generated/include", "generated", "include", ".h")],
     },
@@ -204,6 +241,14 @@ def host_api_version(source: Path) -> int:
     return int(match.group(1))
 
 
+def state_schema_version(source: Path) -> int:
+    """The state database version the engine stamps (and, before release, the only one it reads)."""
+    match = STATE_RE.search(source.read_text(encoding="utf-8"))
+    if not match:
+        raise SystemExit(f"error: SCHEMA_VERSION not found in {source}")
+    return int(match.group(1))
+
+
 def source_notice(repository: str, release_tag: str, public_commit_sha: str, config: dict, config_digest: str, kind: str = "release") -> bytes:
     """SOURCE.txt: where the exact source of this bundle's binaries is. Deterministic."""
     url = f"https://github.com/{repository}"
@@ -267,7 +312,7 @@ def build_identity(args):
     config = dict(item.split("=", 1) for item in args.build_config)
     kind = "dev" if args.channel == "dev" else "release"
     enforced = "enforce-release-trust-root" in config.get("features", "")
-    if kind == "release" and not enforced:
+    if kind == "release" and not enforced and LAYOUTS.get(args.target, {}).get("trust_root", True):
         raise SystemExit("error: a release bundle must be built with the enforce-release-trust-root feature (--build-config features=...)")
     config.update({"channel": args.channel, "target": args.target})
     return kind, config, sha256(canonical(config))
@@ -328,6 +373,8 @@ def build(args) -> int:
     identity = {
         "public_commit_sha": args.public_commit_sha,
         "engine_api_version": host_api_version(Path(args.api_version_source)),
+        "state_schema_version": state_schema_version(Path(args.state_schema_source)),
+        "state_schema_min_readable": state_schema_version(Path(args.state_schema_source)),
         "artifact_sha256": sha256(files[daemon]),
         "channel": args.channel,
         "kind": kind,
@@ -335,6 +382,8 @@ def build(args) -> int:
         "bundle_sha256": sha256(sums),
         "source": {"repository": args.repository, "release_tag": args.release_tag, "asset_name": asset},
     }
+    if "slices" in layout:
+        identity["slices"] = {triple: sha256(files[path]) for triple, path in layout["slices"].items()}
     problems = validator.validate(identity, require_source=True)
     if problems:
         raise SystemExit("error: invalid engine identity: " + "; ".join(problems))
@@ -352,8 +401,78 @@ def build(args) -> int:
             z.writestr(info, entries[name])
     zip_sha = sha256(zip_path.read_bytes())
 
-    (out / f"{asset}.sha256").write_text(f"{zip_sha}  {asset}\n")
+    (out / f"{asset}.sha256").write_text(f"{zip_sha}  {asset}\n", encoding="utf-8", newline="\n")
     print(zip_path)
+    return 0
+
+
+def executables_of(layout: dict) -> list[str]:
+    return [f[0] for f in layout["files"] if f[3]]
+
+
+def extract_executables(args) -> int:
+    found = verify_zip(Path(args.zip), args.expect_zip_sha256, None, args.target, args.release)
+    if found:
+        raise SystemExit("error: " + "; ".join(found))
+    z = zipfile.ZipFile(args.zip)
+    out = Path(args.out_dir)
+    for name in executables_of(LAYOUTS[args.target]):
+        dest = out / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(z.read(name))
+        dest.chmod(0o755)
+        print(dest)
+    return 0
+
+
+def resign(args) -> int:
+    zip_path = Path(args.zip)
+    found = verify_zip(zip_path, args.expect_zip_sha256, None, args.target, args.release)
+    if found:
+        raise SystemExit("error: " + "; ".join(found))
+    z = zipfile.ZipFile(zip_path)
+    entries = {i.filename: z.read(i.filename) for i in z.infolist() if not i.is_dir()}
+    layout = LAYOUTS[args.target]
+    signable = executables_of(layout)
+    replacements = {}
+    for item in args.replace:
+        name, sep, path = item.partition("=")
+        if not sep or name not in signable or name in replacements:
+            raise SystemExit(f"error: bad or repeated --replace {item!r}; executables: {', '.join(signable)}")
+        replacements[name] = Path(path).read_bytes()
+    if set(replacements) != set(signable):
+        raise SystemExit(f"error: every executable must be replaced: missing {', '.join(sorted(set(signable) - set(replacements)))}")
+    identity = json.loads(entries["engine-identity.json"])
+    release_id = f"{identity['public_commit_sha']}:{identity['build_config_digest']}"
+    for name, data in replacements.items():
+        if data == entries[name]:
+            raise SystemExit(f"error: {name} is unchanged; it was not signed")
+        if not embeds(data, release_id):
+            raise SystemExit(f"error: the replacement {name} does not embed the release identity {release_id}")
+    entries.update(replacements)
+    files = {n: v for n, v in entries.items() if n not in EXCLUDED_FROM_SUMS}
+    sums = "".join(f"{sha256(files[n])}  {n}\n" for n in sorted(files)).encode()
+    identity["artifact_sha256"] = sha256(files[layout["daemon"]])
+    identity["bundle_sha256"] = sha256(sums)
+    problems = validator.validate(identity, require_source=True)
+    if problems:
+        raise SystemExit("error: invalid engine identity: " + "; ".join(problems))
+    entries["SHA256SUMS"] = sums
+    entries["engine-identity.json"] = (json.dumps(identity, indent=2, sort_keys=True) + "\n").encode()
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    signed = out / zip_path.name
+    with zipfile.ZipFile(signed, "w", zipfile.ZIP_DEFLATED) as w:
+        for name in sorted(entries):
+            info = zipfile.ZipInfo(name, ZIP_DATE)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = (0o755 if name in signable else 0o644) << 16
+            w.writestr(info, entries[name])
+    problems = verify_zip(signed, None, None, args.target, args.release)
+    if problems:
+        raise SystemExit("error: the signed bundle does not verify: " + "; ".join(problems))
+    (out / f"{signed.name}.sha256").write_text(f"{sha256(signed.read_bytes())}  {signed.name}\n", encoding="utf-8", newline="\n")
+    print(signed)
     return 0
 
 
@@ -443,7 +562,7 @@ def provenance(args) -> int:
         "gates_passed": sorted(args.gate),
     }
     statement_path = out / f"{asset}.provenance.json"
-    statement_path.write_text(json.dumps(statement, indent=2, sort_keys=True) + "\n")
+    statement_path.write_text(json.dumps(statement, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
     if args.sign_cmd:
         subprocess.run([*shlex.split(args.sign_cmd), str(statement_path)], check=True)
         if not Path(f"{statement_path}.sig").is_file():
@@ -477,7 +596,7 @@ def write_lock(args) -> int:
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     path = out / f"engine.lock.{args.target}.json"
-    path.write_text(json.dumps(identity, indent=2, sort_keys=True) + "\n")
+    path.write_text(json.dumps(identity, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
     print(path)
     return 0
 
@@ -533,11 +652,22 @@ def verify_zip(zip_path: Path, expect_zip_sha256: str | None = None, lock: dict 
         problems.append("identity artifact_sha256 matches no bundle file")
     if target is not None and listed.get(LAYOUTS[target]["daemon"]) != identity["artifact_sha256"]:
         problems.append("identity artifact_sha256 is not the layout's daemon")
+    slices = identity.get("slices")
+    if target is not None and (slices is not None) != ("slices" in LAYOUTS[target]):
+        problems.append("identity slices and the layout's slices disagree")
+    elif slices is not None:
+        for triple, digest in slices.items():
+            if target is not None and listed.get(LAYOUTS[target]["slices"][triple]) != digest:
+                problems.append(f"identity slice {triple} does not match its library in SHA256SUMS")
+            elif digest not in listed.values():
+                problems.append(f"identity slice {triple} matches no bundle file")
     if lock is not None:
         problems += validator.validate(lock, require_source=True, release=release)
         for key in ("public_commit_sha", "engine_api_version", "artifact_sha256", "channel", "kind", "build_config_digest", "bundle_sha256"):
             if identity[key] != lock.get(key):
                 problems.append(f"identity {key} != lock {key}")
+        if identity.get("slices") != lock.get("slices"):
+            problems.append("identity slices != lock slices")
         if "source" in identity and identity["source"] != lock.get("source"):
             problems.append("identity source != lock source")
         if lock.get("source", {}).get("asset_name") not in (None, zip_path.name):
@@ -549,15 +679,15 @@ def self_test() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         lic = tmp / "LICENSE"
-        lic.write_text("license\n")
+        lic.write_text("license\n", encoding="utf-8", newline="\n")
         tpl = tmp / "THIRD-PARTY-LICENSES"
-        tpl.write_text("third party\n")
+        tpl.write_text("third party\n", encoding="utf-8", newline="\n")
         api = tmp / "lib.rs"
-        api.write_text("pub const PROVIDER_HOST_API_VERSION: u32 = 7;\n")
+        api.write_text("pub const PROVIDER_HOST_API_VERSION: u32 = 7;\n", encoding="utf-8", newline="\n")
         sha = "a" * 40
 
         # Fake source roots holding every file any layout can ask for.
-        roots = {k: tmp / "roots" / k for k in ("bin", "shell", "generated", "ipc", "csharp")}
+        roots = {k: tmp / "roots" / k for k in ("bin", "shell", "generated", "ipc", "csharp", "device", "simulator")}
         for target, layout in LAYOUTS.items():
             for dest, root, rel, _ in layout["files"]:
                 path = roots[root] / rel
@@ -600,7 +730,7 @@ def self_test() -> int:
             subject = over.pop("subject", sha256(zip_path.read_bytes()))
             doc = [{"verificationResult": {"statement": {"subject": [{"name": zip_path.name, "digest": {"sha256": subject}}]}, "signature": {"certificate": cert}}}]
             path = tmp / f"att-{abs(hash((zip_path.name, subject, json.dumps(cert, sort_keys=True))))}.json"
-            path.write_text(json.dumps(over.get("doc", doc)))
+            path.write_text(json.dumps(over.get("doc", doc)), encoding="utf-8", newline="\n")
             return path
 
         def run_provenance(zip_path: Path, out: Path, attestation: Path | None = None, **extra):
@@ -636,6 +766,11 @@ def self_test() -> int:
                 "swift/Generated/include/module.modulemap", "swift/Generated/include/A.h",
                 "swift/Generated/include/B.h", "ipc-proto/proto/shellipc.proto", "ipc-proto/src/framing.rs",
             },
+            "ios-aarch64": {
+                "lib/device/libyadorilink_mobile_ffi.a", "lib/simulator/libyadorilink_mobile_ffi.a",
+                "swift/Generated/YadoriLinkMobileFFI.swift", "swift/Generated/include/module.modulemap",
+                "swift/Generated/include/A.h", "swift/Generated/include/B.h", "ipc-proto/proto/shellipc.proto",
+            },
         }
         for target, names in expected_names.items():
             out1, out2 = tmp / f"{target}-1", tmp / f"{target}-2"
@@ -657,6 +792,7 @@ def self_test() -> int:
             daemon = LAYOUTS[target]["daemon"]
             assert identity["artifact_sha256"] == sha256(entries[daemon])
             assert identity["engine_api_version"] == 7 and identity["source"]["asset_name"] == z1.name
+            assert identity["state_schema_version"] == identity["state_schema_min_readable"] >= 1
             for info in zipfile.ZipFile(z1).infolist():
                 want = 0o755 if info.filename in {f[0] for f in LAYOUTS[target]["files"] if f[3]} else 0o644
                 assert info.external_attr >> 16 == want, info.filename
@@ -671,7 +807,7 @@ def self_test() -> int:
             assert verify_zip(z1, None, {k: v for k, v in lock.items() if k != "source"})
             assert not (out1 / f"{z1.name}.provenance.json").exists(), "build must not write provenance"
             run_provenance(z1, out1 / "prov", target=target, expect_zip_sha256=sha256(z1.read_bytes()))
-            prov = json.loads((out1 / "prov" / f"{z1.name}.provenance.json").read_text())
+            prov = json.loads((out1 / "prov" / f"{z1.name}.provenance.json").read_text(encoding="utf-8"))
             assert prov["artifact"]["sha256"] == sha256(z1.read_bytes())
             assert prov["public_commit_sha"] == sha and prov["gates_passed"] == ["release-gates"]
             assert prov["bundle_sha256"] == identity["bundle_sha256"]
@@ -693,6 +829,81 @@ def self_test() -> int:
             # A file outside the layout is rejected even when SHA256SUMS lists it.
             extra_sums = entries["SHA256SUMS"] + f"{sha256(b'x')}  stray/file\n".encode()
             assert verify_zip(rewrite(z1, {**entries, "stray/file": b"x", "SHA256SUMS": extra_sums}), target=target)
+
+        # The iOS bundle records each slice's digest in its identity, and nothing else does.
+        for target in expected_names:
+            z = tmp / f"{target}-1" / f"yadorilink-engine-beta-{target}.zip"
+            ents = entries_of(z)
+            ident = json.loads(ents["engine-identity.json"])
+            if target != "ios-aarch64":
+                assert "slices" not in ident, target
+                assert verify_zip(rewrite(z, {**ents, "engine-identity.json": json.dumps({**ident, "slices": {"aarch64-apple-ios": "0" * 64, "aarch64-apple-ios-sim": "1" * 64}}).encode()}), target=target), "slices accepted on a layout without them"
+                continue
+            device, simulator = (LAYOUTS[target]["slices"][t] for t in ("aarch64-apple-ios", "aarch64-apple-ios-sim"))
+            assert ident["slices"] == {"aarch64-apple-ios": sha256(ents[device]), "aarch64-apple-ios-sim": sha256(ents[simulator])}
+            assert ident["slices"]["aarch64-apple-ios"] != ident["slices"]["aarch64-apple-ios-sim"]
+            assert ident["artifact_sha256"] == ident["slices"]["aarch64-apple-ios"]
+            def with_identity(change, name):
+                return rewrite(z, {**ents, "engine-identity.json": json.dumps(change).encode()}, name)
+            swapped = {"aarch64-apple-ios": ident["slices"]["aarch64-apple-ios-sim"], "aarch64-apple-ios-sim": ident["slices"]["aarch64-apple-ios"]}
+            assert verify_zip(with_identity({**ident, "slices": swapped}, "swapped-slices.zip"), target=target), "swapped slice digests were accepted"
+            assert verify_zip(with_identity({k: v for k, v in ident.items() if k != "slices"}, "no-slices.zip"), target=target), "a missing slices record was accepted"
+            assert verify_zip(with_identity({**ident, "slices": {"aarch64-apple-ios": "2" * 64, "aarch64-apple-ios-sim": ident["slices"]["aarch64-apple-ios-sim"]}}, "unlisted-slice.zip")), "a digest of no bundle file was accepted"
+            assert verify_zip(z, None, {**ident, "slices": swapped}, target), "a lock with other slice digests was accepted"
+            assert verify_zip(z, None, {k: v for k, v in ident.items() if k != "slices"}, target), "a lock without the slices was accepted"
+
+        # Code signing: extract the executables, replace them with signed ones, and the result is a
+        # fully consistent bundle that differs from the original only in those files and their hashes.
+        for target in ("macos-aarch64", "linux-x86_64"):
+            src = tmp / f"{target}-1" / f"yadorilink-engine-beta-{target}.zip"
+            orig = entries_of(src)
+            ident = json.loads(orig["engine-identity.json"])
+            rid = f"{ident['public_commit_sha']}:{ident['build_config_digest']}"
+            exe = executables_of(LAYOUTS[target])
+            ex_dir = tmp / f"{target}-ex"
+            assert extract_executables(parse(["extract-executables", str(src), "--target", target, "--out-dir", str(ex_dir)])) == 0
+            assert sorted(str(p.relative_to(ex_dir)) for p in ex_dir.rglob("*") if p.is_file()) == sorted(exe)
+            signed_dir = tmp / f"{target}-signed-files"
+            for n in exe:
+                (signed_dir / n).parent.mkdir(parents=True, exist_ok=True)
+                (signed_dir / n).write_bytes((ex_dir / n).read_bytes() + b"|signature|" + rid.encode())
+            rargs = ["resign", str(src), "--target", target, "--out-dir", str(tmp / f"{target}-signed"), "--release"]
+            for n in exe:
+                rargs += ["--replace", f"{n}={signed_dir / n}"]
+            assert resign(parse(rargs)) == 0
+            out_zip = tmp / f"{target}-signed" / src.name
+            assert verify_zip(out_zip, None, None, target, True) == []
+            new = entries_of(out_zip)
+            for n in set(orig) - set(exe) - {"SHA256SUMS", "engine-identity.json"}:
+                assert new[n] == orig[n], n
+            for n in exe:
+                assert new[n] == (signed_dir / n).read_bytes()
+            nid = json.loads(new["engine-identity.json"])
+            assert nid["artifact_sha256"] == sha256(new[LAYOUTS[target]["daemon"]]) != ident["artifact_sha256"]
+            assert {k: v for k, v in nid.items() if k not in ("artifact_sha256", "bundle_sha256")} == {k: v for k, v in ident.items() if k not in ("artifact_sha256", "bundle_sha256")}
+            assert (tmp / f"{target}-signed" / f"{src.name}.sha256").read_text(encoding="utf-8").split()[0] == sha256(out_zip.read_bytes())
+            for info in zipfile.ZipFile(out_zip).infolist():
+                assert info.external_attr >> 16 == (0o755 if info.filename in exe else 0o644), info.filename
+
+            def refused(mutate_args):
+                try:
+                    resign(parse(mutate_args))
+                except SystemExit:
+                    return True
+                return False
+            base = ["resign", str(src), "--target", target, "--out-dir", str(tmp / f"{target}-refused")]
+            reps = [a for n in exe for a in ("--replace", f"{n}={signed_dir / n}")]
+            assert refused(base + reps[:-2]), "a partly signed bundle was accepted"
+            assert refused(base + reps + reps[:2]), "a repeated replacement was accepted"
+            assert refused(base + ["--replace", f"LICENSE={signed_dir / exe[0]}"] + reps[2:]), "a non-executable was replaced"
+            unchanged = tmp / f"{target}-unchanged"
+            unchanged.write_bytes(orig[exe[0]])
+            assert refused(base + ["--replace", f"{exe[0]}={unchanged}"] + reps[2:]), "an unsigned (unchanged) file was accepted"
+            noid = tmp / f"{target}-noid"
+            noid.write_bytes(b"signed but another build")
+            assert refused(base + ["--replace", f"{exe[0]}={noid}"] + reps[2:]), "a file without the release identity was accepted"
+            assert refused(["resign", str(rewrite(src, {**orig, exe[0]: b"evil"}, "tampered.zip")), "--target", target, "--out-dir", str(tmp / "x"), *reps]), "a tampered input was accepted"
+            assert refused(base + reps + ["--expect-zip-sha256", "0" * 64]), "a wrong input hash was accepted"
 
         # A retired-name library is rejected even when SHA256SUMS lists it and
         # even when the current library is present too.
@@ -739,6 +950,14 @@ def self_test() -> int:
                 pass
             else:
                 raise AssertionError(f"built {label}")
+        # Only the iOS layout (no updater, no trust root) may be a release bundle built without the feature.
+        for target in LAYOUTS:
+            try:
+                run_build(target, tmp / f"no-root-{target}", channel="beta", features="none")
+            except SystemExit:
+                assert LAYOUTS[target].get("trust_root", True), f"{target} refused a release build without the trust root"
+            else:
+                assert not LAYOUTS[target].get("trust_root", True), f"{target} built a release bundle without the trust root"
 
         # Provenance, the release path, refuses a development bundle when asked to.
         try:
@@ -797,7 +1016,7 @@ def self_test() -> int:
         lock_argv = ["lock", str(z), "--target", "linux-x86_64", "--public-commit-sha", sha, "--out-dir", str(lock_out)]
         write_lock(parse(lock_argv))
         lock_file = lock_out / "engine.lock.linux-x86_64.json"
-        lock_doc = json.loads(lock_file.read_text())
+        lock_doc = json.loads(lock_file.read_text(encoding="utf-8"))
         assert lock_doc == json.loads(zipfile.ZipFile(z).read("engine-identity.json"))
         assert lock_doc["public_commit_sha"] == sha and lock_doc["source"]["asset_name"] == z.name
         assert not verify_zip(z, None, lock_doc, "linux-x86_64"), "the lock must verify against its own bundle"
@@ -822,7 +1041,7 @@ def self_test() -> int:
 
         # Signing hook: a command that writes the .sig, and one that does not.
         signer = tmp / "sign.sh"
-        signer.write_text('#!/bin/sh\necho sig > "$1.sig"\n')
+        signer.write_text('#!/bin/sh\necho sig > "$1.sig"\n', encoding="utf-8", newline="\n")
         signer.chmod(0o755)
         run_provenance(z, tmp / "o3", sign_cmd=str(signer))
         assert (tmp / "o3" / "yadorilink-engine-beta-linux-x86_64.zip.provenance.json.sig").is_file()
@@ -854,6 +1073,7 @@ def parse(argv):
     b.add_argument("--release-tag", required=True)
     b.add_argument("--asset-name")
     b.add_argument("--api-version-source", default=str(ROOT / "crates/yadorilink-ipc-proto/src/lib.rs"))
+    b.add_argument("--state-schema-source", default=str(ROOT / "crates/yadorilink-sqlite-runtime/src/schema.rs"))
     b.add_argument("--out-dir", required=True)
     pv = sub.add_parser("provenance")
     pv.add_argument("zip")
@@ -873,6 +1093,19 @@ def parse(argv):
     lk.add_argument("--public-commit-sha", required=True)
     lk.add_argument("--release", action="store_true", help="release path: refuse a development bundle")
     lk.add_argument("--out-dir", required=True)
+    ex = sub.add_parser("extract-executables", help="write the layout's executables (the files to sign) from a verified bundle")
+    ex.add_argument("zip")
+    ex.add_argument("--target", required=True, choices=sorted(LAYOUTS))
+    ex.add_argument("--expect-zip-sha256")
+    ex.add_argument("--release", action="store_true", help="release path: refuse a development bundle")
+    ex.add_argument("--out-dir", required=True)
+    rs = sub.add_parser("resign", help="write a bundle whose executables are replaced by their signed versions")
+    rs.add_argument("zip")
+    rs.add_argument("--target", required=True, choices=sorted(LAYOUTS))
+    rs.add_argument("--expect-zip-sha256")
+    rs.add_argument("--replace", action="append", default=[], metavar="NAME=FILE", help="bundle path of an executable and its signed file")
+    rs.add_argument("--release", action="store_true", help="release path: refuse a development bundle")
+    rs.add_argument("--out-dir", required=True)
     v = sub.add_parser("verify")
     v.add_argument("zip")
     v.add_argument("--target", choices=sorted(LAYOUTS), help="also require exactly this platform layout")
@@ -894,7 +1127,11 @@ def main(argv: list[str]) -> int:
         return provenance(args)
     if args.cmd == "lock":
         return write_lock(args)
-    lock = json.loads(Path(args.lock).read_text()) if args.lock else None
+    if args.cmd == "extract-executables":
+        return extract_executables(args)
+    if args.cmd == "resign":
+        return resign(args)
+    lock = json.loads(Path(args.lock).read_text(encoding="utf-8")) if args.lock else None
     found = verify_zip(Path(args.zip), args.expect_zip_sha256, lock, args.target, args.release)
     for line in found:
         print(f"engine bundle verification failed: {line}", file=sys.stderr)

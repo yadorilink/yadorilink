@@ -30,7 +30,7 @@ if [ "${1:-}" = "--self-test" ]; then
     if [ "$got" != "$2" ]; then echo "FAIL $1: got '$got', want '$2'" >&2; fail=1; fi
   }
   expect refs/tags/v0.1.0 "img:0.1.0,img:latest"
-  expect refs/tags/v0.1.0-beta.5 "img:0.1.0-beta.5"
+  expect refs/tags/v0.1.0-beta.6 "img:0.1.0-beta.6"
   expect refs/tags/v1.2.3-rc.2 "img:1.2.3-rc.2"
   expect refs/heads/main "img:nightly"
   [ "$fail" -eq 0 ] || exit 1

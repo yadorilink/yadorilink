@@ -186,6 +186,7 @@ async fn a_sign_in_that_never_arrives_times_out_with_an_actionable_message() {
         .await
         .expect_err("nothing arrived");
     let message = err.to_string();
-    assert!(message.contains("no sign-in arrived"), "{message}");
-    assert!(message.contains("yadorilink login"), "{message}");
+    assert_eq!(message, "authentication failed: no sign-in arrived within 0 seconds");
+    assert!(!message.contains("yadorilink "), "client-core names no CLI command: {message}");
+    assert_eq!(err.hint(), Some(Hint::SignInAgain));
 }

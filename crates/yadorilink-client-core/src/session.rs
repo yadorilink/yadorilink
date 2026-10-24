@@ -48,8 +48,62 @@ pub type LoginPrecheckFn = Box<dyn Fn() -> Result<(), DesktopError> + Send + Syn
 
 struct LoginShared {
     queue: Mutex<LoginQueue>,
+    /// Held for the length of every poll of the flow; see [`Gated`].
+    gate: Mutex<Gate>,
     ready: Notify,
     stop: Notify,
+}
+
+#[derive(Default)]
+struct Gate {
+    /// A cancel was requested: the flow is never polled again.
+    stopped: bool,
+    /// The flow returned (signed in or failed) before the stop.
+    finished: bool,
+}
+
+/// What a cancel found, once it has returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// The flow is not running and never will be: it will not poll again, so it cannot write the
+    /// credential store from now on. It never completed. The sign-in's last event is usually
+    /// `Cancelled`, but one that already ended (for example `Failed` on its overall timeout)
+    /// keeps that event.
+    Stopped,
+    /// The flow had already returned before the cancel (it may have stored its credential): the
+    /// sign-in ends with its own terminal event, which the consumer reads.
+    AlreadyFinished,
+}
+
+/// The flow, polled only under the session's gate: a poll holds the gate for its whole length,
+/// and a stopped gate never polls. Cancelling takes the same gate, so it returns only after a
+/// poll that was running has returned, and no poll starts after it. The flow's credential write
+/// happens inside one poll (nothing it awaits follows the write), so once a cancel has returned
+/// nothing of the flow writes any more.
+struct Gated {
+    shared: Arc<LoginShared>,
+    flow: BoxFuture<Result<AccountStatus, DesktopError>>,
+}
+
+impl Future for Gated {
+    type Output = Result<AccountStatus, DesktopError>;
+
+    fn poll(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let shared = self.shared.clone();
+        let mut gate = lock(&shared.gate);
+        if gate.stopped {
+            // The run loop takes its stop branch; the cancel's stop permit is already set.
+            return std::task::Poll::Pending;
+        }
+        let polled = self.flow.as_mut().poll(cx);
+        if polled.is_ready() {
+            gate.finished = true;
+        }
+        polled
+    }
 }
 
 #[derive(Default)]
@@ -81,7 +135,17 @@ impl LoginShared {
     /// when it stopped the flow, `SignedIn` only if the flow had already
     /// completed (and so stored its credential), so the event never claims
     /// less than what happened.
-    fn cancel(&self) {
+    fn cancel(&self) -> CancelOutcome {
+        // First: wait for a poll of the flow that is running, and forbid the next one.
+        let outcome = {
+            let mut gate = lock(&self.gate);
+            gate.stopped = true;
+            if gate.finished {
+                CancelOutcome::AlreadyFinished
+            } else {
+                CancelOutcome::Stopped
+            }
+        };
         let mut queue = lock(&self.queue);
         if !queue.terminal_queued {
             queue.cancel_requested = true;
@@ -96,6 +160,7 @@ impl LoginShared {
         // `notify_one` keeps a permit, so a flow task that has not reached its
         // wait yet still sees the stop.
         self.stop.notify_one();
+        outcome
     }
 }
 
@@ -133,6 +198,7 @@ impl LoginSession {
             stage: Mutex::new(Stage::NotBegun { precheck, flow }),
             shared: Arc::new(LoginShared {
                 queue: Mutex::new(LoginQueue::default()),
+                gate: Mutex::new(Gate::default()),
                 ready: Notify::new(),
                 stop: Notify::new(),
             }),
@@ -172,7 +238,10 @@ impl LoginSession {
             queue.flow_running = true;
         }
         let shared = self.shared.clone();
-        let running = flow(LoginEventSink { shared: shared.clone() });
+        let running = Box::pin(Gated {
+            shared: shared.clone(),
+            flow: flow(LoginEventSink { shared: shared.clone() }),
+        });
         runtime.spawn(run_login(shared, running, self.overall_timeout));
         Ok(())
     }
@@ -196,12 +265,23 @@ impl LoginSession {
         }
     }
 
-    /// Idempotent. Stops the flow (nothing is written to the credential
-    /// store after this), drops the steps not yet read, and ends the stream
-    /// with `Cancelled` -- unless the flow had already finished, in which
-    /// case its own terminal event stands.
-    pub fn cancel(&self) {
-        self.shared.cancel();
+    /// Idempotent. Stops the flow, drops the steps not yet read, and ends the
+    /// stream with `Cancelled` -- unless the flow had already finished, in
+    /// which case its own terminal event stands.
+    ///
+    /// Ordering guarantee: this returns only after a poll of the flow that was
+    /// running on another thread has returned, and the flow is never polled
+    /// again, so **the flow stores nothing once this has returned**. Its
+    /// result says whether the flow had finished first
+    /// ([`CancelOutcome::AlreadyFinished`]: its credential may be stored).
+    /// This blocks the calling thread for the rest of the poll in flight: that
+    /// poll's synchronous work (store and keychain access, client
+    /// construction, the account status read), never a wait on the network.
+    /// The wait is not strictly bounded (a macOS keychain ACL prompt inside
+    /// that work holds it until answered). It must not be called from inside
+    /// the flow itself.
+    pub fn cancel(&self) -> CancelOutcome {
+        self.shared.cancel()
     }
 }
 
@@ -209,7 +289,7 @@ impl Drop for LoginSession {
     /// A sign-in nobody can read any more is stopped, so it does not keep a
     /// loopback port open or finish writing a credential nobody asked for.
     fn drop(&mut self) {
-        self.shared.cancel();
+        let _ = self.shared.cancel();
     }
 }
 

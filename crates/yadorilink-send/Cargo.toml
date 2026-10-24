@@ -65,6 +65,8 @@ walkdir = "2"
 tokio.workspace = true
 
 [dev-dependencies]
+yadorilink-local-storage = { path = "../yadorilink-local-storage", features = ["test-support"] }
+yadorilink-sqlite-runtime = { path = "../yadorilink-sqlite-runtime", features = ["test-support"] }
 tempfile = "3"
 yadorilink-sync-substrate = { path = "../yadorilink-sync-substrate", features = ["test-support"] }
 tokio = { version = "1", features = ["full", "test-util"] }

@@ -397,17 +397,24 @@ impl CredentialManager {
     /// on the common path -- one mutex and a clock read -- so there is no
     /// reason for a caller to hold onto the result.
     pub async fn access_token(&self) -> Result<String> {
+        Ok(self.access_token_and_origin().await?.0)
+    }
+
+    /// [`Self::access_token`], also saying whether the token came from a refresh this call made
+    /// (`true`) or from the cache (`false`). Only the former is evidence about what the server
+    /// accepts now.
+    pub async fn access_token_and_origin(&self) -> Result<(String, bool)> {
         if let Some(token) = self.fresh_enough() {
-            return Ok(token);
+            return Ok((token, false));
         }
 
         // One refresh per process, whatever the arrival rate. Everything below
         // runs exactly once for a burst of callers.
         let _serialized = self.refreshing.lock().await;
         if let Some(token) = self.fresh_enough() {
-            return Ok(token);
+            return Ok((token, false));
         }
-        self.refresh_now().await
+        Ok((self.refresh_now().await?, true))
     }
 
     /// Refresh unconditionally.

@@ -153,7 +153,7 @@ pub fn publish_next(base: &Path, text: &str) -> io::Result<u64> {
             }
         };
         out.write_all(text.as_bytes())?;
-        out.sync_all()?;
+        crate::flush::sync_file(&out)?;
         drop(out);
         match publish_durably(&tmp, &dir.join(format!("{name}.{seq}")), Replace::No) {
             Ok(()) => {

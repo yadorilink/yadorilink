@@ -284,6 +284,15 @@ pub fn time_block_read<T>(bytes: u64, f: impl FnOnce() -> T) -> T {
     out
 }
 
+/// Whether the unattributed-read probe is armed.
+static BLOCK_READ_PROBE: AtomicBool = AtomicBool::new(false);
+
+/// Arms the unattributed-read probe. Only a process that arms diagnostics (the desktop daemon,
+/// from its environment) calls this; the probe also needs the counters armed.
+pub fn set_block_read_probe(on: bool) {
+    BLOCK_READ_PROBE.store(on, Ordering::Relaxed);
+}
+
 /// How many unattributed-read backtraces to print. Enough to name the
 /// caller; not so many that the log becomes the bottleneck.
 const UNATTRIBUTED_PROBE_LIMIT: u64 = 6;
@@ -298,16 +307,13 @@ static UNATTRIBUTED_PROBED: AtomicU64 = AtomicU64::new(0);
 /// call sites and still left the growing reader unaccounted for. A
 /// backtrace names it instead of narrowing it.
 ///
-/// Only runs under `YADORILINK_DIAGNOSTIC_BLOCK_READ_PROBE=1`, and only
+/// Only runs once [`set_block_read_probe`] armed it, and only
 /// while counters are armed.
 fn probe_unattributed_caller() {
     if UNATTRIBUTED_PROBED.load(Ordering::Relaxed) >= UNATTRIBUTED_PROBE_LIMIT {
         return;
     }
-    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !ARMED.get_or_init(|| {
-        std::env::var("YADORILINK_DIAGNOSTIC_BLOCK_READ_PROBE").as_deref() == Ok("1")
-    }) {
+    if !BLOCK_READ_PROBE.load(Ordering::Relaxed) {
         return;
     }
     let n = UNATTRIBUTED_PROBED.fetch_add(1, Ordering::Relaxed);

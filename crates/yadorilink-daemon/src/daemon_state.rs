@@ -426,6 +426,10 @@ pub struct DaemonState {
     /// Serializes safe-stop requests; `true` once one has brought the daemon to a safe point
     /// and begun its exit. See `adapters::runtime::safe_stop`.
     pub(crate) safe_stop_committed: tokio::sync::Mutex<bool>,
+    /// Why the shutdown happened, when it was the executable-replaced watch's own safe stop:
+    /// set by the commit itself, before `shutdown_tx` fires, so whoever sees the shutdown sees
+    /// this too. Never set by any other stop.
+    pub(crate) restart_on_exit: std::sync::atomic::AtomicBool,
     /// Local consent/counters/error-candidate/
     /// queue storage, the type that IPC dispatch and
     /// severe-error hooks operate on. Opening this never writes anything
@@ -438,6 +442,10 @@ pub struct DaemonState {
     /// comment). Opening this never writes anything to disk by itself,
     /// mirroring `reporting`'s "safe for every existing call site" property.
     pub governance_config: Arc<GovernanceConfigStore>,
+    /// The state directory this state's configuration, credentials, reports and recovery areas
+    /// live in. Everything the engine persists outside the database and block store is placed
+    /// under it, so one process can run engines over different directories.
+    config_dir: std::path::PathBuf,
     /// The single, shared upload/
     /// download token-bucket pair every `PeerSyncSession` this daemon
     /// constructs is wired to (`peer_orchestrator::spawn_peer_session`,
@@ -460,6 +468,9 @@ pub struct DaemonState {
     /// exact same `spawn_peer_session`, so this needs the same "off unless
     /// `main.rs` opts in" default the block store gets).
     disk_headroom_enforcement_enabled: std::sync::atomic::AtomicBool,
+    /// The directory whose volume decides when a Degraded provider link has room again. A
+    /// provider link's key is a locator, not a path, so it cannot be measured itself.
+    degraded_volume_probes: Mutex<HashMap<String, std::path::PathBuf>>,
     /// Test-only headroom reserve for the link preflight's free-space reading, so a test does not
     /// depend on how full the host's disk is. Production passes no override.
     #[cfg(any(test, feature = "test-support"))]
@@ -494,6 +505,7 @@ pub struct DaemonState {
     /// Check/download/verify/install
     /// orchestration, persisted update policy, and the pinned trust root
     /// for manifest signature verification.
+    #[cfg(feature = "process-model")]
     pub update_manager: Arc<crate::update::manager::UpdateManager>,
     /// Incremented for the duration of
     /// every sync-critical write this daemon performs — the initial
@@ -705,7 +717,10 @@ impl DaemonState {
     /// Shared by both `PendingLocalChangeFlush` methods below: resolves
     /// `group_id` to its live `LinkRuntime`, if this device is actively
     /// linked (and watching) that group at all.
-    fn link_runtime_for(&self, group_id: &str) -> Option<Arc<crate::link_runtime::LinkRuntime>> {
+    pub(crate) fn link_runtime_for(
+        &self,
+        group_id: &str,
+    ) -> Option<Arc<crate::link_runtime::LinkRuntime>> {
         let local_path = match self.replica_coordinator.link_repository().list_links() {
             Ok(links) => links
                 .into_iter()
@@ -880,7 +895,42 @@ impl DaemonState {
         replica_coordinator: Arc<crate::replica_coordinator::ReplicaCoordinator>,
         block_store: Arc<dyn BlockStore + Send + Sync>,
     ) -> Arc<Self> {
-        let state = Self::build(device_id, replica_coordinator, block_store);
+        Self::new_in(
+            crate::device_config::config_dir(),
+            device_id,
+            replica_coordinator,
+            block_store,
+        )
+    }
+
+    /// The tuning this engine was built with (it lives on the replica coordinator, which every
+    /// layer of the engine reaches).
+    #[must_use]
+    pub fn tuning(&self) -> &crate::engine_tuning::EngineTuning {
+        self.replica_coordinator.tuning()
+    }
+
+    /// The semaphore bounding this engine's concurrent receive file assemblies.
+    pub(crate) fn receive_write_gate(&self) -> Arc<tokio::sync::Semaphore> {
+        self.replica_coordinator.receive_write_gate()
+    }
+
+    /// The state directory this state was built over.
+    #[must_use]
+    pub fn config_dir(&self) -> &std::path::Path {
+        &self.config_dir
+    }
+
+    /// [`Self::new`] over an explicit state directory, which holds this state's governance
+    /// config and update state. A test that sets or reads those gives each state its own
+    /// directory, so no other test sees them through the process-wide `YADORILINK_CONFIG_DIR`.
+    pub(crate) fn new_in(
+        config_dir: std::path::PathBuf,
+        device_id: String,
+        replica_coordinator: Arc<crate::replica_coordinator::ReplicaCoordinator>,
+        block_store: Arc<dyn BlockStore + Send + Sync>,
+    ) -> Arc<Self> {
+        let state = Self::build_in(config_dir, device_id, replica_coordinator, block_store);
         #[cfg(any(test, feature = "test-support"))]
         {
             let ((), tasks) = crate::supervise::collect_spawned_tasks(|| {
@@ -909,15 +959,33 @@ impl DaemonState {
                   literal across helpers or hand out a partially-wired state before \
                   its providers are set."
     )]
+    #[cfg(test)]
     pub(crate) fn build(
         device_id: String,
         replica_coordinator: Arc<crate::replica_coordinator::ReplicaCoordinator>,
         block_store: Arc<dyn BlockStore + Send + Sync>,
     ) -> Arc<Self> {
+        Self::build_in(
+            crate::device_config::config_dir(),
+            device_id,
+            replica_coordinator,
+            block_store,
+        )
+    }
+
+    #[allow(clippy::too_many_lines, reason = "see `build`")]
+    pub(crate) fn build_in(
+        config_dir: std::path::PathBuf,
+        device_id: String,
+        replica_coordinator: Arc<crate::replica_coordinator::ReplicaCoordinator>,
+        block_store: Arc<dyn BlockStore + Send + Sync>,
+    ) -> Arc<Self> {
+        #[cfg(feature = "process-model")]
+        let tuning = replica_coordinator.tuning().clone();
         let (status_push_tx, _) = broadcast::channel(256);
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let local_device_id = device_id.clone();
-        let governance_config = GovernanceConfigStore::new(crate::device_config::config_dir());
+        let governance_config = GovernanceConfigStore::new(&config_dir);
         // Apply whatever's on disk
         // (or the safe unlimited/no-override default if nothing's ever
         // been written) right away, so a freshly-started daemon's very
@@ -1015,10 +1083,15 @@ impl DaemonState {
             in_flight_broadcasts: AtomicI64::new(0),
             shutdown_tx,
             safe_stop_committed: tokio::sync::Mutex::new(false),
-            reporting: Arc::new(ReportingStorage::open_default()),
+            restart_on_exit: std::sync::atomic::AtomicBool::new(false),
+            reporting: Arc::new(ReportingStorage::open(crate::reporting::reporting_dir_in(
+                &config_dir,
+            ))),
             governance_config: Arc::new(governance_config),
+            config_dir: config_dir.clone(),
             rate_limiters,
             disk_headroom_enforcement_enabled: std::sync::atomic::AtomicBool::new(false),
+            degraded_volume_probes: Mutex::new(HashMap::new()),
             #[cfg(any(test, feature = "test-support"))]
             link_preflight_headroom_override: Mutex::new(None),
             durability: Arc::new(crate::durability_service::DurabilityService::new(
@@ -1030,9 +1103,11 @@ impl DaemonState {
                 unknown_scope_membership_marker,
             )),
             pending_enrollment_transient_attempts: Mutex::new(HashMap::new()),
+            #[cfg(feature = "process-model")]
             update_manager: Arc::new(crate::update::manager::UpdateManager::new(
-                crate::device_config::config_dir(),
+                config_dir.clone(),
                 current_crate_version(),
+                &tuning,
             )),
             active_write_ops: AtomicI64::new(0),
             started_at: std::time::Instant::now(),
@@ -1148,16 +1223,54 @@ impl DaemonState {
         self.send_service.get().cloned()
     }
 
-    /// Marks `local_path` Degraded
-    /// (disk-pressure), scheduling its next re-check via
-    /// `BackoffConfig::DEGRADED_LINK_RECHECK` — a link already degraded has
+    /// Marks `local_path` Degraded for `cause` (`reason` is human detail only), scheduling its
+    /// next re-check via `BackoffConfig::DEGRADED_LINK_RECHECK` — a link already degraded has
     /// its backoff attempt count bumped (spacing repeated pressure further
     /// apart, "not a tight retry loop") rather than reset, and
     /// keeps its original `since_unix` onset time.
-    pub fn mark_link_degraded(&self, local_path: &str, reason: String) {
-        self.links.mark_degraded(local_path, reason, now_unix(), |backoff_attempt| {
+    pub fn mark_link_degraded(
+        &self,
+        local_path: &str,
+        cause: crate::link_registry::DegradedCause,
+        reason: String,
+    ) {
+        self.links.mark_degraded(local_path, reason, cause, now_unix(), |backoff_attempt| {
             supervise::BackoffConfig::DEGRADED_LINK_RECHECK.next(backoff_attempt).as_secs() as i64
         });
+    }
+
+    /// Marks a link as waiting for free disk space, with `detail` as its human text only.
+    pub(crate) fn mark_link_waiting_for_disk_space(&self, local_path: &str, detail: String) {
+        self.mark_link_degraded(
+            local_path,
+            crate::link_registry::DegradedCause::WaitingForDiskSpace,
+            detail,
+        );
+    }
+
+    /// Marks a provider link as waiting for disk space on the volume of `probe_dir`, the place
+    /// its reads are staged. The link's key is not a path, so the re-check measures `probe_dir`.
+    pub(crate) fn mark_link_degraded_on_volume(
+        &self,
+        link_key: &str,
+        probe_dir: &std::path::Path,
+        reason: String,
+    ) {
+        self.degraded_volume_probes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(link_key.to_string(), probe_dir.to_path_buf());
+        self.mark_link_waiting_for_disk_space(link_key, reason);
+    }
+
+    /// The path whose volume is measured to decide whether `link_key` has room again.
+    fn space_probe_path(&self, link_key: &str) -> std::path::PathBuf {
+        self.degraded_volume_probes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(link_key)
+            .cloned()
+            .unwrap_or_else(|| std::path::PathBuf::from(link_key))
     }
 
     /// Terminal OwnershipLost for `local_path`; true on the first transition only.
@@ -1169,6 +1282,7 @@ impl DaemonState {
     /// degraded.
     pub fn clear_link_degraded(&self, local_path: &str) {
         self.links.clear_degraded(local_path);
+        self.degraded_volume_probes.lock().unwrap_or_else(|p| p.into_inner()).remove(local_path);
     }
 
     /// Clears `local_path`'s Degraded state if its volume is no longer Critical. An
@@ -1179,13 +1293,10 @@ impl DaemonState {
         }
         let headroom_override = self.governance_config.load_or_default().headroom_override_bytes;
         match yadorilink_local_storage::free_space::classify_volume(
-            std::path::Path::new(local_path),
+            &self.space_probe_path(local_path),
             headroom_override,
         ) {
-            Ok(space)
-                if space.classify()
-                    != yadorilink_local_storage::free_space::FreeSpaceState::Critical =>
-            {
+            Ok(space) if space.recovered() => {
                 self.clear_link_degraded(local_path);
                 true
             }
@@ -1412,16 +1523,13 @@ impl DaemonState {
             return;
         }
         let headroom_override = self.governance_config.load_or_default().headroom_override_bytes;
-        for (local_path, reason) in due {
+        for (local_path, info) in due {
             let space = yadorilink_local_storage::free_space::classify_volume(
-                std::path::Path::new(&local_path),
+                &self.space_probe_path(&local_path),
                 headroom_override,
             );
             match space {
-                Ok(space)
-                    if space.classify()
-                        != yadorilink_local_storage::free_space::FreeSpaceState::Critical =>
-                {
+                Ok(space) if space.recovered() => {
                     tracing::info!(local_path = %local_path, "disk-pressure re-check succeeded; clearing Degraded state");
                     self.clear_link_degraded(&local_path);
                 }
@@ -1430,7 +1538,7 @@ impl DaemonState {
                     // with a bumped backoff rather than leaving a stale
                     // `next_recheck_unix` in the past (which would make
                     // this a hot loop at the 2s poll interval).
-                    self.mark_link_degraded(&local_path, reason);
+                    self.mark_link_degraded(&local_path, info.cause, info.reason);
                 }
             }
         }
@@ -1457,7 +1565,7 @@ impl DaemonState {
     }
 
     /// The headroom reserve the link preflight measures free space against: the default
-    /// `max(1 GiB, 5%)` unless a test pinned it.
+    /// the default headroom unless a test pinned it.
     pub(crate) fn link_preflight_headroom_override(&self) -> Option<u64> {
         #[cfg(any(test, feature = "test-support"))]
         {
@@ -1558,6 +1666,12 @@ impl DaemonState {
     /// reach ordinary netmap-authorized peer state.
     pub fn record_send_grant_peer(&self, peer: SendGrantPeer) {
         let mut guard = self.send_grant_peers.lock().unwrap_or_else(|p| p.into_inner());
+        // Checked under the grant lock, so it cannot interleave with `apply_supersessions`'
+        // cleanup of this device's grants.
+        if self.authority.superseded_by(&peer.device_id).is_some() {
+            tracing::warn!(peer = %peer.device_id, "refusing a send grant from a replaced device");
+            return;
+        }
         Self::prune_expired_send_grant_peers(&mut guard);
         guard.retain(|p| p.signing_key != peer.signing_key);
         guard.push(peer);
@@ -1583,6 +1697,35 @@ impl DaemonState {
         let mut guard = self.send_grant_peers.lock().unwrap_or_else(|p| p.into_inner());
         Self::prune_expired_send_grant_peers(&mut guard);
         guard.iter().find(|p| p.device_id == device_id).cloned()
+    }
+
+    /// Installs the account's list of replaced devices (`GET /devices/supersessions`, the
+    /// replacement record the coordination service keeps) and fails closed on it: every device
+    /// newly named is torn down like a device the netmap dropped, its Track Send grants are
+    /// forgotten, and `PeerAuthorityState` refuses to admit it again whatever a later netmap or
+    /// snapshot says. The typed reason is [`PeerAuthorityState::superseded_by`], which status
+    /// reports as `UNREACHABLE_CATEGORY_DEVICE_REPLACED`.
+    pub fn apply_supersessions(self: &Arc<Self>, listed: HashMap<String, String>) {
+        let newly = self.authority.replace_superseded(listed);
+        for device_id in newly {
+            tracing::warn!(peer = %device_id, "device was replaced by another device; refusing it");
+            // Keys known only through a Track Send grant, taken before the grants go: the
+            // connections they opened are closed too.
+            let grant_keys: Vec<[u8; 32]> = {
+                let mut grants = self.send_grant_peers.lock().unwrap_or_else(|p| p.into_inner());
+                let keys = grants
+                    .iter()
+                    .filter(|p| p.device_id == device_id)
+                    .map(|p| p.signing_key)
+                    .collect();
+                grants.retain(|p| p.device_id != device_id);
+                keys
+            };
+            crate::peer_orchestrator::teardown_peer(self, &device_id);
+            for key in grant_keys {
+                self.peer_connectivity.revoke_device(&device_id, Some(key));
+            }
+        }
     }
 
     /// Applies one peer's netmap entry as an authoritative snapshot. Every

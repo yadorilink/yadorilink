@@ -507,7 +507,9 @@ message MaterializeToTempRequest {
   // Set: only the bytes [range_offset, range_offset + range_length) of that exact version are
   // wanted, and `requested_version_hash` must be set too. The daemon fetches and verifies only the
   // blocks covering the window and answers with a handoff file holding exactly those bytes (the
-  // end clamped to the file size). A ranged answer never makes the item present: the OS holds a
+  // end clamped to the file size). A window longer than 256 MiB after clamping is refused with
+  // MATERIALIZE_FAILURE_RANGE_NOT_SATISFIABLE before anything is fetched: the caller asks for
+  // the whole file instead. A ranged answer never makes the item present: the OS holds a
   // window, not the file. A daemon that predates this field ignores it and answers with the whole
   // file and `ranged` unset, which a caller must treat as the whole file.
   bool ranged = 5;
@@ -587,6 +589,10 @@ message NextProviderDownloadsRequest {
   bytes root_id = 1;
   repeated bytes exclude_item_ids = 2;  // currently outstanding at the app, at most 2
   uint32 max = 3;                       // 2 - outstanding
+  // Chosen by the host, one per query. The answer echoes it so a late answer to an earlier query
+  // is told apart from the current one and dropped. Empty from a host that predates it (answered
+  // with an empty id).
+  bytes request_id = 4;
 }
 
 message ProviderDownload {
@@ -607,6 +613,8 @@ message NextProviderDownloadsResponse {
   repeated ProviderDownload downloads = 1;
   repeated bytes settled_item_ids = 2;  // subset of the exclusions that no longer need a download
   DriverState state = 3;
+  bytes request_id = 4;                 // the query's request_id, echoed (empty when it sent none)
+  bytes root_id = 5;                    // the query's root_id, echoed
 }
 
 // app -> daemon: the OS rejected a download request before any fetch (not a fetch failure).

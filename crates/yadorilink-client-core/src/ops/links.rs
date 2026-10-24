@@ -27,7 +27,14 @@ pub async fn run_link_preflight(
     let absolute = std::fs::canonicalize(local_path)
         .map_err(|_| CoreError::InvalidInput(format!("no such directory: {local_path}")))?;
     let existing_paths = fetch_existing_link_paths().await;
-    let report = link_preflight::run_preflight(&absolute, &existing_paths, None);
+    // The desktop command line knows the user's home directory from its environment.
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let report = link_preflight::run_preflight_at_home(
+        &absolute,
+        &existing_paths,
+        None,
+        home.as_deref().map(std::path::Path::new),
+    );
     Ok((absolute, report))
 }
 

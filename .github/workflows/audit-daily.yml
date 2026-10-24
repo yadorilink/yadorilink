@@ -1,0 +1,45 @@
+name: Audit daily
+
+# The advisory database changes every day, so a commit that audited clean
+# yesterday can fail the release audit today. This runs the same audit as
+# Verify and Release once a day on the default branch and keeps one open issue
+# while it fails, so a new advisory is seen before a release day.
+
+on:
+  schedule:
+    - cron: "41 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-daily
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    uses: ./.github/workflows/audit.yml
+
+  report:
+    needs: audit
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Open or update the audit issue
+        run: |
+          title="Dependency audit failing"
+          body="The daily cargo audit failed: $RUN_URL. Update the affected dependency, or add a reasoned, dated entry to .cargo/audit.toml when no fix exists yet."
+          number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number,title \
+            --jq "map(select(.title == \"$title\")) | .[0].number // empty")"
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi

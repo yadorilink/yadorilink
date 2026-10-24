@@ -151,6 +151,14 @@ fn guidance_points_package_managed_installs_at_their_manager() {
     assert!(manual_update_guidance("apt").contains("apt install --only-upgrade"));
     assert!(manual_update_guidance("winget").contains("winget upgrade"));
     assert!(manual_update_guidance("microsoft_store").contains("Microsoft Store"));
+    assert!(manual_update_guidance("app_store").contains("App Store"));
+}
+
+#[test]
+fn an_app_store_install_is_managed_and_never_offered_a_download() {
+    assert_eq!(InstallSource::AppStore.as_str(), "app_store");
+    assert_eq!(manual_update_page("app_store"), None);
+    assert!(!manual_update_guidance("app_store").contains(DOWNLOAD_PAGE_URL));
 }
 
 #[test]
@@ -162,7 +170,7 @@ fn guidance_for_a_standalone_install_is_the_download_page() {
 
 #[test]
 fn the_page_to_open_is_set_only_for_installs_nobody_else_manages() {
-    for managed in ["homebrew", "apt", "winget", "microsoft_store"] {
+    for managed in ["homebrew", "apt", "winget", "microsoft_store", "app_store"] {
         assert_eq!(manual_update_page(managed), None, "{managed}");
     }
     for own in ["standalone", "unknown", ""] {

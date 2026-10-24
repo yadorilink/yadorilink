@@ -138,10 +138,18 @@ impl LoginSession {
         self.inner.next_event().await
     }
 
-    /// Idempotent. Stops the flow; nothing is stored after this.
+    /// Idempotent. Stops the flow; nothing is stored once this has returned (it waits for the
+    /// poll of the flow in flight: its synchronous work, no network wait, but unbounded while a
+    /// macOS keychain prompt is open). A flow that had already finished before the cancel ends
+    /// with its own event: `SignedIn` (credential stored) or `Failed`.
     pub fn cancel(&self) {
         let inner = self.inner.clone();
-        guarded(|| (), move || inner.cancel());
+        guarded(
+            || (),
+            move || {
+                inner.cancel();
+            },
+        );
     }
 }
 

@@ -1,3 +1,4 @@
+// apple-cfg-file: macos-only mirrors WATCH_BACKEND
 #![cfg(test)]
 
 use super::*;
@@ -226,6 +227,9 @@ async fn watch_folder_with_capacity_accepts_a_custom_capacity() {
     assert_eq!(event.kind, FsChangeKind::CreatedOrModified);
 }
 
+// apple-cfg: ios-explicit the iOS host never runs the file watcher, and the simulator's kqueue
+// backend does not deliver this test's event in time
+#[cfg_attr(target_os = "ios", ignore = "the file watcher is not used on iOS")]
 #[tokio::test]
 async fn ignore_aware_watcher_skips_ignored_directory_and_leaf_file_events() {
     let dir = tempfile::tempdir().unwrap();

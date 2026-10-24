@@ -105,10 +105,11 @@ impl LinkLifecycleService {
             .into_iter()
             .map(|(path, _group)| path)
             .collect();
-        let report = yadorilink_local_storage::link_preflight::run_preflight(
+        let report = yadorilink_local_storage::link_preflight::run_preflight_at_home(
             &resolved,
             &existing,
             self.repository.preflight_headroom_override_bytes(),
+            self.repository.preflight_home_dir().as_deref(),
         );
         Ok((resolved, report))
     }
@@ -173,12 +174,9 @@ impl LinkLifecycleService {
     /// A provider-backed link: no directory, so no topology, recovery-area or watcher step. The link
     /// row, the declared root and the enrollment marker commit in one transaction; the only fallible
     /// step after it is advancing the journal row, which has nothing to undo but the commit itself.
+    /// An invite acceptance has no journal row or marker (see `accept_invite_and_link`): its link
+    /// row and declared root commit in one transaction and nothing more is advanced.
     fn link_provider(&self, command: LinkCommand) -> Result<LinkOutcome, DaemonError> {
-        let Some(marker) = &command.pending_enrollment else {
-            return Err(DaemonError::Config(
-                "a provider folder is only created through a journaled enrollment".to_string(),
-            ));
-        };
         let live = self.repository.live_link_keys_for_group(&command.group_id)?;
         if live.iter().any(|key| key != &command.local_path) {
             return Err(DaemonError::Config(format!(
@@ -189,6 +187,17 @@ impl LinkLifecycleService {
         if live.iter().any(|key| key == &command.local_path) {
             return Ok(LinkOutcome::AlreadyLinked);
         }
+        let Some(marker) = &command.pending_enrollment else {
+            let Some(provider) = command.provider.as_ref() else {
+                return Err(DaemonError::Config("a provider link names its provider".to_string()));
+            };
+            self.repository.commit_provider_link_plain(
+                &command.local_path,
+                &command.group_id,
+                provider,
+            )?;
+            return Ok(LinkOutcome::Linked);
+        };
         self.repository.commit_link_with_pending_enrollment(
             &command.local_path,
             &command.group_id,
@@ -287,9 +296,11 @@ impl LinkLifecycleService {
         // The recovery area of a rebootstrap and the store of the versions it set aside hold
         // the user's own files outside every synced folder; a folder around either, or
         // inside it, would have the sync read them back as new files.
-        for kept in
-            [crate::device_config::recovery_root(), crate::device_config::recovery_items_root()]
-        {
+        let state_dir = self.repository.state_dir();
+        for kept in [
+            crate::device_config::recovery_root(&state_dir),
+            crate::device_config::recovery_items_root(&state_dir),
+        ] {
             if crate::device_config::link_overlaps_recovery_area(
                 std::path::Path::new(&command.local_path),
                 &kept,

@@ -35,7 +35,7 @@ iroh-relay = { version = "1.1", optional = true }
 # Same-LAN address lookup for iroh endpoints (mDNS). Resolves addresses only;
 # who a discovered endpoint is and whether it may be dialled stays with the
 # admission policy -- see `lan`.
-iroh-mdns-address-lookup = "0.5"
+iroh-mdns-address-lookup = "0.6"
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -50,5 +50,5 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "te
 yadorilink-sync-substrate = { path = ".", features = ["test-support"] }
 # NAS management tests prove a WebSocket upgrade and its frames pass through
 # a management stream untouched. Both already in the lock.
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }

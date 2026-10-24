@@ -269,3 +269,143 @@ async fn a_flapping_link_loses_nothing_across_repeated_reconnects() {
     }
     expected.settle(&a, &b).await;
 }
+
+/// Deterministic multi-block bytes, different for every `seed`.
+fn large_bytes(seed: u8) -> Vec<u8> {
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64 ^ u64::from(seed);
+    (0..5 * 1024 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+/// Sets a file's modified time to `secs` seconds from the Unix epoch, as a
+/// clock that stepped while the machine slept would have stamped it.
+fn stamp(node: &TopologyNode, relative: &str, secs: u64) {
+    let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+    let file = std::fs::File::options().write(true).open(node.root.path().join(relative)).unwrap();
+    file.set_times(std::fs::FileTimes::new().set_modified(when)).unwrap();
+}
+
+/// Large files are written and the link is cut right after the first device
+/// published them, so the peer is at most part way through fetching. Both
+/// sides then edit the same large file and the link returns: nothing is lost,
+/// whichever point the fetch had reached when the link dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_cut_during_a_large_transfer_with_both_sides_editing_recovers() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
+    setup();
+    let (a, b) = two_with_base("sw-large").await;
+    let mut expected = Expected::from_base();
+
+    for i in 0..3u8 {
+        expected.put(&a, &format!("big/a-{i}.bin"), large_bytes(i));
+    }
+    expected.put(&a, "big/shared.bin", large_bytes(10));
+    captured(&a, GROUP).await;
+    partition(&a, &b).await;
+
+    expected.put(&b, "big/b-only.bin", large_bytes(11));
+    // Whichever version of the shared file b held when the link dropped, both
+    // sides now replace it with different content.
+    // The replacements differ in length from the original and from each other,
+    // so the capture check (which compares sizes) cannot pass before the
+    // watcher has seen each edit.
+    let (mut a_edit, mut b_edit) = (large_bytes(20), large_bytes(21));
+    a_edit.extend_from_slice(b"a tail\n");
+    b_edit.extend_from_slice(b"b longer tail\n");
+    write(&a, "big/shared.bin", &a_edit);
+    write(&b, "big/shared.bin", &b_edit);
+    expected.exact.remove("big/shared.bin");
+    // b may never have received the shared file; then there is no contention
+    // and a's edit simply wins. Accept either end state below.
+    captured(&a, GROUP).await;
+    captured(&b, GROUP).await;
+    pair(&a, &b, GROUP).await;
+
+    let tree = converge_where(&[&a, &b], "the large files cross and settle", |tree| {
+        expected.exact.iter().all(|(p, bytes)| tree.get(p) == Some(bytes))
+            && tree.contains_key("big/shared.bin")
+    })
+    .await;
+    let kept = &tree["big/shared.bin"];
+    let shared_copies: Vec<String> =
+        conflict_copies(&tree).into_iter().filter(|c| c.starts_with("big/shared")).collect();
+    // Every edit survives, at the path or in a conflicted copy.
+    for edit in [&a_edit, &b_edit] {
+        assert!(
+            kept == edit || shared_copies.iter().any(|c| &tree[c] == edit),
+            "an edit of the shared file was lost: {shared_copies:?}"
+        );
+    }
+}
+
+/// The clock stepped back while the machine slept: the edit made after waking
+/// is stamped older than the file it replaces. It still reaches the peer, and
+/// two such edits of one path both survive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn edits_stamped_by_a_clock_that_stepped_back_still_propagate() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
+    setup();
+    let (a, b) = two_with_base("sw-clock-back").await;
+    let mut expected = Expected::from_base();
+
+    partition(&a, &b).await;
+    // A year before the base files were written.
+    let long_ago = 1_000_000_000;
+    for i in 0..5 {
+        let name = base_name(i);
+        expected.put(&a, &name, format!("a after clock step {i}\n").into_bytes());
+        stamp(&a, &name, long_ago);
+    }
+    expected.put(&b, &base_name(5), b"b untouched clock\n".to_vec());
+    expected.contend(&a, &b, &base_name(6), b"a stamped old\n", b"b stamped now\n");
+    stamp(&a, &base_name(6), long_ago);
+    captured(&a, GROUP).await;
+    captured(&b, GROUP).await;
+    pair(&a, &b, GROUP).await;
+
+    expected.settle(&a, &b).await;
+}
+
+/// The same, with the clock stepped far forward: edits stamped in the distant
+/// future do not outrank later real edits, and nothing is dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn edits_stamped_by_a_clock_that_stepped_far_forward_lose_nothing() {
+    if !yadorilink_daemon::test_support::windows_durability_gate_allows_tests(
+        "the winner replacing the loser's original",
+    ) {
+        return;
+    }
+    setup();
+    let (a, b) = two_with_base("sw-clock-fwd").await;
+    let mut expected = Expected::from_base();
+
+    partition(&a, &b).await;
+    let far_future = 4_000_000_000;
+    for i in 0..5 {
+        let name = base_name(i);
+        expected.put(&a, &name, format!("a future stamp {i}\n").into_bytes());
+        stamp(&a, &name, far_future);
+    }
+    expected.contend(&a, &b, &base_name(6), b"a stamped future\n", b"b stamped now\n");
+    stamp(&a, &base_name(6), far_future);
+    expected.put(&b, &base_name(7), b"b edit\n".to_vec());
+    captured(&a, GROUP).await;
+    captured(&b, GROUP).await;
+    pair(&a, &b, GROUP).await;
+
+    expected.settle(&a, &b).await;
+}

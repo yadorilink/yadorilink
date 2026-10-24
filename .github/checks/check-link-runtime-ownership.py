@@ -64,6 +64,7 @@ ALLOWED_CONTROLLER_CALLERS = {
     "mod.rs",  # adapters/mod.rs -- the composition point for every adapter
     "maintenance_coordinator.rs",
     "app.rs",
+    "engine_startup.rs",  # the startup phases `app.rs` and the embedded host share
 }
 
 CFG_TEST_ATTR = re.compile(r"#\[cfg\(\s*test\s*\)\]")

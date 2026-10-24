@@ -328,9 +328,23 @@ impl Fx {
     /// The daemon's evidence that the OS holds `item` at its current version: a verified handoff
     /// and a host report, taken after it, that lists the item.
     pub(crate) fn os_holds(&self, item: ItemId) {
+        self.os_lists_after(item, false);
+    }
+
+    /// The evidence that the OS was served only windows of `item`'s current version and lists it
+    /// afterwards (a large file read through the OS partial-content API).
+    pub(crate) fn os_holds_windows(&self, item: ItemId) {
+        self.os_lists_after(item, true);
+    }
+
+    fn os_lists_after(&self, item: ItemId, windows_only: bool) {
         let repo = self.state.replica_coordinator.provider_repository();
         let version = repo.current_version_hash(&self.root, &item).unwrap().unwrap();
-        let seq = repo.record_handoff(&self.root, &item, version).unwrap().unwrap();
+        let seq = if windows_only {
+            repo.record_window_serve(&self.root, &item, version).unwrap().unwrap()
+        } else {
+            repo.record_handoff(&self.root, &item, version).unwrap().unwrap()
+        };
         let report = yadorilink_ipc_proto::shellipc::ProviderMaterializedReport {
             root_id: hex::decode(&self.root).unwrap(),
             reporter_epoch: self.epoch.fetch_add(1, Ordering::SeqCst) as u64,

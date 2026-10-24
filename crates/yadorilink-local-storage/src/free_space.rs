@@ -1,10 +1,17 @@
 use std::path::Path;
 
-/// Minimum headroom floor when no explicit override is configured:
-/// `max(1 GiB, 5% of the hosting volume)`.
-pub const DEFAULT_MIN_HEADROOM_BYTES: u64 = 1024 * 1024 * 1024;
-/// The percentage half of the same default formula.
-pub const DEFAULT_HEADROOM_PERCENT: f64 = 0.05;
+/// Absolute floor of the default headroom: what the OS, other apps and the sync database
+/// (SQLite needs room to commit and to grow its WAL) keep, whatever the volume.
+pub const DEFAULT_MIN_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
+/// Absolute cap of the default headroom, so a big disk never reserves tens of GiB.
+pub const DEFAULT_MAX_HEADROOM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// The default headroom between floor and cap: one hundredth of the volume.
+pub const DEFAULT_HEADROOM_DIVISOR: u64 = 100;
+/// The floor never exceeds this fraction (1/n) of a volume, so a tiny volume can still receive.
+pub const MAX_HEADROOM_VOLUME_FRACTION_DIVISOR: u64 = 4;
+/// A volume that refused a write counts as recovered only above its headroom plus
+/// 1/n of it (hysteresis): free space hovering at the line does not flip the status.
+pub const RESUME_MARGIN_DIVISOR: u64 = 4;
 
 /// A volume's free-space state relative to its effective headroom.
 /// Ordered from healthiest to worst so a caller that only cares about
@@ -52,6 +59,14 @@ impl VolumeFreeSpace {
         }
     }
 
+    /// Has the volume regained enough room to leave the waiting state it entered by
+    /// refusing a write? Strictly above the headroom plus a resume margin, so the
+    /// status does not flap while free space hovers at the admission line.
+    pub fn recovered(&self) -> bool {
+        self.available_bytes
+            > self.headroom_bytes.saturating_add(self.headroom_bytes / RESUME_MARGIN_DIVISOR)
+    }
+
     /// Would writing `additional_bytes` more bring available space to at or
     /// below the configured headroom? (The preflight predicate —
     /// deliberately the same `<=` boundary `classify`'s `Critical` uses, so
@@ -62,11 +77,15 @@ impl VolumeFreeSpace {
 }
 
 /// The effective headroom for a volume of `total_bytes`: the explicit
-/// `configured_override` if set, else `max(1 GiB, 5%)` of the volume.
+/// `configured_override` if set, else 1% of the volume clamped to
+/// [256 MiB, 2 GiB], and never above a quarter of the volume. This is the margin kept
+/// free on top of the bytes already in flight on the volume (see the admission
+/// ledger), which callers add through `would_breach`.
 pub fn effective_headroom_bytes(total_bytes: u64, configured_override: Option<u64>) -> u64 {
     configured_override.unwrap_or_else(|| {
-        let percent = (total_bytes as f64 * DEFAULT_HEADROOM_PERCENT) as u64;
-        percent.max(DEFAULT_MIN_HEADROOM_BYTES)
+        (total_bytes / DEFAULT_HEADROOM_DIVISOR)
+            .clamp(DEFAULT_MIN_HEADROOM_BYTES, DEFAULT_MAX_HEADROOM_BYTES)
+            .min(total_bytes / MAX_HEADROOM_VOLUME_FRACTION_DIVISOR)
     })
 }
 

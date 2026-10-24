@@ -118,7 +118,7 @@ fn observe(handle: HANDLE) -> std::io::Result<Observed> {
         },
         attributes: basic.FileAttributes,
         links: standard.NumberOfLinks,
-        delete_pending: standard.DeletePending != 0,
+        delete_pending: standard.DeletePending,
     })
 }
 

@@ -6,6 +6,7 @@ Run: python3 .github/release/test_channel_ledger.py
 import copy
 import importlib.util
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -101,6 +102,30 @@ class Assemble(unittest.TestCase):
         self.assertTrue(all(r["artifact_url"].startswith(cl.DL_PREFIX) for r in body["releases"]))
         self.assertEqual(body["generated_at"], AT)
         self.assertNotIn("withdrawn_versions", body)
+        self.assertEqual(body["expires_at"], "2026-12-18T00:00:00Z")
+        self.assertEqual(body["expires_at"], cl.expires_at_for(AT))
+
+    def test_every_entry_declares_the_engines_state_version(self):
+        recs = records("0.4.2")
+        recs["0.4.2"]["state_schema"] = "132"
+        body = json.loads(run(ledger(), recs)["manifest_body"])
+        self.assertTrue(body["releases"])
+        for r in body["releases"]:
+            self.assertEqual((r["state_schema_version"], r["state_schema_min_readable"]), (132, 132))
+
+    def test_only_the_app_bundle_entry_carries_the_sparkle_build_as_an_integer(self):
+        body = json.loads(run(ledger(), records("0.4.2"))["manifest_body"])
+        for r in body["releases"]:
+            if r["install_source"] == "app_bundle":
+                self.assertEqual(r["sparkle_build"], 42)
+            else:
+                self.assertNotIn("sparkle_build", r)
+
+    def test_a_record_without_a_usable_state_version_is_refused_not_published_undeclared(self):
+        for bad in ("", "abc", "0", "-1", "1.5"):
+            recs = records("0.4.2")
+            recs["0.4.2"]["state_schema"] = bad
+            self.assertTrue(problems_of(ledger(), recs), bad)
 
     def test_byte_stable_for_a_fixed_generated_at(self):
         a = run(ledger(), records("0.4.2"))
@@ -117,6 +142,12 @@ class Assemble(unittest.TestCase):
     def test_generated_at_must_be_explicit_and_well_formed(self):
         has(self, _err(lambda: cl.assemble(ledger(), records("0.4.2"), CHAIN, "yesterday", floor=FLOOR)),
             "generated_at")
+
+    def test_expiry_is_sixty_days_after_generation_across_month_and_year_ends(self):
+        self.assertEqual(cl.VALIDITY_DAYS, 60)
+        self.assertEqual(cl.expires_at_for("2026-12-31T23:59:59Z"), "2027-03-01T23:59:59Z")
+        self.assertEqual(cl.expires_at_for("2028-01-01T00:00:00Z"), "2028-03-01T00:00:00Z")
+        self.assertRaises(cl.LedgerError, cl.expires_at_for, "yesterday")
 
     def test_trust_chain_must_be_a_json_array(self):
         has(self, _err(lambda: cl.assemble(ledger(), records("0.4.2"), "{}", AT, floor=FLOOR)),
@@ -135,7 +166,7 @@ def _err(fn):
 
 class LedgerRules(unittest.TestCase):
     def test_channel_allowlist(self):
-        has(self, problems_of(ledger(channel="stable"), records("0.4.2")), "is not one of")
+        has(self, problems_of(ledger(channel="gamma"), records("0.4.2")), "is not one of")
 
     def test_ledger_file_name_must_match_channel(self):
         has(self, problems_of(ledger(), records("0.4.2"), ledger_stem="nightly"), "does not match its file name")
@@ -324,6 +355,24 @@ class RecordRules(unittest.TestCase):
     def test_app_bundle_is_macos_and_store_is_windows(self):
         self.bad(lambda r: r["app_bundle"].update({"linux-x86_64": r["app_bundle"]["macos-aarch64"]}), "must be macos")
 
+    def test_the_ios_engine_target_is_script_only(self):
+        def with_ios(r):
+            r["script"]["ios-aarch64"] = {**r["script"]["linux-x86_64"], "asset": "yadorilink-engine-dev-ios-aarch64.zip"}
+        rec = record("0.4.2")
+        with_ios(rec)
+        self.assertEqual(problems_of(ledger(), {"0.4.2": rec}), [])
+        self.bad(lambda r: r["app_bundle"].update({"ios-aarch64": r["app_bundle"]["macos-aarch64"]}), "must be macos")
+        self.bad(lambda r: r["microsoft_store"].update({"ios-aarch64": r["microsoft_store"]["windows-x86_64"]}), "must be windows")
+
+    def test_the_ios_engine_target_is_served_in_the_manifest_for_script_only(self):
+        rec = record("0.4.2")
+        rec["script"]["ios-aarch64"] = {**rec["script"]["linux-x86_64"], "asset": "yadorilink-engine-dev-ios-aarch64.zip"}
+        entries = cl.build_entries(ledger({"script": "0.4.2"}), {"0.4.2": rec})
+        ios = [e for e in entries if e["platform"] == "ios"]
+        self.assertEqual([(e["arch"], e["install_source"]) for e in ios], [("aarch64", "script")])
+        self.assertEqual(ios[0]["artifact_url"], "https://yadori.link/dl/0.4.2/yadorilink-engine-dev-ios-aarch64.zip")
+        self.assertEqual(cl.check_unique_and_urls(entries), [])
+
     def test_file_name_must_match_version(self):
         has(self, problems_of(ledger(), {"0.4.2": record("0.4.3")}), "does not match its file name")
 
@@ -388,6 +437,11 @@ class AppcastGate(unittest.TestCase):
         ap["items"][0]["sha256"] = "0" * 64
         has(self, cl.check_appcast_covered(ap, self.manifest), "do not match")
 
+    def test_item_whose_build_differs(self):
+        ap = copy.deepcopy(self.plan["appcast"])
+        ap["items"][0]["sparkle_build"] = "43"
+        has(self, cl.check_appcast_covered(ap, self.manifest), "build")
+
     def test_kill_switched_entry_generates_no_item(self):
         led = ledger()
         led["entries"]["app_bundle"]["kill_switch"] = True
@@ -418,13 +472,13 @@ class RecordImmutability(unittest.TestCase):
         root = Path(tempfile.mkdtemp())
         rel = root / ".github" / "channels" / "releases"
         rel.mkdir(parents=True)
-        (rel / ".gitkeep").write_text("")
-        (rel / "0.4.1.json").write_text("{}")
+        (rel / ".gitkeep").write_text("", encoding="utf-8")
+        (rel / "0.4.1.json").write_text("{}", encoding="utf-8")
         for cmd in (["init", "-q"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x"]):
             subprocess.run(["git", "-C", str(root), *cmd], check=True)
         args = ["check-records-immutable", "--base-ref", "HEAD", "--repo-root", str(root)]
         self.assertEqual(gum.main(args), 0)
-        (rel / "0.4.1.json").write_text("{ }")
+        (rel / "0.4.1.json").write_text("{ }", encoding="utf-8")
         self.assertEqual(gum.main(args), 5)
 
     def test_edit_and_delete_are_refused_addition_is_fine(self):
@@ -438,18 +492,18 @@ class Cli(unittest.TestCase):
     def tree(self, led, recs):
         root = Path(tempfile.mkdtemp())
         (root / "releases").mkdir()
-        (root / "beta.json").write_text(json.dumps(led))
+        (root / "beta.json").write_text(json.dumps(led), encoding="utf-8")
         for v, r in recs.items():
-            (root / "releases" / f"{v}.json").write_text(json.dumps(r))
-        (root / "chain.json").write_text(CHAIN)
+            (root / "releases" / f"{v}.json").write_text(json.dumps(r), encoding="utf-8")
+        (root / "chain.json").write_text(CHAIN, encoding="utf-8")
         cut = gum._cutover_guard()
         values = {"PROTOCOL_VERSION": 4, "RPC_VERSION": 2, "CONTROL_PROTOCOL_VERSION": 1, "SCHEMA_VERSION": 1}
         for name, rel in cut.GATES.items():
             (root / rel).parent.mkdir(parents=True, exist_ok=True)
-            (root / rel).write_text(f"pub const {name}: u32 = {values[name]};\n")
+            (root / rel).write_text(f"pub const {name}: u32 = {values[name]};\n", encoding="utf-8")
         (root / "docs").mkdir(exist_ok=True)
         (root / "docs/CUTOVER.md").write_text(
-            "- Generation PROTOCOL_VERSION = 4, RPC_VERSION = 2: first release 0.3.0\n")
+            "- Generation PROTOCOL_VERSION = 4, RPC_VERSION = 2: first release 0.3.0\n", encoding="utf-8")
         return root
 
     def run_cli(self, root, extra=()):
@@ -480,19 +534,19 @@ class Cli(unittest.TestCase):
         arts = root / "a.json"
         arts.write_text(json.dumps([{"platform": "macos", "arch": "aarch64", "install_source": "standalone",
                                      "artifact_url": "https://example.invalid/a.pkg",
-                                     "artifact_sha256": "0" * 64, "artifact_size": 1}]))
+                                     "artifact_sha256": "0" * 64, "artifact_size": 1}]), encoding="utf-8")
         out = root / "m.json"
         self.assertEqual(gum.main(["generate", "--channel", "beta", "--version", "0.3.0", "--min-version",
                                    "0.3.0", "--artifacts", str(arts), "--out", str(out),
                                    "--repo-root", str(root), "--generated-at", AT]), 0)
-        self.assertEqual(out.read_text(), cl.render_body(json.loads(out.read_text())))
+        self.assertEqual(out.read_text(encoding="utf-8"), cl.render_body(json.loads(out.read_text(encoding="utf-8"))))
 
 
 class SchemasMatchValidator(unittest.TestCase):
     """The JSON schemas are documentation; keep their field sets equal to the validator's."""
 
     def schema(self, name):
-        return json.loads((HERE / "channel-schema" / name).read_text())
+        return json.loads((HERE / "channel-schema" / name).read_text(encoding="utf-8"))
 
     def test_ledger_schema(self):
         s = self.schema("ledger.schema.json")
@@ -507,6 +561,270 @@ class SchemasMatchValidator(unittest.TestCase):
             t = s["properties"][source]["additionalProperties"]
             self.assertEqual(set(t["properties"]) - cl.OPTIONAL_TARGET_FIELDS, fields)
             self.assertEqual(set(t["required"]), fields)
+
+
+class StrictIdentifiers(unittest.TestCase):
+    """Identifiers become file names, URLs and upload keys, so `$` (which accepts a trailing
+    newline) must never be the end anchor of a validator."""
+
+    GOOD = {"SHA256_RE": "a" * 64, "COMMIT_RE": "b" * 40, "TARGET_RE": "macos-aarch64", "FILE_RE": "a.dmg",
+            "SEMVER_RE": "1.2.3-rc.1", "STATE_SCHEMA_RE": "12", "GENERATED_AT_RE": AT}
+
+    def test_compiled_validators_reject_a_trailing_newline_and_non_ascii_digits(self):
+        for name, good in self.GOOD.items():
+            rx = getattr(cl, name)
+            self.assertTrue(rx.fullmatch(good), name)
+            self.assertIsNone(rx.fullmatch(good + "\n"), name)
+        self.assertIsNone(cl.GENERATED_AT_RE.fullmatch("\u0662\u0660\u0662\u0666" + AT[4:]))
+        self.assertIsNone(cl.SEMVER_RE.fullmatch("\u0661.2.3"))
+
+    def test_a_record_filename_or_hash_with_a_trailing_newline_is_refused(self):
+        rec = record("0.4.2")
+        rec["app_bundle"]["macos-aarch64"]["file"] += "\n"
+        has(self, cl.validate_record(rec, "0.4.2"), "file")
+        rec = record("0.4.2")
+        rec["script"]["linux-x86_64"]["asset"] += "\n"
+        has(self, cl.validate_record(rec, "0.4.2"), "asset")
+        rec = record("0.4.2")
+        rec["script"]["linux-x86_64"]["attestation_digest"] += "\n"
+        has(self, cl.validate_record(rec, "0.4.2"), "attestation_digest")
+        rec = record("0.4.2")
+        rec["public_commit_sha"] += "\n"
+        has(self, cl.validate_record(rec, "0.4.2"), "public_commit_sha")
+
+    def test_the_manifest_validator_refuses_a_trailing_newline(self):
+        self.assertEqual(gum.parse_semver("1.2.3"), gum.parse_semver("v1.2.3"))
+        with self.assertRaises(ValueError):
+            gum.parse_semver("1.2.3\n")
+        with self.assertRaises(ValueError):
+            gum.parse_semver("\u0661.2.3")
+
+    # Genuine non-identifier uses of an anchored inline re.match/re.search (single-line workflow
+    # text parsers where a trailing newline cannot occur), keyed by (file, pattern) with the reason.
+    INLINE_ALLOWED = {
+        ("check-signing-workflow.py", r"^(\s*)(?:- )?run:"): "one workflow line, no newline in it",
+        ("check-signing-workflow.py", r"^\s+(?:[A-Z][A-Z0-9_]*|group"): "one workflow line, prefix test",
+    }
+
+    # Anchored compiled patterns that are deliberately a prefix match / suffix search, with the reason.
+    PATTERN_ALLOWED = {
+        ("channel_ledger.py", "YANK_RE"): "prefix match of a free-text reason (`yank <version>` then anything)",
+        ("generate-update-manifest.py", "GENERATION_LINE"): "prefix match of one CUTOVER.md line (not an identifier)",
+        ("verifier_mirror.py", "TAG_RE"): "search for the tag suffix of a URL, anchored with \\Z",
+    }
+
+    def test_identifier_patterns_are_only_used_with_fullmatch(self):
+        """Sweep (AST): no `.match`/`.search` on a compiled validator (same-module name or another
+        module's attribute such as `cl.TARGET_RE.match`), and no anchored inline `re.match` /
+        `re.search` without re.M. Patterns are written `\\A...\\Z` and used with fullmatch."""
+        import ast
+        root = HERE.parent.parent
+        dirs = [root / ".github/release", root / ".github/staging-signer", root / "scripts" / "release-publish",
+                root / "packaging/install"]
+        files = [p for d in dirs if d.is_dir() for p in sorted(d.glob("*.py")) if not p.name.startswith("test_")]
+        files += [p for p in (root / "scripts" / "dev-engine.py", root / "scripts" / "check-dev-engine-pin.py") if p.exists()]
+        trees = {p: ast.parse(p.read_text(encoding="utf-8")) for p in files}
+        def literal(node):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                return node.value
+            if isinstance(node, ast.JoinedStr):
+                return "".join(v.value if isinstance(v, ast.Constant) else "{}" for v in node.values)
+            return None
+
+        compiled = set()
+        for tree in trees.values():
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+                        and ast.unparse(node.value.func) == "re.compile" and node.value.args):
+                    pat = literal(node.value.args[0])
+                    if pat is not None and pat.startswith(("^", "\\A")) or pat is not None and pat.endswith(("$", "\\Z")):
+                        compiled |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+
+        offenders = []
+        for path, tree in trees.items():
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                        and node.func.attr in ("match", "search")):
+                    continue
+                recv = node.func.value
+                where = f"{path.name}:{node.lineno}"
+                if isinstance(recv, ast.Name) and recv.id == "re":
+                    pat = literal(node.args[0]) if node.args else None
+                    multiline = any("M" in ast.unparse(a) for a in node.args[2:]) or node.keywords
+                    anchored = pat is not None and (pat.startswith(("^", "\\A")) or pat.endswith(("$", "\\Z")))
+                    if anchored and not multiline:
+                        if not any(path.name == f and pat.startswith(p) for f, p in self.INLINE_ALLOWED):
+                            offenders.append(where)
+                else:
+                    name = recv.id if isinstance(recv, ast.Name) else getattr(recv, "attr", None)
+                    if name in compiled and (path.name, name) not in self.PATTERN_ALLOWED:
+                        offenders.append(where)
+        self.maxDiff = None
+        self.assertEqual(offenders, [])
+
+
+class Channels(unittest.TestCase):
+    """One channel definition (channels.json); stable promotes identical beta bytes."""
+
+    def test_channel_list_and_lanes(self):
+        self.assertEqual(cl.CHANNELS, ("nightly", "beta", "stable"))
+        self.assertEqual(cl.CHANNEL_LANE, {"nightly": "dev", "beta": "beta", "stable": "beta"})
+
+    def test_no_tool_keeps_its_own_channel_list(self):
+        root = HERE.parent.parent
+        offenders = []
+        for path in [*(root / ".github").rglob("*.py"), *(root / "scripts").rglob("*.py")]:
+            if re.search(r'\(\s*"nightly"\s*,\s*"beta"', path.read_text(encoding="utf-8")) \
+                    and path.name != Path(__file__).name:
+                offenders.append(str(path.relative_to(root)))
+        self.assertEqual(offenders, [], "read the list from release_channels instead")
+
+    def test_every_tool_uses_the_shared_list(self):
+        import importlib.util
+        import release_channels as rc
+        import sign_request as sr
+        spec = importlib.util.spec_from_file_location("gum_channels", HERE / "generate-update-manifest.py")
+        gum_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gum_mod)
+        mods = [cl, sr, gum_mod]
+        # .github/staging-signer is private-only: the projected public tree does not carry it.
+        staging_path = HERE.parent / "staging-signer" / "sign_request.py"
+        if staging_path.is_file():
+            spec = importlib.util.spec_from_file_location("staging_sr", staging_path)
+            staging = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(staging)
+            mods.append(staging)
+        for mod in mods:
+            self.assertEqual(tuple(mod.CHANNELS), rc.CHANNELS, mod.__name__)
+
+    def assemble_cli(self, tree, channel):
+        from unittest import mock
+        chain = Path(tree) / "chain.json"
+        chain.write_text(CHAIN, encoding="utf-8")
+        with mock.patch.object(gum, "generation_floor", lambda root: FLOOR), \
+                mock.patch("sys.stderr"), mock.patch("sys.stdout"):
+            return gum.main(["assemble", "--ledger", str(Path(tree) / f"{channel}.json"),
+                             "--records-dir", str(Path(tree) / "releases"), "--trust-chain", str(chain),
+                             "--generated-at", AT, "--out-body", str(Path(tree) / "out.json")])
+
+    def ledger_tree(self, with_beta=True):
+        tree = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, tree, ignore_errors=True)
+        (tree / "releases").mkdir()
+        (tree / "releases" / "0.4.2.json").write_text(json.dumps(record("0.4.2", sources=("script",))), encoding="utf-8")
+        (tree / "stable.json").write_text(json.dumps(self.stable()), encoding="utf-8")
+        if with_beta:
+            (tree / "beta.json").write_text(json.dumps(self.beta("0.4.2")), encoding="utf-8")
+        return tree
+
+    def test_assemble_cli_reads_the_promotion_source_itself(self):
+        """The CI dry run passes no --promotion-source-ledger: assemble must find the sibling beta
+        ledger for stable (as the publisher does), and still refuse when it is absent."""
+        self.assertEqual(self.assemble_cli(self.ledger_tree(), "stable"), 0)
+        self.assertEqual(self.assemble_cli(self.ledger_tree(with_beta=False), "stable"), 5)
+
+    def test_workflows_and_cli_list_the_shared_channels(self):
+        """Every channel list in a workflow or the CLI is the shared one, or the shared one without
+        `stable` in a place that keeps stable off until the owner enables it."""
+        import release_channels as rc
+        root = HERE.parent.parent
+        everything = set(rc.CHANNELS)
+        stable_off = everything - {"stable"}
+        # Where stable is intentionally not enabled yet (publish, signing, self-update).
+        owner_switch = {
+            ".github/workflows/channel-plan.yml", ".github/workflows/channel-publish.yml",
+            ".github/workflows/sign-staging.yml", "oss-public/.github/workflows/sign-manifest.yml",
+            # The same signer after projection: .github/ is replaced by the oss-public overlay.
+            ".github/workflows/sign-manifest.yml",
+            "crates/yadorilink-cli/src/commands/update.rs",
+        }
+        patterns = [r"options:\s*\[([^\]]*)\]", r"channel:\s*\[([^\]]*)\]",
+                    r'case "\$INPUT_CHANNEL" in ([a-z|]+)\)', r'matches!\(channel, ((?:"[a-z]+"\s*\|?\s*)+)\)']
+        found = {}
+        # Some source layouts carry extra workflow directories that others lack, so a file or
+        # directory that exists only in some layouts is checked when present and never required.
+        files = [*(root / ".github/workflows").glob("*.yml"),
+                 *(root / "oss-public/.github/workflows").glob("*.yml"),
+                 root / "crates/yadorilink-cli/src/commands/update.rs"]
+        private_only = {".github/workflows/channel-monitor.yml"}
+        for path in files:
+            text = path.read_text(encoding="utf-8")
+            for pat in patterns:
+                for m in re.finditer(pat, text):
+                    names = set(re.findall(r"[a-z]+", m.group(1)))
+                    if names & {"nightly", "stable"}:  # build-lane lists (beta, dev) are not channel lists
+                        found.setdefault(str(path.relative_to(root)), []).append(names)
+        self.assertIn("crates/yadorilink-cli/src/commands/update.rs", found)
+        for rel in private_only:
+            if (root / rel).exists():
+                self.assertIn(rel, found)
+        for rel, sets in found.items():
+            for names in sets:
+                want = stable_off if rel in owner_switch else everything
+                self.assertEqual(names, want, f"{rel} lists {sorted(names)}, expected {sorted(want)}")
+
+    def stable(self, version="0.4.2"):
+        led = ledger(channel="stable", versions={"script": version})
+        return led
+
+    def beta(self, *versions, withdrawn=()):
+        led = ledger(channel="beta", versions={"script": versions[-1]})
+        led["history"] = {"script": list(versions)}
+        if withdrawn:
+            led["withdrawn_versions"] = list(withdrawn)
+        return led
+
+    def test_stable_serves_a_beta_build_promoted_from_beta(self):
+        out = run(self.stable(), records("0.4.2", sources=("script",)), promotion_source=self.beta("0.4.2"))
+        self.assertTrue(json.loads(out["manifest_body"])["releases"])
+
+    def test_stable_refuses_a_dev_build(self):
+        recs = {"0.4.2": record("0.4.2", lane="dev", sources=("script",))}
+        has(self, problems_of(self.stable(), recs, promotion_source=self.beta("0.4.2")), "lane 'dev'")
+
+    def test_stable_needs_the_beta_ledger(self):
+        has(self, problems_of(self.stable(), records("0.4.2", sources=("script",))), "ledger is required")
+
+    def test_stable_refuses_a_version_never_live_on_beta(self):
+        has(self, problems_of(self.stable("0.4.2"), records("0.4.1", "0.4.2", sources=("script",)),
+                              promotion_source=self.beta("0.4.1")), "not in the beta history")
+
+    def test_stable_refuses_a_version_withdrawn_on_beta(self):
+        has(self, problems_of(self.stable("0.4.2"), records("0.4.2", "0.4.3", sources=("script",)),
+                              promotion_source=self.beta("0.4.2", "0.4.3", withdrawn=["0.4.2"])),
+            "withdrawn on beta")
+
+    def test_stable_refuses_a_prerelease_version(self):
+        has(self, problems_of(self.stable("0.4.2-beta.1"), records("0.4.2-beta.1", sources=("script",)),
+                              promotion_source=self.beta("0.4.2-beta.1")), "pre-release")
+
+    def test_stable_refuses_a_version_beta_has_switched_off_or_not_fully_rolled_out(self):
+        for field, value in (("kill_switch", True), ("rollout_percentage", 0), ("rollout_percentage", 50)):
+            src = self.beta("0.4.2")
+            src["entries"]["script"][field] = value
+            has(self, problems_of(self.stable(), records("0.4.2", sources=("script",)), promotion_source=src),
+                "not fully offered on beta")
+
+    def test_stable_accepts_a_version_beta_has_moved_past(self):
+        src = self.beta("0.4.2", "0.4.3")
+        self.assertEqual(problems_of(self.stable("0.4.2"), records("0.4.2", "0.4.3", sources=("script",)),
+                                     promotion_source=src), [])
+
+    def test_a_malformed_beta_ledger_fails_closed(self):
+        recs = records("0.4.2", sources=("script",))
+        for bad in ("0.4.2", ["0.4.2"], {"script": "0.4.2"}, None):
+            src = self.beta("0.4.2")
+            src["history"] = bad
+            if bad is None:
+                del src["history"]
+            has(self, problems_of(self.stable(), recs, promotion_source=src), "beta ledger")
+        src = self.beta("0.4.2")
+        src["entries"] = "x"
+        has(self, problems_of(self.stable(), recs, promotion_source=src), "beta ledger")
+
+    def test_beta_and_nightly_ignore_promotion(self):
+        self.assertEqual(problems_of(ledger(), records("0.4.2")), [])
+        self.assertEqual(problems_of(ledger(channel="nightly"), records("0.4.2", lane="dev")), [])
 
 
 if __name__ == "__main__":

@@ -32,7 +32,7 @@ EMBEDDED = re.compile(r"\(release ([0-9a-f]{40}:[0-9a-f]{64})\)")
 
 
 def check(identity_path: Path, binary: Path, release: bool = False, require_embedded: bool = False) -> list[str]:
-    identity = json.loads(identity_path.read_text())
+    identity = json.loads(identity_path.read_text(encoding="utf-8"))
     problems = _validator.validate(identity, release=release)
     if problems:
         return problems
@@ -45,7 +45,7 @@ def check(identity_path: Path, binary: Path, release: bool = False, require_embe
         # Fail closed: unverified bytes are never run.
         return [f"artifact sha256 {digest} != identity {identity['artifact_sha256']}"]
     out = []
-    run = subprocess.run([str(binary), "--version"], capture_output=True, text=True, timeout=30)
+    run = subprocess.run([str(binary), "--version"], capture_output=True, text=True, timeout=30, encoding="utf-8")
     match = API.search(run.stdout)
     if run.returncode != 0 or not match:
         out.append("binary did not report a host api version")
@@ -64,7 +64,7 @@ def self_test() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         binary = tmp / "daemon"
-        binary.write_text("#!/bin/sh\necho 'yadorilink-daemon 0.0.0 (host api 2)'\n")
+        binary.write_text("#!/bin/sh\necho 'yadorilink-daemon 0.0.0 (host api 2)'\n", encoding="utf-8")
         binary.chmod(0o755)
         identity = {
             "public_commit_sha": "a" * 40,
@@ -78,7 +78,7 @@ def self_test() -> int:
         path = tmp / "engine-identity.json"
 
         def run(**change):
-            path.write_text(json.dumps({**identity, **change}))
+            path.write_text(json.dumps({**identity, **change}), encoding="utf-8")
             return check(path, binary)
 
         assert run() == []
@@ -86,33 +86,33 @@ def self_test() -> int:
         # A digest mismatch must never execute the binary.
         marker = tmp / "executed"
         probe = tmp / "probe"
-        probe.write_text(f"#!/bin/sh\ntouch '{marker}'\necho 'yadorilink-daemon 0.0.0 (host api 2)'\n")
+        probe.write_text(f"#!/bin/sh\ntouch '{marker}'\necho 'yadorilink-daemon 0.0.0 (host api 2)'\n", encoding="utf-8")
         probe.chmod(0o755)
-        path.write_text(json.dumps({**identity, "artifact_sha256": "0" * 64}))
+        path.write_text(json.dumps({**identity, "artifact_sha256": "0" * 64}), encoding="utf-8")
         found = check(path, probe)
         assert found and "sha256" in found[0], found
         assert not marker.exists(), "binary was executed despite a sha256 mismatch"
-        path.write_text(json.dumps({**identity, "artifact_sha256": hashlib.sha256(probe.read_bytes()).hexdigest()}))
+        path.write_text(json.dumps({**identity, "artifact_sha256": hashlib.sha256(probe.read_bytes()).hexdigest()}), encoding="utf-8")
         assert check(path, probe) == [] and marker.exists()
         assert check(path, tmp / "missing")
         assert run(engine_api_version=3)
         assert run(channel="nightly")
         assert run(channel="dev", kind="dev") == []
-        path.write_text(json.dumps({**identity, "channel": "dev", "kind": "dev"}))
+        path.write_text(json.dumps({**identity, "channel": "dev", "kind": "dev"}), encoding="utf-8")
         assert check(path, binary, release=True), "a release path accepted a development engine"
-        path.write_text(json.dumps(identity))
+        path.write_text(json.dumps(identity), encoding="utf-8")
         rid = f"{'a' * 40}:{'c' * 64}"
         embedding = tmp / "embedding"
-        embedding.write_text(f"#!/bin/sh\necho 'yadorilink-daemon 0.0.0 (host api 2) (release {rid})'\n")
+        embedding.write_text(f"#!/bin/sh\necho 'yadorilink-daemon 0.0.0 (host api 2) (release {rid})'\n", encoding="utf-8")
         embedding.chmod(0o755)
         digest = hashlib.sha256(embedding.read_bytes()).hexdigest()
-        path.write_text(json.dumps({**identity, "artifact_sha256": digest}))
+        path.write_text(json.dumps({**identity, "artifact_sha256": digest}), encoding="utf-8")
         assert check(path, embedding, release=True, require_embedded=True) == []
-        path.write_text(json.dumps({**identity, "artifact_sha256": digest, "build_config_digest": "e" * 64}))
+        path.write_text(json.dumps({**identity, "artifact_sha256": digest, "build_config_digest": "e" * 64}), encoding="utf-8")
         assert check(path, embedding), "a binary embedding another build was accepted"
-        path.write_text(json.dumps({**identity, "artifact_sha256": hashlib.sha256(binary.read_bytes()).hexdigest()}))
+        path.write_text(json.dumps({**identity, "artifact_sha256": hashlib.sha256(binary.read_bytes()).hexdigest()}), encoding="utf-8")
         assert check(path, binary) == [] and check(path, binary, require_embedded=True), "an unembedded binary passed --require-embedded-id"
-        binary.write_text("#!/bin/sh\necho 'yadorilink-daemon 0.0.0'\n")
+        binary.write_text("#!/bin/sh\necho 'yadorilink-daemon 0.0.0'\n", encoding="utf-8")
         assert run(artifact_sha256=hashlib.sha256(binary.read_bytes()).hexdigest())
     print("ok")
     return 0

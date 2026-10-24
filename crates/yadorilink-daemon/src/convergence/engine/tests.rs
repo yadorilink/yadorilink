@@ -66,6 +66,22 @@ fn the_path_budget_window_is_exactly_bounded_by_max_paths_per_reconcile_attempt(
     assert_eq!(short.len(), 3);
 }
 
+/// The shipped receive window is a frozen setting recorded in the operation-count
+/// baseline; moving it needs a recorded reason (`.github/checks/check-perf-baseline.py`).
+#[test]
+fn the_shipped_receive_window_matches_the_recorded_baseline() {
+    let baseline = crate::convergence::receive_cost_tests::perf_baseline();
+    assert_eq!(
+        MAX_PATHS_PER_RECONCILE_ATTEMPT as u64,
+        baseline["frozen_settings"]["receive_window_paths"].as_u64().unwrap()
+    );
+    assert_eq!(
+        yadorilink_peer_session::peer_session::DEFAULT_BLOCK_FETCH_CONCURRENCY as u64,
+        baseline["frozen_settings"]["block_fetch_concurrency"].as_u64().unwrap(),
+        "the default is pinned; an environment override would not belong in a guard run"
+    );
+}
+
 /// The sweep seam resolves to the value it is given, and an absent
 /// setting is byte-for-byte the shipped default.
 ///

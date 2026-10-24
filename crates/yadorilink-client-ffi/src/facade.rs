@@ -54,6 +54,12 @@ impl ClientCore {
         LoginSession::wrap(self.inner.new_login_session(options))
     }
 
+    /// A sign-in of this installation for an action refused with
+    /// `PermissionDenied(ReauthenticationRequired)`; read like a login session.
+    pub fn new_reauthentication_session(&self, options: LoginOptions) -> Arc<LoginSession> {
+        LoginSession::wrap(self.inner.new_reauthentication_session(options))
+    }
+
     /// Starts the status poll loop on the client runtime. If the runtime
     /// cannot start, the watch ends at once.
     pub fn watch_status(&self, interval: Duration) -> Arc<StatusWatch> {
@@ -447,6 +453,14 @@ impl ClientCore {
         let core = self.inner.clone();
         bridge(async move { core.check_for_updates().await }).await
     }
+    pub async fn check_appcast_item(
+        &self,
+        item: AppcastItem,
+        phase: AppcastItemPhase,
+    ) -> Result<AppcastItemCheck, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.check_appcast_item(item, phase).await }).await
+    }
     pub async fn download_guidance(&self) -> Result<UpdateDownloadGuidance, DesktopError> {
         let core = self.inner.clone();
         bridge(async move { core.download_guidance().await }).await
@@ -464,9 +478,20 @@ impl ClientCore {
         let core = self.inner.clone();
         bridge(async move { core.account_deletion_status().await }).await
     }
-    pub async fn request_account_deletion(&self) -> Result<AccountDeletionRequest, DesktopError> {
+    pub async fn account_deletion_impact(&self) -> Result<AccountDeletionImpact, DesktopError> {
         let core = self.inner.clone();
-        bridge(async move { core.request_account_deletion().await }).await
+        bridge(async move { core.account_deletion_impact().await }).await
+    }
+    pub async fn request_account_deletion(
+        &self,
+        acknowledge_impact: bool,
+    ) -> Result<AccountDeletionRequest, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.request_account_deletion(acknowledge_impact).await }).await
+    }
+    pub async fn complete_account_deletion(&self) -> Result<SignOutOutcome, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.complete_account_deletion().await }).await
     }
     pub async fn confirm_account_deletion(
         &self,
@@ -579,6 +604,19 @@ impl ClientCore {
     ) -> Result<AcceptInviteOutcome, DesktopError> {
         let core = self.inner.clone();
         bridge(async move { core.accept_invite(code_or_url, local_path, mode, acknowledge_risks).await }).await
+    }
+
+    pub async fn accept_invite_as_provider_folder(
+        &self,
+        code_or_url: String,
+        display_name: String,
+        mode: FolderMode,
+    ) -> Result<ProviderInviteOutcome, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move {
+            core.accept_invite_as_provider_folder(code_or_url, display_name, mode).await
+        })
+        .await
     }
 
     // ---- linking ----

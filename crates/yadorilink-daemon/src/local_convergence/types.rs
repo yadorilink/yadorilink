@@ -1224,11 +1224,15 @@ pub(crate) async fn reconstruct_file_to_temp_off_runtime(
         headroom,
         ledger,
         None,
+        Arc::new(tokio::sync::Semaphore::new(
+            super::receive_write_gate::DEFAULT_RECEIVE_WRITE_PERMITS,
+        )),
     )
     .await
 }
 
 /// [`reconstruct_file_to_temp_off_runtime`] that reports each block's size once it was written.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn reconstruct_file_to_temp_off_runtime_observed(
     store: Arc<dyn yadorilink_peer_session::ports::BlockContentStore>,
     out_path: &std::path::Path,
@@ -1237,6 +1241,7 @@ pub(crate) async fn reconstruct_file_to_temp_off_runtime_observed(
     headroom: Option<Arc<super::reconcile::HeadroomReservation>>,
     ledger: Arc<dyn yadorilink_local_storage::TempFileLedger>,
     written: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    gate: Arc<tokio::sync::Semaphore>,
 ) -> Result<std::path::PathBuf, PeerSessionError> {
     reconstruct_file_to_temp_off_runtime_durable(
         store,
@@ -1247,6 +1252,7 @@ pub(crate) async fn reconstruct_file_to_temp_off_runtime_observed(
         ledger,
         written,
         yadorilink_local_storage::Durability::Full,
+        gate,
     )
     .await
 }
@@ -1262,6 +1268,7 @@ pub(crate) async fn reconstruct_file_to_temp_off_runtime_durable(
     ledger: Arc<dyn yadorilink_local_storage::TempFileLedger>,
     written: Option<Arc<dyn Fn(u64) + Send + Sync>>,
     durability: yadorilink_local_storage::Durability,
+    gate: Arc<tokio::sync::Semaphore>,
 ) -> Result<std::path::PathBuf, PeerSessionError> {
     let out_path = out_path.to_path_buf();
     let blocks = blocks.to_vec();
@@ -1271,7 +1278,7 @@ pub(crate) async fn reconstruct_file_to_temp_off_runtime_durable(
     // task itself or the drop guard otherwise.
     let owner = Arc::new(std::sync::Mutex::new(TempOwner::Assembling));
     let guard = TempGuard(owner.clone(), ledger.clone());
-    let permit = super::receive_write_gate::admit(super::receive_write_gate::global()).await;
+    let permit = super::receive_write_gate::admit(gate).await;
     match spawn_blocking(move || {
         let _permit = permit;
         // The reserved space is released only when this task, temp file

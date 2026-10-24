@@ -81,7 +81,7 @@ impl PendingStore {
         let written = (|| {
             let mut file = std::fs::File::create(&tmp)?;
             file.write_all(&serde_json::to_vec(map).map_err(io::Error::other)?)?;
-            file.sync_all()
+            yadorilink_fs_platform::flush::sync_file(&file)
         })();
         if let Err(error) = written.and_then(|()| (self.publish)(&tmp, &self.path)) {
             let _ = std::fs::remove_file(&tmp);
@@ -153,6 +153,8 @@ pub(crate) fn is_definitive_rejection(error: &crate::CoreError) -> bool {
         error,
         crate::CoreError::DaemonCommand {
             code: Code::PreparationRejected
+                | Code::InviteExpired
+                | Code::InviteAlreadyUsed
                 | Code::OperationConflict
                 | Code::ActivationRejected
                 | Code::LocalIdentityUnavailable
@@ -168,6 +170,22 @@ mod tests {
 
     fn store(dir: &tempfile::TempDir) -> PendingStore {
         PendingStore::at(dir.path().join("provider-pending.json"))
+    }
+
+    /// A refused invite (expired, already used) created nothing: its pending identity is forgotten
+    /// rather than kept for ever; an ambiguous outcome keeps it.
+    #[test]
+    fn a_refused_invite_is_definitive_and_an_ambiguous_one_is_not() {
+        use yadorilink_ipc_proto::daemonctl::ApplicationErrorCode as Code;
+        let error = |code| crate::CoreError::DaemonCommand {
+            code,
+            message: String::new(),
+            group_ids: Vec::new(),
+            operation_id: None,
+        };
+        assert!(is_definitive_rejection(&error(Code::InviteExpired)));
+        assert!(is_definitive_rejection(&error(Code::InviteAlreadyUsed)));
+        assert!(!is_definitive_rejection(&error(Code::CoordinationAmbiguous)));
     }
 
     /// A restart (a new store over the same file) reuses the token of the same payload; another payload

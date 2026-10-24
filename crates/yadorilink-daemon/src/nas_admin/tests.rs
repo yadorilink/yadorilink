@@ -236,14 +236,22 @@ async fn a_refused_listing_refuses_everyone_and_the_last_listing_is_dropped() {
 
 #[test]
 fn only_an_explicit_setting_offers_management() {
-    let set = |v: &str| Ok(v.to_string());
-    assert!(offered_by(set("1")));
-    assert!(offered_by(set("true")));
-    assert!(offered_by(set(" TRUE ")));
+    use crate::engine_tuning::EngineTuning;
+    let offered = |v: Option<&str>| {
+        EngineTuning::from_lookup(|name| {
+            (name == crate::engine_tuning::vars::NAS_ADMIN_OFFER)
+                .then(|| v.map(str::to_owned))
+                .flatten()
+        })
+        .offer_nas_admin
+    };
+    assert!(offered(Some("1")));
+    assert!(offered(Some("true")));
+    assert!(offered(Some(" TRUE ")));
     for off in ["", "0", "false", "yes", "on", "2"] {
-        assert!(!offered_by(set(off)), "{off:?}");
+        assert!(!offered(Some(off)), "{off:?}");
     }
-    assert!(!offered_by(Err(std::env::VarError::NotPresent)));
+    assert!(!offered(None));
 }
 
 /// The headless unit is what sets the offer: it is in the unit (replaced on
@@ -252,9 +260,10 @@ fn only_an_explicit_setting_offers_management() {
 #[test]
 fn the_headless_unit_offers_management_and_the_desktop_unit_does_not() {
     let headless = include_str!("../../../../packaging/linux/systemd/yadorilink-headless.service");
-    assert!(headless.lines().any(|line| line.trim() == format!("Environment={OFFER_ENV}=1")));
+    let offer = crate::engine_tuning::vars::NAS_ADMIN_OFFER;
+    assert!(headless.lines().any(|line| line.trim() == format!("Environment={offer}=1")));
     let desktop = include_str!("../../../../packaging/linux/systemd/yadorilink-daemon.service");
-    assert!(!desktop.contains(OFFER_ENV));
+    assert!(!desktop.contains(crate::engine_tuning::vars::NAS_ADMIN_OFFER));
 }
 
 #[test]

@@ -19,3 +19,9 @@ tokio.workspace = true
 
 [lints]
 workspace = true
+
+# The test-only provider host stand-in; its unit tests run with the crate's.
+[[example]]
+name = "plain_dir_host"
+path = "examples/plain_dir_host/main.rs"
+test = true

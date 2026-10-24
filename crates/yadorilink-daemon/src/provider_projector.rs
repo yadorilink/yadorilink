@@ -27,7 +27,7 @@ const POLL: Duration = Duration::from_millis(250);
 /// roots between them (a batch holds the single writer for its whole transaction).
 const YIELD: Duration = Duration::from_millis(20);
 /// Obligations per transaction. A 5 000-row batch held the writer about 0.8 s on the slowest measured
-/// host; 1 000 rows hold it about 0.16 s. `YADORILINK_PROVIDER_PROJECTOR_BATCH` overrides it.
+/// host; 1 000 rows hold it about 0.16 s. The tuning's `provider_projector_batch` overrides it.
 const DEFAULT_BATCH: usize = 1_000;
 
 /// The batch size from the environment value, falling back to the default for anything that is not a
@@ -130,7 +130,7 @@ pub(crate) async fn run(
     state: Arc<DaemonState>,
     publication: Arc<PublicationDriver>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let batch = batch_from(std::env::var("YADORILINK_PROVIDER_PROJECTOR_BATCH").ok().as_deref());
+    let batch = state.tuning().provider_projector_batch;
     loop {
         let delay = match pass(&state, batch, |root| publication.kick(root)).await? {
             Pass::Done { delay, .. } => delay,

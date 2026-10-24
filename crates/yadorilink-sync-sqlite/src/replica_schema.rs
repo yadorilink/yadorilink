@@ -57,12 +57,26 @@ impl std::error::Error for ReplicaSchemaError {}
 /// generation check would refuse on every later open.
 pub fn init_replica_schema(conn: &Connection) -> Result<(), ReplicaSchemaError> {
     yadorilink_sqlite_runtime::check_replica_schema_generation(conn)?;
-    let tx = conn.unchecked_transaction().map_err(DatabaseError::from)?;
-    crate::replica_tables::init(&tx)?;
-    tx.pragma_update(None, "user_version", yadorilink_sqlite_runtime::SCHEMA_VERSION)
-        .map_err(DatabaseError::from)?;
-    tx.commit().map_err(DatabaseError::from)?;
-    Ok(())
+    // A savepoint, not a transaction of its own: outside any transaction it is one (and its
+    // release commits); inside the open transaction of an exclusive open it nests, so the
+    // opener can commit the schema together with its generation record.
+    conn.execute_batch("SAVEPOINT replica_schema_init").map_err(DatabaseError::from)?;
+    let created = crate::replica_tables::init(conn).and_then(|()| {
+        conn.pragma_update(None, "user_version", yadorilink_sqlite_runtime::SCHEMA_VERSION)
+            .map_err(DatabaseError::from)
+            .map_err(ReplicaSchemaError::from)
+    });
+    match created {
+        Ok(()) => {
+            conn.execute_batch("RELEASE replica_schema_init").map_err(DatabaseError::from)?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ =
+                conn.execute_batch("ROLLBACK TO replica_schema_init; RELEASE replica_schema_init");
+            Err(error)
+        }
+    }
 }
 
 #[cfg(test)]

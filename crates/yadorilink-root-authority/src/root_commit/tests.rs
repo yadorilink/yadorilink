@@ -89,3 +89,28 @@ fn hold_admission(lease: std::sync::Arc<RootLease>) -> impl Drop {
     lease.active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     Held(lease)
 }
+
+#[test]
+fn a_fenced_lease_refuses_a_commit_once_the_writer_lease_was_taken_over() {
+    use crate::writer_lease::{FakeLeaseClock, WriterLease};
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FakeLeaseClock::new(1_000);
+    let term = Duration::from_secs(10);
+    let writer = Arc::new(WriterLease::acquire(dir.path(), term, clock.clone()).unwrap());
+    let lease = RootLease::for_tests().with_writer_lease(writer);
+
+    let op = lease.begin_operation().unwrap();
+    let owned = op.permit().owned_check();
+    op.permit().verify().unwrap();
+    owned.verify().unwrap();
+
+    clock.advance(term);
+    let _taker = WriterLease::acquire(dir.path(), term, clock).unwrap();
+
+    assert!(matches!(op.permit().verify(), Err(RootAuthorityError::StaleWriter(_))));
+    assert!(matches!(owned.verify(), Err(RootAuthorityError::StaleWriter(_))));
+    drop(op);
+    assert!(matches!(lease.begin_operation(), Err(RootAuthorityError::StaleWriter(_))));
+}

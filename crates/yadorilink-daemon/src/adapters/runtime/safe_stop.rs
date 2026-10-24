@@ -8,7 +8,9 @@
 //! 2. Wait for the operations already admitted to finish (`RootLease::wait_drained`).
 //! 3. Fold the sync database's and the block index's write-ahead logs into their main files.
 //! 4. Commit: request the graceful shutdown that every other stop uses. From here the daemon
-//!    exits with status 0 and its locks are released by the process ending.
+//!    exits (status 0, or the restart status when the executable-replaced watch asked for this
+//!    stop: its reason is recorded in the same step, before the signal) and its locks are
+//!    released by the process ending.
 //!
 //! Before step 1 the link registry's start gate is closed and the starts already under way are
 //! waited out, so no link can become Ready after the leases are taken. Both the gate and the
@@ -35,6 +37,24 @@ pub(crate) enum Step {
     Paused,
     Drained,
     Checkpointed,
+    /// Inside the commit, after the restart reason was recorded and before the shutdown signal
+    /// is set (the commit holds the channel's lock: the hook must not touch it). A test looks
+    /// at the reason here.
+    ReasonRecorded,
+    /// After the shutdown signal fired, before the request returns its answer. Nothing can
+    /// fail here (the hook's result is ignored); a test looks at what a shutdown receiver
+    /// could already see.
+    Committed,
+}
+
+/// Why a stop is requested, which the commit records together with the shutdown signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopIntent {
+    /// An ordinary stop: the process exits with status 0.
+    Plain,
+    /// The executable-replaced watch's stop: the process exits for a restart (see
+    /// `exe_replaced`). Honoured only by the request that itself commits the stop.
+    Restart,
 }
 
 pub(crate) trait StepHook: Send + Sync {
@@ -51,16 +71,35 @@ impl StepHook for NoHook {
 }
 
 pub(crate) async fn request(state: &Arc<DaemonState>, deadline: Duration) -> SafeStopOutcome {
-    request_with(state, deadline, &NoHook).await
+    request_as(state, deadline, &NoHook, StopIntent::Plain).await
+}
+
+/// [`request`] for the executable-replaced watch: a stop this request commits ends the process
+/// for a restart.
+pub(crate) async fn request_to_restart(
+    state: &Arc<DaemonState>,
+    deadline: Duration,
+) -> SafeStopOutcome {
+    request_as(state, deadline, &NoHook, StopIntent::Restart).await
+}
+
+#[cfg(test)]
+pub(crate) async fn request_with(
+    state: &Arc<DaemonState>,
+    deadline: Duration,
+    hook: &dyn StepHook,
+) -> SafeStopOutcome {
+    request_as(state, deadline, hook, StopIntent::Plain).await
 }
 
 /// Pauses the links through the registry: closes the start gate so no link can begin starting,
 /// waits out the starts already under way, and only then takes the leases. Every link that will
 /// ever be Ready during this stop is therefore in the snapshot.
-pub(crate) async fn request_with(
+pub(crate) async fn request_as(
     state: &Arc<DaemonState>,
     deadline: Duration,
     hook: &dyn StepHook,
+    intent: StopIntent,
 ) -> SafeStopOutcome {
     if *state.shutdown_tx.borrow() {
         return SafeStopOutcome::Stopping { already_in_progress: true };
@@ -74,7 +113,8 @@ pub(crate) async fn request_with(
         );
     }
     let leases = state.links.ready_root_leases();
-    let outcome = run(state, deadline.saturating_sub(started.elapsed()), hook, leases).await;
+    let outcome =
+        run_as(state, deadline.saturating_sub(started.elapsed()), hook, leases, intent).await;
     if matches!(outcome, SafeStopOutcome::Stopping { already_in_progress: false }) {
         // Committed: the process is shutting down, and no link may start meanwhile.
         gate.keep_closed();
@@ -115,11 +155,22 @@ fn busy(reason: SafeStopBusy, detail: impl Into<String>) -> SafeStopOutcome {
 type Leases = Vec<Arc<yadorilink_root_authority::root_commit::RootLease>>;
 
 /// [`request`] over the given links' leases, with a hook between the steps.
+#[cfg(test)]
 pub(crate) async fn run(
     state: &Arc<DaemonState>,
     deadline: Duration,
     hook: &dyn StepHook,
     leases: Leases,
+) -> SafeStopOutcome {
+    run_as(state, deadline, hook, leases, StopIntent::Plain).await
+}
+
+pub(crate) async fn run_as(
+    state: &Arc<DaemonState>,
+    deadline: Duration,
+    hook: &dyn StepHook,
+    leases: Leases,
+    intent: StopIntent,
 ) -> SafeStopOutcome {
     let started = Instant::now();
     let remaining = || deadline.saturating_sub(started.elapsed());
@@ -170,12 +221,30 @@ pub(crate) async fn run(
 
     // Past this point nothing can fail: the ordinary graceful shutdown takes over and closes
     // admission for good. The lease clones are released first so that shutdown owns each
-    // link's runtime outright.
+    // link's runtime outright (and the pause is never lifted after the shutdown began).
     paused.disarm();
+    // The commit is one atomic step on the shutdown channel: under the sender's lock it checks
+    // that nobody stopped the daemon meanwhile (a control-socket `Shutdown`, a signal: both
+    // arrive while the drain and the checkpoint above are awaited), records the restart reason,
+    // and only then sets the signal. Whoever observes the shutdown observes the reason too, and a
+    // stop somebody else began is theirs: it never becomes a restart.
+    let won = state.shutdown_tx.send_if_modified(|stopped| {
+        if *stopped {
+            return false;
+        }
+        if intent == StopIntent::Restart {
+            state.restart_on_exit.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let _ = hook.after(Step::ReasonRecorded);
+        *stopped = true;
+        true
+    });
     *committed = true;
+    if !won {
+        return SafeStopOutcome::Stopping { already_in_progress: true };
+    }
     tracing::info!("safe stop: links are at a safe point and checkpointed; shutting down");
-    // `send_replace`: the value must change even if no receiver is listening any more.
-    state.shutdown_tx.send_replace(true);
+    let _ = hook.after(Step::Committed);
     SafeStopOutcome::Stopping { already_in_progress: false }
 }
 

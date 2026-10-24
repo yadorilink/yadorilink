@@ -1,3 +1,4 @@
+// apple-cfg-file: macos-only only macOS has a provider adapter today; an iOS build refuses provider links until it has one
 //! Pure value types describing a link's write-gate state, a hydration
 //! hold, materialization state/policy, a startup-readiness failure, and a
 //! current-version snapshot.
@@ -85,6 +86,10 @@ pub enum ProviderKind {
     /// kind, not a sync-model kind: the root is served through the same provider model (root id,
     /// item ids, readiness, publication, fetch gate).
     WindowsCfapi,
+    /// The iOS replicated File Provider extension. A kind of its own, not `MacFileProvider`:
+    /// the extension, its enumeration and its readiness evidence are a different host
+    /// implementation, and the persisted string never has to be reinterpreted later.
+    IosFileProvider,
 }
 
 impl ProviderKind {
@@ -93,13 +98,17 @@ impl ProviderKind {
             Self::None => "none",
             Self::MacFileProvider => "mac_file_provider",
             Self::WindowsCfapi => "windows_cfapi",
+            Self::IosFileProvider => "ios_file_provider",
         }
     }
 
     /// The provider kind this build's operating system serves, or `None` where the OS has no
-    /// provider adapter (such a platform refuses provider links).
+    /// provider adapter (such a platform refuses provider links). iOS has its own kind.
     pub const fn for_host_platform() -> Option<Self> {
-        if cfg!(target_os = "macos") {
+        // apple-cfg: ios-explicit iOS serves its own File Provider kind
+        if cfg!(target_os = "ios") {
+            Some(Self::IosFileProvider)
+        } else if cfg!(target_vendor = "apple") {
             Some(Self::MacFileProvider)
         } else if cfg!(windows) {
             Some(Self::WindowsCfapi)
@@ -113,6 +122,7 @@ impl ProviderKind {
             "none" => Self::None,
             "mac_file_provider" => Self::MacFileProvider,
             "windows_cfapi" => Self::WindowsCfapi,
+            "ios_file_provider" => Self::IosFileProvider,
             other => unknown_persisted_enum("provider kind", other),
         }
     }

@@ -107,6 +107,13 @@ impl EnrollmentRepository for FakeRepository {
         Ok(None)
     }
 
+    fn provider_display_name_taken(
+        &self,
+        _display_name: &str,
+    ) -> Result<bool, crate::sync_error::SyncError> {
+        unimplemented!("not exercised by recovery-service tests")
+    }
+
     fn list_links(&self) -> Result<Vec<FolderLink>, crate::sync_error::SyncError> {
         if self.fail_list_links.load(Ordering::SeqCst) {
             return Err(std::io::Error::other("fake list_links failure").into());
@@ -385,6 +392,7 @@ impl EnrollmentLinkPort for FakeLinkPort {
         _group_id: &'a str,
         _absolute_path: &'a std::path::Path,
         _on_demand: bool,
+        _provider: Option<crate::application::ports::ProviderLinkTarget>,
     ) -> crate::application::ports::BoxFuture<'a, Result<(), EnrollmentLinkError>> {
         Box::pin(async move { unimplemented!("recovery never commits a plain link") })
     }

@@ -24,6 +24,16 @@
       "type": "integer",
       "minimum": 1
     },
+    "state_schema_version": {
+      "description": "Optional. The state database version the engine stamps on the data it writes. Absent in identities from before the field existed; a reader that does not know it must ignore it.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "state_schema_min_readable": {
+      "description": "Optional, only with state_schema_version. The oldest state database version the engine can still read (never above state_schema_version; the written version when absent). A state database stamped outside the range is refused before anything is written.",
+      "type": "integer",
+      "minimum": 1
+    },
     "artifact_sha256": {
       "description": "SHA-256 of the engine artifact.",
       "type": "string",
@@ -48,6 +58,24 @@
       "description": "SHA-256 of the bundle's SHA256SUMS file, which lists every bundle file except SHA256SUMS and engine-identity.json.",
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
+    },
+    "slices": {
+      "description": "Optional. SHA-256 of each static library slice of an iOS bundle, by target triple: the device library and the simulator library a host app links. Present exactly when the bundle's layout has slices; every digest is also listed in the bundle's SHA256SUMS.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["aarch64-apple-ios", "aarch64-apple-ios-sim"],
+      "properties": {
+        "aarch64-apple-ios": {
+          "description": "SHA-256 of the device library.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "aarch64-apple-ios-sim": {
+          "description": "SHA-256 of the simulator library.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
     },
     "source": {
       "description": "Where the bundle is published: a zip asset on a GitHub Release. Required in a consumer's engine.lock; optional inside the bundle's own identity file.",

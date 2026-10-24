@@ -41,6 +41,16 @@ pub enum RootAuthorityError {
     #[error("{0}")]
     OwnershipLost(String),
 
+    /// Another writer holds an unexpired writer lease on this data area: the open fails closed
+    /// and changes nothing.
+    #[error("{0}")]
+    WriterLeaseHeld(String),
+
+    /// This writer's lease was taken over or ran out: its fence token no longer matches, so the
+    /// commit is refused. Terminal for this lease; acquire a fresh one.
+    #[error("{0}")]
+    StaleWriter(String),
+
     /// A group has more than one live link -- `root_identity`'s
     /// `ensure_single_root` gate refuses before any constructor touches
     /// disk or the index. }` after this crate's

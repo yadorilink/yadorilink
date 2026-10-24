@@ -6,7 +6,10 @@ use std::io;
 use std::path::Path;
 use std::sync::Mutex;
 
-use super::{DiscardOutcome, DurableNamespace, NoLedger, NsError, Replace, RetainReason};
+use super::{
+    describe_io, DiscardOutcome, DurableNamespace, NoLedger, NsError, RefusalCause, Replace,
+    RetainReason,
+};
 use crate::fs_capabilities::Capability;
 
 #[cfg(any(windows, test))]
@@ -16,31 +19,69 @@ const PROBE_LABEL: &str = "dir-durability";
 
 /// Verdicts per volume, so the probe runs once per volume and process. A probe
 /// that could not run (`Unknown`) is not kept.
-static VERDICTS: Mutex<Vec<(u64, Capability)>> = Mutex::new(Vec::new());
+static VERDICTS: Mutex<Vec<(u64, Probed)>> = Mutex::new(Vec::new());
 
-pub(super) fn cached_verdict(dir: &Path) -> Capability {
+/// A probe's verdict and, when it is not `Supported`, why: the step, the error and errno, the
+/// probed path and its volume. The cause is kept with a cached verdict, so a refusal answered
+/// from the cache still says what the probe saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Probed {
+    pub(super) verdict: Capability,
+    pub(super) cause: RefusalCause,
+}
+
+impl Probed {
+    fn supported() -> Self {
+        Self { verdict: Capability::Supported, cause: RefusalCause::default() }
+    }
+}
+
+/// The cause of a volume with a DOS path but no GUID path.
+pub(super) fn guid_path_cause(dir: &Path, error: &io::Error) -> RefusalCause {
+    RefusalCause::new(format!("volume of {dir:?} has no GUID path: {}", describe_io(error)))
+}
+
+pub(super) fn cached_verdict(dir: &Path) -> Probed {
     match volume_key(dir) {
-        Ok(volume) => verdict_for(volume, || probe(dir)),
-        Err(e) if is_no_guid_path(&e) => Capability::Unsupported,
-        Err(_) => Capability::Unknown,
+        Ok(volume) => verdict_cached(volume, || probe_explained(dir)),
+        Err(e) if is_no_guid_path(&e) => {
+            Probed { verdict: Capability::Unsupported, cause: guid_path_cause(dir, &e) }
+        }
+        Err(e) => Probed {
+            verdict: Capability::Unknown,
+            cause: RefusalCause::new(format!(
+                "step volume_key: the volume of {dir:?} could not be identified: {}",
+                describe_io(&e)
+            )),
+        },
     }
 }
 
 /// The cached verdict for `volume`, or `probe_now`'s, kept unless it is `Unknown`.
-fn verdict_for(volume: u64, probe_now: impl FnOnce() -> Capability) -> Capability {
+fn verdict_cached(volume: u64, probe_now: impl FnOnce() -> Probed) -> Probed {
     let known = VERDICTS
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .iter()
-        .find_map(|(v, c)| (*v == volume).then_some(*c));
-    if let Some(verdict) = known {
-        return verdict;
+        .find_map(|(v, c)| (*v == volume).then(|| c.clone()));
+    if let Some(known) = known {
+        return known;
     }
-    let verdict = probe_now();
-    if verdict != Capability::Unknown {
-        VERDICTS.lock().unwrap_or_else(|p| p.into_inner()).push((volume, verdict));
+    let probed = probe_now();
+    if probed.verdict != Capability::Unknown {
+        VERDICTS.lock().unwrap_or_else(|p| p.into_inner()).push((volume, probed.clone()));
     }
-    verdict
+    probed
+}
+
+/// [`verdict_cached`] for callers that only want the verdict.
+#[cfg(test)]
+fn verdict_for(volume: u64, probe_now: impl FnOnce() -> Capability) -> Capability {
+    verdict_cached(volume, || Probed {
+        verdict: probe_now(),
+        cause: RefusalCause::new("test verdict"),
+    })
+    .verdict
 }
 
 /// A number for `key`, the same one every time and never shared with another key,
@@ -152,32 +193,82 @@ pub(super) fn volume_key(dir: &Path) -> io::Result<u64> {
 
 /// Runs the probe on `dir`'s volume now.
 pub(super) fn probe(dir: &Path) -> Capability {
+    probe_explained(dir).verdict
+}
+
+/// [`probe`] with the cause of a verdict that is not `Supported`.
+fn probe_explained(dir: &Path) -> Probed {
+    // Taken before the probe runs: if the directory vanishes meanwhile, the cause still names
+    // the volume it was on.
+    let identity = match volume_key(dir) {
+        Ok(key) => format!("volume key {key}"),
+        Err(e) => format!("volume unidentified ({})", describe_io(&e)),
+    };
+    let refuse = |verdict: Capability, what: String| Probed {
+        verdict,
+        cause: RefusalCause::new(format!("probe of {dir:?} on {identity}: {what}")),
+    };
     #[cfg(windows)]
     {
         let (fs_name, fixed) = match windows::volume_of(dir) {
             Ok(volume) => volume,
-            Err(e) if is_no_guid_path(&e) => return Capability::Unsupported,
-            Err(_) => return Capability::Unknown,
+            Err(e) if is_no_guid_path(&e) => {
+                return refuse(
+                    Capability::Unsupported,
+                    format!("step volume_of: {}", describe_io(&e)),
+                )
+            }
+            Err(e) => {
+                return refuse(Capability::Unknown, format!("step volume_of: {}", describe_io(&e)))
+            }
         };
         if !fixed || !fs_name.eq_ignore_ascii_case("NTFS") {
-            return Capability::Unsupported;
+            return refuse(
+                Capability::Unsupported,
+                format!("step volume_of: file system {fs_name:?}, fixed disk: {fixed}"),
+            );
         }
     }
-    let Ok(base) = crate::fs_capabilities::probe_artefact_name(PROBE_LABEL) else {
-        return Capability::Unknown;
+    let base = match crate::fs_capabilities::probe_artefact_name(PROBE_LABEL) {
+        Ok(base) => base,
+        Err(e) => return refuse(Capability::Unknown, format!("step artefact_name: {e:?}")),
     };
     let work = dir.join(base);
-    if std::fs::create_dir(&work).is_err() {
-        return Capability::Unknown;
+    if let Err(e) = std::fs::create_dir(&work) {
+        return refuse(Capability::Unknown, format!("step create_work_dir: {}", describe_io(&e)));
     }
-    let verdict = super::quiet(|| shapes_work(&work));
+    let outcome = super::quiet(|| try_shapes(&work));
+    // A conclusive refusal is kept for the process, so it says what the probe directory held
+    // when the volume answered: a wrong answer caused by something else touching it shows here.
+    let outcome = outcome.map_err(|fail| match fail {
+        Fail::Unsupported(what) => {
+            Fail::Unsupported(format!("{what}; probe directory held {}", entry_names(&work)))
+        }
+        unknown => unknown,
+    });
     // Only this probe's own directory, made just above: never a directory found by its name.
     let _ = std::fs::remove_dir_all(&work);
-    verdict
+    match outcome {
+        Ok(()) => Probed::supported(),
+        Err(Fail::Unsupported(what)) => refuse(Capability::Unsupported, what),
+        Err(Fail::Unknown(what)) => refuse(Capability::Unknown, what),
+    }
 }
 
-/// The steps of the probe, where a test can make the volume answer "busy".
-#[cfg(test)]
+/// The names in `dir`, for a refusal's cause.
+fn entry_names(dir: &Path) -> String {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => {
+            let mut names: Vec<_> = entries.filter_map(Result::ok).map(|e| e.file_name()).collect();
+            names.sort();
+            format!("{names:?}")
+        }
+        Err(e) => format!("unreadable ({})", describe_io(&e)),
+    }
+}
+
+/// The steps of the probe, named in a refusal's cause; a test can make the volume answer "busy"
+/// at one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
     FirstPublish,
@@ -214,45 +305,40 @@ fn busy_step(step: Step) -> Result<(), Fail> {
         return Ok(());
     }
     let error = io::Error::from(kind);
-    Err(NsError::from_io(error).into())
+    Err(fail_at(step, NsError::from_io(error)))
 }
 
-/// How a probe step went wrong. `Unsupported` is a definite wrong answer: the shape
-/// succeeded where it must be refused, did not do what it must, or the volume says it cannot
-/// do it. `Unknown` is any other error (a sharing violation or lock from a reader, an indexer
-/// or a scanner, a full disk, an I/O error): the volume has not answered, so nothing is
-/// concluded, and the verdict is not kept.
+/// How a probe step went wrong, with the step and the error. `Unsupported` is a definite wrong
+/// answer: the shape succeeded where it must be refused, did something other than it must, or
+/// the volume says it cannot do it (`ENOTSUP`/`EINVAL` class). `Unknown` is any other error (a
+/// sharing violation or lock from a reader, an indexer or a scanner, a full disk, an I/O
+/// error): the volume has not answered, so nothing is concluded, and the verdict is not kept.
 enum Fail {
-    Unsupported,
-    Unknown,
+    Unsupported(String),
+    Unknown(String),
 }
 
-impl From<NsError> for Fail {
-    fn from(error: NsError) -> Self {
-        let says_unsupported = |e: &io::Error| {
-            matches!(e.kind(), io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput)
-        };
-        match error {
-            // The shape did not do what it must: the entry it just made is not there, a fresh
-            // name is occupied, a file is a directory.
-            NsError::AlreadyExists
-            | NsError::NotFound
-            | NsError::NotEmpty
-            | NsError::CrossVolume => Self::Unsupported,
-            NsError::Io(e) | NsError::NotDurable(e) if says_unsupported(&e) => Self::Unsupported,
-            _ => Self::Unknown,
+fn fail_at(step: Step, error: NsError) -> Fail {
+    let says_unsupported = |e: &io::Error| {
+        matches!(e.kind(), io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput)
+    };
+    let what = match &error {
+        NsError::Io(e) | NsError::Busy(e) | NsError::NotDurable(e) => describe_io(e),
+        other => other.to_string(),
+    };
+    let what = format!("step {step:?}: {what}");
+    match error {
+        // The shape did not do what it must: the entry it just made is not there, a fresh
+        // name is occupied, a file is a directory.
+        NsError::AlreadyExists | NsError::NotEmpty | NsError::CrossVolume => {
+            Fail::Unsupported(what)
         }
-    }
-}
-
-/// The five things the contract needs, on throwaway entries under `work`: a
-/// published file, a refused second no-replace publish, a published directory,
-/// a replacing publish and a discard. A busy step (see [`Fail`]) is `Unknown`.
-fn shapes_work(work: &Path) -> Capability {
-    match try_shapes(work) {
-        Ok(()) => Capability::Supported,
-        Err(Fail::Unsupported) => Capability::Unsupported,
-        Err(Fail::Unknown) => Capability::Unknown,
+        // A missing entry or directory is about the path, not the volume: the directory
+        // under probe was removed (a dropped temp dir, a scanner) while the probe ran. It
+        // concludes nothing, so it is never kept as "the volume cannot do this".
+        NsError::NotFound => Fail::Unknown(what),
+        NsError::Io(e) | NsError::NotDurable(e) if says_unsupported(&e) => Fail::Unsupported(what),
+        _ => Fail::Unknown(what),
     }
 }
 
@@ -263,30 +349,41 @@ fn try_shapes(work: &Path) -> Result<(), Fail> {
         |content: &'static [u8]| move |f: &mut std::fs::File| io::Write::write_all(f, content);
     #[cfg(test)]
     busy_step(Step::FirstPublish)?;
-    ns.create_file(&file, Replace::No, &NoLedger, put(b"probe"))?;
+    ns.create_file(&file, Replace::No, &NoLedger, put(b"probe"))
+        .map_err(|e| fail_at(Step::FirstPublish, e))?;
     // The occupied name must be refused as occupied: success, or a refusal of another kind
     // that is not busy, is the wrong answer.
     #[cfg(test)]
     busy_step(Step::SecondPublish)?;
     match ns.create_file(&file, Replace::No, &NoLedger, put(b"again")) {
         Err(NsError::AlreadyExists) => {}
-        Err(other) => return Err(other.into()),
-        Ok(()) => return Err(Fail::Unsupported),
+        Err(other) => return Err(fail_at(Step::SecondPublish, other)),
+        Ok(()) => {
+            return Err(Fail::Unsupported(format!(
+                "step {:?}: a no-replace publish over an existing file succeeded",
+                Step::SecondPublish
+            )))
+        }
     }
     #[cfg(test)]
     busy_step(Step::CreateDir)?;
-    ns.create_dir(&sub, &NoLedger)?;
+    ns.create_dir(&sub, &NoLedger).map_err(|e| fail_at(Step::CreateDir, e))?;
     #[cfg(test)]
     busy_step(Step::ReplacePublish)?;
-    ns.create_file(&file, Replace::Yes, &NoLedger, put(b"second"))?;
+    ns.create_file(&file, Replace::Yes, &NoLedger, put(b"second"))
+        .map_err(|e| fail_at(Step::ReplacePublish, e))?;
     #[cfg(test)]
     busy_step(Step::ReadBack)?;
-    if std::fs::read(&file).map_err(NsError::from_io)? != b"second" {
-        return Err(Fail::Unsupported);
+    let read = std::fs::read(&file).map_err(|e| fail_at(Step::ReadBack, NsError::from_io(e)))?;
+    if read != b"second" {
+        return Err(Fail::Unsupported(format!(
+            "step {:?}: the replaced file reads back other content",
+            Step::ReadBack
+        )));
     }
     #[cfg(test)]
     busy_step(Step::Discard)?;
-    let discarded = ns.discard(&file, &NoLedger)?;
+    let discarded = ns.discard(&file, &NoLedger).map_err(|e| fail_at(Step::Discard, e))?;
     #[cfg(test)]
     let outcome = if busy_at(Step::Removal) {
         DiscardOutcome::Retained { path: file.clone(), reason: RetainReason::RemovalFailed }
@@ -299,8 +396,12 @@ fn try_shapes(work: &Path) -> Result<(), Fail> {
         DiscardOutcome::Removed => Ok(()),
         // The removal of a file the probe just moved aside failed: the entry is committed
         // away but a holder kept it, which says nothing about the shapes.
-        DiscardOutcome::Retained { reason: RetainReason::RemovalFailed, .. } => Err(Fail::Unknown),
-        _ => Err(Fail::Unsupported),
+        DiscardOutcome::Retained { reason: RetainReason::RemovalFailed, .. } => Err(Fail::Unknown(
+            format!("step {:?}: the moved-aside probe file could not be removed", Step::Removal),
+        )),
+        other => {
+            Err(Fail::Unsupported(format!("step {:?}: discard gave {other:?}", Step::Discard)))
+        }
     }
 }
 
@@ -438,7 +539,7 @@ mod windows {
             return Ok(());
         }
         let ex_error = io::Error::last_os_error();
-        let plain = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+        let plain = FILE_DISPOSITION_INFO { DeleteFile: true };
         // SAFETY: as above, with a live FILE_DISPOSITION_INFO.
         let done = unsafe {
             SetFileInformationByHandle(
@@ -600,11 +701,11 @@ mod tests {
         let error = require_volume_guid_path(&share).unwrap_err();
         assert!(is_no_guid_path(&error), "{error:?}");
         assert!(is_no_guid_path(&volume_key(&share).unwrap_err()));
-        assert_eq!(cached_verdict(&share), Capability::Unsupported);
+        assert_eq!(cached_verdict(&share).verdict, Capability::Unsupported);
         assert_eq!(probe(&share), Capability::Unsupported);
         assert!(matches!(
             DurableNamespace::open(&share),
-            Err(NsError::Unavailable(UnavailableReason::VolumeWithoutGuidPath))
+            Err(NsError::Unavailable(UnavailableReason::VolumeWithoutGuidPath, _))
         ));
     }
 
@@ -663,6 +764,51 @@ mod tests {
         assert_eq!(verdict_for(supported, || panic!("probed twice")), Capability::Supported);
         // ... but a different volume with the same serial gets its own probe.
         assert_eq!(verdict_for(other, || Capability::Unsupported), Capability::Unsupported);
+    }
+
+    /// A conclusive "unsupported" is kept for the volume and still refuses the handle.
+    #[test]
+    fn a_conclusive_unsupported_is_kept_and_refuses() {
+        let volume = intern("conclusive-unsupported-test".to_owned());
+        assert_eq!(verdict_for(volume, || Capability::Unsupported), Capability::Unsupported);
+        assert_eq!(verdict_for(volume, || panic!("probed twice")), Capability::Unsupported);
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            DurableNamespace::from_verdict(
+                Capability::Unsupported,
+                RefusalCause::default(),
+                dir.path()
+            ),
+            Err(NsError::Unavailable(crate::durable_dir::UnavailableReason::Unsupported, _))
+        ));
+    }
+
+    /// The directory under probe vanishing mid-probe (a `NotFound` at any step) says nothing
+    /// about the volume: `Unknown`, not kept, and a later valid directory on the same volume
+    /// is probed fresh and is `Supported`, through the per-volume cache.
+    #[test]
+    fn a_vanished_probe_directory_does_not_poison_the_volume() {
+        for step in [
+            Step::FirstPublish,
+            Step::SecondPublish,
+            Step::CreateDir,
+            Step::ReplacePublish,
+            Step::ReadBack,
+            Step::Discard,
+        ] {
+            let gone = tempfile::tempdir().unwrap();
+            inject_at(step, io::ErrorKind::NotFound);
+            let volume = intern(format!("vanished-test-{step:?}"));
+            let verdict = verdict_for(volume, || probe(gone.path()));
+            BUSY_AT.with(|b| b.set(None));
+            assert_eq!(verdict, Capability::Unknown, "{step:?}");
+            let valid = tempfile::tempdir().unwrap();
+            assert_eq!(
+                verdict_for(volume, || probe(valid.path())),
+                Capability::Supported,
+                "{step:?}"
+            );
+        }
     }
 
     #[test]
@@ -728,6 +874,95 @@ mod tests {
                 assert_eq!(verdict, expected, "{step:?} {kind:?}");
             }
         }
+    }
+
+    fn cause_text(probed: &Probed) -> String {
+        probed.cause.detail().expect("a refusal carries its cause").to_owned()
+    }
+
+    /// Unsupported: the cause names the probe step, the error with its errno, the probed path
+    /// and the volume.
+    #[test]
+    fn an_unsupported_verdict_carries_step_errno_path_and_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        inject_at(Step::CreateDir, io::ErrorKind::Unsupported);
+        let probed = probe_explained(dir.path());
+        BUSY_AT.with(|b| b.set(None));
+        assert_eq!(probed.verdict, Capability::Unsupported);
+        let text = cause_text(&probed);
+        for needle in ["step CreateDir", "errno=", "volume key", &format!("{:?}", dir.path())] {
+            assert!(text.contains(needle), "{needle:?} missing from {text}");
+        }
+        let refused = DurableNamespace::from_verdict(probed.verdict, probed.cause, dir.path());
+        let message = refused.unwrap_err().to_string();
+        assert!(message.contains("Unsupported") && message.contains("step CreateDir"), "{message}");
+    }
+
+    /// A conclusive refusal says what the probe directory held when the volume answered.
+    #[test]
+    fn an_unsupported_verdict_lists_the_probe_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        inject_at(Step::CreateDir, io::ErrorKind::Unsupported);
+        let probed = probe_explained(dir.path());
+        BUSY_AT.with(|b| b.set(None));
+        let text = cause_text(&probed);
+        assert!(text.contains("probe directory held [\"f\"]"), "{text}");
+        assert!(!text.contains("probe directory held") || probed.verdict != Capability::Unknown);
+    }
+
+    /// Unknown, from a step of the probe: same.
+    #[test]
+    fn an_unknown_verdict_from_a_step_carries_step_and_errno() {
+        let dir = tempfile::tempdir().unwrap();
+        inject_at(Step::Discard, io::ErrorKind::ResourceBusy);
+        let probed = probe_explained(dir.path());
+        BUSY_AT.with(|b| b.set(None));
+        assert_eq!(probed.verdict, Capability::Unknown);
+        let text = cause_text(&probed);
+        assert!(text.contains("step Discard") && text.contains("errno="), "{text}");
+        assert!(text.contains("volume key"), "{text}");
+    }
+
+    /// Unknown, because the directory is gone before the volume can be identified: the real
+    /// errno of the failing `stat` is in the message.
+    #[test]
+    fn an_unknown_verdict_for_a_missing_directory_carries_the_errno() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone");
+        let probed = cached_verdict(&missing);
+        assert_eq!(probed.verdict, Capability::Unknown);
+        let text = cause_text(&probed);
+        assert!(text.contains("step volume_key") && text.contains("errno=Some("), "{text}");
+        assert!(text.contains("gone"), "{text}");
+        let message = DurableNamespace::open(&missing).unwrap_err().to_string();
+        assert!(message.contains("errno=Some("), "{message}");
+    }
+
+    /// The cause survives the cache: a refusal answered without probing still explains itself.
+    #[test]
+    fn a_cached_refusal_keeps_its_cause() {
+        let volume = intern("cached-cause-test".to_owned());
+        let cause = RefusalCause::new("step CreateDir: boom [kind=Unsupported, errno=Some(95)]");
+        let first = verdict_cached(volume, || Probed {
+            verdict: Capability::Unsupported,
+            cause: cause.clone(),
+        });
+        assert_eq!(first.cause, cause);
+        assert_eq!(verdict_cached(volume, || panic!("probed twice")).cause, cause);
+    }
+
+    /// The gate and no-GUID-path refusals have causes of their own.
+    #[test]
+    fn gate_and_guid_path_refusals_carry_a_cause() {
+        let error = io::Error::new(io::ErrorKind::Unsupported, NoVolumeGuidPath);
+        let cause = guid_path_cause(Path::new("D:\\data"), &error);
+        let message = NsError::Unavailable(
+            crate::durable_dir::UnavailableReason::VolumeWithoutGuidPath,
+            cause,
+        )
+        .to_string();
+        assert!(message.contains("no GUID path") && message.contains("errno="), "{message}");
+        assert!(message.contains("data"), "{message}");
     }
 
     /// A probe leaves nothing of its own behind, and it never deletes what it did not create.

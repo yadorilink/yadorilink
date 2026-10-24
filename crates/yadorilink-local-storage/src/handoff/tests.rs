@@ -75,6 +75,12 @@ struct Inner {
     app_root: Mutex<String>,
     break_journal_writes: AtomicBool,
     started_old: AtomicUsize,
+    /// What the app daemon's start gate said while the roll-back restarted the previous daemon,
+    /// as a launcher the app left registered would have asked.
+    app_start_at_restart: Mutex<Option<ownership::StartVerdict>>,
+    /// What the program running the operation declares about the state database (it need not be
+    /// the previous install).
+    invoker_state_schema: Mutex<Option<StateSchema>>,
 }
 
 #[derive(Clone)]
@@ -96,6 +102,8 @@ impl Fake {
             app_root: Mutex::new(String::new()),
             break_journal_writes: AtomicBool::new(false),
             started_old: AtomicUsize::new(0),
+            app_start_at_restart: Mutex::new(None),
+            invoker_state_schema: Mutex::new(None),
         }))
     }
 
@@ -144,6 +152,7 @@ impl Host for Fake {
         if self.0.start_fails.load(Ordering::SeqCst) {
             return Err("the daemon binary is gone".into());
         }
+        *self.0.app_start_at_restart.lock().unwrap() = Some(app_start_verdict(&self.0.config));
         self.0.started_old.fetch_add(1, Ordering::SeqCst);
         self.start(DaemonKind::Old)
     }
@@ -175,6 +184,7 @@ impl Host for Fake {
             install_source: "script".into(),
             release_id: OLD_RELEASE.into(),
             engine_api_version: 1,
+            state_schema: *self.0.invoker_state_schema.lock().unwrap(),
         })
     }
 
@@ -235,10 +245,12 @@ impl Env {
         let units = home.join(".config/systemd/user");
         std::fs::create_dir_all(&units).unwrap();
         std::fs::write(units.join(UNIT), b"[Service]").unwrap();
+        let old_install = dir.path().join("old-install");
+        std::fs::create_dir_all(&old_install).unwrap();
         let previous = OwnershipRecord {
             owner: Owner::Cli,
             install_source: "script".into(),
-            install_root: "/home/u/.local/lib/yadorilink".into(),
+            install_root: old_install.display().to_string(),
             release_id: OLD_RELEASE.into(),
             written_at: 1,
         };
@@ -255,6 +267,7 @@ impl Env {
     fn ctx(&self) -> Context {
         Context {
             config_dir: self.config.clone(),
+            sync_db: self.config.join("sync-state.sqlite3"),
             roots: Roots {
                 home: self.home.clone(),
                 system_root: self.home.join("win"),
@@ -423,6 +436,32 @@ async fn rollback_after_the_app_started_stops_the_apps_daemon_and_restarts_the_o
     env.release().await.unwrap();
     env.host.start(DaemonKind::App).unwrap();
     assert_eq!(env.rollback().await, Ok(Outcome::RolledBack(PreviousDaemon::Restarted)));
+    env.assert_as_before(Some(DaemonKind::Old));
+}
+
+/// The verdict the app's daemon gets from the start gate, whoever launched it.
+fn app_start_verdict(config: &Path) -> ownership::StartVerdict {
+    ownership::start_verdict_for_installation(&ownership::read(config), Owner::Gui, "app_bundle")
+}
+
+#[tokio::test]
+async fn an_app_launcher_left_registered_cannot_start_the_apps_daemon_after_a_rollback() {
+    let env = Env::new();
+    env.release().await.unwrap();
+    env.host.start(DaemonKind::App).unwrap();
+    assert_eq!(app_start_verdict(&env.config), ownership::StartVerdict::Proceed);
+    assert_eq!(env.rollback().await, Ok(Outcome::RolledBack(PreviousDaemon::Restarted)));
+    let refused = |v: &ownership::StartVerdict| {
+        matches!(
+            v,
+            ownership::StartVerdict::Refuse(ownership::Refusal::ManagedElsewhere { recorded })
+                if *recorded == env.previous
+        )
+    };
+    // Already refused when the previous daemon was started (the lock was free by then) ...
+    assert!(refused(env.host.0.app_start_at_restart.lock().unwrap().as_ref().unwrap()));
+    // ... and afterwards, so exactly one daemon runs whatever the app did with its launcher.
+    assert!(refused(&app_start_verdict(&env.config)));
     env.assert_as_before(Some(DaemonKind::Old));
 }
 
@@ -1213,4 +1252,196 @@ fn registrations_this_program_cannot_move_are_refused_by_the_service_layer_too()
         assert!(env.host.0.services.restore(&p).is_err());
         assert!(env.host.0.services.is_active(&p).is_err());
     }
+}
+
+fn write_identity_declaring_state(dir: &Path, state: &str) {
+    std::fs::write(
+        dir.join(release_descriptor::ENGINE_IDENTITY_FILE),
+        format!(
+            r#"{{"public_commit_sha":"appsha","build_config_digest":"2","engine_api_version":1,{state}}}"#
+        ),
+    )
+    .unwrap();
+}
+
+/// Stamps the sync index database; returns its bytes.
+fn stamp_state_database(env: &Env, version: u32) -> Vec<u8> {
+    let path = env.config.join("sync-state.sqlite3");
+    std::fs::remove_file(&path).unwrap();
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(&format!("CREATE TABLE t(x); PRAGMA user_version = {version};"))
+            .unwrap();
+    }
+    std::fs::read(path).unwrap()
+}
+
+#[tokio::test]
+async fn an_app_engine_that_cannot_read_the_state_on_disk_is_refused_before_anything_changes() {
+    let macos = |env: &Env| env.app.join("Contents/MacOS");
+    let env = Env::new();
+    let stamped = stamp_state_database(&env, 10);
+    for (declared, expect_newer) in [
+        // A downgrade: the app's engine only reads up to 9.
+        (r#""state_schema_version":9"#, true),
+        // An upgrade across a gap it no longer reads.
+        (r#""state_schema_version":12,"state_schema_min_readable":11"#, false),
+    ] {
+        write_identity_declaring_state(&macos(&env), declared);
+        let before = env.snapshot();
+        let error = env.release().await.unwrap_err();
+        let HandoffError::Refused(refused) = error else { panic!("{error:?}") };
+        assert_eq!(env.snapshot(), before);
+        assert_eq!(std::fs::read(env.config.join("sync-state.sqlite3")).unwrap(), stamped);
+        match refused {
+            Refused::StateIncompatible(StateRefusal::NewerThanReadable { .. }) => {
+                assert!(expect_newer, "{declared}");
+                assert!(refused.message().contains("nothing was changed"));
+            }
+            Refused::StateIncompatible(StateRefusal::OlderThanReadable { .. }) => {
+                assert!(!expect_newer, "{declared}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_app_engine_that_reads_the_state_on_disk_or_declares_nothing_is_accepted() {
+    let macos = |env: &Env| env.app.join("Contents/MacOS");
+    for declared in [
+        r#""state_schema_version":10"#,
+        r#""state_schema_version":11,"state_schema_min_readable":10"#,
+        r#""some_future_field":1"#,
+    ] {
+        let env = Env::new();
+        stamp_state_database(&env, 10);
+        write_identity_declaring_state(&macos(&env), declared);
+        env.release().await.unwrap_or_else(|e| panic!("{declared}: {e:?}"));
+    }
+}
+
+#[test]
+fn the_persisted_state_version_is_what_sqlite_stamped() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(persisted_state_version(&dir.path().join("sync-state.sqlite3")), None);
+    let path = dir.path().join("sync-state.sqlite3");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE t(x); PRAGMA user_version = 132;").unwrap();
+    }
+    assert_eq!(persisted_state_version(&dir.path().join("sync-state.sqlite3")), Some(132));
+    std::fs::write(&path, b"not a database").unwrap();
+    assert_eq!(persisted_state_version(&dir.path().join("sync-state.sqlite3")), None);
+}
+
+#[test]
+fn a_stamp_that_lives_only_in_the_write_ahead_log_is_seen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sync-state.sqlite3");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(())).unwrap();
+    conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+    conn.execute_batch("CREATE TABLE t(x); PRAGMA user_version = 132;").unwrap();
+    // The daemon is still running: nothing has been checkpointed into the main file.
+    assert_eq!(persisted_state_version(&dir.path().join("sync-state.sqlite3")), Some(132));
+    drop(conn);
+}
+
+#[tokio::test]
+async fn the_database_the_daemon_is_configured_to_open_is_the_one_checked() {
+    let macos = |env: &Env| env.app.join("Contents/MacOS");
+    let env = Env::new();
+    // A stale default file says 10; the configured database is stamped 20.
+    stamp_state_database(&env, 10);
+    let configured = env._dir.path().join("elsewhere.sqlite3");
+    {
+        let conn = rusqlite::Connection::open(&configured).unwrap();
+        conn.execute_batch("CREATE TABLE t(x); PRAGMA user_version = 20;").unwrap();
+    }
+    write_identity_declaring_state(&macos(&env), r#""state_schema_version":10"#);
+    let mut ctx = env.ctx();
+    ctx.sync_db = configured;
+    let error = release(&env.host, &ctx, &env.request()).await.unwrap_err();
+    assert!(matches!(
+        error,
+        HandoffError::Refused(Refused::StateIncompatible(StateRefusal::NewerThanReadable { .. }))
+    ));
+}
+
+fn declare_previous_state(env: &Env, state: Option<&str>) {
+    let root = PathBuf::from(&env.previous.install_root);
+    match state {
+        Some(state) => write_identity_declaring_state(&root, state),
+        None => {
+            let _ = std::fs::remove_file(root.join(release_descriptor::ENGINE_IDENTITY_FILE));
+        }
+    }
+}
+
+async fn released_and_restamped(env: &Env) {
+    stamp_state_database(env, 10);
+    env.release().await.unwrap();
+    env.host.start(DaemonKind::App).unwrap();
+}
+
+#[tokio::test]
+async fn a_roll_back_to_a_previous_engine_that_cannot_read_the_state_is_refused_whoever_invokes_it()
+{
+    let env = Env::new();
+    released_and_restamped(&env).await;
+    // The previous install only reads up to 9; the invoking program declares it reads 10.
+    declare_previous_state(&env, Some(r#""state_schema_version":9"#));
+    *env.host.0.invoker_state_schema.lock().unwrap() =
+        Some(StateSchema { writes: 10, reads_from: 10 });
+    let before = env.snapshot();
+    let error = env.rollback().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            HandoffError::Refused(Refused::StateIncompatible(StateRefusal::NewerThanReadable {
+                on_disk: 10,
+                newest_readable: 9
+            }))
+        ),
+        "{error:?}"
+    );
+    assert_eq!(env.snapshot(), before);
+    assert!(matches!(env.journal(), JournalState::Present(_)));
+}
+
+#[tokio::test]
+async fn a_roll_back_to_a_previous_engine_that_reads_the_state_is_allowed_whoever_invokes_it() {
+    let env = Env::new();
+    released_and_restamped(&env).await;
+    // The invoking program could not read 10; the previous install, which is what restarts, can.
+    declare_previous_state(&env, Some(r#""state_schema_version":10"#));
+    *env.host.0.invoker_state_schema.lock().unwrap() =
+        Some(StateSchema { writes: 9, reads_from: 9 });
+    assert_eq!(env.rollback().await, Ok(Outcome::RolledBack(PreviousDaemon::Restarted)));
+}
+
+#[tokio::test]
+async fn a_roll_back_to_a_previous_install_that_cannot_be_read_is_refused_before_anything_stops() {
+    let env = Env::new();
+    released_and_restamped(&env).await;
+    let root = PathBuf::from(&env.previous.install_root);
+    std::fs::write(root.join(release_descriptor::ENGINE_IDENTITY_FILE), b"{").unwrap();
+    let before = env.snapshot();
+    let error = env.rollback().await.unwrap_err();
+    assert!(matches!(error, HandoffError::Refused(Refused::PreviousUnreadable(_))), "{error:?}");
+    assert_eq!(env.snapshot(), before);
+    // An install that is gone cannot be judged either.
+    std::fs::remove_dir_all(&root).unwrap();
+    let error = env.rollback().await.unwrap_err();
+    assert!(matches!(error, HandoffError::Refused(Refused::PreviousUnreadable(_))), "{error:?}");
+    assert_eq!(env.snapshot(), before);
+}
+
+#[tokio::test]
+async fn a_previous_install_that_ships_no_identity_declares_nothing_and_rolls_back() {
+    let env = Env::new();
+    released_and_restamped(&env).await;
+    declare_previous_state(&env, None);
+    assert_eq!(env.rollback().await, Ok(Outcome::RolledBack(PreviousDaemon::Restarted)));
 }

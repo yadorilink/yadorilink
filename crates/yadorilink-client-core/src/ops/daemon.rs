@@ -1,3 +1,4 @@
+// apple-cfg-file: macos-only the background service is a macOS LaunchAgent; no other Apple platform has launchd agents
 //! Starting and stopping the local daemon.
 
 use std::path::PathBuf;
@@ -14,7 +15,7 @@ use yadorilink_local_storage::ownership::{self, Owner, StartVerdict};
 
 use crate::daemon::control;
 use crate::dto::DaemonLaunch;
-use crate::error::CoreError;
+use crate::error::{CoreError, Hint};
 
 /// What [`start_daemon`] found or did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,7 +39,8 @@ pub use yadorilink_local_storage::service_registrations::{
 /// macOS, through the background service (an installed CLI has no daemon
 /// beside it: the daemon is the helper app inside YadoriLink.app), else by
 /// spawning `yadorilink-daemon` from PATH.
-fn default_launch() -> DaemonLaunch {
+#[must_use]
+pub fn default_launch() -> DaemonLaunch {
     if cfg!(target_os = "macos") && !daemon_binary_path().is_absolute() {
         DaemonLaunch::LaunchAgent { label: MACOS_DAEMON_AGENT_LABEL.into() }
     } else {
@@ -68,8 +70,10 @@ pub async fn start_daemon() -> Result<DaemonStartOutcome, CoreError> {
 /// [`CoreError::DaemonUnresponsive`] when a daemon is already running but
 /// does not answer: nothing is launched, since another copy cannot help.
 /// [`CoreError::DaemonNotRunning`] is never returned for a launch failure;
-/// every way the daemon could not be brought up is [`CoreError::Other`],
-/// naming what was tried.
+/// every way the daemon could not be brought up is a [`CoreError::Other`], naming what was
+/// tried, which may be wrapped in [`CoreError::Hinted`] (an unanswered start suggests starting
+/// it again unless a startup refusal is recorded): match it through
+/// [`CoreError::into_unhinted`].
 pub async fn start_daemon_with(launch: &DaemonLaunch) -> Result<DaemonStartOutcome, CoreError> {
     match control::send(ReqPayload::Status(StatusRequest {})).await {
         Ok(_) => return Ok(DaemonStartOutcome::AlreadyRunning),
@@ -211,15 +215,17 @@ async fn wait_for_launch(
     .await;
     match answered {
         Ok(()) => Ok(DaemonStartOutcome::Started),
-        Err(_) => {
-            let mut message =
-                "the daemon did not answer after it was started; run `yadorilink daemon start`"
-                    .to_string();
-            if let Some(refusal) = startup_refusal() {
-                message = format!("{message}\n{refusal}");
-            }
-            Err(CoreError::Other(message))
-        }
+        Err(_) => Err(did_not_answer(startup_refusal())),
+    }
+}
+
+/// A started daemon that never answered. With a recorded startup refusal the daemon declined
+/// to start over its data and starting again cannot help, so no start step is suggested.
+pub(crate) fn did_not_answer(refusal: Option<String>) -> CoreError {
+    let message = "the daemon did not answer after it was started".to_string();
+    match refusal {
+        Some(refusal) => CoreError::Other(format!("{message}\n{refusal}")),
+        None => CoreError::Other(message).hinted(Hint::StartDaemon),
     }
 }
 
@@ -373,12 +379,11 @@ pub async fn stop_and_wait(budget: Duration) -> Result<(), CoreError> {
 /// # Errors
 /// [`CoreError::Other`] when the old daemon is still answering after
 /// [`RESTART_BUDGET`], or the new one could not be started.
-pub(crate) async fn restart_if_running() -> Result<(), CoreError> {
-    restart_if_running_with(&default_launch()).await
-}
-
-/// [`restart_if_running`] with a chosen launch strategy. Under a supervisor
-/// that restarts the daemon by itself the launch finds it already running.
+///
+/// The launch is the caller's: the host's (`CoreConfig::daemon_launch`) or, for the CLI,
+/// [`default_launch`]. There is no launch-less form, so a restart cannot fall back to a
+/// strategy the host did not choose. Under a supervisor that restarts the daemon by itself the
+/// launch finds it already running.
 pub(crate) async fn restart_if_running_with(launch: &DaemonLaunch) -> Result<(), CoreError> {
     let config_dir = crate::coordination::device_config::config_dir()?;
     restart_if_running_in(launch, &config_dir, RESTART_BUDGET, LOCK_RELEASE_BUDGET).await
@@ -405,11 +410,8 @@ async fn restart_if_running_in(
     })
     .await;
     if gone.is_err() {
-        return Err(CoreError::Other(
-            "the running daemon did not stop; restart it with `yadorilink daemon stop` and \
-             `yadorilink daemon start`"
-                .into(),
-        ));
+        return Err(CoreError::Other("the running daemon did not stop".into())
+            .hinted(Hint::StopThenStartDaemon));
     }
     let released = tokio::time::timeout(lock_budget, async {
         // A supervisor may already have brought the replacement up: it holds the lock and answers.
@@ -421,9 +423,10 @@ async fn restart_if_running_in(
     if released.is_err() {
         return Err(CoreError::Other(
             "the old daemon stopped answering but is still exiting, so the new one cannot start \
-             yet; wait a moment and run `yadorilink daemon start`"
+             yet; wait a moment"
                 .into(),
-        ));
+        )
+        .hinted(Hint::WaitThenStartDaemon));
     }
     start_daemon_with(launch).await?;
     Ok(())
@@ -452,8 +455,28 @@ mod tests {
 
     /// Tests that point the control client at their own socket share the
     /// process-global `YADORILINK_CONTROL_SOCKET`, so they run one at a time.
+    #[test]
+    fn a_start_with_a_recorded_refusal_does_not_suggest_starting_again() {
+        let error = did_not_answer(Some("the data needs reset steps".into()));
+        assert_eq!(error.hint(), None, "starting again cannot help");
+        assert_eq!(
+            error.to_string(),
+            "the daemon did not answer after it was started\nthe data needs reset steps"
+        );
+        let error = did_not_answer(None);
+        assert_eq!(error.hint(), Some(Hint::StartDaemon));
+        assert_eq!(error.to_string(), "the daemon did not answer after it was started");
+    }
+
     #[cfg(unix)]
     static SOCKET_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A directory short enough to hold a Unix socket: `sun_path` is about 100 bytes, and the
+    /// default temporary directory of some hosts (an iOS simulator) is longer than that.
+    #[cfg(unix)]
+    fn socket_dir() -> tempfile::TempDir {
+        tempfile::Builder::new().prefix("yl-").tempdir_in("/tmp").unwrap()
+    }
 
     #[test]
     fn a_launch_is_refused_over_another_owners_data_and_allowed_over_its_own() {
@@ -670,10 +693,12 @@ mod tests {
     /// registering has to restart it: ask it to stop, wait until it is gone,
     /// launch a new one, and return only once that one answers.
     #[cfg(unix)]
+    // apple-cfg: ios-explicit launching a daemon process is desktop-only; an iOS app embeds the engine
+    #[cfg_attr(target_os = "ios", ignore = "an iOS app does not launch a daemon process")]
     #[tokio::test]
     async fn restart_stops_the_running_daemon_and_launches_a_new_one() {
         let _guard = SOCKET_ENV_LOCK.lock().await;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = socket_dir();
         let socket = dir.path().join("daemon.sock");
         let launched = dir.path().join("launched");
         let script = dir.path().join("launch.sh");
@@ -718,10 +743,12 @@ mod tests {
     /// is still exiting). A new daemon started in that window is refused by the lock and never
     /// answers; the restart must wait for the lock to go before it launches.
     #[cfg(unix)]
+    // apple-cfg: ios-explicit launching a daemon process is desktop-only; an iOS app embeds the engine
+    #[cfg_attr(target_os = "ios", ignore = "an iOS app does not launch a daemon process")]
     #[tokio::test]
     async fn restart_waits_for_the_old_daemon_to_release_the_lock_before_launching() {
         let _guard = SOCKET_ENV_LOCK.lock().await;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = socket_dir();
         let socket = dir.path().join("daemon.sock");
         let launched = dir.path().join("launched");
         let script = dir.path().join("launch.sh");
@@ -776,7 +803,7 @@ mod tests {
     #[tokio::test]
     async fn restart_accepts_a_replacement_the_supervisor_started() {
         let _guard = SOCKET_ENV_LOCK.lock().await;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = socket_dir();
         let socket = dir.path().join("daemon.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         std::env::set_var("YADORILINK_CONTROL_SOCKET", &socket);
@@ -812,7 +839,7 @@ mod tests {
     #[tokio::test]
     async fn restart_reports_an_old_daemon_that_never_releases_the_lock() {
         let _guard = SOCKET_ENV_LOCK.lock().await;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = socket_dir();
         let socket = dir.path().join("daemon.sock");
         let launched = dir.path().join("launched");
         let script = dir.path().join("launch.sh");
@@ -840,8 +867,13 @@ mod tests {
         .await;
         std::env::remove_var("YADORILINK_CONTROL_SOCKET");
         fake_daemon.abort();
-        let message = result.unwrap_err().to_string();
-        assert!(message.contains("yadorilink daemon start"), "{message}");
+        let error = result.unwrap_err();
+        assert_eq!(error.hint(), Some(Hint::WaitThenStartDaemon));
+        assert_eq!(
+            error.to_string(),
+            "the old daemon stopped answering but is still exiting, so the new one cannot start \
+             yet; wait a moment"
+        );
         assert!(!launched.exists());
     }
 
@@ -865,13 +897,38 @@ mod tests {
         }
     }
 
+    /// A daemon that keeps answering after the stop request is reported with its own step.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_reports_a_daemon_that_did_not_stop() {
+        let _guard = SOCKET_ENV_LOCK.lock().await;
+        let dir = socket_dir();
+        let socket = dir.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        std::env::set_var("YADORILINK_CONTROL_SOCKET", &socket);
+        let fake_daemon = tokio::spawn(answer_status_forever(listener));
+        let launch = DaemonLaunch::SpawnBinary { path: Some("/nonexistent/daemon".into()) };
+        let result = restart_if_running_in(
+            &launch,
+            dir.path(),
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+        )
+        .await;
+        std::env::remove_var("YADORILINK_CONTROL_SOCKET");
+        fake_daemon.abort();
+        let error = result.unwrap_err();
+        assert_eq!(error.hint(), Some(Hint::StopThenStartDaemon));
+        assert_eq!(error.to_string(), "the running daemon did not stop");
+    }
+
     /// A kickstart launchd accepted while it was still tearing the stopped job
     /// down starts nothing; repeating it is what brings the daemon back.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_launch_that_did_not_take_is_repeated_until_the_daemon_answers() {
         let _guard = SOCKET_ENV_LOCK.lock().await;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = socket_dir();
         let socket = dir.path().join("daemon.sock");
         let launches = dir.path().join("launches");
         let script = dir.path().join("launch.sh");
@@ -903,6 +960,77 @@ mod tests {
         fake_daemon.abort();
 
         assert_eq!(result.unwrap(), DaemonStartOutcome::Started);
+    }
+
+    /// Start over's daemon steps run on the launch the host configured, not on `default_launch()`:
+    /// a launch that cannot run names its own program in the error.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // a test-only env lock, always taken after the socket lock
+    async fn start_over_starts_the_daemon_with_its_own_launch() {
+        use crate::ops::start_over::{MachinePorts, StartOverPorts};
+        let _guard = SOCKET_ENV_LOCK.lock().await;
+        let _config = crate::coordination::device_config::CONFIG_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = socket_dir();
+        std::env::set_var("YADORILINK_CONTROL_SOCKET", dir.path().join("absent.sock"));
+        std::env::set_var("YADORILINK_CONFIG_DIR", dir.path().join("state"));
+        let ports = MachinePorts {
+            launch: DaemonLaunch::SpawnBinary {
+                path: Some("/nonexistent/host-chosen-daemon".into()),
+            },
+        };
+        let result = ports.ensure_daemon_running().await;
+        std::env::remove_var("YADORILINK_CONTROL_SOCKET");
+        std::env::remove_var("YADORILINK_CONFIG_DIR");
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("host-chosen-daemon"), "{message}");
+    }
+
+    /// The restart of a running daemon launches the new one with the ports' launch.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // a test-only env lock, always taken after the socket lock
+    async fn start_over_restarts_a_running_daemon_with_its_own_launch() {
+        use crate::ops::start_over::{MachinePorts, StartOverPorts};
+        let _guard = SOCKET_ENV_LOCK.lock().await;
+        let _config = crate::coordination::device_config::CONFIG_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = socket_dir();
+        let socket = dir.path().join("daemon.sock");
+        let launched = dir.path().join("launched");
+        let script = dir.path().join("launch.sh");
+        std::fs::write(&script, format!("#!/bin/sh\ntouch '{}'\n", launched.display())).unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        std::env::set_var("YADORILINK_CONTROL_SOCKET", &socket);
+        std::env::set_var("YADORILINK_CONFIG_DIR", dir.path().join("state"));
+        let fake_daemon = tokio::spawn({
+            let socket = socket.clone();
+            let launched = launched.clone();
+            async move {
+                serve_until_shutdown(&listener).await;
+                drop(listener);
+                std::fs::remove_file(&socket).unwrap();
+                while !launched.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+                serve_until_shutdown(&listener).await;
+            }
+        });
+        let ports = MachinePorts {
+            launch: DaemonLaunch::SpawnBinary { path: Some(script.display().to_string()) },
+        };
+        let result = ports.restart_daemon_if_running().await;
+        std::env::remove_var("YADORILINK_CONTROL_SOCKET");
+        std::env::remove_var("YADORILINK_CONFIG_DIR");
+        fake_daemon.abort();
+        result.unwrap();
+        assert!(launched.exists(), "the restart did not use the ports' launch");
     }
 
     /// With no daemon running there is nothing to restart and nothing to

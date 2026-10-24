@@ -287,10 +287,10 @@ pub async fn materialize_temp(
         crate::hydration::Materialized::Temp(TempOutcome::VersionOutOfDate) => {
             Ok(RangedOutcome::VersionOutOfDate)
         }
-        crate::hydration::Materialized::Temp(TempOutcome::RangeNotSatisfiable) => {
-            Ok(RangedOutcome::RangeNotSatisfiable)
-        }
-        crate::hydration::Materialized::InPlace => {
+        crate::hydration::Materialized::Temp(
+            TempOutcome::RangeNotSatisfiable | TempOutcome::RangeTooLarge,
+        ) => Ok(RangedOutcome::RangeNotSatisfiable),
+        crate::hydration::Materialized::InPlace(_) => {
             Err(SyncError::HydrationFailed(path.to_string()))
         }
     }

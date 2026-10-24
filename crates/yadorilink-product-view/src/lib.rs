@@ -29,8 +29,8 @@ pub use device::{
     peer_counts, DeviceSummary,
 };
 pub use folder::{
-    DurabilityStatus, FetchAvailability, FolderMode, FolderState, FolderSummary, FolderTransfer,
-    LocalStorageState,
+    DegradedCause, DurabilityStatus, FetchAvailability, FolderMode, FolderState, FolderSummary,
+    FolderTransfer, LocalStorageState,
 };
 pub use protection::{Protection, ProtectionSummary};
 pub use summary::{AttentionReason, ProductState, ProductStatusSummary};

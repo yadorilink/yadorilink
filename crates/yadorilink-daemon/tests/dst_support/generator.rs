@@ -1089,6 +1089,12 @@ fn fault_devices(fault: &Fault) -> Vec<usize> {
     match fault {
         Fault::Net(NetFault::Partition { device_a, device_b })
         | Fault::Net(NetFault::Heal { device_a, device_b }) => vec![*device_a, *device_b],
+        Fault::Net(NetFault::PartitionOneWay { from, to })
+        | Fault::Net(NetFault::HealOneWay { from, to })
+        | Fault::Net(NetFault::DuplicateDatagrams { from, to, .. })
+        | Fault::Net(NetFault::StopDuplicating { from, to }) => vec![*from, *to],
+        Fault::Net(NetFault::HoldInbound { device, .. })
+        | Fault::Net(NetFault::StopHolding { device }) => vec![*device],
         Fault::Net(_) | Fault::Disk(_) => vec![],
         Fault::Crash { device }
         | Fault::Restart { device }

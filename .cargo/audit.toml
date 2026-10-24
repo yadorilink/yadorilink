@@ -1,15 +1,31 @@
 # cargo-audit configuration.
 #
-# Triaged vulnerability exceptions. Mirrors the same two IDs `.config/deny.toml`'s
-# `[advisories] ignore` carries for the workspace's cargo-deny check; see that
-# file's comment for the dependency-path and impact-assessment rationale.
-# Both are quick-xml DoS advisories pulled in
-# only through the Linux desktop UI's build-time/local-XML paths
-# (wayland-scanner, zbus_xml/atspi), not reachable from untrusted network
-# input. The fix needs an upstream egui/winit/wayland/accesskit bump that
-# cannot be done via the lockfile alone; remove these once that bump lands.
+# Triaged advisory exceptions. The audit stays blocking for every other (and
+# future) advisory; only these IDs are ignored. Each entry records the
+# dependency path, the upstream tracking link and the condition for removing
+# it. Review again by 2027-02-01 (or sooner when the upstream release lands)
+# and delete an entry as soon as the lockfile no longer contains the crate.
+# docs/third-party-unmaintained.md carries the same information.
+#
+# A vulnerability with no fixed release yet is handled the same way: add its ID
+# here with the reasoning, the tracking link and a review date, in a pull
+# request reviewed like any other change. The daily audit workflow
+# (audit-daily.yml) and the release audit both read this file.
 [advisories]
 ignore = [
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
+    # basic-toml 0.1.10 (unmaintained). Not a vulnerability. Reached only
+    # through the optional UniFFI binding generator (uniffi_bindgen ->
+    # askama -> askama_derive), a build-time tool; no shipped binary links it.
+    # askama has already replaced it with `toml` on its main branch
+    # (askama-rs/askama#771, merged 2026-10-20) but has not released it.
+    # Remove once an askama release newer than 0.16.1 is adopted by a uniffi
+    # release (`cargo update -p askama_derive` once uniffi allows it).
+    "RUSTSEC-2026-0374",
+    # paste 1.0.15 (unmaintained, proc-macro). Not a vulnerability. Reached
+    # through iroh -> netwatch 0.19 -> netlink-packet-core 0.8 (Linux and
+    # Android only). netwatch 0.20 uses netlink-packet-core 0.9, which drops
+    # paste (rust-netlink/netlink-packet-core#41), but the newest iroh (1.4.1)
+    # still requires netwatch ^0.19.3, so the lockfile cannot move on its own.
+    # Remove once an iroh release depends on netwatch 0.20 or newer.
+    "RUSTSEC-2024-0436",
 ]

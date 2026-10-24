@@ -18,31 +18,31 @@ pub fn config_dir() -> PathBuf {
 }
 
 /// Where a rebootstrap keeps what it saves of the user's own changes: under the
-/// daemon's state directory, outside every folder it syncs.
-pub fn recovery_root() -> PathBuf {
-    config_dir().join("recovery")
+/// state directory `config_dir`, outside every folder it syncs.
+pub fn recovery_root(config_dir: &std::path::Path) -> PathBuf {
+    config_dir.join("recovery")
 }
 
 /// The part of [`recovery_root`] one device's rebootstraps use. The restart sweep removes every
 /// area of a group that never reached its barrier, so two daemons sharing a state directory
 /// (as in-process test daemons do) must not share an area directory either: one's sweep would
 /// remove the other's rebootstrap in flight.
-pub fn recovery_root_of(device_id: &str) -> PathBuf {
-    recovery_root().join(device_id)
+pub fn recovery_root_of(config_dir: &std::path::Path, device_id: &str) -> PathBuf {
+    recovery_root(config_dir).join(device_id)
 }
 
 /// Where the versions a rebootstrap set aside stay until the user restores or discards them:
 /// under the daemon's state directory, outside every folder it syncs and apart from
 /// [`recovery_root`], whose areas end with their rebootstrap.
-pub fn recovery_items_root() -> PathBuf {
-    config_dir().join("recovery-items")
+pub fn recovery_items_root(config_dir: &std::path::Path) -> PathBuf {
+    config_dir.join("recovery-items")
 }
 
 /// The part of [`recovery_items_root`] one device uses: its sweep removes every item directory
 /// its own database does not register, so a daemon sharing the state directory must not share
 /// the directories either.
-pub fn recovery_items_root_of(device_id: &str) -> PathBuf {
-    recovery_items_root().join(device_id)
+pub fn recovery_items_root_of(config_dir: &std::path::Path, device_id: &str) -> PathBuf {
+    recovery_items_root(config_dir).join(device_id)
 }
 
 /// Whether linking `local_path` would put the recovery area inside the folder or
@@ -78,7 +78,12 @@ pub fn link_overlaps_recovery_area(
 }
 
 pub fn config_path() -> PathBuf {
-    config_dir().join("device.json")
+    config_path_in(&config_dir())
+}
+
+/// The device config of the state directory `config_dir`.
+pub fn config_path_in(config_dir: &std::path::Path) -> PathBuf {
+    config_dir.join("device.json")
 }
 
 #[cfg(windows)]
@@ -130,7 +135,12 @@ pub enum DeviceConfigError {
 /// Reads the current pre-release device config. No legacy fields, missing
 /// identity fingerprints, or pre-versioning sentinel are accepted.
 pub fn load() -> Result<Option<DeviceConfig>, DeviceConfigError> {
-    let path = config_path();
+    load_in(&config_dir())
+}
+
+/// [`load`] from the state directory `config_dir`.
+pub fn load_in(config_dir: &std::path::Path) -> Result<Option<DeviceConfig>, DeviceConfigError> {
+    let path = config_path_in(config_dir);
     let contents = match std::fs::read_to_string(&path) {
         Ok(contents) => contents,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),

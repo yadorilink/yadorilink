@@ -2,7 +2,8 @@
 
 use super::*;
 use yadorilink_ipc_proto::daemonctl::{
-    FetchAvailability as Fetch, GroupDurabilityStatus as Durability, LocalStorageState as Storage,
+    DegradedCause as Wire, FetchAvailability as Fetch, GroupDurabilityStatus as Durability,
+    LocalStorageState as Storage,
 };
 
 fn link(group: &str) -> LinkStatus {
@@ -173,7 +174,30 @@ fn each_attention_condition_is_needs_attention() {
             LinkStatus { durability_status: Durability::Unknown as i32, ..link("a") },
             AttentionReason::DurabilityUnconfirmed,
         ),
-        (LinkStatus { degraded: true, ..link("a") }, AttentionReason::Degraded),
+        (
+            LinkStatus { degraded: true, ..link("a") },
+            AttentionReason::Degraded(DegradedCause::Stopped),
+        ),
+        (
+            LinkStatus {
+                degraded: true,
+                degraded_cause: Wire::WaitingForDiskSpace as i32,
+                ..link("a")
+            },
+            AttentionReason::Degraded(DegradedCause::WaitingForDiskSpace),
+        ),
+        (
+            LinkStatus { degraded: true, degraded_cause: Wire::FileWatchLimit as i32, ..link("a") },
+            AttentionReason::Degraded(DegradedCause::FileWatchLimit),
+        ),
+        (
+            LinkStatus { degraded: true, degraded_cause: Wire::OwnershipLost as i32, ..link("a") },
+            AttentionReason::Degraded(DegradedCause::OwnershipLost),
+        ),
+        (
+            LinkStatus { degraded: true, degraded_cause: Wire::NotJoined as i32, ..link("a") },
+            AttentionReason::Degraded(DegradedCause::NotJoined),
+        ),
         (LinkStatus { ambiguous: true, ..link("a") }, AttentionReason::LinkedTwice),
         (LinkStatus { capture_volume_changed: true, ..link("a") }, AttentionReason::VolumeChanged),
         (
@@ -188,6 +212,23 @@ fn each_attention_condition_is_needs_attention() {
         assert_eq!(s.attention_reasons, vec![reason]);
         assert_eq!(s.attention_count, 1);
     }
+}
+
+/// A folder waiting for disk space is offered what the typed item offers, not a retry of a stopped
+/// folder.
+#[test]
+fn a_disk_space_wait_is_not_offered_a_retry() {
+    let stopped = LinkStatus { degraded: true, ..link("a") };
+    let waiting = LinkStatus {
+        degraded: true,
+        degraded_cause: Wire::WaitingForDiskSpace as i32,
+        ..link("a")
+    };
+    assert_eq!(ProductStatusSummary::for_folder(&stopped).next_action, Some(ProductAction::Retry));
+    assert_eq!(
+        ProductStatusSummary::for_folder(&waiting).next_action,
+        Some(ProductAction::ViewDetails)
+    );
 }
 
 #[test]

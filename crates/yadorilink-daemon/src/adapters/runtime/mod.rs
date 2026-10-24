@@ -22,5 +22,6 @@ pub(crate) mod reporting;
 pub(crate) mod role_loss_journal;
 pub(crate) mod runtime_control;
 pub(crate) mod safe_stop;
+#[cfg(feature = "process-model")]
 pub(crate) mod update;
 pub(crate) mod version_restore;

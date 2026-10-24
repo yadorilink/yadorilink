@@ -30,10 +30,16 @@ use crate::materialization_execution::{
 /// race this same fingerprint also closes, eviction's outcome on a false
 /// match is more destructive: removing the object below destroys the
 /// user's just-edited bytes, not merely stale remote content.
+///
+/// On a Windows volume whose change time or USN cannot be read the samples are the size and
+/// write time alone (`disk_race_fingerprint_or_stat`): a never-equal sample would make every
+/// eviction of an existing file refuse. This is no weaker for eviction, which also compares the
+/// file's bytes with the indexed blocks (`disk_bytes_match_indexed_blocks`) at every point this
+/// fingerprint is compared.
 type DiskIdentity = Option<yadorilink_fs_platform::fs_identity::DiskRaceFingerprint>;
 
 fn disk_identity(path: &Path) -> Result<DiskIdentity, MaterializationExecutionError> {
-    Ok(yadorilink_fs_platform::fs_identity::disk_race_fingerprint(path))
+    Ok(yadorilink_fs_platform::fs_identity::disk_race_fingerprint_or_stat(path))
 }
 
 /// A point between eviction's last check of the object and its removal, at

@@ -210,6 +210,7 @@ pub async fn accept_invite(
             local_path: non_empty(&body.path, "path")?.to_string(),
             on_demand: body.on_demand,
             acknowledge_risks: body.acknowledge_risks,
+            ..Default::default()
         }))
         .await?;
     let Some(RespPayload::AcceptInviteCommand(r)) = resp.payload else {

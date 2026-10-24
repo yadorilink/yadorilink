@@ -40,7 +40,7 @@ impl Owner {
     #[must_use]
     pub fn for_install_source(install_source: &str) -> Self {
         match install_source {
-            "app_bundle" | "microsoft_store" => Owner::Gui,
+            "app_bundle" | "microsoft_store" | "app_store" => Owner::Gui,
             _ => Owner::Cli,
         }
     }
@@ -87,6 +87,47 @@ pub fn uninstaller_elsewhere(install_source: &str) -> Option<&'static str> {
         "container" => "stop and remove the container; its data lives in the volume you mounted",
         _ => return None,
     })
+}
+
+/// The configured cargo home: `CARGO_HOME` when set and non-empty, else `<home>/.cargo`.
+#[must_use]
+pub fn cargo_home(env_cargo_home: Option<&str>, home: Option<&Path>) -> Option<PathBuf> {
+    match env_cargo_home.filter(|v| !v.is_empty()) {
+        Some(dir) => Some(PathBuf::from(dir)),
+        None => home.map(|h| h.join(".cargo")),
+    }
+}
+
+/// Whether `exe` lies in cargo's install directory: `<cargo_home>/bin` (both canonicalized when
+/// they exist), or, whatever the configured home, a `.cargo/bin` path.
+#[must_use]
+pub fn is_cargo_install_path(exe: &Path, cargo_home: Option<&Path>) -> bool {
+    let components: Vec<_> = exe.components().map(|c| c.as_os_str()).collect();
+    if components.windows(2).any(|pair| pair[0] == ".cargo" && pair[1] == "bin") {
+        return true;
+    }
+    let Some(bin) = cargo_home.map(|h| h.join("bin")) else { return false };
+    let Some(exe_dir) = exe.parent() else { return false };
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(exe_dir) == canon(&bin)
+}
+
+/// What to do about a copy that no updater and no installer receipt owns (`standalone`, or an
+/// unknown source): the command line neither updates nor removes it. `update` selects the
+/// update step, otherwise the removal step. A `cargo install` copy names the cargo commands; any
+/// other copy was placed by hand and is replaced or deleted by hand. `cargo_home` is the
+/// configured cargo home ([`cargo_home`]), which the caller resolves from its environment.
+#[must_use]
+pub fn unowned_install_steps(exe: &Path, update: bool, cargo_home: Option<&Path>) -> &'static str {
+    match (is_cargo_install_path(exe, cargo_home), update) {
+        (true, true) => "repeat the `cargo install --locked --force` command you installed it with (`--path` or `--git`, crate `yadorilink-cli`)",
+        (true, false) => "run `cargo uninstall yadorilink-cli`",
+        (false, true) => {
+            "download the new release from https://github.com/yadorilink/yadorilink/releases and \
+             replace the binaries you placed, or reinstall with the installer from https://yadori.link"
+        }
+        (false, false) => "delete the binaries you placed by hand",
+    }
 }
 
 /// Whether `exe` lies inside a macOS application bundle: some directory named `*.app` directly
@@ -172,7 +213,7 @@ pub fn write(config_dir: &Path, record: &OwnershipRecord) -> std::io::Result<()>
     let result = (|| -> std::io::Result<()> {
         let mut file = std::fs::OpenOptions::new().create_new(true).write(true).open(&temporary)?;
         file.write_all(&body)?;
-        file.sync_all()?;
+        yadorilink_fs_platform::flush::sync_file(&file)?;
         drop(file);
         yadorilink_fs_platform::durable_dir::publish_durably(
             &temporary,
@@ -319,6 +360,48 @@ pub fn start_verdict_for_installation(
 mod tests {
     use super::*;
 
+    #[test]
+    fn cargo_home_prefers_the_environment_then_the_home_directory() {
+        let home = Path::new("/home/u");
+        assert_eq!(cargo_home(Some("/opt/cargo"), Some(home)), Some(PathBuf::from("/opt/cargo")));
+        assert_eq!(cargo_home(Some(""), Some(home)), Some(PathBuf::from("/home/u/.cargo")));
+        assert_eq!(cargo_home(None, Some(home)), Some(PathBuf::from("/home/u/.cargo")));
+        assert_eq!(cargo_home(None, None), None);
+    }
+
+    #[test]
+    fn a_custom_cargo_home_bin_is_a_cargo_install_and_an_unrelated_bin_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("opt-cargo");
+        std::fs::create_dir_all(home.join("bin")).unwrap();
+        std::fs::create_dir_all(dir.path().join("tools")).unwrap();
+        let exe = home.join("bin/yadorilink");
+        let other = dir.path().join("tools/yadorilink");
+        assert!(is_cargo_install_path(&exe, Some(&home)));
+        assert!(!is_cargo_install_path(&other, Some(&home)));
+        assert!(!is_cargo_install_path(&exe, None));
+        assert!(unowned_install_steps(&exe, false, Some(&home)).contains("cargo uninstall"));
+        assert!(unowned_install_steps(&other, false, Some(&home)).contains("by hand"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_cargo_home_matches_the_real_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("opt-cargo");
+        std::fs::create_dir_all(home.join("bin")).unwrap();
+        let exe = home.join("bin/yadorilink");
+        let link = dir.path().join("cargo-link");
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+        assert!(is_cargo_install_path(&exe, Some(&link)));
+    }
+
+    #[test]
+    fn the_dot_cargo_bin_layout_is_recognized_without_a_configured_home() {
+        assert!(is_cargo_install_path(Path::new("/home/u/.cargo/bin/yadorilink"), None));
+        assert!(!is_cargo_install_path(Path::new("/home/u/bin/yadorilink"), None));
+    }
+
     fn record(owner: Owner, source: &str) -> OwnershipRecord {
         OwnershipRecord {
             owner,
@@ -373,6 +456,7 @@ mod tests {
     fn owner_follows_the_install_source() {
         assert_eq!(Owner::for_install_source("app_bundle"), Owner::Gui);
         assert_eq!(Owner::for_install_source("microsoft_store"), Owner::Gui);
+        assert_eq!(Owner::for_install_source("app_store"), Owner::Gui);
         for s in ["script", "standalone", "homebrew", "apt", "winget", "container", "other"] {
             assert_eq!(Owner::for_install_source(s), Owner::Cli, "{s}");
         }

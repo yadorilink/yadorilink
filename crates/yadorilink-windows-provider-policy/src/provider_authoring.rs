@@ -251,7 +251,7 @@ fn write_new(path: &Path, contents: &str) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     let mut file = std::fs::File::create(&tmp)?;
     file.write_all(contents.as_bytes())?;
-    file.sync_all()?;
+    yadorilink_fs_platform::flush::sync_file(&file)?;
     drop(file);
     // A durable publish: the journal or sequence file is on disk before the request that
     // depends on it is sent.

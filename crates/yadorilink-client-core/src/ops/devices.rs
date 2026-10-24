@@ -1,9 +1,9 @@
 //! This account's device registry: registering this device, listing the
 //! account's devices, and removing one.
 
+use crate::coordination::http_client::CoordinationAccess;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use yadorilink_fapi_client::CoordinationAuth;
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::{
@@ -11,16 +11,9 @@ use yadorilink_ipc_proto::daemonctl::{
 };
 
 use crate::coordination::device_config;
-use crate::coordination::http_client::{coordination_addr, get_json, post_json, require_auth};
+use crate::coordination::http_client::{get_json, post_json, require_auth};
 use crate::daemon::control;
-use crate::error::CoreError;
-
-/// The device's Ed25519 key, generated on first use. It is the device's
-/// whole identity: its public half is registered so peers can pin it, verify
-/// this device's signed change history, and authenticate its connections.
-fn signing_keypair_path() -> Result<std::path::PathBuf, CoreError> {
-    Ok(device_config::config_dir()?.join("signing_key"))
-}
+use crate::error::{CoreError, Hint};
 
 // The coordination plane reads/writes camelCase JSON keys.
 #[derive(Serialize)]
@@ -52,16 +45,71 @@ struct ListDevicesResponse {
 
 /// Registers this device and persists the one canonical pre-release
 /// `device.json` shape, returning the assigned `device_id`. A daemon that is
-/// already running is restarted so it starts as this registered device.
-pub async fn register_device(device_name: String) -> Result<String, CoreError> {
+/// already running is restarted, with `launch`, so it starts as this registered device.
+pub async fn register_device(
+    device_name: String,
+    launch: &crate::dto::DaemonLaunch,
+) -> Result<String, CoreError> {
+    let dir = crate::coordination::credential_store::process_dir()?;
+    let settings = crate::coordination::credential_store::CredentialSettings::from_env(&dir)?;
+    let device_id = register_device_in(&dir, &settings, device_name).await?;
+    // A running daemon read `device.json` at startup and would keep acting as
+    // an unregistered device until restarted.
+    //
+    // The registration is done by now and stays done: a restart that cannot be
+    // confirmed is reported as that, with the one command that brings the daemon
+    // back, not as a failed registration.
+    if let Err(e) = crate::ops::daemon::restart_if_running_with(launch).await {
+        return Err(restart_failed_after_registration(
+            &device_id,
+            e,
+            crate::ops::daemon::startup_refusal(),
+        ));
+    }
+    Ok(device_id)
+}
+
+/// The registration is done and stays done; the restart that was to make the daemon adopt it
+/// failed. The restart's own next step is carried outward; with none, starting the daemon is it
+/// unless that cannot help (see below).
+fn restart_failed_after_registration(
+    device_id: &str,
+    restart_error: CoreError,
+    startup_refusal: Option<String>,
+) -> CoreError {
+    // No start step where starting cannot help: the daemon refused its data (a recorded
+    // refusal explains), or another owner manages it.
+    let fallback = (startup_refusal.is_none()
+        && !matches!(restart_error, CoreError::ManagedElsewhere(_)))
+    .then_some(Hint::StartDaemon);
+    restart_error.with_context(
+        |why| {
+            format!(
+                "this device is registered ({device_id}), but the daemon could not be restarted \
+                 to pick it up: {why}"
+            )
+        },
+        fallback,
+    )
+}
+
+/// Registers this device in the state directory `dir` (its key, its `device.json`) without
+/// touching any running process: the caller restarts whatever read the old state.
+pub async fn register_device_in(
+    dir: &std::path::Path,
+    settings: &crate::coordination::credential_store::CredentialSettings,
+    device_name: String,
+) -> Result<String, CoreError> {
     // Before anything is created or the server is asked: a registration whose key and
     // `device.json` could not be kept would orphan the device.
-    let signing_key_path = signing_keypair_path()?;
-    crate::ops::start_over::ensure_registration_allowed(&device_config::config_dir()?)?;
-    let auth = require_auth().await?;
-    let signing_keypair =
-        yadorilink_transport::DeviceSigningKeyPair::load_or_generate(signing_key_path)
-            .map_err(|e| CoreError::Other(e.to_string()))?;
+    let signing_key_path = dir.join("signing_key");
+    crate::ops::start_over::ensure_registration_allowed(dir)?;
+    let auth = crate::coordination::http_client::require_auth_in(dir, settings).await?;
+    let signing_keypair = yadorilink_transport::DeviceSigningKeyPair::load_or_generate(
+        signing_key_path,
+        settings.key_mirror,
+    )
+    .map_err(|e| CoreError::Other(e.to_string()))?;
 
     let signing_public_key_base64 =
         base64::engine::general_purpose::STANDARD.encode(signing_keypair.public_bytes());
@@ -76,25 +124,15 @@ pub async fn register_device(device_name: String) -> Result<String, CoreError> {
     )
     .await?;
 
-    device_config::save(&device_config::DeviceConfig {
-        device_id: resp.device_id.clone(),
-        coordination_addr: coordination_addr(),
-        signing_public_key: signing_public_key_base64,
-        config_version: device_config::CONFIG_VERSION,
-    })?;
-    // A running daemon read `device.json` at startup and would keep acting as
-    // an unregistered device until restarted.
-    //
-    // The registration is done by now and stays done: a restart that cannot be
-    // confirmed is reported as that, with the one command that brings the daemon
-    // back, not as a failed registration.
-    if let Err(e) = crate::ops::daemon::restart_if_running().await {
-        return Err(CoreError::Other(format!(
-            "this device is registered ({}), but the daemon could not be restarted to pick it \
-             up: {e}. Run `yadorilink daemon start`.",
-            resp.device_id
-        )));
-    }
+    device_config::save_in(
+        dir,
+        &device_config::DeviceConfig {
+            device_id: resp.device_id.clone(),
+            coordination_addr: settings.coordination_addr(),
+            signing_public_key: signing_public_key_base64,
+            config_version: device_config::CONFIG_VERSION,
+        },
+    )?;
     Ok(resp.device_id)
 }
 
@@ -108,7 +146,7 @@ pub async fn list_devices() -> Result<Vec<DeviceInfo>, CoreError> {
 /// this machine's own device, shown online whatever the coordination plane
 /// last observed of it -- see `ops::shares::fetch_members`.
 async fn fetch_devices(
-    auth: &CoordinationAuth,
+    auth: &CoordinationAccess,
     own_device_id: Option<&str>,
 ) -> Result<Vec<DeviceInfo>, CoreError> {
     let resp: ListDevicesResponse = get_json("/devices", auth).await?;

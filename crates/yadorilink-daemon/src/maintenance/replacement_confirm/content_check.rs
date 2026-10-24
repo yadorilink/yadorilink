@@ -12,9 +12,15 @@
 //!   the platform has them, inode, device and ctime). A completed verification never authorizes a
 //!   confirm by itself: [`refresh`] runs immediately before every confirm call, re-stats every
 //!   entry and re-hashes any whose fingerprint changed, so a file damaged after the verification
-//!   (for example while the service answered 409) stops the confirm. Where the platform has no
-//!   ctime/inode (not unix) a same-size rewrite with a restored mtime is not noticed; that is a
-//!   documented limit, and the window between the refresh and the confirm call remains.
+//!   (for example while the service answered 409) stops the confirm. A stat taken
+//!   within a couple of seconds of the file's mtime is "racy" (a same-size rewrite in the same
+//!   timestamp tick leaves it unchanged), so such an entry is re-read instead of trusted. The
+//!   order is: verify, then [`refresh`] of every group (this is the settle step: it re-reads every
+//!   racy entry), then the stat-only final sweep, which never reads content and fails closed on any
+//!   entry still racy (it settles on a later pass). Where the
+//!   platform has no ctime/inode (not unix) a same-size rewrite with a restored mtime is not
+//!   noticed; that is a documented limit, and the window between the refresh and the confirm call
+//!   remains.
 //! * With several groups the refresh of each is followed, once all are refreshed, by a stat-only
 //!   [`still_unchanged`] pass over all of them, so a long re-hash of a later group never widens
 //!   an earlier group's window beyond a stat sweep.
@@ -25,7 +31,7 @@
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use yadorilink_local_storage::{
     disk_matches_expected_object, DiskContentComparison, ExpectedObject,
@@ -48,13 +54,33 @@ pub(crate) struct ExpectedEntry {
 }
 
 /// What a stat said about an entry when it was verified.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct Fingerprint {
     size: u64,
     modified: Option<SystemTime>,
     #[cfg(unix)]
     identity: (u64, u64, i64, i64),
+    /// The mtime was within [`RACY_WINDOW`] of the moment of the stat (or unknown or in the
+    /// future): a same-size rewrite in the same timestamp tick would leave the stat unchanged, so
+    /// a matching stat is not proof of unchanged content. Not part of the comparison.
+    racy: bool,
 }
+
+impl PartialEq for Fingerprint {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        let same_identity = self.identity == other.identity;
+        #[cfg(not(unix))]
+        let same_identity = true;
+        self.size == other.size && self.modified == other.modified && same_identity
+    }
+}
+
+impl Eq for Fingerprint {}
+
+/// Timestamps are coarse (a filesystem tick, a cached clock, FAT's two seconds): a file modified
+/// less than this long before it was stat-ed can be rewritten without its stat changing.
+const RACY_WINDOW: Duration = Duration::from_secs(2);
 
 fn fingerprint(path: &Path) -> Option<Fingerprint> {
     let metadata = std::fs::symlink_metadata(path).ok()?;
@@ -63,12 +89,22 @@ fn fingerprint(path: &Path) -> Option<Fingerprint> {
         use std::os::unix::fs::MetadataExt;
         (metadata.dev(), metadata.ino(), metadata.ctime(), metadata.ctime_nsec())
     };
+    let modified = metadata.modified().ok();
+    let racy = modified
+        .is_none_or(|m| SystemTime::now().duration_since(m).map_or(true, |age| age < RACY_WINDOW));
     Some(Fingerprint {
         size: metadata.len(),
-        modified: metadata.modified().ok(),
+        modified,
         #[cfg(unix)]
         identity,
+        racy,
     })
+}
+
+/// Whether the stat recorded when an entry verified still proves its content unchanged: the stat
+/// matches and the recorded one was not racy (a racy one proves nothing, so the bytes are read).
+fn stat_proves_unchanged(path: &Path, recorded: Option<Fingerprint>) -> bool {
+    recorded.is_some_and(|r| !r.racy) && fingerprint(path) == recorded
 }
 
 /// One group's verification: its index snapshot, the fingerprints of what verified, and a cursor.
@@ -139,9 +175,12 @@ pub(super) fn verify_step(
         }
         let index = state.next;
         // Verified before and still the same on disk: no need to hash it again.
-        let unchanged = state.fingerprints[index].is_some()
-            && parents_are_directories(root, &state.entries[index].path, &mut parents).is_ok()
-            && fingerprint(&root.join(&state.entries[index].path)) == state.fingerprints[index];
+        let unchanged = parents_are_directories(root, &state.entries[index].path, &mut parents)
+            .is_ok()
+            && stat_proves_unchanged(
+                &root.join(&state.entries[index].path),
+                state.fingerprints[index],
+            );
         if unchanged {
             state.next += 1;
             continue;
@@ -164,8 +203,10 @@ pub(super) fn refresh(root: &Path, state: &mut GroupState) -> Step {
     for index in 0..state.entries.len() {
         let unchanged = parents_are_directories(root, &state.entries[index].path, &mut parents)
             .is_ok()
-            && state.fingerprints[index].is_some()
-            && fingerprint(&root.join(&state.entries[index].path)) == state.fingerprints[index];
+            && stat_proves_unchanged(
+                &root.join(&state.entries[index].path),
+                state.fingerprints[index],
+            );
         if unchanged {
             continue;
         }
@@ -176,17 +217,22 @@ pub(super) fn refresh(root: &Path, state: &mut GroupState) -> Step {
     Step::Complete
 }
 
-/// A stat-only look at every entry, run last (after [`refresh`] of every group) so the time
-/// between the fresh check of the first group and the confirm call does not include another
-/// group's re-hashing. Never hashes: an entry whose fingerprint or parent chain is not what was
-/// verified fails it, and the next pass re-hashes it.
+/// A stat-only look at every entry, run last (after [`refresh`] of every group, which re-reads
+/// every entry whose stat proves nothing) so the time between the fresh check of the first group
+/// and the confirm call does not include another group's re-hashing. It never reads file
+/// content: an entry whose fingerprint or parent chain is not what was verified fails it, and so
+/// does one whose recorded stat is still racy (modified within the window of its stat, or the
+/// clock went backwards): that fails closed as "changed", and the next pass re-reads it once it
+/// has settled.
 pub(super) fn still_unchanged(root: &Path, state: &GroupState) -> Step {
     let mut parents = HashSet::new();
     for index in 0..state.entries.len() {
         let unchanged = parents_are_directories(root, &state.entries[index].path, &mut parents)
             .is_ok()
-            && state.fingerprints[index].is_some()
-            && fingerprint(&root.join(&state.entries[index].path)) == state.fingerprints[index];
+            && stat_proves_unchanged(
+                &root.join(&state.entries[index].path),
+                state.fingerprints[index],
+            );
         if !unchanged {
             return Step::Failed {
                 index,

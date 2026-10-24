@@ -49,8 +49,8 @@ def self_test() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         base = Path(tmp) / RELEASE_DIR
         base.mkdir(parents=True)
-        (base / "ok.sh").write_text("echo hello\n")
-        (base / "check-release-gates.py").write_text("release-signing secrets.X\n")
+        (base / "ok.sh").write_text("echo hello\n", encoding="utf-8")
+        (base / "check-release-gates.py").write_text("release-signing secrets.X\n", encoding="utf-8")
         assert problems(Path(tmp)) == []
         for label, name, body in [
             ("secret", "new.sh", "x=${{ secrets.TOKEN }}\n"),
@@ -59,7 +59,7 @@ def self_test() -> int:
         ]:
             target = base / name
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(body)
+            target.write_text(body, encoding="utf-8")
             assert problems(Path(tmp)), f"not detected: {label}"
             target.unlink()
         assert problems(Path(tmp)) == []

@@ -66,16 +66,22 @@ impl SyncStack {
         state: Arc<DaemonState>,
         config: NetworkConfig,
     ) -> Result<Self, SyncStackError> {
-        Self::spawn_offering(state, config, crate::nas_admin::offered()).await
+        #[cfg(feature = "process-model")]
+        let offer_nas_admin = state.tuning().offer_nas_admin;
+        #[cfg(not(feature = "process-model"))]
+        let offer_nas_admin = false;
+        Self::spawn_offering(state, config, offer_nas_admin).await
     }
 
     /// [`Self::spawn`], with management of this device offered or not
-    /// (`nas_admin::offered` in production), so a test can bind both kinds.
+    /// (the engine tuning's `offer_nas_admin` in production), so a test can bind both kinds.
     pub(crate) async fn spawn_offering(
         state: Arc<DaemonState>,
         config: NetworkConfig,
         offer_nas_admin: bool,
     ) -> Result<Self, SyncStackError> {
+        #[cfg(not(feature = "process-model"))]
+        let _ = offer_nas_admin;
         let signing_key = state.device_signing_key().ok_or(SyncStackError::NoDeviceIdentity)?;
 
         // The iroh endpoint, its admission policy and its address lookup are
@@ -86,11 +92,19 @@ impl SyncStack {
             .bind_endpoint(
                 signing_key.to_bytes(),
                 &state.authority,
+                #[cfg(feature = "process-model")]
                 crate::send_transfer::track_send_admission(&state),
+                #[cfg(not(feature = "process-model"))]
+                yadorilink_sync_substrate::AdmitWhen::new(
+                    |_: &yadorilink_sync_substrate::PeerId| false,
+                ),
+                #[cfg(feature = "process-model")]
                 offer_nas_admin.then(|| {
                     Arc::new(crate::nas_admin::AccountDevices::of(&state))
                         as Arc<dyn yadorilink_sync_substrate::NasAdminAuthorizer>
                 }),
+                #[cfg(not(feature = "process-model"))]
+                None,
                 config,
             )
             .await?;

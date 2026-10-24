@@ -40,6 +40,7 @@ use crate::maintenance::recovery::RecoveryJob;
 use crate::maintenance::replacement_confirm::ReplacementConfirmJob;
 use crate::maintenance::retention_expiry::RetentionExpiryJob;
 #[cfg(not(test))]
+#[cfg(feature = "process-model")]
 use crate::maintenance::update_check::UpdateCheckJob;
 use crate::supervise;
 
@@ -90,7 +91,7 @@ pub(crate) fn start(
     // test body and can overwrite the update-policy fixture another test
     // is asserting. Integration tests still compile this crate normally,
     // so production-like scheduler coverage remains available there.
-    #[cfg(not(test))]
+    #[cfg(all(not(test), feature = "process-model"))]
     {
         let update_check_job = UpdateCheckJob::new(state.update_manager.clone());
         supervise::spawn_logged("daemon-state-update-check-scheduler", async move {
@@ -243,7 +244,31 @@ pub(crate) fn start(
     // group is fully here as an eager replica (and its link finished startup), confirms it and
     // removes the record. The first pass runs at once, so a daemon restarted with a pending
     // record picks it up without waiting.
-    if let Some(replacement_confirm_job) = ReplacementConfirmJob::for_daemon(state.clone()) {
+    {
+        // Replaced devices are refused whether or not a confirmation is pending.
+        let state = state.clone();
+        supervise::spawn_logged("daemon-state-superseded-devices", async move {
+            loop {
+                // Tests that count their coordination stub's requests switch background jobs off.
+                #[cfg(test)]
+                let disabled = state
+                    .membership_recovery_sweep_disabled_for_test
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                #[cfg(not(test))]
+                let disabled = false;
+                if !disabled {
+                    crate::maintenance::replacement_confirm::refresh_superseded_devices(&state)
+                        .await;
+                }
+                tokio::time::sleep(
+                    crate::maintenance::replacement_confirm::SUPERSESSION_REFRESH_INTERVAL,
+                )
+                .await;
+            }
+        });
+    }
+    {
+        let replacement_confirm_job = ReplacementConfirmJob::for_daemon(state.clone());
         // With no record the job asks the service for the supersessions at once. A test that
         // counts the requests its coordination stub receives switches the background recovery
         // jobs off (`DaemonState::disable_membership_recovery_sweep_for_test`), so that request

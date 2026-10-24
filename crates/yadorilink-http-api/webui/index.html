@@ -302,7 +302,9 @@
       case "held": return "Some files in " + folder + " are being kept as they were.";
       case "volume_unconfirmed": return "The disk for " + folder + " changed or was remounted. Confirm it's the right disk to resume.";
       case "volume_changed": return "The disk for " + folder + " isn't available. Reconnect it to keep the copy.";
-      case "degraded": case "ownership_lost": case "ambiguous": return folder + " is not syncing.";
+      case "waiting_for_disk_space": return folder + " is waiting for free disk space. Syncing resumes by itself once there is room.";
+      case "file_watch_limit": return "The system's limit on watched files is reached, so changes in " + folder + " arrive late or not at all. Raise the limit.";
+      case "degraded": case "ownership_lost": case "not_joined": case "ambiguous": return folder + " is not syncing.";
       case "fetch_unavailable": return "Files in " + folder + " can't be downloaded right now.";
       case "peer_disconnected": return "A device can't be reached right now.";
       case "peer_update_required": case "update_required": return "Update required: a device runs a different version, so syncing with it is paused until every device is updated.";

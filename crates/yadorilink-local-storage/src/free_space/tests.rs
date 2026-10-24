@@ -2,19 +2,6 @@
 
 use super::*;
 
-/// config defaults when unset — the 1 GiB floor wins on a
-/// small volume, the 5% figure wins on a large one.
-#[test]
-fn default_headroom_is_max_of_1gib_and_5_percent() {
-    let small_volume = 10 * 1024 * 1024 * 1024u64; // 10 GiB: 5% = 512 MiB < 1 GiB floor
-    assert_eq!(effective_headroom_bytes(small_volume, None), DEFAULT_MIN_HEADROOM_BYTES);
-
-    let large_volume = 100 * 1024 * 1024 * 1024u64; // 100 GiB: 5% = 5 GiB > 1 GiB floor
-    let expected = (large_volume as f64 * DEFAULT_HEADROOM_PERCENT) as u64;
-    assert!(expected > DEFAULT_MIN_HEADROOM_BYTES);
-    assert_eq!(effective_headroom_bytes(large_volume, None), expected);
-}
-
 /// config round-trip after an explicit override — the
 /// override always wins over the formula, regardless of volume size.
 #[test]
@@ -90,4 +77,56 @@ fn classify_volume_on_a_missing_path_fails_rather_than_reporting_the_containing_
          faulted block-store root) must surface as NotFound, not as a successful query of \
          its containing volume"
     );
+}
+
+const MIB: u64 = 1024 * 1024;
+const GIB: u64 = 1024 * MIB;
+
+/// The default headroom is 1% of the volume between a 256 MiB floor and a 2 GiB cap, and
+/// never more than a quarter of a tiny volume.
+#[test]
+fn default_headroom_is_one_percent_clamped_to_floor_and_cap() {
+    // Tiny: the floor would swallow the volume, so a quarter of it.
+    assert_eq!(effective_headroom_bytes(0, None), 0);
+    assert_eq!(effective_headroom_bytes(100 * MIB, None), 25 * MIB);
+    // Small: 4 GiB test volume gets the floor, not 1 GiB.
+    assert_eq!(effective_headroom_bytes(4 * GIB, None), 256 * MIB);
+    // Mid: 1% between floor and cap.
+    assert_eq!(effective_headroom_bytes(100 * GIB, None), 100 * GIB / 100);
+    // Large and huge: capped.
+    assert_eq!(effective_headroom_bytes(228 * GIB, None), 2 * GIB);
+    assert_eq!(effective_headroom_bytes(100 * 1024 * GIB, None), 2 * GIB);
+}
+
+/// Regression: a 228 GiB disk with 18 GB free used to refuse a 100 MB receive (headroom
+/// 11.4 GiB); it now has room, while a receive that really does not fit is still refused.
+#[test]
+fn big_disk_with_room_takes_a_small_receive_and_refuses_one_that_does_not_fit() {
+    let total = 228 * GIB;
+    let space = VolumeFreeSpace {
+        available_bytes: 18_000_000_000,
+        total_bytes: total,
+        headroom_bytes: effective_headroom_bytes(total, None),
+    };
+    assert!(!space.would_breach(100_000_000));
+    assert!(space.would_breach(17_000_000_000)); // leaves less than 2 GiB
+                                                 // Nearly full big disk: a small receive is refused only when it eats the margin.
+    let nearly_full = VolumeFreeSpace { available_bytes: 2 * GIB + 50 * MIB, ..space };
+    assert!(!nearly_full.would_breach(10 * MIB));
+    assert!(nearly_full.would_breach(100 * MIB));
+}
+
+/// The status leaves "waiting" only above headroom + 25%, so free space hovering at the
+/// admission line does not flip it.
+#[test]
+fn recovery_needs_a_margin_above_the_admission_line() {
+    let mk = |available_bytes| VolumeFreeSpace {
+        available_bytes,
+        total_bytes: 1_000_000,
+        headroom_bytes: 1000,
+    };
+    assert!(!mk(1000).recovered());
+    assert!(!mk(1001).recovered()); // admission would pass, but not yet "recovered"
+    assert!(!mk(1250).recovered());
+    assert!(mk(1251).recovered());
 }

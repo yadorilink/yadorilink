@@ -143,7 +143,7 @@ impl NameLedger for StageLedger {
         let tmp = record.with_extension("tmp");
         let mut out = std::fs::File::create(&tmp)?;
         io::Write::write_all(&mut out, text.as_bytes())?;
-        out.sync_all()?;
+        yadorilink_fs_platform::flush::sync_file(&out)?;
         drop(out);
         match publish_durably(&tmp, &record, Replace::No) {
             Ok(()) => Ok(()),

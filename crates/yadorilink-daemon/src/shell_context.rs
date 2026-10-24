@@ -228,9 +228,7 @@ impl ShellContext {
                 state: state.clone(),
                 host: provider_host.clone(),
             }),
-            crate::space_management_config::SpaceManagementStore::new(
-                crate::device_config::config_dir(),
-            ),
+            crate::space_management_config::SpaceManagementStore::new(state.config_dir()),
         ));
         control.auto_reclaim.install(auto_reclaim.clone());
         Self {

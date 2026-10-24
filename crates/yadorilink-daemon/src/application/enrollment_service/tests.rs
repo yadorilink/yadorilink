@@ -67,6 +67,11 @@ struct FakeEnrollmentRepository {
     operations: Mutex<HashMap<String, EnrollmentOperation>>,
     links: Mutex<Vec<yadorilink_replica_domain::session_state::FolderLink>>,
     digests: Mutex<HashMap<String, String>>,
+    /// Display names of provider folders that already exist on the fake device.
+    taken_names: Mutex<Vec<String>>,
+    /// `list_links` calls so far, and the call number (1-based) from which it fails (0: never).
+    list_links_calls: std::sync::atomic::AtomicUsize,
+    fail_list_links_from: std::sync::atomic::AtomicUsize,
 }
 
 impl EnrollmentRepository for FakeEnrollmentRepository {
@@ -129,7 +134,19 @@ impl EnrollmentRepository for FakeEnrollmentRepository {
         Vec<yadorilink_replica_domain::session_state::FolderLink>,
         crate::sync_error::SyncError,
     > {
+        let call = self.list_links_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let from = self.fail_list_links_from.load(std::sync::atomic::Ordering::SeqCst);
+        if from != 0 && call >= from {
+            return Err(std::io::Error::other("fake list_links failure").into());
+        }
         Ok(self.links.lock().unwrap().clone())
+    }
+
+    fn provider_display_name_taken(
+        &self,
+        display_name: &str,
+    ) -> Result<bool, crate::sync_error::SyncError> {
+        Ok(self.taken_names.lock().unwrap().iter().any(|n| n == display_name))
     }
 
     fn scan_pending(
@@ -394,6 +411,8 @@ struct FakeLinkPort {
     commit_plain: Mutex<std::collections::VecDeque<Result<(), EnrollmentLinkError>>>,
     /// What each commit asked for: (operation id, link key, provider target).
     requests: Mutex<Vec<(String, PathBuf, Option<super::super::ports::ProviderLinkTarget>)>>,
+    /// What each plain commit asked for: (link key, provider target).
+    plain_requests: Mutex<Vec<(PathBuf, Option<super::super::ports::ProviderLinkTarget>)>>,
 }
 
 impl EnrollmentLinkPort for FakeLinkPort {
@@ -426,10 +445,12 @@ impl EnrollmentLinkPort for FakeLinkPort {
     fn commit_plain<'a>(
         &'a self,
         _group_id: &'a str,
-        _absolute_path: &'a std::path::Path,
+        absolute_path: &'a std::path::Path,
         _on_demand: bool,
+        provider: Option<super::super::ports::ProviderLinkTarget>,
     ) -> super::super::ports::BoxFuture<'a, Result<(), EnrollmentLinkError>> {
         Box::pin(async move {
+            self.plain_requests.lock().unwrap().push((absolute_path.to_path_buf(), provider));
             self.calls.lock().unwrap().push(EnrollmentCall::LinkCommitPlain);
             self.commit_plain.lock().unwrap().pop_front().expect("missing fake commit_plain result")
         })
@@ -711,6 +732,333 @@ fn accept_invite_command() -> AcceptInviteCommand {
         code: "invite-code-abc".to_string(),
         absolute_path: PathBuf::from("/home/bob/Shared"),
         on_demand: false,
+        provider: None,
+    }
+}
+
+fn provider_accept_command(display_name: &str, token: &str) -> AcceptInviteCommand {
+    AcceptInviteCommand {
+        code: "invite-code-abc".to_string(),
+        absolute_path: PathBuf::new(),
+        on_demand: true,
+        provider: Some(ProviderCreation {
+            display_name: display_name.to_string(),
+            request_token: token.to_string(),
+        }),
+    }
+}
+
+/// An invite accepted as a provider folder redeems and activates like any invite, but links the
+/// provider locator with a provider target (a joined group: not an empty owner) in on-demand mode,
+/// with no journal row.
+#[tokio::test]
+async fn an_invite_accepted_as_a_provider_folder_links_the_provider_locator() {
+    let repository = Arc::new(FakeEnrollmentRepository::default());
+    let coordination = Arc::new(FakeCoordination::configured());
+    coordination
+        .prepare
+        .lock()
+        .unwrap()
+        .push_back(EnrollmentPrepareResult::Prepared { group_id: "group-7".to_string() });
+    coordination.activate.lock().unwrap().push_back(EnrollmentActivationResult::Activated);
+    let links = Arc::new(FakeLinkPort::default());
+    links.commit_plain.lock().unwrap().push_back(Ok(()));
+
+    let outcome = service(repository.clone(), coordination.clone(), links.clone())
+        .accept_invite_and_link(provider_accept_command("Shared", "token-1"))
+        .await
+        .expect("accepted");
+
+    assert_eq!(outcome.group_id, "group-7");
+    assert_eq!(outcome.local_path, PathBuf::from("provider://token-1"));
+    assert!(!outcome.awaiting_approval);
+    let plain = links.plain_requests.lock().unwrap();
+    assert_eq!(plain.len(), 1);
+    assert_eq!(plain[0].0, PathBuf::from("provider://token-1"));
+    let target = plain[0].1.as_ref().expect("a provider target");
+    assert_eq!(target.display_name, "Shared");
+    assert!(target.on_demand && !target.empty_owner);
+    assert!(repository.operations.lock().unwrap().is_empty(), "an invite opens no journal row");
+}
+
+/// A name already used by a provider folder here is refused before the one-use invite is
+/// redeemed; so is a platform without provider folders.
+#[tokio::test]
+async fn a_provider_invite_is_refused_before_redeeming_when_it_cannot_link() {
+    let repository = Arc::new(FakeEnrollmentRepository::default());
+    repository.taken_names.lock().unwrap().push("Shared".to_string());
+    let coordination = Arc::new(FakeCoordination::configured());
+    let links = Arc::new(FakeLinkPort::default());
+    let svc = service(repository.clone(), coordination.clone(), links.clone());
+    let taken = svc.accept_invite_and_link(provider_accept_command("Shared", "token-2")).await;
+    assert!(matches!(taken, Err(EnrollmentError::PreparationRejected { .. })), "{taken:?}");
+    let none = service(repository, coordination.clone(), links.clone())
+        .with_provider_kind(None)
+        .accept_invite_and_link(provider_accept_command("Other", "token-3"))
+        .await;
+    assert!(matches!(none, Err(EnrollmentError::PreparationRejected { .. })), "{none:?}");
+    assert!(coordination.calls.lock().unwrap().is_empty(), "the invite was redeemed");
+    assert!(links.calls.lock().unwrap().is_empty());
+}
+
+/// A retry after a crash between the link and the activation finds its own link: its name is not
+/// a clash, the same locator is linked again and the invite activates.
+#[tokio::test]
+async fn a_provider_invite_retry_finds_its_own_link_and_activates() {
+    use yadorilink_replica_domain::session_state::{
+        FolderLink, LinkLocation, MaterializationPolicy,
+    };
+    let repository = Arc::new(FakeEnrollmentRepository::default());
+    let creation = ProviderCreation {
+        display_name: "Shared".to_string(),
+        request_token: "token-4".to_string(),
+    };
+    repository.links.lock().unwrap().push(FolderLink {
+        location: LinkLocation::Provider {
+            locator: creation.locator(),
+            root_id: "root-1".to_string(),
+        },
+        group_id: "group-7".to_string(),
+        paused: false,
+        materialization_policy: MaterializationPolicy::OnDemand,
+        orphaned: false,
+    });
+    repository.taken_names.lock().unwrap().push("Shared".to_string());
+    repository
+        .digests
+        .lock()
+        .unwrap()
+        .insert(creation.locator(), creation_digest(&creation, "group-7", true, "invite"));
+    let coordination = Arc::new(FakeCoordination::configured());
+    coordination
+        .prepare
+        .lock()
+        .unwrap()
+        .push_back(EnrollmentPrepareResult::Prepared { group_id: "group-7".to_string() });
+    coordination.activate.lock().unwrap().push_back(EnrollmentActivationResult::AlreadyActive);
+    let links = Arc::new(FakeLinkPort::default());
+    links.commit_plain.lock().unwrap().push_back(Ok(()));
+
+    let outcome = service(repository, coordination, links)
+        .accept_invite_and_link(provider_accept_command("Shared", "token-4"))
+        .await
+        .expect("the retry completes");
+    assert_eq!(outcome.group_id, "group-7");
+}
+
+/// The same token with another request (here another group) is refused, never linked as the
+/// earlier one.
+#[tokio::test]
+async fn a_provider_invite_token_is_bound_to_its_request() {
+    use yadorilink_replica_domain::session_state::{
+        FolderLink, LinkLocation, MaterializationPolicy,
+    };
+    let repository = Arc::new(FakeEnrollmentRepository::default());
+    let creation = ProviderCreation {
+        display_name: "Shared".to_string(),
+        request_token: "token-5".to_string(),
+    };
+    repository.links.lock().unwrap().push(FolderLink {
+        location: LinkLocation::Provider {
+            locator: creation.locator(),
+            root_id: "root-1".to_string(),
+        },
+        group_id: "group-1".to_string(),
+        paused: false,
+        materialization_policy: MaterializationPolicy::OnDemand,
+        orphaned: false,
+    });
+    repository
+        .digests
+        .lock()
+        .unwrap()
+        .insert(creation.locator(), creation_digest(&creation, "group-1", true, "invite"));
+    let coordination = Arc::new(FakeCoordination::configured());
+    coordination
+        .prepare
+        .lock()
+        .unwrap()
+        .push_back(EnrollmentPrepareResult::Prepared { group_id: "group-8".to_string() });
+    coordination.cancel.lock().unwrap().push_back(EnrollmentCancellationResult::Confirmed);
+    let links = Arc::new(FakeLinkPort::default());
+    let result = service(repository, coordination.clone(), links.clone())
+        .accept_invite_and_link(provider_accept_command("Shared", "token-5"))
+        .await;
+    assert!(matches!(result, Err(EnrollmentError::PreparationRejected { .. })), "{result:?}");
+    assert!(links.calls.lock().unwrap().is_empty());
+    // Only knowable with the group the invite named, so the redeemed acceptance is cancelled.
+    assert_eq!(
+        *coordination.calls.lock().unwrap(),
+        vec![EnrollmentCall::PrepareInviteAccept, EnrollmentCall::CancelInviteAccept]
+    );
+}
+
+/// A name that is empty or only whitespace never reaches the redemption.
+#[tokio::test]
+async fn a_blank_provider_name_is_refused_before_redeeming() {
+    for name in ["", "   ", "\t"] {
+        let coordination = Arc::new(FakeCoordination::configured());
+        let links = Arc::new(FakeLinkPort::default());
+        let result = service(
+            Arc::new(FakeEnrollmentRepository::default()),
+            coordination.clone(),
+            links.clone(),
+        )
+        .accept_invite_and_link(provider_accept_command(name, "token-blank"))
+        .await;
+        assert!(matches!(result, Err(EnrollmentError::PreparationRejected { .. })), "{result:?}");
+        assert!(coordination.calls.lock().unwrap().is_empty(), "{name:?} redeemed the invite");
+        assert!(links.calls.lock().unwrap().is_empty());
+    }
+}
+
+/// The token of an earlier link of this device with another request is refused before the
+/// invite is redeemed whenever the earlier link already shows it (same group, other name).
+#[tokio::test]
+async fn a_token_bound_to_another_name_is_refused_before_redeeming() {
+    use yadorilink_replica_domain::session_state::{
+        FolderLink, LinkLocation, MaterializationPolicy,
+    };
+    let repository = Arc::new(FakeEnrollmentRepository::default());
+    let earlier = ProviderCreation {
+        display_name: "Shared".to_string(),
+        request_token: "token-6".to_string(),
+    };
+    repository.links.lock().unwrap().push(FolderLink {
+        location: LinkLocation::Provider {
+            locator: earlier.locator(),
+            root_id: "root-1".to_string(),
+        },
+        group_id: "group-7".to_string(),
+        paused: false,
+        materialization_policy: MaterializationPolicy::OnDemand,
+        orphaned: false,
+    });
+    repository
+        .digests
+        .lock()
+        .unwrap()
+        .insert(earlier.locator(), creation_digest(&earlier, "group-7", true, "invite"));
+    let coordination = Arc::new(FakeCoordination::configured());
+    let links = Arc::new(FakeLinkPort::default());
+    let result = service(repository, coordination.clone(), links)
+        .accept_invite_and_link(provider_accept_command("Renamed", "token-6"))
+        .await;
+    assert!(matches!(result, Err(EnrollmentError::PreparationRejected { .. })), "{result:?}");
+    assert!(coordination.calls.lock().unwrap().is_empty(), "the invite was redeemed");
+}
+
+/// Every way a provider invite can end after the redemption, and what it leaves remotely: the
+/// paths where nothing was committed locally cancel the pending acceptance; the paths where the
+/// link may or does exist keep it for the retry or the owner.
+#[tokio::test]
+async fn every_path_after_the_redemption_compensates_or_keeps_by_what_is_committed() {
+    use EnrollmentCall::{ActivateInviteAccept, CancelInviteAccept, LinkCommitPlain};
+    let prepared = || EnrollmentPrepareResult::Prepared { group_id: "group-7".to_string() };
+    let calls_of = |c: &Arc<FakeCoordination>, l: &Arc<FakeLinkPort>| {
+        let mut calls = c.calls.lock().unwrap().clone();
+        calls.extend(l.calls.lock().unwrap().iter().cloned());
+        calls
+    };
+
+    // The target cannot be built (the link list cannot be read): nothing committed, cancelled.
+    let repository = Arc::new(FakeEnrollmentRepository::default());
+    // The first read (before the redemption) passes, the second (after it) fails.
+    repository.fail_list_links_from.store(2, std::sync::atomic::Ordering::SeqCst);
+    let coordination = Arc::new(FakeCoordination::configured());
+    coordination.prepare.lock().unwrap().push_back(prepared());
+    coordination.cancel.lock().unwrap().push_back(EnrollmentCancellationResult::Confirmed);
+    let links = Arc::new(FakeLinkPort::default());
+    let result = service(repository, coordination.clone(), links.clone())
+        .accept_invite_and_link(provider_accept_command("Shared", "token-a"))
+        .await;
+    assert!(matches!(result, Err(EnrollmentError::Persistence(_))), "{result:?}");
+    assert_eq!(
+        calls_of(&coordination, &links),
+        vec![EnrollmentCall::PrepareInviteAccept, CancelInviteAccept]
+    );
+
+    // The link was refused before anything was committed: cancelled.
+    let coordination = Arc::new(FakeCoordination::configured());
+    coordination.prepare.lock().unwrap().push_back(prepared());
+    coordination.cancel.lock().unwrap().push_back(EnrollmentCancellationResult::Confirmed);
+    let links = Arc::new(FakeLinkPort::default());
+    links.commit_plain.lock().unwrap().push_back(Err(EnrollmentLinkError::NotCommitted {
+        detail: "name taken".to_string(),
+        refusal: None,
+    }));
+    let result =
+        service(Arc::new(FakeEnrollmentRepository::default()), coordination.clone(), links.clone())
+            .accept_invite_and_link(provider_accept_command("Shared", "token-b"))
+            .await;
+    assert!(matches!(result, Err(EnrollmentError::LocalLinkFailed { .. })), "{result:?}");
+    assert_eq!(
+        calls_of(&coordination, &links),
+        vec![EnrollmentCall::PrepareInviteAccept, CancelInviteAccept, LinkCommitPlain]
+    );
+
+    // The link may be committed: kept (no cancel, no activation).
+    let coordination = Arc::new(FakeCoordination::configured());
+    coordination.prepare.lock().unwrap().push_back(prepared());
+    let links = Arc::new(FakeLinkPort::default());
+    links
+        .commit_plain
+        .lock()
+        .unwrap()
+        .push_back(Err(EnrollmentLinkError::CommitUncertain { detail: "unknown".to_string() }));
+    let result =
+        service(Arc::new(FakeEnrollmentRepository::default()), coordination.clone(), links.clone())
+            .accept_invite_and_link(provider_accept_command("Shared", "token-c"))
+            .await;
+    assert!(matches!(result, Err(EnrollmentError::LocalLinkAmbiguous { .. })), "{result:?}");
+    assert!(!calls_of(&coordination, &links).contains(&CancelInviteAccept));
+
+    // After the link committed, activation ends keep the link and never cancel it away.
+    for activation in [
+        EnrollmentActivationResult::Deleted,
+        EnrollmentActivationResult::TransientFailure { detail: "offline".to_string() },
+        EnrollmentActivationResult::AwaitingApproval,
+    ] {
+        let coordination = Arc::new(FakeCoordination::configured());
+        coordination.prepare.lock().unwrap().push_back(prepared());
+        coordination.activate.lock().unwrap().push_back(activation);
+        let links = Arc::new(FakeLinkPort::default());
+        links.commit_plain.lock().unwrap().push_back(Ok(()));
+        let _ = service(
+            Arc::new(FakeEnrollmentRepository::default()),
+            coordination.clone(),
+            links.clone(),
+        )
+        .accept_invite_and_link(provider_accept_command("Shared", "token-d"))
+        .await;
+        let calls = calls_of(&coordination, &links);
+        assert!(calls.contains(&ActivateInviteAccept), "{calls:?}");
+        assert!(!calls.contains(&CancelInviteAccept), "{calls:?}");
+    }
+
+    // Refusals of the redemption itself consumed nothing: no cancel, nothing linked.
+    for refused in [
+        EnrollmentPrepareResult::DefinitelyRejected { detail: "no".to_string() },
+        EnrollmentPrepareResult::InviteRefused {
+            reason: crate::application::model::InviteRefusal::Expired,
+            detail: "expired".to_string(),
+        },
+        EnrollmentPrepareResult::Conflict { detail: "409".to_string() },
+        EnrollmentPrepareResult::Ambiguous { detail: "timeout".to_string() },
+    ] {
+        let coordination = Arc::new(FakeCoordination::configured());
+        coordination.prepare.lock().unwrap().push_back(refused);
+        let links = Arc::new(FakeLinkPort::default());
+        let result = service(
+            Arc::new(FakeEnrollmentRepository::default()),
+            coordination.clone(),
+            links.clone(),
+        )
+        .accept_invite_and_link(provider_accept_command("Shared", "token-e"))
+        .await;
+        assert!(result.is_err());
+        assert_eq!(*coordination.calls.lock().unwrap(), vec![EnrollmentCall::PrepareInviteAccept]);
+        assert!(links.calls.lock().unwrap().is_empty());
     }
 }
 

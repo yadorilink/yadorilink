@@ -13,9 +13,11 @@
 //! was wrong or the carrier was, and those are only separable while they are
 //! separate pieces.
 //!
-//! Only `Partition` and `Heal` are carried across so far. The rest of
-//! `NetFault` is reported as unimplemented rather than quietly ignored --
-//! see [`CarrierOutcome`].
+//! `Partition`, `Heal`, the one-way cut, duplication and the inbound hold
+//! (reordering and delay) are carried across. The unparameterised `Drop`,
+//! `Delay`, `Reorder` and `Duplicate` of the decision engine name no link, so
+//! they are reported as unimplemented rather than quietly ignored -- see
+//! [`CarrierOutcome`].
 //!
 //! `#[cfg(turmoil)]`: the carrier is a `test-support` type of
 //! `yadorilink-lane-ports`, and only the turmoil build is meant to reach it.
@@ -24,7 +26,7 @@
 #![allow(dead_code)] // the schedule runtime does not drive this yet
 
 use iroh::EndpointId;
-use yadorilink_lane_ports::sim_fault::SimFaultController;
+use yadorilink_lane_ports::sim_fault::{HoldPolicy, SimFaultController};
 
 use super::case_ir::{Fault, NetFault, SimNanos};
 
@@ -97,11 +99,80 @@ impl CarrierFaults {
                 }
                 Err(missing) => CarrierOutcome::UnknownDevice(missing),
             },
+            NetFault::PartitionOneWay { from, to } => match self.pair(*from, *to) {
+                Ok((a, b)) => {
+                    self.controller.partition_one_way(a, b);
+                    CarrierOutcome::Applied
+                }
+                Err(missing) => CarrierOutcome::UnknownDevice(missing),
+            },
+            NetFault::HealOneWay { from, to } => match self.pair(*from, *to) {
+                Ok((a, b)) => {
+                    self.controller.heal_one_way(a, b);
+                    CarrierOutcome::Applied
+                }
+                Err(missing) => CarrierOutcome::UnknownDevice(missing),
+            },
+            NetFault::DuplicateDatagrams { from, to, every_nth, seed } => {
+                match self.pair(*from, *to) {
+                    Ok((a, b)) if *every_nth > 0 => {
+                        self.controller.duplicate_datagrams(a, b, *every_nth, *seed);
+                        CarrierOutcome::Applied
+                    }
+                    Ok(_) => CarrierOutcome::Unimplemented("DuplicateDatagrams with period 0"),
+                    Err(missing) => CarrierOutcome::UnknownDevice(missing),
+                }
+            }
+            NetFault::StopDuplicating { from, to } => match self.pair(*from, *to) {
+                Ok((a, b)) => {
+                    self.controller.stop_duplicating(a, b);
+                    CarrierOutcome::Applied
+                }
+                Err(missing) => CarrierOutcome::UnknownDevice(missing),
+            },
+            NetFault::HoldInbound { device, every_nth, release_after, seed } => {
+                match self.endpoints.get(*device) {
+                    Some(at) if *every_nth > 0 && *release_after > 0 => {
+                        self.controller.hold_inbound(
+                            *at,
+                            HoldPolicy {
+                                every_nth: *every_nth,
+                                release_after: *release_after,
+                                seed: *seed,
+                            },
+                        );
+                        CarrierOutcome::Applied
+                    }
+                    Some(_) => CarrierOutcome::Unimplemented("HoldInbound with a zero parameter"),
+                    None => CarrierOutcome::UnknownDevice(*device),
+                }
+            }
+            NetFault::StopHolding { device } => match self.endpoints.get(*device) {
+                Some(at) => {
+                    self.controller.stop_holding(*at);
+                    CarrierOutcome::Applied
+                }
+                None => CarrierOutcome::UnknownDevice(*device),
+            },
             NetFault::Drop => CarrierOutcome::Unimplemented("Drop"),
             NetFault::Delay { .. } => CarrierOutcome::Unimplemented("Delay"),
             NetFault::Reorder => CarrierOutcome::Unimplemented("Reorder"),
             NetFault::Duplicate => CarrierOutcome::Unimplemented("Duplicate"),
         }
+    }
+
+    /// The carrier's evidence per target, keyed by device index, for
+    /// crediting scheduled wire faults.
+    pub fn wire_evidence(&self) -> super::fault_schedule::WireEvidence {
+        let mut evidence = super::fault_schedule::WireEvidence::default();
+        for (i, from) in self.endpoints.iter().enumerate() {
+            evidence.reordered.insert(i, self.controller.reordered_at(*from));
+            for (j, to) in self.endpoints.iter().enumerate().filter(|(j, _)| *j != i) {
+                evidence.dropped.insert((i, j), self.controller.dropped_on(*from, *to));
+                evidence.duplicated.insert((i, j), self.controller.duplicated_on(*from, *to));
+            }
+        }
+        evidence
     }
 
     /// Applies a whole schedule's faults in order, returning one outcome per
@@ -223,6 +294,41 @@ mod tests {
         assert_eq!(
             faults.apply(&Fault::Net(NetFault::Duplicate)),
             CarrierOutcome::Unimplemented("Duplicate")
+        );
+    }
+
+    /// The wire faults reach the carrier: a one-way cut cuts one direction,
+    /// duplication and hold are armed, and each can be lifted again. A zero
+    /// period is refused by name, never silently armed.
+    #[test]
+    fn wire_faults_reach_the_carrier_and_can_be_lifted() {
+        let faults = two_devices();
+        let (a, b) = (endpoint(1), endpoint(2));
+        let apply = |net| faults.apply(&Fault::Net(net));
+
+        assert_eq!(apply(NetFault::PartitionOneWay { from: 0, to: 1 }), CarrierOutcome::Applied);
+        assert!(faults.controller().is_cut(a, b) && !faults.controller().is_cut(b, a));
+        assert_eq!(apply(NetFault::HealOneWay { from: 0, to: 1 }), CarrierOutcome::Applied);
+        assert!(!faults.controller().is_cut(a, b));
+
+        assert_eq!(
+            apply(NetFault::DuplicateDatagrams { from: 0, to: 1, every_nth: 1, seed: 0 }),
+            CarrierOutcome::Applied
+        );
+        assert_eq!(
+            apply(NetFault::DuplicateDatagrams { from: 0, to: 1, every_nth: 0, seed: 0 }),
+            CarrierOutcome::Unimplemented("DuplicateDatagrams with period 0")
+        );
+        assert_eq!(apply(NetFault::StopDuplicating { from: 0, to: 1 }), CarrierOutcome::Applied);
+
+        assert_eq!(
+            apply(NetFault::HoldInbound { device: 1, every_nth: 2, release_after: 1, seed: 0 }),
+            CarrierOutcome::Applied
+        );
+        assert_eq!(apply(NetFault::StopHolding { device: 1 }), CarrierOutcome::Applied);
+        assert_eq!(
+            apply(NetFault::HoldInbound { device: 9, every_nth: 2, release_after: 1, seed: 0 }),
+            CarrierOutcome::UnknownDevice(9)
         );
     }
 

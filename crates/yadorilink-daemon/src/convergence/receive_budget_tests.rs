@@ -223,3 +223,95 @@ async fn the_window_gap_map_is_bounded_under_group_churn() {
     receive_diag::set_enabled(false);
     receive_diag::reset();
 }
+
+/// Set in the child process that runs the isolated receive-flush count.
+#[cfg(unix)]
+const ISOLATED_ENV: &str = "YADORILINK_ISOLATED_RECEIVE_FLUSH_COUNT";
+#[cfg(unix)]
+const ISOLATED_TEST: &str = "convergence::receive_budget_tests::receive_flush_counts_run";
+
+/// Differences between observed flush counts and the baseline's `receive_engine_workload`.
+fn flush_count_differences(observed: &[(&str, u64)], baseline: &serde_json::Value) -> Vec<String> {
+    observed
+        .iter()
+        .filter_map(|(name, seen)| {
+            let want = baseline[name].as_u64().unwrap_or_else(|| panic!("baseline.{name} missing"));
+            (*seen != want).then(|| format!("{name}: observed {seen}, baseline {want}"))
+        })
+        .collect()
+}
+
+/// Files received through the real engine, and exact flush counts against the baseline. The
+/// flush counters are process-global, and the lib's other tests share a process, so this body
+/// only runs in the child process the test below starts for it alone.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receive_flush_counts_run() {
+    if std::env::var_os(ISOLATED_ENV).is_none() {
+        return;
+    }
+    let baseline = &super::receive_cost_tests::perf_baseline()["receive_engine_workload"];
+    let files = baseline["files"].as_u64().unwrap();
+    let f = super::receive_cost_tests::quiet_fixture(false).await;
+    let engine = crate::convergence::engine::ConvergenceEngine::new(f.state.clone());
+    let warm = admit_files(&f, "warm", 1);
+    receive_until_on_disk(&f, &engine, &warm).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    let names = admit_files(&f, "counted", files);
+    io_diag::reset();
+    io_diag::set_enabled(true);
+    let flushes_before = yadorilink_fs_platform::flush::counts();
+    receive_until_on_disk(&f, &engine, &names).await;
+    // Let any trailing batch flush finish before reading.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    io_diag::set_enabled(false);
+    let flushed = yadorilink_fs_platform::flush::counts();
+    let observed = [
+        ("file_fsync", io_diag::stat(Op::FileFsync).calls),
+        ("dir_fsync", io_diag::stat(Op::DirFsync).calls),
+        ("rename", io_diag::stat(Op::Rename).calls),
+        ("file_flushes", flushed.file_flushes - flushes_before.file_flushes),
+        ("directory_syncs", flushed.directory_syncs - flushes_before.directory_syncs),
+    ];
+    eprintln!("MEASURE receive flush counts: {observed:?}");
+    let moved = flush_count_differences(&observed, baseline);
+    assert!(
+        moved.is_empty(),
+        "the receive flush counts moved: {moved:#?}\nIf this is intended, follow the update \
+         procedure in .github/checks/check-perf-baseline.py (a recorded reason is required)."
+    );
+}
+
+/// Runs [`receive_flush_counts_run`] alone in its own process, so no other test's flushes
+/// are counted with it.
+#[cfg(unix)]
+#[test]
+fn receive_flush_counts_match_the_recorded_baseline_in_an_isolated_process() {
+    if std::env::var_os(ISOLATED_ENV).is_some() {
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", ISOLATED_TEST, "--nocapture", "--test-threads=1"])
+        .env(ISOLATED_ENV, "1")
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "isolated receive flush count failed:\n{text}");
+    assert!(
+        text.contains("MEASURE receive flush counts"),
+        "the isolated test did not run:\n{text}"
+    );
+}
+
+#[test]
+fn the_flush_count_comparison_notices_one_extra_flush() {
+    let baseline = serde_json::json!({ "file_fsync": 3, "dir_fsync": 3 });
+    assert!(flush_count_differences(&[("file_fsync", 3), ("dir_fsync", 3)], &baseline).is_empty());
+    let moved = flush_count_differences(&[("file_fsync", 3), ("dir_fsync", 4)], &baseline);
+    assert_eq!(moved.len(), 1, "{moved:?}");
+}

@@ -21,6 +21,9 @@ Rules enforced:
   - a record's build lane matches the channel (nightly bytes never enter beta);
   - an app bundle's engine release id equals its record's release id;
   - merged release records are never edited;
+  - a promoting channel (`stable`, see channels.json) serves only release versions (no
+    pre-release suffix) that are in its source channel's history, not withdrawn there and, if
+    the source still serves them, fully rolled out and not kill-switched (promotion_problems);
   - an appcast item exists only for the app_bundle entry the manifest serves (none while it is
     kill-switched or at 0% rollout; partial rollout is carried on the item).
 """
@@ -30,29 +33,67 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sys
+from datetime import datetime, timedelta
 from pathlib import Path
+
+# Appended, not prepended: a caller that put another sign_request.py first keeps it.
+sys.path.append(str(Path(__file__).resolve().parent))
+import release_channels  # noqa: E402
 
 LEDGER_SCHEMA_VERSION = 1
 RECORD_SCHEMA_VERSION = 1
 MANIFEST_SCHEMA_VERSION = 2
-CHANNELS = ("nightly", "beta")
-# Which build lane may be served on which channel.
-CHANNEL_LANE = {"nightly": "dev", "beta": "beta"}
+CHANNELS = release_channels.CHANNELS
+CHANNEL_LANE = release_channels.CHANNEL_LANE
 SOURCES = ("script", "app_bundle", "microsoft_store")
 SOURCE_PLATFORM = {"app_bundle": "macos", "microsoft_store": "windows"}
 DL_PREFIX = "https://yadori.link/dl/"
 
-SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
-TARGET_RE = re.compile(r"^(linux|macos|windows)-(x86_64|aarch64)$")
-FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-GENERATED_AT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+COMMIT_RE = re.compile(r"\A[0-9a-f]{40}\Z")
+TARGET_RE = re.compile(r"\A(linux|macos|windows|ios)-(x86_64|aarch64)\Z")
+# `ios` is an engine-bundle platform only (the `script` source): app_bundle and microsoft_store
+# are pinned to macos and windows by SOURCE_PLATFORM.
+FILE_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+GENERATED_AT_RE = re.compile(r"\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
+# How long a signed manifest stays valid, and how many days before expiry the channel monitor
+# starts reminding the operator to republish. Clients treat `expires_at` as the end of validity.
+VALIDITY_DAYS = 60
+REMINDER_DAYS_LEFT = 20
+TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+# A publish may not stamp a manifest later than the publisher's own clock plus this. Clients keep
+# the newest generated_at they ever accepted and never expire it, so a manifest stamped far ahead
+# would make every later, correctly stamped one look older to them.
+MAX_FUTURE_SKEW = timedelta(minutes=5)
+
+
+def future_dated_problem(generated_at: str, now: datetime) -> str | None:
+    """Why `generated_at` is too far ahead of `now` (an aware or naive UTC time), or None."""
+    stamped = datetime.strptime(generated_at, TIME_FORMAT)
+    if stamped > now.replace(tzinfo=None) + MAX_FUTURE_SKEW:
+        return (f"generated_at {generated_at} is more than {int(MAX_FUTURE_SKEW.total_seconds() // 60)} "
+                "minutes ahead of the publisher's clock; clients would keep it as their replay floor")
+    return None
+
+
+def expires_at_for(generated_at: str) -> str:
+    """The `expires_at` of a manifest stamped `generated_at`: derived, never typed, so the same
+    inputs always produce the same bytes."""
+    if not GENERATED_AT_RE.fullmatch(generated_at or ""):
+        raise LedgerError([f"generated_at {generated_at!r} must be YYYY-MM-DDTHH:MM:SSZ"])
+    start = datetime.strptime(generated_at, TIME_FORMAT)
+    return (start + timedelta(days=VALIDITY_DAYS)).strftime(TIME_FORMAT)
 _NUM = r"(?:0|[1-9]\d*)"
 _PRE_ID = r"(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"
 # semver.org strict grammar without build metadata (versions are also file and URL names).
 SEMVER_RE = re.compile(
-    rf"^({_NUM})\.({_NUM})\.({_NUM})(?:-({_PRE_ID}(?:\.{_PRE_ID})*))?$"
+    rf"\A({_NUM})\.({_NUM})\.({_NUM})(?:-({_PRE_ID}(?:\.{_PRE_ID})*))?\Z",
+    re.ASCII,
 )
+# The state database version the engine stamps; every manifest entry declares it so a client
+# can refuse a release whose engine cannot read the data it has.
+STATE_SCHEMA_RE = re.compile(r"\A[1-9][0-9]{0,9}\Z")
 YANK_RE = re.compile(r"^yank (\S+)")
 
 LEDGER_FIELDS = {
@@ -101,7 +142,7 @@ def load_json(text: str, what: str):
 
 def semver_key(raw: str):
     """Total order on strict semver (no leading v: ledger versions are also file and URL names)."""
-    m = SEMVER_RE.match(raw) if isinstance(raw, str) else None
+    m = SEMVER_RE.fullmatch(raw) if isinstance(raw, str) else None
     if not m:
         raise ValueError(f"not strict semver: {raw!r}")
     core = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
@@ -146,7 +187,9 @@ def validate_record(rec, expected_version: str | None = None) -> list[str]:
     for f in ("tag", "release_id", "engine_api_version", "state_schema"):
         if not _is_str(rec.get(f)):
             p.append(f"record.{f} must be a non-empty string")
-    if not (isinstance(rec.get("public_commit_sha"), str) and COMMIT_RE.match(rec["public_commit_sha"])):
+    if _is_str(rec.get("state_schema")) and not STATE_SCHEMA_RE.fullmatch(rec["state_schema"]):
+        p.append("record.state_schema must be the state database version, a positive integer")
+    if not (isinstance(rec.get("public_commit_sha"), str) and COMMIT_RE.fullmatch(rec["public_commit_sha"])):
         p.append("record.public_commit_sha must be 40 lowercase hex chars")
     if rec.get("build_lane") not in set(CHANNEL_LANE.values()):
         p.append(f"record.build_lane must be one of {sorted(set(CHANNEL_LANE.values()))}")
@@ -165,7 +208,7 @@ def validate_record(rec, expected_version: str | None = None) -> list[str]:
             continue
         for tname, t in sec.items():
             where = f"record.{source}[{tname}]"
-            m = TARGET_RE.match(tname)
+            m = TARGET_RE.fullmatch(tname)
             if not m:
                 p.append(f"{where}: target must look like <platform>-<arch>")
             elif source in SOURCE_PLATFORM and m.group(1) != SOURCE_PLATFORM[source]:
@@ -186,8 +229,8 @@ def validate_record(rec, expected_version: str | None = None) -> list[str]:
             continue
         for name, a in items.items():
             if not (isinstance(a, dict) and set(a) == {"asset", "sha256"}
-                    and isinstance(a["asset"], str) and FILE_RE.match(a["asset"])
-                    and isinstance(a["sha256"], str) and SHA256_RE.match(a["sha256"])):
+                    and isinstance(a["asset"], str) and FILE_RE.fullmatch(a["asset"])
+                    and isinstance(a["sha256"], str) and SHA256_RE.fullmatch(a["sha256"])):
                 p.append(f"record.{aux}[{name}] must be {{asset, sha256}}")
     return p
 
@@ -208,12 +251,12 @@ def _validate_target(source: str, where: str, t) -> list[str]:
             continue
         v = t[f]
         if f.endswith("sha256") or f == "attestation_digest":
-            ok = isinstance(v, str) and (SHA256_RE.match(v) or
-                                         (f == "attestation_digest" and re.match(r"^sha256:[0-9a-f]{64}$", v)))
+            ok = isinstance(v, str) and (SHA256_RE.fullmatch(v) or
+                                         (f == "attestation_digest" and re.fullmatch(r"sha256:[0-9a-f]{64}", v)))
         elif f in ("size", "upload_size"):
             ok = _is_int(v) and v > 0
         elif f in ("asset", "file"):
-            ok = isinstance(v, str) and FILE_RE.match(v) and ".." not in v
+            ok = isinstance(v, str) and FILE_RE.fullmatch(v) and ".." not in v
         elif f == "github_url":
             ok = isinstance(v, str) and v.startswith("https://github.com/")
         elif f == "publisher_identity":
@@ -321,6 +364,9 @@ def validate_ledger(ledger, records: dict[str, dict], *, floor: str,
                      f"which may not be served on {channel!r}")
         if not rec.get(source):
             p.append(f"{where}: record {ver} has no {source} artifacts")
+        if channel in release_channels.PROMOTES_FROM and SEMVER_RE.fullmatch(ver) \
+                and SEMVER_RE.fullmatch(ver).group(4) is not None:
+            p.append(f"{where}: pre-release version {ver} may not be served on {channel!r}")
         generations[source] = (ver, json.dumps(rec.get("protocol_generation"), sort_keys=True))
     if minimum is not None:
         try:
@@ -336,6 +382,43 @@ def validate_ledger(ledger, records: dict[str, dict], *, floor: str,
             if va != vb and ga != gb:
                 p.append(f"entries at {va} and {vb} are in different protocol generations; promote "
                          "a generation change for every install_source or for none")
+    return p
+
+
+def promotion_problems(ledger: dict, source_ledger: dict | None, records: dict[str, dict], *,
+                       floor: str) -> list[str]:
+    """A promoting channel serves only what its source channel has served. Checked, for every
+    entry of the promoting ledger and the same install_source in the source ledger (itself
+    validated first, so a malformed source fails closed):
+      - the version is in the source's history and not in its withdrawn_versions;
+      - if the source currently serves that version, it is not kill-switched and its rollout is
+        100 (a version still ramping or switched off on the source is not promoted).
+    Not checked: how long the version has been live (history has no publish times) and whether
+    the source ledger gained the version in the same change as this one (the ledger alone cannot
+    tell; the reviewer of the change must)."""
+    channel = ledger.get("channel")
+    source_channel = release_channels.PROMOTES_FROM.get(channel)
+    if source_channel is None:
+        return []
+    if not isinstance(source_ledger, dict) or source_ledger.get("channel") != source_channel:
+        return [f"{channel!r} promotes from {source_channel!r}: the {source_channel} ledger is required"]
+    found = validate_ledger(source_ledger, records, floor=floor, file_stem=source_channel)
+    if found:
+        return [f"the {source_channel} ledger this promotion reads is invalid: {x}" for x in found]
+    p = []
+    history = source_ledger["history"]
+    withdrawn = source_ledger.get("withdrawn_versions", [])
+    for source, e in (ledger.get("entries") or {}).items():
+        ver = e.get("version") if isinstance(e, dict) else None
+        if ver not in history.get(source, []):
+            p.append(f"entries[{source}].version {ver} is not in the {source_channel} history")
+        elif ver in withdrawn:
+            p.append(f"entries[{source}].version {ver} is withdrawn on {source_channel}")
+        else:
+            now = source_ledger["entries"].get(source)
+            if now and now["version"] == ver and (now["kill_switch"] or now["rollout_percentage"] != 100):
+                p.append(f"entries[{source}].version {ver} is not fully offered on {source_channel} "
+                         "(kill-switched or rollout below 100)")
     return p
 
 
@@ -457,7 +540,7 @@ def build_entries(ledger: dict, records: dict[str, dict]) -> list[dict]:
         rec = records[e["version"]]
         for tname in sorted(rec[source]):
             t = rec[source][tname]
-            platform, arch = TARGET_RE.match(tname).groups()
+            platform, arch = TARGET_RE.fullmatch(tname).groups()
             if source == "script":
                 name, sha, size = t["asset"], t["sha256"], t["size"]
             elif source == "app_bundle":
@@ -480,6 +563,9 @@ def build_entries(ledger: dict, records: dict[str, dict]) -> list[dict]:
                 "artifact_size": size,
                 "artifact_publisher_identity": t.get("publisher_identity", ""),
                 "release_notes_url": "",
+                "state_schema_version": int(rec["state_schema"]),
+                "state_schema_min_readable": int(rec["state_schema"]),
+                **({"sparkle_build": int(t["sparkle_build"])} if source == "app_bundle" else {}),
             })
     return out
 
@@ -494,7 +580,7 @@ def check_unique_and_urls(releases: list[dict]) -> list[str]:
         url = r["artifact_url"]
         rest = url[len(DL_PREFIX):]
         if not url.startswith(DL_PREFIX) or any(c in rest for c in "?#\\") or ".." in rest \
-                or "//" in rest or not re.match(r"^[A-Za-z0-9._/-]+$", rest):
+                or "//" in rest or not re.fullmatch(r"[A-Za-z0-9._/-]+", rest):
             p.append(f"releases[{i}].artifact_url {url!r} is not under {DL_PREFIX}")
     return p
 
@@ -508,7 +594,7 @@ def build_appcast(ledger: dict, records: dict[str, dict]) -> dict:
         rec = records[e["version"]]
         for tname in sorted(rec["app_bundle"]):
             t = rec["app_bundle"][tname]
-            platform, arch = TARGET_RE.match(tname).groups()
+            platform, arch = TARGET_RE.fullmatch(tname).groups()
             items.append({
                 "platform": platform,
                 "arch": arch,
@@ -541,9 +627,12 @@ def check_appcast_covered(appcast: dict, manifest: dict) -> list[str]:
         elif r["version"] != it.get("version"):
             p.append(f"{where}: version {it.get('version')} is not the manifest's app_bundle "
                      f"version {r['version']}")
-        elif (r["artifact_url"], r["artifact_sha256"], r["artifact_size"], r["rollout_percentage"]) != \
-                (it.get("url"), it.get("sha256"), it.get("size"), it.get("rollout_percentage")):
-            p.append(f"{where}: url/sha256/size/rollout do not match the manifest's app_bundle entry")
+        elif (r["artifact_url"], r["artifact_sha256"], r["artifact_size"], r["rollout_percentage"],
+              str(r.get("sparkle_build"))) != \
+                (it.get("url"), it.get("sha256"), it.get("size"), it.get("rollout_percentage"),
+                 str(it.get("sparkle_build"))):
+            p.append(f"{where}: url/sha256/size/rollout/build do not match the manifest's "
+                     "app_bundle entry")
     return p
 
 
@@ -561,14 +650,14 @@ def sha256_hex(data: str | bytes) -> str:
 def assemble(ledger: dict, records: dict[str, dict], trust_chain_text: str, generated_at: str, *,
              floor: str, previous_ledger: dict | None = None,
              served_appcast_version: str | None = None,
-             ledger_stem: str | None = None) -> dict:
+             ledger_stem: str | None = None, promotion_source: dict | None = None) -> dict:
     """Pure: build the unsigned manifest body and appcast body data, or raise LedgerError.
 
     Returns {manifest_body, manifest_body_sha256, appcast, trust_chain_sha256}. The trust chain
     rides on the signed envelope rather than the body, so only its digest is reported (it must be
     a JSON array)."""
     problems: list[str] = []
-    if not GENERATED_AT_RE.match(generated_at or ""):
+    if not GENERATED_AT_RE.fullmatch(generated_at or ""):
         problems.append(f"generated_at {generated_at!r} must be YYYY-MM-DDTHH:MM:SSZ")
     chain = load_json(trust_chain_text, "trust-chain.json")
     if not isinstance(chain, list):
@@ -582,11 +671,13 @@ def assemble(ledger: dict, records: dict[str, dict], trust_chain_text: str, gene
         raise LedgerError(problems)
     problems += validate_transition(previous_ledger, ledger, records, floor=floor,
                                     served_appcast_version=served_appcast_version)
+    problems += promotion_problems(ledger, promotion_source, records, floor=floor)
     releases = build_entries(ledger, records)
     problems += check_unique_and_urls(releases)
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "generated_at": generated_at,
+        "expires_at": expires_at_for(generated_at),
         "releases": releases,
     }
     withdrawn = sorted(set(ledger.get("withdrawn_versions", [])), key=semver_key)

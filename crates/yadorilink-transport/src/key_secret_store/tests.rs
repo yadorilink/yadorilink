@@ -39,11 +39,11 @@ fn persist_then_load_round_trips_via_file_when_keyring_down() {
     let path = dir.path().join("k");
     let secret = sample_secret();
 
-    persist_new_secret(&path, &secret).unwrap();
+    persist_new_secret(&path, &secret, KeyMirror::OsKeyring).unwrap();
     assert!(path.exists());
-    assert!(keyring_load(&path).is_none(), "keyring is down in this test");
+    assert!(keyring_load(&path, KeyMirror::OsKeyring).is_none(), "keyring is down in this test");
 
-    let loaded = load_persisted_secret(&path).unwrap().unwrap();
+    let loaded = load_persisted_secret(&path, KeyMirror::OsKeyring).unwrap().unwrap();
     assert_eq!(loaded.as_slice(), &secret);
     assert!(temp_leftovers(dir.path()).is_empty());
 }
@@ -56,7 +56,7 @@ fn persist_creates_owner_only_file() {
     test_keyring::reset();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("k");
-    persist_new_secret(&path, &sample_secret()).unwrap();
+    persist_new_secret(&path, &sample_secret(), KeyMirror::OsKeyring).unwrap();
 
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
@@ -72,14 +72,14 @@ fn migration_populates_keyring_without_losing_the_file() {
 
     // Simulate a pre-keyring plaintext identity file already on disk.
     std::fs::write(&path, hex::encode(secret)).unwrap();
-    assert!(keyring_load(&path).is_none());
+    assert!(keyring_load(&path, KeyMirror::OsKeyring).is_none());
 
-    let loaded = load_persisted_secret(&path).unwrap().unwrap();
+    let loaded = load_persisted_secret(&path, KeyMirror::OsKeyring).unwrap().unwrap();
     assert_eq!(loaded.as_slice(), &secret);
     // The identity file must survive migration untouched.
     assert!(path.exists(), "migration must never delete the identity file");
     // And the keyring now mirrors it.
-    assert_eq!(keyring_load(&path).unwrap().as_slice(), &secret);
+    assert_eq!(keyring_load(&path, KeyMirror::OsKeyring).unwrap().as_slice(), &secret);
 
     test_keyring::reset();
 }
@@ -93,10 +93,10 @@ fn recovers_identity_from_keyring_when_file_is_lost() {
     let secret = sample_secret();
 
     // Identity only in the keyring, nothing on disk yet.
-    assert_eq!(keyring_mirror(&path, &secret), KeyringMirror::Present);
+    assert_eq!(keyring_mirror(&path, &secret, KeyMirror::OsKeyring), KeyringMirror::Present);
     assert!(!path.exists());
 
-    let loaded = load_persisted_secret(&path).unwrap().unwrap();
+    let loaded = load_persisted_secret(&path, KeyMirror::OsKeyring).unwrap().unwrap();
     assert_eq!(loaded.as_slice(), &secret);
     // Recovery restores the on-disk source of truth.
     assert!(path.exists(), "recovery must rewrite the hardened file");
@@ -109,7 +109,7 @@ fn missing_file_and_empty_keyring_returns_none() {
     test_keyring::reset();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("absent");
-    assert!(load_persisted_secret(&path).unwrap().is_none());
+    assert!(load_persisted_secret(&path, KeyMirror::OsKeyring).unwrap().is_none());
 }
 
 /// A power cut can leave the key file empty or half-written. The identity
@@ -123,13 +123,13 @@ fn truncated_key_file_is_restored_from_the_keyring() {
     let path = dir.path().join("k");
     let secret = sample_secret();
 
-    persist_new_secret(&path, &secret).unwrap();
-    assert_eq!(keyring_load(&path).unwrap().as_slice(), &secret);
+    persist_new_secret(&path, &secret, KeyMirror::OsKeyring).unwrap();
+    assert_eq!(keyring_load(&path, KeyMirror::OsKeyring).unwrap().as_slice(), &secret);
 
     for damaged in [b"".as_slice(), b"0102030405".as_slice(), &[0xFF, 0xFE, 0x00]] {
         std::fs::write(&path, damaged).unwrap();
 
-        let loaded = load_persisted_secret(&path).unwrap().unwrap();
+        let loaded = load_persisted_secret(&path, KeyMirror::OsKeyring).unwrap().unwrap();
         assert_eq!(loaded.as_slice(), &secret, "identity must survive a torn write");
         assert_eq!(
             read_secret(&path),
@@ -152,7 +152,7 @@ fn unreadable_key_file_without_a_keyring_copy_is_an_error() {
     let path = dir.path().join("k");
     std::fs::write(&path, b"not hex at all").unwrap();
 
-    let err = load_persisted_secret(&path).unwrap_err();
+    let err = load_persisted_secret(&path, KeyMirror::OsKeyring).unwrap_err();
     assert!(matches!(err, TransportError::InvalidKey(_)), "expected a decode error, got {err:?}");
 }
 
@@ -167,16 +167,16 @@ fn a_disagreeing_keyring_entry_is_never_overwritten_by_the_file() {
     let path = dir.path().join("k");
 
     assert_eq!(
-        keyring_mirror(&path, &other_secret()),
+        keyring_mirror(&path, &other_secret(), KeyMirror::OsKeyring),
         KeyringMirror::Present,
         "seed the keyring with a different identity"
     );
     std::fs::write(&path, hex::encode(sample_secret())).unwrap();
 
-    let loaded = load_persisted_secret(&path).unwrap().unwrap();
+    let loaded = load_persisted_secret(&path, KeyMirror::OsKeyring).unwrap().unwrap();
     assert_eq!(loaded.as_slice(), &sample_secret(), "the file stays the source of truth");
     assert_eq!(
-        keyring_load(&path).unwrap().as_slice(),
+        keyring_load(&path, KeyMirror::OsKeyring).unwrap().as_slice(),
         &other_secret(),
         "the keyring copy must survive as an independent anchor"
     );
@@ -195,9 +195,9 @@ fn publishing_an_identity_never_clobbers_one_that_appeared_first() {
     let path = dir.path().join("k");
     let winner = sample_secret();
 
-    persist_new_secret(&path, &winner).unwrap();
+    persist_new_secret(&path, &winner, KeyMirror::OsKeyring).unwrap();
 
-    let err = persist_new_secret(&path, &other_secret()).unwrap_err();
+    let err = persist_new_secret(&path, &other_secret(), KeyMirror::OsKeyring).unwrap_err();
     assert!(
         matches!(&err, TransportError::Io(e) if e.kind() == std::io::ErrorKind::AlreadyExists),
         "the loser must see AlreadyExists so it re-reads the winner's file, got {err:?}"
@@ -222,7 +222,7 @@ fn loading_tightens_permissions_on_a_world_readable_key_file() {
     std::fs::write(&path, hex::encode(sample_secret())).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-    load_persisted_secret(&path).unwrap().unwrap();
+    load_persisted_secret(&path, KeyMirror::OsKeyring).unwrap().unwrap();
 
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "a loosened key file must be tightened on load");
@@ -237,7 +237,7 @@ fn creates_missing_parent_directories() {
     let path = dir.path().join("nested/deeper/k");
     let secret = sample_secret();
 
-    persist_new_secret(&path, &secret).unwrap();
+    persist_new_secret(&path, &secret, KeyMirror::OsKeyring).unwrap();
 
     assert_eq!(read_secret(&path), Some(secret));
     assert!(temp_leftovers(dir.path().join("nested/deeper").as_path()).is_empty());
@@ -245,9 +245,13 @@ fn creates_missing_parent_directories() {
 
 #[test]
 fn only_the_literal_one_disables_the_keyring() {
-    assert!(disables_keyring(Some("1")));
+    assert_eq!(KeyMirror::from_disable_flag(Some("1")), KeyMirror::Disabled);
     for off in [None, Some(""), Some("0"), Some("true")] {
-        assert!(!disables_keyring(off), "{off:?} must leave the keyring on");
+        assert_eq!(
+            KeyMirror::from_disable_flag(off),
+            KeyMirror::OsKeyring,
+            "{off:?} must leave the keyring on"
+        );
     }
 }
 
@@ -255,21 +259,22 @@ fn only_the_literal_one_disables_the_keyring() {
 fn disabled_keyring_is_never_read_or_written_and_the_file_still_works() {
     test_keyring::reset();
     test_keyring::set_available(true); // a keyring that WOULD work
-    test_keyring::set_disabled(true);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("k");
     let secret = sample_secret();
 
-    persist_new_secret(&path, &secret).unwrap();
-    let loaded = load_persisted_secret(&path).unwrap().unwrap();
+    persist_new_secret(&path, &secret, KeyMirror::Disabled).unwrap();
+    let loaded = load_persisted_secret(&path, KeyMirror::Disabled).unwrap().unwrap();
     assert_eq!(loaded.as_slice(), &secret);
     // A lost file cannot be recovered from a keyring that is switched off.
     std::fs::remove_file(&path).unwrap();
-    assert!(load_persisted_secret(&path).unwrap().is_none());
+    assert!(load_persisted_secret(&path, KeyMirror::Disabled).unwrap().is_none());
 
     assert_eq!(test_keyring::calls(), 0, "the switch must prevent every keyring operation");
-    test_keyring::set_disabled(false);
-    assert!(keyring_load(&path).is_none(), "nothing was mirrored while disabled");
+    assert!(
+        keyring_load(&path, KeyMirror::OsKeyring).is_none(),
+        "nothing was mirrored while disabled"
+    );
     test_keyring::reset();
 }
 
@@ -279,14 +284,13 @@ fn enabled_keyring_is_still_used() {
     test_keyring::set_available(true);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("k");
-    persist_new_secret(&path, &sample_secret()).unwrap();
+    persist_new_secret(&path, &sample_secret(), KeyMirror::OsKeyring).unwrap();
     assert!(test_keyring::calls() > 0);
-    assert_eq!(keyring_load(&path).unwrap().as_slice(), &sample_secret());
+    assert_eq!(keyring_load(&path, KeyMirror::OsKeyring).unwrap().as_slice(), &sample_secret());
     test_keyring::reset();
 }
 
-/// Retiring an identity keeps it (file and keyring copy under the retired
-/// name) and makes the new secret the one a lost file recovers: the old key
+/// Retiring an identity keeps its file under the retired name, drops its keyring copy, and makes the new secret the one a lost file recovers: the old key
 /// must not come back from the keyring entry of the live path.
 #[test]
 fn a_retired_identity_is_kept_and_does_not_come_back_from_the_keyring() {
@@ -295,16 +299,16 @@ fn a_retired_identity_is_kept_and_does_not_come_back_from_the_keyring() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("signing_key");
     let retired = dir.path().join("retired").join("signing_key");
-    persist_new_secret(&path, &sample_secret()).unwrap();
+    persist_new_secret(&path, &sample_secret(), KeyMirror::OsKeyring).unwrap();
 
-    replace_retiring(&path, &retired, &other_secret()).unwrap();
+    replace_retiring(&path, &retired, &other_secret(), KeyMirror::OsKeyring).unwrap();
 
     assert_eq!(read_secret(&path), Some(other_secret()));
     assert_eq!(read_secret(&retired), Some(sample_secret()));
-    assert_eq!(keyring_load(&retired).as_deref(), Some(&sample_secret()));
+    assert!(keyring_load(&retired, KeyMirror::OsKeyring).is_none());
 
     std::fs::remove_file(&path).unwrap();
-    let recovered = load_persisted_secret(&path).unwrap().unwrap();
+    let recovered = load_persisted_secret(&path, KeyMirror::OsKeyring).unwrap().unwrap();
     assert_eq!(
         recovered.as_slice(),
         &other_secret(),
@@ -323,10 +327,10 @@ fn retiring_again_after_an_interruption_finishes_the_replacement() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("signing_key");
     let retired = dir.path().join("retired_key");
-    persist_new_secret(&path, &sample_secret()).unwrap();
-    persist_new_secret(&retired, &sample_secret()).unwrap();
+    persist_new_secret(&path, &sample_secret(), KeyMirror::OsKeyring).unwrap();
+    persist_new_secret(&retired, &sample_secret(), KeyMirror::OsKeyring).unwrap();
 
-    replace_retiring(&path, &retired, &other_secret()).unwrap();
+    replace_retiring(&path, &retired, &other_secret(), KeyMirror::OsKeyring).unwrap();
 
     assert_eq!(read_secret(&path), Some(other_secret()));
     assert_eq!(read_secret(&retired), Some(sample_secret()));
@@ -340,10 +344,10 @@ fn retiring_never_overwrites_a_different_retired_identity() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("signing_key");
     let retired = dir.path().join("retired_key");
-    persist_new_secret(&path, &sample_secret()).unwrap();
-    persist_new_secret(&retired, &[0x11; 32]).unwrap();
+    persist_new_secret(&path, &sample_secret(), KeyMirror::OsKeyring).unwrap();
+    persist_new_secret(&retired, &[0x11; 32], KeyMirror::OsKeyring).unwrap();
 
-    assert!(replace_retiring(&path, &retired, &other_secret()).is_err());
+    assert!(replace_retiring(&path, &retired, &other_secret(), KeyMirror::OsKeyring).is_err());
 
     assert_eq!(read_secret(&path), Some(sample_secret()));
     assert_eq!(read_secret(&retired), Some([0x11; 32]));
@@ -360,18 +364,22 @@ fn a_keyring_that_refuses_the_replacement_is_reported_and_repaired_on_retry() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("signing_key");
     let retired = dir.path().join("retired_key");
-    persist_new_secret(&path, &sample_secret()).unwrap();
+    persist_new_secret(&path, &sample_secret(), KeyMirror::OsKeyring).unwrap();
 
     test_keyring::set_fail_writes(true);
-    assert!(replace_retiring(&path, &retired, &other_secret()).is_err());
+    assert!(replace_retiring(&path, &retired, &other_secret(), KeyMirror::OsKeyring).is_err());
     assert_eq!(read_secret(&path), Some(other_secret()));
-    assert_eq!(keyring_load(&path).as_deref(), Some(&sample_secret()), "still the old entry");
+    assert_eq!(
+        keyring_load(&path, KeyMirror::OsKeyring).as_deref(),
+        Some(&sample_secret()),
+        "still the old entry"
+    );
 
     test_keyring::set_fail_writes(false);
-    replace_retiring(&path, &retired, &other_secret()).unwrap();
-    assert_eq!(keyring_load(&path).as_deref(), Some(&other_secret()));
+    replace_retiring(&path, &retired, &other_secret(), KeyMirror::OsKeyring).unwrap();
+    assert_eq!(keyring_load(&path, KeyMirror::OsKeyring).as_deref(), Some(&other_secret()));
     std::fs::remove_file(&path).unwrap();
-    let recovered = load_persisted_secret(&path).unwrap().unwrap();
+    let recovered = load_persisted_secret(&path, KeyMirror::OsKeyring).unwrap().unwrap();
     assert_eq!(recovered.as_slice(), &other_secret());
     test_keyring::reset();
 }
@@ -386,18 +394,99 @@ fn a_locked_keyring_is_reported_not_treated_as_absent_and_is_repaired_on_retry()
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("signing_key");
     let retired = dir.path().join("retired_key");
-    persist_new_secret(&path, &sample_secret()).unwrap();
+    persist_new_secret(&path, &sample_secret(), KeyMirror::OsKeyring).unwrap();
 
     test_keyring::set_available(false);
-    assert!(replace_retiring(&path, &retired, &other_secret()).is_err());
+    assert!(replace_retiring(&path, &retired, &other_secret(), KeyMirror::OsKeyring).is_err());
     assert_eq!(read_secret(&path), Some(other_secret()));
 
     test_keyring::set_available(true);
-    assert_eq!(keyring_load(&path).as_deref(), Some(&sample_secret()), "still the old entry");
-    replace_retiring(&path, &retired, &other_secret()).unwrap();
-    assert_eq!(keyring_load(&path).as_deref(), Some(&other_secret()));
+    assert_eq!(
+        keyring_load(&path, KeyMirror::OsKeyring).as_deref(),
+        Some(&sample_secret()),
+        "still the old entry"
+    );
+    replace_retiring(&path, &retired, &other_secret(), KeyMirror::OsKeyring).unwrap();
+    assert_eq!(keyring_load(&path, KeyMirror::OsKeyring).as_deref(), Some(&other_secret()));
     std::fs::remove_file(&path).unwrap();
-    let recovered = load_persisted_secret(&path).unwrap().unwrap();
+    let recovered = load_persisted_secret(&path, KeyMirror::OsKeyring).unwrap().unwrap();
     assert_eq!(recovered.as_slice(), &other_secret());
     test_keyring::reset();
+}
+
+#[test]
+fn deleting_the_keyring_copy_leaves_the_key_file_and_reports_it() {
+    test_keyring::reset();
+    test_keyring::set_available(true);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("k");
+    persist_new_secret(&path, &sample_secret(), KeyMirror::OsKeyring).unwrap();
+    assert!(keyring_load(&path, KeyMirror::OsKeyring).is_some());
+
+    assert_eq!(delete_keyring_entry(&path, KeyMirror::OsKeyring).unwrap(), KeyringDelete::Deleted);
+    assert!(keyring_load(&path, KeyMirror::OsKeyring).is_none());
+    assert_eq!(read_secret(&path), Some(sample_secret()), "the key file is not touched");
+}
+
+#[test]
+fn deleting_a_missing_keyring_entry_is_success() {
+    test_keyring::reset();
+    test_keyring::set_available(true);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("k");
+    assert_eq!(delete_keyring_entry(&path, KeyMirror::OsKeyring).unwrap(), KeyringDelete::NotFound);
+    persist_new_secret(&path, &sample_secret(), KeyMirror::OsKeyring).unwrap();
+    assert_eq!(delete_keyring_entry(&path, KeyMirror::OsKeyring).unwrap(), KeyringDelete::Deleted);
+    assert_eq!(delete_keyring_entry(&path, KeyMirror::OsKeyring).unwrap(), KeyringDelete::NotFound);
+}
+
+#[test]
+fn a_refused_or_unavailable_keyring_delete_is_an_error_not_success() {
+    test_keyring::reset();
+    test_keyring::set_available(true);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("k");
+    persist_new_secret(&path, &sample_secret(), KeyMirror::OsKeyring).unwrap();
+
+    test_keyring::set_fail_deletes(true);
+    let err = delete_keyring_entry(&path, KeyMirror::OsKeyring).unwrap_err().to_string();
+    assert!(err.contains("could not delete"), "{err}");
+    assert!(keyring_load(&path, KeyMirror::OsKeyring).is_some(), "the entry is still there");
+
+    test_keyring::set_fail_deletes(false);
+    test_keyring::set_available(false);
+    assert!(delete_keyring_entry(&path, KeyMirror::OsKeyring).is_err());
+}
+
+#[test]
+fn a_disabled_keyring_deletes_nothing() {
+    test_keyring::reset();
+    test_keyring::set_available(true);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("k");
+    persist_new_secret(&path, &sample_secret(), KeyMirror::OsKeyring).unwrap();
+    assert_eq!(
+        delete_keyring_entry(&path, KeyMirror::Disabled).unwrap(),
+        KeyringDelete::KeyringDisabled
+    );
+    assert!(keyring_load(&path, KeyMirror::OsKeyring).is_some());
+}
+
+#[test]
+fn retiring_a_key_removes_the_retired_keyring_copy_and_keeps_the_new_one() {
+    test_keyring::reset();
+    test_keyring::set_available(true);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("k");
+    let retired = dir.path().join("old");
+    persist_new_secret(&path, &sample_secret(), KeyMirror::OsKeyring).unwrap();
+
+    replace_retiring(&path, &retired, &other_secret(), KeyMirror::OsKeyring).unwrap();
+
+    assert_eq!(read_secret(&retired), Some(sample_secret()), "the retired key file is kept");
+    assert!(
+        keyring_load(&retired, KeyMirror::OsKeyring).is_none(),
+        "the retired keyring copy is gone"
+    );
+    assert_eq!(keyring_load(&path, KeyMirror::OsKeyring).unwrap().as_slice(), &other_secret());
 }

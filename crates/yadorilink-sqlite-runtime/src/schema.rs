@@ -18,7 +18,7 @@ use crate::error::DatabaseError;
 /// Bump this whenever the created shape changes at all, since the previous
 /// shape becomes unopenable by this binary and unopenable is the intended
 /// outcome.
-pub const SCHEMA_VERSION: i32 = 132;
+pub const SCHEMA_VERSION: i32 = 133;
 
 /// Reads `PRAGMA user_version` and refuses anything that is not exactly
 /// this binary's [`SCHEMA_VERSION`], in either direction: a newer stamp is
@@ -66,7 +66,7 @@ pub fn check_replica_schema_generation(conn: &Connection) -> Result<(), Database
     }
     let tables: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE type = 'table' \
-         AND name NOT LIKE 'sqlite_%'",
+         AND name NOT LIKE 'sqlite_%' AND name <> 'writer_generation'",
         [],
         |r| r.get(0),
     )?;
@@ -918,6 +918,7 @@ fn create_root_set_generation(conn: &Connection) -> Result<(), DatabaseError> {
         "#,
     )?;
     create_provider_tables(conn)?;
+    create_provider_window_ledger(conn)?;
     create_provider_removals(conn)?;
     Ok(())
 }
@@ -939,6 +940,29 @@ fn create_provider_removals(conn: &Connection) -> Result<(), DatabaseError> {
             requested_at       INTEGER NOT NULL,
             preserved_location TEXT
         );
+        "#,
+    )?;
+    Ok(())
+}
+
+/// The ledger of versions served to the OS in windows only (see `provider_handoffs`).
+fn create_provider_window_ledger(conn: &Connection) -> Result<(), DatabaseError> {
+    conn.execute_batch(
+        r#"
+        -- The ledger of verified WINDOWS: for each item, the version whose bytes the daemon handed
+        -- to the OS only in ranged windows (a large file is read that way), with the same content
+        -- signature and evidence sequence as a handoff. A window serve says the OS may hold SOME
+        -- bytes of that version, never all of them: it is never presence of the content (the
+        -- `provider_handoffs` rule), and only lets the user's explicit eviction ask the host to
+        -- drop what it holds of exactly that version. Demoted with the handoff row.
+        CREATE TABLE IF NOT EXISTS provider_window_serves (
+            root_id      TEXT NOT NULL,
+            item_id      BLOB NOT NULL,
+            version_hash BLOB NOT NULL,
+            content_sig  TEXT NOT NULL,
+            evidence_seq INTEGER NOT NULL,
+            PRIMARY KEY (root_id, item_id)
+        ) WITHOUT ROWID;
         "#,
     )?;
     Ok(())
@@ -1334,6 +1358,19 @@ pub fn reconcile_provider_liveness(conn: &Connection) -> rusqlite::Result<()> {
                             AND (f.size || '|' || f.blocks_json || '|' || f.record_kind || '|'
                                  || COALESCE(CAST(f.symlink_target AS TEXT), ''))
                                 = provider_handoffs.content_sig);
+        DELETE FROM provider_window_serves
+        WHERE EXISTS (SELECT 1 FROM provider_items i
+                      JOIN provider_dirty_paths d ON d.group_id = i.group_id AND d.path = i.path
+                      WHERE i.root_id = provider_window_serves.root_id
+                        AND i.item_id = provider_window_serves.item_id)
+          AND NOT EXISTS (SELECT 1 FROM provider_items i
+                          JOIN files f ON f.group_id = i.group_id AND f.path = i.path
+                          WHERE i.root_id = provider_window_serves.root_id
+                            AND i.item_id = provider_window_serves.item_id
+                            AND f.state = 'current' AND f.deleted = 0
+                            AND (f.size || '|' || f.blocks_json || '|' || f.record_kind || '|'
+                                 || COALESCE(CAST(f.symlink_target AS TEXT), ''))
+                                = provider_window_serves.content_sig);
         DELETE FROM provider_dirty_paths;
         "#,
     )

@@ -51,6 +51,10 @@ fn platform_fields_from_path(_path: &Path, _metadata: &Metadata) -> io::Result<P
 }
 #[cfg(windows)]
 fn platform_fields_from_path(path: &Path, _metadata: &Metadata) -> io::Result<PlatformFields> {
+    #[cfg(feature = "test-support")]
+    if IDENTITY_QUERY_UNREADABLE.with(|f| f.get()) {
+        return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+    }
     win_identity::query_path(path)
 }
 
@@ -441,7 +445,9 @@ impl FileIdentity {
         }
         #[cfg(windows)]
         {
-            win_identity::query_path(path).is_ok_and(|fields| fields.change_time.is_some())
+            // The same condition under which the race fingerprint is not degraded.
+            win_identity::query_path(path)
+                .is_ok_and(|fields| fields.change_time.is_some() && fields.usn.is_ok())
         }
     }
 
@@ -1870,9 +1876,18 @@ mod win_identity {
                 std::mem::size_of::<FileBasicInfo>() as u32,
             )
         };
-        let change_time = (basic_ok != 0).then_some(basic_info.change_time);
+        let change_time = change_time_from_basic_info(basic_ok != 0, basic_info.change_time);
 
         Ok(IdentityFields { object_id, number_of_links, change_time, usn: file_usn(handle) })
+    }
+
+    /// The usable `ChangeTime`: `None` when the query failed OR answered `0`. A volume with no
+    /// change time (FAT/FAT32: `FileBasicInfo` succeeds and returns `0`) is as unreadable as a
+    /// failed query: a zero would otherwise read as a real, "strict" sample that is
+    /// bit-identical to the stat-only one, and a 2 s write-time granularity hides an ordinary
+    /// same-size save. A genuine `ChangeTime` of 0 (1601-01-01) does not occur on a live file.
+    pub(super) fn change_time_from_basic_info(query_ok: bool, raw: i64) -> Option<i64> {
+        (query_ok && raw != 0).then_some(raw)
     }
 
     /// The USN of the file behind `handle`; see [`IdentityFields::usn`].
@@ -2118,7 +2133,7 @@ pub fn disk_race_fingerprint(path: &Path) -> Option<DiskRaceFingerprint> {
     Some(disk_race_fingerprint_of_at(&std::fs::symlink_metadata(path).ok()?, path))
 }
 
-/// [`disk_race_fingerprint_of`] for a caller that holds the `lstat` AND the
+/// The fingerprint for a caller that holds the `lstat` AND the
 /// path it came from. Identical on Unix. On Windows the std `Metadata` carries
 /// no change time, so the path is asked for NTFS `ChangeTime` and the file's
 /// USN. `ChangeTime` moves with every write but `FileBasicInfo` lets a writer
@@ -2136,34 +2151,188 @@ pub fn disk_race_fingerprint_of_at(meta: &Metadata, path: &Path) -> DiskRaceFing
     #[cfg(not(windows))]
     {
         let _ = path;
-        disk_race_fingerprint_of(meta)
+        stat_fingerprint(meta)
     }
     #[cfg(windows)]
     {
-        use std::sync::atomic::{AtomicI64, Ordering};
-        static UNOBSERVABLE: AtomicI64 = AtomicI64::new(0);
-        let (len, mtime, _, _) = disk_race_fingerprint_of(meta);
-        let fields = win_identity::query_path(path).ok();
-        match fields.as_ref().and_then(|fields| fields.change_time.zip(fields.usn.ok())) {
-            // A volume without a change journal has no USN (`None`): the fingerprint is then
-            // as strong as the change time alone.
-            Some((change_time, usn)) => (len, mtime, change_time, usn.unwrap_or(0)),
-            None => (len, mtime, i64::MIN, UNOBSERVABLE.fetch_add(1, Ordering::Relaxed)),
-        }
+        windows_fingerprint(meta, query_fingerprint_fields(path), true)
     }
 }
 
-/// What [`disk_race_fingerprint`] would report for an `lstat` the caller
-/// already holds.
-///
-/// Exists so a caller that needs BOTH a path's metadata (its size, mtime
-/// and mode) and the fingerprint that brackets its observation can derive
-/// them from ONE `lstat` rather than two. Two stats mean the metadata a
-/// mutation is built from and the fingerprint that vouches for it describe
-/// the filesystem at two different instants, and a change landing between
-/// them is invisible to both -- the exact shape of drift the bracket
-/// exists to detect.
-pub fn disk_race_fingerprint_of(meta: &Metadata) -> DiskRaceFingerprint {
+/// [`disk_race_fingerprint_of_at`] for a baseline compared later by a retry loop (hydration):
+/// where the change time or USN cannot be read it is the size and write time alone instead of a
+/// value equal to no other sample, because "never equal" there would refuse every attempt on a
+/// volume that cannot answer.
+pub fn disk_race_fingerprint_of_at_or_stat(meta: &Metadata, path: &Path) -> DiskRaceFingerprint {
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        stat_fingerprint(meta)
+    }
+    #[cfg(windows)]
+    {
+        windows_fingerprint(meta, query_fingerprint_fields(path), false)
+    }
+}
+
+/// [`disk_race_fingerprint_or_stat`] and, from the same single query, whether the sample is the
+/// size and write time alone because the change time or USN could not be read (Windows). Such a
+/// fingerprint cannot show a same-size rewrite with a restored mtime, so a caller that needs more
+/// asks the bytes. Deriving both from one sample keeps the decision and the fingerprint from
+/// disagreeing after a transient query failure. The flag is always `false` on Unix.
+pub fn disk_race_fingerprint_or_stat_observed(path: &Path) -> Option<(DiskRaceFingerprint, bool)> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Some((stat_fingerprint(&meta), false))
+    }
+    #[cfg(windows)]
+    {
+        let fields = query_fingerprint_fields(path).ok();
+        let observed = fields
+            .as_ref()
+            .and_then(|fields| fields.change_time.zip(fields.usn.ok()))
+            .map(|(change_time, usn)| (change_time, usn.unwrap_or(0)));
+        let degraded = observed.is_none();
+        Some((compose_fingerprint(stat_fingerprint(&meta), observed, false), degraded))
+    }
+}
+
+#[cfg(all(windows, feature = "test-support"))]
+thread_local! {
+    static CHANGE_TIME_UNREADABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Until the guard drops, on this thread the path-based fingerprints behave as on a volume whose
+/// change time and USN cannot be read (Windows only; elsewhere the fingerprint is the stat alone,
+/// so this changes nothing).
+#[cfg(feature = "test-support")]
+pub fn change_time_unreadable_for_test() -> ChangeTimeUnreadableGuardForTest {
+    #[cfg(windows)]
+    CHANGE_TIME_UNREADABLE.with(|f| f.set(true));
+    ChangeTimeUnreadableGuardForTest(())
+}
+
+#[cfg(all(windows, feature = "test-support"))]
+thread_local! {
+    static IDENTITY_QUERY_UNREADABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Until the guard drops, on this thread `FileIdentity::observe_path` fails as on a volume whose
+/// whole identity query errors (Windows only; a no-op elsewhere). Independent of
+/// [`change_time_unreadable_for_test`].
+#[cfg(feature = "test-support")]
+pub fn identity_query_unreadable_for_test() -> IdentityQueryUnreadableGuardForTest {
+    #[cfg(windows)]
+    IDENTITY_QUERY_UNREADABLE.with(|f| f.set(true));
+    IdentityQueryUnreadableGuardForTest(())
+}
+
+/// Restores the identity query on drop.
+#[cfg(feature = "test-support")]
+pub struct IdentityQueryUnreadableGuardForTest(());
+
+#[cfg(feature = "test-support")]
+impl Drop for IdentityQueryUnreadableGuardForTest {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        IDENTITY_QUERY_UNREADABLE.with(|f| f.set(false));
+    }
+}
+
+/// Restores the readable change time on drop.
+#[cfg(feature = "test-support")]
+pub struct ChangeTimeUnreadableGuardForTest(());
+
+#[cfg(feature = "test-support")]
+impl Drop for ChangeTimeUnreadableGuardForTest {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        CHANGE_TIME_UNREADABLE.with(|f| f.set(false));
+    }
+}
+
+#[cfg(windows)]
+fn query_fingerprint_fields(path: &Path) -> io::Result<win_identity::IdentityFields> {
+    #[cfg(feature = "test-support")]
+    if CHANGE_TIME_UNREADABLE.with(|f| f.get()) {
+        return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+    }
+    win_identity::query_path(path)
+}
+
+/// [`disk_race_fingerprint`] for a pre/post bracket that a retry loop compares (the eager
+/// materialize's fetch and assemble windows, eviction's revalidation): the path's `lstat` through
+/// [`disk_race_fingerprint_of_at_or_stat`], so where the change time or USN cannot be read both
+/// samples are the size and write time alone and still compare equal for an untouched file. Only
+/// for a bracket whose caller also verifies the bytes or the dirty journal; evidence that must
+/// not miss an edit uses [`disk_race_fingerprint`].
+pub fn disk_race_fingerprint_or_stat(path: &Path) -> Option<DiskRaceFingerprint> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    Some(disk_race_fingerprint_of_at_or_stat(&meta, path))
+}
+
+/// [`disk_race_fingerprint_of_at`] for a caller that holds the open file
+/// `meta` came from (`file.metadata()`): the change time and USN are read
+/// from that handle, so the sample describes the object the caller is
+/// reading even when the path has since been swapped for another file. Where the change time or
+/// USN cannot be read it is the size and write time alone (unlike [`disk_race_fingerprint_of_at`],
+/// which then never compares equal): it brackets one read, where "never equal" would starve it.
+pub fn disk_race_fingerprint_of_handle(meta: &Metadata, file: &File) -> DiskRaceFingerprint {
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+        stat_fingerprint(meta)
+    }
+    #[cfg(windows)]
+    {
+        windows_fingerprint(meta, win_identity::query_handle(file), false)
+    }
+}
+
+/// The Windows fingerprint of an `lstat` plus whatever the change-time/USN query answered.
+#[cfg(windows)]
+fn windows_fingerprint(
+    meta: &Metadata,
+    fields: io::Result<win_identity::IdentityFields>,
+    fail_closed: bool,
+) -> DiskRaceFingerprint {
+    let fields = fields.ok();
+    // A volume without a change journal has no USN (`None`): the fingerprint is then as strong as
+    // the change time alone.
+    let observed = fields
+        .as_ref()
+        .and_then(|fields| fields.change_time.zip(fields.usn.ok()))
+        .map(|(change_time, usn)| (change_time, usn.unwrap_or(0)));
+    compose_fingerprint(stat_fingerprint(meta), observed, fail_closed)
+}
+
+/// Adds the change time and USN to a stat fingerprint. When they could not be read
+/// (`observed == None`): with `fail_closed` the result carries a value that equals no other
+/// sample (a comparison never reports "unchanged": the cost is a re-capture, never a missed
+/// edit), otherwise it is the stat fingerprint unchanged.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn compose_fingerprint(
+    stat: DiskRaceFingerprint,
+    observed: Option<(i64, i64)>,
+    fail_closed: bool,
+) -> DiskRaceFingerprint {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static UNOBSERVABLE: AtomicI64 = AtomicI64::new(0);
+    let (len, mtime, _, _) = stat;
+    match observed {
+        Some((change_time, usn)) => (len, mtime, change_time, usn),
+        None if fail_closed => (len, mtime, i64::MIN, UNOBSERVABLE.fetch_add(1, Ordering::Relaxed)),
+        None => stat,
+    }
+}
+
+/// Size, mtime and (on Unix) ctime of an `lstat`: what every fingerprint starts from. Private on
+/// purpose: on Windows these alone cannot see a same-size rewrite inside one timestamp tick, so
+/// every caller goes through [`disk_race_fingerprint_of_at`] or
+/// [`disk_race_fingerprint_of_handle`].
+fn stat_fingerprint(meta: &Metadata) -> DiskRaceFingerprint {
     #[cfg(unix)]
     let (ctime, ctime_nsec) = {
         use std::os::unix::fs::MetadataExt as _;
@@ -2187,6 +2356,32 @@ pub fn metadata_mtime_matches(metadata: &Metadata, indexed_mtime_unix_nanos: i64
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos() as i64)
         == Some(indexed_mtime_unix_nanos)
+}
+
+/// Whether `a` and `b` currently name one filesystem object (a hard link counts as the
+/// same object), neither followed if it is a symlink. This is identity, not change detection:
+/// size and times say nothing about it (two siblings written together share both). Any failure
+/// to observe either path answers `false`.
+pub fn same_live_object(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        match (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match (FileIdentity::observe_path(a), FileIdentity::observe_path(b)) {
+            (Ok(a), Ok(b)) => {
+                a.volume_identity == b.volume_identity
+                    && a.object_id == b.object_id
+                    && a.object_kind == b.object_kind
+            }
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]

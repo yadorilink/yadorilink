@@ -80,7 +80,7 @@ const BLOCK_STORE_LOCK_FILE: &str = ".yadorilink-store.lock";
 /// [`std::fs::File`] handles keeps the advisory lock(s); dropping the value
 /// releases them (so a partially-acquired set rolls back automatically).
 #[derive(Debug)]
-pub(crate) struct ResourceLock {
+pub struct ResourceLock {
     _sidecar: std::fs::File,
     /// (Linux/Android, sync DB only) A second whole-file flock held on the
     /// *live* database inode, so same-inode aliases (file bind mount, hard
@@ -96,7 +96,7 @@ impl ResourceLock {
     /// Lock the block-store root. The lock file lives inside the canonicalized
     /// root, so any alias resolving to (or bind-mounting) the same directory
     /// targets the same lock-file inode and conflicts.
-    pub(crate) fn lock_block_store(root: &Path) -> anyhow::Result<Self> {
+    pub fn lock_block_store(root: &Path) -> anyhow::Result<Self> {
         let canonical = canonicalize_dir(root).map_err(|e| {
             anyhow::anyhow!("failed to resolve block-store root {}: {e}", root.display())
         })?;
@@ -116,7 +116,7 @@ impl ResourceLock {
     /// on every platform; on Linux/Android an additional whole-file flock on
     /// the live database inode additionally catches same-inode file aliases
     /// (bind mount, hard link). See the module doc for the platform rationale.
-    pub(crate) fn lock_sync_db(db_path: &Path) -> anyhow::Result<Self> {
+    pub fn lock_sync_db(db_path: &Path) -> anyhow::Result<Self> {
         let canonical_db = canonicalize_file_target(db_path).map_err(|e| {
             anyhow::anyhow!("failed to resolve sync database {}: {e}", db_path.display())
         })?;
@@ -183,7 +183,7 @@ impl ResourceLock {
     /// then; without this the first session would not be protected against a
     /// hard-link or file-bind-mount alias of the file it just created.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    pub(crate) fn lock_created_live_inode(&mut self, db_path: &Path) -> anyhow::Result<()> {
+    pub fn lock_created_live_inode(&mut self, db_path: &Path) -> anyhow::Result<()> {
         if self._live_inode.is_none() {
             let canonical_db = canonicalize_file_target(db_path).map_err(|e| {
                 anyhow::anyhow!("failed to resolve sync database {}: {e}", db_path.display())
@@ -195,7 +195,7 @@ impl ResourceLock {
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    pub(crate) fn lock_created_live_inode(&mut self, _db_path: &Path) -> anyhow::Result<()> {
+    pub fn lock_created_live_inode(&mut self, _db_path: &Path) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -203,7 +203,7 @@ impl ResourceLock {
 /// The daemon's two data-resource locks, acquired together in a deterministic
 /// order so distinct instances can never deadlock waiting on each other.
 #[derive(Debug)]
-pub(crate) struct DataResourceLocks {
+pub struct DataResourceLocks {
     _block_store: ResourceLock,
     _sync_db: ResourceLock,
 }
@@ -214,7 +214,7 @@ impl DataResourceLocks {
     /// config dir → block store → DB). On any conflict the already-acquired
     /// lock is dropped as this returns `Err`, so a losing daemon fails fast
     /// holding nothing — no store or database mutation has happened yet.
-    pub(crate) fn acquire(block_store_root: &Path, sync_db_path: &Path) -> anyhow::Result<Self> {
+    pub fn acquire(block_store_root: &Path, sync_db_path: &Path) -> anyhow::Result<Self> {
         let block_store = ResourceLock::lock_block_store(block_store_root)?;
         let sync_db = ResourceLock::lock_sync_db(sync_db_path)?;
         Ok(Self { _block_store: block_store, _sync_db: sync_db })
@@ -222,7 +222,7 @@ impl DataResourceLocks {
 
     /// Call after the sync database has been opened (and so created, on a
     /// new install) to extend the lock to the live inode.
-    pub(crate) fn lock_created_sync_db(&mut self, sync_db_path: &Path) -> anyhow::Result<()> {
+    pub fn lock_created_sync_db(&mut self, sync_db_path: &Path) -> anyhow::Result<()> {
         self._sync_db.lock_created_live_inode(sync_db_path)
     }
 }

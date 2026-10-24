@@ -240,6 +240,36 @@ fn a_bundle_for_another_engine_api_refuses_the_start_even_over_a_recorded_owner(
     assert_eq!(std::fs::read(config.path().join(ownership::FILE_NAME)).unwrap(), before);
 }
 
+fn identity_json_declaring(state: &str) -> String {
+    let base = identity_json(yadorilink_ipc_proto::PROVIDER_HOST_API_VERSION);
+    format!("{},{state}}}", base.trim_end_matches('}'))
+}
+
+#[test]
+fn an_identity_declaring_the_state_version_the_binary_writes_starts() {
+    let config = tempfile::tempdir().unwrap();
+    let writes = yadorilink_sqlite_runtime::SCHEMA_VERSION;
+    let (_install, exe) = install_with_identity(&identity_json_declaring(&format!(
+        r#""state_schema_version":{writes},"state_schema_min_readable":{writes}"#
+    )));
+    identity(&exe, "script", Some(config.path())).gate_start(config.path()).unwrap();
+}
+
+#[test]
+fn an_identity_declaring_another_state_version_refuses_the_start_and_writes_nothing() {
+    let config = tempfile::tempdir().unwrap();
+    let other = yadorilink_sqlite_runtime::SCHEMA_VERSION + 1;
+    let (_install, exe) = install_with_identity(&identity_json_declaring(&format!(
+        r#""state_schema_version":{other}"#
+    )));
+    let refused = identity(&exe, "script", Some(config.path()))
+        .gate_start(config.path())
+        .expect_err("a mixed bundle must stop the start");
+    assert!(matches!(refused.0, Refusal::DescriptorUnusable { .. }), "{refused}");
+    assert!(refused.to_string().contains("state database version"), "{refused}");
+    assert!(std::fs::read_dir(config.path()).unwrap().next().is_none(), "nothing may be written");
+}
+
 /// N -> N+1 interrupted while the new daemon refreshes the release in the owner record (large-tree
 /// acceptance, update case): whatever point the power fails at, the record is the old or
 /// the new one with the same owner, the other owner is still refused, and the next start finishes.

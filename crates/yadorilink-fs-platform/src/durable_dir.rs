@@ -117,6 +117,37 @@ pub enum UnavailableReason {
     VolumeWithoutGuidPath,
 }
 
+/// What made [`DurableNamespace::open`] refuse: the probe step that failed, the underlying
+/// error with its errno, the probed path and the identity of its volume. Empty only where the
+/// refusal has no further cause to give (a test seam).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RefusalCause(Option<String>);
+
+impl RefusalCause {
+    pub(crate) fn new(detail: impl Into<String>) -> Self {
+        Self(Some(detail.into()))
+    }
+
+    /// The cause text, if any.
+    pub fn detail(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+}
+
+impl std::fmt::Display for RefusalCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(detail) => write!(f, " (cause: {detail})"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// `kind` and errno of `error`, for a refusal's cause.
+pub(crate) fn describe_io(error: &io::Error) -> String {
+    format!("{error} [kind={:?}, errno={:?}]", error.kind(), error.raw_os_error())
+}
+
 /// A failpoint of the namespace operations: the operation stops there as a
 /// process killed at that point would, leaving the file system as it is. Armed
 /// per thread by [`arm_failpoint`] (test builds only).
@@ -137,8 +168,8 @@ pub enum NsFailpoint {
 #[non_exhaustive]
 pub enum NsError {
     /// Not a volume this contract holds on: the caller fails closed.
-    #[error("durable namespace changes are unavailable here: {0:?}")]
-    Unavailable(UnavailableReason),
+    #[error("durable namespace changes are unavailable here: {0:?}{1}")]
+    Unavailable(UnavailableReason, RefusalCause),
     /// A no-replace move found its target occupied.
     #[error("the target already exists")]
     AlreadyExists,
@@ -349,24 +380,34 @@ impl DurableNamespace {
     /// per volume (an `Unknown` is not).
     pub fn open(dir: &Path) -> Result<Self, NsError> {
         if cfg!(windows) && !WINDOWS_DIRECTORY_DURABILITY_VALIDATED {
-            return Err(NsError::Unavailable(UnavailableReason::GateClosed));
+            return Err(NsError::Unavailable(
+                UnavailableReason::GateClosed,
+                RefusalCause::new("WINDOWS_DIRECTORY_DURABILITY_VALIDATED is false"),
+            ));
         }
         if let Err(e) = probe::volume_key(dir) {
             if probe::is_no_guid_path(&e) {
-                return Err(NsError::Unavailable(UnavailableReason::VolumeWithoutGuidPath));
+                return Err(NsError::Unavailable(
+                    UnavailableReason::VolumeWithoutGuidPath,
+                    probe::guid_path_cause(dir, &e),
+                ));
             }
         }
-        Self::from_verdict(probe::cached_verdict(dir), dir)
+        let probed = probe::cached_verdict(dir);
+        Self::from_verdict(probed.verdict, probed.cause, dir)
     }
 
-    /// The handle for `dir` given its volume's probe verdict: only `Supported` opens.
-    fn from_verdict(verdict: Capability, dir: &Path) -> Result<Self, NsError> {
+    /// The handle for `dir` given its volume's probe verdict (and the cause the probe gave for
+    /// it): only `Supported` opens.
+    fn from_verdict(verdict: Capability, cause: RefusalCause, dir: &Path) -> Result<Self, NsError> {
         match verdict {
             Capability::Supported => {
                 Ok(Self { volume: Some(probe::volume_key(dir).map_err(NsError::Io)?) })
             }
-            Capability::Unsupported => Err(NsError::Unavailable(UnavailableReason::Unsupported)),
-            Capability::Unknown => Err(NsError::Unavailable(UnavailableReason::Unknown)),
+            Capability::Unsupported => {
+                Err(NsError::Unavailable(UnavailableReason::Unsupported, cause))
+            }
+            Capability::Unknown => Err(NsError::Unavailable(UnavailableReason::Unknown, cause)),
         }
     }
 
@@ -385,7 +426,7 @@ impl DurableNamespace {
     ) -> Result<Option<Self>, NsError> {
         match opened {
             Ok(ns) => Ok(Some(ns)),
-            Err(NsError::Unavailable(UnavailableReason::GateClosed)) => Ok(None),
+            Err(NsError::Unavailable(UnavailableReason::GateClosed, _)) => Ok(None),
             Err(error) => Err(error),
         }
     }
@@ -1037,7 +1078,7 @@ mod ops {
     }
 
     pub(super) fn sync_file(file: &fs::File, path: &Path) -> io::Result<()> {
-        file.sync_all()?;
+        crate::flush::sync_file(file)?;
         trace::emit(|| trace::Event::FlushFile { path: path.into() });
         Ok(())
     }

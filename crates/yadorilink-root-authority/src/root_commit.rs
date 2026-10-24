@@ -57,8 +57,10 @@ use std::sync::Arc;
 
 use tokio::sync::Notify;
 
+use crate::blocking_work_core::BlockingWork;
 use crate::error::RootAuthorityError;
 use crate::sync_root_lock::SyncRootLock;
+use crate::writer_lease::WriterLease;
 
 /// One linked folder's root-mutation capability: the `SyncRootLock` proving
 /// single-process ownership of this root, this link's group id and startup
@@ -83,12 +85,9 @@ pub struct RootLease {
     /// Blocking-pool work that cannot be cancelled and still owns the processor (and so this
     /// lease) after its task is aborted; see [`RootLease::hold_blocking_work`].
     blocking_work: Arc<BlockingWork>,
-}
-
-#[derive(Default)]
-struct BlockingWork {
-    held: AtomicI64,
-    notify: Notify,
+    /// Fence for hosts without a daemon; `None` on the desktop, where the root lock is the
+    /// ownership proof. See [`RootLease::with_writer_lease`].
+    writer_lease: Option<Arc<WriterLease>>,
 }
 
 /// Proof that uncancellable blocking-pool work is still running for a lease. Dropping it (after
@@ -100,9 +99,7 @@ pub struct BlockingWorkHold {
 
 impl Drop for BlockingWorkHold {
     fn drop(&mut self) {
-        if self.work.held.fetch_sub(1, Ordering::SeqCst) == 1 {
-            self.work.notify.notify_waiters();
-        }
+        self.work.release();
     }
 }
 
@@ -121,7 +118,17 @@ impl RootLease {
             active: AtomicI64::new(0),
             notify: Notify::new(),
             blocking_work: Arc::default(),
+            writer_lease: None,
         }
+    }
+
+    /// Adds a writer-lease fence: every admission and every permit check then also requires
+    /// the lease to still be this writer's ([`WriterLease::verify`]), so a late writer whose
+    /// lease was taken over is refused at commit.
+    #[must_use]
+    pub fn with_writer_lease(mut self, lease: Arc<WriterLease>) -> Self {
+        self.writer_lease = Some(lease);
+        self
     }
 
     pub fn group_id(&self) -> &str {
@@ -181,6 +188,12 @@ impl RootLease {
         }
         if let Some(root_lock) = &self.root_lock {
             if let Err(e) = root_lock.verify_still_owns() {
+                self.release();
+                return Err(e);
+            }
+        }
+        if let Some(writer) = &self.writer_lease {
+            if let Err(e) = writer.verify() {
                 self.release();
                 return Err(e);
             }
@@ -272,21 +285,15 @@ impl RootLease {
     /// closure owns, so that when [`RootLease::wait_blocking_work_released`] returns the closure
     /// no longer owns the lease. Unlike an operation it does not delay a safe-stop pause.
     pub fn hold_blocking_work(&self) -> BlockingWorkHold {
-        self.blocking_work.held.fetch_add(1, Ordering::SeqCst);
+        self.blocking_work.acquire();
         BlockingWorkHold { work: self.blocking_work.clone() }
     }
 
     /// Waits until every [`BlockingWorkHold`] has been dropped. Call after the tasks that
     /// spawn such work have been awaited, so no new hold can appear.
     pub async fn wait_blocking_work_released(&self) {
-        loop {
-            let notified = self.blocking_work.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.blocking_work.held.load(Ordering::SeqCst) == 0 {
-                return;
-            }
-            notified.await;
+        while let Some(registration) = self.blocking_work.register_unless_released() {
+            registration.wait().await;
         }
     }
 
@@ -308,6 +315,7 @@ impl RootLease {
             active: AtomicI64::new(0),
             notify: Notify::new(),
             blocking_work: Arc::default(),
+            writer_lease: None,
         }
     }
 }
@@ -344,8 +352,11 @@ impl<'a> LinkOperation<'a> {
     /// this on the caller's behalf; most callers never need to call it
     /// directly.
     fn reverify(&self) -> Result<(), RootAuthorityError> {
-        match &self.lease.root_lock {
-            Some(root_lock) => root_lock.verify_still_owns(),
+        if let Some(root_lock) = &self.lease.root_lock {
+            root_lock.verify_still_owns()?;
+        }
+        match &self.lease.writer_lease {
+            Some(writer) => writer.verify(),
             None => Ok(()),
         }
     }
@@ -386,18 +397,27 @@ impl<'a> RootCommitPermit<'a> {
     /// the permit borrows must stay held until that commit has finished: the
     /// stop fence is the operation's, not the check's.
     pub fn owned_check(&self) -> OwnedPermitCheck {
-        OwnedPermitCheck(self.op.lease.root_lock.as_ref().map(SyncRootLock::identity_check))
+        OwnedPermitCheck(
+            self.op.lease.root_lock.as_ref().map(SyncRootLock::identity_check),
+            self.op.lease.writer_lease.clone(),
+        )
     }
 }
 
 /// See [`RootCommitPermit::owned_check`].
 #[derive(Debug, Clone)]
-pub struct OwnedPermitCheck(Option<crate::sync_root_lock::RootIdentityCheck>);
+pub struct OwnedPermitCheck(
+    Option<crate::sync_root_lock::RootIdentityCheck>,
+    Option<Arc<WriterLease>>,
+);
 
 impl OwnedPermitCheck {
     pub fn verify(&self) -> Result<(), RootAuthorityError> {
-        match &self.0 {
-            Some(check) => check.verify(),
+        if let Some(check) = &self.0 {
+            check.verify()?;
+        }
+        match &self.1 {
+            Some(writer) => writer.verify(),
             None => Ok(()),
         }
     }

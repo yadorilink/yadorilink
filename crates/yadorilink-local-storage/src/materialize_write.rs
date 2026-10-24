@@ -924,7 +924,9 @@ fn reconstruct_file_to_named_temp_with(
         // durable across power loss. Persist the complete temp before the
         // rename can publish it under the user-visible path.
         if durability == Durability::Full {
-            crate::io_diag::time(crate::io_diag::Op::FileFsync, 0, || out.sync_all())?;
+            crate::io_diag::time(crate::io_diag::Op::FileFsync, 0, || {
+                yadorilink_fs_platform::flush::sync_file(&out)
+            })?;
         }
         tracing::debug!("phase T_recv_fsync_done: final-file fsync complete");
         Ok(())
@@ -980,6 +982,9 @@ pub fn persist_reconstructed_file_durable(
             return Err(error.into());
         }
     };
+    // Only a Unix volume defers the flush.
+    #[cfg(not(unix))]
+    let _ = durability;
     #[cfg(unix)]
     if let (Some(ns), Durability::DeferredToBatch) = (&namespace, durability) {
         let published = crate::io_diag::time(crate::io_diag::Op::Rename, 0, || {
@@ -1038,7 +1043,7 @@ fn sync_parent_directory(path: &Path) -> Result<(), StorageError> {
         let parent = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
         crate::io_diag::note_dir_fsync(parent);
         crate::io_diag::time(crate::io_diag::Op::DirFsync, 0, || {
-            fs::File::open(parent)?.sync_all()
+            yadorilink_fs_platform::flush::sync_directory(&fs::File::open(parent)?)
         })?;
     }
     Ok(())

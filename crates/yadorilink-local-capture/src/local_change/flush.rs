@@ -13,8 +13,8 @@ use yadorilink_sync_sqlite::SyncSqliteError;
 
 use super::dirty_journal::dirty_kind_str;
 use super::disk_observation::{
-    disk_matches_prepare, error_means_absent, exact_leaf_exists_as_directory,
-    try_exact_leaf_exists_as_file_or_symlink,
+    disk_bytes_match_indexed_blocks_off_worker, error_means_absent, exact_leaf_exists_as_directory,
+    prepare_match, try_exact_leaf_exists_as_file_or_symlink, PrepareMatch,
 };
 use super::event_ingest::EventOutcome;
 use super::path_policy::relative_key;
@@ -29,7 +29,7 @@ use super::{FlushOutcome, LocalChangeOutcome, LocalChangeProcessor};
 /// preparation and commit excludes this mutation from the batch rather
 /// than authoring stale bytes or clobbering a concurrent peer update (see
 /// `flush_pending_batch`'s own doc for the full argument -- this is the
-/// SAME `disk_race_fingerprint` scheme `peer_session::PeerSyncSession::
+/// SAME race-fingerprint scheme (`disk_race_fingerprint_or_stat`, stat-only where the volume has no change time) `peer_session::PeerSyncSession::
 /// hydrate_inner` already relies on for the identical class of "is what I
 /// prepared still current" question, applied here to local capture instead
 /// of peer materialization).
@@ -39,6 +39,42 @@ pub(super) struct PendingBatchedCommit {
     pub(super) observed_at_unix_nanos: i64,
     pub(super) disk_fingerprint_at_prepare: Option<(u64, Option<std::time::SystemTime>, i64, i64)>,
     pub(super) mutation: yadorilink_replica_domain::session_state::PreparedLocalMutation,
+}
+
+/// For a mutation whose fingerprint sample is stat-only: whether the file on disk still holds
+/// exactly what the mutation records (a file's blocks, a symlink's target, a directory). Fail
+/// closed: an unreadable path or any difference is "no", and the mutation is excluded and
+/// re-driven. A delete has no bytes to check (its exact leaf is re-confirmed absent separately).
+fn degraded_upsert_bytes_still_match(pending_commit: &PendingBatchedCommit) -> bool {
+    use yadorilink_local_storage::{
+        disk_matches_expected_object, DiskContentComparison, ExpectedObject,
+    };
+    use yadorilink_replica_domain::file::RecordKind;
+    use yadorilink_replica_domain::session_state::PreparedLocalMutation;
+    let PreparedLocalMutation::Upsert { record, version, .. } = &pending_commit.mutation else {
+        return true;
+    };
+    let path = &pending_commit.event_path;
+    match version.meta.record_kind {
+        // The bytes are read through `File::open`, which follows a symlink: the object must be a
+        // regular file first.
+        RecordKind::File => {
+            std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
+                && disk_bytes_match_indexed_blocks_off_worker(path, &record.blocks, record.size)
+                    .unwrap_or(false)
+        }
+        RecordKind::Symlink => matches!(
+            disk_matches_expected_object(
+                path,
+                ExpectedObject::Symlink { target: version.meta.symlink_target.as_deref() },
+            ),
+            Ok(DiskContentComparison::Matched)
+        ),
+        RecordKind::Directory => matches!(
+            disk_matches_expected_object(path, ExpectedObject::Directory),
+            Ok(DiskContentComparison::Matched)
+        ),
+    }
 }
 
 /// How many times a single path's chunk/index step is retried when it fails
@@ -575,7 +611,7 @@ impl LocalChangeProcessor {
     ///    Preparing a mutation (chunk/hash/decide) happens with no lock
     ///    held at all, so by the time this function acquires a path's
     ///    lock, disk or index state may have moved on. Re-checking both
-    ///    (`disk_race_fingerprint`, `get_file`) against what preparation
+    ///    (`prepare_match`, `get_file`) against what preparation
     ///    observed — the same scheme `peer_session::PeerSyncSession::
     ///    hydrate_inner` already relies on for the identical question —
     ///    catches a stale mutation before it authors bytes that are no
@@ -653,10 +689,18 @@ impl LocalChangeProcessor {
                 Some(witness) => self.state.native_capture_is_fresh(group_id, witness)?,
                 None => true,
             };
-            let mut still_current = disk_matches_prepare(
+            let first_match = prepare_match(
                 &pending_commit.event_path,
                 &pending_commit.disk_fingerprint_at_prepare,
-            ) && native_fresh
+            );
+            let mut still_current = first_match != PrepareMatch::Changed
+                // Where the fingerprint is stat-only (the volume cannot answer the change
+                // time/USN query) it cannot show a same-size rewrite with a restored mtime, so
+                // the bytes are checked here, under the path lock. The second sample below
+                // closes the read.
+                && (first_match != PrepareMatch::Degraded
+                    || degraded_upsert_bytes_still_match(pending_commit))
+                && native_fresh
                 && !match &pending_commit.mutation {
                     yadorilink_replica_domain::session_state::PreparedLocalMutation::Upsert {
                         record,
@@ -684,15 +728,22 @@ impl LocalChangeProcessor {
                         super::record_builder::fire_post_identity_race_hook(
                             &pending_commit.event_path,
                         );
-                        match observed {
-                            Some(filesystem_identity)
-                                if disk_matches_prepare(
-                                    &pending_commit.event_path,
-                                    &pending_commit.disk_fingerprint_at_prepare,
-                                ) =>
+                        let closing = prepare_match(
+                            &pending_commit.event_path,
+                            &pending_commit.disk_fingerprint_at_prepare,
+                        );
+                        match (observed, closing) {
+                            (Some(filesystem_identity), PrepareMatch::Strict)
+                                if first_match == PrepareMatch::Strict =>
                             {
                                 evidence = Some(Evidence::Present { filesystem_identity });
                             }
+                            // Bytes verified above and both samples stat-only: commit, publish
+                            // no proof (the identity cannot show a later same-size rewrite). The
+                            // identity query is not needed for that, so its failure (a volume
+                            // whose whole query errors) must not exclude the commit.
+                            (_, PrepareMatch::Degraded)
+                                if first_match == PrepareMatch::Degraded => {}
                             _ => still_current = false,
                         }
                     }

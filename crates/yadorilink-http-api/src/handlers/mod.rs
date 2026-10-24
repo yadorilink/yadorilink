@@ -76,6 +76,8 @@ pub fn link_status_json(l: &LinkStatus) -> Value {
     });
     // Added apart from the literal above, which is at the macro's recursion limit.
     value["unreadable_file_count"] = json!(l.unreadable_file_count);
+    value["waiting_for_disk_space"] = json!(l.waiting_for_disk_space);
+    value["degraded_cause"] = json!(l.degraded_cause().as_str_name());
     value["pending_approvals"] = json!(l.pending_approvals);
     value["reclaimable_bytes"] = json!(l.reclaimable_bytes);
     value["unreadable_files"] = l

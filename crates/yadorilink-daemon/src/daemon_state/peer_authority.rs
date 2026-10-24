@@ -67,6 +67,12 @@ pub struct PeerAuthorityState {
     /// prevents change admission and last-replica custody from observing a
     /// partially-applied revocation/demotion snapshot.
     peer_netmap_metadata: Mutex<PeerNetmapMetadata>,
+    /// Devices the account replaced (`GET /devices/supersessions`): old device id -> the device
+    /// that replaced it. THE shared refusal: every mutator of `peer_netmap_metadata` consults it
+    /// (under that lock), so no admission path -- transport, change authentication, LAN
+    /// discovery, Track Send resolution -- can hold a replaced device's key or groups, whatever a
+    /// netmap or the offline snapshot says. Lock order: `peer_netmap_metadata`, then this.
+    superseded_devices: Mutex<HashMap<String, String>>,
     /// Monotonic counter bumped on every actual change to the netmap-derived
     /// authorization state above (`PeerNetmapMetadata::writers` /
     /// `PeerNetmapMetadata::full_replicas`). A version-present confirmation captures it
@@ -428,13 +434,13 @@ impl PeerAuthorityState {
     /// Only the insert: `DaemonState::record_peer_signing_key` is the entry
     /// point, and it also re-projects the peer's substrate reachability.
     pub(super) fn record_peer_signing_key(&self, device_id: &str, key: [u8; 32]) {
-        let changed = self
-            .peer_netmap_metadata
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .signing_keys
-            .insert(device_id.to_string(), key)
-            != Some(key);
+        let changed = {
+            let mut metadata = self.peer_netmap_metadata.lock().unwrap_or_else(|p| p.into_inner());
+            if self.superseded_by(device_id).is_some() {
+                return;
+            }
+            metadata.signing_keys.insert(device_id.to_string(), key) != Some(key)
+        };
         self.note_live_netmap_authority();
         self.persist_peer_authorization(device_id);
         if changed {
@@ -479,6 +485,37 @@ impl PeerAuthorityState {
             snapshot.entry(device_id.clone()).or_default().insert(group_id.clone());
         }
         snapshot
+    }
+
+    /// The device that replaced `device_id`, when the account has superseded it: the one typed
+    /// reason a peer is refused for being replaced rather than merely unknown.
+    pub fn superseded_by(&self, device_id: &str) -> Option<String> {
+        self.superseded_devices.lock().unwrap_or_else(|p| p.into_inner()).get(device_id).cloned()
+    }
+
+    /// Every replaced device with its replacement, sorted by device id.
+    pub fn superseded_snapshot(&self) -> Vec<(String, String)> {
+        let mut all: Vec<(String, String)> = self
+            .superseded_devices
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(old, new)| (old.clone(), new.clone()))
+            .collect();
+        all.sort();
+        all
+    }
+
+    /// Installs the account's supersessions (a full listing) and returns the devices newly
+    /// replaced by it. Their metadata is NOT cleared here: the caller tears each one down after
+    /// this returns (see `DaemonState::apply_supersessions`), and the check in the mutators
+    /// already keeps any later write from re-admitting them.
+    pub(super) fn replace_superseded(&self, listed: HashMap<String, String>) -> Vec<String> {
+        let mut guard = self.superseded_devices.lock().unwrap_or_else(|p| p.into_inner());
+        let newly: Vec<String> =
+            listed.keys().filter(|id| !guard.contains_key(*id)).cloned().collect();
+        *guard = listed;
+        newly
     }
 
     /// Wakes once after any change to which peers are pinned or what they
@@ -558,6 +595,12 @@ impl PeerAuthorityState {
         mirror: SnapshotMirror,
     ) -> bool {
         let mut metadata = self.peer_netmap_metadata.lock().unwrap_or_else(|p| p.into_inner());
+        // A replaced device is applied as a withdrawal, whatever the caller says.
+        let replaced = self.superseded_by(device_id).is_some();
+        let signing_key = if replaced { None } else { signing_key };
+        let no_groups = HashSet::new();
+        let authorized_groups = if replaced { &no_groups } else { authorized_groups };
+        let full_replica_groups = if replaced { &no_groups } else { full_replica_groups };
         let before_writers: HashSet<String> = metadata
             .writers
             .iter()
@@ -614,6 +657,7 @@ impl PeerAuthorityState {
         is_writer: bool,
     ) -> bool {
         let mut metadata = self.peer_netmap_metadata.lock().unwrap_or_else(|p| p.into_inner());
+        let is_writer = is_writer && self.superseded_by(device_id).is_none();
         let key = (device_id.to_string(), group_id.to_string());
         let changed =
             if is_writer { metadata.writers.insert(key) } else { metadata.writers.remove(&key) };

@@ -214,6 +214,9 @@ impl LinkRepositoryPort for RemoveLinkAlwaysFails {
     fn preflight_headroom_override_bytes(&self) -> Option<u64> {
         self.inner.preflight_headroom_override_bytes()
     }
+    fn state_dir(&self) -> std::path::PathBuf {
+        self.inner.state_dir()
+    }
     fn live_link_paths_for_group(
         &self,
         group_id: &str,
@@ -237,6 +240,14 @@ impl LinkRepositoryPort for RemoveLinkAlwaysFails {
         group_id: &str,
     ) -> Result<LinkRowWrite, crate::sync_error::SyncError> {
         self.inner.commit_plain_link(local_path, group_id)
+    }
+    fn commit_provider_link_plain(
+        &self,
+        local_path: &str,
+        group_id: &str,
+        provider: &crate::application::ports::ProviderLinkTarget,
+    ) -> Result<LinkRowWrite, crate::sync_error::SyncError> {
+        self.inner.commit_provider_link_plain(local_path, group_id, provider)
     }
     fn commit_link_with_pending_enrollment(
         &self,
@@ -335,7 +346,7 @@ async fn commit_plain_classifies_a_genuinely_uncommittable_rollback_failure_as_c
     let local_path = dir.path().to_path_buf();
     let local_path_str = local_path.to_string_lossy().to_string();
 
-    let result = adapter.commit_plain("group-1", &local_path, false).await;
+    let result = adapter.commit_plain("group-1", &local_path, false, None).await;
 
     assert!(
         matches!(result, Err(EnrollmentLinkError::CommitUncertain { .. })),
@@ -497,6 +508,9 @@ async fn assert_first_link_survives(
 /// the group), driven straight through `LinkLifecycleService::link`.
 // Multi-threaded: the live watcher's flush uses `block_in_place`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// apple-cfg: ios-explicit the iOS host never runs the file watcher, and the simulator's kqueue
+// backend does not deliver this test's event in time
+#[cfg_attr(target_os = "ios", ignore = "the file watcher is not used on iOS")]
 async fn an_enrollment_relink_of_a_running_link_leaves_the_first_link_intact() {
     let state = test_state();
     let lifecycle = test_link_lifecycle(&state);
@@ -669,6 +683,9 @@ impl crate::application::ports::EnrollmentCoordination for AlreadyMemberCoordina
 /// the first link usable, and leave no enrollment bookkeeping behind.
 // Multi-threaded: the live watcher's flush uses `block_in_place`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// apple-cfg: ios-explicit the iOS host never runs the file watcher, and the simulator's kqueue
+// backend does not deliver this test's event in time
+#[cfg_attr(target_os = "ios", ignore = "the file watcher is not used on iOS")]
 async fn a_repeated_share_join_of_a_linked_folder_succeeds_without_touching_it() {
     let state = test_state();
     let lifecycle = test_link_lifecycle(&state);

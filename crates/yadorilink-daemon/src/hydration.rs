@@ -25,6 +25,8 @@ use yadorilink_sync_sqlite::exact_materialized_commit::{
 use crate::daemon_state::{run_blocking_sweep_offloaded, DaemonState};
 
 mod range_window;
+#[cfg(test)]
+pub(crate) use range_window::MAX_RANGE_WINDOW_LEN;
 
 /// A single deadline for the *entire* multi-session dispatch —
 /// supersedes what used to be the former per-session hydrate's per-session
@@ -224,15 +226,23 @@ const WORKER_IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from
 /// user space, so that residual needs a coarse-ctime filesystem. Closing it
 /// would mean hashing the file at every re-check, a full read of it each
 /// time.
+///
+/// On Windows the file id is `None` (only Unix has `(device, inode)` here), so a rename-over save
+/// is caught there by the fingerprint's change time and USN alone. On a volume where those cannot
+/// be read the fingerprint degrades to size and write time (`disk_race_fingerprint_of_at_or_stat`,
+/// so that a retry loop does not refuse forever): a same-size rewrite with a restored write time,
+/// or a rename-over save of the same size and write time, is then caught only by the dirty-journal
+/// check at commit. This is no weaker than before the degraded mode existed.
 pub(crate) type DiskIdentity =
     Option<(yadorilink_fs_platform::fs_identity::DiskRaceFingerprint, Option<(u64, u64)>)>;
 
 pub(crate) fn disk_identity(path: &std::path::Path) -> Result<DiskIdentity, SyncError> {
-    Ok(std::fs::symlink_metadata(path).ok().as_ref().map(disk_identity_of))
+    Ok(std::fs::symlink_metadata(path).ok().as_ref().map(|meta| disk_identity_of(meta, path)))
 }
 
 pub(crate) fn disk_identity_of(
     meta: &std::fs::Metadata,
+    path: &std::path::Path,
 ) -> (yadorilink_fs_platform::fs_identity::DiskRaceFingerprint, Option<(u64, u64)>) {
     #[cfg(unix)]
     let file_id = {
@@ -241,7 +251,7 @@ pub(crate) fn disk_identity_of(
     };
     #[cfg(not(unix))]
     let file_id = None;
-    (yadorilink_fs_platform::fs_identity::disk_race_fingerprint_of(meta), file_id)
+    (yadorilink_fs_platform::fs_identity::disk_race_fingerprint_of_at_or_stat(meta, path), file_id)
 }
 
 /// Journals `path` dirty when the file on disk is no longer the one the
@@ -1410,6 +1420,17 @@ pub async fn hydrate(
     group_id: &str,
     path: &str,
 ) -> Result<(), SyncError> {
+    hydrate_reporting(state, group_id, path).await.map(|_| ())
+}
+
+/// [`hydrate`], also saying whether any content was fetched from peers: `false` when the file
+/// was already here, healed over bytes that were already right, or rebuilt from blocks this
+/// device already holds, so a caller can tell a download from a no-op.
+pub async fn hydrate_reporting(
+    state: &Arc<DaemonState>,
+    group_id: &str,
+    path: &str,
+) -> Result<bool, SyncError> {
     hydrate_impl(state, group_id, path, HydrationBound::Stall(HYDRATION_TIMEOUT)).await
 }
 
@@ -1429,7 +1450,7 @@ pub async fn hydrate_with_timeout(
     path: &str,
     timeout: std::time::Duration,
 ) -> Result<(), SyncError> {
-    hydrate_impl(state, group_id, path, HydrationBound::Flat(timeout)).await
+    hydrate_impl(state, group_id, path, HydrationBound::Flat(timeout)).await.map(|_| ())
 }
 
 /// Where a materialization's bytes end up.
@@ -1443,7 +1464,8 @@ pub(crate) enum Sink<'a> {
 }
 
 pub(crate) enum Materialized {
-    InPlace,
+    /// Whether content was fetched from peers (see `hydrate_reporting`).
+    InPlace(bool),
     Temp(crate::application::ports::TempOutcome),
 }
 
@@ -1457,7 +1479,7 @@ pub(crate) async fn materialize_path(
     sink: Sink<'_>,
 ) -> Result<Materialized, SyncError> {
     match sink {
-        Sink::InPlace => hydrate(state, group_id, path).await.map(|()| Materialized::InPlace),
+        Sink::InPlace => hydrate_reporting(state, group_id, path).await.map(Materialized::InPlace),
         Sink::Temp(request) => {
             let stall = Arc::new(
                 HydrationStallTracker::new(HYDRATION_TIMEOUT)
@@ -1469,8 +1491,12 @@ pub(crate) async fn materialize_path(
                 assemble_to_temp(state, group_id, path, request, Some(&stall)),
             )
             .await;
-            if let Err(error) = &outcome {
-                state.telemetry.record_recent_error(error.category(), "hydration");
+            match &outcome {
+                Err(error) => state.telemetry.record_recent_error(error.category(), "hydration"),
+                Ok(crate::application::ports::TempOutcome::Assembled(_)) => {
+                    note_provider_read_succeeded(state, group_id);
+                }
+                Ok(_) => {}
             }
             outcome.map(Materialized::Temp)
         }
@@ -1621,7 +1647,7 @@ fn cut_range(
             ));
         }
     }
-    target.sync_all().map_err(io)
+    yadorilink_fs_platform::flush::sync_file(&target).map_err(io)
 }
 
 /// Whether the file holds exactly `blocks`; each block that matched is reported to `observer`.
@@ -1653,10 +1679,12 @@ fn progress_observer(
 /// reports the version out of date.
 const MAX_TEMP_RESTARTS: usize = 3;
 
-/// The temp sink. Holds the path lock for the attempt (it serializes every attempt for the path,
-/// so a second request finds the blocks local), binds the attempt to the version it reads under
-/// the entry CAS, and returns bytes only if that version is still current after they were
-/// assembled and verified. Nothing here commits a materialization state: the row returns to the
+/// The temp sink. A whole-file attempt holds the path lock (it serializes every whole-file attempt
+/// for the path, so a second request finds the blocks local) and binds itself to the version it
+/// reads under the entry CAS. A window does neither: it changes no row, so it neither waits for a
+/// whole-file assembly of the same item nor makes another window wait, which is what lets the
+/// first bytes be served while the rest is still arriving. Both return bytes only if the version
+/// is still current after they were assembled and verified. Nothing here commits a materialization state: the row returns to the
 /// state it was in, and whether the OS holds the bytes is learned from the handoff and the
 /// host's reports.
 async fn assemble_to_temp(
@@ -1670,7 +1698,10 @@ async fn assemble_to_temp(
     let _write_activity = state.begin_write_activity();
     let coordinator = state.replica_coordinator.as_ref();
     let path_lock = state.replica_coordinator.path_lock_registry().path_lock(group_id, path);
-    let _path_guard = crate::receive_diag::lock_path(&path_lock).await;
+    let _path_guard = match request.range {
+        Some(_) => None,
+        None => Some(crate::receive_diag::lock_path(&path_lock).await),
+    };
     if coordinator.held_path_repository().group_frozen(group_id)? {
         return Err(SyncError::HydrationFailed(format!(
             "{group_id}/{path} is frozen by a rebootstrap"
@@ -1716,6 +1747,9 @@ async fn assemble_to_temp(
                 None => return Ok(TempOutcome::RangeNotSatisfiable),
             },
         };
+        if window.as_ref().is_some_and(|window| !window.within_cap()) {
+            return Ok(TempOutcome::RangeTooLarge);
+        }
         let blocks = match &window {
             Some(window) => window.blocks.clone(),
             None => canonical.snapshot.blocks.clone(),
@@ -1739,19 +1773,27 @@ async fn assemble_to_temp(
                     assembled_len,
                     headroom_override,
                 )
-                .map_err(SyncError::from)?,
+                .map_err(|error| {
+                    note_provider_disk_pressure(state, group_id, staging_dir, &error);
+                    SyncError::from(error)
+                })?,
             ))
         } else {
             None
         };
         // Bound to this version: the row is `Hydrating` for exactly as long as the attempt runs,
         // and goes back to what it was when the guard drops.
-        let entry_state = coordinator
-            .materialization_state_repository()
-            .get_materialization_state(group_id, path)?;
-        let Some(attempt) = coordinator.begin_hydration(group_id, path, entry_state, target)?
-        else {
-            return Err(SyncError::HydrationFailed(path.to_string()));
+        let attempt = if request.range.is_some() {
+            None
+        } else {
+            let entry_state = coordinator
+                .materialization_state_repository()
+                .get_materialization_state(group_id, path)?;
+            let Some(attempt) = coordinator.begin_hydration(group_id, path, entry_state, target)?
+            else {
+                return Err(SyncError::HydrationFailed(path.to_string()));
+            };
+            Some(attempt)
         };
         let still_missing =
             resolve_blocks_local_first(state, group_id, path, &blocks, stall).await?;
@@ -1784,6 +1826,7 @@ async fn assemble_to_temp(
                     // A provider's staging directory is not a linked folder start recovers.
                     Arc::new(yadorilink_local_storage::NoTempLedger),
                     progress_observer(request.progress.as_ref()),
+                    state.receive_write_gate(),
                 )
                 .await
                 .map_err(|error| SyncError::HydrationFailed(format!("{path}: {error}")))?,
@@ -1890,7 +1933,7 @@ async fn hydrate_impl(
     group_id: &str,
     path: &str,
     bound: HydrationBound,
-) -> Result<(), SyncError> {
+) -> Result<bool, SyncError> {
     // A provider root hydrates nothing through the filesystem pipeline.
     crate::provider_gate::require_filesystem_root(&state.replica_coordinator, group_id)?;
     // Single-flight coalescing -- a concurrent caller for the SAME
@@ -1904,7 +1947,7 @@ async fn hydrate_impl(
         crate::hydration_single_flight::Role::Follower(mut rx) => {
             return match rx.changed().await {
                 Ok(()) => match *rx.borrow() {
-                    Some(Ok(())) => Ok(()),
+                    Some(Ok(materialized)) => Ok(materialized),
                     _ => Err(SyncError::HydrationFailed(path.to_string())),
                 },
                 // The leader's `Sender` was dropped without ever sending --
@@ -1957,7 +2000,7 @@ async fn hydrate_impl(
     if let Err(e) = &result {
         state.telemetry.record_recent_error(e.category(), "hydration");
     }
-    leader.complete(result.as_ref().map(|_| ()).map_err(|_| ()));
+    leader.complete(result.as_ref().map(|materialized| *materialized).map_err(|_| ()));
     result
 }
 
@@ -1972,7 +2015,7 @@ async fn hydrate_inner(
     group_id: &str,
     path: &str,
     stall: Option<&Arc<HydrationStallTracker>>,
-) -> Result<(), SyncError> {
+) -> Result<bool, SyncError> {
     // Hydration is a materialization write (block-store reads plus a
     // `reconstruct_file` disk write) — held for this whole function's
     // duration so an update install never starts mid-hydration.
@@ -2105,7 +2148,7 @@ async fn hydrate_inner(
     // directory at `out_path` with an empty regular file. Nothing to
     // hydrate for a kind that is never a placeholder in the first place.
     if canonical.snapshot.record_kind != yadorilink_replica_domain::file::RecordKind::File {
-        return Ok(());
+        return Ok(false);
     }
     // Sampled BEFORE anything reads or judges the file, and reused as
     // the baseline for every later decision about it.
@@ -2119,7 +2162,8 @@ async fn hydrate_inner(
     // baseline and then overwritten. `path_lock` does not serialize an
     // external writer -- an editor writing to the file never takes it.
     let initial_lstat = std::fs::symlink_metadata(&out_path).ok();
-    let initial_disk_identity = initial_lstat.as_ref().map(disk_identity_of);
+    let initial_disk_identity =
+        initial_lstat.as_ref().map(|meta| disk_identity_of(meta, &out_path));
     // Idempotent fast path: `hydrate` must be safe to call on a path that is
     // already materialized. Its only production caller (the shell IPC
     // `HydrateRequest` handler) tracks no per-path hydration state and has no
@@ -2155,6 +2199,7 @@ async fn hydrate_inner(
                 path,
                 &out_path,
                 initial_lstat.as_ref(),
+                initial_disk_identity,
                 &current,
                 canonical.snapshot.unix_mode,
                 &canonical.snapshot.xattrs,
@@ -2190,7 +2235,7 @@ async fn hydrate_inner(
             .sqlite()
             .dag_usable_proof_names_current_version(group_id, path)?
         {
-            return Ok(());
+            return Ok(false);
         }
         // A usable proof that names some OTHER version. The common way to
         // get here is a metadata-only version bump: a mode or xattr change
@@ -2265,7 +2310,7 @@ async fn hydrate_inner(
                     &root_commit_permit,
                 )?;
                 if healed {
-                    return Ok(());
+                    return Ok(false);
                 }
                 // The row moved again while we were checking. Fail closed:
                 // whatever is current now is not what disk was compared
@@ -2340,8 +2385,8 @@ async fn hydrate_inner(
     // own doc comment). When present, its budget grows to cover the real
     // missing-block sizes once they're known, and every durably-completed
     // block resets it.
-    let still_missing =
-        resolve_blocks_local_first(state, group_id, path, &record.blocks, stall).await?;
+    let (still_missing, fetched) =
+        resolve_blocks_local_first_reporting(state, group_id, path, &record.blocks, stall).await?;
 
     if !still_missing.is_empty() {
         return Err(SyncError::HydrationFailed(path.to_string()));
@@ -2672,7 +2717,7 @@ async fn hydrate_inner(
     // can clear immediately rather than waiting out the next scheduled
     // re-check. A no-op if the link wasn't degraded.
     state.clear_link_degraded(&root.to_string_lossy());
-    Ok(())
+    Ok(fetched)
 }
 
 /// Reserves `required_bytes` of the headroom of the volume hosting `root`
@@ -2706,7 +2751,7 @@ fn preflight_disk_pressure(
                 available_bytes,
                 headroom_bytes,
             };
-            state.mark_link_degraded(
+            state.mark_link_waiting_for_disk_space(
                 &root.to_string_lossy(),
                 crate::link_registry::waiting_for_disk_space_reason(
                     &root.display().to_string(),
@@ -2717,6 +2762,48 @@ fn preflight_disk_pressure(
             Err(err)
         }
         Err(other) => Err(other.into()),
+    }
+}
+
+/// A provider read refused for lack of room shows its link as waiting for disk space, in the
+/// words of the receive path. The read itself still fails with the typed refusal.
+fn note_provider_disk_pressure(
+    state: &DaemonState,
+    group_id: &str,
+    staging_dir: &std::path::Path,
+    error: &yadorilink_local_storage::StorageError,
+) {
+    let yadorilink_local_storage::StorageError::DiskPressure {
+        volume,
+        available_bytes,
+        headroom_bytes,
+        ..
+    } = error
+    else {
+        return;
+    };
+    if let Ok(Some(key)) =
+        state.replica_coordinator.link_repository().live_link_key_for_group(group_id)
+    {
+        state.mark_link_degraded_on_volume(
+            &key,
+            staging_dir,
+            crate::link_registry::waiting_for_disk_space_reason(
+                &volume.display().to_string(),
+                *available_bytes,
+                *headroom_bytes,
+            ),
+        );
+    }
+}
+
+/// A provider read that got through clears the waiting state once the volume has room again by
+/// the same rule as every other path, so one read at the edge never flaps it.
+fn note_provider_read_succeeded(state: &DaemonState, group_id: &str) {
+    if let Ok(Some(key)) =
+        state.replica_coordinator.link_repository().live_link_key_for_group(group_id)
+    {
+        state.clear_link_degraded_if_space_recovered(&key);
     }
 }
 
@@ -3272,8 +3359,9 @@ async fn restore_content_inner(
             );
             if !matches!(declined, Ok(false)) {
                 yadorilink_local_storage::discard_temp_file(&tmp_path, &temp_ledger);
-                // The journal row stays: startup reconciliation reads the
-                // disk and discards it, since the disk holds the local edit.
+                // Nothing was published, so the row describes no write: drop
+                // it now, or a retry in this process collides with it.
+                state.replica_coordinator.abandon_restore_operation(&operation_id)?;
                 declined?;
                 return Err(SyncError::PathChangedLocally(format!("{group_id}/{path}")));
             }
@@ -3648,6 +3736,19 @@ async fn resolve_blocks_local_first(
     blocks: &[BlockInfo],
     stall: Option<&Arc<HydrationStallTracker>>,
 ) -> Result<Vec<BlockInfo>, SyncError> {
+    resolve_blocks_local_first_reporting(state, group_id, path, blocks, stall)
+        .await
+        .map(|(still_missing, _)| still_missing)
+}
+
+/// [`resolve_blocks_local_first`], also saying whether any block was requested from peers.
+async fn resolve_blocks_local_first_reporting(
+    state: &DaemonState,
+    group_id: &str,
+    path: &str,
+    blocks: &[BlockInfo],
+    stall: Option<&Arc<HydrationStallTracker>>,
+) -> Result<(Vec<BlockInfo>, bool), SyncError> {
     let hashes: Vec<String> = blocks.iter().map(|b| hex::encode(&b.hash)).collect();
     let present = state.block_store.present_blocks(&hashes)?;
     let candidates = candidate_sessions(state, group_id);
@@ -3683,7 +3784,7 @@ async fn resolve_blocks_local_first(
     }
 
     if missing.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     }
 
     // Registers this file as an active transfer for the *missing* blocks
@@ -3733,7 +3834,7 @@ async fn resolve_blocks_local_first(
         LaneStop::new(),
     )
     .await?;
-    Ok(unresolved.remaining)
+    Ok((unresolved.remaining, true))
 }
 
 /// Fetches the blocks of a version that no index row names (a recovery item's) from the

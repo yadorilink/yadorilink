@@ -2,7 +2,7 @@
 """Render, read and check the pin block of the installers.
 
 Usage: pins.py show
-       pins.py check [--allow-dev-key] [--require-verifier]
+       pins.py check [--allow-dev-key] [--require-verifier] [--require-floor]
        pins.py set [--trust-set "id:hex id2:hex"] [--verifier-sha TARGET=HEX]...
                    [--verifier-base URL] [--min-generated-at TS]
        pins.py --self-test
@@ -17,6 +17,10 @@ verifier is released, and the oldest manifest time a first install accepts.
 replay floor, and no pinned key is the public development key (unless --allow-dev-key).
 --require-verifier additionally fails while any platform's verifier hash is still empty; release
 CI passes it for a tagged release, so an engine tag cannot ship installers that pin no verifier.
+--require-floor likewise fails while the manifest floor is empty: installers keep no state, so
+an unset floor lets any manifest ever signed (an old one, with an unexpired window or not
+yet expired) pass a first install. Set it to the `generated_at` of the first manifest that
+carries `expires_at` (`set --min-generated-at`), and roll it forward when a release needs to.
 """
 
 from __future__ import annotations
@@ -29,10 +33,10 @@ HERE = Path(__file__).resolve().parent
 SH, PS1 = HERE / "install.sh", HERE / "install.ps1"
 DEV_KEY = "00e033f866c263139ff4afd165e75bae3cfca67eb32399dddd6e33a3251af1e3"
 TARGETS = ("macos-aarch64", "linux-x86_64")
-KEY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-HEX_RE = re.compile(r"^[0-9a-f]{64}$")
-TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
-BASE_RE = re.compile(r"^https://github\.com/yadorilink/yadorilink/releases/download/verifier-[1-9][0-9]*$")
+KEY_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+HEX_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+TS_RE = re.compile(r"\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
+BASE_RE = re.compile(r"\Ahttps://github\.com/yadorilink/yadorilink/releases/download/verifier-[1-9][0-9]*\Z")
 BEGIN, END = ">>> PINS >>>", "<<< PINS <<<"
 
 
@@ -99,23 +103,24 @@ def validate(pins: dict, where: str, allow_dev: bool) -> list[str]:
     for entry in pins["trust_set"]:
         kid, _, hexkey = entry.partition(":")
         ids.append(kid)
-        if not KEY_ID_RE.match(kid) or not HEX_RE.match(hexkey):
+        if not KEY_ID_RE.fullmatch(kid) or not HEX_RE.fullmatch(hexkey):
             out.append(f"{where}: trust entry {entry!r} must be <key_id>:<64 lowercase hex>")
         elif hexkey == DEV_KEY and not allow_dev:
             out.append(f"{where}: trust entry {kid!r} is the public development key")
     if len(set(ids)) != len(ids) or len({e.partition(':')[2] for e in pins['trust_set']}) != len(ids):
         out.append(f"{where}: a key id or key is pinned twice")
-    if pins["min_generated_at"] and not TS_RE.match(pins["min_generated_at"]):
+    if pins["min_generated_at"] and not TS_RE.fullmatch(pins["min_generated_at"]):
         out.append(f"{where}: MIN_MANIFEST_GENERATED_AT must be YYYY-MM-DDTHH:MM:SSZ or empty")
     for t, sha in pins.get("verifier_sha", {}).items():
-        if sha and not HEX_RE.match(sha):
+        if sha and not HEX_RE.fullmatch(sha):
             out.append(f"{where}: verifier hash for {t} must be 64 lowercase hex or empty")
-    if "verifier_base" in pins and not BASE_RE.match(pins["verifier_base"]):
+    if "verifier_base" in pins and not BASE_RE.fullmatch(pins["verifier_base"]):
         out.append(f"{where}: verifier base must be a yadorilink verifier-N release download URL")
     return out
 
 
-def check(sh_text: str, ps1_text: str, allow_dev: bool = False, require_verifier: bool = False) -> list[str]:
+def check(sh_text: str, ps1_text: str, allow_dev: bool = False, require_verifier: bool = False,
+          require_floor: bool = False) -> list[str]:
     out = []
     try:
         sh = parse_sh(sh_text)
@@ -127,6 +132,10 @@ def check(sh_text: str, ps1_text: str, allow_dev: bool = False, require_verifier
         for t in TARGETS:
             if not sh.get("verifier_sha", {}).get(t):
                 out.append(f"install.sh pins no verifier hash for {t} (publish verifier-N and `pins.py set --verifier-sha` first)")
+    if require_floor:
+        for name, pins in (("install.sh", sh), ("install.ps1", ps)):
+            if not pins["min_generated_at"]:
+                out.append(f"{name} pins no manifest floor (`pins.py set --min-generated-at` the generated_at of the first manifest with expires_at first)")
     if sh["trust_set"] != ps["trust_set"]:
         out.append("install.sh and install.ps1 pin different trust sets")
     if sh["min_generated_at"] != ps["min_generated_at"]:
@@ -186,6 +195,11 @@ def self_test() -> int:
     assert check(empty_sh, empty_ps, require_verifier=True), "one empty verifier hash must fail --require-verifier"
     full_sh, full_ps = apply(sh_text, ps_text, {"verifier_sha": {"linux-x86_64": "c" * 64, "macos-aarch64": "d" * 64}})
     assert check(full_sh, full_ps, require_verifier=True) == [], check(full_sh, full_ps, require_verifier=True)
+    # --require-floor: an empty floor fails in either installer, a set one passes
+    assert check(sh_text, ps_text, require_floor=True), "an empty floor must fail --require-floor"
+    floored_sh, floored_ps = apply(sh_text, ps_text, {"min_generated_at": "2026-10-19T00:00:00Z"})
+    assert check(floored_sh, floored_ps, require_floor=True) == [], check(floored_sh, floored_ps, require_floor=True)
+    assert check(floored_sh, floored_ps.replace("MinManifestGeneratedAt = '2026-10-19T00:00:00Z'", "MinManifestGeneratedAt = ''"), require_floor=True)
     assert apply(new_sh, new_ps, {})[0] == new_sh
     assert parse_sh(new_sh)["trust_set"] == [ok, other] and parse_ps1(new_ps)["trust_set"] == [ok, other]
     assert new_sh.replace(render_sh(parse_sh(new_sh)), "") != new_sh
@@ -238,7 +252,8 @@ def main(argv: list[str]) -> int:
         return 0
     if cmd == "check":
         problems = check(sh_text, ps_text, allow_dev="--allow-dev-key" in rest,
-                         require_verifier="--require-verifier" in rest)
+                         require_verifier="--require-verifier" in rest,
+                         require_floor="--require-floor" in rest)
         for p in problems:
             print(f"error: {p}", file=sys.stderr)
         print("pins: ok" if not problems else "pins: FAILED")

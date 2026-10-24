@@ -205,7 +205,7 @@ impl BlockIndex {
     /// schema and refusing any store whose stamped format version is not
     /// this build's.
     pub(crate) fn open(path: &Path) -> Result<Self, StorageError> {
-        let db = SyncDatabase::open(path, |conn| {
+        let db = SyncDatabase::open_process_locked(path, |conn| {
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS store_meta (
                      key   TEXT PRIMARY KEY,

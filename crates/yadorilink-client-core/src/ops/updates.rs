@@ -5,7 +5,8 @@ use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPay
 use yadorilink_ipc_proto::daemonctl::{
     UpdateCheckRequest, UpdateCheckResponse, UpdateConfigRequest, UpdateConfigResponse,
     UpdateInstallRequest, UpdateInstallResponse, UpdateStatusRequest, UpdateStatusResponse,
-    UpdateVersionCheckRequest, UpdateVersionCheckResponse,
+    UpdateVerifiedEntryRequest, UpdateVerifiedEntryResponse, UpdateVersionCheckRequest,
+    UpdateVersionCheckResponse,
 };
 
 use crate::daemon::control;
@@ -52,6 +53,35 @@ pub async fn check_version(
     Ok(check)
 }
 
+/// Asks the daemon whether an appcast item is covered by the `app_bundle` entry of the channel
+/// manifest it last verified, and for that entry. The daemon answers from what it already
+/// verified: no network request, no replay floor change. Not allowed carries a typed reason,
+/// `cannot_confirm` when no fresh verified manifest exists. `phase` picks the check:
+/// `enclosure` before the download, `downloaded` once the file's sha256 is known.
+pub async fn verified_entry(
+    item: &crate::dto::AppcastItem,
+    phase: crate::dto::AppcastItemPhase,
+) -> Result<UpdateVerifiedEntryResponse, CoreError> {
+    let resp = control::send(ReqPayload::UpdateVerifiedEntry(UpdateVerifiedEntryRequest {
+        version: item.version.clone(),
+        sparkle_build: item.sparkle_build,
+        channel: item.channel.clone().unwrap_or_default(),
+        url: item.url.clone(),
+        length: item.length,
+        sha256: item.sha256.clone().unwrap_or_default(),
+        phase: match phase {
+            crate::dto::AppcastItemPhase::Enclosure => "enclosure",
+            crate::dto::AppcastItemPhase::Downloaded => "downloaded",
+        }
+        .to_string(),
+    }))
+    .await?;
+    let Some(RespPayload::UpdateVerifiedEntry(check)) = resp.payload else {
+        return Err(unexpected());
+    };
+    Ok(check)
+}
+
 /// Official page to download new versions from. v1 ships manual updates:
 /// the daemon checks and reports, the user downloads and installs. Matches
 /// the daemon's `update::install_source::DOWNLOAD_PAGE_URL`.
@@ -60,7 +90,7 @@ pub const DOWNLOAD_PAGE_URL: &str = "https://github.com/yadorilink/yadorilink/re
 /// Whether a package manager or store, not the user, owns this install.
 /// Matches the install sources the daemon reports in `install_source`.
 pub fn is_package_managed(install_source: &str) -> bool {
-    matches!(install_source, "homebrew" | "apt" | "winget" | "microsoft_store")
+    matches!(install_source, "homebrew" | "apt" | "winget" | "microsoft_store" | "app_store")
 }
 
 /// Checks a daemon's download reply and returns `(guidance, page_url)`.

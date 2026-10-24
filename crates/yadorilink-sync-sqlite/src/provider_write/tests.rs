@@ -387,7 +387,12 @@ fn a_create_commits_the_row_the_item_and_its_published_version_together() {
         fx.repo.publication(&fx.root, &file.item_id).unwrap(),
         Some(crate::provider::Publication::Published)
     );
-    assert_eq!(fx.count("provider_handoffs"), 0, "an apply-change recorded presence evidence");
+    // The bytes came from the OS, which holds exactly them: the create is the handoff of its own
+    // version (a file only; a directory has no content).
+    assert_eq!(fx.count("provider_handoffs"), 1, "the authored file is not recorded as held");
+    let handoff = fx.repo.handoff(&fx.root, &file.item_id).unwrap().unwrap();
+    assert_eq!(handoff.version_hash, version_of(b"hello"));
+    assert!(fx.repo.handoff(&fx.root, &dir.item_id).unwrap().is_none());
 
     let mut link = fx.input(ChangeKind::Create);
     link.name = Some("ln".into());
@@ -395,6 +400,24 @@ fn a_create_commits_the_row_the_item_and_its_published_version_together() {
     link.symlink_target = Some(b"docs/a.txt".to_vec());
     let symlink = fx.run(&link).unwrap().item.unwrap();
     assert_eq!(symlink.kind, EntryKind::Symlink);
+}
+
+/// An edit the user made on this device is the content the OS holds: each applied edit moves the
+/// ledger to the new version with a newer evidence sequence, so the item is never offered as a
+/// download; an edit that moves the item only (no content) keeps its entry.
+#[test]
+fn an_authored_edit_is_recorded_as_the_version_the_os_holds() {
+    let fx = Fx::new();
+    let file = fx.create(None, "a.txt", b"one").item_id;
+    let first = fx.repo.handoff(&fx.root, &file).unwrap().unwrap();
+    assert_eq!(first.version_hash, version_of(b"one"));
+
+    fx.modify_content(file, b"two");
+    let second = fx.repo.handoff(&fx.root, &file).unwrap().unwrap();
+    assert_eq!(second.version_hash, version_of(b"two"));
+    assert!(second.evidence_seq > first.evidence_seq);
+    assert_eq!(fx.repo.latest_evidence_seq(&fx.root).unwrap(), Some(second.evidence_seq));
+    assert_eq!(fx.count("provider_handoffs"), 1);
 }
 
 #[test]

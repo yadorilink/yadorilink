@@ -131,7 +131,10 @@ pub use bootstrap::{
     PendingEnrolment, Registration, BOOTSTRAP_POLL_PATH, BOOTSTRAP_START_PATH,
 };
 pub use client::{AuthorizationRequest, FapiClient, PushedAuthorizationResponse, TokenResponse};
-pub use coordination::{CoordinationAuth, RegistrationStatus, Reload, RequestAuthorization};
+pub use coordination::{
+    CoordinationAuth, CoordinationBlock, RegistrationStatus, Reload, RequestAuthorization,
+    REFUSED_REFRESH_COOLDOWN,
+};
 pub use device_grant::{DeviceAuthorization, DevicePoll, DEVICE_CODE_GRANT};
 pub use discovery::Metadata;
 // Same reasoning as `client_assertion` above: no product call site mints a

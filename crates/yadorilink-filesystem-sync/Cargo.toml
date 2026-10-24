@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [features]
+default = ["os-watch"]
+# The OS-backed folder watcher (`notify`). A host whose linked folders are owned by the
+# operating system and change only through a provider channel builds without it.
+os-watch = ["dep:notify"]
 test-support = []
 
 [dependencies]
@@ -34,7 +38,7 @@ tracing.workspace = true
 # workspace crate's `sha2` dependency.
 sha2.workspace = true
 hex = "0.4"
-notify = "8"
+notify = { version = "8", optional = true }
 walkdir = "2"
 tokio.workspace = true
 
@@ -53,7 +57,7 @@ yadorilink-daemon = { path = "../yadorilink-daemon", features = ["test-support"]
 
 # The Windows root watcher (`win_watch.rs`): `ReadDirectoryChangesW`.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",

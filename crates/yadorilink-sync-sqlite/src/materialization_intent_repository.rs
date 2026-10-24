@@ -120,6 +120,34 @@ pub fn clear_flush_pending_in_tx(
     Ok(true)
 }
 
+/// Whether `path`'s open write intent was marked as landed (see
+/// [`MaterializationIntentRepository::mark_write_landed`]) and nothing has
+/// proven or moved the write since: the fence is still the one the mark names
+/// and no proof was published under it. A write waiting for its batch flush
+/// has a proof under its fence and is excluded: its file may not have reached
+/// stable storage, so its absence says nothing about the user.
+pub fn write_landed_unproven(
+    conn: &rusqlite::Connection,
+    group_id: &str,
+    path: &str,
+) -> Result<bool, SyncSqliteError> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM materialization_intents i \
+           JOIN path_actual_mutation_fences f \
+             ON f.group_id = i.group_id AND f.path = i.path \
+          WHERE i.group_id = ?1 AND i.path = ?2 AND i.kind = 'write' \
+            AND i.mutation_generation IS NOT NULL \
+            AND f.mutation_generation = i.mutation_generation \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM path_materialized_generations g \
+                 WHERE g.group_id = i.group_id AND g.path = i.path \
+                   AND g.published_under_mutation_generation = i.mutation_generation)",
+        rusqlite::params![group_id, path],
+        |r| r.get(0),
+    )?;
+    Ok(count > 0)
+}
+
 /// The proof's recorded identity when `path`'s write intent is waiting for a
 /// batch flush AND the proof it waits for still stands (published under that
 /// very fence, which is still the live one). `None` when the path has no such
@@ -188,6 +216,35 @@ impl MaterializationIntentRepository {
                   created_at_unix_nanos = excluded.created_at_unix_nanos, \
                   mutation_generation = NULL",
                 rusqlite::params![group_id, path, target_version_hash, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Records, durably, that the bytes of the write `path`'s intent is open
+    /// for were renamed into place and the rename reached stable storage, under
+    /// the mutation fence `mutation_generation` the write bumped. From here on
+    /// the name's absence is the user's doing (a remove or a move), never a
+    /// rename that did not happen, which is what an open intent alone cannot
+    /// tell. Only the intent of that same write is marked: a newer write
+    /// reopened it, and a moved fence is no longer this write's.
+    pub fn mark_write_landed(
+        &self,
+        group_id: &str,
+        path: &str,
+        mutation_generation: i64,
+        permit: &RootCommitPermit,
+    ) -> Result<(), SyncSqliteError> {
+        self.database.write::<_, SyncSqliteError>(|conn| {
+            permit.verify()?;
+            conn.execute(
+                "UPDATE materialization_intents SET mutation_generation = ?3 \
+                 WHERE group_id = ?1 AND path = ?2 AND kind = 'write' \
+                   AND mutation_generation IS NULL \
+                   AND EXISTS (SELECT 1 FROM path_actual_mutation_fences f \
+                                WHERE f.group_id = ?1 AND f.path = ?2 \
+                                  AND f.mutation_generation = ?3)",
+                rusqlite::params![group_id, path, mutation_generation],
             )?;
             Ok(())
         })

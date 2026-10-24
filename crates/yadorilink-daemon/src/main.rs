@@ -7,9 +7,15 @@
 //! `run(..)` directly with its own `DaemonConfig`, instead of going through
 //! this real process entry point.
 
-// `yadorilink-daemon` takes no arguments at all -- every real
+// A background start (logon task, packaged app) must not open a console window, so the Windows
+// binary uses the GUI subsystem; `console::attach_parent` gives a start from a terminal its
+// console back, and without one the log file (`log_roll`) is where output goes.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
+// `yadorilink-daemon` takes no settings as arguments -- every real
 // setting comes from `DaemonConfig::from_env()`, matching this binary's own
-// doc comment above. `--version`/`-V` is the one argument handled here
+// doc comment above. `--restart-on-replace` (a restarting supervisor's
+// declaration, see `exe_replaced`) is read in `async_main`. `--version`/`-V` is the one argument handled here
 // (not via `clap`, to keep this genuinely thin): a daemon binary that
 // silently ignores `--version` and starts the full sync daemon instead is
 // a real footgun for a package build/test step (this repo's own
@@ -23,21 +29,30 @@ fn print_version_and_exit_if_requested() {
         let release = yadorilink_local_storage::release_descriptor::embedded_build()
             .map(|b| format!(" (release {})", b.release_id))
             .unwrap_or_default();
-        println!(
+        // Written and flushed explicitly: `process::exit` does not run destructors, and a
+        // closed or missing stdout must not turn the exit into a panic.
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(
+            out,
             "{} {} (host api {}){release}",
             env!("CARGO_PKG_NAME"),
             env!("CARGO_PKG_VERSION"),
             yadorilink_ipc_proto::PROVIDER_HOST_API_VERSION
         );
+        let _ = out.flush();
         std::process::exit(0);
     }
 }
 
 fn main() -> anyhow::Result<()> {
+    console::attach_parent();
     print_version_and_exit_if_requested();
     // Before the runtime spawns its threads: glibc arenas are created per
     // contending thread and an existing arena is never merged away.
-    let arena_cap = yadorilink_daemon::malloc_arenas::cap_arenas();
+    let arena_cap = yadorilink_daemon::malloc_arenas::cap_arenas(
+        std::env::var_os("MALLOC_ARENA_MAX").as_deref(),
+    );
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -55,7 +70,11 @@ async fn async_main(arena_cap: yadorilink_daemon::malloc_arenas::ArenaCap) -> an
         let filter = env.and(throttle);
         // The macOS LaunchAgent logs to a file that rolls by size instead of
         // growing in launchd's unrotated StandardOutPath files.
-        let rolling = yadorilink_daemon::log_roll::log_file_path().and_then(|p| {
+        let rolling = yadorilink_daemon::log_roll::log_file_path(
+            &yadorilink_fs_platform::state_dir::Env::from_process(),
+            std::env::var_os("HOME"),
+        )
+        .and_then(|p| {
             yadorilink_daemon::log_roll::RollingLog::open(p, yadorilink_daemon::log_roll::MAX_BYTES)
                 .ok()
         });
@@ -72,6 +91,9 @@ async fn async_main(arena_cap: yadorilink_daemon::malloc_arenas::ArenaCap) -> an
                 .with(tracing_subscriber::fmt::layer().with_filter(filter))
                 .init(),
         }
+    }
+    if std::env::args().skip(1).any(|arg| arg == yadorilink_daemon::exe_replaced::SUPERVISED_ARG) {
+        yadorilink_daemon::exe_replaced::arm();
     }
     yadorilink_daemon::malloc_arenas::log(arena_cap);
     yadorilink_daemon::fd_limit::raise_nofile_soft_limit();
@@ -98,5 +120,77 @@ async fn async_main(arena_cap: yadorilink_daemon::malloc_arenas::ArenaCap) -> an
             std::process::exit(yadorilink_daemon::identity::REFUSAL_EXIT_CODE);
         }
     }
-    result
+    if let Ok(end) = &result {
+        if let Some(status) = end.exit_status() {
+            // The supervisor restarts a daemon that exits with a non-zero status.
+            tracing::info!("executable replaced; restarting");
+            std::process::exit(status);
+        }
+    }
+    result.map(|_| ())
+}
+
+/// Foreground use from a terminal keeps printing to it although the binary has no console of
+/// its own (GUI subsystem on Windows). Elsewhere there is nothing to do.
+mod console {
+    #[cfg(not(windows))]
+    pub fn attach_parent() {}
+
+    #[cfg(windows)]
+    pub fn attach_parent() {
+        use windows_sys::Win32::Foundation::{
+            GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, GetFileType, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_UNKNOWN,
+            OPEN_EXISTING,
+        };
+        use windows_sys::Win32::System::Console::{
+            AttachConsole, GetStdHandle, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE,
+            STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+
+        // A GUI-subsystem process is not connected to a console at start, so a handle value
+        // inherited for a console (no redirection) is stale: it is non-null yet refers to
+        // nothing. Only a handle with a known file type is a real redirection (file, pipe).
+        // SAFETY (all calls below): plain Win32 calls with valid arguments.
+        let usable = |handle: HANDLE| unsafe {
+            !handle.is_null()
+                && handle != INVALID_HANDLE_VALUE
+                && GetFileType(handle) != FILE_TYPE_UNKNOWN
+        };
+        let which_handles = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE];
+        // Captured before attaching: attaching may rebind the standard handles to the console
+        // and would lose a `> file` or pipe the parent set up.
+        let inherited = which_handles.map(|which| unsafe { GetStdHandle(which) });
+        unsafe {
+            // No parent console (a logon task, the packaged app): stay without one.
+            if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+                return;
+            }
+            for (which, before) in which_handles.into_iter().zip(inherited) {
+                if usable(before) {
+                    SetStdHandle(which, before);
+                    continue;
+                }
+                let name: Vec<u16> = if which == STD_INPUT_HANDLE {
+                    "CONIN$\0".encode_utf16().collect()
+                } else {
+                    "CONOUT$\0".encode_utf16().collect()
+                };
+                let handle = CreateFileW(
+                    name.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null_mut(),
+                );
+                if handle != INVALID_HANDLE_VALUE {
+                    SetStdHandle(which, handle);
+                }
+            }
+        }
+    }
 }

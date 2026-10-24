@@ -6,7 +6,8 @@
 //! (`UnixStream`, `unix_transport::serve`) before that change — now made
 //! explicit since `windows_pipe_tests` below adds a real Windows path
 //! that would otherwise collide with these Unix-specific signatures.
-#[cfg(unix)]
+//! apple-cfg: ios-explicit (the unix transport module is not compiled for iOS)
+#[cfg(all(unix, not(target_os = "ios")))] // the unix transport module is not compiled for iOS
 mod unix_socket_tests {
 
     use std::sync::Arc;

@@ -7,7 +7,7 @@ use super::{existing_directory, folder_memberships, offering_force, ClientCore};
 use crate::dto::{
     self, AcceptInviteOutcome, ApproveOutcome, AssignableRole, DeviceSummary, FolderMode,
     GroupSummary, InviteSummary, MemberSummary, MembershipOutcome, PendingApprovalSummary,
-    PendingInviteSummary, RevokeEdgeOutcome, ShareSummary,
+    PendingInviteSummary, ProviderInviteOutcome, RevokeEdgeOutcome, ShareSummary,
 };
 use crate::error::{CoreError, DesktopError};
 use crate::ops;
@@ -339,6 +339,35 @@ impl ClientCore {
             group_id: outcome.group_id,
             local_path,
             awaiting_approval: outcome.awaiting_approval,
+        })
+    }
+
+    /// Redeems an invite (its code or its `yadorilink://invite/` link) and joins the group it
+    /// names as a provider-backed folder named `display_name`: no directory is linked, the
+    /// operating system's root is the folder. Safe to repeat with the same code and request, also
+    /// after a restart.
+    ///
+    /// # Errors
+    /// `InvalidInput{field: "invite"}` for input that is not an invite; daemon and coordination
+    /// failures, including a refusal when provider folders are not available or the name is taken.
+    pub async fn accept_invite_as_provider_folder(
+        &self,
+        code_or_url: String,
+        display_name: String,
+        mode: FolderMode,
+    ) -> Result<ProviderInviteOutcome, DesktopError> {
+        let accepted = ops::shares::accept_invite_as_provider_folder(
+            &code_or_url,
+            display_name.clone(),
+            mode == FolderMode::OnDemand,
+        )
+        .await?;
+        Ok(ProviderInviteOutcome {
+            group_id: accepted.group_id,
+            root_id: accepted.root_id,
+            display_name,
+            mode,
+            awaiting_approval: accepted.awaiting_approval,
         })
     }
 }

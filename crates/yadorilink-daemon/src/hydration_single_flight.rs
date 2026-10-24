@@ -33,7 +33,8 @@ use tokio::sync::watch;
 
 type Key = (String, String);
 
-/// `Ok(())` if the leader's `hydrate_inner` succeeded, `Err(())`
+/// `Ok(materialized)` if the leader's `hydrate_inner` succeeded (`materialized`: it fetched
+/// content from peers, rather than finding the file already here), `Err(())`
 /// otherwise -- deliberately not `Result<(), SyncError>` (`SyncError` is
 /// not `Clone`, and `watch`'s value type must be). A follower that
 /// observes `Err(())` reconstructs a generic `SyncError::HydrationFailed`
@@ -41,7 +42,7 @@ type Key = (String, String);
 /// already does today when ITS OWN `tokio::time::timeout` elapses --
 /// losing the leader's specific failure detail is the same acceptable
 /// trade-off, not a new one this registry introduces.
-type Outcome = Result<(), ()>;
+type Outcome = Result<bool, ()>;
 
 /// Folds `path` the same way [`crate::sync_runtime::path_locks::
 /// PathLockRegistry`] folds its own lock key -- two paths that case-fold

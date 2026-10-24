@@ -30,11 +30,11 @@ pub fn plan(env_value: Option<&std::ffi::OsStr>) -> Option<i32> {
     env_value.is_none().then_some(ARENA_MAX)
 }
 
-/// Caps arenas unless the operator already set `MALLOC_ARENA_MAX`. Call before
-/// any thread is spawned.
+/// Caps arenas unless the operator already set `MALLOC_ARENA_MAX` (`env_value` is its value, which
+/// the binary's `main` reads). Call before any thread is spawned.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-pub fn cap_arenas() -> ArenaCap {
-    let Some(n) = plan(std::env::var_os("MALLOC_ARENA_MAX").as_deref()) else {
+pub fn cap_arenas(env_value: Option<&std::ffi::OsStr>) -> ArenaCap {
+    let Some(n) = plan(env_value) else {
         return ArenaCap::OperatorSet;
     };
     // SAFETY: mallopt only adjusts allocator tunables and is called before
@@ -47,7 +47,7 @@ pub fn cap_arenas() -> ArenaCap {
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-pub fn cap_arenas() -> ArenaCap {
+pub fn cap_arenas(_env_value: Option<&std::ffi::OsStr>) -> ArenaCap {
     ArenaCap::NotApplicable
 }
 
@@ -75,10 +75,11 @@ mod tests {
     #[test]
     fn mallopt_accepts_the_cap() {
         // Skip when the harness environment already pins it.
-        if std::env::var_os("MALLOC_ARENA_MAX").is_some() {
-            assert_eq!(cap_arenas(), ArenaCap::OperatorSet);
+        let pinned = std::env::var_os("MALLOC_ARENA_MAX");
+        if pinned.is_some() {
+            assert_eq!(cap_arenas(pinned.as_deref()), ArenaCap::OperatorSet);
         } else {
-            assert_eq!(cap_arenas(), ArenaCap::Applied(ARENA_MAX));
+            assert_eq!(cap_arenas(None), ArenaCap::Applied(ARENA_MAX));
         }
     }
 }

@@ -192,12 +192,19 @@ async fn run(
     if matches!(restart, Restart::Start) {
         start(&f);
     }
-    for _ in 0..6 {
+    // Wait on the state, not on a pass count: a pass may legitimately skip the
+    // path (the group's guard held by a background task) and the next one
+    // lands it. A real regression never lands and runs into the deadline.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
         let_backoff_elapse(&f);
         pass(&engine).await;
         if f.read("held.bin").as_deref() == Some(content.as_slice())
             && !open_obligation(&f, "held.bin")
         {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;

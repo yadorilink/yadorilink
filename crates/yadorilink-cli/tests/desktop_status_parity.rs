@@ -28,10 +28,16 @@ use yadorilink_local_storage::SegmentBlockStore;
 async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("YADORILINK_CONFIG_DIR", dir.path());
-    std::env::set_var("YADORILINK_UPDATE_MANIFEST_URL", "http://127.0.0.1:1/manifest.json");
+    // The manifest URL is an explicit engine setting: nothing listens on this port.
+    let tuning = yadorilink_daemon::engine_tuning::EngineTuning {
+        update_manifest_url: Some("http://127.0.0.1:1/manifest.json".into()),
+        witness: yadorilink_daemon::install_witness::WitnessPlacement::BesideDatabase,
+        ..Default::default()
+    };
 
     let store = Arc::new(SegmentBlockStore::new(dir.path().join("blocks")).unwrap());
-    let sync_state = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
+    let sync_state =
+        Arc::new(ReplicaCoordinator::open_with(dir.path().join("sync.sqlite3"), tuning).unwrap());
     let state = DaemonState::new("device-under-test".into(), sync_state, store);
     // A registered (non-empty device_id) device with no change-signing key is
     // fail-closed (`link_manager::ensure_initial_change_history`): linking a
@@ -82,7 +88,7 @@ static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// `DaemonState::new` always spawns the periodic update-check scheduler
 /// immediately and always attempts a check at startup regardless of
 /// `automatic_checks_enabled` (`update_ipc.rs`'s own doc comment) — against
-/// this file's deliberately-unreachable `YADORILINK_UPDATE_MANIFEST_URL`,
+/// this file's deliberately-unreachable manifest URL (an engine setting),
 /// that startup check fails fast (connection refused) and records an
 /// `update_last_error_category`, which `overall_status` (correctly) surfaces
 /// as an `update_failed:...` attention reason. `tests/update.rs` already

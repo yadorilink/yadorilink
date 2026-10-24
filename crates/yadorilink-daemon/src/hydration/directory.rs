@@ -148,19 +148,24 @@ pub(crate) fn fold_directory_eviction(
 }
 
 /// Fetches every file below the directory `prefix` that is not here yet.
-/// Every file is attempted; the first failure is reported after.
+/// Every file is attempted; the first failure is reported after. Whether any file's content
+/// was fetched from peers.
 pub(crate) async fn hydrate_directory(
     state: &Arc<DaemonState>,
     group_id: &str,
     prefix: &str,
-) -> Result<(), SyncError> {
+) -> Result<bool, SyncError> {
     let mut first_error = None;
+    let mut materialized = false;
     for path in files_not_hydrated_under(state, group_id, prefix)? {
-        if let Err(error) = super::hydrate(state, group_id, &path).await {
-            first_error.get_or_insert(error);
+        match super::hydrate_reporting(state, group_id, &path).await {
+            Ok(wrote) => materialized |= wrote,
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
         }
     }
-    first_error.map_or(Ok(()), Err)
+    first_error.map_or(Ok(materialized), Err)
 }
 
 /// Hydrates every live file below the directory `prefix`, including the ones already here (a

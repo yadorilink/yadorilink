@@ -1275,3 +1275,123 @@ fn windows_an_untouched_file_has_a_stable_race_fingerprint() {
         FileIdentity::observe_path(&path).unwrap().metadata_fingerprint
     );
 }
+
+/// A same-size rewrite through another handle that puts the write time back leaves length and
+/// mtime as they were; the fingerprint of the open handle must still move.
+#[test]
+fn handle_fingerprint_sees_a_same_size_rewrite_that_restores_the_mtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f");
+    std::fs::write(&path, b"aaaa").unwrap();
+    let file = File::open(&path).unwrap();
+    let before_meta = file.metadata().unwrap();
+    let before = disk_race_fingerprint_of_handle(&before_meta, &file);
+
+    // Past one coarse clock tick (a kernel's cached time advances every few milliseconds), so the
+    // rewrite below cannot land in the tick of the first sample.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    io::Write::write_all(&mut &writer, b"bbbb").unwrap();
+    writer.set_modified(before_meta.modified().unwrap()).unwrap();
+    drop(writer);
+
+    let after_meta = file.metadata().unwrap();
+    assert_eq!(after_meta.len(), before_meta.len());
+    assert_eq!(after_meta.modified().unwrap(), before_meta.modified().unwrap());
+    assert_ne!(disk_race_fingerprint_of_handle(&after_meta, &file), before);
+}
+
+#[test]
+fn two_siblings_with_one_size_and_mtime_are_not_the_same_live_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let when = SystemTime::now() - std::time::Duration::from_secs(60);
+    for name in ["a", "b"] {
+        let file = File::create(dir.path().join(name)).unwrap();
+        io::Write::write_all(&mut &file, b"same").unwrap();
+        file.set_modified(when).unwrap();
+    }
+
+    assert!(!same_live_object(&dir.path().join("a"), &dir.path().join("b")));
+    assert!(same_live_object(&dir.path().join("a"), &dir.path().join("a")));
+}
+
+#[test]
+fn a_hard_link_is_the_same_live_object_and_a_missing_path_is_not() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a"), b"x").unwrap();
+    std::fs::hard_link(dir.path().join("a"), dir.path().join("link")).unwrap();
+
+    assert!(same_live_object(&dir.path().join("a"), &dir.path().join("link")));
+    assert!(!same_live_object(&dir.path().join("a"), &dir.path().join("missing")));
+}
+
+#[test]
+fn an_unreadable_change_time_is_never_equal_when_fail_closed_and_the_stat_otherwise() {
+    let stat: DiskRaceFingerprint = (4, Some(SystemTime::UNIX_EPOCH), 0, 0);
+
+    assert_eq!(compose_fingerprint(stat, None, false), stat);
+    assert_eq!(compose_fingerprint(stat, None, false), compose_fingerprint(stat, None, false));
+    assert_ne!(compose_fingerprint(stat, None, true), compose_fingerprint(stat, None, true));
+    assert_eq!(
+        compose_fingerprint(stat, Some((7, 9)), true),
+        (4, Some(SystemTime::UNIX_EPOCH), 7, 9)
+    );
+}
+
+/// A bracket sampled twice where the change time and USN cannot be read must compare equal for an
+/// untouched file, and still move with a size change; the strict sample never compares equal.
+#[cfg(windows)]
+#[test]
+fn windows_an_unreadable_change_time_still_brackets_for_a_retry_loop() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.bin");
+    std::fs::write(&path, b"aaaa").unwrap();
+    let meta = std::fs::symlink_metadata(&path).unwrap();
+    let unreadable = || Err(io::Error::from(io::ErrorKind::PermissionDenied));
+    assert_eq!(
+        windows_fingerprint(&meta, unreadable(), false),
+        windows_fingerprint(&meta, unreadable(), false)
+    );
+    assert_ne!(
+        windows_fingerprint(&meta, unreadable(), true),
+        windows_fingerprint(&meta, unreadable(), true)
+    );
+}
+
+#[test]
+fn the_retry_bracket_fingerprint_is_stable_for_an_untouched_file_and_moves_with_its_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.bin");
+    std::fs::write(&path, b"aaaa").unwrap();
+    let first = disk_race_fingerprint_or_stat(&path).unwrap();
+    assert_eq!(Some(first), disk_race_fingerprint_or_stat(&path));
+    std::fs::write(&path, b"aaaaa").unwrap();
+    assert_ne!(Some(first), disk_race_fingerprint_or_stat(&path));
+    assert_eq!(disk_race_fingerprint_or_stat(&dir.path().join("absent")), None);
+}
+
+/// A zero `ChangeTime` (FAT/FAT32: the query succeeds and answers 0) is as unreadable as a failed
+/// query, so every consumer takes the degraded path instead of treating it as a strict sample.
+#[cfg(windows)]
+#[test]
+fn a_zero_or_failed_change_time_is_unreadable() {
+    assert_eq!(win_identity::change_time_from_basic_info(true, 0), None);
+    assert_eq!(win_identity::change_time_from_basic_info(false, 5), None);
+    assert_eq!(win_identity::change_time_from_basic_info(true, 5), Some(5));
+}
+
+/// On a real FAT/exFAT-like volume: set `YADORI_NO_CHANGE_TIME_DIR` to a directory on it. The
+/// fingerprint is degraded, never equal to itself when strict, and an in-place rewrite is not
+/// "visible" (the caller must compare bytes). Skipped when the variable is unset.
+#[cfg(windows)]
+#[test]
+fn a_volume_without_a_change_time_is_degraded_everywhere() {
+    let Some(dir) = std::env::var_os("YADORI_NO_CHANGE_TIME_DIR") else { return };
+    let path = std::path::Path::new(&dir).join("y2-fat-probe.bin");
+    std::fs::write(&path, b"v1").unwrap();
+    let (_, degraded) = disk_race_fingerprint_or_stat_observed(&path).unwrap();
+    assert!(degraded, "a volume answering ChangeTime 0 must be degraded");
+    assert_ne!(disk_race_fingerprint(&path), disk_race_fingerprint(&path), "strict never equal");
+    assert!(!FileIdentity::in_place_rewrite_visible(&path));
+    std::fs::remove_file(&path).unwrap();
+}

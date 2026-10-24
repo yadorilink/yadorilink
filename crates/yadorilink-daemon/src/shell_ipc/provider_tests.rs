@@ -26,7 +26,13 @@ const GROUP: &str = "group-1";
 pub(super) fn state_with_root() -> (Arc<DaemonState>, String) {
     let store = Arc::new(SegmentBlockStore::new(tempfile::tempdir().unwrap().keep()).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
-    let state = DaemonState::new("device-a".into(), sync_state, store);
+    // Its own state directory: the governance config (a headroom override) is per state.
+    let state = DaemonState::new_in(
+        tempfile::tempdir().unwrap().keep(),
+        "device-a".into(),
+        sync_state,
+        store,
+    );
     state.replica_coordinator.link_repository().add_link("/provider/photos", GROUP).unwrap();
     let root = state
         .replica_coordinator
@@ -758,6 +764,7 @@ fn next_downloads_message(root_id: &[u8], exclude: &[[u8; 16]], max: u32) -> She
                 root_id: root_id.to_vec(),
                 exclude_item_ids: exclude.iter().map(|i| i.to_vec()).collect(),
                 max,
+                request_id: Vec::new(),
             },
         )),
     }

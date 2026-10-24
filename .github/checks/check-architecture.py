@@ -73,7 +73,7 @@ def workspace_graph(root: Path) -> dict[str, dict[str, set[str]]]:
         cwd=root,
         check=True,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     ).stdout
     return parse_metadata(json.loads(raw))
 
@@ -575,7 +575,7 @@ def workspace_members(root: Path) -> set[str]:
         cwd=root,
         check=True,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     ).stdout
     metadata = json.loads(raw)
     by_id = {p["id"]: p["name"] for p in metadata["packages"]}

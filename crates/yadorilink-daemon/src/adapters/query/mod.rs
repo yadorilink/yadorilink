@@ -4,6 +4,7 @@
 //! `crate::queries::link_status`'s own doc comment for why that's a
 //! deliberate strangler step, not a shortcut.
 
+#[cfg(feature = "process-model")]
 pub(crate) mod diagnostics_bundle;
 pub(crate) mod handoff_readiness;
 pub(crate) mod link_status;

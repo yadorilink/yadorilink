@@ -73,6 +73,7 @@ impl EnrollmentLinkPort for DaemonEnrollmentLinkAdapter {
         group_id: &'a str,
         absolute_path: &'a std::path::Path,
         on_demand: bool,
+        provider: Option<crate::application::ports::ProviderLinkTarget>,
     ) -> BoxFuture<'a, Result<(), EnrollmentLinkError>> {
         Box::pin(async move {
             let local_path = absolute_path.to_string_lossy().to_string();
@@ -83,7 +84,7 @@ impl EnrollmentLinkPort for DaemonEnrollmentLinkAdapter {
                     group_id: group_id.to_string(),
                     on_demand,
                     pending_enrollment: None,
-                    provider: None,
+                    provider,
                 })
                 .await
             {

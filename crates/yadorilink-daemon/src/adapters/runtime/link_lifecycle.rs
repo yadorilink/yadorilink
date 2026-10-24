@@ -29,6 +29,14 @@ impl LinkRepositoryPort for DaemonLinkRepositoryAdapter {
         self.state.link_preflight_headroom_override()
     }
 
+    fn preflight_home_dir(&self) -> Option<std::path::PathBuf> {
+        self.state.tuning().home_dir.clone()
+    }
+
+    fn state_dir(&self) -> std::path::PathBuf {
+        self.state.config_dir().to_path_buf()
+    }
+
     fn live_link_paths_for_group(&self, group_id: &str) -> Result<Vec<String>, SyncError> {
         self.state
             .replica_coordinator
@@ -66,6 +74,29 @@ impl LinkRepositoryPort for DaemonLinkRepositoryAdapter {
             .replica_coordinator
             .link_repository()
             .add_link(local_path, group_id)
+            .map_err(SyncError::from)
+    }
+
+    fn commit_provider_link_plain(
+        &self,
+        local_path: &str,
+        group_id: &str,
+        provider: &crate::application::ports::ProviderLinkTarget,
+    ) -> Result<LinkRowWrite, SyncError> {
+        self.state
+            .replica_coordinator
+            .link_repository()
+            .add_provider_link(
+                local_path,
+                group_id,
+                &yadorilink_sync_sqlite::provider::ProviderLinkSpec {
+                    kind: provider.kind,
+                    display_name: provider.display_name.clone(),
+                    empty_owner: provider.empty_owner,
+                    on_demand: provider.on_demand,
+                    creation_digest: provider.creation_digest.clone(),
+                },
+            )
             .map_err(SyncError::from)
     }
 

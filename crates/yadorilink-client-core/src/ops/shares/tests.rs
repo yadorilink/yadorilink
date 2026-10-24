@@ -264,10 +264,7 @@ fn a_role_change_refuses_a_role_the_coordination_plane_would_refuse() {
 #[tokio::test]
 async fn change_role_resolved_issues_no_request_at_all_for_a_refused_role() {
     let server = MockServer::start().await;
-    let _guard = crate::coordination::http_client::COORDINATION_ADDR_ENV_LOCK.lock().await;
-    std::env::set_var("YADORILINK_COORDINATION_ADDR", server.uri());
     let result = change_role_resolved("group-1", "device-1", "owner").await;
-    std::env::remove_var("YADORILINK_COORDINATION_ADDR");
 
     assert!(result.is_err(), "an unchangeable role must be refused, not sent");
     assert_eq!(server.received_requests().await.unwrap().len(), 0);
@@ -376,11 +373,14 @@ async fn resolve_against_mocked_listings(
         .mount(&server)
         .await;
 
-    let _guard = crate::coordination::http_client::COORDINATION_ADDR_ENV_LOCK.lock().await;
-    std::env::set_var("YADORILINK_COORDINATION_ADDR", server.uri());
-    let result =
-        resolve_group_id(&yadorilink_fapi_client::test_support::offline_auth(), group_name).await;
-    std::env::remove_var("YADORILINK_COORDINATION_ADDR");
+    let result = resolve_group_id(
+        &crate::coordination::http_client::CoordinationAccess::new(
+            yadorilink_fapi_client::test_support::offline_auth(),
+            server.uri(),
+        ),
+        group_name,
+    )
+    .await;
     (server, result)
 }
 
@@ -468,13 +468,12 @@ async fn resolve_group_id_fails_for_a_name_in_neither_listing() {
     )
     .await;
 
-    let message = match result {
-        Err(CoreError::InvalidInput(message)) => message,
-        other => panic!("expected a not-found message, got {other:?}"),
-    };
-    assert!(message.contains("nonexistent"), "got: {message}");
-    assert!(message.contains("share create"), "got: {message}");
-    assert!(message.contains("share accept"), "got: {message}");
+    let error = result.expect_err("a not-found refusal");
+    assert_eq!(error.hint(), Some(Hint::CreateOrAcceptShare));
+    let CoreError::Hinted { error: inner, .. } = error else { panic!("hinted: {error:?}") };
+    let CoreError::InvalidInput(message) = *inner else { panic!("not found, got {inner:?}") };
+    assert_eq!(message, "no folder group named \"nonexistent\" is visible to this account");
+    assert!(!message.contains("yadorilink "), "client-core names no CLI command: {message}");
 }
 
 #[test]
@@ -532,12 +531,15 @@ async fn members_as_presented(
         .respond_with(ResponseTemplate::new(200).set_body_json(listing))
         .mount(&server)
         .await;
-    let _guard = crate::coordination::http_client::COORDINATION_ADDR_ENV_LOCK.lock().await;
-    std::env::set_var("YADORILINK_COORDINATION_ADDR", server.uri());
-    let result =
-        fetch_members(&yadorilink_fapi_client::test_support::offline_auth(), "g1", own_device_id)
-            .await;
-    std::env::remove_var("YADORILINK_COORDINATION_ADDR");
+    let result = fetch_members(
+        &crate::coordination::http_client::CoordinationAccess::new(
+            yadorilink_fapi_client::test_support::offline_auth(),
+            server.uri(),
+        ),
+        "g1",
+        own_device_id,
+    )
+    .await;
     result.unwrap()
 }
 
@@ -671,4 +673,21 @@ fn refusal_reasons_are_plain_and_distinct() {
     assert!(admitted.contains("already approved"));
     assert!(gone.contains("no longer waiting") && gone.contains("Nothing was changed"));
     assert_ne!(admitted, gone);
+}
+
+#[tokio::test]
+async fn resolve_joinable_group_id_names_the_missing_group_and_its_next_step() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/shares/joinable"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "groups": [] })))
+        .mount(&server)
+        .await;
+    let auth = crate::coordination::http_client::CoordinationAccess::new(
+        yadorilink_fapi_client::test_support::offline_auth(),
+        server.uri(),
+    );
+    let error = resolve_joinable_group_id_with(&auth, "docs").await.unwrap_err();
+    assert_eq!(error.hint(), Some(Hint::ListJoinableShares));
+    assert_eq!(error.to_string(), "no joinable folder group named \"docs\"");
 }

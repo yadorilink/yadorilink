@@ -57,10 +57,15 @@ def errors(value, schema, path="$"):
 
 
 def validate(identity, require_source: bool = False, release: bool = False) -> list[str]:
-    found = errors(identity, json.loads(SCHEMA.read_text()))
+    found = errors(identity, json.loads(SCHEMA.read_text(encoding="utf-8")))
     if require_source and isinstance(identity, dict) and "source" not in identity:
         found.append("$: missing 'source'")
     if isinstance(identity, dict):
+        written, oldest = identity.get("state_schema_version"), identity.get("state_schema_min_readable")
+        if oldest is not None and written is None:
+            found.append("$: state_schema_min_readable requires state_schema_version")
+        if isinstance(written, int) and isinstance(oldest, int) and oldest > written:
+            found.append("$: state_schema_min_readable is above state_schema_version")
         kind, channel = identity.get("kind"), identity.get("channel")
         # kind and channel say the same thing twice on purpose: a development
         # engine cannot be relabelled as a release (or the reverse) by editing
@@ -98,6 +103,11 @@ def self_test() -> int:
     assert validate({**good, "source": {"repository": "owner/repo"}})
     assert validate({**good, "source": {**source, "extra": 1}})
     assert validate({k: v for k, v in good.items() if k != "bundle_sha256"})
+    slices = {"aarch64-apple-ios": "e" * 64, "aarch64-apple-ios-sim": "f" * 64}
+    assert validate({**good, "slices": slices}) == []
+    assert validate({**good, "slices": {"aarch64-apple-ios": "e" * 64}}), "a missing slice was accepted"
+    assert validate({**good, "slices": {**slices, "x86_64-apple-ios": "e" * 64}}), "an unknown slice was accepted"
+    assert validate({**good, "slices": {**slices, "aarch64-apple-ios": "E" * 64}}), "a bad slice digest was accepted"
     assert validate({**good, "bundle_sha256": "D" * 64})
     for key, bad in [
         ("public_commit_sha", "abc"),
@@ -122,6 +132,14 @@ def self_test() -> int:
     assert validate(good, release=True) == [] and validate({**good, "channel": "beta"}, release=True) == []
     assert validate({**good, "extra": 1})
     assert validate([])
+    # The state database compatibility fields are additive and optional: identities
+    # without them (older bundles) and with them are both accepted.
+    assert validate({**good, "state_schema_version": 132}) == []
+    assert validate({**good, "state_schema_version": 132, "state_schema_min_readable": 130}) == []
+    assert validate({**good, "state_schema_min_readable": 130})
+    assert validate({**good, "state_schema_version": 5, "state_schema_min_readable": 6})
+    for bad_state in (0, "132", True, 1.5):
+        assert validate({**good, "state_schema_version": bad_state}), bad_state
     print("ok")
     return 0
 
@@ -135,7 +153,7 @@ def main(argv: list[str]) -> int:
     if len(argv) != 1:
         print(__doc__, file=sys.stderr)
         return 2
-    found = validate(json.loads(Path(argv[0]).read_text()), require_source, release)
+    found = validate(json.loads(Path(argv[0]).read_text(encoding="utf-8")), require_source, release)
     for line in found:
         print(line, file=sys.stderr)
     return 1 if found else 0

@@ -129,6 +129,16 @@ pub(crate) trait DaemonLifecyclePort: Send + Sync {
     /// Never forces anything.
     fn request_safe_stop(&self, deadline: std::time::Duration) -> BoxFuture<'_, SafeStopOutcome>;
 
+    /// [`Self::request_safe_stop`] on behalf of the executable-replaced watch: when this request
+    /// is the one that commits the stop (`Stopping { already_in_progress: false }`), the daemon
+    /// records, before the shutdown signal fires and as part of the same commit, that the process
+    /// must exit for a restart. A request that does not commit (busy, already stopping) records
+    /// nothing.
+    fn request_safe_stop_to_restart(
+        &self,
+        deadline: std::time::Duration,
+    ) -> BoxFuture<'_, SafeStopOutcome>;
+
     /// Requests graceful shutdown -- fire-and-forget, matching
     /// `DaemonState.shutdown_tx`'s own "a send error just means every
     /// receiver is already gone" semantics.

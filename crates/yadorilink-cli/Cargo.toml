@@ -20,7 +20,7 @@ yadorilink-sqlite-runtime = { path = "../yadorilink-sqlite-runtime" }
 yadorilink-root-authority = { path = "../yadorilink-root-authority" }
 yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
 yadorilink-reporting = { path = "../yadorilink-reporting" }
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 # Local-time rendering of timestamps in `status` (`localtime_r`).
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }
@@ -48,7 +48,7 @@ libc = "0.2"
 
 # Local-time rendering and parsing (`SystemTimeToTzSpecificLocalTime`).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Time"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Time"] }
 
 [dev-dependencies]
 # The wire-contract harness decodes JWT-shaped values and parses redirect

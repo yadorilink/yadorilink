@@ -244,6 +244,33 @@ message LinkStatus {
   // duplicates). They are in neither `availability_reachable_device_ids` nor
   // `availability_offline_device_ids`. Additive; empty from an older daemon.
   repeated string availability_update_required_device_ids = 53;
+  // True while this link is `degraded` because it waits for free disk space on a volume (a
+  // receive or provider read was refused for lack of room; sync resumes by itself once there is
+  // room). The typed form of that state: `degraded_reason` is human detail only and must never be
+  // matched by text. The overall-status rollup reports it as `waiting_for_disk_space:<group>`
+  // instead of `degraded:<group>`. Additive; false from an older daemon. Mirrors
+  // `degraded_cause == DEGRADED_CAUSE_WAITING_FOR_DISK_SPACE`; kept because it is already on the
+  // wire.
+  bool waiting_for_disk_space = 54;
+  // Why this link is `degraded`; `DEGRADED_CAUSE_UNSPECIFIED` when it is not, or for a stop with
+  // no more specific cause. The typed form of the state: `degraded_reason` is human detail only
+  // and must never be matched by text. The overall-status rollup reports each cause under its own
+  // code (`<DegradedCause key>:<group>`). Additive; unspecified from an older daemon.
+  DegradedCause degraded_cause = 55;
+}
+
+// See `LinkStatus.degraded_cause`.
+enum DegradedCause {
+  DEGRADED_CAUSE_UNSPECIFIED = 0;
+  // A receive or provider read was refused for lack of room on a volume; sync resumes by itself.
+  DEGRADED_CAUSE_WAITING_FOR_DISK_SPACE = 1;
+  // The OS file-watch limit is hit: changes are picked up late, or (at startup) not at all, until
+  // the user raises the limit.
+  DEGRADED_CAUSE_FILE_WATCH_LIMIT = 2;
+  // The folder's ownership marker is gone; only re-linking or a restart clears it.
+  DEGRADED_CAUSE_OWNERSHIP_LOST = 3;
+  // The folder is no longer joined to its folder group (orphaned link).
+  DEGRADED_CAUSE_NOT_JOINED = 4;
 }
 
 // See `LinkStatus.availability`. A link is `AVAILABLE` only when the exact
@@ -462,6 +489,10 @@ enum UnreachableCategory {
   // Reachable on the network but the handshake was refused (key/netmap
   // mismatch), distinct from network unreachability.
   UNREACHABLE_CATEGORY_HANDSHAKE_REFUSED = 4;
+  // The account replaced this device with another one (start over). It is
+  // refused for good, not out of reach; `PeerStatus.replaced_by_device_id`
+  // names its replacement.
+  UNREACHABLE_CATEGORY_DEVICE_REPLACED = 5;
 }
 
 message PeerStatus {
@@ -505,6 +536,9 @@ message PeerStatus {
   // paused until both devices run the same release. Independent of `reachability`, which stays
   // `CONNECTED`: the device is online and the fix is to update, not to wait.
   bool version_incompatible = 9;
+  // The device that replaced this one, set exactly when `unreachable_category`
+  // is `UNREACHABLE_CATEGORY_DEVICE_REPLACED`; empty otherwise.
+  string replaced_by_device_id = 10;
 }
 
 // See `PeerStatus.route_kind`'s own doc comment, mirroring
@@ -1203,6 +1237,10 @@ message ProviderRootStatus {
   // progress and stuck files) could not be read: they are zero only because nothing is known, and
   // `readiness` names what failed. A shell shows "unknown" instead of the zeros.
   bool counters_unreadable = 16;
+  // The folder the OS shows this root in (the Windows sync root, `%USERPROFILE%\\YadoriLink\\<name>`),
+  // as the host registered it; empty when the host has not registered it yet or the platform has
+  // no such folder. The link's own key is an identity, not a place to open.
+  string sync_root_path = 17;
 }
 
 message ListProviderPendingRequest {
@@ -1646,7 +1684,12 @@ message IdentifyResponse {
 message HydrateRequest {
   string absolute_path = 1;
 }
-message HydrateResponse {}
+message HydrateResponse {
+  // Whether the daemon fetched content from peers for this request. `false` means everything asked for was
+  // already on this device and nothing was downloaded (always the case in a regular folder,
+  // which keeps every file); a client must not say it downloaded anything then.
+  bool downloaded = 1;
+}
 
 message EvictRequest {
   string absolute_path = 1;
@@ -2012,6 +2055,15 @@ message UpdateStatusResponse {
   // The `generated_at` of the newest channel manifest this install accepted ("" before the
   // first accepted check). An older or different-at-equal manifest is refused after it.
   string manifest_generated_at = 16;
+  // Unix seconds of the last check that accepted a manifest; 0 means "never succeeded". Unlike
+  // `last_check_unix`, a failed check leaves it, so a screen can show "last successful check".
+  int64 last_success_unix = 17;
+  // `expires_at` of the newest channel manifest the last check saw ("" before the first), also
+  // set when that manifest was refused as expired.
+  string manifest_expires_at = 18;
+  // The last check refused the channel manifest because it had expired. Only update checks stop:
+  // sync and running apps are unaffected.
+  bool manifest_expired = 19;
 }
 
 // `yadorilink update check` triggers an immediate manifest
@@ -2037,6 +2089,63 @@ message UpdateVersionCheckResponse {
   bool allowed = 1;
   // Why not, for display. Empty when allowed.
   string reason = 2;
+}
+
+// Whether one appcast item is covered by the `app_bundle` entry of the channel manifest this
+// daemon last verified, plus that entry. Answers from what an earlier check verified: it makes
+// no network request and never moves the replay floor. Two phases, both fail closed: a
+// required field that is empty/zero is refused, never skipped.
+//   "enclosure"  (before the download, from the appcast alone): version, sparkle_build, url
+//                (the whole enclosure URL) and length are required.
+//   "downloaded" (the file is on disk, before the updater installs it): the same, plus the
+//                file's sha256.
+// url and length must equal the verified entry's artifact URL and size exactly. `channel` is
+// compared when non-empty (the daemon's own channel is authoritative); an unknown phase is an
+// error.
+message UpdateVerifiedEntryRequest {
+  string version = 1;
+  // The item's `sparkle:version` (the app's CFBundleVersion).
+  uint64 sparkle_build = 2;
+  string channel = 3;
+  // The enclosure URL, whole.
+  string url = 4;
+  string sha256 = 5;
+  // The enclosure `length`.
+  uint64 length = 6;
+  string phase = 7;
+}
+message UpdateVerifiedEntryResponse {
+  // "allowed", "refused" (the manifest is known and the item is not covered) or
+  // "cannot_confirm" (no fresh, unexpired verified manifest: nothing is known to be wrong, so
+  // an app must not render this as "update required").
+  string outcome = 1;
+  // Stable code when not allowed; empty when allowed. For "cannot_confirm": not_checked, stale,
+  // manifest_expired, no_manifest. For "refused": invalid_version, withdrawn, kill_switched,
+  // below_minimum, not_offered, version_mismatch, held_back, state_incompatible,
+  // channel_mismatch, build_missing, build_not_declared, build_mismatch, url_missing,
+  // url_mismatch, length_missing, length_mismatch, sha256_missing, sha256_mismatch.
+  string reason_code = 2;
+  // The reason for display. Empty when allowed.
+  string reason = 3;
+  // Set whenever a fresh, unexpired verified manifest has an entry for this install, also when
+  // the item is refused; never set for "cannot_confirm".
+  UpdateVerifiedEntry entry = 4;
+}
+message UpdateVerifiedEntry {
+  string channel = 1;
+  string version = 2;
+  // 0 when the manifest declares none.
+  uint64 sparkle_build = 3;
+  string minimum_supported_version = 4;
+  string file = 5;
+  string sha256 = 6;
+  uint64 size = 7;
+  bool kill_switch = 8;
+  uint32 rollout_percentage = 9;
+  string generated_at = 10;
+  string expires_at = 11;
+  // This build is below `minimum_supported_version`.
+  bool update_required = 12;
 }
 
 // `yadorilink update download` (wire name kept as `UpdateInstall`).
@@ -2354,6 +2463,13 @@ message AcceptInviteCommandRequest {
   string local_path = 2;
   bool on_demand = 3;
   bool acknowledge_risks = 4;
+  // Set: join the invited group as a provider-backed folder (macOS File Provider, Windows Cloud
+  // Files) named this, instead of linking `local_path`, which is then ignored and needs no risk
+  // acknowledgement. `request_token` is the client's retry identity, as for a provider
+  // create/join: the same request, also after a restart, finishes the folder it began. The outcome
+  // names the group and the provider root. Leave both empty for a plain folder.
+  string provider_display_name = 5;
+  string request_token = 6;
 }
 
 message AcceptInviteCommandResponse {
@@ -2903,6 +3019,7 @@ message DaemonControlRequest {
     MarkLinkNotRejoinedRequest mark_link_not_rejoined = 97;
     UpdateVersionCheckRequest update_version_check = 98;
     ListSentTransfersRequest list_sent_transfers = 99;
+    UpdateVerifiedEntryRequest update_verified_entry = 100;
   }
   // Field numbers 24-26 were the directional-mode requests (set_mode,
   // override, revert); 40-43 were the directional folder-operation requests
@@ -3049,6 +3166,7 @@ message DaemonControlResponse {
     MarkLinkNotRejoinedResponse mark_link_not_rejoined = 98;
     UpdateVersionCheckResponse update_version_check = 99;
     ListSentTransfersResponse list_sent_transfers = 100;
+    UpdateVerifiedEntryResponse update_verified_entry = 101;
   }
   // Field numbers 25-27 were the directional-mode responses (set_mode,
   // override, revert); 40-43 were the directional folder-operation responses

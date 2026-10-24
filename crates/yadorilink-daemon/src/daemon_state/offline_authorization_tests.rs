@@ -428,3 +428,44 @@ async fn a_failed_erasure_does_not_advance_the_reserved_generation() {
          where it was, exactly as the per-peer write paths do"
     );
 }
+
+/// A device clock that jumps decides the offline window, so it is judged at
+/// every step of a jump rather than only at an honest `now`: a backward step
+/// never makes an old authorization younger, a forward step past the horizon
+/// ends it, and a capture time in the future (beyond ordinary drift) is not
+/// one to act on.
+#[test]
+fn the_offline_horizon_is_judged_the_same_under_every_clock_jump() {
+    use super::offline_authorization::{
+        is_within_offline_horizon, OFFLINE_AUTHORIZATION_HORIZON_SECS,
+    };
+    const HOUR: i64 = 60 * 60;
+    let captured = 1_800_000_000_i64;
+    let horizon = OFFLINE_AUTHORIZATION_HORIZON_SECS;
+
+    // (clock reading relative to the capture, acted on)
+    let cases = [
+        (0, true),
+        (horizon, true),
+        (horizon + 1, false),
+        // forward jump of a year
+        (365 * 24 * HOUR, false),
+        // backward step inside the drift slack
+        (-HOUR, true),
+        // backward step beyond the slack: the record's age cannot be judged
+        (-HOUR - 1, false),
+        (-365 * 24 * HOUR, false),
+        // an absurd clock must not overflow into "fresh"
+        (i64::MAX - captured, false),
+    ];
+    for (offset, expected) in cases {
+        assert_eq!(
+            is_within_offline_horizon(captured, captured.saturating_add(offset)),
+            expected,
+            "clock at capture {offset:+} s"
+        );
+    }
+    // A capture time in the far future judged against a sane clock.
+    assert!(!is_within_offline_horizon(i64::MAX, captured));
+    assert!(!is_within_offline_horizon(i64::MIN, captured));
+}

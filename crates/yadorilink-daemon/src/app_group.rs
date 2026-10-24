@@ -1,3 +1,4 @@
+// apple-cfg-file: macos-only the shell IPC socket serves the macOS Finder extensions; the iOS host places its own sockets
 //! The macOS App Group container, obtained the way the OS requires.
 //!
 //! Since macOS 15 a process only receives the group-container access token

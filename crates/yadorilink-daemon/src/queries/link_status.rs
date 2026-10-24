@@ -87,6 +87,8 @@ pub(crate) struct HeldFileView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DegradedLinkView {
     pub(crate) reason: String,
+    /// Why the link is degraded; `reason` is human detail only.
+    pub(crate) cause: crate::link_registry::DegradedCause,
 }
 
 /// A link's active-transfer rollup, if any transfer is currently in

@@ -1,3 +1,4 @@
+// apple-cfg-file: macos-only mounts disk images with hdiutil
 //! The folder's disk is really swapped: a different volume (a disk image) is
 //! mounted at the folder's path, over the folder's own volume. Unlike
 //! `folder_volume_outage.rs` nothing is overridden in-process: the volume the

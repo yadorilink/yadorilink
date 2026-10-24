@@ -57,7 +57,7 @@ const ALREADY_REPLACED_MESSAGE: &str =
 /// The journal's file name in the state directory.
 const JOURNAL: &str = "identity-restart.json";
 /// Where retired identities are kept, one directory per retired device id.
-const RETIRED_DIR: &str = "retired-devices";
+pub(crate) const RETIRED_DIR: &str = "retired-devices";
 
 /// What happened to one linked folder when the new device joined its group again.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,6 +125,14 @@ pub trait StartOverPorts: Send + Sync {
     fn sign_out(&self) -> impl Future<Output = Result<(), CoreError>> + Send;
     /// Replaces the signing key with a new one, keeping the old at `retired_key`.
     fn replace_signing_key(&self, key: &Path, retired_key: &Path) -> Result<(), CoreError>;
+    /// Whether this host joins a folder group again itself. A host that cannot (the embedded
+    /// engine: its folders are provider folders, which are linked from the provider folder list)
+    /// answers false: every linked folder is then marked as needing the person, never joined,
+    /// and [`Self::joinable_group_names`], [`Self::rejoin`] and [`Self::promote_to_eager`] are
+    /// not called.
+    fn can_rejoin(&self) -> bool {
+        true
+    }
     fn restart_daemon_if_running(&self) -> impl Future<Output = Result<(), CoreError>> + Send;
     /// Starts the daemon when nothing answers: a restart can leave it down.
     fn ensure_daemon_running(&self) -> impl Future<Output = Result<(), CoreError>> + Send;
@@ -255,7 +263,7 @@ fn write_journal(dir: &Path, journal: &Journal) -> Result<(), CoreError> {
         // One handle for the write and the flush: a read-only handle cannot flush on Windows.
         let mut file = std::fs::File::create(&staged)?;
         std::io::Write::write_all(&mut file, &serde_json::to_vec_pretty(journal)?)?;
-        file.sync_all()?;
+        yadorilink_fs_platform::flush::sync_file(&file)?;
     }
     yadorilink_fs_platform::durable_dir::publish_durably(
         &staged,
@@ -417,10 +425,16 @@ pub async fn start_over<P: StartOverPorts>(
     // stored sign-in; if that cannot be confirmed, nothing has been sent to the service
     // yet and the start over stays where it is.
     ports.restart_daemon_if_running().await.map_err(|error| {
-        CoreError::Other(format!(
-            "the running daemon could not be restarted to pick up the current sign-in, so \
-             nothing was registered or changed and the start over can be run again: {error}"
-        ))
+        error.with_context(
+            |why| {
+                format!(
+                    "the running daemon could not be restarted to pick up the current sign-in, \
+                     so nothing was registered or changed and the start over can be run again: \
+                     {why}"
+                )
+            },
+            None,
+        )
     })?;
     let new_device_id = match ports.registered_device_id() {
         Some(id) if id != journal.retired_device_id => id,
@@ -531,7 +545,12 @@ async fn rejoin_all<P: StartOverPorts>(
     let unconfirmed: Vec<String> = yadorilink_local_storage::replacement_unconfirmed::read(dir)?
         .map(|record| record.unconfirmed_group_ids)
         .unwrap_or_default();
-    let names = if folders.is_empty() { Vec::new() } else { ports.joinable_group_names().await? };
+    let can_rejoin = ports.can_rejoin();
+    let names = if folders.is_empty() || !can_rejoin {
+        Vec::new()
+    } else {
+        ports.joinable_group_names().await?
+    };
     let mut report = StartOverReport {
         retired_device_id: retired_device_id.to_owned(),
         new_device_id,
@@ -542,6 +561,8 @@ async fn rejoin_all<P: StartOverPorts>(
     for folder in folders {
         let needs_person = if folder.local_path.starts_with("provider://") {
             Some("a provider folder is joined again from the provider folder list")
+        } else if !can_rejoin {
+            Some("this host does not join a folder again by itself; accept an invite to its group again, or unlink the folder")
         } else if !names.iter().any(|(id, _)| *id == folder.group_id) {
             Some(
                 "this account does not own the folder group, so it cannot be joined again from \
@@ -607,7 +628,11 @@ async fn rejoin_all<P: StartOverPorts>(
 }
 
 /// The real machine: the control socket, the credential store and the coordination service.
-pub struct MachinePorts;
+/// `launch` is how every daemon restart and start of this start over brings the daemon up: the
+/// host's choice (`CoreConfig::daemon_launch`), or `ops::daemon::default_launch()` for the CLI.
+pub struct MachinePorts {
+    pub launch: crate::dto::DaemonLaunch,
+}
 
 impl StartOverPorts for MachinePorts {
     fn state_dir(&self) -> Result<PathBuf, CoreError> {
@@ -629,25 +654,31 @@ impl StartOverPorts for MachinePorts {
     }
 
     async fn sign_out(&self) -> Result<(), CoreError> {
+        // The key-mirror cleanup warning is dropped on purpose: the retired identity is already
+        // revoked, and the new device key is written over the same keyring entry right after.
         crate::ops::auth::sign_out().await.map(|_| ())
     }
 
     fn replace_signing_key(&self, key: &Path, retired_key: &Path) -> Result<(), CoreError> {
-        yadorilink_transport::DeviceSigningKeyPair::replace_retiring(key, retired_key)
-            .map(|_| ())
-            .map_err(|e| CoreError::Other(e.to_string()))
+        yadorilink_transport::DeviceSigningKeyPair::replace_retiring(
+            key,
+            retired_key,
+            crate::coordination::credential_store::key_mirror(),
+        )
+        .map(|_| ())
+        .map_err(|e| CoreError::Other(e.to_string()))
     }
 
     async fn restart_daemon_if_running(&self) -> Result<(), CoreError> {
-        crate::ops::daemon::restart_if_running().await
+        crate::ops::daemon::restart_if_running_with(&self.launch).await
     }
 
     async fn ensure_daemon_running(&self) -> Result<(), CoreError> {
-        crate::ops::daemon::start_daemon().await.map(|_| ())
+        crate::ops::daemon::start_daemon_with(&self.launch).await.map(|_| ())
     }
 
     async fn register(&self, name: String) -> Result<String, CoreError> {
-        crate::ops::devices::register_device(name).await
+        crate::ops::devices::register_device(name, &self.launch).await
     }
 
     async fn supersede(

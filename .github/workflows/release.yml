@@ -19,6 +19,30 @@ env:
   YADORILINK_SOURCE_REF: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || github.sha }}
 
 jobs:
+  # The tests, Clippy and the other per-commit checks are Verify's job, and
+  # this release builds exactly the commit Verify ran on. The gate refuses a
+  # commit whose Verify run is not green, and checks the tag against the
+  # shipped versions, which only the release can know.
+  verify-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Release tag matches shipped versions
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: bash .github/release/check-release-version.sh "$GITHUB_REF_NAME"
+
+      - name: Verify is green for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/release/require-verify.sh "$GITHUB_REPOSITORY" "$GITHUB_SHA"
+
   # Required gates for everything this workflow publishes or builds for release:
   # the development manifest key is rejected by the release packagers, release
   # builds enforce the real trust root, and the gate script itself is proven to
@@ -32,9 +56,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Release tag matches shipped versions
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: bash .github/release/check-release-version.sh "$GITHUB_REF_NAME"
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
@@ -43,6 +64,7 @@ jobs:
       - run: python3 .github/release/build-engine-bundle.py --self-test
       - run: python3 .github/release/csharp-binding.py --self-test
       - run: python3 .github/release/third-party-licenses.py --self-test
+      - run: bash .github/release/require-verify.sh --self-test
       - run: python3 .github/release/csharp-binding.py pin-check
       - run: python3 .github/checks/validate-engine-identity.py --self-test
       - run: python3 .github/checks/check-engine-artifact.py --self-test
@@ -70,7 +92,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master @ 2026-06-30
         with:
           toolchain: stable
-          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -78,32 +99,15 @@ jobs:
           save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
           workspaces: crates/yadorilink-shell-ext-windows
 
-      - name: Check formatting
-        working-directory: crates/yadorilink-shell-ext-windows
-        run: cargo fmt --all -- --check
-
-      - name: Clippy
-        working-directory: crates/yadorilink-shell-ext-windows
-        run: cargo clippy --all-targets -- -D warnings
-
       - name: Build
         working-directory: crates/yadorilink-shell-ext-windows
         run: cargo build --release
 
+  # The dependency audit is the same workflow Verify and the daily schedule
+  # call. It stays here as the last gate because the advisory database changes
+  # daily.
   cargo-audit:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master @ 2026-06-30
-        with:
-          toolchain: stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
-        with:
-          tool: cargo-audit
-      - name: Audit
-        run: cargo audit
+    uses: ./.github/workflows/audit.yml
 
   linux-artifacts:
     runs-on: ubuntu-latest
@@ -193,7 +197,8 @@ jobs:
   # permission is already scoped to this one run by GitHub, not a
   # long-lived credential this workflow manages.
   docker-artifacts:
-    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || (startsWith(github.ref, 'refs/tags/v') && github.ref != 'refs/tags/v0.1.0-beta.5'))
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || (startsWith(github.ref, 'refs/tags/v') && github.ref != 'refs/tags/v0.1.0-beta.6'))
+    needs: verify-gate
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -359,6 +364,7 @@ jobs:
     if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs:
       - release-gates
+      - verify-gate
     strategy:
       fail-fast: false
       matrix:
@@ -367,14 +373,24 @@ jobs:
             target: linux-x86_64
             triple: x86_64-unknown-linux-gnu
             bin_dir: target/release
+            features: yadorilink-daemon/enforce-release-trust-root
           - os: windows-latest
             target: windows-x86_64
             triple: x86_64-pc-windows-msvc
             bin_dir: target/release
+            features: yadorilink-daemon/enforce-release-trust-root
           - os: macos-latest
             target: macos-aarch64
             triple: aarch64-apple-darwin
             bin_dir: target/aarch64-apple-darwin/release
+            features: yadorilink-daemon/enforce-release-trust-root
+          # The iOS slices need macOS and Xcode: the same hosted macOS runner as the macOS bundle.
+          # The libraries hold no updater, so there is no release trust root to enforce.
+          - os: macos-latest
+            target: ios-aarch64
+            triple: aarch64-apple-ios
+            bin_dir: target/aarch64-apple-ios/release
+            features: none
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     permissions:
@@ -407,6 +423,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master @ 2026-06-30
         with:
           toolchain: stable
+          targets: ${{ matrix.target == 'ios-aarch64' && 'aarch64-apple-ios,aarch64-apple-ios-sim' || '' }}
 
       # The programs embed the identity of the build they are part of, so a caller never
       # infers its build from where it is installed. The settings here must equal the ones
@@ -415,6 +432,7 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
+          FEATURES: ${{ matrix.features }}
           TAGGED: ${{ startsWith(github.ref, 'refs/tags/v') }}
           PUBLIC_SHA: ${{ github.sha }}
         run: |
@@ -424,7 +442,7 @@ jobs:
             --channel "$channel" \
             --target "$TARGET" \
             --public-commit-sha "$PUBLIC_SHA" \
-            --build-config "features=yadorilink-daemon/enforce-release-trust-root" \
+            --build-config "features=${FEATURES}" \
             --build-config "coordination_addr=${YADORILINK_DEFAULT_COORDINATION_ADDR}" \
             --build-config "rustc=$(rustc -V)" \
             --build-config "cargo_lock_sha256=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open("Cargo.lock","rb").read()).hexdigest())')")"
@@ -432,7 +450,7 @@ jobs:
           echo "YADORILINK_CHANNEL=$channel" >> "$GITHUB_ENV"
 
       - name: Build engine binaries with the enforced trust root
-        if: matrix.target != 'macos-aarch64'
+        if: matrix.target != 'macos-aarch64' && matrix.target != 'ios-aarch64'
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
@@ -468,6 +486,17 @@ jobs:
             --features yadorilink-daemon/enforce-release-trust-root
           .github/release/generate-swift-binding.sh --out "$RUNNER_TEMP/swift-binding"
 
+      # The iOS app links the static libraries (device and simulator) and compiles the Swift
+      # binding generated from the device library; the bundle ships all of them, built together
+      # here. The libraries are shipped as built (unstripped, symbols kept for debugging): Xcode
+      # strips them when the app is archived.
+      - name: Build iOS static libraries and Swift binding
+        if: matrix.target == 'ios-aarch64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          .github/release/generate-ios-binding.sh --out "$RUNNER_TEMP/swift-binding"
+
       # The Windows app loads the client facade library through the C# generated
       # from that same library; the bundle ships both, built together here.
       - name: Generate the C# binding
@@ -496,6 +525,7 @@ jobs:
           set -euo pipefail
           manifests=(crates/yadorilink-cli/Cargo.toml crates/yadorilink-daemon/Cargo.toml)
           if [ "$TARGET" != "linux-x86_64" ]; then manifests+=(crates/yadorilink-client-ffi/Cargo.toml); fi
+          if [ "$TARGET" = "ios-aarch64" ]; then manifests=(crates/yadorilink-mobile-ffi/Cargo.toml); fi
           if [ "$TARGET" = "windows-x86_64" ]; then manifests+=(crates/yadorilink-shell-ext-windows/Cargo.toml); fi
           .github/release/generate-third-party-licenses.sh "$RUNNER_TEMP/THIRD-PARTY-LICENSES" --target "$TRIPLE" "${manifests[@]}"
 
@@ -505,6 +535,7 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           BIN_DIR: ${{ matrix.bin_dir }}
+          FEATURES: ${{ matrix.features }}
           TAGGED: ${{ startsWith(github.ref, 'refs/tags/v') }}
           REF_NAME: ${{ github.ref_name }}
           PUBLIC_SHA: ${{ github.sha }}
@@ -525,13 +556,15 @@ jobs:
             --root "shell=crates/yadorilink-shell-ext-windows/target/release" \
             --root "generated=${RUNNER_TEMP}/swift-binding/Generated" \
             --root "csharp=${RUNNER_TEMP}/csharp-binding" \
+            --root "device=${RUNNER_TEMP}/swift-binding/device" \
+            --root "simulator=${RUNNER_TEMP}/swift-binding/simulator" \
             --root "ipc=crates/yadorilink-ipc-proto" \
             --third-party-licenses "$RUNNER_TEMP/THIRD-PARTY-LICENSES" \
             --public-commit-sha "$PUBLIC_SHA" \
             --expect-release-id "$YADORILINK_RELEASE_ID" \
             --repository "$REPOSITORY" \
             --release-tag "$release_tag" \
-            --build-config "features=yadorilink-daemon/enforce-release-trust-root" \
+            --build-config "features=${FEATURES}" \
             --build-config "coordination_addr=${YADORILINK_DEFAULT_COORDINATION_ADDR}" \
             --build-config "rustc=$(rustc -V)" \
             --build-config "cargo_lock_sha256=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open("Cargo.lock","rb").read()).hexdigest())')" \
@@ -553,6 +586,9 @@ jobs:
           release=()
           if [ "$TAGGED" = "true" ]; then release=(--release); fi
           python3 .github/release/build-engine-bundle.py verify "$zip" --target "$TARGET" --expect-zip-sha256 "$expected" ${release[@]+"${release[@]}"}
+          # The iOS bundle holds static libraries only: nothing to run, and the hashes above
+          # (including the embedded release id `build` required) are the whole check.
+          if [ "$TARGET" = "ios-aarch64" ]; then exit 0; fi
           mkdir engine-bundle-check
           python3 -m zipfile -e "$zip" engine-bundle-check
           # zipfile extraction drops the executable bit recorded in the archive.
@@ -583,7 +619,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [linux-x86_64, windows-x86_64, macos-aarch64]
+        target: [linux-x86_64, windows-x86_64, macos-aarch64, ios-aarch64]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -630,11 +666,13 @@ jobs:
       - name: Check the installer pins
         run: python3 packaging/install/pins.py check
 
-      # A tagged release ships installers that pin the verifier: publish verifier-N first, pin
-      # its hash (pins.py set --verifier-sha) and tag the commit that carries the pins.
-      - name: Require the verifier pins on a release tag
+      # A tagged release ships installers that pin the verifier and the manifest floor: publish
+      # verifier-N first, pin its hash (pins.py set --verifier-sha), publish the first manifest
+      # that carries expires_at, pin its generated_at (pins.py set --min-generated-at) and tag
+      # the commit that carries the pins.
+      - name: Require the verifier and floor pins on a release tag
         if: startsWith(github.ref, 'refs/tags/v')
-        run: python3 packaging/install/pins.py check --require-verifier
+        run: python3 packaging/install/pins.py check --require-verifier --require-floor
 
       - name: Attest the bundle
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -643,6 +681,157 @@ jobs:
             engine-unverified/*.zip
             packaging/install/install.sh
             packaging/install/install.ps1
+
+  # macOS signing half. The unsigned macOS bundle from engine-build (already attested by
+  # engine-attest) is checked against that attestation and by hash, its two executables are
+  # signed with the Developer ID Application certificate (hardened runtime, secure timestamp)
+  # and notarized, and a bundle holding the signed executables is written. This is the only
+  # job that sees the signing and notarization secrets, and only in the step that signs. Nothing
+  # from the artifact runs here: the files are hashed, signed and zipped. No toolchain, no
+  # generator, no build step belongs here and it holds no id-token (check-release-gates.py
+  # enforces it); the signed bundle is attested by engine-attest-signed. A signature embeds a
+  # timestamp, so only the unsigned bundle is reproducible.
+  engine-sign-macos:
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    needs:
+      - release-gates
+      - engine-build
+      - engine-attest
+    runs-on: macos-latest
+    timeout-minutes: 90
+    environment: release-signing
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Download the unprivileged build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: engine-build-macos-aarch64
+          path: engine-unverified
+
+      - name: Verify the attestation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          zips=(engine-unverified/*.zip)
+          [ "${#zips[@]}" -eq 1 ] || { echo "expected exactly one bundle zip" >&2; exit 1; }
+          gh attestation verify "${zips[0]}" \
+            --repo ${{ github.repository }} \
+            --signer-workflow ${{ github.repository }}/.github/workflows/release.yml \
+            --source-digest ${{ github.sha }} \
+            --source-ref ${{ github.ref }}
+
+      - name: Extract the executables by hash-verified bundle
+        shell: bash
+        env:
+          TAGGED: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          set -euo pipefail
+          zip="$(ls engine-unverified/*.zip)"
+          expected="$(cut -d' ' -f1 "${zip}.sha256")"
+          release=()
+          if [ "$TAGGED" = "true" ]; then release=(--release); fi
+          python3 .github/release/build-engine-bundle.py extract-executables "$zip" \
+            --target macos-aarch64 --expect-zip-sha256 "$expected" ${release[@]+"${release[@]}"} \
+            --out-dir "$RUNNER_TEMP/to-sign"
+
+      - name: Sign and notarize
+        shell: bash
+        env:
+          MACOS_DEVELOPER_ID_APP_P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_APP_P12_BASE64 }}
+          MACOS_DEVELOPER_ID_APP_P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_APP_P12_PASSWORD }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_KEY_P8_BASE64: ${{ secrets.MACOS_NOTARY_KEY_P8_BASE64 }}
+        run: |
+          bash .github/release/macos-sign-notarize.sh \
+            "$RUNNER_TEMP/to-sign/bin/yadorilink=com.juntaki.yadorilink.engine.cli" \
+            "$RUNNER_TEMP/to-sign/bin/yadorilink-daemon=com.juntaki.yadorilink.engine.daemon"
+
+      - name: Write the bundle with the signed executables
+        shell: bash
+        env:
+          TAGGED: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          set -euo pipefail
+          zip="$(ls engine-unverified/*.zip)"
+          expected="$(cut -d' ' -f1 "${zip}.sha256")"
+          release=()
+          if [ "$TAGGED" = "true" ]; then release=(--release); fi
+          python3 .github/release/build-engine-bundle.py resign "$zip" \
+            --target macos-aarch64 --expect-zip-sha256 "$expected" ${release[@]+"${release[@]}"} \
+            --replace "bin/yadorilink=$RUNNER_TEMP/to-sign/bin/yadorilink" \
+            --replace "bin/yadorilink-daemon=$RUNNER_TEMP/to-sign/bin/yadorilink-daemon" \
+            --out-dir engine-signed
+          ls -la engine-signed
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: engine-signed-macos-aarch64
+          path: engine-signed
+          if-no-files-found: error
+
+  # Attestation half for the signed macOS bundle: like engine-attest, the only kind of job with
+  # id-token/attestations, no environment, no secrets, nothing runs. It has GitHub sign a
+  # build-provenance attestation for the signed zip, so the bytes that are released are the ones
+  # attested.
+  engine-attest-signed:
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    needs:
+      - release-gates
+      - engine-sign-macos
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # Same workflow run only: no run-id, repository or token inputs.
+      - name: Download the signed bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: engine-signed-macos-aarch64
+          path: engine-unverified
+
+      - name: Re-verify the bundle by hash only
+        shell: bash
+        env:
+          TAGGED: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          zips=(engine-unverified/*.zip)
+          [ "${#zips[@]}" -eq 1 ] || { echo "expected exactly one bundle zip" >&2; exit 1; }
+          zip="${zips[0]}"
+          expected="$(cut -d' ' -f1 "${zip}.sha256")"
+          release=()
+          if [ "$TAGGED" = "true" ]; then release=(--release); fi
+          python3 .github/release/build-engine-bundle.py verify "$zip" --target macos-aarch64 --expect-zip-sha256 "$expected" ${release[@]+"${release[@]}"}
+
+      - name: Attest the signed bundle
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: engine-unverified/*.zip
 
   # Protected half: only downloads the engine-build artifact, checks its
   # attestation, re-verifies it by
@@ -653,12 +842,15 @@ jobs:
     if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs:
       - release-gates
+      - verify-gate
       - engine-build
       - engine-attest
+      - engine-sign-macos
+      - engine-attest-signed
     strategy:
       fail-fast: false
       matrix:
-        target: [linux-x86_64, windows-x86_64, macos-aarch64]
+        target: [linux-x86_64, windows-x86_64, macos-aarch64, ios-aarch64]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: release-signing
@@ -683,7 +875,8 @@ jobs:
       - name: Download the unprivileged build
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: engine-build-${{ matrix.target }}
+          # macOS ships the signed and notarized executables; the other targets ship the build as is.
+          name: ${{ matrix.target == 'macos-aarch64' && 'engine-signed' || 'engine-build' }}-${{ matrix.target }}
           path: engine-unverified
 
       - name: Verify the attestation
@@ -737,6 +930,9 @@ jobs:
           if [ -n "${PROVENANCE_SIGN_CMD:-}" ]; then sign=(--sign-cmd "$PROVENANCE_SIGN_CMD"); fi
           release=()
           if [ "$TAGGED" = "true" ]; then release=(--release); fi
+          # The macOS executables in this bundle are signed and were accepted by notarization.
+          extra_gate=()
+          if [ "$TARGET" = "macos-aarch64" ]; then extra_gate=(--gate macos-notarized); fi
           python3 .github/release/build-engine-bundle.py provenance engine-bundle/*.zip \
             ${release[@]+"${release[@]}"} \
             --target "$TARGET" \
@@ -745,6 +941,7 @@ jobs:
             --attestation-json "$RUNNER_TEMP/attestation.json" \
             --gate release-gates \
             --gate release-config \
+            ${extra_gate[@]+"${extra_gate[@]}"} \
             "${sign[@]}" \
             --out-dir engine-bundle
           ls -la engine-bundle
@@ -780,6 +977,7 @@ jobs:
     needs:
       - release-gates
       - engine-bundle
+      - verify-gate
       - shell-ext-windows
       - windows-build-health
       - cargo-audit
@@ -887,6 +1085,7 @@ jobs:
     needs:
       - release-gates
       - engine-bundle
+      - verify-gate
       - shell-ext-windows
       - windows-build-health
       - cargo-audit

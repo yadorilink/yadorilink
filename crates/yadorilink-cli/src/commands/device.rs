@@ -8,7 +8,9 @@ use yadorilink_client_core::ops::devices::DeviceInfo;
 
 /// `yadorilink device register [--name <name>]`.
 pub async fn register(device_name: String) -> Result<(), CliError> {
-    let device_id = ops::register_device(device_name).await?;
+    let device_id =
+        ops::register_device(device_name, &yadorilink_client_core::ops::daemon::default_launch())
+            .await?;
     println!("Registered device: {device_id}");
     Ok(())
 }
@@ -61,7 +63,10 @@ pub async fn start_over(name: String, yes: bool) -> Result<(), CliError> {
             yes,
         )?;
     }
-    match start_over(&yadorilink_client_core::ops::start_over::MachinePorts, true, name).await? {
+    let ports = yadorilink_client_core::ops::start_over::MachinePorts {
+        launch: yadorilink_client_core::ops::daemon::default_launch(),
+    };
+    match start_over(&ports, true, name).await? {
         StartOverProgress::SignInRequired { retired_device_id } => {
             println!(
                 "The old device identity {retired_device_id} is retired and this computer is \

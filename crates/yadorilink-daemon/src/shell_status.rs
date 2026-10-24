@@ -107,16 +107,18 @@ pub fn resolve_group_and_rel_path(
 /// (`windows_sync_roots`), and the path is matched against those places.
 pub fn resolve_provider_group_and_rel_path(
     sync_state: &ReplicaCoordinator,
+    config_dir: &std::path::Path,
     absolute_path: &str,
 ) -> Option<(String, String)> {
     #[cfg(windows)]
     {
-        let (root_id, rel_path) = crate::windows_sync_roots::locate(absolute_path)?;
+        let (root_id, rel_path) = crate::windows_sync_roots::locate(config_dir, absolute_path)?;
         let group_id = sync_state.provider_repository().group_of_root(&root_id).ok().flatten()?;
         Some((group_id, rel_path))
     }
     #[cfg(not(windows))]
     {
+        let _ = config_dir;
         resolve_cloud_storage_path(sync_state, absolute_path)
     }
 }

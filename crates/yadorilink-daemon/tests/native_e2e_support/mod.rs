@@ -175,16 +175,33 @@ pub fn write(node: &TopologyNode, relative: &str, contents: &[u8]) {
     std::fs::write(path, contents).unwrap();
 }
 
+/// Removes a file. A directory goes through [`remove_dir`], which waits for the node's capture
+/// to be quiescent first.
 pub fn remove(node: &TopologyNode, relative: &str) {
     let path = node.root.path().join(relative);
-    if path.is_dir() {
-        std::fs::remove_dir_all(path).unwrap();
-    } else {
-        std::fs::remove_file(path).unwrap();
-    }
+    assert!(!path.is_dir(), "{relative} is a directory: use remove_dir");
+    std::fs::remove_file(path).unwrap();
 }
 
+/// Renames a file. A directory goes through [`rename_dir`].
 pub fn rename(node: &TopologyNode, from: &str, to: &str) {
+    let from_path = node.root.path().join(from);
+    assert!(!from_path.is_dir(), "{from} is a directory: use rename_dir");
+    // quiescence-exempt: a file, which no open daemon capture can pin
+    std::fs::rename(from_path, node.root.path().join(to)).unwrap();
+}
+
+/// Removes a directory tree once nothing of the node's own capture is pending or opening files
+/// below it.
+pub async fn remove_dir(node: &TopologyNode, group: &str, relative: &str) {
+    support::quiescence::wait_quiescent(node.root.path(), &node.state, group).await;
+    std::fs::remove_dir_all(node.root.path().join(relative)).unwrap();
+}
+
+/// Renames a directory once nothing of the node's own capture is pending or opening files below
+/// it.
+pub async fn rename_dir(node: &TopologyNode, group: &str, from: &str, to: &str) {
+    support::quiescence::wait_quiescent(node.root.path(), &node.state, group).await;
     std::fs::rename(node.root.path().join(from), node.root.path().join(to)).unwrap();
 }
 

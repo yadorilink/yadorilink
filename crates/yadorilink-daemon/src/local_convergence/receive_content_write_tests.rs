@@ -144,6 +144,49 @@ async fn a_local_edit_after_the_pre_write_commit_is_kept_and_publishes_nothing()
     assert_published_nothing(&h, "edited.bin", "local edit");
 }
 
+/// On a volume that cannot answer the change time / USN (simulated through the
+/// fingerprint seam; a no-op on macOS, where the stat fingerprint itself shows
+/// the rewrite), a same-size rewrite that restores the mtime lands during the
+/// assembly with the watcher not having journaled it. The fingerprint and the
+/// dirty journal both pass, so only the bytes can refuse the rename. Only Windows reaches that
+/// byte comparison (stat-only is never true elsewhere, and the Unix fingerprint carries ctime, which
+/// rejects the rewrite first), so the new check is exercised only there. The seam is thread-local:
+/// keep this test current-thread.
+#[tokio::test(flavor = "current_thread")]
+async fn a_same_size_mtime_restoring_rewrite_during_assembly_is_kept_when_the_change_time_is_unreadable(
+) {
+    let _unreadable = yadorilink_fs_platform::fs_identity::change_time_unreadable_for_test();
+    let h = Harness::new(false);
+    std::fs::write(h.path("scratch.bin"), b"the peer's v2 bytes").unwrap();
+    assert!(matches!(h.capture("scratch.bin").await, LocalChangeOutcome::FileChanged(_)));
+    let v2 = VersionHash(h.own_head("scratch.bin").content.unwrap().version_hash);
+    let stored = h.state.dag_get_file_version(GROUP, &v2).unwrap().expect("stored");
+    std::fs::write(h.path("notes.txt"), b"captured v1 bytes").unwrap();
+    assert!(matches!(h.capture("notes.txt").await, LocalChangeOutcome::FileChanged(_)));
+    let own = yadorilink_replica_domain::ids::DeltaHash(h.own_head("notes.txt").change_hash);
+    crate::test_support::remote_admission_fixture::admit_remote(
+        &h.state,
+        GROUP,
+        "device-remote",
+        vec![put("notes.txt", v2, vec![own])],
+        &[stored],
+    );
+    *h.convergence.between_assemble_and_persist_hook.lock().unwrap() = Some(Box::new(|out_path| {
+        let mtime = std::fs::metadata(out_path).unwrap().modified().unwrap();
+        std::fs::write(out_path, b"user edit same ln").unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(out_path).unwrap();
+        file.set_modified(mtime).unwrap();
+    }));
+
+    project(&h, "notes.txt").await;
+
+    assert_eq!(
+        std::fs::read(h.path("notes.txt")).unwrap(),
+        b"user edit same ln",
+        "the rewrite must survive: the bytes differ from the indexed content"
+    );
+}
+
 /// The volume under the link root disappears while a peer's content is being
 /// assembled (the marker goes with it, the mountpoint stays). The rename
 /// must not land on the bare mountpoint, and no proof or Present row is made.

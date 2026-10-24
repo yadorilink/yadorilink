@@ -12,6 +12,7 @@ use std::sync::Arc;
 use yadorilink_replica_domain::file::RecordKind;
 
 use crate::daemon_state::DaemonState;
+use crate::link_registry::DegradedCause;
 use crate::queries::link_status::{
     DegradedLinkView, FetchAvailability, HeldFileView, LinkStatusReadPort, LinkStatusView,
     LinkTransferView, LocalStorageState,
@@ -42,17 +43,18 @@ fn link_degraded_view(
         .watch_limit_reason(link.key())
         // An exhausted OS watch limit: sync is stalled or late, and only
         // the user can raise it, so it outranks the self-clearing causes.
-        .map(|reason| DegradedLinkView { reason })
+        .map(|reason| DegradedLinkView { reason, cause: DegradedCause::FileWatchLimit })
         .or_else(|| {
             state
                 .degraded_link_info(link.key())
-                .map(|info| DegradedLinkView { reason: info.reason })
+                .map(|info| DegradedLinkView { reason: info.reason, cause: info.cause })
         })
         // An orphaned link no longer takes part in sync at all; without a
         // reason here it would read as an idle, up-to-date folder.
         .or_else(|| {
             link.orphaned.then(|| DegradedLinkView {
                 reason: crate::link_registry::NOT_JOINED_REASON.to_string(),
+                cause: DegradedCause::NotJoined,
             })
         })
 }

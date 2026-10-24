@@ -66,6 +66,7 @@ fn eager_progress_and_stuck_files_are_encoded() {
 
 /// The rollup flags a provider folder that needs the user: not ready, stuck files, kept edits.
 #[test]
+#[cfg(feature = "process-model")] // calls control_socket, which the engine-only build compiles out
 fn the_overall_status_names_provider_folders_that_need_attention() {
     let response = yadorilink_ipc_proto::daemonctl::StatusResponse {
         provider_roots: vec![
@@ -89,7 +90,7 @@ fn the_overall_status_names_provider_folders_that_need_attention() {
         ],
         ..Default::default()
     };
-    let reasons = crate::control_socket::attention_reasons_for_tests(&response);
+    let reasons = crate::status_report::attention_reasons_for_tests(&response);
     assert!(reasons.contains(&"provider_not_ready:r1".to_owned()), "{reasons:?}");
     assert!(reasons.contains(&"provider_stuck:r2".to_owned()));
     assert!(reasons.contains(&"kept_edits:r2".to_owned()));
@@ -167,4 +168,17 @@ fn an_eager_root_counts_as_complete_only_when_done_with_nothing_remote_or_stuck(
     for (name, status) in cases {
         assert!(eager_status_complete(&status).is_err(), "{name} must not be complete");
     }
+}
+
+/// The folder a root is shown in is the host's registered one, by full root id; a root the host
+/// has not registered has none (empty), never a guess.
+#[test]
+fn the_sync_root_folder_comes_from_what_the_host_registered() {
+    let registered = std::collections::HashMap::from([(
+        "abcdef0123456789".to_string(),
+        std::path::PathBuf::from("C:\\Users\\a\\YadoriLink\\Photos"),
+    )]);
+    assert_eq!(sync_root_text(&registered, "abcdef0123456789"), "C:\\Users\\a\\YadoriLink\\Photos");
+    assert_eq!(sync_root_text(&registered, "0000000000000000"), "");
+    assert_eq!(sync_root_text(&Default::default(), "abcdef0123456789"), "");
 }

@@ -120,8 +120,16 @@ pub fn context() -> Result<Context, CoreError> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
+    let sync_db = yadorilink_fs_platform::state_dir::checked_override(
+        &yadorilink_fs_platform::state_dir::Env::from_process(),
+        yadorilink_fs_platform::state_dir::PathOverride::SyncDb,
+    )
+    .map_err(|e| CoreError::Other(e.to_string()))?
+    .unwrap_or_else(|| config_dir.join("sync-state.sqlite3"));
     Ok(Context {
-        roots: Roots::detect(home(), recorded.as_deref()),
+        sync_db,
+        roots: Roots::detect(home(), recorded.as_deref())
+            .with_system_root(std::env::var_os("SystemRoot")),
         config_dir,
         stop_deadline: STOP_DEADLINE,
         lock_wait: LOCK_WAIT,

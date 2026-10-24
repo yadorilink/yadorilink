@@ -18,6 +18,8 @@ Every bundle also holds these five files at the root:
 | `SHA256SUMS` | `<sha256>  <path>` for every file in the bundle except `SHA256SUMS` and `engine-identity.json`, sorted by path. |
 | `engine-identity.json` | Engine identity (`.github/checks/engine-identity.schema.json`). `kind` is `release` for the stable and beta channels and `dev` for the dev channel; a `dev` bundle is for development only and every release or production path refuses it (`validate-engine-identity.py --release`, `build-engine-bundle.py verify --release`). `bundle_sha256` is the SHA-256 of `SHA256SUMS`, so it covers every other file, `SOURCE.txt` and `THIRD-PARTY-LICENSES` included. `artifact_sha256` is the SHA-256 of the daemon listed below. |
 
+`engine-identity.json` also carries the optional `state_schema_version` (the state database version the engine stamps, `SCHEMA_VERSION`) and `state_schema_min_readable` (the oldest it can still read; the written version when absent; today both equal `SCHEMA_VERSION` since there are no migrations). Readers that predate the fields ignore them; a descriptor without them is accepted and is not judged on state compatibility (the engine's own check when it opens the database still applies). The hand-off to the app refuses an engine whose declared range does not contain the version the current install wrote, before anything changes, and the daemon refuses to start when its identity declares a different version than the binary writes. A consumer that vendors `validate-engine-identity.py` and the schema must re-vendor them before pinning a bundle that carries the fields: the previous schema rejects unknown fields.
+
 The programs of the bundle (the executables and the client facade library) are compiled with the release id (`<public_commit_sha>:<build_config_digest>`, printed by `build-engine-bundle.py release-id`) in `YADORILINK_RELEASE_ID` and the channel in `YADORILINK_CHANNEL`, so each names its own build without reading `engine-identity.json`. `build` refuses a bundle in which one of them does not contain that id; `check-engine-artifact.py --require-embedded-id` checks that the daemon reports the identity's own id.
 
 Verification only hashes: the zip against its `.sha256`, each file against
@@ -64,6 +66,15 @@ generated file starts with the MPL-2.0 notice (generator, version, source), and
 `csharp/BINDING-NOTES.md` states the generator, its pinned commit, its licence
 and where its source is.
 
+Regenerate the snapshot whenever the public surface of `yadorilink-client-ffi`
+changes (a record, enum, method or signature, or anything else UniFFI exports),
+or when `csharp-bindgen.pin` moves: run
+`.github/release/generate-csharp-binding.sh --debug --out DIR --update-snapshot`,
+read the diff (a removed or renamed public symbol is a breaking change for the
+Windows app), and commit the new `csharp-api-surface.txt` with the change. The
+PR gate (`linux-check`) and the verify workflow run the same script without
+`--update-snapshot` and fail on any difference.
+
 ## macos-aarch64
 
 ```
@@ -81,6 +92,64 @@ ipc-proto/src/framing.rs                      shell IPC framing
 The Swift binding is generated at bundle build time, from the library in the
 same bundle (`.github/release/generate-swift-binding.sh --out DIR`); nothing
 is checked in. The macOS app repository consumes it from the bundle.
+
+The two executables in this bundle are signed (Developer ID Application, hardened runtime,
+secure timestamp) and notarized by the release workflow after the unsigned bundle is built and
+attested; `SHA256SUMS` and `artifact_sha256` describe the signed files. Only the unsigned stage is
+reproducible (a signature embeds a timestamp).
+
+## ios-aarch64
+
+```
+lib/device/libyadorilink_mobile_ffi.a         static library of aarch64-apple-ios       (artifact_sha256)
+lib/simulator/libyadorilink_mobile_ffi.a      static library of aarch64-apple-ios-sim
+swift/Generated/YadoriLinkMobileFFI.swift     generated Swift binding
+swift/Generated/include/*.h                   generated C headers (one or more)
+swift/Generated/include/module.modulemap      one clang module per header
+ipc-proto/proto/shellipc.proto                provider protocol schema (the provider channel's messages)
+```
+
+The libraries are `cargo build --release -p yadorilink-mobile-ffi --target <triple>` with
+`IPHONEOS_DEPLOYMENT_TARGET` pinned, and the Swift binding is generated from the device library
+(`.github/release/generate-ios-binding.sh --out DIR` builds both libraries and writes the
+`device`, `simulator` and `generated` roots). Both libraries embed the release id like every
+program. The bundle holds no executable, so `artifact_sha256` is the device library's digest and
+there is nothing to sign here.
+
+The release workflow builds this bundle in `engine-build` on the hosted macOS runner (`macos-latest`, Xcode), the same
+runner as the macOS bundle: the iOS slices cannot be built elsewhere. It installs the two iOS Rust targets, exports
+`YADORILINK_RELEASE_ID` and `YADORILINK_CHANNEL`, runs `generate-ios-binding.sh --out DIR`, and passes the `device`,
+`simulator`, `generated` and `ipc` roots to `build`. The attest and protected bundle jobs handle it exactly like the other
+targets (hash-only verification, attestation, provenance, `engine.lock.ios-aarch64.json`); nothing in them builds or
+runs it. The bundle is built without the daemon's release trust root (the libraries hold no updater), so its build
+settings record `features=none` and `build` accepts a release bundle of this layout without that feature. The staging
+inputs build produces the same dev bundle and its lock as a separate artifact.
+
+The bundle is recorded, pinned and served like the other engine targets. A release record lists it as the
+`script` target `ios-aarch64` (same fields: asset, sha256, size, bundle_sha256, attestation_digest,
+github_url): `release-ingest` passes `--target ios-aarch64` and checks it as the other targets, except that the
+manifest-key check of the daemon is skipped because a layout without a trust root has none. The staging record
+adds the same target from the dev zip (`staging_inputs.py make --ios-zip`), and `stage-inputs` ships that zip in
+`staging-inputs`. The manifest and the per-version snapshot gain one `script` entry (platform `ios`, arch
+`aarch64`) from the record; the update-manifest validity (`expires_at`) and signing are unchanged, and no
+client selects an `ios` entry. `app_bundle` and `microsoft_store` stay macos and windows only.
+
+The libraries are shipped unstripped (about 129 MB each): symbols stay available for debugging and Xcode strips them
+when the app is archived.
+
+The app links the device (or simulator) library with the frameworks the engine uses: `Security`,
+`CoreFoundation`, `SystemConfiguration` and `Network`, and `-lresolv -lc++`. (`Network` is needed
+by the engine's network-path monitoring; a program that only calls into the library's version
+symbol links without it because the linker drops the rest, which is why the gate's smoke program
+runs the engine.)
+
+The identity of this bundle also carries `slices` (published in the attested bundle's identity and in
+`engine.lock.ios-aarch64.json`, which the app's pin consumer verifies and copies): the SHA-256 of each library by target triple
+(`aarch64-apple-ios`, `aarch64-apple-ios-sim`), so a consumer pins the device and the simulator
+library separately. `verify` requires each digest to equal its library's entry in `SHA256SUMS`, and a
+lock must carry the same `slices` as the bundle. Only the iOS layout has them. A consumer that
+vendors `validate-engine-identity.py` and the schema must re-vendor them before pinning an iOS bundle:
+the previous schema rejects the field.
 
 ## The engine.lock release asset
 

@@ -140,7 +140,7 @@ fn default_dir_for(env: &Env, windows: bool) -> Result<PathBuf, StateDirError> {
     }
     let home = env.home.as_ref().ok_or(StateDirError::NoHome)?;
     let home = PathBuf::from(home);
-    let base = if cfg!(target_os = "macos") {
+    let base = if cfg!(target_vendor = "apple") {
         home.join("Library").join("Application Support")
     } else if cfg!(target_os = "linux") {
         env.xdg_data_home.as_ref().map_or_else(|| home.join(".local").join("share"), PathBuf::from)

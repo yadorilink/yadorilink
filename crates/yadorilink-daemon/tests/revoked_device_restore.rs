@@ -36,18 +36,6 @@ const CONVERGE: Duration = Duration::from_secs(90);
 
 static TEST_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// One witness directory for the whole test process, kept outside every node's data, as the
-/// installation witness is kept outside a backup (see `database_restored.rs`).
-fn use_witness_dir() {
-    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-    let dir = DIR.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("YADORILINK_WITNESS_DIR", dir.path());
-        dir
-    });
-    assert_eq!(std::env::var_os("YADORILINK_WITNESS_DIR").as_deref(), Some(dir.path().as_os_str()));
-}
-
 fn read(root: &Path, name: &str) -> Option<Vec<u8>> {
     std::fs::read(root.join(name)).ok()
 }
@@ -72,7 +60,6 @@ struct Mesh {
 
 async fn mesh_with(revoked_id: &str) -> (Mesh, TopologyNode) {
     support::ensure_isolated_config_dir();
-    use_witness_dir();
     let fake = FakeCoordination::start().await;
     fake.enable_signed_policy();
     let member = new_node("restore-member");

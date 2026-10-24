@@ -70,15 +70,30 @@ fn only_the_documented_timestamp_form_is_accepted() {
 }
 
 #[test]
-fn damaged_state_fails_closed() {
+fn damaged_state_is_moved_aside_and_treated_as_a_first_run() {
     let (d, s) = store();
-    std::fs::write(d.path().join("update_replay_floor.json"), "{not json").unwrap();
-    assert!(matches!(s.accept("beta", T1, "x"), Err(ReplayError::Storage(_))));
-    std::fs::write(
-        d.path().join("update_replay_floor.json"),
-        r#"{"channels":{"beta":{"generated_at":"junk","envelope_sha256":"x"}}}"#,
-    )
-    .unwrap();
+    let path = d.path().join("update_replay_floor.json");
+    let aside = d.path().join("update_replay_floor.json.damaged");
+    std::fs::write(&path, "{not json").unwrap();
+    s.accept("beta", T2, "x").unwrap();
+    assert_eq!(std::fs::read_to_string(&aside).unwrap(), "{not json");
+    assert_eq!(s.accepted("beta").unwrap().generated_at, T2);
+    // The recovered state is a normal floor again.
+    assert!(matches!(s.accept("beta", T1, "y"), Err(ReplayError::Older { .. })));
+
+    std::fs::write(&path, r#"{"channels":{"beta":{"generated_at":"junk","envelope_sha256":"x"}}}"#)
+        .unwrap();
+    s.accept("beta", T1, "x").unwrap();
+    assert_eq!(s.accepted("beta").unwrap().generated_at, T1);
+}
+
+#[test]
+fn a_state_path_that_cannot_be_read_still_fails_closed() {
+    let (d, s) = store();
+    // A directory in place of the file is neither absent nor movable damage to recover from.
+    std::fs::create_dir(d.path().join("update_replay_floor.json")).unwrap();
+    std::fs::create_dir(d.path().join("update_replay_floor.json.damaged")).unwrap();
+    std::fs::write(d.path().join("update_replay_floor.json.damaged").join("x"), "x").unwrap();
     assert!(matches!(s.accept("beta", T1, "x"), Err(ReplayError::Storage(_))));
 }
 

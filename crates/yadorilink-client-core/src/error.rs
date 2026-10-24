@@ -22,7 +22,7 @@ pub enum LimitKind {
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
     /// Nobody has signed in on this machine.
-    #[error("not logged in — run `yadorilink login`")]
+    #[error("not signed in")]
     NotLoggedIn,
 
     /// A credential store that exists and cannot be used. Deliberately not
@@ -37,10 +37,36 @@ pub enum CoreError {
     #[error("authentication failed: {0}")]
     AuthFailed(String),
 
+    /// The coordination plane answered 401 `device_superseded`: this device was replaced by a
+    /// newer one and can never sign in again. Unlike [`CoreError::AuthFailed`], signing in again
+    /// on this installation does not help; the device has to be set up afresh or retired.
+    #[error("this device was replaced by another device and can no longer sign in")]
+    DeviceSuperseded,
+
+    /// The Authorization Server refused to refresh this installation's session with
+    /// `invalid_grant`. After a change of the Terms this is how it refuses every grant of an
+    /// account without current consent; a revoked grant answers the same way. The stored
+    /// sign-in is kept, and signing in again as this installation is the remedy.
+    #[error("sign-in required (the Terms may have changed); sign in again to continue")]
+    SignInRequired,
+
+    /// The coordination plane answered 403 `terms_consent_required`: the account has not
+    /// accepted the current Terms. Nothing about the installation or its device changes; signing
+    /// in again (the browser shows the consent screen) is the remedy.
+    #[error("the Terms must be accepted to continue; sign in again to review and accept them")]
+    TermsConsentRequired { terms_version: Option<String> },
+
     /// The coordination plane answered 403: the session is valid but not
     /// allowed to do this.
     #[error("{0}")]
     Forbidden(String),
+
+    /// The coordination plane answered 403 `reauthentication_required`: the
+    /// action needs a sign-in made in the last few minutes. Signing in again as
+    /// this installation (see `ops::auth::reauthenticate`) and retrying is the
+    /// remedy; nothing about the installation or its device changes.
+    #[error("this needs a fresh sign-in; sign in again to continue")]
+    ReauthenticationRequired,
 
     #[error("could not reach the coordination plane: {0}")]
     CoordinationPlaneUnreachable(String),
@@ -49,7 +75,7 @@ pub enum CoreError {
     #[error("{message}")]
     LimitExceeded { message: String, kind: LimitKind },
 
-    #[error("yadorilink daemon is not running — run `yadorilink daemon start`")]
+    #[error("the yadorilink daemon is not running")]
     DaemonNotRunning,
 
     /// The daemon's control socket did not accept, or a quick request got no
@@ -118,6 +144,81 @@ pub enum CoreError {
 
     #[error("{0}")]
     Other(String),
+
+    /// An error whose own text is host-neutral, plus what the person can do next as a typed
+    /// [`Hint`]. The text never names a command: each host words the hint for its own surface
+    /// (the command line prints the command, a GUI offers its own action). `error` keeps its
+    /// category: the command line's exit code is that of `error`, and so is the desktop reason,
+    /// except that a daemon hint (`StartDaemon`, `WaitThenStartDaemon`, `StopThenStartDaemon`)
+    /// reaches a desktop front end as `DaemonUnavailable { StartNeeded }`. Match a category with
+    /// [`CoreError::into_unhinted`].
+    #[error("{error}")]
+    Hinted { error: Box<CoreError>, hint: Hint },
+}
+
+/// What a person can do next about a failure, as an action rather than a command line. Hosts
+/// map it to their own wording; client-core texts never spell a host's commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hint {
+    /// The daemon is not running or did not answer: start it.
+    StartDaemon,
+    /// The old daemon is still exiting, so the new one cannot start yet: wait, then start it.
+    WaitThenStartDaemon,
+    /// The running daemon did not stop: stop it, then start it.
+    StopThenStartDaemon,
+    /// This installation is already enrolled: sign out first to enrol again, or remove the
+    /// leftover sign-in of a removed data directory from this computer.
+    AlreadyEnrolled,
+    /// A sign-in did not arrive in time: start it again.
+    SignInAgain,
+    /// No folder group of that name is visible: create one or accept an invitation to one.
+    CreateOrAcceptShare,
+    /// No joinable folder group of that name: list what the account can join.
+    ListJoinableShares,
+}
+
+impl CoreError {
+    /// This error with the next step a host can offer.
+    #[must_use]
+    pub fn hinted(self, hint: Hint) -> Self {
+        CoreError::Hinted { error: Box::new(self), hint }
+    }
+
+    /// This error without its hint, for a match on the category it wraps. A direct
+    /// `match` on `CoreError::Other(..)` etc. does not see through [`CoreError::Hinted`].
+    #[must_use]
+    pub fn into_unhinted(self) -> Self {
+        match self {
+            CoreError::Hinted { error, .. } => error.into_unhinted(),
+            other => other,
+        }
+    }
+
+    /// This error with `context` put around its text as a plain failure, keeping the next step
+    /// it carries (the inner hint goes outward; it is never spelled into the text and
+    /// attached again). `fallback` is the hint when it carries none.
+    #[must_use]
+    pub fn with_context(
+        self,
+        context: impl FnOnce(&str) -> String,
+        fallback: Option<Hint>,
+    ) -> Self {
+        let hint = self.hint().or(fallback);
+        let wrapped = CoreError::Other(context(&self.to_string()));
+        match hint {
+            Some(hint) => wrapped.hinted(hint),
+            None => wrapped,
+        }
+    }
+
+    /// The next step attached to this error, if any.
+    #[must_use]
+    pub fn hint(&self) -> Option<Hint> {
+        match self {
+            CoreError::Hinted { hint, .. } => Some(*hint),
+            _ => None,
+        }
+    }
 }
 
 /// Why starting over as a new device was refused.
@@ -131,6 +232,10 @@ pub enum StartOverRefusal {
     /// A start over is mid-way and the old signing key is not yet replaced: registering now would
     /// bind a new device to the key being retired. Finish the start over first.
     InProgress,
+    /// A start over already finished on this engine, which still reports the database as
+    /// refused because it has not been restarted since: starting over again now would retire the
+    /// identity just registered. Restart the engine first. Nothing is changed.
+    RestartRequired,
 }
 
 impl std::fmt::Display for StartOverRefusal {
@@ -145,9 +250,14 @@ impl std::fmt::Display for StartOverRefusal {
                 "this computer's database is not reported as restored or copied, so there is \
                  nothing to start over from",
             ),
+            Self::RestartRequired => f.write_str(
+                "a start over already finished on this engine, which still shows the old state \
+                 until it restarts: restart the engine (suspend and resume) before starting \
+                 over again",
+            ),
             Self::InProgress => f.write_str(
-                "a start over as a new device is under way on this computer; finish it \
-                 (`yadorilink device start-over`) before registering",
+                "a start over as a new device is under way on this computer; finish it before \
+                 registering",
             ),
         }
     }
@@ -191,11 +301,22 @@ impl From<yadorilink_fapi_client::Error> for CoreError {
             // revoked, the refresh token was replayed and took the grant family
             // with it, or the clock is wrong. All three are answered by signing
             // in again, not by retrying.
+            // A refresh the server refused with `invalid_grant` is its own case: the stored
+            // sign-in is intact and the person is asked to sign in again.
+            ref refused @ FapiError::Response { step: "refresh", .. }
+                if refused.is_invalid_grant() =>
+            {
+                CoreError::SignInRequired
+            }
             FapiError::Response { status: 400 | 401 | 403, .. } => {
                 CoreError::AuthFailed(e.to_string())
             }
             FapiError::Response { status: 429 | 500..=599, .. } => {
                 CoreError::CoordinationPlaneUnreachable(e.to_string())
+            }
+            // The code the person was shown ran out before they approved it.
+            FapiError::DeviceAuthorizationExpired => {
+                CoreError::AuthFailed(format!("{e}; start the sign-in again"))
             }
             other => CoreError::Other(other.to_string()),
         }
@@ -257,11 +378,13 @@ pub struct EngineMismatchDetail {
 
 /// Why the daemon could not be asked.
 ///
-/// A shell built before `EngineMismatch` existed cannot decode it (its bindings are generated
-/// from the library it ships with and refuse a different one), so the pairing never arises with
-/// an older shell. A shell that must degrade on a variant it does not know reads it as
-/// `ProtocolMismatch`: starting the engine again cannot help and the remedy is an update, the
-/// same as for a mismatch.
+/// A shell built before a case existed cannot decode it (its bindings are generated from the
+/// library it ships with and refuse a different one), so the pairing never arises with an older
+/// shell. A shell that must degrade on a case it does not know reads it by what that case
+/// asks: `EngineMismatch` as `ProtocolMismatch` (starting the engine again cannot help; the
+/// remedy is an update), `StartNeeded` as `NotRunning` (the remedy is starting the engine).
+/// Host code that switches on this enum needs an arm for each case before it adopts the
+/// library that adds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
 pub enum DaemonUnavailableReason {
@@ -285,6 +408,13 @@ pub enum DaemonUnavailableReason {
         app_api_version: u32,
         engine_api_version: u32,
     },
+    /// A start or restart of the engine was attempted and did not complete (a registration that
+    /// could not restart it, a start that was not answered, a stop that did not finish). The host
+    /// starts it its own way; `stop_first` says the old process must be stopped before. Declared
+    /// last so the other cases keep their wire order.
+    StartNeeded {
+        stop_first: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -303,11 +433,21 @@ pub enum PermissionDeniedReason {
     /// The coordination plane refused this installation's session; signing
     /// in again is the remedy.
     SessionRejected,
+    /// The coordination plane reported that another device replaced this one; signing in again
+    /// cannot restore it.
+    DeviceSuperseded,
+    /// The action needs a sign-in made in the last few minutes. Signing in
+    /// again as this installation and retrying is the remedy.
+    ReauthenticationRequired,
     Forbidden,
     QuotaExceeded,
     /// The credential store exists and cannot be used; signing in again
     /// would leave it damaged.
     CredentialStoreUnusable,
+    /// The account has not accepted the current Terms (`403 terms_consent_required`). Sign in
+    /// again as this installation (the step-up sign-in; the browser shows the consent screen);
+    /// the installation, its device and its folders are kept and work again afterwards.
+    TermsConsentRequired,
 }
 
 /// What a daemon refusal of a link or an invite acceptance says, for a front
@@ -348,6 +488,9 @@ pub enum RefusalReason {
     /// The folder at the path now belongs to a different group than the caller named (it was
     /// unlinked and linked again, or replaced). Nothing changed; look the folder up again.
     GroupMismatch,
+    /// A start over already finished on this embedded engine, which still reports the old state
+    /// until the host restarts it; starting over again is refused until then. Nothing changed.
+    StartOverRestartRequired,
 }
 
 /// The one error a desktop front end sees. Eight cases, each with a typed
@@ -422,8 +565,19 @@ impl DesktopError {
             CoreError::LimitExceeded { kind: LimitKind::Quota, .. } => {
                 denied(message, PermissionDeniedReason::QuotaExceeded)
             }
-            CoreError::AuthFailed(_) => denied(message, PermissionDeniedReason::SessionRejected),
+            CoreError::AuthFailed(_) | CoreError::SignInRequired => {
+                denied(message, PermissionDeniedReason::SessionRejected)
+            }
+            CoreError::TermsConsentRequired { .. } => {
+                denied(message, PermissionDeniedReason::TermsConsentRequired)
+            }
+            CoreError::DeviceSuperseded => {
+                denied(message, PermissionDeniedReason::DeviceSuperseded)
+            }
             CoreError::Forbidden(_) => denied(message, PermissionDeniedReason::Forbidden),
+            CoreError::ReauthenticationRequired => {
+                denied(message, PermissionDeniedReason::ReauthenticationRequired)
+            }
             CoreError::CredentialStore(_) => {
                 denied(message, PermissionDeniedReason::CredentialStoreUnusable)
             }
@@ -442,6 +596,7 @@ impl DesktopError {
                     StartOverRefusal::NotConfirmed => RefusalReason::StartOverNotConfirmed,
                     StartOverRefusal::NotRestored => RefusalReason::DatabaseNotRestored,
                     StartOverRefusal::InProgress => RefusalReason::StartOverInProgress,
+                    StartOverRefusal::RestartRequired => RefusalReason::StartOverRestartRequired,
                 },
             },
             CoreError::InvalidInput(_) => DesktopError::InvalidInput { message, field: None },
@@ -467,6 +622,19 @@ impl DesktopError {
             CoreError::DaemonRejected(_) | CoreError::Io(_) | CoreError::Other(_) => {
                 DesktopError::Internal { message, category: "cli_command_failed".to_owned() }
             }
+            // The hint is the host's to word; a daemon hint is a typed reason a GUI maps to its
+            // own start action, every other hint is already carried by the inner error's reason.
+            CoreError::Hinted { error, hint } => match hint {
+                Hint::StartDaemon | Hint::WaitThenStartDaemon | Hint::StopThenStartDaemon => {
+                    DesktopError::DaemonUnavailable {
+                        message,
+                        reason: DaemonUnavailableReason::StartNeeded {
+                            stop_first: hint == Hint::StopThenStartDaemon,
+                        },
+                    }
+                }
+                _ => DesktopError::from_core(*error, can_force),
+            },
         }
     }
 

@@ -235,12 +235,12 @@ fn apply_op(
             std::fs::write(&path, content.as_bytes()).unwrap();
         }
         Op::Delete => {
-            let _ = std::fs::remove_file(&path);
+            support::remove_file_unless_vanished(&path);
         }
         Op::Rename => {
             if path.exists() {
                 let renamed = root.join(format!("{target}.renamed-{device_idx}-r{round}"));
-                let _ = std::fs::rename(&path, renamed);
+                support::rename_unless_vanished(&path, &renamed);
             } else {
                 std::fs::write(&path, content.as_bytes()).unwrap();
             }

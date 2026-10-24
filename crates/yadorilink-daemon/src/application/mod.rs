@@ -21,14 +21,17 @@ pub(crate) use link_lifecycle_service::LinkLifecycleService;
 #[allow(unused_imports)]
 pub(crate) use ports::{
     ConsentCommand, LastErrorReport, LinkCommand, LinkOutcome, PendingEnrollmentLinkCommand,
-    UpdateConfigCommand, UpdatePolicyView,
 };
+#[cfg(feature = "process-model")]
+#[allow(unused_imports)]
+pub(crate) use ports::{UpdateConfigCommand, UpdatePolicyView};
 #[allow(unused_imports)]
 pub(crate) use replica_membership_service::{
     MembershipHandoffOutcome, RemoveDeviceCommand, ReplicaMembershipError,
     ReplicaMembershipOutcome, ReplicaMembershipService, RevokeDeviceCommand,
 };
-pub(crate) use replica_role_service::{ReplicaRoleService, UnlinkError};
+pub(crate) use replica_role_service::ReplicaRoleService;
+pub(crate) use replica_role_service::UnlinkError;
 #[allow(unused_imports)]
 pub(crate) use services::ApplicationServices;
 #[allow(unused_imports)]

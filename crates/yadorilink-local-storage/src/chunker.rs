@@ -164,7 +164,7 @@ pub fn chunk_file_content_defined(
 /// than deadlocking (see `submit`'s own doc comment).
 const DURABILITY_QUEUE_BYTE_BUDGET: usize = 128 * 1024 * 1024;
 
-/// The byte budget actually in force, read once per process.
+/// The byte budget actually in force.
 ///
 /// Measurement seam, not a tuning knob: sweeping the budget is the only
 /// way to distinguish "the producer is throttled by this bound" from "the
@@ -178,14 +178,21 @@ const DURABILITY_QUEUE_BYTE_BUDGET: usize = 128 * 1024 * 1024;
 /// the queue to drain completely, which is a deadlock-adjacent
 /// configuration nobody wants to reach by typo.
 fn durability_queue_byte_budget() -> usize {
-    static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *BUDGET.get_or_init(|| {
-        std::env::var("YADORILINK_DIAGNOSTIC_QUEUE_BUDGET_BYTES")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<usize>().ok())
-            .filter(|&bytes| bytes > 0)
-            .unwrap_or(DURABILITY_QUEUE_BYTE_BUDGET)
-    })
+    match QUEUE_BUDGET_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => DURABILITY_QUEUE_BYTE_BUDGET,
+        bytes => bytes,
+    }
+}
+
+/// The measurement override of [`DURABILITY_QUEUE_BYTE_BUDGET`]; `0` is no override.
+static QUEUE_BUDGET_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Overrides the byte budget for this process; `None` (or zero) restores the default. A
+/// measurement seam only a process that arms diagnostics (the desktop daemon, from its
+/// environment) calls: an embedded host never does, so it always runs the default.
+pub fn set_durability_queue_byte_budget(bytes: Option<usize>) {
+    QUEUE_BUDGET_OVERRIDE.store(bytes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// A bounded, single-producer-single-consumer queue plus ONE background
@@ -867,12 +874,7 @@ pub fn read_replicated_xattrs(file: &fs::File) -> Vec<(String, Vec<u8>)> {
 /// meaning), so none is included by default. `read_xattrs_filtered`
 /// below is already fully generic; adding a real macOS namespace later
 /// is a one-line predicate change, not a redesign.
-#[cfg(target_os = "macos")]
-pub fn read_replicated_xattrs(_file: &fs::File) -> Vec<(String, Vec<u8>)> {
-    Vec::new()
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(target_os = "linux"))]
 pub fn read_replicated_xattrs(_file: &fs::File) -> Vec<(String, Vec<u8>)> {
     Vec::new()
 }

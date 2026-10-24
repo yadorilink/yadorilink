@@ -191,9 +191,7 @@ const _: () = assert!(DEFAULT_RECEIVE_WRITE_CONCURRENCY <= MAX_RECEIVE_WRITE_CON
 const DEFAULT_COLLECTOR_FLUSH_CAP: usize = 16;
 const MIN_COLLECTOR_FLUSH_CAP: usize = 1;
 const MAX_COLLECTOR_FLUSH_CAP: usize = 64;
-const COLLECTOR_FLUSH_CAP_VAR: &str = "YADORILINK_RECEIVE_COLLECTOR_CAP";
-
-fn parse_collector_flush_cap(raw: Option<&str>) -> usize {
+pub(crate) fn parse_collector_flush_cap(raw: Option<&str>) -> usize {
     raw.and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .map_or(DEFAULT_COLLECTOR_FLUSH_CAP, |n| {
@@ -201,9 +199,7 @@ fn parse_collector_flush_cap(raw: Option<&str>) -> usize {
         })
 }
 
-const RECEIVE_WRITE_CONCURRENCY_VAR: &str = "YADORILINK_RECEIVE_WRITE_CONCURRENCY";
-
-fn parse_receive_write_concurrency(raw: Option<&str>) -> usize {
+pub(crate) fn parse_receive_write_concurrency(raw: Option<&str>) -> usize {
     raw.and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .map_or(DEFAULT_RECEIVE_WRITE_CONCURRENCY, |n| n.min(MAX_RECEIVE_WRITE_CONCURRENCY))
@@ -517,9 +513,7 @@ impl super::LocalConvergenceExecutor {
                 return pinned;
             }
         }
-        parse_receive_write_concurrency(
-            std::env::var(RECEIVE_WRITE_CONCURRENCY_VAR).ok().as_deref(),
-        )
+        self.state.tuning().receive_write_concurrency
     }
 
     /// How many items a collector batch may carry; see
@@ -533,7 +527,7 @@ impl super::LocalConvergenceExecutor {
                 return pinned;
             }
         }
-        parse_collector_flush_cap(std::env::var(COLLECTOR_FLUSH_CAP_VAR).ok().as_deref())
+        self.state.tuning().collector_flush_cap
     }
 
     /// Whether the files of a run hand their completion transaction to a
@@ -546,7 +540,7 @@ impl super::LocalConvergenceExecutor {
             2 => return false,
             _ => {}
         }
-        super::completion_window::batch_completion_from_env()
+        self.state.tuning().batch_completion
     }
 
     /// Whether the files of a run queue the open of their write in the same
@@ -558,7 +552,7 @@ impl super::LocalConvergenceExecutor {
             2 => return false,
             _ => {}
         }
-        super::completion_window::batch_open_from_env()
+        self.state.tuning().batch_open
     }
 
     /// How a pass flushes the files it received, when it does not do so one by
@@ -574,10 +568,10 @@ impl super::LocalConvergenceExecutor {
             1 => Some(yadorilink_local_storage::ReceivedFlushMode::FullFsyncEach),
             2 => Some(yadorilink_local_storage::ReceivedFlushMode::FsyncThenOneFullFsync),
             3 => None,
-            _ => super::completion_window::deferred_flush_from_env(),
+            _ => self.state.tuning().deferred_flush,
         };
         #[cfg(not(any(test, feature = "test-support")))]
-        let mode = super::completion_window::deferred_flush_from_env();
+        let mode = self.state.tuning().deferred_flush;
         // Only a plain directory root: a provider root keeps the durability
         // contract of its own path, and a root whose declaration cannot be
         // read is not assumed plain.
@@ -916,7 +910,11 @@ impl super::LocalConvergenceExecutor {
                         self.zero_work_settlement_for_path(group_id, holder)?,
                         Some(SettlementEvidence::ExactObject { .. })
                     );
-                    if !on_disk {
+                    // The identity proof is inconclusive on a volume with a coarse birth-time
+                    // clock and no inode generation (overlayfs, tmpfs), and waiting for it
+                    // would wait forever. The question here is whether the content is kept
+                    // under the other name, which its bytes answer directly.
+                    if !on_disk && !self.holder_bytes_match_row(group_id, holder).await? {
                         return Ok(false);
                     }
                 }
@@ -937,6 +935,65 @@ impl super::LocalConvergenceExecutor {
                 durable
             }
         })
+    }
+
+    /// Whether the object on disk at `holder` is, byte for byte, what the index row
+    /// of `holder` describes (the file's blocks, or the symlink's target), and has been
+    /// made durable. Anything that cannot be positively confirmed is `false`.
+    async fn holder_bytes_match_row(
+        &self,
+        group_id: &str,
+        holder: &str,
+    ) -> Result<bool, PeerSessionError> {
+        use yadorilink_local_storage::{
+            disk_matches_expected_object, DiskContentComparison, ExpectedObject,
+        };
+        if self.is_locally_ignored(group_id, holder) {
+            return Ok(false);
+        }
+        let Some(row) = self
+            .state
+            .file_index_repository()
+            .canonical_current_row(group_id, holder)
+            .map_err(crate::sync_error::SyncError::from)?
+        else {
+            return Ok(false);
+        };
+        if row.snapshot.deleted {
+            return Ok(false);
+        }
+        let full = self.sync_root(group_id)?.join(holder);
+        let snapshot = row.snapshot;
+        let matched = tokio::task::spawn_blocking(move || {
+            let expected = match snapshot.record_kind {
+                yadorilink_replica_domain::file::RecordKind::File => {
+                    ExpectedObject::File { blocks: &snapshot.blocks }
+                }
+                yadorilink_replica_domain::file::RecordKind::Symlink => {
+                    ExpectedObject::Symlink { target: snapshot.symlink_target.as_deref() }
+                }
+                yadorilink_replica_domain::file::RecordKind::Directory => return false,
+            };
+            if !matches!(
+                disk_matches_expected_object(&full, expected),
+                Ok(DiskContentComparison::Matched)
+            ) {
+                return false;
+            }
+            // The caller is about to give up the only other copy: what was just read
+            // must also survive a crash, in the file and in its directory entry.
+            if snapshot.record_kind == yadorilink_replica_domain::file::RecordKind::File
+                && !yadorilink_fs_platform::flush::open_for_flush(&full)
+                    .and_then(|file| yadorilink_fs_platform::flush::sync_file(&file))
+                    .is_ok()
+            {
+                return false;
+            }
+            yadorilink_local_storage::sync_parent_dir(&full).is_ok()
+        })
+        .await
+        .unwrap_or(false);
+        Ok(matched)
     }
 
     /// Gives `path` the shape `node` requires and projects it.

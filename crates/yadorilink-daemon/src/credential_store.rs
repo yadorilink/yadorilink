@@ -29,21 +29,63 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use yadorilink_fapi_client::store::{CredentialStore, Credentials, StoreError};
+use yadorilink_fapi_client::store::{Backend, CredentialStore, Credentials, StoreError};
 use yadorilink_fapi_client::{CoordinationAuth, CredentialManager, Metadata};
+use yadorilink_transport::KeyMirror;
 
-/// Where this installation's Authorization Server lives; see the CLI's
-/// constant of the same name. Defaults to the issuer in the stored credential.
-pub const AUTH_SERVER_ADDR_VAR: &str = "YADORILINK_AUTH_SERVER_ADDR";
+/// How one engine stores and reaches its credentials.
+///
+/// Resolved once by the composition root and handed down: the desktop daemon builds it from
+/// the process environment ([`crate::app::credential_config_from_env`], the same variables the
+/// CLI reads), an embedding host builds it from its own configuration. Nothing below the root
+/// reads the environment, so a mobile host never depends on it.
+#[derive(Debug, Clone)]
+pub struct CredentialConfig {
+    /// Which store holds the credential.
+    pub backend: Backend,
+    /// Whether the device key is mirrored into the OS keyring.
+    pub key_mirror: KeyMirror,
+    /// The Authorization Server to use instead of the stored credential's issuer.
+    pub auth_server_addr: Option<String>,
+    /// The coordination service the host's account commands (sign-in, registration, sign-out,
+    /// account deletion) talk to; `None` is the build's own address. The engine's own
+    /// coordination client takes its address from `device.json`.
+    pub coordination_addr: Option<String>,
+    /// How the machine names itself on the sign-in approval page; `None` is a generic label.
+    pub host_name: Option<String>,
+}
 
-/// Open the credential store this process should use.
-pub fn open() -> Result<CredentialStore, StoreError> {
-    CredentialStore::configure_from_env(&crate::device_config::config_dir())
+impl CredentialConfig {
+    #[must_use]
+    pub fn new(backend: Backend, key_mirror: KeyMirror) -> Self {
+        Self {
+            backend,
+            key_mirror,
+            auth_server_addr: None,
+            coordination_addr: None,
+            host_name: None,
+        }
+    }
+
+    /// Use `addr` as the Authorization Server whatever the stored credential's issuer says.
+    #[must_use]
+    pub fn with_auth_server_addr(mut self, addr: impl Into<String>) -> Self {
+        self.auth_server_addr = Some(addr.into());
+        self
+    }
+}
+
+/// Open the credential store of the state directory `dir`.
+pub fn open(dir: &std::path::Path, config: &CredentialConfig) -> CredentialStore {
+    CredentialStore::with_backend(config.backend.clone(), dir)
 }
 
 /// This installation's OAuth credentials, if it has enrolled.
-pub fn installation() -> Result<Option<Credentials>, StoreError> {
-    open()?.load()
+pub fn installation(
+    dir: &std::path::Path,
+    config: &CredentialConfig,
+) -> Result<Option<Credentials>, StoreError> {
+    open(dir, config).load()
 }
 
 /// The credential this daemon authenticates every coordination call with, or
@@ -88,13 +130,19 @@ pub fn installation() -> Result<Option<Credentials>, StoreError> {
 /// no longer meets the profile, and an issuer that disagrees with the stored
 /// credential are all cases where the server WAS reached and said something,
 /// and none of them is a network outage to ride out.
-pub async fn coordination_auth() -> anyhow::Result<Option<CoordinationAuth>> {
-    let store = open()?;
+pub async fn coordination_auth(
+    dir: &std::path::Path,
+    config: &CredentialConfig,
+) -> anyhow::Result<Option<CoordinationAuth>> {
+    let store = open(dir, config);
 
     let Some(credentials) = store.load()? else { return Ok(None) };
-    let manager = manager_for(store, &credentials).await?;
-    let reload: yadorilink_fapi_client::Reload = Arc::new(|running_client_id| {
-        Box::pin(async move { reload_manager(&running_client_id).await })
+    let manager = manager_for(store, &credentials, dir, config).await?;
+    let dir = dir.to_path_buf();
+    let config = config.clone();
+    let reload: yadorilink_fapi_client::Reload = Arc::new(move |running_client_id| {
+        let (dir, config) = (dir.clone(), config.clone());
+        Box::pin(async move { reload_manager(&dir, &config, &running_client_id).await })
     });
     Ok(Some(CoordinationAuth::reloading(manager, reload)?))
 }
@@ -104,16 +152,18 @@ pub async fn coordination_auth() -> anyhow::Result<Option<CoordinationAuth>> {
 /// out and in again. `None` when the store is empty (signed out: keep what is
 /// running until a sign-in) or still holds the running installation.
 async fn reload_manager(
+    dir: &std::path::Path,
+    config: &CredentialConfig,
     running_client_id: &str,
 ) -> Result<Option<Arc<CredentialManager>>, yadorilink_fapi_client::Error> {
-    let store = open().map_err(yadorilink_fapi_client::Error::Store)?;
+    let store = open(dir, config);
     let Some(credentials) = store.load().map_err(yadorilink_fapi_client::Error::Store)? else {
         return Ok(None);
     };
     if credentials.client_id() == running_client_id {
         return Ok(None);
     }
-    let manager = manager_for(store, &credentials)
+    let manager = manager_for(store, &credentials, dir, config)
         .await
         .map_err(|error| yadorilink_fapi_client::Error::Reload(format!("{error:#}")))?;
     tracing::info!("the credential store holds a new sign-in; the daemon now uses it");
@@ -123,9 +173,10 @@ async fn reload_manager(
 async fn manager_for(
     store: CredentialStore,
     credentials: &Credentials,
+    dir: &std::path::Path,
+    config: &CredentialConfig,
 ) -> anyhow::Result<Arc<CredentialManager>> {
-    let base =
-        std::env::var(AUTH_SERVER_ADDR_VAR).unwrap_or_else(|_| credentials.issuer().to_owned());
+    let base = config.auth_server_addr.clone().unwrap_or_else(|| credentials.issuer().to_owned());
     let store = Arc::new(store);
     let manager = match CredentialManager::from_credentials(
         reqwest::Client::new(),
@@ -136,11 +187,11 @@ async fn manager_for(
     .await
     {
         Ok(manager) => {
-            remember_discovery_document(&base, manager.client().metadata());
+            remember_discovery_document(dir, &base, manager.client().metadata());
             manager
         }
         Err(yadorilink_fapi_client::Error::Http(error)) => {
-            let Some(metadata) = remembered_discovery_document(&base) else {
+            let Some(metadata) = remembered_discovery_document(dir, &base) else {
                 return Err(anyhow::Error::new(error).context(
                     "could not reach the Authorization Server and this device has no \
                      discovery document from an earlier run to start from",
@@ -185,8 +236,8 @@ async fn manager_for(
 /// nothing secret -- it is a public document any client may GET -- and it is
 /// not a credential, so it has no business in a file whose whole contract is
 /// that it holds one.
-fn discovery_document_path() -> PathBuf {
-    crate::device_config::config_dir().join("coordination_discovery.json")
+fn discovery_document_path(dir: &std::path::Path) -> PathBuf {
+    dir.join("coordination_discovery.json")
 }
 
 /// One socket's remembered discovery document.
@@ -206,10 +257,10 @@ struct RememberedDiscoveryDocument {
 ///
 /// Best-effort: failing to write it costs a future offline start its head
 /// start, and is never a reason to fail a startup that has just succeeded.
-fn remember_discovery_document(base_url: &str, metadata: &Metadata) {
+fn remember_discovery_document(dir: &std::path::Path, base_url: &str, metadata: &Metadata) {
     let remembered =
         RememberedDiscoveryDocument { base_url: base_url.to_owned(), metadata: metadata.clone() };
-    let path = discovery_document_path();
+    let path = discovery_document_path(dir);
     let write = serde_json::to_vec_pretty(&remembered)
         .map_err(std::io::Error::other)
         .and_then(|bytes| std::fs::write(&path, bytes));
@@ -229,8 +280,8 @@ fn remember_discovery_document(base_url: &str, metadata: &Metadata) {
 /// or remembered for a different socket -- because every one of them means
 /// the same thing to the caller: there is nothing here to start from, so the
 /// unreachable server stays fatal.
-fn remembered_discovery_document(base_url: &str) -> Option<Metadata> {
-    let path = discovery_document_path();
+fn remembered_discovery_document(dir: &std::path::Path, base_url: &str) -> Option<Metadata> {
+    let path = discovery_document_path(dir);
     let bytes = std::fs::read(&path).ok()?;
     let remembered: RememberedDiscoveryDocument = serde_json::from_slice(&bytes).ok()?;
     if remembered.base_url != base_url {

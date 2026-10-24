@@ -1,3 +1,4 @@
+// apple-cfg-file: macos-only App Group shell socket of the macOS daemon
 //! Long-running sync daemon: loads persistent local state,
 //! opens the CLI control socket, and — once logged in and registered —
 //! connects to the coordination plane's netmap and establishes peer sync
@@ -26,20 +27,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_storage::daemon_lock::LOCK_FILE_NAME as DAEMON_INSTANCE_LOCK_FILE;
-use yadorilink_local_storage::SegmentBlockStore;
 
-use crate::adapters::runtime::link_runtime_controller::LinkRuntimeController;
+use crate::control_socket;
 use crate::daemon_state::DaemonState;
+#[cfg(windows)]
+use crate::device_config;
+#[cfg(any(windows, all(unix, not(target_os = "ios"))))]
+use crate::shell_ipc;
 use crate::supervise::EssentialTasks;
-use crate::{control_socket, shell_ipc};
-use crate::{credential_store, device_config, peer_orchestrator};
+use crate::{credential_store, peer_orchestrator};
 
 /// Names used both for the essential-task logging and for
 /// `DaemonState::task_liveness` (health surface) — kept as
 /// constants so the two always agree.
 const TASK_CONTROL_SOCKET: &str = "control-socket";
+#[cfg(not(target_os = "ios"))]
 const TASK_SHELL_IPC: &str = "shell-ipc-server";
 const TASK_PEER_ORCHESTRATOR: &str = "peer-orchestrator";
 
@@ -108,15 +111,6 @@ fn gate_ownership(
     Ok(())
 }
 
-/// How often `EnrollmentRecoveryService::reconcile_once` re-runs after its first pass at
-/// startup. A few minutes: far below `daemon_state`'s hour-scale
-/// retention-expiry sweep (retrying a coordination-plane call is cheap, so
-/// there's no reason to wait that long), but well above its sub-two-minute
-/// materialization-repair/disk-reconcile cadences (this is a crash-recovery
-/// backstop for a killed CLI process, not a live sync path racing user-visible
-/// staleness).
-const PENDING_ENROLLMENT_RECONCILE_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
-
 /// Filesystem locations the daemon operates over. Extracted from the
 /// process environment for the real binary ([`DaemonConfig::from_env`]),
 /// but passed in explicitly so a single OS process running many daemon
@@ -136,35 +130,13 @@ pub struct DaemonConfig {
     pub provider_temp_root: Option<PathBuf>,
     #[cfg(unix)]
     pub control_socket_path: PathBuf,
-    #[cfg(unix)]
+    // apple-cfg: ios-explicit iOS has no shell socket: the host reaches the engine over in-memory
+    // provider channels (`embedded_host`)
+    #[cfg(all(unix, not(target_os = "ios")))]
     pub shell_ipc_socket_path: PathBuf,
-}
-
-/// Uploads of undecided operations are retained (never aged out): report them, and sweep the
-/// unclaimed finished copies now that the journal is known.
-#[cfg(any(windows, unix))]
-fn report_retained_uploads(
-    state: &Arc<crate::daemon_state::DaemonState>,
-    handoff: &Arc<crate::provider_handoff::HandoffRoot>,
-) {
-    let repo = state.replica_coordinator.provider_repository();
-    let Ok(names) = repo.pending_ingest_names() else { return };
-    handoff.sweep_ingest(Some(&names));
-    if names.is_empty() {
-        return;
-    }
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as i64);
-    let (count, oldest_ms) = repo.undecided_uploads(now_ms).unwrap_or((0, 0));
-    let (orphans, orphan_oldest_ms) = repo.orphaned_uploads(now_ms).unwrap_or((0, 0));
-    tracing::warn!(
-        count,
-        oldest_ms,
-        orphans,
-        orphan_oldest_ms,
-        "uploads of undecided operations are retained"
-    );
+    /// The engine's tuning and measurement settings, mapped once from the process environment
+    /// (the only place the engine's `YADORILINK_*` switches are read).
+    pub tuning: crate::engine_tuning::EngineTuning,
 }
 
 /// Where the shell IPC socket goes when `YADORILINK_SHELL_IPC_SOCKET` is not
@@ -173,7 +145,7 @@ fn report_retained_uploads(
 /// use, obtained from the OS (`app_group`); elsewhere it is next to the other
 /// state. A macOS daemon the OS gives no container to cannot serve the
 /// extensions at all, so that is a startup failure, not a guessed path.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "ios")))]
 fn default_shell_ipc_socket(config_dir: &std::path::Path) -> std::path::PathBuf {
     #[cfg(target_os = "macos")]
     if yadorilink_fs_platform::state_dir::Env::from_process().config_dir.is_none() {
@@ -219,11 +191,19 @@ impl DaemonConfig {
         let control_socket_path = std::env::var("YADORILINK_CONTROL_SOCKET")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| dir.join("daemon.sock"));
-        #[cfg(unix)]
+        #[cfg(all(unix, not(target_os = "ios")))]
         let shell_ipc_socket_path = std::env::var("YADORILINK_SHELL_IPC_SOCKET")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| default_shell_ipc_socket(&dir));
         let provider_temp_root = checked_override(env, PathOverride::ProviderTempRoot)?;
+        let mut tuning =
+            crate::engine_tuning::EngineTuning::from_lookup(|name| std::env::var(name).ok());
+        tuning.witness = match checked_override(env, PathOverride::WitnessDir)? {
+            Some(dir) => crate::install_witness::WitnessPlacement::At(dir),
+            None => {
+                crate::install_witness::WitnessPlacement::platform(|name| std::env::var_os(name))
+            }
+        };
         Ok(Self {
             config_dir: dir,
             block_store_root,
@@ -231,9 +211,74 @@ impl DaemonConfig {
             provider_temp_root,
             #[cfg(unix)]
             control_socket_path,
-            #[cfg(unix)]
+            #[cfg(all(unix, not(target_os = "ios")))]
             shell_ipc_socket_path,
+            tuning,
         })
+    }
+}
+
+/// The engine's credential settings as the process environment selects them, read once by
+/// [`run`]: the same `YADORILINK_CREDENTIAL_STORE`, `YADORILINK_CREDENTIAL_FILE`,
+/// `YADORILINK_DISABLE_OS_KEYRING` and `YADORILINK_AUTH_SERVER_ADDR` the CLI reads.
+///
+/// # Errors
+/// An unknown store name, or a credential file named while the OS keyring is selected.
+pub fn credential_config_from_env(
+    dir: &std::path::Path,
+) -> Result<crate::credential_store::CredentialConfig, yadorilink_fapi_client::store::StoreError> {
+    let backend = yadorilink_fapi_client::store::Backend::from_env(dir)?;
+    let mut config = crate::credential_store::CredentialConfig::new(
+        backend,
+        yadorilink_transport::KeyMirror::from_env(),
+    );
+    config.auth_server_addr = std::env::var(AUTH_SERVER_ADDR_VAR).ok();
+    Ok(config)
+}
+
+/// Arms the process-global measurement instruments of the lower crates from the diagnostic
+/// environment variables. Their setters are called nowhere else, so an embedded host (which
+/// never runs this) always gets the production behaviour.
+fn arm_process_diagnostics() {
+    let flag = |name: &str| std::env::var(name).as_deref() == Ok("1");
+    if let Some(bytes) = std::env::var("YADORILINK_DIAGNOSTIC_QUEUE_BUDGET_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|&bytes| bytes > 0)
+    {
+        yadorilink_local_storage::chunker::set_durability_queue_byte_budget(Some(bytes));
+    }
+    yadorilink_local_storage::io_diag::set_block_read_probe(flag(
+        "YADORILINK_DIAGNOSTIC_BLOCK_READ_PROBE",
+    ));
+    yadorilink_local_capture::diagnostics::set_force_fixed_chunking(flag(
+        "YADORILINK_DIAGNOSTIC_FORCE_FIXED_CHUNKING",
+    ));
+    if let Some(ms) = std::env::var("YADORILINK_DIAGNOSTIC_SCAN_SNAPSHOT_DELAY_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+    {
+        yadorilink_local_capture::diagnostics::set_snapshot_delay_ms(ms);
+    }
+}
+
+/// Where this installation's Authorization Server lives, when not the stored credential's issuer.
+const AUTH_SERVER_ADDR_VAR: &str = "YADORILINK_AUTH_SERVER_ADDR";
+
+/// How a daemon that shut down gracefully ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunEnd {
+    /// Any ordinary stop: the process exits with status 0.
+    Stopped,
+    /// The executable-replaced watch's own safe stop committed: exit for a restart.
+    RestartRequested,
+}
+
+impl RunEnd {
+    /// The status the process must exit with instead of returning normally, if any.
+    #[must_use]
+    pub fn exit_status(self) -> Option<i32> {
+        matches!(self, Self::RestartRequested).then_some(crate::exe_replaced::RESTART_EXIT_CODE)
     }
 }
 
@@ -249,11 +294,15 @@ impl DaemonConfig {
 /// `update::manifest::enforce_release_trust_root_gate`.
 #[cfg(feature = "enforce-release-trust-root")]
 fn enforce_trust_root_gate_at_startup() -> anyhow::Result<()> {
-    crate::update::manifest::enforce_release_trust_root_gate().map_err(|reason| {
-        anyhow::anyhow!(
-            "refusing to start: update trust-root release gate rejected this build: {reason}"
-        )
-    })
+    let override_value =
+        std::env::var(crate::update::manifest::ALLOW_PLACEHOLDER_TRUST_ROOT_ENV).ok();
+    crate::update::manifest::enforce_release_trust_root_gate(override_value.as_deref()).map_err(
+        |reason| {
+            anyhow::anyhow!(
+                "refusing to start: update trust-root release gate rejected this build: {reason}"
+            )
+        },
+    )
 }
 
 /// A boolean-flag-shaped env var is "set" (the flag is on) for any value
@@ -316,7 +365,14 @@ mod env_disable_flag_tests {
               phases into helpers would hide the ordering that makes an aborted \
               startup leave nothing on disk mutated."
 )]
-pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
+pub async fn run(config: DaemonConfig) -> anyhow::Result<RunEnd> {
+    // apple-cfg: ios-explicit the process model (sockets, self-update, log files) is desktop-only
+    if cfg!(target_os = "ios") {
+        anyhow::bail!(
+            "the daemon process model does not run on iOS; the host embeds the engine \
+             (yadorilink-embedded-host)"
+        );
+    }
     #[cfg(feature = "enforce-release-trust-root")]
     enforce_trust_root_gate_at_startup()?;
 
@@ -324,7 +380,11 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // which carriers its transfers use, the request has to be complete. A
     // half-configured instrument would start cleanly and then write a file
     // that reads like evidence, which is worse than not measuring at all.
-    crate::path_witness_sink::configure_from_env()?;
+    crate::path_witness_sink::configure(
+        std::env::var_os(crate::path_witness_sink::PATH_VAR),
+        std::env::var(crate::path_witness_sink::EXPECT_VAR).ok(),
+    )?;
+    arm_process_diagnostics();
 
     // `YADORILINK_DIAGNOSTIC_IO_COUNTERS=1` arms `yadorilink_local_storage
     // ::io_diag`'s process-global durability/pipeline counters for this
@@ -356,7 +416,11 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     spawn_io_diag_mark_listener();
 
     let dir = config.config_dir;
+    let tuning = config.tuning;
     refuse_unusable_state_dir(&yadorilink_fs_platform::state_dir::Env::from_process(), &dir)?;
+    // The one place the credential settings are read from the environment; everything below
+    // is handed this value.
+    let credentials = credential_config_from_env(&dir)?;
     yadorilink_fs_platform::durable_dir::create_dir_all_durably(&dir)?;
     // Acquire before opening the block store/SQLite or touching either Unix
     // socket. In particular, a losing process must never unlink the live
@@ -364,7 +428,10 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     let _instance_lock = DaemonInstanceLock::acquire(&dir)?;
     // Under the lock nothing else runs, so this is where a second owner is turned away, before
     // anything below can touch the data.
-    let identity = std::sync::Arc::new(crate::identity::RuntimeIdentity::detect(Some(dir.clone())));
+    let identity = std::sync::Arc::new(crate::identity::RuntimeIdentity::detect(
+        Some(dir.clone()),
+        tuning.install_source.as_deref(),
+    ));
     gate_ownership(&identity, &dir)?;
     // The HTTP API port file describes this run's listener only: a file left
     // by an earlier run must be gone before anything starts serving, and
@@ -390,46 +457,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // store, so the only ordering constraint is the instance lock above, which
     // still comes first so a daemon that does not own this config dir never
     // reports on its contents.
-    let device_config = match device_config::load() {
-        // Genuine absence (`Ok(None)`) legitimately means "not registered
-        // yet" and is the only condition allowed to mean that.
-        Ok(cfg) => cfg,
-        // Each failure names its own condition and its own remedy. They must
-        // not collapse into one message: the remedy for a corrupt file
-        // ("remove it and register again") is destructive when applied to a
-        // downgrade, where the device *is* registered and re-registering
-        // mints a second identity for one physical device that nothing can
-        // merge back afterwards (see `DeviceConfigError`'s doc comment).
-        // Matched exhaustively with no catch-all arm, so a variant added
-        // later must state its own case here instead of silently inheriting
-        // a wrong one.
-        Err(
-            e @ (device_config::DeviceConfigError::UnsupportedConfigDowngrade { .. }
-            | device_config::DeviceConfigError::StaleConfigVersion { .. }),
-        ) => {
-            return Err(anyhow::anyhow!(
-                "refusing to start: {e}. Nothing on disk has been modified, and this device is \
-                 still registered: do not delete device.json and do not run `yadorilink device \
-                 register` again, which would register a second identity for this one device."
-            ));
-        }
-        Err(e @ device_config::DeviceConfigError::Read { .. }) => {
-            return Err(anyhow::anyhow!(
-                "refusing to start: {e}. device.json exists but could not be read, so this \
-                 device's registration is unknown rather than absent -- usually a permissions \
-                 problem, and often transient. Restore access to the file and start again rather \
-                 than registering this device again."
-            ));
-        }
-        Err(e @ device_config::DeviceConfigError::Corrupt { .. }) => {
-            return Err(anyhow::anyhow!(
-                "refusing to start: {e}. Restore device.json from a backup if one exists. \
-                 Running `yadorilink device register` again registers a new identity for this \
-                 device rather than recovering the old one, and changes already made under the \
-                 previous device id stay attributed to it."
-            ));
-        }
-    };
+    let device_config = crate::engine_startup::load_device_config(&dir)?;
 
     let block_store_root = config.block_store_root;
     let sync_db_path = config.sync_db_path;
@@ -444,7 +472,10 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // authenticates its transport, and a registered device that cannot load
     // it must fail rather than mint a replacement -- see `KeyLoadError`.
     let registered_identity = if device_config.is_some() {
-        Some(yadorilink_transport::DeviceSigningKeyPair::load_existing(dir.join("signing_key"))?)
+        Some(yadorilink_transport::DeviceSigningKeyPair::load_existing(
+            dir.join("signing_key"),
+            credentials.key_mirror,
+        )?)
     } else {
         None
     };
@@ -459,101 +490,21 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // store → DB) prevents cross-instance deadlock; on conflict the
     // already-acquired lock is released (RAII) as `run` returns the error.
     let mut data_resource_locks =
-        crate::resource_lock::DataResourceLocks::acquire(&block_store_root, &sync_db_path)?;
+        yadorilink_local_storage::resource_lock::DataResourceLocks::acquire(
+            &block_store_root,
+            &sync_db_path,
+        )?;
 
     let provider_temp_root = config.provider_temp_root;
     #[cfg(unix)]
     let control_socket_path = config.control_socket_path;
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "ios")))]
     let shell_ipc_socket_path = config.shell_ipc_socket_path;
 
-    // A severe-error hook for the
-    // two fallible startup calls that would otherwise abort startup before
-    // `DaemonState` (and therefore `state.reporting`) exists — opens a
-    // throwaway `ReportingStorage` over the same config directory rather
-    // than waiting for `DaemonState::new`, since a failure here is exactly
-    // the kind of thing a maintainer would want a local candidate for.
-    // Opening a missing replica database creates an empty one, and an empty
-    // database references no blocks: the first idle sweep would then delete
-    // every block that survived. Decide, before either is opened, whether a
-    // missing database is a new install or a lost one.
-    let surviving_blocks = SegmentBlockStore::holds_segment_data(&block_store_root)?
-        .then_some("the block store still holds data");
-    let block_store;
-    let replica_coordinator;
-    {
-        let opened = (|| -> anyhow::Result<_> {
-            yadorilink_sqlite_runtime::refuse_lost_database(&sync_db_path, surviving_blocks)?;
-            let block_store = Arc::new(SegmentBlockStore::new(&block_store_root)?);
-            let coordinator = Arc::new(ReplicaCoordinator::open(&sync_db_path)?);
-            Ok((block_store, coordinator))
-        })();
-        match opened {
-            Ok((store, coordinator)) => {
-                block_store = store;
-                replica_coordinator = coordinator;
-                if let Err(e) = yadorilink_local_storage::startup_refusal::clear(&dir) {
-                    tracing::warn!(error = %e, "could not clear the recorded startup refusal");
-                }
-            }
-            Err(e) => {
-                record_startup_error_best_effort("daemon_startup", "sync-state", e.to_string());
-                let message = data_refusal_message(&e, &sync_db_path, &block_store_root);
-                tracing::error!("{message}");
-                if let Err(write_error) =
-                    yadorilink_local_storage::startup_refusal::record(&dir, &message)
-                {
-                    tracing::warn!(error = %write_error, "could not record the startup refusal");
-                }
-                return Err(e);
-            }
-        }
-    }
+    let crate::engine_startup::OpenedData { block_store, replica_coordinator } =
+        crate::engine_startup::open_data(&dir, &block_store_root, &sync_db_path, &tuning)?;
     data_resource_locks.lock_created_sync_db(&sync_db_path)?;
-    yadorilink_sqlite_runtime::record_database_created(&sync_db_path)?;
-
-    // Both resets run (each its own transaction) before either result is
-    // looked at, and fail independently.
-    let (stale_hydrating, stale_evicting) = replica_coordinator.reset_stale_transient_states();
-    match stale_hydrating {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(count = n, "reset stale Hydrating rows to Placeholder on startup"),
-        Err(e) => tracing::warn!(error = %e, "failed to reset stale Hydrating rows on startup"),
-    }
-
-    // Recover any file left permanently stuck `Evicting` by a crash
-    // mid-eviction (before its placeholder commit) — otherwise nothing
-    // ever reconciles it and the file is wedged.
-    match stale_evicting {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(count = n, "reset stale Evicting rows to Placeholder on startup"),
-        Err(e) => tracing::warn!(error = %e, "failed to reset stale Evicting rows on startup"),
-    }
-
-    // A structural `mkdir` interrupted between its intent and its
-    // completion: at startup nothing is in flight, so every pending intent
-    // is dropped (never completed). The directory it may have created is
-    // kept and is of unknown origin -- never removed, never authored.
-    match replica_coordinator.drop_interrupted_structural_intents_at_startup() {
-        Ok(dropped) if dropped.is_empty() => {}
-        Ok(dropped) => tracing::info!(
-            count = dropped.len(),
-            "dropped interrupted structural-directory intents on startup"
-        ),
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to drop interrupted structural-directory intents")
-        }
-    }
-
-    // A folder rewind is never resumed. Nothing can have started one in this
-    // process yet, so every unfinished run belongs to a process that is gone
-    // and is settled from its journal row alone: one that committed a chunk
-    // needs a fresh preview, any other changed nothing and failed.
-    match replica_coordinator.rewind_run_repository().interrupt_unfinished_runs() {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(count = n, "settled interrupted folder rewinds on startup"),
-        Err(e) => tracing::warn!(error = %e, "failed to settle interrupted folder rewinds"),
-    }
+    crate::engine_startup::settle_data(&replica_coordinator, &sync_db_path)?;
 
     // Per-link interrupted-materialization/restore-operation repair and the
     // removal of the temp files a crash left run inside the daemon's own
@@ -573,45 +524,14 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
 
     let device_id = device_config.as_ref().map(|c| c.device_id.clone()).unwrap_or_default();
 
-    // Construction (`DaemonState::build`) and starting `MaintenanceCoordinator`
-    // are two explicit steps here, not the single `DaemonState::new` every
-    // test call site uses -- this composition root is the one place that
-    // needs to sequence maintenance startup relative to its OWN later setup
-    // (headroom enforcement, custody confirmer, signing key), not just get a
-    // fully-running `DaemonState` back. Starting maintenance immediately
-    // after `build` (before any of that later setup) preserves the exact
-    // ordering `DaemonState::new` always had -- this is not a behavior
-    // change, just the same two steps made explicit and separately owned.
-    let state =
-        DaemonState::build(device_id.clone(), replica_coordinator.clone(), block_store.clone());
-    // The one `ApplicationServices` for this daemon: shared by the recovery
-    // job and the control socket. It reads `state` lazily, so building it
-    // before the setup below is equivalent to building it after.
-    let application = crate::adapters::build_application_services(state.clone());
-    let recovery_job = crate::maintenance_coordinator::start(&state, Some(&application));
-    // Only the real `yadorilink-daemon`
-    // binary itself opts into disk-headroom enforcement — see
-    // `DaemonState::enable_disk_headroom_enforcement`'s doc comment for why
-    // this is not done inside `DaemonState::new` (which every test in this
-    // crate also goes through).
-    state.enable_disk_headroom_enforcement();
-
-    // Wire the generation-stamped peer custody confirmer. Physical cache
-    // reclamation remains disabled until the responder can persist a custody
-    // lease as a GC root; the real daemon keeps the exact-version protocol
-    // available for diagnostics and that future lease flow.
-    state.install_p2p_custody_confirmer();
-    // Releases the custody leases this device asked peers to keep and no
-    // longer depends on. Runs after the stale-`Evicting` reset above, so every
-    // row is judged against settled state.
-    crate::custody_holds::spawn_custody_hold_reconciler(&state);
-
-    // Wire this device's change-history signing key once, so linked folders
-    // emit signed changes. Only for a registered device (an unregistered one
-    // has no identity to attribute changes to).
-    if let Some(signing) = registered_identity.as_ref() {
-        state.set_device_signing_key(signing.signing.clone());
-    }
+    let crate::engine_startup::BuiltEngine { state, application, recovery_job } =
+        crate::engine_startup::build_engine(
+            &dir,
+            device_id.clone(),
+            &replica_coordinator,
+            &block_store,
+            registered_identity.as_ref(),
+        );
 
     // Opt-in `/metrics`
     // endpoint — off/localhost-only by default. The env var (if set)
@@ -640,51 +560,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
         }
     }
 
-    // Resume watching every previously-linked folder (local
-    // state persistence across restarts: links survive, and their
-    // watchers are simply restarted). An orphaned link's watcher is never
-    // restarted here -- it was stopped the moment `pending_enrollment::
-    // reconcile` marked it orphaned, and staying stopped across restarts is
-    // exactly what "no longer a live sync target" means; its on-disk files
-    // are untouched either way.
-    let link_runtime_controller = LinkRuntimeController::new(state.clone());
-    for link in &links {
-        if link.orphaned {
-            continue;
-        }
-        // `LinkRuntimeController::start_inner` runs this link's own startup
-        // materialization repair itself (right after acquiring its
-        // `SyncRootLock`) and ANDs its own `emit_tombstones` gate down to
-        // `false` if repair fails for THIS link -- fail-closed: a
-        // crash-mid-materialize that repair could not disambiguate this
-        // boot must not be misread as an offline delete and propagated
-        // group-wide. `true` here is just this caller's own "no other
-        // reason to suppress" default (mirroring `LinkRuntimeController::start`'s
-        // identical hardcoded `true`); the additive-scan flag a two-live-
-        // roots recovery arms on the survivor is similarly read and ANDed
-        // in by `start_inner` itself, not by this caller.
-        // A provider link has no directory to watch.
-        let Some(folder) = link.folder_path() else { continue };
-        if let Err(e) = link_runtime_controller.start_gating_tombstones(
-            folder.to_string(),
-            link.group_id.clone(),
-            true,
-        ) {
-            // Continuing is deliberate: one unwatchable folder must not stop the
-            // daemon for every other link. It is only safe because
-            // `start_inner` arms this group's startup gate before any
-            // fallible step, so the failure leaves the gate Failed and peer apply
-            // for this group defers rather than overwriting un-indexed local
-            // content. Error, not warn: this folder syncs nothing until fixed --
-            // except a folder whose disk is not there yet, which starts by
-            // itself once it is (`LinkVolumeJob`).
-            if state.links.is_awaiting_volume(folder) {
-                tracing::warn!(error = %e, local_path = %folder, "linked folder is not on its volume yet; it starts syncing once the volume is mounted");
-            } else {
-                tracing::error!(error = %e, local_path = %folder, "failed to resume watching linked folder; this folder will not sync until startup succeeds for it");
-            }
-        }
-    }
+    crate::engine_startup::resume_links(&state, &links);
 
     // Every essential task lives in this one supervisor set instead
     // of a bare `tokio::spawn` with its handle dropped (shell-IPC, peer
@@ -704,21 +580,10 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
         crate::control_context::ControlContext::new(
             application,
             crate::adapters::build_query_services(state.clone()),
+            dir.clone(),
         )
         .with_identity(identity.clone()),
     );
-
-    // An installation that is deleted or replaced under a running daemon stops it, safely.
-    if let Some(path) = identity.watched_path() {
-        let lifecycle = control_context.application.lifecycle.clone();
-        let mut shutdown = state.shutdown_tx.subscribe();
-        tokio::spawn(async move {
-            tokio::select! {
-                () = crate::exe_watch::watch(path, crate::exe_watch::ExeWatchConfig::default(), lifecycle) => {}
-                _ = shutdown.changed() => {}
-            }
-        });
-    }
 
     #[cfg(unix)]
     {
@@ -755,57 +620,11 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
         });
     }
 
-    // The shell extension's hydrate/pin/evict share the control socket's
-    // `ApplicationServices` instance rather than reaching `DaemonState`.
     #[cfg(any(windows, unix))]
-    let shell_context = std::sync::Arc::new(
-        crate::shell_context::ShellContext::new(&control_context, &state).with_handoff_slot(
-            crate::provider_handoff::HandoffSlot::lazy(
-                // Resolved again on every access that finds no root: the app group container only
-                // exists once the host app has run, which may be after the daemon started.
-                // An explicitly configured path (`YADORILINK_PROVIDER_TEMP_ROOT`); otherwise the container the
-                // host app reports through the shell socket is adopted (the daemon knows no path of its own).
-                Arc::new(move || provider_temp_root.clone()),
-                {
-                    let state = state.clone();
-                    Arc::new(move |handoff| report_retained_uploads(&state, handoff))
-                },
-            ),
-        ),
-    );
-    // Open it now when it can be (this also reports retained uploads at start-up).
-    #[cfg(any(windows, unix))]
-    let _ = shell_context.handoff.get();
+    let shell_context =
+        crate::engine_startup::start_provider(&state, &control_context, provider_temp_root);
 
-    #[cfg(any(windows, unix))]
-    {
-        let context = shell_context.clone();
-        crate::supervise::spawn_logged("provider-prefetch", async move {
-            crate::provider_prefetch::run(context).await;
-            Ok(())
-        });
-    }
-
-    #[cfg(any(windows, unix))]
-    {
-        let auto = shell_context.auto_reclaim.clone();
-        crate::supervise::spawn_logged("provider-auto-reclaim", async move {
-            crate::provider_auto_reclaim::run(auto).await;
-            Ok(())
-        });
-    }
-
-    // The provider projector: the only consumer of a provider group's projection obligations.
-    {
-        let state = state.clone();
-        let publication = shell_context.publication.clone();
-        crate::supervise::spawn_logged(
-            "provider-projector",
-            crate::provider_projector::run(state, publication),
-        );
-    }
-
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "ios")))]
     {
         let state = state.clone();
         let shell_context = shell_context.clone();
@@ -821,6 +640,9 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
             TASK_SHELL_IPC
         });
     }
+    // iOS serves no shell socket (`run` refuses there before this point).
+    #[cfg(target_os = "ios")]
+    let _ = &shell_context;
     #[cfg(windows)]
     {
         let state = state.clone();
@@ -927,7 +749,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // credential manager, so every clone below refreshes through one cache and
     // one cross-process rotation lock instead of holding a five-minute
     // snapshot that dies while the daemon is idle.
-    let coordination_auth = credential_store::coordination_auth().await?;
+    let coordination_auth = credential_store::coordination_auth(&dir, &credentials).await?;
 
     // Before the orchestrator can start, and whether or not it can reach
     // anything: rebuild the verified group policy state from the signed
@@ -945,62 +767,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
         (Some(cfg), Some(auth)) => {
             tracing::info!(device_id = %cfg.device_id, "connecting to coordination plane");
 
-            // Best-effort, production-only coordination-plane wiring, spawned
-            // before the orchestrator moves `cfg`/`access_token` into its
-            // config: keeps the coordination plane's view of this device's iroh
-            // address current.
-            {
-                let addr = cfg.coordination_addr.clone();
-                let token = auth.clone();
-                let device_id = cfg.device_id.clone();
-                let own_address = state.peer_connectivity.local_substrate_reachability.clone();
-
-                // Recorded once, up front, so any control-socket request the
-                // CLI issues from this point on (currently only the
-                // full-replica-handoff lease request) can make its own
-                // coordination-plane calls without needing `coordination_addr`/
-                // the credential threaded through as extra parameters -- see
-                // `DaemonState::coordination_client_config`'s doc comment.
-                state.set_coordination_client_config(addr.clone(), token.clone());
-
-                // Crash-safe create/join enrollment (see
-                // `EnrollmentRecoveryService`'s own module doc), run through
-                // the daemon's one `RecoveryJob`: finish
-                // confirming (or, failing that, cancel) any local link this
-                // device committed whose matching coordination-plane
-                // activation never got confirmed -- the CLI process that
-                // would have done so was killed first, or its own
-                // confirmation call never reached the daemon. Runs once
-                // immediately (covering a marker left over from before this
-                // startup) and then on a fixed interval, so a marker left
-                // behind by a killed CLI process is retried without needing a
-                // daemon restart to notice it. Best-effort and self-healing: a
-                // sweep that can't reach the coordination plane leaves its
-                // marker in place for the next one.
-                {
-                    let recovery_job = recovery_job.clone();
-                    crate::supervise::spawn_logged("pending-enrollment-reconcile", async move {
-                        let mut interval =
-                            tokio::time::interval(PENDING_ENROLLMENT_RECONCILE_SWEEP_INTERVAL);
-                        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                        loop {
-                            interval.tick().await;
-                            recovery_job.run_enrollment_recovery_once().await;
-                        }
-                    });
-                }
-
-                crate::supervise::spawn_logged("address-report", async move {
-                    crate::peer_connectivity_runtime::report_own_address(
-                        addr,
-                        token,
-                        device_id,
-                        own_address,
-                    )
-                    .await;
-                    Ok(())
-                });
-            }
+            crate::engine_startup::spawn_coordination_tasks(&state, &recovery_job, &cfg, &auth);
 
             // Track Send: waits for the reconciliation stack to bind this
             // device's iroh endpoint, then builds and serves this device's
@@ -1024,7 +791,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
             // its own ALPN over the same endpoint. Best-effort, like Track
             // Send: it has no effect on folder sync. Only where the headless
             // profile offers it; elsewhere the endpoint has no queue for it.
-            if crate::nas_admin::offered() {
+            if state.tuning().offer_nas_admin {
                 let state = state.clone();
                 let dashboard = nas_admin_dashboard.clone();
                 crate::supervise::spawn_logged("nas-admin-inbound", async move {
@@ -1065,17 +832,46 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "ios")))]
     let socket_paths = vec![control_socket_path.clone(), shell_ipc_socket_path.clone()];
+    #[cfg(target_os = "ios")]
+    let socket_paths = vec![control_socket_path.clone()];
     #[cfg(windows)]
     let socket_paths: Vec<PathBuf> = Vec::new(); // named pipes have no filesystem entry to remove
 
-    let mut shutdown_rx = state.shutdown_tx.subscribe();
+    // Started only here, once startup is complete and this task is about to wait for a stop: a
+    // watch that committed its safe stop during startup would leave admission closed with
+    // nothing to carry the stop out. (The baseline of the replaced-watch was taken earlier, by
+    // `exe_replaced::arm`, so a swap during startup still counts.)
+    // An installation that is deleted or replaced under a running daemon stops it, safely.
+    if let Some(path) = identity.watched_path() {
+        let lifecycle = control_context.application.lifecycle.clone();
+        let mut shutdown = state.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            tokio::select! {
+                () = crate::exe_watch::watch(path, crate::exe_watch::ExeWatchConfig::default(), lifecycle) => {}
+                _ = shutdown.wait_for(|stopped| *stopped) => {}
+            }
+        });
+    }
+
+    // A supervised daemon whose executable was replaced stops safely and exits for a restart.
+    crate::exe_replaced::spawn_if_supervised(
+        control_context.application.lifecycle.clone(),
+        state.shutdown_tx.subscribe(),
+    );
+
     tokio::select! {
-        reason = wait_for_shutdown_request(&mut shutdown_rx) => {
+        reason = wait_for_shutdown_request(&state.shutdown_tx, wait_for_os_signal()) => {
             tracing::info!(reason, "shutdown requested; starting graceful shutdown");
             graceful_shutdown(&state, &socket_paths, &mut essential).await;
-            Ok(())
+            // The commit that fired the shutdown recorded its reason first (safe_stop), so
+            // this read, which comes after the signal, cannot miss it.
+            Ok(if state.restart_on_exit.load(std::sync::atomic::Ordering::SeqCst) {
+                RunEnd::RestartRequested
+            } else {
+                RunEnd::Stopped
+            })
         }
         Some(joined) = essential.join_next() => {
             // `essential`'s own tasks never panic (each body already
@@ -1160,11 +956,22 @@ fn refuse_unusable_state_dir(
 /// `DaemonState::shutdown_tx` — either way, returns a short tag
 /// naming which one fired, purely for the log line at the call site.
 async fn wait_for_shutdown_request(
-    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    os_signal: impl std::future::Future<Output = &'static str>,
 ) -> &'static str {
+    // Subscribed only now, long after the stop producers started (the watches, the control
+    // socket): `wait_for` looks at the current value first, so a stop requested during startup
+    // is not lost, whatever the receiver has "seen".
+    let mut shutdown_rx = shutdown_tx.subscribe();
     tokio::select! {
-        signal_name = wait_for_os_signal() => signal_name,
-        _ = shutdown_rx.changed() => "control-socket Shutdown request",
+        signal_name = os_signal => {
+            // The signal takes part in the same arbitration as every other stop: marking the
+            // shutdown now means a safe stop still committing during the cleanup finds the
+            // daemon already stopping, and never turns this stop into a restart.
+            shutdown_tx.send_replace(true);
+            signal_name
+        }
+        _ = shutdown_rx.wait_for(|stopped| *stopped) => "control-socket Shutdown request",
     }
 }
 
@@ -1182,58 +989,6 @@ async fn wait_for_os_signal() -> &'static str {
         _ = sigterm.recv() => "SIGTERM",
         _ = tokio::signal::ctrl_c() => "SIGINT",
     }
-}
-
-/// What `status` shows while no daemon answers because the data on disk cannot
-/// be opened. Only data this build cannot use is answered with the destructive
-/// reset (there is no migration before release); a newer database is answered
-/// by running the newer build, and any other failure (permissions, a full disk)
-/// is only reported, because the data is not known to be unusable.
-fn data_refusal_message(
-    error: &anyhow::Error,
-    sync_db_path: &std::path::Path,
-    block_store_root: &std::path::Path,
-) -> String {
-    use yadorilink_sqlite_runtime::{DatabaseError, LostDatabaseError};
-    let head = format!("The background service cannot open the data on disk: {error}");
-    let unusable =
-        matches!(error.downcast_ref::<DatabaseError>(), Some(DatabaseError::CorruptSchema(_)))
-            || matches!(
-                error.downcast_ref::<LostDatabaseError>(),
-                Some(
-                    LostDatabaseError::MarkerWithoutDatabase { .. }
-                        | LostDatabaseError::OtherDataWithoutDatabase { .. }
-                )
-            );
-    if unusable {
-        format!(
-            "{head}\nThere is no migration before release. To start over: run `yadorilink daemon \
-             stop`, delete the index database {} (and its -wal and -shm files), its marker file {} and the \
-             block store {}, then run `yadorilink daemon start` and link your folders again. If this \
-             device is signed in, remove this device from your account's device list first and \
-             register it again afterwards.",
-            sync_db_path.display(),
-            yadorilink_sqlite_runtime::creation_marker_path(sync_db_path).display(),
-            block_store_root.display()
-        )
-    } else if matches!(
-        error.downcast_ref::<DatabaseError>(),
-        Some(DatabaseError::UnsupportedSchemaDowngrade { .. })
-    ) {
-        format!("{head}\nIt was written by a newer build: run that build or a newer one.")
-    } else {
-        head
-    }
-}
-
-/// Records a severe-error
-/// candidate for a startup failure that happens before `DaemonState`
-/// exists. Opens its own short-lived `ReportingStorage` handle (cheap —
-/// see that type's doc comment on not writing anything just by opening)
-/// rather than restructuring startup to build `DaemonState` earlier.
-fn record_startup_error_best_effort(category: &str, subsystem: &str, message: String) {
-    let storage = crate::reporting::ReportingStorage::open_default();
-    crate::reporting::hooks::record_severe_error(&storage, category, subsystem, vec![message]);
 }
 
 /// Windows has no SIGTERM; a process supervisor there typically stops a
@@ -1382,65 +1137,7 @@ async fn graceful_shutdown(
         sink.flush().await;
     }
 
-    // Stop generating new local changes first: shut down every link's
-    // runtime (watcher/executor/repair/dirty-journal tasks, then the
-    // operation fence) before anything else, so nothing new gets queued
-    // while the rest of shutdown runs. `LinkRuntime::shutdown`, not
-    // `abort_tasks` -- see that method's own doc for why: this function
-    // does not exit the process immediately afterward (it still drains
-    // in-flight broadcasts, up to 3s, and checkpoints SQLite), so a
-    // still-running scan/flush/backstop operation must be genuinely
-    // finished, not merely asked to stop, before its root lock is allowed
-    // to drop. Every link shuts down concurrently, not one at a time --
-    // each shutdown's own wait is independent of every other link's.
-    let link_runtimes = state.links.drain_for_shutdown();
-    futures_util::future::join_all(link_runtimes.into_iter().map(|drained| async move {
-        let (local_path, runtime) = match drained {
-            crate::link_registry::DrainedLink::Ready { local_path, runtime } => {
-                (local_path, runtime)
-            }
-            // A start attempt is genuinely in flight for this path at the
-            // moment of shutdown -- rare, but not impossible. There is no
-            // `LinkRuntime` to shut down yet; the in-progress `start_link_
-            // watch_inner` call runs to completion (or fails) on its own,
-            // independent of this drained map entry, and the process is
-            // about to exit regardless.
-            crate::link_registry::DrainedLink::Starting { local_path } => {
-                tracing::debug!(
-                    local_path,
-                    "graceful_shutdown: a start attempt was still in flight for this link; \
-                     nothing to shut down yet"
-                );
-                return;
-            }
-        };
-        tracing::debug!(local_path, "shutting down link runtime");
-        // `link_runtimes` was the only place this `Arc` was ever cloned
-        // from, so removing it there (via `drain` above) leaves exactly
-        // one strong reference: this one.
-        //
-        // Admission is closed first, so an operation some other holder starts
-        // from here on is refused whether or not the unwrap below succeeds.
-        runtime.root_lease().begin_stopping();
-        match Arc::try_unwrap(runtime) {
-            Ok(runtime) => runtime.shutdown().await,
-            Err(shared) => {
-                tracing::error!(
-                    local_path,
-                    refs = Arc::strong_count(&shared),
-                    "graceful_shutdown: Arc<LinkRuntime> unexpectedly still shared after \
-                     removal from link_runtimes; draining it in place"
-                );
-                shared.drain_shared().await;
-            }
-        }
-    }))
-    .await;
-
-    // Drain in-flight broadcasts (bounded — see
-    // `DaemonState::wait_for_broadcasts_to_drain`'s doc comment) before
-    // tearing down the sessions that would otherwise cut them off.
-    state.wait_for_broadcasts_to_drain(Duration::from_secs(3)).await;
+    crate::engine_startup::quiesce(state).await;
 
     // Remove the socket files last, once nothing should be listening
     // through them anymore — a stale socket left behind after an
@@ -1525,18 +1222,7 @@ async fn graceful_shutdown(
         crate::receive_diag::emit_report("shutdown");
     }
 
-    // Close the substrate endpoint while the tasks that serve it are still
-    // running, so peers are TOLD this device is going away instead of being
-    // left to discover it. A peer that is not told keeps its connection, and
-    // iroh sends every datagram for a remote down that connection's selected
-    // path -- including the handshake of a new dial -- so until that dead
-    // connection times out on its own the peer cannot reach this device
-    // again, not even after it comes back. `SubstrateNode::shutdown`'s own
-    // doc comment says this lifecycle is owned explicitly for exactly that
-    // reason; nothing was calling it.
-    if let Some(driver) = state.peer_session_driver() {
-        driver.stack().shutdown().await;
-    }
+    crate::engine_startup::close_substrate(state).await;
 
     // Finally, stop the essential tasks themselves (control socket,
     // shell IPC, peer orchestrator) — aborts whichever of them are still
@@ -1544,13 +1230,7 @@ async fn graceful_shutdown(
     // they're actually gone.
     essential.shutdown().await;
 
-    // Nothing writes any more: leave both databases standing alone on disk. Best effort, since
-    // an unfolded log is still complete and is replayed at the next open.
-    if let Err(detail) =
-        crate::adapters::runtime::safe_stop::checkpoint(state, Duration::from_secs(10)).await
-    {
-        tracing::warn!(detail, "could not checkpoint the databases at shutdown");
-    }
+    crate::engine_startup::checkpoint_data(state).await;
 }
 
 /// The daemon's `/metrics`
@@ -1604,7 +1284,11 @@ mod trust_root_startup_tests {
     #[test]
     fn startup_path_enforces_the_trust_root_gate() {
         let startup = enforce_trust_root_gate_at_startup();
-        if crate::update::manifest::enforce_release_trust_root_gate().is_ok() {
+        let override_value =
+            std::env::var(crate::update::manifest::ALLOW_PLACEHOLDER_TRUST_ROOT_ENV).ok();
+        if crate::update::manifest::enforce_release_trust_root_gate(override_value.as_deref())
+            .is_ok()
+        {
             // A real root is pinned (or the dev override is set): startup allowed.
             assert!(startup.is_ok());
         } else {
@@ -1746,7 +1430,8 @@ mod instance_lock_tests {
     fn rejected_second_daemon_cannot_unlink_the_live_control_socket() {
         use std::os::unix::net::{UnixListener, UnixStream};
 
-        let dir = tempfile::tempdir().unwrap();
+        // Short enough for `sun_path`: an iOS simulator's temporary directory is not.
+        let dir = tempfile::Builder::new().prefix("yl-").tempdir_in("/tmp").unwrap();
         let _owner = DaemonInstanceLock::acquire(dir.path()).unwrap();
         let socket_path = dir.path().join("daemon.sock");
         let _listener = UnixListener::bind(&socket_path).unwrap();
@@ -1767,10 +1452,112 @@ mod instance_lock_tests {
     }
 }
 
+/// The credential settings map from the environment exactly as the CLI's do, and are read only
+/// through `credential_config_from_env`.
+#[cfg(test)]
+mod credential_config_tests {
+    use super::*;
+    use crate::test_support::CONFIG_ENV_MUTEX;
+    use yadorilink_fapi_client::store::Backend;
+    use yadorilink_transport::KeyMirror;
+
+    const VARS: [&str; 4] = [
+        "YADORILINK_CREDENTIAL_STORE",
+        "YADORILINK_CREDENTIAL_FILE",
+        "YADORILINK_DISABLE_OS_KEYRING",
+        "YADORILINK_AUTH_SERVER_ADDR",
+    ];
+
+    #[tokio::test]
+    async fn the_environment_maps_to_the_same_settings_as_the_cli_reads() {
+        let _guard = CONFIG_ENV_MUTEX.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("elsewhere.json");
+        let clear = || VARS.iter().for_each(|v| std::env::remove_var(v));
+        clear();
+
+        let unset = credential_config_from_env(dir.path()).unwrap();
+        assert_eq!(unset.backend, Backend::platform_default(dir.path()));
+        assert_eq!(unset.key_mirror, KeyMirror::OsKeyring);
+        assert_eq!(unset.auth_server_addr, None);
+
+        std::env::set_var("YADORILINK_CREDENTIAL_STORE", "file");
+        std::env::set_var("YADORILINK_CREDENTIAL_FILE", &file);
+        std::env::set_var("YADORILINK_DISABLE_OS_KEYRING", "1");
+        std::env::set_var("YADORILINK_AUTH_SERVER_ADDR", "http://127.0.0.1:1");
+        let set = credential_config_from_env(dir.path()).unwrap();
+        assert_eq!(set.backend, Backend::File(file.clone()));
+        assert_eq!(set.key_mirror, KeyMirror::Disabled);
+        assert_eq!(set.auth_server_addr.as_deref(), Some("http://127.0.0.1:1"));
+
+        std::env::set_var("YADORILINK_CREDENTIAL_STORE", "keyring");
+        let refused = credential_config_from_env(dir.path());
+        std::env::set_var("YADORILINK_CREDENTIAL_STORE", "nonsense");
+        let unknown = credential_config_from_env(dir.path());
+        clear();
+        assert!(refused.is_err(), "a credential file with the keyring selected is refused");
+        assert!(unknown.is_err(), "an unknown store name is refused");
+    }
+}
+
+/// The daemon binary still honours the `YADORILINK_*` tuning switches: `DaemonConfig::from_env`
+/// is the one place they are read, and what it maps is what the engine is built with.
+#[cfg(test)]
+mod tuning_config_tests {
+    use super::*;
+    use crate::test_support::CONFIG_ENV_MUTEX;
+
+    const VARS: [&str; 6] = [
+        "YADORILINK_CONFIG_DIR",
+        "YADORILINK_RECEIVE_WRITE_PERMITS",
+        "YADORILINK_RECEIVE_ASYNC_COMMIT",
+        "YADORILINK_SYNC_RELAYS",
+        "YADORILINK_NAS_ADMIN",
+        "YADORILINK_WITNESS_DIR",
+    ];
+
+    #[tokio::test]
+    async fn the_environment_is_mapped_once_into_the_engine_tuning() {
+        let _guard = CONFIG_ENV_MUTEX.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let witness = tempfile::tempdir().unwrap();
+        let clear = || VARS.iter().for_each(|v| std::env::remove_var(v));
+        clear();
+        std::env::set_var("YADORILINK_CONFIG_DIR", dir.path());
+
+        let unset = DaemonConfig::from_env().unwrap().tuning;
+        assert_eq!(
+            unset.receive_write_permits,
+            crate::engine_tuning::EngineTuning::default().receive_write_permits
+        );
+        assert!(unset.receive_async_commit);
+        assert!(!unset.offer_nas_admin);
+
+        std::env::set_var("YADORILINK_RECEIVE_WRITE_PERMITS", "5");
+        std::env::set_var("YADORILINK_RECEIVE_ASYNC_COMMIT", "0");
+        std::env::set_var("YADORILINK_SYNC_RELAYS", "none");
+        std::env::set_var("YADORILINK_NAS_ADMIN", "1");
+        std::env::set_var("YADORILINK_WITNESS_DIR", witness.path());
+        let set = DaemonConfig::from_env().unwrap().tuning;
+        clear();
+
+        assert_eq!(set.receive_write_permits, 5);
+        assert!(!set.receive_async_commit);
+        assert_eq!(set.sync_relays.as_deref(), Some("none"));
+        assert!(set.offer_nas_admin);
+        assert_eq!(
+            set.witness,
+            crate::install_witness::WitnessPlacement::At(witness.path().to_path_buf())
+        );
+    }
+}
+
 #[cfg(test)]
 mod startup_config_validation_tests {
     use super::*;
+    use crate::device_config;
     use crate::test_support::CONFIG_ENV_MUTEX;
+    use yadorilink_local_storage::SegmentBlockStore;
 
     /// One complete `run` attempt against a throwaway config directory. The
     /// error is captured as a `String` and the interesting paths are copied
@@ -1819,6 +1606,7 @@ mod startup_config_validation_tests {
         if create_signing_key {
             yadorilink_transport::DeviceSigningKeyPair::generate_and_persist(
                 config_dir.path().join("signing_key"),
+                yadorilink_transport::KeyMirror::Disabled,
             )
             .unwrap();
         }
@@ -1836,6 +1624,17 @@ mod startup_config_validation_tests {
         StartupAttempt { error, sync_db_path, _config_dir: config_dir }
     }
 
+    /// The daemon process model (sockets, updater, log file) is desktop-only: on iOS `run`
+    /// refuses before it reads or creates anything.
+    // apple-cfg: ios-explicit the refusal itself
+    #[cfg(target_os = "ios")]
+    #[tokio::test]
+    async fn run_refuses_on_ios_before_touching_anything() {
+        let attempt = start_daemon_with_device_json(&current_device_json()).await;
+        assert!(attempt.error.contains("does not run on iOS"), "{}", attempt.error);
+        assert!(!attempt.sync_db_path.exists());
+    }
+
     fn current_device_json() -> String {
         format!(
             r#"{{"device_id":"device-a","coordination_addr":"http://127.0.0.1:1","signing_public_key":"signing-pub","config_version":{}}}"#,
@@ -1848,6 +1647,8 @@ mod startup_config_validation_tests {
     /// this device can neither sign a change nor authenticate a connection,
     /// so startup must abort rather than proceed as a device that appears to
     /// work locally and is rejected by every peer.
+    // apple-cfg: ios-explicit `run` refuses on iOS: the daemon process model does not run there
+    #[cfg_attr(target_os = "ios", ignore = "the daemon process model does not run on iOS")]
     #[tokio::test]
     async fn a_registered_devices_key_is_validated_before_persistent_startup() {
         let attempt = start_daemon_with_device_json_and_keys(&current_device_json(), false).await;
@@ -1861,6 +1662,8 @@ mod startup_config_validation_tests {
     /// stop startup. Opening a missing database creates an empty one, and an
     /// empty database references no blocks, so the next idle sweep would
     /// delete every stored block.
+    // apple-cfg: ios-explicit `run` refuses on iOS: the daemon process model does not run there
+    #[cfg_attr(target_os = "ios", ignore = "the daemon process model does not run on iOS")]
     #[tokio::test]
     async fn a_missing_replica_database_beside_a_populated_block_store_aborts_startup() {
         let _env_guard = CONFIG_ENV_MUTEX.lock().await;
@@ -1873,6 +1676,7 @@ mod startup_config_validation_tests {
         std::fs::write(config_dir.path().join("device.json"), current_device_json()).unwrap();
         yadorilink_transport::DeviceSigningKeyPair::generate_and_persist(
             config_dir.path().join("signing_key"),
+            yadorilink_transport::KeyMirror::Disabled,
         )
         .unwrap();
         {
@@ -1904,6 +1708,8 @@ mod startup_config_validation_tests {
 
     /// A real daemon, asked to stop safely over its control socket, answers, exits cleanly,
     /// releases the config-directory lock and leaves its database without a write-ahead log.
+    // apple-cfg: ios-explicit `run` refuses on iOS: the daemon process model does not run there
+    #[cfg_attr(target_os = "ios", ignore = "the daemon process model does not run on iOS")]
     #[cfg(unix)]
     #[tokio::test]
     async fn a_running_daemon_stops_safely_on_request_and_releases_everything() {
@@ -1917,7 +1723,8 @@ mod startup_config_validation_tests {
         use yadorilink_ipc_proto::framing::{read_message, write_message};
 
         let _env_guard = CONFIG_ENV_MUTEX.lock().await;
-        let config_dir = tempfile::tempdir().unwrap();
+        // Short enough for `sun_path`: an iOS simulator's temporary directory is not.
+        let config_dir = tempfile::Builder::new().prefix("yl-").tempdir_in("/tmp").unwrap();
         let sync_db_path = config_dir.path().join("sync-state.sqlite3");
         std::env::set_var("YADORILINK_CONFIG_DIR", config_dir.path());
         std::env::set_var("YADORILINK_BLOCK_STORE", config_dir.path().join("blocks"));
@@ -1927,6 +1734,7 @@ mod startup_config_validation_tests {
         std::fs::write(config_dir.path().join("device.json"), current_device_json()).unwrap();
         yadorilink_transport::DeviceSigningKeyPair::generate_and_persist(
             config_dir.path().join("signing_key"),
+            yadorilink_transport::KeyMirror::Disabled,
         )
         .unwrap();
         let config = DaemonConfig::from_env().unwrap();
@@ -2061,6 +1869,8 @@ mod startup_config_validation_tests {
     /// A database written by an older build is refused, and the refusal is left
     /// where `status` can show it while no daemon answers: the reason, the exact
     /// data to delete, and the account step. A start that opens its data clears it.
+    // apple-cfg: ios-explicit `run` refuses on iOS: the daemon process model does not run there
+    #[cfg_attr(target_os = "ios", ignore = "the daemon process model does not run on iOS")]
     #[tokio::test]
     async fn an_older_schema_database_leaves_its_reason_and_reset_steps() {
         let _env_guard = CONFIG_ENV_MUTEX.lock().await;
@@ -2073,6 +1883,7 @@ mod startup_config_validation_tests {
         std::fs::write(config_dir.path().join("device.json"), current_device_json()).unwrap();
         yadorilink_transport::DeviceSigningKeyPair::generate_and_persist(
             config_dir.path().join("signing_key"),
+            yadorilink_transport::KeyMirror::Disabled,
         )
         .unwrap();
         {
@@ -2102,34 +1913,6 @@ mod startup_config_validation_tests {
         assert!(refusal.contains("remove this device"), "the account step: {refusal}");
     }
 
-    /// Only data this build cannot use is answered with the destructive reset: a
-    /// failure that says nothing about the data (a permission error) is only reported.
-    #[test]
-    fn a_failure_that_says_nothing_about_the_data_does_not_advise_deleting_it() {
-        let io = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-        let message = data_refusal_message(
-            &io,
-            std::path::Path::new("/d/db"),
-            std::path::Path::new("/d/blocks"),
-        );
-        assert!(
-            !message.contains("delete") && !message.contains("remove this device"),
-            "{message}"
-        );
-        let newer = anyhow::Error::new(
-            yadorilink_sqlite_runtime::DatabaseError::UnsupportedSchemaDowngrade {
-                on_disk_version: 999,
-                supported_version: 1,
-            },
-        );
-        let message = data_refusal_message(
-            &newer,
-            std::path::Path::new("/d/db"),
-            std::path::Path::new("/d/blocks"),
-        );
-        assert!(message.contains("newer build") && !message.contains("delete"), "{message}");
-    }
-
     /// A `device.json` from a newer build must abort startup before anything
     /// on disk changes.
     ///
@@ -2155,6 +1938,8 @@ mod startup_config_validation_tests {
     /// config read as "this device was never registered" — the one reading
     /// that invites registering a second identity for a device that already
     /// has one, which nothing afterwards can merge back.
+    // apple-cfg: ios-explicit `run` refuses on iOS: the daemon process model does not run there
+    #[cfg_attr(target_os = "ios", ignore = "the daemon process model does not run on iOS")]
     #[tokio::test]
     async fn each_unusable_device_config_reports_its_own_cause() {
         let corrupt = start_daemon_with_device_json("{ not json").await;
@@ -2175,6 +1960,81 @@ mod startup_config_validation_tests {
                 !error.contains("unregistered"),
                 "a device.json that exists but cannot be used must never be described as an \
                  unregistered device: {error}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod run_end_tests {
+    use super::RunEnd;
+
+    #[test]
+    fn only_a_requested_restart_has_an_exit_status() {
+        assert_eq!(RunEnd::Stopped.exit_status(), None);
+        assert_eq!(RunEnd::RestartRequested.exit_status(), Some(75));
+    }
+}
+
+#[cfg(test)]
+mod shutdown_request_tests {
+    use super::wait_for_shutdown_request;
+    use std::time::Duration;
+
+    fn never() -> impl std::future::Future<Output = &'static str> {
+        std::future::pending()
+    }
+
+    #[tokio::test]
+    async fn a_stop_requested_before_main_subscribed_still_ends_the_wait() {
+        // A stop producer (a watch, the control socket) committed during a long startup, before
+        // the main task looked at the channel.
+        let (tx, _keep) = tokio::sync::watch::channel(false);
+        tx.send_replace(true);
+        let reason =
+            tokio::time::timeout(Duration::from_secs(5), wait_for_shutdown_request(&tx, never()))
+                .await
+                .expect("an already requested stop must not be waited for");
+        assert_eq!(reason, "control-socket Shutdown request");
+    }
+
+    #[tokio::test]
+    async fn a_stop_requested_while_waiting_ends_the_wait() {
+        let (tx, _keep) = tokio::sync::watch::channel(false);
+        let tx = std::sync::Arc::new(tx);
+        let tx2 = tx.clone();
+        let wait = tokio::spawn(async move { wait_for_shutdown_request(&tx2, never()).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        tx.send_replace(true);
+        assert_eq!(wait.await.unwrap(), "control-socket Shutdown request");
+    }
+
+    #[tokio::test]
+    async fn a_signal_marks_the_shutdown_so_a_safe_stop_committing_meanwhile_loses() {
+        let (tx, _keep) = tokio::sync::watch::channel(false);
+        let reason = wait_for_shutdown_request(&tx, std::future::ready("SIGTERM")).await;
+        assert_eq!(reason, "SIGTERM");
+        assert!(*tx.borrow(), "the signal is part of the stop arbitration");
+    }
+}
+
+#[cfg(test)]
+mod stop_watch_placement_tests {
+    /// The watches that ask for a safe stop start only once startup is complete, right before
+    /// the task waits for a stop: before that point nothing would carry a committed stop out,
+    /// and admission would stay closed. Pinned by source position (the first occurrences are the
+    /// production ones).
+    #[test]
+    fn the_safe_stop_watches_start_after_the_last_startup_await() {
+        let src = include_str!("app.rs");
+        let at = |needle: &str| src.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        let startup_end = at("credential_store::coordination_auth(");
+        let wait = at("wait_for_shutdown_request(&state.shutdown_tx");
+        for watch in ["exe_replaced::spawn_if_supervised(", "exe_watch::watch("] {
+            let p = at(watch);
+            assert!(
+                p > startup_end && p < wait,
+                "{watch} must start after startup, before waiting"
             );
         }
     }

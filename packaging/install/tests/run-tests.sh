@@ -67,6 +67,7 @@ inst() {
         YADORILINK_INSTALL_KEY_ID="$(cat "$SRV/$keyfrom/key_id")" \
         YADORILINK_INSTALL_BASE_URL="${BASEURL_OVERRIDE:-$BASE/$name}" \
         ${MINGEN:+YADORILINK_INSTALL_MIN_GENERATED_AT="$MINGEN"} \
+        ${NOW:+YADORILINK_INSTALL_NOW="$NOW"} \
         YADORILINK_INSTALL_OS="${TOS:-Linux}" YADORILINK_INSTALL_ARCH="${TARCH:-x86_64}" \
         ${TRUSTSET:+YADORILINK_INSTALL_TRUST_SET="$TRUSTSET"} \
         YADORILINK_INSTALL_VERIFIER_BASE="${VBASE:-$BASE/verifier}" \
@@ -354,6 +355,30 @@ MINGEN=2026-10-18T00:00:00Z; inst rf rf; unset MINGEN
 newhome 46
 MINGEN=2026-01-01T00:00:00Z; inst rf rf; unset MINGEN
 { code_is 0; } && ok "manifest newer than the pinned floor accepted" || bad "floor newer" "$T/out"
+
+# --- manifest expiry: the live manifest is refused after its expires_at, never before
+fx ex --generated-at 2026-10-01T00:00:00Z --expires-at 2026-10-02T00:00:00Z
+newhome 48; inst ex ex
+{ code_is 4 && has "expired at 2026-10-02T00:00:00Z" && has "clock" && nothing_installed; } && ok "expired manifest refused (real clock)" || bad "expired" "$T/out"
+newhome 49; NOW=2026-10-02T00:00:01Z; inst ex ex; unset NOW
+{ code_is 4 && has "expired at" && nothing_installed; } && ok "manifest one second past expiry refused" || bad "expiry +1s" "$T/out"
+newhome 50; NOW=2026-10-02T00:00:00Z; inst ex ex; unset NOW
+{ code_is 0 && version_is 0.2.0; } && ok "manifest at its expiry second accepted" || bad "expiry boundary" "$T/out"
+newhome 51; fx exneg --generated-at 2026-10-01T00:00:00Z --expires-at 2026-10-01T00:00:00Z; inst exneg exneg
+{ code_is 4 && has "is not after generated_at" && nothing_installed; } && ok "expires_at not after generated_at refused" || bad "expiry order" "$T/out"
+newhome 52; fx exgone --omit-expires; inst exgone exgone
+{ code_is 4 && has "invalid expires_at" && nothing_installed; } && ok "manifest without expires_at refused" || bad "no expiry" "$T/out"
+
+# --- snapshots published before expires_at existed stay usable: pinned and offline installs
+fx lg --version 0.3.0 --extra-version 0.2.0 --legacy-snapshots
+newhome 53; inst lg lg --version 0.2.0
+{ code_is 0 && version_is 0.2.0; } && ok "pinned install from a legacy per-version manifest without expires_at" || bad "legacy pinned" "$T/out"
+LGD=$T/lgfrom; rm -rf "$LGD"; mkdir -p "$LGD"
+cp "$SRV/lg/0.2.0/manifest.json" "$LGD/manifest.json"
+cp "$SRV/lg/files/0.2.0/yadorilink-engine-beta-linux-x86_64.zip" "$LGD/"
+cp "$SRV/verifier/yadorilink-verify-linux-x86_64" "$LGD/"
+newhome 54; BASEURL_OVERRIDE=http://127.0.0.1:1; inst lg lg --from "$LGD/manifest.json"; unset BASEURL_OVERRIDE
+{ code_is 0 && version_is 0.2.0 && has "offline install"; } && ok "--from a legacy per-version manifest installs offline" || bad "legacy --from" "$T/out"
 
 # --- version-pinned installs (the live channel manifest has the last word)
 fx pv --version 0.3.0 --extra-version 0.2.0

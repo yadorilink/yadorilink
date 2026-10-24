@@ -256,9 +256,8 @@ impl ProviderEvictor {
     }
 
     /// Asks the host to drop its copy, but only for an item the daemon's own evidence shows the OS
-    /// holds with the CURRENT content (see [`crate::provider_evidence::os_holds_current_content`]): the host cannot check a
-    /// shown version itself, so a request for anything else would drop whatever the OS has there
-    /// now.
+    /// holds with the CURRENT content (see [`crate::provider_evidence::os_holds_current_content`]), or
+    /// some of it from windows it was served (see [`OsCopy::Windows`]).
     ///
     /// `None`: the evidence does not settle what the OS holds, so nothing was asked of the host.
     async fn drop_os_copy(
@@ -271,7 +270,7 @@ impl ProviderEvictor {
     ) -> Result<Option<HostAnswer>, SyncError> {
         self.refuse_if_kept(group_id, path)?;
         match os_copy(&self.state.replica_coordinator, &self.membership, root_id, &item) {
-            OsCopy::Current => {
+            OsCopy::Current | OsCopy::Windows => {
                 Ok(Some(self.host.evict_shown_version(root_id, item, version).await))
             }
             OsCopy::Absent => Ok(Some(HostAnswer::NotMaterialized)),

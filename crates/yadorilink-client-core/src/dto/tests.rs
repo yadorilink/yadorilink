@@ -150,6 +150,8 @@ fn keyed_only_items_reach_shells_as_unrecognized_with_their_own_key() {
         ("not_joined:g1", "not_joined"),
         ("unreadable_files:g1", "unreadable_files"),
         ("approval_pending:g1", "approval_pending"),
+        ("waiting_for_disk_space:g1", "waiting_for_disk_space"),
+        ("file_watch_limit:g1", "file_watch_limit"),
     ] {
         let reason = attention_reason(raw, &[], &[]);
         assert_eq!(reason.category, AttentionCategory::Unrecognized, "{raw}");
@@ -219,6 +221,24 @@ fn folder_summary_wraps_the_shared_derivation_and_turns_unset_values_into_none()
     assert_eq!(summary.degraded_reason.as_deref(), Some("disk full"));
     assert_eq!(summary.volume, None);
     assert_eq!(summary.transfer, None);
+    assert_eq!(summary.degraded_cause, None);
+
+    // The wait is the typed flag, whatever the detail text says.
+    let mut waiting = link("/f/Docs", "g1");
+    waiting.degraded = true;
+    waiting.set_degraded_cause(yadorilink_ipc_proto::daemonctl::DegradedCause::WaitingForDiskSpace);
+    waiting.degraded_reason = "anything".into();
+    assert_eq!(
+        folder_summary(&waiting, &volumes, &[]).degraded_cause,
+        Some(DegradedCause::WaitingForDiskSpace)
+    );
+    let mut lookalike = link("/f/Docs", "g1");
+    lookalike.degraded = true;
+    lookalike.degraded_reason = "Waiting for disk space on /v".into();
+    assert_eq!(
+        folder_summary(&lookalike, &volumes, &[]).degraded_cause,
+        Some(DegradedCause::Stopped)
+    );
 }
 
 fn status_response() -> StatusResponse {
@@ -794,11 +814,17 @@ fn updates_map_states_modes_and_outcomes() {
         current_version: "1.0".into(),
         state: "kill_switched".into(),
         last_check_unix: 20,
+        last_success_unix: 10,
+        manifest_expires_at: "2026-12-18T00:00:00Z".into(),
+        manifest_expired: true,
         automatic_checks_enabled: true,
         ..Default::default()
     });
     assert_eq!(status.state, UpdateState::KillSwitched);
     assert_eq!(status.last_checked_at, Some(secs(20)));
+    assert_eq!(status.last_successful_check_at, Some(secs(10)));
+    assert_eq!(status.manifest_expires_at.as_deref(), Some("2026-12-18T00:00:00Z"));
+    assert!(status.manifest_expired);
     assert_eq!(status.available_version, None);
     assert_eq!(status.config, UpdateConfig { automatic_checks: true });
     assert_eq!(
@@ -1087,6 +1113,8 @@ fn dimensions_json_carries_both_dimensions_per_folder_and_overall() {
                 availability_offline_device_ids: vec!["dev-b".into()],
                 protection: DataProtection::Protected as i32,
                 protection_device_ids: vec!["dev-b".into()],
+                materialization_policy: "ondemand".into(),
+                placeholder_count: 7,
                 ..link("/tmp/photos", "group-1")
             },
             LinkStatus {
@@ -1111,6 +1139,10 @@ fn dimensions_json_carries_both_dimensions_per_folder_and_overall() {
     assert_eq!(folders[0]["protection"]["state"], "protected");
     assert_eq!(folders[0]["protection"]["device_ids"][0], "dev-b");
     assert_eq!(folders[1]["protection"]["state"], "at_risk");
+    assert_eq!(folders[0]["on_demand"], true);
+    assert_eq!(folders[0]["placeholder_count"], 7);
+    assert_eq!(folders[1]["on_demand"], false);
+    assert_eq!(folders[1]["placeholder_count"], 0);
 }
 
 #[test]
@@ -1499,6 +1531,25 @@ fn provider_folder_carries_its_root_status_matched_by_id_prefix() {
     );
 }
 
+/// The folder the system shows a provider root in is carried as it came, and is `None` (not an
+/// empty path) while the host has not registered the root.
+#[test]
+fn a_provider_root_carries_the_folder_the_system_shows_it_in() {
+    let registered = [WireProviderRoot {
+        root_id: "01234567".into(),
+        sync_root_path: r"C:\Users\a\YadoriLink\Photos".into(),
+        ..Default::default()
+    }];
+    let status = folder_summary(&provider_link("0123456789abcdef"), &[], &registered)
+        .provider_status
+        .unwrap();
+    assert_eq!(status.sync_root_path.as_deref(), Some(r"C:\Users\a\YadoriLink\Photos"));
+    let waiting = [WireProviderRoot { root_id: "01234567".into(), ..Default::default() }];
+    let status =
+        folder_summary(&provider_link("0123456789abcdef"), &[], &waiting).provider_status.unwrap();
+    assert_eq!(status.sync_root_path, None);
+}
+
 #[test]
 fn unreadable_provider_counters_are_unknown_not_zero() {
     let roots = [WireProviderRoot {
@@ -1799,4 +1850,56 @@ fn a_count_without_a_list_still_reports_the_files_as_more() {
     assert!(folder.unreadable_files.is_empty());
     assert_eq!(folder.unreadable_files_more, 3);
     assert_eq!(folder_summary(&link("/f/B", "g2"), &[], &[]).unreadable_files_more, 0);
+}
+
+#[test]
+fn an_appcast_item_check_maps_outcome_reason_and_entry() {
+    use yadorilink_ipc_proto::daemonctl::{UpdateVerifiedEntry, UpdateVerifiedEntryResponse};
+    let allowed = appcast_item_check(&UpdateVerifiedEntryResponse {
+        outcome: "allowed".into(),
+        entry: Some(UpdateVerifiedEntry {
+            sparkle_build: 42,
+            version: "1.0.0".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    assert_eq!(
+        (allowed.outcome, allowed.reason, allowed.message),
+        (AppcastItemOutcome::Allowed, None, None)
+    );
+    assert_eq!(allowed.entry.unwrap().sparkle_build, Some(42));
+
+    let cannot = appcast_item_check(&UpdateVerifiedEntryResponse {
+        outcome: "cannot_confirm".into(),
+        reason_code: "manifest_expired".into(),
+        reason: "expired".into(),
+        entry: None,
+    });
+    assert_eq!(cannot.outcome, AppcastItemOutcome::CannotConfirm);
+    assert_eq!(cannot.reason, Some(AppcastItemReason::ManifestExpired));
+
+    // A code a newer daemon adds is kept raw and is never read as allowed.
+    let newer = appcast_item_check(&UpdateVerifiedEntryResponse {
+        outcome: "later".into(),
+        reason_code: "later_reason".into(),
+        ..Default::default()
+    });
+    assert_eq!(newer.outcome, AppcastItemOutcome::Unknown { raw: "later".into() });
+    assert_eq!(newer.reason, Some(AppcastItemReason::Unknown { raw: "later_reason".into() }));
+
+    for (code, reason) in [
+        ("url_missing", AppcastItemReason::UrlMissing),
+        ("url_mismatch", AppcastItemReason::UrlMismatch),
+        ("length_missing", AppcastItemReason::LengthMissing),
+        ("length_mismatch", AppcastItemReason::LengthMismatch),
+        ("sha256_missing", AppcastItemReason::Sha256Missing),
+    ] {
+        let check = appcast_item_check(&UpdateVerifiedEntryResponse {
+            outcome: "refused".into(),
+            reason_code: code.into(),
+            ..Default::default()
+        });
+        assert_eq!(check.reason, Some(reason));
+    }
 }

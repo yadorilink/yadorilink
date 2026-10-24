@@ -273,6 +273,7 @@ async fn original(device: &Device) -> BTreeMap<String, String> {
 async fn mass_edit(device: &Device) {
     device.write("report.txt", "ENCRYPTED");
     std::fs::remove_file(device.path("notes.txt")).unwrap();
+    // quiescence-exempt: a file rename, not a directory
     std::fs::rename(device.path("sub/data.txt"), device.path("sub/data.txt.locked")).unwrap();
     device.write("ransom/README.txt", "pay up");
     device.wait_indexed("notes.txt", false).await;
@@ -455,6 +456,7 @@ async fn mass_deleted(a: &Device) -> i64 {
         || format!("only {} files indexed", a.current_rows().len()),
     )
     .await;
+    support::quiescence::wait_quiescent(&a.root, &a.state, GROUP).await;
     let target = target_now().await;
     std::fs::remove_dir_all(a.path("many")).unwrap();
     let live_files = || -> Vec<String> {

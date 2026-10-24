@@ -467,8 +467,9 @@ async fn a_file_provider_location_resolves_by_display_name_not_by_path() {
         .provider_repository()
         .declare_root("group-1", ProviderKind::MacFileProvider, "Photos")
         .unwrap();
-    let resolve =
-        |path: &str| resolve_provider_group_and_rel_path(&state.replica_coordinator, path);
+    let resolve = |path: &str| {
+        resolve_provider_group_and_rel_path(&state.replica_coordinator, state.config_dir(), path)
+    };
     assert_eq!(
         resolve("/Users/a/Library/CloudStorage/YadoriLink-Photos/trips/a.jpg"),
         Some(("group-1".to_string(), "trips/a.jpg".to_string()))

@@ -14,7 +14,7 @@
 //! Only server-supplied values are compared, so the local clock never matters. The state sits
 //! next to the trust store; deleting it resets the guard and is not a threat this covers (a
 //! brand-new install has no stored value, so the first check accepts any validly signed
-//! manifest).
+//! manifest). A damaged state file is moved aside and treated the same way.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -87,6 +87,35 @@ impl ReplayStore {
         }
     }
 
+    /// Like `load`, but a file that is present and damaged is moved aside (kept for inspection,
+    /// replacing an earlier one) and the check proceeds as a first run. Refusing forever would
+    /// stop update checks on an installed app with no way back; expiry still bounds what a
+    /// replayed manifest can do. A file that cannot be moved aside is still an error.
+    fn load_or_quarantine(&self) -> Result<ReplayFile, ReplayError> {
+        let damaged = match self.load() {
+            Ok(file)
+                if file.channels.values().all(|g| parse_generated_at(&g.generated_at).is_ok()) =>
+            {
+                return Ok(file);
+            }
+            Ok(_) => true,
+            Err(ReplayError::Storage(_)) => self.path.exists(),
+            Err(e) => return Err(e),
+        };
+        if damaged {
+            let aside = self.path.with_file_name("update_replay_floor.json.damaged");
+            yadorilink_fs_platform::durable_dir::publish_durably(
+                &self.path,
+                &aside,
+                yadorilink_fs_platform::durable_dir::Replace::Yes,
+            )
+            .map_err(|e| {
+                ReplayError::Storage(format!("damaged state could not be moved aside: {e}"))
+            })?;
+        }
+        Ok(ReplayFile::default())
+    }
+
     fn save(&self, file: &ReplayFile) -> std::io::Result<()> {
         use std::io::Write;
 
@@ -101,7 +130,7 @@ impl ReplayStore {
         let tmp = self.path.with_file_name(".update_replay_floor.json.tmp");
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(json.as_bytes())?;
-        f.sync_all()?;
+        yadorilink_fs_platform::flush::sync_file(&f)?;
         drop(f);
         publish_durably(&tmp, &self.path, Replace::Yes)
     }
@@ -125,10 +154,8 @@ impl ReplayStore {
         let offered_at = parse_generated_at(generated_at)?;
         let offered_hash = envelope_sha256(envelope_bytes);
         let _serialized = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut file = self.load()?;
+        let mut file = self.load_or_quarantine()?;
         if let Some(kept) = file.channels.get(channel) {
-            // A stored value that does not parse means the state was damaged: refuse rather
-            // than treat it as "nothing stored".
             let kept_at = parse_generated_at(&kept.generated_at)
                 .map_err(|_| ReplayError::Storage("persisted generated_at is invalid".into()))?;
             if offered_at < kept_at {

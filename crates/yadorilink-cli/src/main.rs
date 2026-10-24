@@ -372,7 +372,16 @@ enum AccountAction {
 #[derive(Subcommand)]
 enum AccountDeleteAction {
     /// Request account deletion and get a confirmation token. Nothing is deleted yet.
-    Request,
+    Request {
+        /// Proceed although deleting the account removes other people's access or the last
+        /// full copy of a shared folder group. The override is recorded on the server.
+        #[arg(long)]
+        force: bool,
+        /// If a fresh sign-in is needed, print a URL and short code to enter on any device
+        /// instead of opening a browser redirect.
+        #[arg(long)]
+        device: bool,
+    },
     /// Confirm the deletion with your token and start the grace period.
     Confirm { confirmation_token: String },
     /// Cancel a pending deletion during the grace period and keep your account.
@@ -810,8 +819,8 @@ enum DaemonAction {
         /// The app's daemon runs: verify it and close the hand-off.
         #[arg(long, conflicts_with_all = ["to", "rollback", "status"])]
         commit: bool,
-        /// Undo the open hand-off and return to the previous setup. The app must unregister its
-        /// own launcher first.
+        /// Undo the open hand-off and return to the previous setup. The app should unregister
+        /// its own launcher; one left behind cannot start a second daemon.
         #[arg(long, conflicts_with_all = ["to", "commit", "status"])]
         rollback: bool,
         /// Show the open hand-off without changing anything.
@@ -889,9 +898,24 @@ async fn main() {
     // purely diagnostic logging, never load-bearing for command behavior.
     let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
     let cli = Cli::parse();
+    let is_sign_in_command = is_sign_in_command(&cli.command);
     let result = run(cli.command).await;
     if let Err(e) = result {
         eprintln!("error: {e}");
+        if let Some(device) = commands::auth::auto_sign_in_plan(
+            &e,
+            is_sign_in_command,
+            commands::auth::TerminalEnv::detect(),
+        ) {
+            // The person is at a terminal: start the normal sign-in now, everything on stderr.
+            // The command itself did not run, so it is not retried; the exit code stays the
+            // failure's, whatever the sign-in does.
+            eprintln!("Starting the sign-in. The browser shows the Terms to review and accept.");
+            match commands::auth::login_on_stderr(device).await {
+                Ok(()) => eprintln!("Signed in. Run the command again."),
+                Err(login_error) => eprintln!("error: {login_error}"),
+            }
+        }
         if let Some(detail) = e.daemon_refusal_detail() {
             eprintln!("{detail}");
         }
@@ -904,6 +928,17 @@ async fn main() {
         }
         std::process::exit(e.exit_code());
     }
+}
+
+/// The commands that are themselves about signing in or out, which must never start another.
+fn is_sign_in_command(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Login { .. }
+            | Command::Logout { .. }
+            | Command::ForgetLocalCredentials
+            | Command::Credentials { .. }
+    )
 }
 
 async fn run_provider_folder(action: ProviderFolderAction) -> Result<(), CliError> {
@@ -1150,7 +1185,9 @@ async fn run(command: Command) -> Result<(), CliError> {
         },
         Command::Account { action } => match action {
             AccountAction::Delete { action } => match action {
-                AccountDeleteAction::Request => commands::account::delete_request().await,
+                AccountDeleteAction::Request { force, device } => {
+                    commands::account::delete_request(force, device).await
+                }
                 AccountDeleteAction::Confirm { confirmation_token } => {
                     commands::account::delete_confirm(confirmation_token).await
                 }
@@ -1259,5 +1296,26 @@ mod help_text_tests {
             offenders.len(),
             offenders.join("\n")
         );
+    }
+}
+
+#[cfg(test)]
+mod sign_in_command_tests {
+    use super::*;
+
+    #[test]
+    fn the_sign_in_commands_are_exactly_login_logout_and_the_credential_commands() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("yadorilink").chain(args.iter().copied()))
+                .expect("parses")
+                .command
+        };
+        assert!(is_sign_in_command(&parse(&["login"])));
+        assert!(is_sign_in_command(&parse(&["login", "--device"])));
+        assert!(is_sign_in_command(&parse(&["logout", "--yes"])));
+        assert!(is_sign_in_command(&parse(&["forget-local-credentials"])));
+        assert!(is_sign_in_command(&parse(&["credentials", "purge"])));
+        assert!(!is_sign_in_command(&parse(&["links"])));
+        assert!(!is_sign_in_command(&parse(&["status"])));
     }
 }

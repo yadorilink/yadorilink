@@ -132,9 +132,12 @@ pub(crate) fn build_application_services(state: Arc<DaemonState>) -> Arc<Applica
     ));
     let reporting =
         Arc::new(runtime::reporting::DaemonReportingCommandAdapter::new(state.reporting.clone()));
+    #[cfg(feature = "process-model")]
     let update = Arc::new(runtime::update::DaemonUpdateCommandAdapter::new(state.clone()));
 
+    #[cfg(feature = "process-model")]
     let send_transfer = Arc::new(crate::send_transfer::SendTransferService::new(state.clone()));
+    #[cfg(feature = "process-model")]
     let nas_admin = Arc::new(crate::nas_admin_bridge::NasAdminSessions::new(&state));
     let rewind = Arc::new(crate::rewind::RewindService::new(state.clone()));
 
@@ -154,9 +157,12 @@ pub(crate) fn build_application_services(state: Arc<DaemonState>) -> Arc<Applica
         version_restore,
         governance,
         reporting,
+        #[cfg(feature = "process-model")]
         update,
         link_lifecycle,
+        #[cfg(feature = "process-model")]
         send_transfer,
+        #[cfg(feature = "process-model")]
         nas_admin,
         rewind,
     })
@@ -173,6 +179,7 @@ pub(crate) fn build_query_services(state: Arc<DaemonState>) -> Arc<QueryServices
         state.device_id.clone(),
         state.links.clone(),
     ));
+    #[cfg(feature = "process-model")]
     let update_status = Arc::new(crate::queries::update_status::UpdateStatusQueryService::new(
         state.update_manager.clone(),
     ));
@@ -181,17 +188,24 @@ pub(crate) fn build_query_services(state: Arc<DaemonState>) -> Arc<QueryServices
     let link_status = Arc::new(LinkStatusQueryService::new(link_status_reader));
     let runtime_status = Arc::new(crate::queries::runtime_status::RuntimeStatusQueryService::new(
         link_status.clone(),
+        #[cfg(feature = "process-model")]
         update_status.clone(),
         state.peer_connectivity.clone(),
+        state.authority.clone(),
         state.telemetry.clone(),
         state.governance_config.clone(),
         state.block_store.clone(),
         state.gc.clone(),
         state.rate_limiters.clone(),
         state.replica_coordinator.clone(),
+        {
+            let state = state.clone();
+            Arc::new(move || state.coordination_client_config().and_then(|c| c.auth.block()))
+        },
     ));
     let linked_path = Arc::new(crate::queries::linked_path::LinkedPathResolver::new(
         state.replica_coordinator.clone(),
+        state.config_dir().to_path_buf(),
     ));
     let file_history = Arc::new(crate::queries::file_history::FileHistoryQueryService::new(
         state.replica_coordinator.clone(),
@@ -209,6 +223,7 @@ pub(crate) fn build_query_services(state: Arc<DaemonState>) -> Arc<QueryServices
         coordination_config,
     ));
 
+    #[cfg(feature = "process-model")]
     let diagnostics_bundle =
         Arc::new(crate::queries::diagnostics_bundle::DiagnosticsBundleQueryService::new(
             Arc::new(query::diagnostics_bundle::DaemonRuntimeDiagnostics::new(
@@ -232,6 +247,7 @@ pub(crate) fn build_query_services(state: Arc<DaemonState>) -> Arc<QueryServices
             query::handoff_readiness::DaemonHandoffReadinessReader::new(state.clone()),
         )));
 
+    #[cfg(feature = "process-model")]
     let inbox = Arc::new(crate::send_transfer::InboxQueries::new(state.clone()));
 
     let rewind = Arc::new(crate::rewind::RewindQueries::new(state.clone()));
@@ -246,9 +262,12 @@ pub(crate) fn build_query_services(state: Arc<DaemonState>) -> Arc<QueryServices
         governance,
         reporting,
         recovery,
+        #[cfg(feature = "process-model")]
         diagnostics_bundle,
         handoff_readiness,
+        #[cfg(feature = "process-model")]
         update_status,
+        #[cfg(feature = "process-model")]
         inbox,
         rewind,
     })

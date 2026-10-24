@@ -31,7 +31,54 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use yadorilink_filesystem_sync::watcher::{FolderWatchSource, RealFolderWatchSource};
+use yadorilink_filesystem_sync::watcher::FolderWatchSource;
+#[cfg(feature = "process-model")]
+use yadorilink_filesystem_sync::watcher::RealFolderWatchSource;
+
+/// The watch source a link starts with: the OS watcher in the desktop daemon; none in the
+/// embedded host, whose linked folders are owned by the operating system and change through
+/// the provider channel.
+fn default_watch_source(links: &Arc<LinkRegistry>) -> Arc<dyn FolderWatchSource> {
+    #[cfg(feature = "process-model")]
+    {
+        let _ = links;
+        Arc::new(RealFolderWatchSource)
+    }
+    #[cfg(not(feature = "process-model"))]
+    {
+        Arc::new(NoChangeSource { links: links.clone() })
+    }
+}
+
+/// The watch source of the embedded build: an ordinary folder has no source of changes, so its
+/// start fails (its startup gate stays failed, so peers' changes are deferred, not applied) and
+/// the link is shown stopped with the reason.
+#[cfg(not(feature = "process-model"))]
+struct NoChangeSource {
+    links: Arc<LinkRegistry>,
+}
+
+#[cfg(not(feature = "process-model"))]
+impl FolderWatchSource for NoChangeSource {
+    fn watch(
+        &self,
+        root: &std::path::Path,
+        ignore_set: Arc<yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet>,
+    ) -> Result<
+        yadorilink_filesystem_sync::watcher::FolderWatcher,
+        yadorilink_filesystem_sync::watcher::WatcherError,
+    > {
+        self.links.mark_no_change_source(&root.to_string_lossy(), crate::daemon_state::now_unix());
+        yadorilink_filesystem_sync::watcher::NoWatchSource.watch(root, ignore_set)
+    }
+}
+
+/// Whether an ordinary folder link can have a source of changes in this build: only the desktop
+/// build has an OS watcher. Elsewhere only provider folders can be linked.
+#[must_use]
+pub const fn ordinary_folder_links_supported() -> bool {
+    cfg!(feature = "process-model")
+}
 #[cfg(test)]
 use yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet;
 
@@ -70,7 +117,7 @@ impl LinkRuntimeController {
     }
 
     pub fn start(&self, local_path: String, group_id: String) -> Result<(), DaemonError> {
-        self.start_inner(local_path, group_id, Arc::new(RealFolderWatchSource), true)
+        self.start_inner(local_path, group_id, default_watch_source(&self.state.links), true)
     }
 
     /// Same as `start`, but takes
@@ -106,7 +153,12 @@ impl LinkRuntimeController {
         group_id: String,
         emit_tombstones: bool,
     ) -> Result<(), DaemonError> {
-        self.start_inner(local_path, group_id, Arc::new(RealFolderWatchSource), emit_tombstones)
+        self.start_inner(
+            local_path,
+            group_id,
+            default_watch_source(&self.state.links),
+            emit_tombstones,
+        )
     }
 
     fn start_inner(

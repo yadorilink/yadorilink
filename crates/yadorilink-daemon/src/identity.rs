@@ -65,12 +65,19 @@ impl RuntimeIdentity {
         let install_root = ownership::app_bundle_root(&inputs.exe)
             .or_else(|| inputs.exe.parent().map(Path::to_path_buf))
             .unwrap_or_default();
+        let identity_dir = yadorilink_local_storage::release_descriptor::identity_dir(&inputs.exe);
         let descriptor = ReleaseDescriptor::of_program(
             env!("CARGO_PKG_VERSION"),
             &inputs.install_source,
             yadorilink_ipc_proto::PROVIDER_HOST_API_VERSION,
-            yadorilink_local_storage::release_descriptor::identity_dir(&inputs.exe).as_deref(),
-        );
+            identity_dir.as_deref(),
+        )
+        .and_then(|d| {
+            d.confirm_state_schema(
+                u32::try_from(yadorilink_sqlite_runtime::SCHEMA_VERSION).unwrap_or(0),
+                identity_dir.as_deref(),
+            )
+        });
         Self {
             exe: inputs.exe,
             owner: Owner::for_install_source(&inputs.install_source),
@@ -84,11 +91,13 @@ impl RuntimeIdentity {
     }
 
     /// This process, as installed.
+    #[cfg(feature = "process-model")]
     #[must_use]
-    pub fn detect(config_dir: Option<PathBuf>) -> Self {
+    pub fn detect(config_dir: Option<PathBuf>, declared_install_source: Option<&str>) -> Self {
         Self::from_inputs(IdentityInputs {
             exe: crate::update::install_source::running_exe(),
-            install_source: crate::update::manager::PlatformInfo::detect().install_source,
+            install_source: crate::update::manager::PlatformInfo::detect(declared_install_source)
+                .install_source,
             pid: std::process::id(),
             started_at_unix: now_unix(),
             config_dir,

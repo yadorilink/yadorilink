@@ -2,12 +2,6 @@
 
 use super::*;
 
-/// `YADORILINK_UPDATE_MANIFEST_URL` is a process-global env var —
-/// every test in this module that touches it holds this mutex for
-/// its whole body, mirroring `daemon_state.rs`'s own
-/// `CONFIG_ENV_MUTEX` precedent for `YADORILINK_CONFIG_DIR`.
-static MANIFEST_URL_ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 /// Answers every probe with "not available" and counts them, so a test can see that detection
 /// went through the runner instead of spawning a process.
 #[cfg(target_os = "linux")]
@@ -30,13 +24,39 @@ impl install_source::CommandRunner for NoSpawnRunner {
 #[test]
 fn platform_detection_spawns_no_process_in_a_test_binary() {
     let before = REFUSED_PROBES.load(std::sync::atomic::Ordering::SeqCst);
-    let info = PlatformInfo::detect();
+    let info = PlatformInfo::detect(None);
     assert!(REFUSED_PROBES.load(std::sync::atomic::Ordering::SeqCst) > before);
     assert_eq!(info.install_source, "standalone");
 }
 
+/// An iOS build is its own platform and an App Store install, whatever its bundle path looks like.
+// apple-cfg: ios-explicit the iOS platform string and install source
+#[cfg(target_os = "ios")]
+#[test]
+fn an_ios_build_reports_the_app_store_as_its_install_source() {
+    let info = PlatformInfo::detect(None);
+    assert_eq!(info.platform, "ios");
+    assert_eq!(info.install_source, "app_store");
+}
+
 fn manager(config_dir: &Path) -> UpdateManager {
-    UpdateManager::new(config_dir, semver::Version::parse("0.1.0").unwrap())
+    UpdateManager::new(
+        config_dir,
+        semver::Version::parse("0.1.0").unwrap(),
+        &crate::engine_tuning::EngineTuning::default(),
+    )
+}
+
+/// A manager that fetches its manifest from `manifest_url`.
+fn manager_at(config_dir: &Path, manifest_url: &str) -> UpdateManager {
+    UpdateManager::new(
+        config_dir,
+        semver::Version::parse("0.1.0").unwrap(),
+        &crate::engine_tuning::EngineTuning {
+            update_manifest_url: Some(manifest_url.to_owned()),
+            ..crate::engine_tuning::EngineTuning::default()
+        },
+    )
 }
 
 /// Update Privacy requirement / spec "Update check uses coarse
@@ -53,7 +73,6 @@ async fn update_check_request_sends_only_the_documented_coarse_fields() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    let _guard = MANIFEST_URL_ENV_MUTEX.lock().await;
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/manifest.json"))
@@ -63,10 +82,10 @@ async fn update_check_request_sends_only_the_documented_coarse_fields() {
         .respond_with(ResponseTemplate::new(200).set_body_string("not a valid manifest"))
         .mount(&server)
         .await;
-    std::env::set_var("YADORILINK_UPDATE_MANIFEST_URL", format!("{}/manifest.json", server.uri()));
+    let manifest_url = format!("{}/manifest.json", server.uri());
 
     let dir = tempfile::tempdir().unwrap();
-    let manager = manager(dir.path());
+    let manager = manager_at(dir.path(), &manifest_url);
     let _ = manager.check_now().await;
 
     let requests = server.received_requests().await.expect("request recording must be enabled");
@@ -82,8 +101,6 @@ async fn update_check_request_sends_only_the_documented_coarse_fields() {
         query_keys, expected,
         "update-check request must carry exactly the documented coarse fields and nothing else"
     );
-
-    std::env::remove_var("YADORILINK_UPDATE_MANIFEST_URL");
 }
 
 /// Builds a `ReleaseEntry` that matches `mgr`'s own detected platform
@@ -110,12 +127,24 @@ fn matching_entry(
         artifact_size: 1024,
         artifact_publisher_identity: String::new(),
         release_notes_url: "https://example.invalid/notes".into(),
+        state_schema_version: None,
+        state_schema_min_readable: None,
+        sparkle_build: None,
     }
 }
 
 async fn serve_envelope_and_check(
     envelope_json: String,
     config_dir: &Path,
+) -> Result<Applicability, UpdateError> {
+    serve_envelope_and_check_at(envelope_json, config_dir, None).await
+}
+
+/// As [`serve_envelope_and_check`], with the manager's clock fixed at `now` (Unix seconds).
+async fn serve_envelope_and_check_at(
+    envelope_json: String,
+    config_dir: &Path,
+    now: Option<i64>,
 ) -> Result<Applicability, UpdateError> {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -126,13 +155,15 @@ async fn serve_envelope_and_check(
         .respond_with(ResponseTemplate::new(200).set_body_string(envelope_json))
         .mount(&server)
         .await;
-    std::env::set_var("YADORILINK_UPDATE_MANIFEST_URL", format!("{}/manifest.json", server.uri()));
-    let mut mgr = manager(config_dir);
+    let manifest_url = format!("{}/manifest.json", server.uri());
+    let mut mgr = manager_at(config_dir, &manifest_url);
     mgr.set_trusted_keys_for_test(manifest::test_support::trusted_keys_hex(
         &manifest::test_support::test_trusted_keys(),
     ));
+    if let Some(now) = now {
+        mgr.set_now_for_test(now);
+    }
     let result = mgr.check_now().await;
-    std::env::remove_var("YADORILINK_UPDATE_MANIFEST_URL");
     result
 }
 
@@ -144,13 +175,13 @@ async fn serve_envelope_and_check(
 /// `select_applicable` alone.
 #[tokio::test]
 async fn a_running_daemon_discovers_verifies_and_applies_a_signed_manifest() {
-    let _guard = MANIFEST_URL_ENV_MUTEX.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let mgr = manager(dir.path());
     let entry = matching_entry(&mgr, "9.9.9", 100, false);
     let doc = manifest::UpdateManifest {
         schema_version: manifest::MANIFEST_SCHEMA_VERSION,
         generated_at: "2026-07-01T00:00:00Z".into(),
+        expires_at: "2099-01-01T00:00:00Z".into(),
         withdrawn_versions: Vec::new(),
         releases: vec![entry],
     };
@@ -171,13 +202,13 @@ async fn a_running_daemon_discovers_verifies_and_applies_a_signed_manifest() {
 /// install and not error out.
 #[tokio::test]
 async fn a_running_daemon_holds_back_an_update_outside_its_rollout_percentage() {
-    let _guard = MANIFEST_URL_ENV_MUTEX.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let mgr = manager(dir.path());
     let entry = matching_entry(&mgr, "9.9.9", 0, false);
     let doc = manifest::UpdateManifest {
         schema_version: manifest::MANIFEST_SCHEMA_VERSION,
         generated_at: "2026-07-01T00:00:00Z".into(),
+        expires_at: "2099-01-01T00:00:00Z".into(),
         withdrawn_versions: Vec::new(),
         releases: vec![entry],
     };
@@ -198,13 +229,13 @@ async fn a_running_daemon_holds_back_an_update_outside_its_rollout_percentage() 
 /// unverified manifest and never report an update as available.
 #[tokio::test]
 async fn a_running_daemon_rejects_a_tampered_manifest() {
-    let _guard = MANIFEST_URL_ENV_MUTEX.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let mgr = manager(dir.path());
     let entry = matching_entry(&mgr, "9.9.9", 100, false);
     let doc = manifest::UpdateManifest {
         schema_version: manifest::MANIFEST_SCHEMA_VERSION,
         generated_at: "2026-07-01T00:00:00Z".into(),
+        expires_at: "2099-01-01T00:00:00Z".into(),
         withdrawn_versions: Vec::new(),
         releases: vec![entry],
     };
@@ -233,17 +264,15 @@ async fn serve_status_and_check(
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    let _guard = MANIFEST_URL_ENV_MUTEX.lock().await;
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/manifest.json"))
         .respond_with(ResponseTemplate::new(status))
         .mount(&server)
         .await;
-    std::env::set_var("YADORILINK_UPDATE_MANIFEST_URL", format!("{}/manifest.json", server.uri()));
-    let mgr = manager(config_dir);
+    let manifest_url = format!("{}/manifest.json", server.uri());
+    let mgr = manager_at(config_dir, &manifest_url);
     let result = mgr.check_now().await;
-    std::env::remove_var("YADORILINK_UPDATE_MANIFEST_URL");
     (result, mgr.policy.load_or_default())
 }
 
@@ -277,7 +306,6 @@ async fn a_server_error_while_fetching_the_manifest_is_still_a_failure() {
 async fn trust_chain_from_a_response_is_persisted_and_revocation_sticks() {
     use manifest::test_support::{numbered_key, sign_manifest_as, sign_record, test_signing_key};
 
-    let _guard = MANIFEST_URL_ENV_MUTEX.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let mgr = manager(dir.path());
     // Each response is a new publish, so each carries a newer generated_at (the replay floor
@@ -288,6 +316,7 @@ async fn trust_chain_from_a_response_is_persisted_and_revocation_sticks() {
         manifest::UpdateManifest {
             schema_version: manifest::MANIFEST_SCHEMA_VERSION,
             generated_at: format!("2026-07-01T00:00:{:02}Z", generation.get()),
+            expires_at: "2099-01-01T00:00:00Z".into(),
             withdrawn_versions: Vec::new(),
             releases: vec![matching_entry(&mgr, "9.9.9", 100, false)],
         }
@@ -353,6 +382,7 @@ async fn check_against_entry(
     let doc = manifest::UpdateManifest {
         schema_version: manifest::MANIFEST_SCHEMA_VERSION,
         generated_at: "2026-07-01T00:00:00Z".into(),
+        expires_at: "2099-01-01T00:00:00Z".into(),
         withdrawn_versions: Vec::new(),
         releases: vec![entry],
     };
@@ -364,8 +394,6 @@ async fn check_against_entry(
 /// A client below the signed minimum reports "update required"; one exactly at it does not.
 #[tokio::test]
 async fn a_client_below_the_manifest_minimum_is_told_an_update_is_required() {
-    let _guard = MANIFEST_URL_ENV_MUTEX.lock().await;
-
     let dir = tempfile::tempdir().unwrap();
     let (policy, current) = check_against_entry("9.9.9", "5.0.0", false, dir.path()).await;
     assert!(policy.update_required(&current), "0.1.0 is below the minimum 5.0.0");
@@ -379,7 +407,6 @@ async fn a_client_below_the_manifest_minimum_is_told_an_update_is_required() {
 /// does not make "update required".
 #[tokio::test]
 async fn the_mandatory_flag_alone_is_not_a_cutover() {
-    let _guard = MANIFEST_URL_ENV_MUTEX.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let (policy, current) = check_against_entry("9.9.9", "0.1.0", true, dir.path()).await;
     assert!(policy.mandatory);
@@ -391,7 +418,6 @@ async fn the_mandatory_flag_alone_is_not_a_cutover() {
 async fn an_up_to_date_check_clears_the_recorded_minimum() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let _guard = MANIFEST_URL_ENV_MUTEX.lock().await;
         check_against_entry("9.9.9", "5.0.0", false, dir.path()).await;
     }
     // `serve_status_and_check` takes the env lock itself.
@@ -406,6 +432,7 @@ fn doc_at(mgr: &UpdateManager, generated_at: &str) -> manifest::UpdateManifest {
     manifest::UpdateManifest {
         schema_version: manifest::MANIFEST_SCHEMA_VERSION,
         generated_at: generated_at.into(),
+        expires_at: "2099-01-01T00:00:00Z".into(),
         withdrawn_versions: Vec::new(),
         releases: vec![matching_entry(mgr, "9.9.9", 100, false)],
     }
@@ -421,7 +448,6 @@ async fn serve_doc(
 
 #[tokio::test]
 async fn an_older_signed_manifest_is_refused_after_a_newer_one_even_across_restarts() {
-    let _guard = MANIFEST_URL_ENV_MUTEX.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let mgr = manager(dir.path());
     let new = doc_at(&mgr, "2026-10-19T00:00:10Z");
@@ -439,7 +465,6 @@ async fn an_older_signed_manifest_is_refused_after_a_newer_one_even_across_resta
 
 #[tokio::test]
 async fn an_equal_generated_at_is_accepted_for_the_same_bytes_only() {
-    let _guard = MANIFEST_URL_ENV_MUTEX.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let mgr = manager(dir.path());
     let doc = doc_at(&mgr, "2026-10-19T00:00:10Z");
@@ -453,7 +478,6 @@ async fn an_equal_generated_at_is_accepted_for_the_same_bytes_only() {
 
 #[tokio::test]
 async fn a_manifest_that_fails_verification_does_not_move_the_floor() {
-    let _guard = MANIFEST_URL_ENV_MUTEX.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let mgr = manager(dir.path());
     let mut envelope = manifest::test_support::sign_manifest(&doc_at(&mgr, "2999-01-01T00:00:00Z"));
@@ -485,19 +509,17 @@ async fn check_version_against(
         .respond_with(response)
         .mount(&server)
         .await;
-    std::env::set_var("YADORILINK_UPDATE_MANIFEST_URL", format!("{}/manifest.json", server.uri()));
-    let mut mgr = manager(dir);
+    let manifest_url = format!("{}/manifest.json", server.uri());
+    let mut mgr = manager_at(dir, &manifest_url);
     mgr.set_trusted_keys_for_test(manifest::test_support::trusted_keys_hex(
         &manifest::test_support::test_trusted_keys(),
     ));
     let result = mgr.check_version(kind, version).await;
-    std::env::remove_var("YADORILINK_UPDATE_MANIFEST_URL");
     result
 }
 
 #[tokio::test]
 async fn a_pinned_install_of_a_killed_version_is_refused_by_the_live_manifest() {
-    let _guard = MANIFEST_URL_ENV_MUTEX.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let mgr = manager(dir.path());
     let mut doc = doc_at(&mgr, "2026-10-19T00:00:10Z");
@@ -517,7 +539,6 @@ async fn a_pinned_install_of_a_killed_version_is_refused_by_the_live_manifest() 
 
 #[tokio::test]
 async fn a_version_check_fails_closed_without_a_verified_manifest() {
-    let _guard = MANIFEST_URL_ENV_MUTEX.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let none =
         check_version_against(None, VersionCheckKind::AppcastItem, "9.9.9", dir.path()).await;
@@ -538,16 +559,12 @@ async fn a_version_check_fails_closed_without_a_verified_manifest() {
             )
             .mount(&server)
             .await;
-        std::env::set_var(
-            "YADORILINK_UPDATE_MANIFEST_URL",
-            format!("{}/manifest.json", server.uri()),
-        );
-        let mut m = manager(dir.path());
+        let manifest_url = format!("{}/manifest.json", server.uri());
+        let mut m = manager_at(dir.path(), &manifest_url);
         m.set_trusted_keys_for_test(manifest::test_support::trusted_keys_hex(
             &manifest::test_support::test_trusted_keys(),
         ));
         let r = m.check_version(VersionCheckKind::PinnedInstall, "9.9.9").await;
-        std::env::remove_var("YADORILINK_UPDATE_MANIFEST_URL");
         r
     };
     assert!(matches!(unverifiable, Err(VersionCheckError::Unverifiable(_))));
@@ -555,7 +572,6 @@ async fn a_version_check_fails_closed_without_a_verified_manifest() {
 
 #[tokio::test]
 async fn an_appcast_item_ahead_of_the_manifest_is_refused() {
-    let _guard = MANIFEST_URL_ENV_MUTEX.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let mgr = manager(dir.path());
     let doc = doc_at(&mgr, "2026-10-19T00:00:10Z");
@@ -569,4 +585,363 @@ async fn an_appcast_item_ahead_of_the_manifest_is_refused() {
     let served =
         check_version_against(Some(&doc), VersionCheckKind::AppcastItem, "9.9.9", dir.path()).await;
     assert!(served.is_ok(), "{served:?}");
+}
+
+// ---- manifest freshness (expiry), through the real fetch path ----
+
+fn unix_at(date: &str) -> i64 {
+    chrono::NaiveDateTime::parse_from_str(date, "%Y-%m-%dT%H:%M:%SZ").unwrap().and_utc().timestamp()
+}
+
+fn doc_expiring(
+    mgr: &UpdateManager,
+    generated_at: &str,
+    expires_at: &str,
+) -> manifest::UpdateManifest {
+    manifest::UpdateManifest { expires_at: expires_at.into(), ..doc_at(mgr, generated_at) }
+}
+
+async fn serve_doc_at(
+    doc: &manifest::UpdateManifest,
+    dir: &Path,
+    now: i64,
+) -> Result<Applicability, UpdateError> {
+    let envelope = manifest::test_support::sign_manifest(doc);
+    serve_envelope_and_check_at(serde_json::to_string(&envelope).unwrap(), dir, Some(now)).await
+}
+
+fn floor_bytes(dir: &Path) -> Option<Vec<u8>> {
+    std::fs::read(dir.join("update_replay_floor.json")).ok()
+}
+
+#[tokio::test]
+async fn an_expired_manifest_offers_nothing_and_leaves_the_replay_floor_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = manager(dir.path());
+    let good = doc_expiring(&mgr, "2026-10-19T00:00:10Z", "2026-12-18T00:00:10Z");
+    assert!(serve_doc_at(&good, dir.path(), unix_at("2026-10-20T00:00:00Z")).await.is_ok());
+    let before = floor_bytes(dir.path()).expect("the accepted manifest stored a floor");
+
+    // A newer manifest, but past its expiry: refused before the floor can move.
+    let stale = doc_expiring(&mgr, "2026-10-19T00:00:20Z", "2026-10-20T00:00:20Z");
+    let err = serve_doc_at(&stale, dir.path(), unix_at("2026-10-21T00:00:00Z")).await.unwrap_err();
+    assert!(
+        matches!(err, UpdateError::Manifest(manifest::ManifestError::Expired { .. })),
+        "{err:?}"
+    );
+    assert_eq!(err.category(), "update_manifest_expired");
+    assert_eq!(floor_bytes(dir.path()), Some(before));
+
+    let policy = UpdatePolicyStore::new(dir.path()).load_or_default();
+    assert_eq!(policy.state, UpdateState::Failed);
+    assert!(policy.manifest_expired());
+    assert_eq!(policy.manifest_expires_at.as_deref(), Some("2026-10-20T00:00:20Z"));
+}
+
+#[tokio::test]
+async fn a_manifest_is_accepted_through_its_expiry_second_and_refused_after() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = manager(dir.path());
+    let doc = doc_expiring(&mgr, "2026-10-19T00:00:10Z", "2026-12-18T00:00:10Z");
+    let last_valid = unix_at("2026-12-18T00:00:10Z");
+    assert!(serve_doc_at(&doc, dir.path(), last_valid).await.is_ok());
+    assert!(floor_bytes(dir.path()).is_some());
+    let err = serve_doc_at(&doc, dir.path(), last_valid + 1).await.unwrap_err();
+    assert_eq!(err.category(), "update_manifest_expired");
+}
+
+#[tokio::test]
+async fn a_failed_check_keeps_the_last_successful_check_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = manager(dir.path());
+    let doc = doc_expiring(&mgr, "2026-10-19T00:00:10Z", "2026-10-25T00:00:10Z");
+    let ok_at = unix_at("2026-10-20T00:00:00Z");
+    assert!(serve_doc_at(&doc, dir.path(), ok_at).await.is_ok());
+    let policy = UpdatePolicyStore::new(dir.path()).load_or_default();
+    assert_eq!(policy.last_success_unix, policy.last_check_unix);
+    assert_eq!(policy.manifest_expires_at.as_deref(), Some("2026-10-25T00:00:10Z"));
+    assert!(!policy.manifest_expired());
+
+    let later = unix_at("2026-11-20T00:00:00Z");
+    assert!(serve_doc_at(&doc, dir.path(), later).await.is_err());
+    let policy = UpdatePolicyStore::new(dir.path()).load_or_default();
+    assert_eq!(policy.last_success_unix, Some(ok_at));
+    assert_eq!(policy.last_check_unix, Some(later));
+    assert!(policy.manifest_expired());
+}
+
+#[tokio::test]
+async fn a_far_future_manifest_is_refused_and_cannot_set_the_replay_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = manager(dir.path());
+    let now = unix_at("2026-10-20T00:00:00Z");
+    let poisoned = doc_expiring(&mgr, "2999-01-01T00:00:00Z", "2999-03-02T00:00:00Z");
+    let err = serve_doc_at(&poisoned, dir.path(), now).await.unwrap_err();
+    assert!(matches!(err, UpdateError::Manifest(manifest::ManifestError::FutureDated { .. })));
+    assert_eq!(floor_bytes(dir.path()), None);
+
+    // A correctly stamped manifest is still accepted afterwards.
+    let good = doc_expiring(&mgr, "2026-10-19T00:00:10Z", "2026-12-18T00:00:10Z");
+    assert!(serve_doc_at(&good, dir.path(), now).await.is_ok());
+}
+
+#[tokio::test]
+async fn an_expired_manifest_stops_reporting_update_required_until_a_check_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = manager(dir.path());
+    let running = mgr.current_version().clone();
+    let mut doc = doc_expiring(&mgr, "2026-10-19T00:00:10Z", "2026-10-25T00:00:10Z");
+    let mut entry = matching_entry(&mgr, "999.0.0", 100, false);
+    entry.minimum_supported_version = "999.0.0".into();
+    doc.releases = vec![entry];
+    assert!(serve_doc_at(&doc, dir.path(), unix_at("2026-10-20T00:00:00Z")).await.is_ok());
+    let policy = UpdatePolicyStore::new(dir.path()).load_or_default();
+    assert!(policy.update_required(&running));
+
+    assert!(serve_doc_at(&doc, dir.path(), unix_at("2026-11-20T00:00:00Z")).await.is_err());
+    let policy = UpdatePolicyStore::new(dir.path()).load_or_default();
+    assert!(policy.manifest_expired());
+    assert!(!policy.update_required(&running), "cannot confirm, not required");
+
+    let fresh = doc_expiring(&mgr, "2026-11-19T00:00:10Z", "2027-01-18T00:00:10Z");
+    let fresh = manifest::UpdateManifest { releases: doc.releases.clone(), ..fresh };
+    assert!(serve_doc_at(&fresh, dir.path(), unix_at("2026-11-20T00:00:00Z")).await.is_ok());
+    assert!(UpdatePolicyStore::new(dir.path()).load_or_default().update_required(&running));
+}
+
+/// A deliberate rollback is a new manifest with a higher generated_at that serves the older
+/// release; the older manifest itself stays refused.
+#[tokio::test]
+async fn a_rollback_is_a_newer_manifest_not_an_older_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = manager(dir.path());
+    let now = unix_at("2026-10-20T00:00:00Z");
+    let older = doc_expiring(&mgr, "2026-10-19T00:00:10Z", "2026-12-18T00:00:10Z");
+    let newer = doc_expiring(&mgr, "2026-10-19T00:00:20Z", "2026-12-18T00:00:20Z");
+    assert!(serve_doc_at(&newer, dir.path(), now).await.is_ok());
+    let err = serve_doc_at(&older, dir.path(), now).await.unwrap_err();
+    assert_eq!(err.category(), "update_manifest_replayed");
+    let rolled_back = doc_expiring(&mgr, "2026-10-19T00:00:30Z", "2026-12-18T00:00:30Z");
+    assert!(serve_doc_at(&rolled_back, dir.path(), now).await.is_ok());
+}
+
+// ---- the verified entry, as the app asks for it ----
+
+const ENTRY_URL: &str = "https://example.invalid/yadorilink-update";
+use manifest::AppcastPhase::{Downloaded, Enclosure};
+
+fn item() -> manifest::AppcastItem {
+    manifest::AppcastItem {
+        version: "9.9.9".into(),
+        sparkle_build: 42,
+        channel: Some("beta".into()),
+        url: ENTRY_URL.into(),
+        length: 1024,
+        sha256: Some("0".repeat(64)),
+    }
+}
+
+fn doc_with_build(mgr: &UpdateManager) -> manifest::UpdateManifest {
+    let mut doc = doc_at(mgr, "2026-10-19T00:00:10Z");
+    doc.releases[0].sparkle_build = Some(42);
+    doc
+}
+
+/// A manager that verified `doc` (or saw a 404 for `None`) through a real check at `now`. The
+/// server is gone afterwards, so any later network request would fail.
+async fn verified_manager(
+    doc: Option<&manifest::UpdateManifest>,
+    dir: &Path,
+    now: i64,
+) -> UpdateManager {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let response = match doc {
+        Some(doc) => ResponseTemplate::new(200).set_body_string(
+            serde_json::to_string(&manifest::test_support::sign_manifest(doc)).unwrap(),
+        ),
+        None => ResponseTemplate::new(404),
+    };
+    Mock::given(method("GET"))
+        .and(path("/manifest.json"))
+        .respond_with(response)
+        .mount(&server)
+        .await;
+    let manifest_url = format!("{}/manifest.json", server.uri());
+    let mut mgr = manager_at(dir, &manifest_url);
+    mgr.set_trusted_keys_for_test(manifest::test_support::trusted_keys_hex(
+        &manifest::test_support::test_trusted_keys(),
+    ));
+    mgr.set_now_for_test(now);
+    let _ = mgr.check_now().await;
+    mgr
+}
+
+fn code(answer: &VerifiedEntryAnswer) -> &'static str {
+    match answer.verdict.as_ref().unwrap_err() {
+        EntryRefusal::CannotConfirm(why) => why.code(),
+        EntryRefusal::Refused(r) => r.code(),
+    }
+}
+
+const NOW: &str = "2026-10-20T00:00:00Z";
+
+#[tokio::test]
+async fn an_item_equal_to_the_verified_entry_is_allowed_and_the_entry_is_returned() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = doc_with_build(&manager(dir.path()));
+    let mgr = verified_manager(Some(&doc), dir.path(), unix_at(NOW)).await;
+    let answer = mgr.verified_entry(&item(), Downloaded);
+    assert!(answer.verdict.is_ok(), "{:?}", answer.verdict);
+    let entry = answer.entry.expect("the verified entry is returned");
+    assert_eq!(entry.entry.version, "9.9.9");
+    assert_eq!(entry.entry.sparkle_build, Some(42));
+    assert_eq!(entry.file, "yadorilink-update");
+    assert_eq!(entry.entry.artifact_sha256, "0".repeat(64));
+    assert_eq!(entry.expires_at, "2099-01-01T00:00:00Z");
+    assert!(!entry.update_required);
+
+    // Before the download there is no digest, and the daemon's own channel is authoritative.
+    let enclosure = manifest::AppcastItem { channel: None, sha256: None, ..item() };
+    assert!(mgr.verified_entry(&enclosure, Enclosure).verdict.is_ok());
+    // After it, the digest is required: an item without one is refused, not skipped.
+    let answer = mgr.verified_entry(&enclosure, Downloaded);
+    assert_eq!(code(&answer), "sha256_missing");
+}
+
+#[tokio::test]
+async fn any_field_mismatch_is_refused_with_its_own_reason_and_still_returns_the_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = doc_with_build(&manager(dir.path()));
+    let mgr = verified_manager(Some(&doc), dir.path(), unix_at(NOW)).await;
+    let cases: [(manifest::AppcastItem, &str); 10] = [
+        (manifest::AppcastItem { version: "9.9.8".into(), ..item() }, "version_mismatch"),
+        (manifest::AppcastItem { version: "nine".into(), ..item() }, "invalid_version"),
+        (manifest::AppcastItem { sparkle_build: 43, ..item() }, "build_mismatch"),
+        (manifest::AppcastItem { sparkle_build: 0, ..item() }, "build_missing"),
+        (
+            manifest::AppcastItem {
+                url: "https://evil.invalid/yadorilink-update".into(),
+                ..item()
+            },
+            "url_mismatch",
+        ),
+        (manifest::AppcastItem { url: String::new(), ..item() }, "url_missing"),
+        (manifest::AppcastItem { length: 1, ..item() }, "length_mismatch"),
+        (manifest::AppcastItem { length: 0, ..item() }, "length_missing"),
+        (manifest::AppcastItem { sha256: Some("1".repeat(64)), ..item() }, "sha256_mismatch"),
+        (manifest::AppcastItem { channel: Some("stable".into()), ..item() }, "channel_mismatch"),
+    ];
+    for (wrong, expected) in cases {
+        let answer = mgr.verified_entry(&wrong, Downloaded);
+        assert_eq!(code(&answer), expected, "{wrong:?}");
+        assert!(matches!(answer.verdict, Err(EntryRefusal::Refused(_))));
+        // The invalid-version and channel cases do not depend on the entry; the entry is still
+        // the verified one.
+        assert_eq!(answer.entry.expect("entry").entry.version, "9.9.9");
+    }
+}
+
+#[tokio::test]
+async fn a_withdrawn_or_killed_or_undeclared_entry_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = doc_with_build(&manager(dir.path()));
+    doc.withdrawn_versions = vec!["9.9.9".into()];
+    let mgr = verified_manager(Some(&doc), dir.path(), unix_at(NOW)).await;
+    assert_eq!(code(&mgr.verified_entry(&item(), Downloaded)), "withdrawn");
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = doc_with_build(&manager(dir.path()));
+    doc.releases[0].kill_switch = true;
+    let mgr = verified_manager(Some(&doc), dir.path(), unix_at(NOW)).await;
+    assert_eq!(code(&mgr.verified_entry(&item(), Downloaded)), "kill_switched");
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = doc_with_build(&manager(dir.path()));
+    doc.releases[0].sparkle_build = None;
+    let mgr = verified_manager(Some(&doc), dir.path(), unix_at(NOW)).await;
+    assert_eq!(code(&mgr.verified_entry(&item(), Downloaded)), "build_not_declared");
+}
+
+#[tokio::test]
+async fn without_a_fresh_verified_manifest_the_answer_is_cannot_confirm() {
+    let confirm = |a: &VerifiedEntryAnswer| {
+        assert!(a.entry.is_none(), "nothing is returned that was not confirmed");
+        assert!(matches!(a.verdict, Err(EntryRefusal::CannotConfirm(_))));
+        code(a)
+    };
+
+    // Nothing verified since start.
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(confirm(&manager(dir.path()).verified_entry(&item(), Downloaded)), "not_checked");
+
+    // The channel has no manifest.
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = verified_manager(None, dir.path(), unix_at(NOW)).await;
+    assert_eq!(confirm(&mgr.verified_entry(&item(), Downloaded)), "no_manifest");
+
+    // Stale, then expired.
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = doc_with_build(&manager(dir.path()));
+    doc.expires_at = "2026-10-25T00:00:10Z".into();
+    let mut mgr = verified_manager(Some(&doc), dir.path(), unix_at(NOW)).await;
+    mgr.set_now_for_test(unix_at(NOW) + VERIFIED_MAX_AGE_SECS);
+    assert!(mgr.verified_entry(&item(), Downloaded).verdict.is_ok());
+    mgr.set_now_for_test(unix_at(NOW) + VERIFIED_MAX_AGE_SECS + 1);
+    assert_eq!(confirm(&mgr.verified_entry(&item(), Downloaded)), "stale");
+    // Expired while still fresh by age.
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = doc_with_build(&manager(dir.path()));
+    doc.expires_at = "2026-10-20T01:00:00Z".into();
+    let mut mgr = verified_manager(Some(&doc), dir.path(), unix_at(NOW)).await;
+    mgr.set_now_for_test(unix_at("2026-10-20T01:00:01Z"));
+    assert_eq!(confirm(&mgr.verified_entry(&item(), Downloaded)), "manifest_expired");
+
+    // A clock that went backwards past the verification does not make the entry fresh again.
+    mgr.set_now_for_test(unix_at(NOW) - 1);
+    assert_eq!(confirm(&mgr.verified_entry(&item(), Downloaded)), "stale");
+}
+
+#[tokio::test]
+async fn asking_for_the_entry_does_not_move_the_replay_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = doc_with_build(&manager(dir.path()));
+    let mgr = verified_manager(Some(&doc), dir.path(), unix_at(NOW)).await;
+    let floor = floor_bytes(dir.path()).expect("the verified manifest stored a floor");
+    let policy = std::fs::read(dir.path().join("update_policy.json")).ok();
+    for wrong in [item(), manifest::AppcastItem { sparkle_build: 7, ..item() }] {
+        let _ = mgr.verified_entry(&wrong, Downloaded);
+    }
+    assert_eq!(floor_bytes(dir.path()), Some(floor));
+    assert_eq!(std::fs::read(dir.path().join("update_policy.json")).ok(), policy);
+}
+
+#[tokio::test]
+async fn switching_channel_makes_the_verified_manifest_not_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = doc_with_build(&manager(dir.path()));
+    let mgr = verified_manager(Some(&doc), dir.path(), unix_at(NOW)).await;
+    assert!(mgr.verified_entry(&item(), Downloaded).verdict.is_ok());
+    mgr.policy.update(|p| p.channel = "stable".into()).unwrap();
+    let answer = mgr.verified_entry(&item(), Downloaded);
+    assert!(answer.entry.is_none());
+    assert_eq!(code(&answer), "not_checked");
+}
+
+/// A check that was accepted earlier can finish after a newer one: the floor refuses it and the
+/// cache keeps the newer manifest, so a withdrawal in the newer one is never lost.
+#[tokio::test]
+async fn an_older_generation_finishing_late_cannot_replace_the_newer_cached_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mgr = manager(dir.path());
+    mgr.set_now_for_test(unix_at(NOW));
+    let old = doc_with_build(&mgr);
+    let mut newer =
+        manifest::UpdateManifest { generated_at: "2026-10-19T00:00:20Z".into(), ..old.clone() };
+    newer.withdrawn_versions = vec!["9.9.9".into()];
+    mgr.accept_and_remember("beta", &newer, "newer-body").unwrap();
+    assert!(mgr.accept_and_remember("beta", &old, "older-body").is_err());
+    assert_eq!(code(&mgr.verified_entry(&item(), Downloaded)), "withdrawn");
 }

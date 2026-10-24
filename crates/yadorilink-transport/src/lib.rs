@@ -19,5 +19,6 @@ pub mod sim_net;
 
 pub use block_stream::{MAX_BLOCK_STREAM_BODY_BYTES, MAX_BLOCK_STREAM_HEADER_BYTES};
 pub use error::TransportError;
+pub use key_secret_store::{KeyMirror, KeyringDelete};
 pub use keys::{verifying_key_from_bytes, DeviceSigningKeyPair, KeyLoadError};
 pub use peer_channel::{diff_netmap, NetmapDiff, NetmapSnapshot};

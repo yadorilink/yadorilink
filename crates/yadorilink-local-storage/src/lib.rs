@@ -38,6 +38,7 @@ pub mod ownership;
 mod received_flush;
 pub mod release_descriptor;
 pub mod replacement_unconfirmed;
+pub mod resource_lock;
 pub mod segment_store;
 pub mod service_registrations;
 pub mod startup_refusal;
@@ -93,6 +94,7 @@ pub use received_flush::{
 pub use segment_store::{
     CommitPoint, CompactionReport, DurableReceipt, FaultPlan, GroupCommitLimits, RecoveryReport,
     SegmentBlockStore, SegmentStoreUsage, COMPACTION_DEAD_RATIO, COMPACTION_MIN_DEAD_BYTES,
+    DEFAULT_CACHED_SEGMENT_READERS,
 };
 pub use traits::{
     hash_block_bytes, BlockStore, ContentHash, GcReport, LocallyHashedBlock, StorageUsage,

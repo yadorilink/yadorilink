@@ -61,6 +61,29 @@ pub(crate) fn materialize_within(
     policy::materialize_within(&Pipe, timeout, cancel, root, item, request_id, target)
 }
 
+/// [`materialize_within`] that also receives the daemon's progress as `(completed, total)`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn materialize_reporting(
+    timeout: Duration,
+    cancel: &AtomicBool,
+    root: &[u8],
+    item: &[u8],
+    request_id: &[u8],
+    target: Option<FetchTarget>,
+    on_progress: &dyn Fn(u64, u64),
+) -> Option<MaterializeToTempResponse> {
+    policy::materialize_reporting(
+        &Pipe,
+        timeout,
+        cancel,
+        root,
+        item,
+        request_id,
+        target,
+        Some(on_progress),
+    )
+}
+
 /// Sends one change the user made to the daemon and returns its answer; `None` when the daemon
 /// could not be asked or did not answer.
 pub fn apply(

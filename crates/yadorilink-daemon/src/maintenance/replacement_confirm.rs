@@ -804,16 +804,28 @@ pub(crate) async fn confirm_supersession(
     }
 }
 
-/// Where the job reads and writes its record.
-pub(crate) fn state_dir() -> Option<PathBuf> {
-    yadorilink_fs_platform::state_dir::state_dir().ok()
-}
-
 impl ReplacementConfirmJob<DaemonConfirmPorts> {
-    pub(crate) fn for_daemon(state: Arc<DaemonState>) -> Option<Self> {
-        Some(Self::new(DaemonConfirmPorts::new(state), state_dir()?))
+    pub(crate) fn for_daemon(state: Arc<DaemonState>) -> Self {
+        let dir = state.config_dir().to_path_buf();
+        Self::new(DaemonConfirmPorts::new(state), dir)
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+/// How often the account's replaced-device list is refreshed, whatever else is pending.
+pub(crate) const SUPERSESSION_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// One refresh: asks the service for the supersessions and applies them, so peers refuse every
+/// replaced device (`DaemonState::apply_supersessions`). Independent of any confirmation record.
+pub(crate) async fn refresh_superseded_devices(state: &Arc<DaemonState>) {
+    let Some(config) = state.coordination_client_config() else { return };
+    if let SupersessionsAnswer::Listed(listed) =
+        fetch_supersessions(&config.addr, &config.auth).await
+    {
+        state.apply_supersessions(
+            listed.into_iter().map(|s| (s.old_device_id, s.new_device_id)).collect(),
+        );
+    }
+}

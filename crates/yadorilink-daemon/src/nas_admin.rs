@@ -11,7 +11,8 @@
 //!   the last listing it gave keeps answering, for at most
 //!   [`LAST_LISTING_SERVES_FOR`].
 //!
-//! Offered only where [`OFFER_ENV`] turns it on: the headless (system
+//! Offered only where the engine tuning's `offer_nas_admin` (the desktop daemon maps
+//! `YADORILINK_NAS_ADMIN` into it) turns it on: the headless (system
 //! service) profile. Elsewhere the ALPN is not registered at all, so a
 //! dialler is refused at the handshake exactly as by an older build.
 //! - where an authorized stream goes: this device's own dashboard, handed
@@ -36,12 +37,6 @@ use yadorilink_sync_substrate::{
 
 use crate::coordination_client::DeviceListingError;
 use crate::daemon_state::DaemonState;
-
-/// The setting that turns management of this device on. Set by the headless
-/// (system service) profile's own unit file and by nothing else, so a
-/// desktop install never answers the management ALPN. Only `1` or `true`
-/// turn it on; anything else, unset included, leaves it off.
-pub(crate) const OFFER_ENV: &str = "YADORILINK_NAS_ADMIN";
 
 /// How long one device listing answers for. Bounds both how long a removed
 /// device can keep opening streams and how often anyone (an authenticated
@@ -68,18 +63,6 @@ const LISTING_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often [`run`] checks whether the device endpoint exists yet.
 const ENDPOINT_POLL_INTERVAL: Duration = Duration::from_millis(500);
-
-/// Whether this daemon offers management at all, from [`OFFER_ENV`].
-pub(crate) fn offered() -> bool {
-    offered_by(std::env::var(OFFER_ENV))
-}
-
-fn offered_by(value: Result<String, std::env::VarError>) -> bool {
-    value.is_ok_and(|v| {
-        let v = v.trim();
-        v == "1" || v.eq_ignore_ascii_case("true")
-    })
-}
 
 type Keys = Arc<HashSet<[u8; 32]>>;
 type WallClock = Box<dyn Fn() -> SystemTime + Send + Sync>;

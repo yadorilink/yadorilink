@@ -7,7 +7,7 @@
   "required": ["schema_version", "channel", "minimum_supported_version", "entries", "reason", "history"],
   "properties": {
     "schema_version": { "const": 1 },
-    "channel": { "enum": ["nightly", "beta"] },
+    "channel": { "enum": ["nightly", "beta", "stable"] },
     "minimum_supported_version": { "type": "string" },
     "reason": { "type": "string", "minLength": 1, "description": "A version moves back only with a reason starting 'yank <bad version>'." },
     "entries": {

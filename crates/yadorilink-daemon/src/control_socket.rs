@@ -19,41 +19,49 @@ use yadorilink_ipc_proto::daemonctl::{
     accept_invite_command_response, create_and_link_command_response,
     delete_group_command_response, join_and_link_command_response, mint_invite_command_response,
     remove_device_command_response, revoke_device_command_response, revoke_edge_command_response,
-    AcceptInviteCommandResponse, ActiveTransferProgress, ApplicationCommandError,
-    ApplicationErrorCode, CancelTransferResponse, CheckFullReplicaHandoffReadyExcludingResponse,
+    AcceptInviteCommandResponse, ApplicationCommandError, ApplicationErrorCode,
+    CancelTransferResponse, CheckFullReplicaHandoffReadyExcludingResponse,
     CheckFullReplicaHandoffReadyResponse, ConflictedFileInfo, ConnectionAttemptTrace,
     ConnectivityDoctorCategory, ConnectivityDoctorResponse, CreateAndLinkCommandResponse,
     DaemonControlRequest, DaemonControlResponse, DeleteGroupCommandResponse,
-    EnrollmentCommandOutcome, EvictResponse, FetchAvailability, FileVersionInfo, GcResponse,
-    GetSpaceManagementResponse, GroupDurabilityStatus, HandoffResult, HealthResponse, HeldFile,
-    HydrateResponse, InboxFileSummary, InboxTransfer, JoinAndLinkCommandResponse,
-    LatchGroupDurabilityUnknownResponse, LimitsSetResponse, LimitsShowResponse,
-    LinkPreflightResponse, LinkRequest, LinkResponse, LinkStatus, ListConflictsResponse,
-    ListConnectionTracesResponse, ListInboxResponse, ListLinksResponse, ListQueueItemsResponse,
-    ListRecoveryOperationsResponse, ListSentTransfersResponse, ListTrashResponse,
-    ListVersionsResponse, LocalState as WireLocalState, LocalStorageState,
+    EnrollmentCommandOutcome, EvictResponse, FileVersionInfo, GcResponse,
+    GetSpaceManagementResponse, HandoffResult, HealthResponse, HydrateResponse, InboxFileSummary,
+    InboxTransfer, JoinAndLinkCommandResponse, LatchGroupDurabilityUnknownResponse,
+    LimitsSetResponse, LimitsShowResponse, LinkPreflightResponse, LinkRequest, LinkResponse,
+    ListConflictsResponse, ListConnectionTracesResponse, ListInboxResponse, ListLinksResponse,
+    ListQueueItemsResponse, ListRecoveryOperationsResponse, ListSentTransfersResponse,
+    ListTrashResponse, ListVersionsResponse, LocalState as WireLocalState,
     LocalTransition as WireLocalTransition, MarkLinkNotRejoinedResponse,
     MaterializationStatusResponse, MembershipHandoffResult, MintInviteCommandResponse,
     MintedInviteInfo, NasAdminFailureKind, ObtainHandoffTicketResponse, OpenNasAdminResponse,
-    PauseResponse, PeerStatus, PendingEnrollmentKind, PinItemResponse, PreviewSpaceReclaimResponse,
-    QueueItem, ReadoptVolumeResponse, ReceiveTransferResponse, RecentSyncError,
-    ReleaseHandoffTicketResponse, RemoveDeviceCommandResponse, RemovePendingEnrollmentResponse,
-    ReplicaMembershipCommandOutcome, ReportingConsentState, ReportingStatusResponse,
-    RequestHandoffLeaseResponse, RestoreTrashOperationFailure, RestoreTrashOperationResponse,
-    RestoreTrashResponse, RestoreVersionResponse, ResumeResponse, RetentionPolicy,
-    RetentionState as WireRetentionState, RetryTransferResponse, RevokeDeviceCommandResponse,
-    RevokeEdgeCommandResponse, RewindActionCounts as WireRewindActionCounts, RewindExecuteResponse,
+    PauseResponse, PendingEnrollmentKind, PinItemResponse, PreviewSpaceReclaimResponse, QueueItem,
+    ReadoptVolumeResponse, ReceiveTransferResponse, ReleaseHandoffTicketResponse,
+    RemoveDeviceCommandResponse, RemovePendingEnrollmentResponse, ReplicaMembershipCommandOutcome,
+    ReportingConsentState, ReportingStatusResponse, RequestHandoffLeaseResponse,
+    RestoreTrashOperationFailure, RestoreTrashOperationResponse, RestoreTrashResponse,
+    RestoreVersionResponse, ResumeResponse, RetentionPolicy, RetentionState as WireRetentionState,
+    RetryTransferResponse, RevokeDeviceCommandResponse, RevokeEdgeCommandResponse,
+    RewindActionCounts as WireRewindActionCounts, RewindExecuteResponse,
     RewindPathEntry as WireRewindPathEntry, RewindPlanStale, RewindPreviewResponse, RewindRefused,
     RewindRenameCandidate as WireRewindRenameCandidate, RewindRun as WireRewindRun,
     RewindRunStarted, RewindStatusResponse, SendFileResponse, SentTransferEntry,
     SetSpaceManagementResponse, SetStorageModeResponse, ShowQueueItemResponse, ShutdownResponse,
-    SpaceReclaimPreviewItem, StatusResponse, TaskLiveness, TrashedFileInfo, UnlinkResponse,
-    UnpinItemResponse, VolumeFreeSpace,
+    SpaceReclaimPreviewItem, TaskLiveness, TrashedFileInfo, UnlinkResponse, UnpinItemResponse,
 };
 use yadorilink_ipc_proto::framing::{read_message, write_message};
 
+use crate::enrollment_commands::{self, link_refusal_code};
 use crate::pause_deadline::PauseDuration;
 use crate::reporting_ipc;
+use crate::status_report::encode_link_status;
+#[cfg(test)]
+#[allow(
+    unused_imports,
+    reason = "the wire tests in this module's children name these through `super`"
+)]
+use crate::status_report::{
+    overall_status, reachability_to_proto, OverallState, UNREADABLE_FILES_LISTED,
+};
 use yadorilink_ipc_proto::daemonctl::PauseDuration as WirePauseDuration;
 
 const MAX_CONTROL_CONNECTIONS: usize = 64;
@@ -325,11 +333,11 @@ fn group_mismatch_response(local_path: String) -> RespPayload {
 }
 
 /// `SF_DATALESS` in `st_flags`: the OS holds the item's metadata but not its content.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_vendor = "apple", test))]
 const SF_DATALESS: u32 = 0x4000_0000;
 
 /// The local state a File Provider item's flags show: present on this device unless dataless.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_vendor = "apple", test))]
 fn local_state_from_flags(st_flags: u32) -> WireLocalState {
     WireLocalState {
         local_object_present: st_flags & SF_DATALESS == 0,
@@ -340,14 +348,19 @@ fn local_state_from_flags(st_flags: u32) -> WireLocalState {
 
 /// The state of an item of a File Provider folder, read from the file itself (`lstat` never
 /// downloads). `None` where the OS does not expose it or the item cannot be read.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn provider_local_state(absolute_path: &str) -> Option<WireLocalState> {
-    use std::os::macos::fs::MetadataExt;
-    let metadata = std::fs::symlink_metadata(absolute_path).ok()?;
-    Some(local_state_from_flags(metadata.st_flags()))
+    let path = std::ffi::CString::new(absolute_path).ok()?;
+    // SAFETY: `lstat` fills the struct it is given; zeroed is a valid initial value, and the
+    // path is a NUL-terminated string that outlives the call.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::lstat(path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    Some(local_state_from_flags(stat.st_flags))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(target_vendor = "apple"))]
 fn provider_local_state(_absolute_path: &str) -> Option<WireLocalState> {
     None
 }
@@ -410,7 +423,13 @@ async fn handle_request(
     }
     let payload = match req.payload {
         Some(ReqPayload::Link(r)) => {
-            match require_risks_acknowledged(context, &r.local_path, r.acknowledge_risks).await {
+            match enrollment_commands::require_risks_acknowledged(
+                &context.application.link_lifecycle,
+                &r.local_path,
+                r.acknowledge_risks,
+            )
+            .await
+            {
                 Err(error) => link_failure_payload(&error),
                 Ok(()) => match decode_link_command(r) {
                     Err(message) => RespPayload::Error(message),
@@ -686,7 +705,7 @@ async fn handle_request(
         // The setting is a small local file; an unreadable one reads as Off.
         Some(ReqPayload::GetSpaceManagement(_)) => {
             let config = crate::space_management_config::SpaceManagementStore::new(
-                crate::device_config::config_dir(),
+                context.config_dir.clone(),
             )
             .load_or_off();
             RespPayload::GetSpaceManagement(GetSpaceManagementResponse {
@@ -696,7 +715,7 @@ async fn handle_request(
         Some(ReqPayload::SetSpaceManagement(r)) => match r.settings {
             None => RespPayload::Error("no setting given".into()),
             Some(settings) => match crate::space_management_config::SpaceManagementStore::new(
-                crate::device_config::config_dir(),
+                context.config_dir.clone(),
             )
             .set(settings.enabled)
             {
@@ -865,71 +884,12 @@ async fn handle_request(
             }
         }
 
-        Some(ReqPayload::Status(_)) => match context.queries.runtime_status.snapshot() {
-            Ok(view) => {
-                let database_restored = view.database_restored;
-                let author_unavailable = view.author_unavailable;
-                let mut response = encode_runtime_status(view);
-                response.provider_roots = context.provider_status.snapshot();
-                (response.provider_removals, response.orphan_domains) =
-                    context.provider_status.extras();
-                response.provider_registry_restored =
-                    crate::windows_sync_roots::registry_restored();
-                status_dimensions::fill_link_dimensions(&mut response);
-                let reclaimable = context.auto_reclaim.reclaimable_by_group();
-                for link in &mut response.links {
-                    link.reclaimable_bytes = reclaimable.get(&link.group_id).copied().unwrap_or(0);
-                }
-                attribute_reclaimable(&mut response.volumes, &reclaimable, |path| {
-                    context.queries.runtime_status.shares_block_store_volume(path)
-                });
-                let (mut overall_state, mut attention_reasons) = overall_status(&response);
-                if let Some(category) = database_restored {
-                    // Sync as this device is refused until it is registered again.
-                    attention_reasons.insert(0, format!("database_restored:{category}"));
-                    if overall_state == OverallState::Healthy {
-                        overall_state = OverallState::Attention;
-                    }
-                }
-                if author_unavailable {
-                    // Nothing this device edits can be signed, so nothing syncs from it.
-                    attention_reasons.insert(0, "author_unavailable".to_owned());
-                    if overall_state == OverallState::Healthy {
-                        overall_state = OverallState::Attention;
-                    }
-                }
-                apply_replacement_unconfirmed(
-                    replacement_unconfirmed_pending(),
-                    &mut overall_state,
-                    &mut attention_reasons,
-                );
-                apply_replacement_sign_in(replacement_sign_in_required(), &mut attention_reasons);
-                apply_replacement_acknowledgement(
-                    replacement_acknowledgement_required(),
-                    &mut attention_reasons,
-                );
-                apply_replacement_waiting(replacement_waiting_reason(), &mut attention_reasons);
-                response.overall_state = overall_state.as_str().to_string();
-                response.attention_reasons = attention_reasons;
-                let preserved = context.application.preserved.summary();
-                response.preserved = Some(yadorilink_ipc_proto::daemonctl::PreservedSummary {
-                    total: preserved.total,
-                    content_unavailable: preserved.content_unavailable,
-                    record_unavailable: preserved.record_unavailable,
-                    bytes: preserved.bytes,
-                    unreplayed_own_units: preserved.unreplayed_own_units,
-                    warn_bytes: preserved.warn_bytes,
-                    warn: preserved.warn,
-                    retained_originals: preserved.retained_originals,
-                });
-                response.rebootstrapping_groups =
-                    context.application.preserved.rebootstrapping_groups();
-                (response.undecided_uploads, response.undecided_uploads_oldest_ms) =
-                    context.application.preserved.undecided_uploads();
-                RespPayload::Status(response)
+        Some(ReqPayload::Status(_)) => {
+            match crate::status_report::build_status(context, Some(&context.config_dir)) {
+                Ok(response) => RespPayload::Status(response),
+                Err(message) => RespPayload::Error(message),
             }
-            Err(e) => RespPayload::Error(e.to_string()),
-        },
+        }
 
         Some(ReqPayload::LimitsSet(r)) => {
             match context
@@ -958,7 +918,7 @@ async fn handle_request(
             Some((group_id, path)) => {
                 let application = context.application.clone();
                 match application.materialization.hydrate(&group_id, &path).await {
-                    Ok(()) => RespPayload::Hydrate(HydrateResponse {}),
+                    Ok(downloaded) => RespPayload::Hydrate(HydrateResponse { downloaded }),
                     Err(e) => RespPayload::Error(e.to_string()),
                 }
             }
@@ -1232,6 +1192,16 @@ async fn handle_request(
                         crate::update_ipc::encode_version_check_response(outcome),
                     )
                 }
+                Err(e) => RespPayload::Error(e),
+            }
+        }
+        Some(ReqPayload::UpdateVerifiedEntry(r)) => {
+            match crate::update_ipc::decode_verified_entry(r) {
+                Ok((item, phase)) => RespPayload::UpdateVerifiedEntry(
+                    crate::update_ipc::encode_verified_entry_response(
+                        context.queries.update_status.verified_entry(&item, phase),
+                    ),
+                ),
                 Err(e) => RespPayload::Error(e),
             }
         }
@@ -1556,50 +1526,19 @@ async fn handle_request(
         }
 
         Some(ReqPayload::CreateAndLinkCommand(r)) => {
-            let application = context.application.clone();
-            let refusal = match provider_refusal(&r.provider_display_name) {
-                Some(detail) => {
-                    Some(crate::application::EnrollmentError::PreparationRejected { detail })
-                }
-                None if r.provider_display_name.is_empty() => {
-                    let created = if r.create_local_path_if_missing {
-                        yadorilink_fs_platform::durable_dir::create_dir_all_durably(
-                            std::path::Path::new(&r.local_path),
-                        )
-                        .map_err(|e| {
-                            crate::application::EnrollmentError::PreparationRejected {
-                                detail: format!("could not create {}: {e}", r.local_path),
-                            }
-                        })
-                    } else {
-                        Ok(())
-                    };
-                    match created {
-                        Err(error) => Some(error),
-                        Ok(()) => {
-                            require_risks_acknowledged(context, &r.local_path, r.acknowledge_risks)
-                                .await
-                                .err()
-                                .map(risks_refusal)
-                        }
-                    }
-                }
-                None => None,
-            };
-            let result = match refusal {
-                Some(error) => Err(error),
-                None => {
-                    application
-                        .enrollment
-                        .create_and_link(crate::application::CreateAndLinkCommand {
-                            group_name: r.group_name,
-                            absolute_path: r.local_path.into(),
-                            on_demand: r.on_demand,
-                            provider: provider_creation(&r.provider_display_name, &r.request_token),
-                        })
-                        .await
-                }
-            };
+            let result = enrollment_commands::create_and_link(
+                &context.application,
+                enrollment_commands::CreateShare {
+                    group_name: r.group_name,
+                    local_path: r.local_path,
+                    create_local_path_if_missing: r.create_local_path_if_missing,
+                    on_demand: r.on_demand,
+                    acknowledge_risks: r.acknowledge_risks,
+                    provider_display_name: r.provider_display_name,
+                    request_token: r.request_token,
+                },
+            )
+            .await;
             RespPayload::CreateAndLinkCommand(CreateAndLinkCommandResponse {
                 result: Some(match result {
                     Ok(outcome) => create_and_link_command_response::Result::Outcome(
@@ -1613,34 +1552,19 @@ async fn handle_request(
         }
 
         Some(ReqPayload::JoinAndLinkCommand(r)) => {
-            let application = context.application.clone();
-            let refusal = match provider_refusal(&r.provider_display_name) {
-                Some(detail) => {
-                    Some(crate::application::EnrollmentError::PreparationRejected { detail })
-                }
-                None if r.provider_display_name.is_empty() => {
-                    require_risks_acknowledged(context, &r.local_path, r.acknowledge_risks)
-                        .await
-                        .err()
-                        .map(risks_refusal)
-                }
-                None => None,
-            };
-            let result = match refusal {
-                Some(error) => Err(error),
-                None => {
-                    application
-                        .enrollment
-                        .join_and_link(crate::application::JoinAndLinkCommand {
-                            group_id: r.group_id,
-                            group_name: r.group_name,
-                            absolute_path: r.local_path.into(),
-                            on_demand: r.on_demand,
-                            provider: provider_creation(&r.provider_display_name, &r.request_token),
-                        })
-                        .await
-                }
-            };
+            let result = enrollment_commands::join_and_link(
+                &context.application,
+                enrollment_commands::JoinGroup {
+                    group_id: r.group_id,
+                    group_name: r.group_name,
+                    local_path: r.local_path,
+                    on_demand: r.on_demand,
+                    acknowledge_risks: r.acknowledge_risks,
+                    provider_display_name: r.provider_display_name,
+                    request_token: r.request_token,
+                },
+            )
+            .await;
             RespPayload::JoinAndLinkCommand(JoinAndLinkCommandResponse {
                 result: Some(match result {
                     Ok(outcome) => join_and_link_command_response::Result::Outcome(
@@ -1654,23 +1578,18 @@ async fn handle_request(
         }
 
         Some(ReqPayload::AcceptInviteCommand(r)) => {
-            let application = context.application.clone();
-            let result =
-                match require_risks_acknowledged(context, &r.local_path, r.acknowledge_risks).await
-                {
-                    // Refused before the one-use invite is redeemed.
-                    Err(error) => Err(risks_refusal(error)),
-                    Ok(()) => {
-                        application
-                            .enrollment
-                            .accept_invite_and_link(crate::application::AcceptInviteCommand {
-                                code: r.code,
-                                absolute_path: r.local_path.into(),
-                                on_demand: r.on_demand,
-                            })
-                            .await
-                    }
-                };
+            let result = enrollment_commands::accept_invite(
+                &context.application,
+                enrollment_commands::AcceptInvite {
+                    code: r.code,
+                    local_path: r.local_path,
+                    on_demand: r.on_demand,
+                    acknowledge_risks: r.acknowledge_risks,
+                    provider_display_name: r.provider_display_name,
+                    request_token: r.request_token,
+                },
+            )
+            .await;
             RespPayload::AcceptInviteCommand(AcceptInviteCommandResponse {
                 result: Some(match result {
                     Ok(outcome) => accept_invite_command_response::Result::Outcome(
@@ -1851,47 +1770,8 @@ fn membership_error_to_proto(
     }
 }
 
-/// Why a provider folder cannot be created now, `None` when it can (or the request is not for one).
-/// A provider folder needs the operating system's provider adapter (the macOS File Provider or the
-/// Windows Cloud Files API); refused before anything is written.
-/// [`LinkLifecycleService::require_risks_acknowledged`] for a link, create,
-/// join or invite acceptance of `local_path`, off the async runtime (the
-/// preflight scans the folder).
-///
-/// [`LinkLifecycleService::require_risks_acknowledged`]: crate::application::LinkLifecycleService::require_risks_acknowledged
-async fn require_risks_acknowledged(
-    context: &crate::control_context::ControlContext,
-    local_path: &str,
-    acknowledged: bool,
-) -> Result<(), crate::error::DaemonError> {
-    if acknowledged {
-        return Ok(());
-    }
-    let links = context.application.link_lifecycle.clone();
-    let path = std::path::PathBuf::from(local_path);
-    match tokio::task::spawn_blocking(move || links.require_risks_acknowledged(&path, false)).await
-    {
-        Ok(result) => result,
-        Err(e) => {
-            Err(crate::error::DaemonError::Config(format!("link preflight did not complete: {e}")))
-        }
-    }
-}
-
-/// A failed risk check as the enrollment refusal it is.
-fn risks_refusal(error: crate::error::DaemonError) -> crate::application::EnrollmentError {
-    match error.link_refusal() {
-        Some(refusal) => {
-            crate::application::EnrollmentError::LinkRefused { refusal, detail: error.to_string() }
-        }
-        None => {
-            crate::application::EnrollmentError::PreparationRejected { detail: error.to_string() }
-        }
-    }
-}
-
-/// `LinkPreflightRequest`: the same report [`require_risks_acknowledged`]
-/// checks, for a client to show before it asks for the acknowledgement.
+/// `LinkPreflightRequest`: the same report the share and link commands check before they
+/// proceed, for a client to show before it asks for the acknowledgement.
 async fn link_preflight(
     context: &crate::control_context::ControlContext,
     local_path: &str,
@@ -1915,47 +1795,12 @@ async fn link_preflight(
     })
 }
 
-fn provider_refusal(display_name: &str) -> Option<String> {
-    if display_name.is_empty() {
-        return None;
-    }
-    if yadorilink_replica_domain::session_state::ProviderKind::for_host_platform().is_none() {
-        return Some("provider folders are not supported on this platform".to_string());
-    }
-    None
-}
-
-/// The provider-folder part of a create/join request, `None` for a plain folder.
-fn provider_creation(
-    display_name: &str,
-    request_token: &str,
-) -> Option<crate::application::ProviderCreation> {
-    (!display_name.is_empty()).then(|| crate::application::ProviderCreation {
-        display_name: display_name.to_string(),
-        request_token: request_token.to_string(),
-    })
-}
-
 fn enrollment_outcome_to_proto(
     context: &crate::control_context::ControlContext,
     outcome: crate::application::EnrollmentOutcome,
 ) -> EnrollmentCommandOutcome {
-    // The root of a provider folder: its link's key is the locator the outcome names.
-    let key = outcome.local_path.to_string_lossy().to_string();
-    let provider_root_id = context
-        .queries
-        .link_status
-        .list_links()
-        .ok()
-        .and_then(|views| {
-            views.into_iter().find_map(|v| match v.provider {
-                Some((root_id, _)) if v.local_path == key => Some(root_id),
-                _ => None,
-            })
-        })
-        .unwrap_or_default();
     EnrollmentCommandOutcome {
-        provider_root_id,
+        provider_root_id: enrollment_commands::provider_root_id(&context.queries, &outcome),
         operation_id: outcome.operation_id,
         group_id: outcome.group_id,
         local_path: outcome.local_path.to_string_lossy().to_string(),
@@ -1967,70 +1812,12 @@ fn enrollment_outcome_to_proto(
 fn enrollment_error_to_proto(
     error: crate::application::EnrollmentError,
 ) -> ApplicationCommandError {
-    use crate::application::EnrollmentError as Error;
-    let (code, operation_id) = match &error {
-        Error::LocalIdentityUnavailable => {
-            (ApplicationErrorCode::LocalIdentityUnavailable, String::new())
-        }
-        Error::RecoveryJournalUnavailable { operation_id, .. } => {
-            (ApplicationErrorCode::RecoveryJournalUnavailable, operation_id.clone())
-        }
-        Error::PreparationRejected { .. } => {
-            (ApplicationErrorCode::PreparationRejected, String::new())
-        }
-        Error::PreparationAmbiguous { operation_id, .. } => {
-            (ApplicationErrorCode::CoordinationAmbiguous, operation_id.clone())
-        }
-        Error::LocalLinkFailed { refusal: None, .. } => {
-            (ApplicationErrorCode::LocalLinkFailed, String::new())
-        }
-        Error::LocalLinkFailed { refusal: Some(refusal), .. }
-        | Error::LinkRefused { refusal, .. } => (link_refusal_code(*refusal), String::new()),
-        Error::InviteRefused { reason, .. } => (
-            match reason {
-                crate::application::model::InviteRefusal::Expired => {
-                    ApplicationErrorCode::InviteExpired
-                }
-                crate::application::model::InviteRefusal::AlreadyUsed => {
-                    ApplicationErrorCode::InviteAlreadyUsed
-                }
-            },
-            String::new(),
-        ),
-        Error::LocalLinkAmbiguous { operation_id, .. } => {
-            (ApplicationErrorCode::RecoveryPending, operation_id.clone())
-        }
-        Error::ActivationRejected { .. } => {
-            (ApplicationErrorCode::ActivationRejected, String::new())
-        }
-        Error::ActivationAmbiguous { operation_id, .. } => {
-            (ApplicationErrorCode::ActivationAmbiguous, operation_id.clone())
-        }
-        Error::CompensationPending { operation_id, .. } => {
-            (ApplicationErrorCode::CompensationPending, operation_id.clone())
-        }
-        Error::OperationConflict { operation_id, .. } => {
-            (ApplicationErrorCode::OperationConflict, operation_id.clone())
-        }
-        Error::CoordinationTransport { .. } => {
-            (ApplicationErrorCode::CoordinationTransport, String::new())
-        }
-        Error::Persistence(_) => (ApplicationErrorCode::Persistence, String::new()),
-    };
+    let (code, operation_id) = enrollment_commands::enrollment_error_code(&error);
     ApplicationCommandError {
         code: code as i32,
         message: error.to_string(),
         group_ids: Vec::new(),
         operation_id,
-    }
-}
-
-fn link_refusal_code(refusal: crate::application::model::LinkRefusal) -> ApplicationErrorCode {
-    use crate::application::model::LinkRefusal;
-    match refusal {
-        LinkRefusal::DiskFull => ApplicationErrorCode::DiskFull,
-        LinkRefusal::PathNotAllowed => ApplicationErrorCode::PathNotAllowed,
-        LinkRefusal::AccessDenied => ApplicationErrorCode::AccessDenied,
     }
 }
 
@@ -2457,44 +2244,6 @@ fn conflicted_file_view_to_proto(
     }
 }
 
-/// Maps the daemon's internal reachability into the control-socket wire
-/// enums (`PeerStatus.reachability` / `unreachable_category`). The category
-/// is `Unspecified` whenever the peer is not unreachable.
-///
-/// The third element is this connection's `RouteKind` (only meaningful,
-/// i.e. non-`Unspecified`, when the reachability itself is `Connected`).
-fn reachability_to_proto(
-    reachability: crate::peer_registry::PeerReachability,
-) -> (
-    yadorilink_ipc_proto::daemonctl::PeerReachability,
-    yadorilink_ipc_proto::daemonctl::UnreachableCategory,
-    yadorilink_ipc_proto::daemonctl::RouteKind,
-) {
-    use crate::peer_registry::{PeerReachability as Daemon, UnreachableCategory as DaemonCat};
-    use yadorilink_ipc_proto::daemonctl::{
-        PeerReachability as Wire, RouteKind as WireRoute, UnreachableCategory as WireCat,
-    };
-    match reachability {
-        Daemon::Connecting => (Wire::Connecting, WireCat::Unspecified, WireRoute::Unspecified),
-        Daemon::Connected(route) => {
-            let wire_route = match route {
-                crate::route::RouteKind::Direct => WireRoute::Direct,
-                crate::route::RouteKind::Relay => WireRoute::Relay,
-            };
-            (Wire::Connected, WireCat::Unspecified, wire_route)
-        }
-        Daemon::Unreachable(category) => {
-            let wire_category = match category {
-                DaemonCat::NoCandidates => WireCat::NoCandidates,
-                DaemonCat::NoResponse => WireCat::NoResponse,
-                DaemonCat::UdpBlocked => WireCat::UdpBlocked,
-                DaemonCat::HandshakeRefused => WireCat::HandshakeRefused,
-            };
-            (Wire::Unreachable, wire_category, WireRoute::Unspecified)
-        }
-    }
-}
-
 /// A file or folder of a linked folder, as `(group_id, path relative to its root)`: a plain
 /// folder's, or a File Provider folder's.
 fn resolve_item(
@@ -2560,57 +2309,6 @@ fn local_state_to_proto(state: crate::application::ports::LocalPresence) -> Wire
     }
 }
 
-/// Maps the daemon's internal per-group durability status into the
-/// control-socket wire enum (`LinkStatus.durability_status`).
-fn durability_status_to_proto(
-    status: crate::durability_service::GroupDurabilityStatus,
-) -> GroupDurabilityStatus {
-    use crate::durability_service::GroupDurabilityStatus as Daemon;
-    match status {
-        Daemon::Protected => GroupDurabilityStatus::Protected,
-        Daemon::Protecting => GroupDurabilityStatus::Protecting,
-        Daemon::Unknown => GroupDurabilityStatus::Unknown,
-        Daemon::AtRisk => GroupDurabilityStatus::AtRisk,
-    }
-}
-
-/// Projects the evidence axis onto the wire enum. See
-/// `DurabilityEvidence`'s own doc comment for why it is an axis rather than
-/// more values of the status it accompanies.
-fn durability_evidence_to_proto(
-    evidence: crate::durability_service::DurabilityEvidence,
-) -> yadorilink_ipc_proto::daemonctl::DurabilityEvidence {
-    use crate::durability_service::DurabilityEvidence as Domain;
-    use yadorilink_ipc_proto::daemonctl::DurabilityEvidence as Wire;
-    match evidence {
-        Domain::None => Wire::None,
-        Domain::CorroboratedIndex => Wire::CorroboratedIndex,
-        Domain::VerifiedPayload => Wire::VerifiedPayload,
-    }
-}
-
-fn local_storage_state_to_proto(
-    state: crate::queries::link_status::LocalStorageState,
-) -> LocalStorageState {
-    use crate::queries::link_status::LocalStorageState as Domain;
-    match state {
-        Domain::FullCopy => LocalStorageState::FullCopy,
-        Domain::PartiallyMaterialized => LocalStorageState::PartiallyMaterialized,
-        Domain::OnDemand => LocalStorageState::OnDemand,
-    }
-}
-
-fn fetch_availability_to_proto(
-    availability: crate::queries::link_status::FetchAvailability,
-) -> FetchAvailability {
-    use crate::queries::link_status::FetchAvailability as Domain;
-    match availability {
-        Domain::AvailableNow => FetchAvailability::AvailableNow,
-        Domain::UnavailableNow => FetchAvailability::UnavailableNow,
-        Domain::Unknown => FetchAvailability::Unknown,
-    }
-}
-
 /// `HealthView` (`crate::queries::health`, DaemonState-independent) -> the
 /// IPC wire type.
 pub(crate) fn encode_health(view: crate::queries::health::HealthView) -> HealthResponse {
@@ -2626,495 +2324,10 @@ pub(crate) fn encode_health(view: crate::queries::health::HealthView) -> HealthR
 // crate::recovery_diagnosis::ipc, not here -- see that module's own doc
 // comment.
 
-/// Attributes what freeing up space would give back to every volume it frees: the block store's
-/// physical volume, however many entries (the store itself, linked folders) sit on it. Space
-/// management evicts the daemon's own copies, so it cannot relieve any other volume, and a
-/// low-disk item about another volume must not offer the action.
-fn attribute_reclaimable(
-    volumes: &mut [VolumeFreeSpace],
-    reclaimable_by_group: &std::collections::HashMap<String, u64>,
-    shares_block_store_volume: impl Fn(&str) -> bool,
-) {
-    let total = reclaimable_by_group.values().fold(0u64, |sum, b| sum.saturating_add(*b));
-    for volume in volumes {
-        if shares_block_store_volume(&volume.path) {
-            volume.reclaimable_bytes = total;
-        }
-    }
-}
-
-/// `RuntimeStatusView` (`crate::queries::runtime_status`, DaemonState-
-/// independent) -> the IPC wire type. `overall_state`/`attention_reasons`
-/// are left at their zero values -- `overall_status` fills them in from
-/// this same response immediately after, so they can never disagree with
-/// the rest of the message they summarize.
-fn encode_runtime_status(
-    view: crate::queries::runtime_status::RuntimeStatusView,
-) -> StatusResponse {
-    let links = view.links.into_iter().map(encode_link_status).collect();
-    let peers = view
-        .peers
-        .into_iter()
-        .map(|peer| {
-            let (reachability, category, route_kind) = reachability_to_proto(peer.reachability);
-            PeerStatus {
-                device_id: peer.device_id,
-                reachability: reachability as i32,
-                unreachable_category: category as i32,
-                route_kind: route_kind as i32,
-                version_incompatible: peer.version_incompatible,
-            }
-        })
-        .collect();
-    let volumes = view
-        .volumes
-        .into_iter()
-        .map(|v| VolumeFreeSpace {
-            path: v.path,
-            state: v.state,
-            available_bytes: v.available_bytes,
-            headroom_bytes: v.headroom_bytes,
-            total_bytes: v.total_bytes,
-            reclaimable_bytes: 0,
-        })
-        .collect();
-    let update = crate::update_ipc::encode_update_status(view.update);
-    let active_transfers = view
-        .active_transfers
-        .into_iter()
-        .map(|t| ActiveTransferProgress {
-            group_id: t.group_id,
-            path: t.path,
-            bytes_done: t.bytes_done,
-            bytes_total: t.bytes_total,
-            blocks_done: t.blocks_done,
-            blocks_total: t.blocks_total,
-            source_peer: t.source_peer,
-            started_at_unix: t.started_at_unix,
-        })
-        .collect();
-    let recent_errors = view
-        .recent_errors
-        .into_iter()
-        .map(|e| RecentSyncError {
-            category: e.category,
-            timestamp_unix: e.timestamp_unix,
-            coarse_context: e.coarse_context,
-        })
-        .collect();
-    StatusResponse {
-        links,
-        peers,
-        upload_limit_bytes_per_sec: view.upload_limit_bytes_per_sec,
-        download_limit_bytes_per_sec: view.download_limit_bytes_per_sec,
-        update_state: update.state,
-        update_available_version: update.available_version,
-        update_mandatory: update.mandatory,
-        update_required: update.update_required,
-        update_last_error_category: update.last_error_category,
-        update_channel: update.channel,
-        update_install_source: update.install_source,
-        update_holdback_reason: update.holdback_reason,
-        current_upload_bytes_per_sec: view.current_upload_bytes_per_sec,
-        current_download_bytes_per_sec: view.current_download_bytes_per_sec,
-        volumes,
-        block_store_total_bytes: view.block_store.total_bytes,
-        block_store_block_count: view.block_store.block_count,
-        last_gc_unix: view.last_gc_unix,
-        gc_reclaimable_estimate_bytes: view.gc_reclaimable_estimate_bytes,
-        active_transfers,
-        recent_errors,
-        overall_state: String::new(),
-        attention_reasons: Vec::new(),
-        preserved: None,
-        rebootstrapping_groups: Vec::new(),
-        undecided_uploads: 0,
-        undecided_uploads_oldest_ms: 0,
-        provider_roots: Vec::new(),
-        provider_removals: Vec::new(),
-        orphan_domains: Vec::new(),
-        host_api_version: yadorilink_ipc_proto::PROVIDER_HOST_API_VERSION,
-        provider_registry_restored: false,
-    }
-}
-
-/// `LinkStatusView` (`crate::queries::link_status`, DaemonState-independent)
-/// -> the IPC wire type -- the one place this crate is allowed to know
-/// both sides.
-pub(crate) fn encode_link_status(view: crate::queries::link_status::LinkStatusView) -> LinkStatus {
-    let held_files: Vec<HeldFile> = view
-        .held_files
-        .into_iter()
-        .map(|held| HeldFile {
-            path: held.path,
-            reason: held.reason,
-            held_since_unix_nanos: held.held_since_unix_nanos,
-        })
-        .collect();
-    let held_file_count = held_files.len() as u64;
-    let durability_status = durability_status_to_proto(view.durability_status);
-    let durability_evidence = durability_evidence_to_proto(view.durability_evidence);
-    let (provider_root_id, provider_display_name) = view.provider.unwrap_or_default();
-    LinkStatus {
-        provider_root_id,
-        provider_display_name,
-        local_path: view.local_path,
-        group_id: view.group_id,
-        paused: view.paused,
-        conflict_count: view.conflict_count,
-        conflicts_pending: view.conflicts_pending,
-        conflict_note: view.conflict_note,
-        materialization_policy: view.materialization_policy,
-        hydrated_count: view.hydrated_count,
-        placeholder_count: view.placeholder_count,
-        hydrating_count: view.hydrating_count,
-        requested_content_count: view.requested_content_count,
-        held_file_count,
-        held_files,
-        stranded_directory_count: view.stranded_directory_count,
-        unreadable_file_count: view.unreadable_files.len() as u64,
-        pending_approvals: view.pending_approvals,
-        // Filled by the status read, which alone has the space-management cache.
-        reclaimable_bytes: 0,
-        unreadable_files: view
-            .unreadable_files
-            .into_iter()
-            .take(UNREADABLE_FILES_LISTED)
-            .map(|f| yadorilink_ipc_proto::daemonctl::UnreadableFile {
-                path: f.path,
-                reason: f.reason.code().to_owned(),
-            })
-            .collect(),
-        skipped_symlink_count: view.skipped_symlink_count,
-        degraded: view.degraded.is_some(),
-        degraded_reason: view.degraded.map(|d| d.reason).unwrap_or_default(),
-        // This link's active-transfer rollup -- absent (all zero,
-        // `has_active_transfer = false`) when nothing is currently
-        // in flight for this link.
-        has_active_transfer: view.transfer.is_some(),
-        transfer_bytes_done: view.transfer.as_ref().map(|t| t.bytes_done).unwrap_or(0),
-        transfer_bytes_total: view.transfer.as_ref().map(|t| t.bytes_total).unwrap_or(0),
-        transfer_blocks_done: view.transfer.as_ref().map(|t| t.blocks_done).unwrap_or(0),
-        transfer_blocks_total: view.transfer.as_ref().map(|t| t.blocks_total).unwrap_or(0),
-        transfer_eta_seconds: view.transfer.and_then(|t| t.eta_seconds).unwrap_or(0),
-        durability_status: durability_status as i32,
-        durability_evidence: durability_evidence as i32,
-        durability_check_pending: view.durability_check_pending,
-        policy_stale: view.policy_stale,
-        // A folder group linked at more than one folder refuses to sync
-        // entirely (each folder's scan would delete the other's files on
-        // every device). The refusal is otherwise only a log line, which is
-        // loud in the code and silent in the UI -- this is what makes it
-        // visible where the user actually looks, and names every folder
-        // involved so the remedy (unlink all but one) is actionable.
-        ambiguous: view.ambiguous_local_paths.len() > 1,
-        ambiguous_local_paths: view.ambiguous_local_paths,
-        capture_volume_changed: view.capture_volume_changed,
-        capture_volume_unconfirmed: view.capture_volume_unconfirmed,
-        local_storage_state: local_storage_state_to_proto(view.local_storage_state) as i32,
-        fetch_availability: fetch_availability_to_proto(view.fetch_availability) as i32,
-        full_replica_device_ids: view.full_replica_device_ids,
-        // Filled in with the peer list at status assembly, which this per-link
-        // conversion does not see.
-        availability: 0,
-        availability_reachable_device_ids: Vec::new(),
-        availability_offline_device_ids: Vec::new(),
-        availability_update_required_device_ids: Vec::new(),
-        protection: 0,
-        // Input to the dimension fill: who confirmed the custody, if anyone.
-        protection_device_ids: view.custody_confirmed_by,
-        paused_until_unix: view.paused_until_unix,
-    }
-}
-
-/// `StatusResponse.overall_state`'s three values, kept as a small internal
-/// enum (rather than juggling raw strings below) purely so the precedence
-/// rules below read clearly; the wire format is still the plain lowercase
-/// string this converts to via `as_str`, matching every other
-/// string-typed status enum in this message
-/// (`LinkStatus.materialization_policy`, `VolumeFreeSpace.state`,...).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OverallState {
-    Healthy,
-    Attention,
-    Degraded,
-}
-
-impl OverallState {
-    fn as_str(self) -> &'static str {
-        match self {
-            OverallState::Healthy => "healthy",
-            OverallState::Attention => "attention",
-            OverallState::Degraded => "degraded",
-        }
-    }
-}
-
-/// The device that was replaced may have held the only complete replica of a group, and the new
-/// device's state is not confirmed yet: status is never healthy meanwhile. The reason is appended
-/// after the others.
-fn apply_replacement_unconfirmed(
-    pending: bool,
-    overall_state: &mut OverallState,
-    attention_reasons: &mut Vec<String>,
-) {
-    if !pending {
-        return;
-    }
-    attention_reasons
-        .push(yadorilink_local_storage::replacement_unconfirmed::ATTENTION_REASON.to_owned());
-    if *overall_state == OverallState::Healthy {
-        *overall_state = OverallState::Attention;
-    }
-}
-
-/// The confirmation of the replacement was refused for lack of a valid sign-in: the person has to
-/// sign in again. Appended after every other reason (the state is already attention, because the
-/// replacement is unconfirmed).
-fn apply_replacement_sign_in(required: bool, attention_reasons: &mut Vec<String>) {
-    if required {
-        attention_reasons.push(
-            yadorilink_local_storage::replacement_unconfirmed::SIGN_IN_ATTENTION_REASON.to_owned(),
-        );
-    }
-}
-
-/// The person has not yet acknowledged that changes made after the backup may be missing, which
-/// the confirm of the replacement waits for. Appended after every other reason (the state is
-/// already attention, because the replacement is unconfirmed).
-fn apply_replacement_acknowledgement(required: bool, attention_reasons: &mut Vec<String>) {
-    if required {
-        attention_reasons.push(
-            yadorilink_local_storage::replacement_unconfirmed::ACKNOWLEDGEMENT_ATTENTION_REASON
-                .to_owned(),
-        );
-    }
-}
-
-/// Why the confirmation of the replacement is still waiting, as the daemon's last pass recorded
-/// it. Appended after every other reason as `code:reason`, so the wait can be told from a stall.
-fn apply_replacement_waiting(reason: Option<String>, attention_reasons: &mut Vec<String>) {
-    if let Some(reason) = reason {
-        attention_reasons.push(format!(
-            "{}:{reason}",
-            yadorilink_local_storage::replacement_unconfirmed::WAITING_ATTENTION_REASON
-        ));
-    }
-}
-
-fn replacement_waiting_reason() -> Option<String> {
-    let dir = yadorilink_fs_platform::state_dir::state_dir().ok()?;
-    yadorilink_local_storage::replacement_unconfirmed::waiting_reason(&dir)
-}
-
-fn replacement_acknowledgement_required() -> bool {
-    yadorilink_fs_platform::state_dir::state_dir().is_ok_and(|dir| {
-        yadorilink_local_storage::replacement_unconfirmed::acknowledgement_required(&dir)
-    })
-}
-
-fn replacement_sign_in_required() -> bool {
-    yadorilink_fs_platform::state_dir::state_dir()
-        .is_ok_and(|dir| yadorilink_local_storage::replacement_unconfirmed::sign_in_required(&dir))
-}
-
-/// Whether a start over left a replacement the service has not confirmed (see
-/// `yadorilink_local_storage::replacement_unconfirmed`). A state directory that cannot be resolved
-/// has no such record.
-fn replacement_unconfirmed_pending() -> bool {
-    yadorilink_fs_platform::state_dir::state_dir()
-        .is_ok_and(|dir| yadorilink_local_storage::replacement_unconfirmed::pending(&dir))
-}
-
-/// Rolls up every already-populated field on `response` into one
-/// glanceable `(state, reasons)` pair (spec's "Aggregate Sync Status"/
-/// "Sync needs attention" scenarios), computed daemon-side so a UI client
-/// (or the CLI) never has to re-derive "is anything wrong?" itself and
-/// risk drifting from this definition. Deliberately takes the
-/// already-built `StatusResponse` rather than the raw `DaemonState` — this
-/// keeps it a pure function over data the caller already has, directly
-/// unit-testable with plain struct literals (this file's/`status.rs`'s
-/// established discipline), and guarantees the rollup can never disagree
-/// with the detail fields sitting right next to it in the same message.
-///
-/// Precedence (highest first): any link `degraded`, any link whose
-/// `durability_status` is `AT_RISK` (a positively-known "no durable copy
-/// exists anywhere" fact -- the durability axis's own most severe
-/// state), or any volume `state == "critical"` -> `Degraded` (spec: a
-/// low-disk condition on a linked folder needs attention; a *critical*
-/// one is actively blocking sync, same severity split
-/// `VolumeFreeSpace.state`'s own `"low"` vs `"critical"` already draws).
-/// Otherwise any conflict, held file, a `"low"` volume, a disconnected
-/// peer, a link whose `durability_status` cannot currently be confirmed
-/// (`UNKNOWN`/`UNSPECIFIED`) or whose `fetch_availability` is
-/// `UNAVAILABLE_NOW`/`UNKNOWN`/`UNSPECIFIED` (an unconfirmed fetch
-/// availability must never silently read as `AVAILABLE_NOW` any more than
-/// an unconfirmed durability status may silently read as `PROTECTED` --
-/// same fail-safe discipline, applied to both axes uniformly), a
-/// non-empty recent-error feed, or a recorded update failure ->
-/// `Attention`. A merely-`paused` link is *not* by itself
-/// attention-worthy (spec's "Sync is healthy" scenario: "caught up or idle
-/// *without errors*" says nothing about pause being an error state --
-/// pausing is a deliberate user action, matching `status.rs`'s own
-/// `held_summary_suffix`-style "only surface what's actionable"
-/// discipline). Otherwise `Healthy`, with no reasons.
-///
-/// Folding in `durability_status`/`fetch_availability` here is required by
-/// this function's own doc comment above: it claims the rollup "can never
-/// disagree with the detail fields sitting right next to it in the same
-/// message," and an earlier version of this function never read those
-/// two fields at all -- a group with zero durable copies anywhere
-/// (`AtRisk`) could read `Overall: healthy`.
-#[cfg(test)]
-pub(crate) fn attention_reasons_for_tests(response: &StatusResponse) -> Vec<String> {
-    overall_status(response).1
-}
-
-/// Most unreadable files a status reply names; the count carries the rest.
-const UNREADABLE_FILES_LISTED: usize = 50;
-
-fn overall_status(response: &StatusResponse) -> (OverallState, Vec<String>) {
-    use yadorilink_ipc_proto::daemonctl::{FetchAvailability, GroupDurabilityStatus};
-
-    let mut degraded_reasons = Vec::new();
-    let mut attention_reasons = Vec::new();
-
-    for link in &response.links {
-        if link.degraded && link.degraded_reason == crate::link_registry::OWNERSHIP_LOST_REASON {
-            degraded_reasons.push(format!("ownership_lost:{}", link.group_id));
-        } else if link.degraded && link.degraded_reason == crate::link_registry::NOT_JOINED_REASON {
-            degraded_reasons.push(format!("not_joined:{}", link.group_id));
-        } else if link.degraded {
-            degraded_reasons.push(format!("degraded:{}", link.group_id));
-        }
-        // A group linked at several folders syncs nothing at all, which is not
-        // something a rollup may call healthy next to the `NOT SYNCING` detail.
-        if link.ambiguous {
-            degraded_reasons.push(format!("ambiguous:{}", link.group_id));
-        }
-        if link.capture_volume_changed {
-            attention_reasons.push(format!("volume_changed:{}", link.group_id));
-        }
-        if link.capture_volume_unconfirmed {
-            attention_reasons.push(format!("volume_unconfirmed:{}", link.group_id));
-        }
-        match link.durability_status() {
-            GroupDurabilityStatus::AtRisk => {
-                degraded_reasons.push(format!("durability_at_risk:{}", link.group_id));
-            }
-            // Not asked yet is "checking" (see `LinkStatus.durability_check_pending`):
-            // transient, and nothing a user could act on.
-            GroupDurabilityStatus::Unknown if link.durability_check_pending => {}
-            GroupDurabilityStatus::Unknown | GroupDurabilityStatus::Unspecified => {
-                attention_reasons.push(format!("durability_unknown:{}", link.group_id));
-            }
-            GroupDurabilityStatus::Protected | GroupDurabilityStatus::Protecting => {}
-        }
-        let wants_content = link.requested_content_count > 0;
-        // Fetch availability matters only while content is wanted; an idle On-Demand folder's
-        // remote placeholders are its normal steady state (the same predicate as the product
-        // summary's `wants_content`; the rollup/summary agreement test pins the two together).
-        match link.fetch_availability() {
-            _ if !wants_content => {}
-            FetchAvailability::UnavailableNow => {
-                attention_reasons.push(format!("fetch_unavailable:{}", link.group_id));
-            }
-            FetchAvailability::Unknown | FetchAvailability::Unspecified => {
-                attention_reasons.push(format!("fetch_availability_unknown:{}", link.group_id));
-            }
-            FetchAvailability::AvailableNow => {}
-        }
-        if link.conflict_count > 0 {
-            attention_reasons.push(format!("conflict:{}", link.group_id));
-        }
-        if link.conflicts_pending > 0 {
-            attention_reasons.push(format!("conflict_pending:{}", link.group_id));
-        }
-        if link.held_file_count > 0 {
-            attention_reasons.push(format!("held:{}", link.group_id));
-        }
-        if link.unreadable_file_count > 0 {
-            attention_reasons.push(format!("unreadable_files:{}", link.group_id));
-        }
-        if link.stranded_directory_count > 0 {
-            attention_reasons.push(format!("stranded_directory:{}", link.group_id));
-        }
-        if link.pending_approvals > 0 {
-            attention_reasons.push(format!("approval_pending:{}", link.group_id));
-        }
-    }
-    for root in &response.provider_roots {
-        // A provider folder the user can act on: not ready (enable File Provider, an error), files
-        // that keep failing to download, edits kept beside a file waiting to be merged.
-        if root.readiness != "ready" && root.readiness != "preparing the folder" {
-            attention_reasons.push(format!("provider_not_ready:{}", root.root_id));
-        }
-        if !root.stuck.is_empty() {
-            attention_reasons.push(format!("provider_stuck:{}", root.root_id));
-        }
-        if root.kept_edits > 0 {
-            attention_reasons.push(format!("kept_edits:{}", root.root_id));
-        }
-    }
-    if response.provider_removals.iter().any(|r| r.unreadable) {
-        // The list could not be read, so nothing is known about removals: not "no removals".
-        // "removals" cannot be a root id (those are hex digits).
-        attention_reasons.push("provider_not_ready:removals".to_owned());
-    }
-    if response.provider_registry_restored {
-        attention_reasons.push("provider_registry_restored:older_generation".to_owned());
-    }
-    for orphan in &response.orphan_domains {
-        attention_reasons.push(format!("provider_orphan_domain:{orphan}"));
-    }
-    for volume in &response.volumes {
-        match volume.state.as_str() {
-            "critical" => degraded_reasons.push(format!("low_disk_critical:{}", volume.path)),
-            "low" => attention_reasons.push(format!("low_disk:{}", volume.path)),
-            _ => {}
-        }
-    }
-    for peer in &response.peers {
-        // A peer still racing candidates ("connecting") is transient and
-        // not yet attention; only one that genuinely cannot be connected is.
-        if peer.version_incompatible {
-            // Online but on another version: the user updates, nothing is waiting to come back.
-            attention_reasons.push(format!("peer_update_required:{}", peer.device_id));
-        } else if peer.reachability()
-            == yadorilink_ipc_proto::daemonctl::PeerReachability::Unreachable
-        {
-            attention_reasons.push(format!("peer_disconnected:{}", peer.device_id));
-        }
-    }
-    for error in &response.recent_errors {
-        attention_reasons.push(format!("recent_error:{}", error.category));
-    }
-    if response.update_required {
-        // This device is below the signed minimum supported version: it cannot sync with
-        // current-generation devices until it updates.
-        attention_reasons.push("update_required".to_owned());
-    }
-    if !response.update_last_error_category.is_empty() {
-        attention_reasons.push(format!("update_failed:{}", response.update_last_error_category));
-    }
-
-    if !degraded_reasons.is_empty() {
-        degraded_reasons.extend(attention_reasons);
-        return (OverallState::Degraded, degraded_reasons);
-    }
-    if !attention_reasons.is_empty() {
-        return (OverallState::Attention, attention_reasons);
-    }
-    (OverallState::Healthy, Vec::new())
-}
-
 #[cfg(test)]
 mod rewind_execute_wire_tests;
 #[cfg(test)]
 mod rewind_preview_wire_tests;
-
-#[cfg(test)]
-mod overall_status_tests;
 
 #[cfg(test)]
 mod provider_flags_tests {
@@ -3128,8 +2341,6 @@ mod provider_flags_tests {
         assert_eq!(local_state_word(Some(&local_state_from_flags(0x20))), "local-current");
     }
 }
-
-mod status_dimensions;
 
 #[cfg(test)]
 mod entry_kind_wire_tests;

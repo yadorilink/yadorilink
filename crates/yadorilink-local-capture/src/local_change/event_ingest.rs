@@ -10,7 +10,7 @@ use yadorilink_replica_domain::ids::SyncPath;
 use yadorilink_replica_domain::local_op::Op;
 use yadorilink_replica_domain::session_state::MaterializationState;
 
-use yadorilink_fs_platform::fs_identity::disk_race_fingerprint;
+use yadorilink_fs_platform::fs_identity::disk_race_fingerprint_or_stat;
 use yadorilink_fs_platform::ignore_patterns::{is_ignore_file_relative_path, EffectiveIgnoreSet};
 use yadorilink_sync_sqlite::file_index::ImportedActualState;
 
@@ -320,7 +320,7 @@ impl LocalChangeProcessor {
         // once the mutation was fully built it would describe the changed
         // file as "what was prepared against", and the stale mutation would
         // revalidate against itself.
-        let fingerprint_before_observation = disk_race_fingerprint(&event.path);
+        let fingerprint_before_observation = disk_race_fingerprint_or_stat(&event.path);
         let effective_kind = match event.path.symlink_metadata() {
             // Nothing answers to this name at all: a genuine removal.
             Err(error) if error_means_absent(&error) => FsChangeKind::ObservedRemoval,
@@ -623,13 +623,13 @@ impl LocalChangeProcessor {
                 );
                 // Captured before this event's own content read below, so
                 // the eventual commit-time proof-publication check
-                // (`fingerprint_before_content_read == disk_race_
-                // fingerprint(&event.path)` immediately before the
+                // (`closed_disk_observation_if_unraced` against
+                // `fingerprint_before_content_read` immediately before the
                 // single-immediate commit call, further down) can detect a
                 // race across the WHOLE read-through-commit window, not
                 // just the narrower prepare-to-commit window the batched
                 // path's own `disk_fingerprint_at_prepare` already covers.
-                let fingerprint_before_content_read = disk_race_fingerprint(&event.path);
+                let fingerprint_before_content_read = disk_race_fingerprint_or_stat(&event.path);
                 let built = self.build_record_for_created_or_modified(
                     group_id,
                     &root,

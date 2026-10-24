@@ -46,7 +46,18 @@ pub(super) const GROUP: &str = "receive-cost-group";
 /// commit; the temp-file record is the fourth. The guard runs against a quiet
 /// watcher so the count is this exact number and fails if any change adds to
 /// it; do not raise it to absorb a timing-dependent extra, find that extra.
-const MAX_WRITE_TRANSACTIONS_PER_PATH: u64 = 4;
+///
+/// The number lives in `.github/checks/perf-baseline.json`, where changing it needs a
+/// recorded reason (see `.github/checks/check-perf-baseline.py`).
+pub(super) fn max_write_transactions_per_path() -> u64 {
+    perf_baseline()["write_transactions_per_received_path_max"].as_u64().expect("baseline entry")
+}
+
+/// The operation-count baseline shared with the storage-level durability guard.
+pub(super) fn perf_baseline() -> serde_json::Value {
+    serde_json::from_str(include_str!("../../../../.github/checks/perf-baseline.json"))
+        .expect("perf-baseline.json parses")
+}
 
 pub(super) struct Fixture {
     pub(super) state: Arc<DaemonState>,
@@ -71,7 +82,7 @@ pub(super) async fn fixture(on_disk: bool) -> Fixture {
 /// debounced event lands, which on a slow disk is inside the window being
 /// counted) is the watcher's cost, not the receive's, and would make the count
 /// depend on timing.
-async fn quiet_fixture(on_disk: bool) -> Fixture {
+pub(super) async fn quiet_fixture(on_disk: bool) -> Fixture {
     let (source, events) = SimulatedFolderWatchSource::new(16);
     fixture_watching(on_disk, Arc::new(source), Some(events)).await
 }
@@ -276,9 +287,10 @@ async fn measurement_guard_write_transactions_per_received_path() {
     }
     for (shape, per_path) in measured {
         assert!(
-            per_path <= MAX_WRITE_TRANSACTIONS_PER_PATH as f64,
+            per_path <= max_write_transactions_per_path() as f64,
             "receiving one {shape} file took {per_path} write transactions, more than the \
-             {MAX_WRITE_TRANSACTIONS_PER_PATH} this guard allows"
+             {} this guard allows",
+            max_write_transactions_per_path()
         );
     }
 }
@@ -383,7 +395,7 @@ async fn a_burst_of_received_files_arrives_whole_through_the_engine() {
     const COUNT: usize = 24;
     let (_sites, total, _) = receive_window_by_site(COUNT, false).await;
     assert!(
-        total <= MAX_WRITE_TRANSACTIONS_PER_PATH * COUNT as u64,
+        total <= max_write_transactions_per_path() * COUNT as u64,
         "{total} write transactions for {COUNT} files"
     );
 }

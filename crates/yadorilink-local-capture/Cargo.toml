@@ -15,11 +15,12 @@ test-support = [
     "yadorilink-replica-domain/test-support",
     "yadorilink-root-authority/test-support",
     "yadorilink-filesystem-sync/test-support",
+    "yadorilink-fs-platform/test-support",
 ]
 
 [dependencies]
 # See `yadorilink_filesystem_sync::debounce`'s own doc comment.
-yadorilink-filesystem-sync = { path = "../yadorilink-filesystem-sync" }
+yadorilink-filesystem-sync = { path = "../yadorilink-filesystem-sync", default-features = false }
 yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
 yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
 yadorilink-root-authority = { path = "../yadorilink-root-authority" }
@@ -35,6 +36,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# The tests watch real folders.
+yadorilink-filesystem-sync = { path = "../yadorilink-filesystem-sync", features = ["os-watch"] }
 # `local_change.rs`'s own local-origin zero-work-proof regression needs
 # `PathResolution` to call `SqliteSyncStore::dag_desired_resolved_path_
 # state_hash`'s test-facing delegate directly -- this crate's production

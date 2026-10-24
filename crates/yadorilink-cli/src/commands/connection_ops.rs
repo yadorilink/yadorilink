@@ -37,7 +37,8 @@ async fn installation_rows() -> Vec<install_check::Finding> {
         ownership::RecordState::Present(r) => Some(r.install_root.as_str()),
         _ => None,
     };
-    let roots = service_registrations::Roots::detect(home, recorded_root);
+    let roots = service_registrations::Roots::detect(home, recorded_root)
+        .with_system_root(std::env::var_os("SystemRoot"));
     install_check::check(&install_check::Facts {
         config_dir: &config_dir,
         record: &record,

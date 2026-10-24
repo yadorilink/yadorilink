@@ -85,7 +85,7 @@ impl ConsentStore {
             use std::io::Write;
             let mut file = std::fs::File::create(&tmp_path)?;
             file.write_all(json.as_bytes())?;
-            file.sync_all()
+            yadorilink_fs_platform::flush::sync_file(&file)
         })();
         if let Err(error) = flushed {
             let _ = std::fs::remove_file(&tmp_path);

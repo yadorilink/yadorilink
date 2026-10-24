@@ -15,6 +15,7 @@ pub mod backoff;
 pub mod engine;
 #[path = "engine.rs"]
 mod engine_impl;
+pub(crate) use engine_impl::parse_reconcile_paths;
 
 #[cfg(test)]
 mod receive_budget_tests;

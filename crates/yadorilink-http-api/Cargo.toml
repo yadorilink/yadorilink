@@ -49,7 +49,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # in `lib.rs::build_router` -- `limit` for `tower::limit::ConcurrencyLimitLayer`,
 # `timeout` for `tower_http::timeout::TimeoutLayer`.
 tower = { version = "0.5", default-features = false, features = ["limit"] }
-tower-http = { version = "0.6", default-features = false, features = ["timeout"] }
+tower-http = { version = "0.7", default-features = false, features = ["timeout"] }
 # Serves device-authorized streams (`peer.rs`) inside a task `run` owns, so
 # they end with it; axum's own `serve` detaches every connection. Both are
 # already in the lock as axum's dependencies.
@@ -59,7 +59,7 @@ hyper-util = { version = "0.1", default-features = false, features = ["tokio", "
 [target.'cfg(windows)'.dependencies]
 # Named-pipe client retry-on-busy loop, mirroring
 # `yadorilink-cli`'s own `control_client.rs` exactly (same feature set).
-windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 # This crate's own `tests/*.rs` integration binaries link against

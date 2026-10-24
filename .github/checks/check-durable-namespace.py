@@ -81,7 +81,15 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     # segment is not a namespace publish, and a lost one leaves a segment the next collection
     # removes again.
     C + "yadorilink-fs-platform/src/durable_dir/judged_remove.rs": {"fs::remove_file": 1},
-    C + "yadorilink-fs-platform/src/fs_capabilities.rs": {"fs::remove_file": 20, "fs::rename": 1},
+    # Capability probes remove their own throwaway artefacts, and `sweep_probe_artefacts` removes
+    # the ones a killed probe left: a removal lost to a crash leaves a reserved-name artefact the
+    # next sweep removes again, and nothing is published.
+    C
+    + "yadorilink-fs-platform/src/fs_capabilities.rs": {
+        "fs::remove_file": 21,
+        "fs::remove_dir_all": 1,
+        "fs::rename": 1,
+    },
     C + "yadorilink-peer-session/src/hazard.rs": {"fs::remove_dir_all": 1},
     # `yadorilink uninstall`: the removal of the installer's own program files, links and (on
     # request) the data directory; a removal lost to a crash leaves files the same command removes
@@ -271,9 +279,9 @@ def self_test() -> None:
         root = Path(tmp)
         gate = root / GATE_FILE
         gate.parent.mkdir(parents=True)
-        gate.write_text("pub(crate) const WINDOWS_DIRECTORY_DURABILITY_VALIDATED: bool = false;\n")
+        gate.write_text("pub(crate) const WINDOWS_DIRECTORY_DURABILITY_VALIDATED: bool = false;\n", encoding="utf-8")
         assert gate_errors(root, pending) == []
-        gate.write_text("pub(crate) const WINDOWS_DIRECTORY_DURABILITY_VALIDATED: bool = true;\n")
+        gate.write_text("pub(crate) const WINDOWS_DIRECTORY_DURABILITY_VALIDATED: bool = true;\n", encoding="utf-8")
         assert gate_errors(root, {}) == []
         assert gate_errors(root, pending), "an open gate over pending work must fail"
         src = root / "crates/demo/src"

@@ -702,11 +702,11 @@ fn granularity_cache_reprobes_on_a_different_volume_identity_but_not_the_same_on
     let probes_for_a = AtomicU64::new(0);
     let first = cached_granularity_for_volume(volume_a, || {
         probes_for_a.fetch_add(1, Ordering::SeqCst);
-        TimestampGranularity::Fine
+        Some(TimestampGranularity::Fine)
     });
     let second = cached_granularity_for_volume(volume_a, || {
         probes_for_a.fetch_add(1, Ordering::SeqCst);
-        TimestampGranularity::Coarse
+        Some(TimestampGranularity::Coarse)
     });
     assert_eq!(first, TimestampGranularity::Fine);
     assert_eq!(
@@ -723,7 +723,7 @@ fn granularity_cache_reprobes_on_a_different_volume_identity_but_not_the_same_on
     let probes_for_b = AtomicU64::new(0);
     let third = cached_granularity_for_volume(volume_b, || {
         probes_for_b.fetch_add(1, Ordering::SeqCst);
-        TimestampGranularity::Coarse
+        Some(TimestampGranularity::Coarse)
     });
     assert_eq!(
         third,
@@ -742,4 +742,20 @@ fn granularity_probe_treats_zero_usable_samples_as_coarse_not_unresolved() {
     // on it still blocks on ambiguity rather than guessing.
     let missing = std::env::temp_dir().join("yadorilink-fscap-granularity-missing-dir");
     assert_eq!(probe_birth_time_granularity(&missing), TimestampGranularity::Coarse);
+}
+
+/// A measurement that could not be made (the directory vanished mid-probe) answers `Coarse` for
+/// that call only: it is not kept, and the next valid measurement on the same volume decides.
+#[test]
+fn an_unmeasurable_granularity_is_not_kept_for_the_volume() {
+    let volume = VolumeIdentity::Unix { device_id: 0xE4E4 };
+    assert_eq!(cached_granularity_for_volume(volume, || None), TimestampGranularity::Coarse);
+    assert_eq!(
+        cached_granularity_for_volume(volume, || Some(TimestampGranularity::Fine)),
+        TimestampGranularity::Fine
+    );
+    let gone = tempfile::tempdir().unwrap();
+    let path = gone.path().to_path_buf();
+    drop(gone);
+    assert_eq!(measure_birth_time_granularity(&path), None);
 }

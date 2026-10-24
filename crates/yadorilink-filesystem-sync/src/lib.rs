@@ -11,5 +11,6 @@ pub mod materialization_eviction;
 pub mod materialization_execution;
 pub mod materialization_repair;
 pub mod watcher;
+#[cfg(feature = "os-watch")]
 #[cfg_attr(not(windows), allow(dead_code))]
 mod win_watch;

@@ -192,5 +192,8 @@ pub async fn update_check(State(state): State<AppState>) -> Result<Json<Value>, 
         "last_error_category": s.last_error_category,
         "last_error_message": s.last_error_message,
         "manifest_generated_at": s.manifest_generated_at,
+        "last_success_unix": s.last_success_unix,
+        "manifest_expires_at": s.manifest_expires_at,
+        "manifest_expired": s.manifest_expired,
     })))
 }

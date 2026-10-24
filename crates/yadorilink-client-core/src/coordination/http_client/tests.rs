@@ -121,6 +121,14 @@ fn plain_401_and_untyped_bodies_keep_their_prior_classification() {
     assert!(matches!(other, CoreError::Other(_)));
 }
 
+/// Only a 401 carrying the `device_superseded` code is the typed replaced-device refusal.
+#[test]
+fn a_401_device_superseded_is_its_own_error_and_other_statuses_are_not() {
+    let body = serde_json::json!({ "error": "device_superseded" });
+    assert!(matches!(error_from_body(401, &body), CoreError::DeviceSuperseded));
+    assert!(matches!(error_from_body(403, &body), CoreError::Forbidden(_)));
+}
+
 /// A 403 is classified as its own category, and its text is the bare error
 /// code exactly as the untyped classification rendered it.
 #[test]
@@ -177,6 +185,61 @@ fn coordination_addr_uses_compiled_default_without_env() {
 #[test]
 fn coordination_addr_falls_back_to_loopback() {
     assert_eq!(resolve_coordination_addr(None, None), "http://127.0.0.1:8787");
+}
+
+/// The address of a request is the one its access was built with, whatever the process
+/// environment says: an embedded host picks its server through its settings, and a second engine
+/// in the process cannot be redirected by a variable.
+#[tokio::test]
+async fn a_request_goes_to_its_accesss_address_and_not_the_environments() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/ping"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+        .mount(&server)
+        .await;
+    let _guard = COORDINATION_ADDR_ENV_LOCK.lock().await;
+    std::env::set_var(COORDINATION_ADDR_VAR, "http://127.0.0.1:1");
+    let access =
+        CoordinationAccess::new(yadorilink_fapi_client::test_support::offline_auth(), server.uri());
+    let answer: serde_json::Value = get_json("/ping", &access).await.expect("served by the mock");
+    std::env::remove_var(COORDINATION_ADDR_VAR);
+    assert_eq!(answer["ok"], true);
+}
+
+/// The settings carry the coordination address: an explicit one wins, an unset one is the build's
+/// default, and building settings for a host reads no variable.
+#[tokio::test]
+async fn the_coordination_address_is_a_setting_the_environment_only_fills_at_the_entry_point() {
+    use crate::coordination::credential_store::CredentialSettings;
+    use yadorilink_fapi_client::store::Backend;
+    use yadorilink_transport::KeyMirror;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let _guard = COORDINATION_ADDR_ENV_LOCK.lock().await;
+    std::env::set_var(COORDINATION_ADDR_VAR, "http://127.0.0.1:3");
+    let backend = Backend::File(dir.path().join("credentials.json"));
+    let host = CredentialSettings::new(backend, KeyMirror::Disabled);
+    assert_eq!(host.coordination_addr, None);
+    assert_eq!(
+        host.coordination_addr(),
+        resolve_coordination_addr(None, COMPILED_COORDINATION_ADDR),
+        "a host's settings ignore the environment"
+    );
+    let explicit =
+        CredentialSettings { coordination_addr: Some("http://127.0.0.1:4".into()), ..host.clone() };
+    assert_eq!(explicit.coordination_addr(), "http://127.0.0.1:4");
+
+    std::env::set_var("YADORILINK_CREDENTIAL_STORE", "file");
+    std::env::set_var("YADORILINK_CREDENTIAL_FILE", dir.path().join("credentials.json"));
+    let mapped = CredentialSettings::from_env(dir.path()).expect("settings");
+    std::env::remove_var("YADORILINK_CREDENTIAL_FILE");
+    std::env::remove_var("YADORILINK_CREDENTIAL_STORE");
+    std::env::remove_var(COORDINATION_ADDR_VAR);
+    assert_eq!(mapped.coordination_addr.as_deref(), Some("http://127.0.0.1:3"));
 }
 
 /// A step that never finishes (a service that accepts and never answers, at
@@ -275,4 +338,26 @@ async fn stalled_body_is_unreachable(status: &str) {
     tokio::time::pause();
     let err = handle_response::<serde_json::Value>(resp).await.unwrap_err();
     assert!(matches!(err, CoreError::CoordinationPlaneUnreachable(_)), "{err:?}");
+}
+
+/// The exact body the coordination service sends while the Terms gate is on.
+#[test]
+fn the_terms_consent_refusal_is_typed_and_is_not_a_plain_forbidden() {
+    let body = serde_json::json!({
+        "error": "terms_consent_required",
+        "terms_version": "placeholder-v0",
+        "message": "the current Terms and consent have not been accepted; sign in again to review and accept them",
+    });
+    match error_from_body(403, &body) {
+        CoreError::TermsConsentRequired { terms_version } => {
+            assert_eq!(terms_version.as_deref(), Some("placeholder-v0"))
+        }
+        other => panic!("{other:?}"),
+    }
+    // Only a 403 is the gate; the same code on another status is not.
+    assert!(!matches!(error_from_body(401, &body), CoreError::TermsConsentRequired { .. }));
+    assert!(matches!(
+        error_from_body(403, &serde_json::json!({"error": "forbidden"})),
+        CoreError::Forbidden(_)
+    ));
 }

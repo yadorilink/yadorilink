@@ -13,15 +13,17 @@ use yadorilink_local_storage::SegmentBlockStore;
 async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("YADORILINK_CONFIG_DIR", dir.path());
-    // Mirrors `tests/update.rs::start_daemon`'s own rationale: point the
-    // periodic update-check scheduler `DaemonState::new` spawns
-    // immediately at a local port nothing listens on, so it fails fast
-    // and deterministically instead of depending on real network/DNS
-    // behavior in this test.
-    std::env::set_var("YADORILINK_UPDATE_MANIFEST_URL", "http://127.0.0.1:1/manifest.json");
+    // The manifest URL is an explicit engine setting: nothing listens on this port, so the
+    // update check fails fast instead of reaching the production manifest.
+    let tuning = yadorilink_daemon::engine_tuning::EngineTuning {
+        update_manifest_url: Some("http://127.0.0.1:1/manifest.json".into()),
+        witness: yadorilink_daemon::install_witness::WitnessPlacement::BesideDatabase,
+        ..Default::default()
+    };
 
     let store = Arc::new(SegmentBlockStore::new(dir.path().join("blocks")).unwrap());
-    let sync_state = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
+    let sync_state =
+        Arc::new(ReplicaCoordinator::open_with(dir.path().join("sync.sqlite3"), tuning).unwrap());
     let state = DaemonState::new("device-under-test".into(), sync_state, store);
 
     let socket_path = dir.path().join("daemon.sock");

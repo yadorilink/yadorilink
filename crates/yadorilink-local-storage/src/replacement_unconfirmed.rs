@@ -76,7 +76,7 @@ pub fn write(dir: &Path, record: &Record) -> std::io::Result<()> {
     {
         let mut file = std::fs::File::create(&staged)?;
         std::io::Write::write_all(&mut file, &serde_json::to_vec_pretty(record)?)?;
-        file.sync_all()?;
+        yadorilink_fs_platform::flush::sync_file(&file)?;
     }
     durable_dir::publish_durably(&staged, &path(dir), durable_dir::Replace::Yes)
 }
@@ -139,7 +139,7 @@ pub fn set_sign_in_required(dir: &Path, required: bool) -> std::io::Result<()> {
         yadorilink_fs_platform::durable_dir::remove_file_durably(&staged)?;
         {
             let file = std::fs::File::create(&staged)?;
-            file.sync_all()?;
+            yadorilink_fs_platform::flush::sync_file(&file)?;
         }
         yadorilink_fs_platform::durable_dir::publish_durably(
             &staged,
@@ -190,7 +190,7 @@ pub fn set_waiting_reason(dir: &Path, reason: Option<&str>) -> std::io::Result<b
     {
         let mut file = std::fs::File::create(&staged)?;
         std::io::Write::write_all(&mut file, flat.as_bytes())?;
-        file.sync_all()?;
+        yadorilink_fs_platform::flush::sync_file(&file)?;
     }
     yadorilink_fs_platform::durable_dir::publish_durably(
         &staged,

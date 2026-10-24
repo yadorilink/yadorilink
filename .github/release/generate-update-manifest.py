@@ -63,10 +63,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import channel_ledger  # noqa: E402
+import release_channels  # noqa: E402
 
 MANIFEST_SCHEMA_VERSION = 2
-CHANNELS = ("nightly", "beta")
-SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+CHANNELS = release_channels.CHANNELS
+SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 
 # Fields the client requires with no serde default — must always be present.
 REQUIRED_ENTRY_FIELDS = (
@@ -88,7 +89,7 @@ def parse_semver(raw: str) -> tuple[int, int, int, str]:
     prerelease string is compared lexically only for equal core versions,
     which is enough for the min<=version validation we do here."""
     s = raw[1:] if raw.startswith("v") else raw
-    m = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$", s)
+    m = re.fullmatch(r"([0-9]+)\.([0-9]+)\.([0-9]+)(?:[-+].*)?", s)
     if not m:
         raise ValueError(f"not strict semver: {raw!r}")
     pre = s[m.end(3):]
@@ -174,24 +175,43 @@ def build_manifest(shared: dict, artifacts: list[dict], generated_at: str) -> di
             "artifact_publisher_identity": a.get("artifact_publisher_identity", ""),
             "release_notes_url": shared.get("release_notes_url", ""),
         }
+        # The engine's declared state database range, when the artifact record carries it.
+        for key in ("state_schema_version", "state_schema_min_readable", "sparkle_build"):
+            if key in a:
+                entry[key] = int(a[key])
         releases.append(entry)
     return {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "generated_at": generated_at,
+        "expires_at": channel_ledger.expires_at_for(generated_at),
         "releases": releases,
     }
 
 
-def validate_manifest(manifest: dict, check_urls: bool, floor: str | None = None) -> list[str]:
+def validate_manifest(manifest: dict, check_urls: bool, floor: str | None = None,
+                      snapshot: bool = False, require_sparkle_build: bool = False) -> list[str]:
     """Field/consistency validation that must pass BEFORE signing
     (spec: 'Manifest is validated before signing'). Returns a list of
     problems; empty means valid. With `floor` (the first release of the protocol generation
-    being published) every entry's minimum_supported_version must be at least the floor."""
+    being published) every entry's minimum_supported_version must be at least the floor.
+    The live channel manifest must carry a valid expires_at; with `snapshot` (a per-version
+    manifest, published once and kept, never expired) it is accepted with or without one."""
     problems: list[str] = []
     if manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
         problems.append(
             f"schema_version must be {MANIFEST_SCHEMA_VERSION}, got {manifest.get('schema_version')!r}"
         )
+    generated_at = manifest.get("generated_at")
+    expires_at = manifest.get("expires_at")
+    stamp = channel_ledger.GENERATED_AT_RE
+    if not (isinstance(generated_at, str) and stamp.fullmatch(generated_at)):
+        problems.append(f"generated_at {generated_at!r} must be YYYY-MM-DDTHH:MM:SSZ")
+    elif snapshot:
+        pass
+    elif not (isinstance(expires_at, str) and stamp.fullmatch(expires_at)):
+        problems.append(f"expires_at {expires_at!r} is required and must be YYYY-MM-DDTHH:MM:SSZ")
+    elif expires_at <= generated_at:
+        problems.append(f"expires_at {expires_at} must be after generated_at {generated_at}")
     releases = manifest.get("releases")
     if not isinstance(releases, list) or not releases:
         problems.append("releases must be a non-empty array")
@@ -202,6 +222,15 @@ def validate_manifest(manifest: dict, check_urls: bool, floor: str | None = None
         for f in REQUIRED_ENTRY_FIELDS:
             if not e.get(f):
                 problems.append(f"{where}.{f} is required and non-empty")
+        build = e.get("sparkle_build")
+        if e.get("install_source") == "app_bundle":
+            valid = isinstance(build, int) and not isinstance(build, bool) and build > 0
+            if build is None and not require_sparkle_build:
+                pass
+            elif not valid:
+                problems.append(f"{where}.sparkle_build must be a positive integer for app_bundle")
+        elif build is not None:
+            problems.append(f"{where}.sparkle_build is only carried by app_bundle entries")
         ch = e.get("channel")
         if ch not in CHANNELS:
             problems.append(f"{where}.channel {ch!r} is not one of {CHANNELS}")
@@ -212,7 +241,7 @@ def validate_manifest(manifest: dict, check_urls: bool, floor: str | None = None
         if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
             problems.append(f"{where}.artifact_size must be a positive integer byte count")
         sha = e.get("artifact_sha256", "")
-        if not SHA256_RE.match(sha):
+        if not SHA256_RE.fullmatch(sha):
             problems.append(f"{where}.artifact_sha256 must be 64 lowercase hex chars")
         ver = e.get("version", "")
         minv = e.get("minimum_supported_version", "")
@@ -263,7 +292,7 @@ def _url_resolves(url: str, sha256: str) -> bool:
     try:
         with urllib.request.urlopen(url + ".sha256", timeout=20) as r:  # noqa: S310
             sidecar = r.read().decode().split()[0].strip().lower()
-            if SHA256_RE.match(sidecar):
+            if SHA256_RE.fullmatch(sidecar):
                 return sidecar == sha256.lower()
     except Exception:
         pass
@@ -285,12 +314,12 @@ def sign_or_write(manifest: dict, out_path: Path, *, require_signature: bool,
             print(f"error: {msg}", file=sys.stderr)
             return 3
         print(f"warning: {msg} Writing UNSIGNED body to {out_path}.", file=sys.stderr)
-        out_path.write_text(body_json, encoding="utf-8")
+        out_path.write_text(body_json, encoding="utf-8", newline="\n")
         return 0
 
     with tempfile.TemporaryDirectory() as td:
         body_file = Path(td) / "manifest-body.json"
-        body_file.write_text(body_json, encoding="utf-8")
+        body_file.write_text(body_json, encoding="utf-8", newline="\n")
         cmd = [
             sign_tool, "sign",
             "--key-hex", key,
@@ -368,14 +397,25 @@ def cmd_assemble(args: argparse.Namespace) -> int:
         if args.previous_ledger:
             previous = channel_ledger.load_json(
                 Path(args.previous_ledger).read_text(encoding="utf-8"), args.previous_ledger)
+        source = None
+        source_path = args.promotion_source_ledger
+        if not source_path and (source_channel := release_channels.PROMOTES_FROM.get(ledger_path.stem)):
+            # A channel that promotes always reads its source from the sibling ledger, as the
+            # publisher does (plan.load_inputs): no caller can forget the argument.
+            source_path = str(ledger_path.with_name(f"{source_channel}.json"))
+        if source_path and (args.promotion_source_ledger or Path(source_path).is_file()):
+            source = channel_ledger.load_json(Path(source_path).read_text(encoding="utf-8"), source_path)
         records = channel_ledger.load_records(Path(args.records_dir))
         chain_text = Path(args.trust_chain).read_text(encoding="utf-8")
         plan = channel_ledger.assemble(
             ledger, records, chain_text, args.generated_at, floor=floor, previous_ledger=previous,
             served_appcast_version=args.served_appcast_version, ledger_stem=ledger_path.stem,
+            promotion_source=source,
         )
         # Belt and braces: the body must also pass the generic manifest validation.
-        problems = validate_manifest(json.loads(plan["manifest_body"]), check_urls=False, floor=floor)
+        problems = validate_manifest(
+            json.loads(plan["manifest_body"]), check_urls=False, floor=floor,
+            require_sparkle_build=True)
         if problems:
             raise channel_ledger.LedgerError(problems)
     except FloorError as ex:
@@ -389,10 +429,10 @@ def cmd_assemble(args: argparse.Namespace) -> int:
     except OSError as ex:
         print(f"error: {ex}", file=sys.stderr)
         return 2
-    Path(args.out_body).write_text(plan["manifest_body"], encoding="utf-8")
+    Path(args.out_body).write_text(plan["manifest_body"], encoding="utf-8", newline="\n")
     if args.out_appcast:
         Path(args.out_appcast).write_text(
-            json.dumps(plan["appcast"], indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            json.dumps(plan["appcast"], indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
     print(f"manifest_body_sha256={plan['manifest_body_sha256']}")
     print(f"trust_chain_sha256={plan['trust_chain_sha256']}")
     return 0
@@ -447,6 +487,7 @@ def cmd_resign(args: argparse.Namespace) -> int:
     manifest["generated_at"] = args.generated_at or datetime.now(timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
+    manifest["expires_at"] = channel_ledger.expires_at_for(manifest["generated_at"])
 
     try:
         floor = generation_floor(Path(args.repo_root))
@@ -516,6 +557,9 @@ def main(argv: list[str]) -> int:
     a.add_argument("--previous-ledger", default=None,
                    help="the ledger this one replaces (e.g. from the base branch); enables the "
                         "promotion, yank and live-minimum rules")
+    a.add_argument("--promotion-source-ledger", default=None,
+                   help="the ledger of the channel this one promotes from (default: the sibling <source>.json "
+                        "of a channel that promotes; a missing one is refused by the ledger rules)")
     a.add_argument("--served-appcast-version", default=None,
                    help="app_bundle version currently in the served appcast")
     a.add_argument("--trust-chain", default=str(Path(__file__).with_name("trust-chain.json")))

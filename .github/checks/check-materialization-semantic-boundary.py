@@ -432,7 +432,7 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     # same predicate the post-compare branch already uses; no state change).
     F + "materialization_repair.rs": {
         "has_usable_materialized_generation": 3,
-        "commit_recovered_materialized_state": 2,
+        "commit_recovered_materialized_state": 1,
         "open_materialization_intent_guard": 1,
         "dag_bump_mutation_fence": 3,
         "clear_materialization_intent": 2,
@@ -555,7 +555,7 @@ ALLOWLIST: dict[str, dict[str, int]] = {
 #   L daemon/local_convergence/types.rs                             3
 #   L daemon/materialization_intent.rs                              2
 #   L filesystem-sync/materialization_eviction.rs                   1
-#   L filesystem-sync/materialization_repair.rs                    14
+#   L filesystem-sync/materialization_repair.rs                    13
 #   L local-capture/local_change/event_ingest.rs                    4
 #   L local-capture/local_change/flush.rs                           1
 #   L local-capture/local_change/scan.rs                            2
@@ -577,9 +577,9 @@ ALLOWLIST: dict[str, dict[str, int]] = {
 #   R sync-sqlite/store.rs                                         12
 #   R sync-sqlite/structural_origin.rs                              3
 #   ------------------------------------------------------------
-#   total 191 = lane 44 + owner 91 + repository 56 (the per-file rows above are
+#   total 190 = lane 43 + owner 91 + repository 56 (the per-file rows above are
 #   indicative; the pins in ALLOWLIST are authoritative)
-EXPECTED_ALLOWED = 191
+EXPECTED_ALLOWED = 190
 
 # The in-family row mutators outside `FORBIDDEN`. Each also writes
 # materialization-relevant columns (a peer row's version and authoring, the

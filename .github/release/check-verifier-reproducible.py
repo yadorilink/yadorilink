@@ -82,7 +82,7 @@ def main(argv: list[str]) -> int:
         out_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(first, out_dir / first.name)
         shutil.copy2(first.with_name(first.name + ".sha256"), out_dir / (first.name + ".sha256"))
-    print(f"reproducible: {(out_dir / (first.name + '.sha256')).read_text().strip()}")
+    print(f"reproducible: {(out_dir / (first.name + '.sha256')).read_text(encoding="utf-8").strip()}")
     return 0
 
 

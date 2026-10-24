@@ -47,10 +47,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::core::{Result as WinResult, GUID, PCWSTR};
-use windows::Win32::Foundation::{NTSTATUS, STATUS_SUCCESS, STATUS_UNSUCCESSFUL};
+use windows::Win32::Foundation::{
+    NTSTATUS, STATUS_CLOUD_FILE_INSUFFICIENT_RESOURCES, STATUS_CLOUD_FILE_NETWORK_UNAVAILABLE,
+    STATUS_CLOUD_FILE_NOT_IN_SYNC, STATUS_CLOUD_FILE_REQUEST_CANCELED, STATUS_SUCCESS,
+    STATUS_UNSUCCESSFUL,
+};
 use windows::Win32::Storage::CloudFilters::{
     CfConnectSyncRoot, CfCreatePlaceholders, CfDisconnectSyncRoot, CfExecute,
-    CfGetSyncRootInfoByPath, CfRegisterSyncRoot, CfUnregisterSyncRoot, CF_CALLBACK_INFO,
+    CfGetSyncRootInfoByPath, CfRegisterSyncRoot, CfReportProviderProgress, CfUnregisterSyncRoot, CF_CALLBACK_INFO,
     CF_CALLBACK_PARAMETERS, CF_CALLBACK_REGISTRATION, CF_CALLBACK_TYPE_CANCEL_FETCH_DATA,
     CF_CALLBACK_TYPE_FETCH_DATA, CF_CALLBACK_TYPE_NONE, CF_CONNECT_FLAG_NONE, CF_CREATE_FLAG_NONE,
     CF_HARDLINK_POLICY_NONE, CF_HYDRATION_POLICY, CF_HYDRATION_POLICY_FULL,
@@ -68,6 +72,7 @@ use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO,
 };
 use yadorilink_fs_platform::durable_dir::{move_durably, NameLedger, Replace};
+use yadorilink_windows_provider_policy::fetch_report::{FetchFailure, RangeProgress};
 use yadorilink_fs_platform::reserved_namespace::{artefact_component_name, ArtefactKind};
 
 use crate::windowed_fetch;
@@ -978,6 +983,37 @@ struct ProviderFetch<'a> {
     placeholder_size: u64,
     cancelled: &'a AtomicBool,
     next: &'a AtomicU64,
+    /// The daemon's typed reason for the last refusal (`MaterializeFailure`), `0` when none.
+    refusal: &'a std::sync::atomic::AtomicI32,
+    /// What the operating system is told about how far the whole range is.
+    progress: &'a RangeProgress,
+}
+
+/// Tells the operating system how far the provider is with the transfer `info` belongs to:
+/// `completed` of `total` bytes. Best effort; progress is information and never changes the
+/// outcome of the fetch.
+unsafe fn report_progress(info: &CF_CALLBACK_INFO, total: u64, completed: u64) {
+    #[cfg(test)]
+    PROGRESS_REPORTS.lock().unwrap().push((total, completed));
+    let _ = CfReportProviderProgress(
+        info.ConnectionKey,
+        info.TransferKey,
+        i64::try_from(total).unwrap_or(i64::MAX),
+        i64::try_from(completed).unwrap_or(i64::MAX),
+    );
+}
+
+/// The completion status that tells Explorer and applications why a fetch failed: a full disk,
+/// an unreachable device, a version that is gone and a reader that left are different problems.
+/// Anything else stays the generic failure.
+fn fetch_failure_status(failure: FetchFailure) -> NTSTATUS {
+    match failure {
+        FetchFailure::LowDisk => STATUS_CLOUD_FILE_INSUFFICIENT_RESOURCES,
+        FetchFailure::Unreachable => STATUS_CLOUD_FILE_NETWORK_UNAVAILABLE,
+        FetchFailure::VersionUnavailable => STATUS_CLOUD_FILE_NOT_IN_SYNC,
+        FetchFailure::Cancelled => STATUS_CLOUD_FILE_REQUEST_CANCELED,
+        FetchFailure::Other => STATUS_UNSUCCESSFUL,
+    }
 }
 
 impl windowed_fetch::Window for ProviderFetch<'_> {
@@ -1000,16 +1036,31 @@ impl windowed_fetch::Window for ProviderFetch<'_> {
         use std::io::{Read, Seek};
 
         let request_id = next_request_id();
-        let response = crate::provider_client::materialize_within(
+        // Progress of the daemon's own assembly of this window, as the progress of the range.
+        // Nothing is reported once the reader is gone.
+        let info = self.info;
+        let (cancelled, progress) = (self.cancelled, self.progress);
+        let on_progress = |verified: u64, of: u64| {
+            if cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+            if let Some((total, completed)) = progress.report(start, end, verified, of) {
+                // Safety: `info` is the callback's own, valid for the whole callback.
+                unsafe { report_progress(info, total, completed) };
+            }
+        };
+        let response = crate::provider_client::materialize_reporting(
             crate::provider_client::MATERIALIZE_TIMEOUT,
             self.cancelled,
             self.root,
             self.item,
             &request_id,
             target,
+            &on_progress,
         )
         .ok_or("the daemon did not answer the materialization")?;
         if !response.ok {
+            self.refusal.store(response.failure, Ordering::Relaxed);
             return Err(format!(
                 "the daemon refused the materialization (failure {}): {}",
                 response.failure, response.error
@@ -1164,6 +1215,7 @@ unsafe fn fetch_provider_item(
     let next = Arc::new(AtomicU64::new(required_offset.max(0) as u64));
     let asked_end: i64 = required_offset.saturating_add(required_length);
     let (_active, cancelled) = ActiveGuard::new(info, &next, required_offset.max(0), asked_end);
+    let refusal = std::sync::atomic::AtomicI32::new(0);
     let served = (|| -> Result<(), String> {
         let root = connected_root(info.ConnectionKey.0)
             .and_then(|root| root.provider_root)
@@ -1179,6 +1231,7 @@ unsafe fn fetch_provider_item(
         crate::provider_client::note_fetch_activity(&root, item_id);
         next.store(start, Ordering::Relaxed);
         let mut at = start;
+        let progress = RangeProgress::new(start, end);
         let mut io = ProviderFetch {
             info,
             root: &root,
@@ -1186,6 +1239,8 @@ unsafe fn fetch_provider_item(
             placeholder_size,
             cancelled: &cancelled,
             next: &next,
+            refusal: &refusal,
+            progress: &progress,
         };
         let result = windowed_fetch::serve_range(&mut io, version, placeholder_size, &mut at, end);
         next.store(at, Ordering::Relaxed);
@@ -1202,7 +1257,13 @@ unsafe fn fetch_provider_item(
         let remaining = asked_end - delivered;
         let (start, length) =
             if remaining > 0 { (delivered, remaining) } else { (required_offset, required_length) };
-        transfer_data(info, STATUS_UNSUCCESSFUL, &[], start, length);
+        // A reader that left is told so; otherwise the daemon's own typed reason, if it gave one.
+        let failure = if cancelled.load(Ordering::Relaxed) {
+            FetchFailure::Cancelled
+        } else {
+            FetchFailure::from_wire(refusal.load(Ordering::Relaxed))
+        };
+        transfer_data(info, fetch_failure_status(failure), &[], start, length);
     }
 }
 
@@ -1225,6 +1286,10 @@ mod fetch_tests;
 #[cfg(test)]
 static FETCHES: Mutex<Vec<(i64, i64)>> = Mutex::new(Vec::new());
 
+/// Test-only: every `(total, completed)` this host reported to the operating system.
+#[cfg(test)]
+static PROGRESS_REPORTS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
 /// Test-only: every successful-status `TRANSFER_DATA` this host made: when, where, how long, and
 /// whether the operating system took it.
 #[cfg(test)]
@@ -1232,7 +1297,8 @@ static TRANSFERS: Mutex<Vec<(std::time::Instant, i64, i64, bool)>> = Mutex::new(
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_generation_identity, fetch_window, served_layout};
+    use super::{decode_generation_identity, fetch_failure_status, fetch_window, served_layout};
+    use yadorilink_windows_provider_policy::fetch_report::FetchFailure;
     use crate::provider_client::FetchTarget;
 
     fn answer(
@@ -1253,6 +1319,25 @@ mod tests {
 
     fn ranged(version: [u8; 32], start: u64, end: u64) -> FetchTarget {
         FetchTarget { version, range: Some((start, end - start)) }
+    }
+
+    /// Every kind of failure completes the fetch with a status of its own.
+    #[test]
+    fn each_failure_kind_has_its_own_status() {
+        let kinds = [
+            FetchFailure::LowDisk,
+            FetchFailure::Unreachable,
+            FetchFailure::VersionUnavailable,
+            FetchFailure::Cancelled,
+            FetchFailure::Other,
+        ];
+        let statuses: Vec<_> = kinds.iter().map(|k| fetch_failure_status(*k).0).collect();
+        for (i, a) in statuses.iter().enumerate() {
+            assert!(*a != 0, "{:?} is a failure", kinds[i]);
+            for (j, b) in statuses.iter().enumerate() {
+                assert!(i == j || a != b, "{:?} and {:?} share a status", kinds[i], kinds[j]);
+            }
+        }
     }
 
     /// A 4 KiB open of a 1 GiB file asks for one 4 KiB window, and a ranged answer for exactly

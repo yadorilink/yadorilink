@@ -30,6 +30,7 @@ fn local(release_id: &str, api: u32) -> Result<ReleaseDescriptor, DescriptorProb
         install_source: String::new(),
         release_id: release_id.into(),
         engine_api_version: api,
+        state_schema: None,
     })
 }
 

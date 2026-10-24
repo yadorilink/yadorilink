@@ -284,13 +284,13 @@ pub(super) fn spawn_flush_pending_checkpoints(state: &Arc<DaemonState>, only: Op
 /// hours; with these it errors in about a minute and the reconnect loop redials.
 const KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
 const KEEPALIVE_PROBES: u32 = 3;
 
 pub(super) fn enable_dead_peer_detection(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
     let keepalive =
         socket2::TcpKeepalive::new().with_time(KEEPALIVE_IDLE).with_interval(KEEPALIVE_INTERVAL);
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     let keepalive = keepalive.with_retries(KEEPALIVE_PROBES);
     socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive)
 }
@@ -363,7 +363,24 @@ pub(super) async fn run_netmap_attempt(
         .map_err(|_| DaemonError::Config("the DPoP proof is not a valid header value".into()))?;
     request.headers_mut().insert("dpop", proof);
 
-    let (mut ws_stream, _response) = connect_with_dead_peer_detection(request).await?;
+    let (mut ws_stream, _response) = match connect_with_dead_peer_detection(request).await {
+        Ok(connected) => connected,
+        Err(error) => {
+            // A refused upgrade carries the service's own answer; the credential learns from it
+            // (a `403 terms_consent_required` is remembered, never treated as a revocation).
+            if let DaemonError::WebSocket(boxed) = &error {
+                if let tokio_tungstenite::tungstenite::Error::Http(refusal) = boxed.as_ref() {
+                    config.auth.observe_status(
+                        refusal.status().as_u16(),
+                        refusal.body().as_deref().unwrap_or_default(),
+                    );
+                }
+            }
+            return Err(error);
+        }
+    };
+    // The upgrade passed authentication and the consent gate.
+    config.auth.observe_status(101, &[]);
     // Record a successful coordination-plane connect so a doctor read
     // mid-outage can see the coordination plane itself is reachable,
     // separately from any peer's direct-path state.
@@ -388,8 +405,8 @@ pub(super) async fn run_netmap_attempt(
         config,
         state,
         diff_state,
-        signing_key_pins: load_signing_key_pins()?,
-        service_key_pins: load_service_key_pins()?,
+        signing_key_pins: load_signing_key_pins(state.config_dir())?,
+        service_key_pins: load_service_key_pins(state.config_dir())?,
     };
 
     while let Some(msg) = ws_stream.next().await {
@@ -802,7 +819,12 @@ impl NetmapSessionState<'_> {
                 teardown_peer(self.state, &peer.device_id);
                 continue;
             };
-            if pin_peer_signing_key(&mut self.signing_key_pins, &peer.device_id, &signing_key)? {
+            if pin_peer_signing_key(
+                self.state.config_dir(),
+                &mut self.signing_key_pins,
+                &peer.device_id,
+                &signing_key,
+            )? {
                 teardown_peer(self.state, &peer.device_id);
                 continue;
             }

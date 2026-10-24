@@ -26,6 +26,7 @@ pub mod displacement_guard;
 pub mod enrollment;
 mod error;
 pub mod exact_materialized_commit;
+pub mod exclusive_open;
 pub mod file_identity_codec;
 pub mod file_index;
 pub mod handoff_lease;
@@ -114,8 +115,9 @@ pub use error::SyncSqliteError;
 pub use handoff_lease::HandoffLeaseRepository;
 pub use held_path::HeldPathRepository;
 pub use materialization_intent_repository::{
-    clear_flush_pending_in_tx, flush_pending_proof_identity, IntentDisposition,
-    MaterializationIntentRepository, MaterializationTempLedger, TempReleaseQueue,
+    clear_flush_pending_in_tx, flush_pending_proof_identity, write_landed_unproven,
+    IntentDisposition, MaterializationIntentRepository, MaterializationTempLedger,
+    TempReleaseQueue,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use materialization_state::{fail_placeholder_reads_for_path, fail_state_reads_for_path};

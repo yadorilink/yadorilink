@@ -1,6 +1,6 @@
 [package]
 name = "yadorilink-shell-ext-windows"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 edition = "2021"
 license = "AGPL-3.0-only"
 
@@ -106,7 +106,7 @@ features = [
 # `windows-sys` patterns verbatim rather than gambling on unverified
 # `windows`-crate signatures for functions this crate has never bound.
 [dependencies.windows-sys]
-version = "0.59"
+version = "0.61"
 features = [
     "Win32_Foundation",
     "Win32_Security",

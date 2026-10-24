@@ -177,6 +177,14 @@ fn recursive_snapshot(root: &Path) -> HashMap<String, String> {
     out
 }
 
+/// Waits until neither device's own capture has anything pending or in flight (see
+/// `support::quiescence`), so a directory rename or delete cannot race the daemon's file opens.
+async fn wait_devices_quiescent(device_a: &TestDevice, device_b: &TestDevice, group_id: &str) {
+    for device in [device_a, device_b] {
+        support::quiescence::wait_quiescent(device.root.path(), &device.state, group_id).await;
+    }
+}
+
 // --- Scenario 1: concurrent directory rename to different targets ---------
 
 /// Both devices independently rename the same already-synced directory
@@ -217,7 +225,7 @@ fn recursive_snapshot(root: &Path) -> HashMap<String, String> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_directory_rename_to_different_targets() {
     let _ = tracing_subscriber::fmt::try_init();
-    let (device_a, device_b, _group_id) =
+    let (device_a, device_b, group_id) =
         two_synced_devices("dir-collision-rename-rename-diff").await;
 
     let dir_a = device_a.root.path().join("shared_dir");
@@ -228,6 +236,7 @@ async fn concurrent_directory_rename_to_different_targets() {
 
     wait_until(|| device_b.root.path().join("shared_dir/c.txt").exists(), Duration::from_secs(10))
         .await;
+    wait_devices_quiescent(&device_a, &device_b, &group_id).await;
 
     std::fs::rename(
         device_a.root.path().join("shared_dir"),
@@ -313,6 +322,7 @@ async fn delete_directory_while_peer_adds_a_file_inside_it() {
         Duration::from_secs(10),
     )
     .await;
+    wait_devices_quiescent(&device_a, &device_b, &group_id).await;
 
     std::fs::remove_dir_all(&dir_a).unwrap();
     std::fs::write(
@@ -376,7 +386,6 @@ async fn delete_directory_while_peer_adds_a_file_inside_it() {
 async fn nested_rename_races_a_child_file_edit() {
     let (device_a, device_b, group_id) =
         two_synced_devices("dir-collision-nested-rename-vs-edit").await;
-    let _ = group_id;
 
     let subdir_a = device_a.root.path().join("subdir");
     std::fs::create_dir_all(&subdir_a).unwrap();
@@ -384,6 +393,7 @@ async fn nested_rename_races_a_child_file_edit() {
 
     wait_until(|| device_b.root.path().join("subdir/child.txt").exists(), Duration::from_secs(10))
         .await;
+    wait_devices_quiescent(&device_a, &device_b, &group_id).await;
 
     std::fs::rename(
         device_a.root.path().join("subdir"),
@@ -613,7 +623,7 @@ async fn settle_to_one_tree(
 /// that are now gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rm_rf_directory_removes_now_empty_directory_on_peer() {
-    let (device_a, device_b, _group_id) = two_synced_devices("dir-rm-rf-leaves-no-dir").await;
+    let (device_a, device_b, group_id) = two_synced_devices("dir-rm-rf-leaves-no-dir").await;
 
     let linux = device_a.root.path().join("linux");
     std::fs::create_dir_all(linux.join("arch")).unwrap();
@@ -624,6 +634,7 @@ async fn rm_rf_directory_removes_now_empty_directory_on_peer() {
         Duration::from_secs(20),
     )
     .await;
+    wait_devices_quiescent(&device_a, &device_b, &group_id).await;
 
     std::fs::remove_dir_all(&linux).unwrap();
     let tree = settle_to_one_tree(&device_a, &device_b, |t| t.is_empty()).await;
@@ -677,6 +688,7 @@ async fn delete_directory_vs_concurrent_child_keeps_child_and_container() {
         Duration::from_secs(20),
     )
     .await;
+    wait_devices_quiescent(&device_a, &device_b, &group_id).await;
 
     std::fs::remove_dir_all(&dir_a).unwrap();
     std::fs::write(device_b.root.path().join("target_dir/new_from_b.txt"), b"new from b").unwrap();
@@ -796,11 +808,12 @@ async fn directory_rename_across_two_devices_moves_explicit_entries_only() {
     ) {
         return;
     }
-    let (device_a, device_b, _group_id) = two_synced_devices("dir-rename-vs-child").await;
+    let (device_a, device_b, group_id) = two_synced_devices("dir-rename-vs-child").await;
 
     std::fs::create_dir(device_a.root.path().join("d")).unwrap();
     std::fs::write(device_a.root.path().join("d/f.txt"), b"moved").unwrap();
     wait_until(|| device_b.root.path().join("d/f.txt").exists(), Duration::from_secs(20)).await;
+    wait_devices_quiescent(&device_a, &device_b, &group_id).await;
 
     std::fs::rename(device_a.root.path().join("d"), device_a.root.path().join("e")).unwrap();
     std::fs::write(device_b.root.path().join("d/new.txt"), b"concurrent").unwrap();
@@ -820,11 +833,12 @@ async fn directory_rename_across_two_devices_moves_explicit_entries_only() {
 /// explicit entry and appears, empty, on the peer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mkdir_after_remote_rm_rf_of_same_path_is_captured_as_explicit() {
-    let (device_a, device_b, _group_id) = two_synced_devices("dir-mkdir-after-rm-rf").await;
+    let (device_a, device_b, group_id) = two_synced_devices("dir-mkdir-after-rm-rf").await;
 
     std::fs::create_dir(device_a.root.path().join("p")).unwrap();
     std::fs::write(device_a.root.path().join("p/f.txt"), b"f").unwrap();
     wait_until(|| device_b.root.path().join("p/f.txt").exists(), Duration::from_secs(20)).await;
+    wait_devices_quiescent(&device_a, &device_b, &group_id).await;
     std::fs::remove_dir_all(device_a.root.path().join("p")).unwrap();
     settle_to_one_tree(&device_a, &device_b, |t| t.is_empty()).await;
 

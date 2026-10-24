@@ -1,0 +1,38 @@
+[package]
+name = "yadorilink-embedded-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The composition root for a host that embeds the engine in its own process (the
+# mobile apps). It owns the engine's runtime and lifecycle and hands the host an
+# in-process provider channel; it adds no engine behavior. The foreign-language
+# binding is a separate static library on top of this crate.
+[dependencies]
+# Without the desktop daemon's process model: no control socket, shell IPC, self-update,
+# NAS admin, send transfer, signal handling or process-lifetime locks.
+yadorilink-daemon = { path = "../yadorilink-daemon", default-features = false }
+yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
+# The sign-in, device registration, sign-out and account-deletion operations the desktop clients
+# run, scoped to the engine's state directory (`*_in`); nothing of its daemon client is used.
+yadorilink-client-core = { path = "../yadorilink-client-core" }
+# The credential type of the test hook that points the engine at an in-process coordination plane.
+yadorilink-fapi-client.workspace = true
+yadorilink-sqlite-runtime = { path = "../yadorilink-sqlite-runtime" }
+# The device key a start over retires and replaces.
+yadorilink-transport = { path = "../yadorilink-transport" }
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# The offline credential a test hands the engine in place of a sign-in.
+yadorilink-fapi-client = { workspace = true, features = ["test-support"] }
+yadorilink-local-storage = { path = "../yadorilink-local-storage" }
+tempfile = "3"
+# `SyncDatabase::open_in_memory`, for the bounded-session test that returns inside a transaction.
+yadorilink-sqlite-runtime = { path = "../yadorilink-sqlite-runtime", features = ["test-support"] }
+
+[lints]
+workspace = true

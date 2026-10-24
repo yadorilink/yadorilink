@@ -5,10 +5,10 @@ use std::path::Path;
 
 use super::ClientCore;
 use crate::dto::{
-    self, AccountDeletionRequest, AccountDeletionStatus, BandwidthLimits, DaemonStartOutcome,
-    DiagnosticsCollectionMode, DiagnosticsExport, GcReport, IncomingTransfer, OutgoingTransfer,
-    ReceivedTransfer, SentTransfer, SpaceManagement, SpaceReclaimPreview, UpdateConfig,
-    UpdateDownloadGuidance, UpdateStatus,
+    self, AccountDeletionImpact, AccountDeletionRequest, AccountDeletionStatus, BandwidthLimits,
+    DaemonStartOutcome, DiagnosticsCollectionMode, DiagnosticsExport, GcReport, IncomingTransfer,
+    OutgoingTransfer, ReceivedTransfer, SentTransfer, SpaceManagement, SpaceReclaimPreview,
+    UpdateConfig, UpdateDownloadGuidance, UpdateStatus,
 };
 use crate::error::{CoreError, DaemonUnavailableReason, DesktopError};
 use crate::ops;
@@ -213,11 +213,7 @@ impl ClientCore {
                 Ok(DaemonStartOutcome::AlreadyRunning)
             }
             Ok(ops::daemon::DaemonStartOutcome::Started) => Ok(DaemonStartOutcome::Started),
-            Err(CoreError::Other(message)) => Err(DesktopError::DaemonUnavailable {
-                message,
-                reason: DaemonUnavailableReason::NotRunning,
-            }),
-            Err(other) => Err(other.into()),
+            Err(error) => Err(start_failure(error)),
         }
     }
 
@@ -272,6 +268,26 @@ impl ClientCore {
         Ok(dto::update_status(&status))
     }
 
+    /// Whether `item` (an appcast item the updater is about to act on) matches the verified
+    /// channel manifest's `app_bundle` entry for this install, and that entry. Two phases:
+    /// `Enclosure` before the download (version, build, whole URL and length must equal the
+    /// entry's) and `Downloaded` once the file is on disk (also the file's sha256). A required
+    /// field left empty is refused, not skipped. Only `Allowed` lets the item proceed; `Refused`
+    /// and `CannotConfirm` (no fresh verified manifest) both stop it, and only an `Allowed` from
+    /// `Downloaded` covers the bytes. The daemon answers from what it already verified, so this
+    /// makes no network request and never changes the replay floor; run `check_for_updates`
+    /// first to refresh.
+    ///
+    /// # Errors
+    /// Daemon failures.
+    pub async fn check_appcast_item(
+        &self,
+        item: crate::dto::AppcastItem,
+        phase: crate::dto::AppcastItemPhase,
+    ) -> Result<crate::dto::AppcastItemCheck, DesktopError> {
+        Ok(dto::appcast_item_check(&ops::updates::verified_entry(&item, phase).await?))
+    }
+
     /// Where to get the new version: the official download page, or the
     /// package-manager command for a package-managed install. YadoriLink
     /// never downloads or installs an update itself.
@@ -305,13 +321,33 @@ impl ClientCore {
         Ok(dto::account_deletion_status(&ops::account::deletion_status().await?))
     }
 
-    /// Asks for account deletion; nothing is deleted until it is confirmed
-    /// with the returned token.
+    /// What deleting the account would do to other people's access and data
+    /// custody. Show it before `request_account_deletion`.
     ///
     /// # Errors
     /// Coordination failures.
-    pub async fn request_account_deletion(&self) -> Result<AccountDeletionRequest, DesktopError> {
-        let requested = ops::account::request_deletion().await?;
+    pub async fn account_deletion_impact(&self) -> Result<AccountDeletionImpact, DesktopError> {
+        Ok(dto::account_deletion_impact(&ops::account::deletion_impact().await?))
+    }
+
+    /// Asks for account deletion; nothing is deleted until it is confirmed
+    /// with the returned token.
+    ///
+    /// When the deletion would remove other people's access or the last full
+    /// copy of a shared group (see `account_deletion_impact`), it is refused
+    /// with `DurabilityBlocked { can_force: true }` until called again with
+    /// `acknowledge_impact` set, which the person must choose explicitly. The
+    /// acknowledgement is recorded on the server.
+    ///
+    /// # Errors
+    /// Coordination failures, or `DurabilityBlocked` as above.
+    pub async fn request_account_deletion(
+        &self,
+        acknowledge_impact: bool,
+    ) -> Result<AccountDeletionRequest, DesktopError> {
+        let requested = ops::account::request_deletion(acknowledge_impact)
+            .await
+            .map_err(|e| DesktopError::from_core(e, true))?;
         Ok(AccountDeletionRequest { confirmation_token: requested.confirmation_token })
     }
 
@@ -331,6 +367,21 @@ impl ClientCore {
         Ok(dto::account_deletion_status(&ops::account::cancel_deletion().await?))
     }
 
+    /// After the server has finalized the deletion, removes this computer's
+    /// credential and device key the way a confirmed sign-out does. Local
+    /// folders and replica data are never touched. Fails closed: while the
+    /// account still exists nothing is removed.
+    ///
+    /// # Errors
+    /// The account is not deleted yet, or its deletion could not be confirmed.
+    pub async fn complete_account_deletion(&self) -> Result<dto::SignOutOutcome, DesktopError> {
+        let report = ops::auth::complete_account_deletion().await?;
+        Ok(dto::SignOutOutcome {
+            kind: dto::SignOutKind::ConfirmedRevokedAfterRejection,
+            key_cleanup_warning: report.key_cleanup_warning,
+        })
+    }
+
     /// The account's server-side records as pretty-printed JSON; the front
     /// end saves it where the person chooses.
     ///
@@ -338,5 +389,49 @@ impl ClientCore {
     /// Coordination failures.
     pub async fn export_account_data(&self) -> Result<String, DesktopError> {
         Ok(ops::account::export_account_json().await?)
+    }
+}
+
+/// A launch that did not bring the daemon up: `NotRunning` naming what was tried (never "start
+/// it", which is what was just done), whatever next step the failure carries.
+fn start_failure(error: CoreError) -> DesktopError {
+    match error.into_unhinted() {
+        CoreError::Other(message) => {
+            DesktopError::DaemonUnavailable { message, reason: DaemonUnavailableReason::NotRunning }
+        }
+        other => other.into(),
+    }
+}
+
+#[cfg(test)]
+mod start_failure_tests {
+    use super::*;
+    use crate::error::Hint;
+
+    #[test]
+    fn a_launch_that_got_no_answer_is_not_running_with_what_was_tried() {
+        for error in [
+            crate::ops::daemon::did_not_answer(None),
+            crate::ops::daemon::did_not_answer(Some("refused its data".into())),
+            CoreError::Other("failed to launch x".into()),
+            CoreError::Other("still exiting".into()).hinted(Hint::WaitThenStartDaemon),
+        ] {
+            let text = error.to_string();
+            assert_eq!(
+                start_failure(error),
+                DesktopError::DaemonUnavailable {
+                    message: text,
+                    reason: DaemonUnavailableReason::NotRunning
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn another_failure_keeps_its_own_category() {
+        assert!(matches!(
+            start_failure(CoreError::ManagedElsewhere("the app owns it".into())),
+            DesktopError::Refused { .. }
+        ));
     }
 }

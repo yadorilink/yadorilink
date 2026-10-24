@@ -61,7 +61,7 @@ pub(super) fn write(path: &Path, contents: &str) -> StoreResult<()> {
         file.write_all(contents.as_bytes())?;
         // Durable before the rename, or a crash can leave the new name
         // pointing at an empty file while the old document is already gone.
-        file.sync_all()?;
+        yadorilink_fs_platform::flush::sync_file(&file)?;
         drop(file);
         // Published by a durable move: the new name is on disk when this
         // returns. That matters specifically for a rotated refresh token --

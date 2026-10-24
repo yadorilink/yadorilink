@@ -85,7 +85,7 @@ pub fn record_database_created(db_path: &Path) -> std::io::Result<()> {
     let written = (|| -> std::io::Result<()> {
         let mut file = std::fs::File::create(&staged)?;
         file.write_all(b"yadorilink database creation marker\n")?;
-        file.sync_all()
+        yadorilink_fs_platform::flush::sync_file(&file)
     })();
     if let Err(error) = written {
         let _ = std::fs::remove_file(&staged);

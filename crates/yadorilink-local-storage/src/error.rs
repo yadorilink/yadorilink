@@ -12,6 +12,11 @@ pub enum StorageError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// The writer lease proving exclusive ownership of the data area was refused (taken over or
+    /// expired); nothing on disk was touched.
+    #[error("writer lease refused: {0}")]
+    WriterLease(String),
+
     /// An operation on the user's own source file failed: the open, its `fstat`, or a read of its
     /// bytes (an EIO partway through, a network volume dropping). Every failure whose origin is
     /// the source is this variant, and none of the block store's is. Deliberately not `Io` and never built via `#[from]`: `Io` is also
@@ -121,6 +126,7 @@ impl StorageError {
                     headroom_bytes: *headroom_bytes,
                 }
             }
+            StorageError::WriterLease(message) => StorageError::WriterLease(message.clone()),
             StorageError::PathEscapesRoot(path) => StorageError::PathEscapesRoot(path.clone()),
             StorageError::Hex(error) => StorageError::Hex(*error),
             StorageError::Chunking(message) => StorageError::Chunking(message.clone()),

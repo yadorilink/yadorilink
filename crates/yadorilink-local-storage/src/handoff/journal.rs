@@ -173,7 +173,7 @@ pub fn write(config_dir: &Path, journal: &Journal) -> std::io::Result<()> {
     let result = (|| -> std::io::Result<()> {
         let mut file = std::fs::OpenOptions::new().create_new(true).write(true).open(&temporary)?;
         file.write_all(&body)?;
-        file.sync_all()?;
+        yadorilink_fs_platform::flush::sync_file(&file)?;
         drop(file);
         yadorilink_fs_platform::durable_dir::publish_durably(
             &temporary,

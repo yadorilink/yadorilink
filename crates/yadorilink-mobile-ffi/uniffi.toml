@@ -1,0 +1,4 @@
+[bindings.swift]
+# One module for everything the library generates, so the records, errors and objects see
+# each other without imports. The macOS binding is `YadoriLinkFFI`; the two never share an app.
+module_name = "YadoriLinkMobileFFI"

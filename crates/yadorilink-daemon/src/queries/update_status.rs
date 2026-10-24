@@ -26,6 +26,12 @@ pub(crate) struct UpdateStatusView {
     pub(crate) automatic_checks_enabled: bool,
     /// `generated_at` of the newest manifest accepted for this channel; empty before the first.
     pub(crate) manifest_generated_at: String,
+    /// Unix seconds of the last check that accepted a manifest; 0 when none ever did.
+    pub(crate) last_success_unix: i64,
+    /// `expires_at` of the manifest the last check saw; empty before the first.
+    pub(crate) manifest_expires_at: String,
+    /// The last check refused the manifest as expired.
+    pub(crate) manifest_expired: bool,
 }
 
 pub(crate) struct UpdateStatusQueryService {
@@ -58,7 +64,20 @@ impl UpdateStatusQueryService {
                 .accepted_generation()
                 .map(|g| g.generated_at)
                 .unwrap_or_default(),
+            last_success_unix: policy.last_success_unix.unwrap_or(0),
+            manifest_expires_at: policy.manifest_expires_at.clone().unwrap_or_default(),
+            manifest_expired: policy.manifest_expired(),
         }
+    }
+
+    /// Read-only: answers from the manifest an earlier check verified (no network, no replay
+    /// floor change).
+    pub(crate) fn verified_entry(
+        &self,
+        item: &crate::update::manifest::AppcastItem,
+        phase: crate::update::manifest::AppcastPhase,
+    ) -> crate::update::manager::VerifiedEntryAnswer {
+        self.manager.verified_entry(item, phase)
     }
 }
 
@@ -68,8 +87,11 @@ mod tests {
 
     fn snapshot_with_minimum(running: &str, minimum: Option<&str>) -> UpdateStatusView {
         let dir = tempfile::tempdir().unwrap();
-        let manager =
-            Arc::new(UpdateManager::new(dir.path(), semver::Version::parse(running).unwrap()));
+        let manager = Arc::new(UpdateManager::new(
+            dir.path(),
+            semver::Version::parse(running).unwrap(),
+            &crate::engine_tuning::EngineTuning::default(),
+        ));
         manager
             .policy
             .update(|p| p.minimum_supported_version = minimum.map(str::to_owned))

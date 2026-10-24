@@ -101,7 +101,7 @@ async fn a_case_only_directory_rename_converges_on_source_and_peer() {
     )
     .await;
 
-    rename(&a, "Photos", "photos");
+    rename_dir(&a, GROUP, "Photos", "photos").await;
 
     converge_to(
         &[&a, &b],

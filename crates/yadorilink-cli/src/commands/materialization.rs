@@ -26,9 +26,19 @@ fn absolute_path(local_path: &str) -> Result<String, CliError> {
 /// root is hydrated by the OS when the file is opened, and the daemon refuses
 /// this request there.
 pub async fn hydrate(local_path: String) -> Result<(), CliError> {
-    files::hydrate_file(absolute_path(&local_path)?).await?;
-    println!("Downloaded {local_path}");
+    let downloaded = files::hydrate_file(absolute_path(&local_path)?).await?;
+    println!("{}", hydrate_report(&local_path, downloaded));
     Ok(())
+}
+
+/// A request that fetched nothing (a regular folder keeps every file, so there is nothing to
+/// fetch there) must never read as a download.
+fn hydrate_report(local_path: &str, downloaded: bool) -> String {
+    if downloaded {
+        format!("Downloaded {local_path}")
+    } else {
+        format!("Nothing to download: {local_path} is already on this device.")
+    }
 }
 
 /// Reads `EvictResponse.dehydrated` and only ever claims success

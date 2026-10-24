@@ -98,6 +98,9 @@ fn entry(version: &str, install_source: &str, kill: bool) -> ReleaseEntry {
         artifact_size: 1024,
         artifact_publisher_identity: String::new(),
         release_notes_url: String::new(),
+        state_schema_version: None,
+        state_schema_min_readable: None,
+        sparkle_build: None,
     }
 }
 
@@ -105,6 +108,7 @@ fn signed_envelope(key: &SigningKey, withdrawn: &[&str]) -> (String, String) {
     let m = manifest::UpdateManifest {
         schema_version: manifest::MANIFEST_SCHEMA_VERSION,
         generated_at: "2026-10-21T00:00:00Z".into(),
+        expires_at: "2099-01-01T00:00:00Z".into(),
         withdrawn_versions: withdrawn.iter().map(|s| s.to_string()).collect(),
         releases: vec![entry("0.2.0", "script", false), entry("0.2.0", "app_bundle", true)],
     };
@@ -127,6 +131,7 @@ fn a_pre_field_client_accepts_a_body_with_withdrawn_versions_and_selects_the_sam
     let (without, _) = signed_envelope(&key, &[]);
     let (with, body) = signed_envelope(&key, &["0.1.5", "0.1.6"]);
     assert!(body.contains("withdrawn_versions"), "the body must carry the new field");
+    assert!(body.contains("\"expires_at\""), "the body must carry the expiry field");
 
     let old_without = pre_field::verify_envelope(&without, &key.verifying_key(), 2).unwrap();
     let old_with = pre_field::verify_envelope(&with, &key.verifying_key(), 2)
@@ -149,6 +154,7 @@ fn a_pre_field_client_accepts_a_body_with_withdrawn_versions_and_selects_the_sam
     }];
     let current = manifest::verify_and_parse_with_keys(&with, &trusted).unwrap();
     assert_eq!(current.withdrawn_versions, vec!["0.1.5".to_string(), "0.1.6".to_string()]);
+    assert_eq!(current.expires_at, "2099-01-01T00:00:00Z");
 }
 
 #[test]

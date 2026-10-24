@@ -25,9 +25,23 @@ fn print_status(status: &UpdateStatusResponse) {
     } else {
         println!("last check: {} (unix seconds)", status.last_check_unix);
     }
+    if status.last_success_unix == 0 {
+        println!("last successful check: never");
+    } else {
+        println!("last successful check: {} (unix seconds)", status.last_success_unix);
+    }
     println!("state: {}", status.state);
     if !status.manifest_generated_at.is_empty() {
         println!("manifest generated: {}", status.manifest_generated_at);
+    }
+    if !status.manifest_expires_at.is_empty() {
+        println!("manifest expires: {}", status.manifest_expires_at);
+    }
+    if status.manifest_expired {
+        println!(
+            "manifest expired: yes (the update manifest for this channel has expired; check the \
+             system clock or retry later. Sync and running apps are not affected)"
+        );
     }
     if status.update_required {
         println!(
@@ -216,6 +230,7 @@ fn self_update_target(
     channel: &str,
     available_version: &str,
     requested: Option<&str>,
+    exe: &std::path::Path,
 ) -> Result<Option<String>, CliError> {
     let daemon_source = match record {
         RecordState::Missing => daemon_install_source,
@@ -231,11 +246,13 @@ fn self_update_target(
     if source != SELF_UPDATE_SOURCE {
         return Err(CliError::ManagedElsewhere(format!(
             "this YadoriLink is not a command-line install (source: {}), so `yadorilink \
-             self-update` does not touch it. Update it the way it was installed, or reinstall with \
-             the installer from https://yadori.link.",
-            if source.is_empty() { "unknown" } else { source }
+             self-update` does not touch it. To update it: {}.",
+            if source.is_empty() { "unknown" } else { source },
+            unowned_install_steps(exe, true)
         )));
     }
+    // `stable` is refused on purpose until the first stable publish is enabled; a release-tool
+    // test pins this list against .github/release/channels.json.
     if !matches!(channel, "beta" | "nightly") {
         return Err(CliError::Other(format!(
             "self-update works on the beta and nightly channels, not {channel:?}"
@@ -283,6 +300,7 @@ fn refuse_if_check_failed(status: &UpdateStatusResponse) -> Result<(), CliError>
 /// against the daemon's live verified channel manifest (fail closed) and, if allowed, prints the
 /// pinned installer command that does the verified download and atomic switch.
 pub async fn self_update(requested: Option<String>) -> Result<(), CliError> {
+    let exe = std::env::current_exe().unwrap_or_default();
     let record = match yadorilink_client_core::coordination::device_config::config_dir() {
         Ok(config_dir) => ownership::read(&config_dir),
         Err(_) => RecordState::Missing,
@@ -290,7 +308,7 @@ pub async fn self_update(requested: Option<String>) -> Result<(), CliError> {
     // The recorded owner decides before the daemon is asked anything: a stopped daemon must not
     // hide "the app updates this".
     if matches!(record, RecordState::Present(_) | RecordState::Unreadable(_)) {
-        self_update_target(&record, "", "beta", "", None)?;
+        self_update_target(&record, "", "beta", "", None, &exe)?;
     }
     let status = if requested.is_some() {
         updates::update_status().await?
@@ -306,6 +324,7 @@ pub async fn self_update(requested: Option<String>) -> Result<(), CliError> {
         &status.channel,
         &status.available_version,
         requested.as_deref(),
+        &exe,
     )?
     else {
         refuse_if_check_failed(&status)?;
@@ -337,6 +356,17 @@ pub async fn self_update(requested: Option<String>) -> Result<(), CliError> {
         installer_command(&target, &status.channel, prefix.as_deref(), cfg!(windows))
     );
     Ok(())
+}
+
+/// What to do about a copy that no updater and no installer receipt owns: the cargo home comes
+/// from this process's environment (the command line is where it is read).
+pub(crate) fn unowned_install_steps(exe: &std::path::Path, update: bool) -> &'static str {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let cargo_home = ownership::cargo_home(
+        std::env::var("CARGO_HOME").ok().as_deref(),
+        home.as_deref().map(std::path::Path::new),
+    );
+    ownership::unowned_install_steps(exe, update, cargo_home.as_deref())
 }
 
 #[cfg(test)]
@@ -389,7 +419,9 @@ mod tests {
 
     #[test]
     fn self_update_acts_only_on_the_command_line_install() {
-        let ok = |r: &RecordState, ds: &str| self_update_target(r, ds, "beta", "1.2.0", None);
+        let ok = |r: &RecordState, ds: &str| {
+            self_update_target(r, ds, "beta", "1.2.0", None, std::path::Path::new("/x/yadorilink"))
+        };
         assert_eq!(ok(&record(Owner::Cli, "script"), "").unwrap().as_deref(), Some("1.2.0"));
         assert_eq!(ok(&RecordState::Missing, "script").unwrap().as_deref(), Some("1.2.0"));
         for (r, ds) in [
@@ -410,17 +442,58 @@ mod tests {
     }
 
     #[test]
+    fn an_unowned_copy_gets_cargo_or_by_hand_steps() {
+        let cargo = std::path::Path::new("/home/u/.cargo/bin/yadorilink");
+        let hand = std::path::Path::new("/opt/tools/yadorilink");
+        let r = record(Owner::Cli, "standalone");
+        let msg = |e| self_update_target(&r, "", "beta", "1.0.0", None, e).unwrap_err().to_string();
+        assert!(msg(cargo).contains("cargo install --locked --force"), "{}", msg(cargo));
+        assert!(msg(hand).contains("releases"), "{}", msg(hand));
+        assert!(!msg(hand).contains("cargo"));
+    }
+
+    #[test]
     fn self_update_target_rules() {
         let r = record(Owner::Cli, "script");
-        assert_eq!(self_update_target(&r, "", "beta", "", None).unwrap(), None);
         assert_eq!(
-            self_update_target(&r, "", "nightly", "2.0.0", Some("1.9.0")).unwrap().as_deref(),
+            self_update_target(&r, "", "beta", "", None, std::path::Path::new("/x/yadorilink"))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            self_update_target(
+                &r,
+                "",
+                "nightly",
+                "2.0.0",
+                Some("1.9.0"),
+                std::path::Path::new("/x/yadorilink")
+            )
+            .unwrap()
+            .as_deref(),
             Some("1.9.0")
         );
-        assert!(self_update_target(&r, "", "stable", "2.0.0", None).is_err());
+        assert!(self_update_target(
+            &r,
+            "",
+            "stable",
+            "2.0.0",
+            None,
+            std::path::Path::new("/x/yadorilink")
+        )
+        .is_err());
         for bad in ["1.0; rm -rf /", "$(x)", "a b", ""] {
             assert!(
-                self_update_target(&r, "", "beta", "2.0.0", Some(bad)).is_ok() == bad.is_empty()
+                self_update_target(
+                    &r,
+                    "",
+                    "beta",
+                    "2.0.0",
+                    Some(bad),
+                    std::path::Path::new("/x/yadorilink")
+                )
+                .is_ok()
+                    == bad.is_empty()
             );
         }
     }

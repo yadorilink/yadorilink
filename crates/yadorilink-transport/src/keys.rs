@@ -4,7 +4,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use zeroize::Zeroizing;
 
 use crate::error::TransportError;
-use crate::key_secret_store;
+use crate::key_secret_store::{self, KeyMirror};
 
 /// Why an already-persisted device identity could not be loaded.
 ///
@@ -94,9 +94,9 @@ impl DeviceSigningKeyPair {
     /// including [`KeyLoadError::Missing`]. Continuing without a signing key is
     /// not a lesser evil here: a registered device that cannot sign emits no
     /// changes at all, so its local edits never enter the shared history.
-    pub fn load_existing(path: impl AsRef<Path>) -> Result<Self, KeyLoadError> {
+    pub fn load_existing(path: impl AsRef<Path>, mirror: KeyMirror) -> Result<Self, KeyLoadError> {
         let path = path.as_ref();
-        match key_secret_store::load_persisted_secret(path) {
+        match key_secret_store::load_persisted_secret(path, mirror) {
             Ok(Some(secret)) => Ok(Self::from_secret_bytes(&secret)),
             Ok(None) => Err(KeyLoadError::Missing { path: path.to_path_buf() }),
             Err(source) => Err(KeyLoadError::Unreadable { path: path.to_path_buf(), source }),
@@ -110,14 +110,17 @@ impl DeviceSigningKeyPair {
     /// form of the mistake: the coordination plane records a device's signing
     /// key once, so the replacement is never distributed, and peers go on
     /// rejecting everything this device signs.
-    pub fn generate_and_persist(path: impl AsRef<Path>) -> Result<Self, TransportError> {
+    pub fn generate_and_persist(
+        path: impl AsRef<Path>,
+        mirror: KeyMirror,
+    ) -> Result<Self, TransportError> {
         let path = path.as_ref();
         let keypair = Self::generate();
         let secret_bytes = Zeroizing::new(keypair.signing.to_bytes());
-        match key_secret_store::persist_new_secret(path, &secret_bytes) {
+        match key_secret_store::persist_new_secret(path, &secret_bytes, mirror) {
             Ok(()) => Ok(keypair),
             Err(TransportError::Io(err)) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                key_secret_store::load_persisted_secret(path)?
+                key_secret_store::load_persisted_secret(path, mirror)?
                     .map(|secret| Self::from_secret_bytes(&secret))
                     .ok_or_else(|| {
                         TransportError::Io(std::io::Error::new(
@@ -134,11 +137,14 @@ impl DeviceSigningKeyPair {
     /// absent. Registration-only, exactly as
     /// [`DeviceSigningKeyPair::load_or_generate`] — see that method for why a daemon
     /// must call [`Self::load_existing`] instead.
-    pub fn load_or_generate(path: impl AsRef<Path>) -> Result<Self, TransportError> {
+    pub fn load_or_generate(
+        path: impl AsRef<Path>,
+        mirror: KeyMirror,
+    ) -> Result<Self, TransportError> {
         let path = path.as_ref();
-        match Self::load_existing(path) {
+        match Self::load_existing(path, mirror) {
             Ok(keypair) => Ok(keypair),
-            Err(KeyLoadError::Missing { .. }) => Self::generate_and_persist(path),
+            Err(KeyLoadError::Missing { .. }) => Self::generate_and_persist(path, mirror),
             Err(KeyLoadError::Unreadable { source, .. }) => Err(source),
         }
     }
@@ -150,26 +156,38 @@ impl DeviceSigningKeyPair {
     pub fn replace_retiring(
         path: impl AsRef<Path>,
         retired: impl AsRef<Path>,
+        mirror: KeyMirror,
     ) -> Result<Self, TransportError> {
         // Already replaced by an earlier run that was interrupted afterwards: the retired name
         // holds a key other than the live one. Another replacement would retire the new key.
-        if let (Ok(live), Ok(kept)) =
-            (Self::load_existing(path.as_ref()), Self::load_existing(retired.as_ref()))
-        {
+        if let (Ok(live), Ok(kept)) = (
+            Self::load_existing(path.as_ref(), mirror),
+            Self::load_existing(retired.as_ref(), mirror),
+        ) {
             if live.public_bytes() != kept.public_bytes() {
                 // Only the keyring entry can still be behind.
                 key_secret_store::replace_retiring(
                     path.as_ref(),
                     retired.as_ref(),
                     &Zeroizing::new(live.signing.to_bytes()),
+                    mirror,
                 )?;
                 return Ok(live);
             }
         }
         let keypair = Self::generate();
         let secret_bytes = Zeroizing::new(keypair.signing.to_bytes());
-        key_secret_store::replace_retiring(path.as_ref(), retired.as_ref(), &secret_bytes)?;
+        key_secret_store::replace_retiring(path.as_ref(), retired.as_ref(), &secret_bytes, mirror)?;
         Ok(keypair)
+    }
+
+    /// Deletes the OS keyring copy of the identity stored at `path`, leaving the key file alone.
+    /// A missing entry is success; see [`crate::KeyringDelete`].
+    pub fn delete_keyring_entry(
+        path: impl AsRef<Path>,
+        mirror: KeyMirror,
+    ) -> Result<crate::KeyringDelete, TransportError> {
+        key_secret_store::delete_keyring_entry(path.as_ref(), mirror)
     }
 
     fn from_secret_bytes(bytes: &[u8; 32]) -> Self {

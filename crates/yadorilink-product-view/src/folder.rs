@@ -144,6 +144,52 @@ pub struct FolderSummary {
     pub ambiguous_local_paths: Vec<String>,
     pub degraded: bool,
     pub degraded_reason: String,
+    /// Typed cause of `degraded` (`None` when the folder is not degraded). `degraded_reason` is
+    /// human detail only; nothing matches its text.
+    pub degraded_cause: Option<DegradedCause>,
+}
+
+/// Why a degraded folder is degraded, from `LinkStatus.degraded_cause`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DegradedCause {
+    /// Stopped with no more specific cause (the wire value is unspecified).
+    Stopped,
+    /// Waits for free space on its disk; resumes by itself.
+    WaitingForDiskSpace,
+    /// The OS file-watch limit is hit; only the user can raise it.
+    FileWatchLimit,
+    /// The ownership marker is gone.
+    OwnershipLost,
+    /// No longer joined to its folder group.
+    NotJoined,
+}
+
+impl DegradedCause {
+    /// The cause of `link`'s degraded state; `None` when it is not degraded.
+    #[must_use]
+    pub fn of(link: &LinkStatus) -> Option<Self> {
+        use yadorilink_ipc_proto::daemonctl::DegradedCause as Wire;
+        link.degraded.then(|| match link.degraded_cause() {
+            Wire::Unspecified => Self::Stopped,
+            Wire::WaitingForDiskSpace => Self::WaitingForDiskSpace,
+            Wire::FileWatchLimit => Self::FileWatchLimit,
+            Wire::OwnershipLost => Self::OwnershipLost,
+            Wire::NotJoined => Self::NotJoined,
+        })
+    }
+
+    /// The attention item this cause is.
+    #[must_use]
+    pub fn item(self) -> crate::AttentionItem {
+        use crate::AttentionItem as I;
+        match self {
+            Self::Stopped => I::FolderStopped,
+            Self::WaitingForDiskSpace => I::WaitingForDiskSpace,
+            Self::FileWatchLimit => I::FileWatchLimit,
+            Self::OwnershipLost => I::OwnershipLost,
+            Self::NotJoined => I::NotJoined,
+        }
+    }
 }
 
 impl From<&LinkStatus> for FolderSummary {
@@ -183,6 +229,7 @@ impl From<&LinkStatus> for FolderSummary {
             ambiguous_local_paths: link.ambiguous_local_paths.clone(),
             degraded: link.degraded,
             degraded_reason: link.degraded_reason.clone(),
+            degraded_cause: DegradedCause::of(link),
         }
     }
 }

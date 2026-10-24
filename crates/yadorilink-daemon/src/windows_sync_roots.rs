@@ -16,16 +16,16 @@ use yadorilink_fs_platform::windows_name::windows_name_key as name_key;
 
 /// The host's record of its sync roots: the base name of its generation files
 /// (`cfapi_sync_roots.txt.<seq>`, see `yadorilink_fs_platform::generation`).
-pub(crate) fn registry_file() -> Option<PathBuf> {
-    yadorilink_fs_platform::state_dir::state_dir().ok().map(|dir| dir.join("cfapi_sync_roots.txt"))
+pub(crate) fn registry_file(config_dir: &std::path::Path) -> PathBuf {
+    config_dir.join("cfapi_sync_roots.txt")
 }
 
 /// Whether the host serves its sync roots from an older generation of the record because the
 /// newest one is torn (the host takes the previous complete one; see
 /// `yadorilink_windows_provider_policy::host::read_registry_at`). The lookup below stays closed
 /// in that case. It clears when the host publishes its next generation.
-pub(crate) fn registry_restored() -> bool {
-    registry_file().is_some_and(|base| registry_restored_at(&base))
+pub(crate) fn registry_restored(config_dir: &std::path::Path) -> bool {
+    registry_restored_at(&registry_file(config_dir))
 }
 
 fn registry_restored_at(base: &std::path::Path) -> bool {
@@ -37,8 +37,11 @@ fn registry_restored_at(base: &std::path::Path) -> bool {
 
 /// `(root id hex, path relative to the root with `/` separators)` of an absolute path inside one
 /// of the host's sync roots. `None` when no root holds it, or when it names the root itself.
-pub(crate) fn locate(absolute_path: &str) -> Option<(String, String)> {
-    locate_at(&registry_file()?, absolute_path)
+pub(crate) fn locate(
+    config_dir: &std::path::Path,
+    absolute_path: &str,
+) -> Option<(String, String)> {
+    locate_at(&registry_file(config_dir), absolute_path)
 }
 
 /// Reads the registry the way the host does: the newest complete generation. Anything that

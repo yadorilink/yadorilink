@@ -50,7 +50,7 @@ def write_manifest(paths: list[Path], out: Path) -> None:
             raise SystemExit(f"error: artifact not found: {path}")
         lines.append(f"{sha256_of(path)}  {path.name}")
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
     print(f"wrote {out} ({len(paths)} artifact(s))")
 
 
@@ -59,7 +59,7 @@ def write_sidecars(paths: list[Path]) -> None:
         if not path.exists():
             raise SystemExit(f"error: artifact not found: {path}")
         sidecar = path.with_name(path.name + ".sha256")
-        sidecar.write_text(f"{sha256_of(path)}  {path.name}", encoding="utf-8")
+        sidecar.write_text(f"{sha256_of(path)}  {path.name}", encoding="utf-8", newline="\n")
         print(f"wrote {sidecar}")
 
 

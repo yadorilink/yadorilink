@@ -35,7 +35,7 @@
 //!
 //! # Refusing a half-configured store
 //!
-//! Modelled on `yadorilink_daemon::path_witness_sink::configure_from_env`: the
+//! Modelled on the daemon's path witness sink: the
 //! combinations that cannot mean anything are named and refused at startup,
 //! rather than defaulted into something that starts cleanly and is wrong.
 //! `YADORILINK_CREDENTIAL_FILE` with `YADORILINK_CREDENTIAL_STORE=keyring` is
@@ -78,12 +78,14 @@
 //! reading it -- refusing to read a damaged store is only a policy if the
 //! remedy it names can actually be carried out.
 
+mod entry_claim;
 mod file;
 mod keyring_backend;
 mod lock;
 
 use std::path::{Path, PathBuf};
 
+pub use entry_claim::{EntryClaim, FileEntryLock};
 pub use lock::CredentialLock;
 
 /// Selects the backend. Unset means the platform default.
@@ -344,6 +346,30 @@ pub enum StoreError {
     ClientIdChanged { expected: String, found: String },
 
     #[error(
+        "the credential file {0} cannot be claimed (its lock file cannot be created beside it), \
+         so whether another engine uses the same entry cannot be told"
+    )]
+    UnresolvableCredentialPath(PathBuf),
+
+    #[error(
+        "the credential file {0} is named like the rotation lock file (`credentials.lock`), \
+         which the store takes for every refresh; use another file name"
+    )]
+    CredentialFileIsRotationLock(PathBuf),
+
+    #[error(
+        "the credential file {0} is a symbolic link; name the file itself, because saving \
+         replaces the link with a regular file"
+    )]
+    CredentialFileIsSymlink(PathBuf),
+
+    #[error("the credential entry {0} is already in use by another engine")]
+    EntryInUse(PathBuf),
+
+    #[error("{0:?} is not a keyring scope: use 1 to 64 of lowercase letters a-z, digits, '.', '_' and '-'")]
+    InvalidKeyringScope(String),
+
+    #[error(
         "this `CredentialLock` was acquired for {held}, not this store's own lock file {expected}; \
          a lock over a different config directory proves nothing about mutual exclusion on THIS \
          store's document, so the mutation is refused rather than run unlocked in every sense \
@@ -357,8 +383,10 @@ pub type StoreResult<T> = Result<T, StoreError>;
 /// Which backing store holds the document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Backend {
-    /// The OS-native credential store.
-    Keyring,
+    /// The OS-native credential store. `scope` names this engine's own entry inside it
+    /// (the account is `credentials.<scope>`); `None` is the one entry the desktop
+    /// installation, daemon and CLI share.
+    Keyring { scope: Option<String> },
     /// An owner-only file at this path.
     File(PathBuf),
 }
@@ -376,7 +404,52 @@ impl Backend {
         if cfg!(target_os = "linux") {
             Backend::File(config_dir.join(CREDENTIALS_FILE))
         } else {
-            Backend::Keyring
+            Backend::Keyring { scope: None }
+        }
+    }
+
+    /// The OS keyring entry private to `scope`: two engines of one process with different
+    /// scopes keep different entries, so neither can read or rotate the other's credential.
+    ///
+    /// A scope is lowercase ASCII only (`a-z`, `0-9`, `.`, `_`, `-`, 1 to 64 long) and anything
+    /// else is refused, never normalized: Windows Credential Manager target names are
+    /// case-insensitive, so `engine-a` and `ENGINE-A` would be one credential under two
+    /// spellings, and two engines could pass admission over it. With one canonical spelling,
+    /// comparing scopes literally compares the entries.
+    pub fn scoped_keyring(scope: &str) -> StoreResult<Self> {
+        let valid = !scope.is_empty()
+            && scope.len() <= 64
+            && scope.bytes().all(|b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+            });
+        if !valid {
+            return Err(StoreError::InvalidKeyringScope(scope.to_owned()));
+        }
+        Ok(Backend::Keyring { scope: Some(scope.to_owned()) })
+    }
+
+    /// Resolves the backend a process's environment selects: `YADORILINK_CREDENTIAL_STORE`
+    /// and `YADORILINK_CREDENTIAL_FILE`. The one place those variables are read; a host that
+    /// has its own configuration builds a [`Backend`] directly.
+    pub fn from_env(config_dir: &Path) -> StoreResult<Self> {
+        let selected = std::env::var(STORE_VAR).ok();
+        let file_override = std::env::var_os(FILE_VAR).map(PathBuf::from);
+        Self::select(selected.as_deref(), file_override, config_dir)
+    }
+
+    /// The selection rules, over already-read values.
+    pub fn select(
+        selected: Option<&str>,
+        file_override: Option<PathBuf>,
+        config_dir: &Path,
+    ) -> StoreResult<Self> {
+        match (selected, file_override) {
+            (None, None) => Ok(Backend::platform_default(config_dir)),
+            (None, Some(path)) | (Some("file"), Some(path)) => Ok(Backend::File(path)),
+            (Some("file"), None) => Ok(Backend::File(config_dir.join(CREDENTIALS_FILE))),
+            (Some("keyring"), None) => Ok(Backend::Keyring { scope: None }),
+            (Some("keyring"), Some(_)) => Err(StoreError::ConflictingConfiguration),
+            (Some(other), _) => Err(StoreError::UnknownBackend(other.to_owned())),
         }
     }
 }
@@ -389,34 +462,9 @@ pub struct CredentialStore {
 }
 
 impl CredentialStore {
-    /// Reads the environment and builds the store, or refuses.
-    ///
-    /// `config_dir` is the caller's own config directory -- `yadorilink-cli`
-    /// and `yadorilink-daemon` each already derive it the same way, and
-    /// passing it in keeps that one rule in one place rather than duplicating
-    /// it here.
-    ///
-    /// The rotation lock always lives in `config_dir`, whichever backend holds
-    /// the secret: the CLI and the daemon share a config directory, and the OS
-    /// keyring offers no lock primitive of its own.
-    pub fn configure_from_env(config_dir: &Path) -> StoreResult<Self> {
-        let selected = std::env::var(STORE_VAR).ok();
-        let file_override = std::env::var_os(FILE_VAR).map(PathBuf::from);
-
-        let backend = match (selected.as_deref(), file_override) {
-            (None, None) => Backend::platform_default(config_dir),
-            (None, Some(path)) | (Some("file"), Some(path)) => Backend::File(path),
-            (Some("file"), None) => Backend::File(config_dir.join(CREDENTIALS_FILE)),
-            (Some("keyring"), None) => Backend::Keyring,
-            (Some("keyring"), Some(_)) => return Err(StoreError::ConflictingConfiguration),
-            (Some(other), _) => return Err(StoreError::UnknownBackend(other.to_owned())),
-        };
-
-        tracing::debug!(?backend, "credential store selected");
-        Ok(Self { backend, lock_path: config_dir.join(LOCK_FILE) })
-    }
-
-    /// A store on a named backend, independent of the environment.
+    /// A store on `backend`. `config_dir` holds the rotation lock whichever backend holds the
+    /// secret: the CLI and the daemon share a config directory, and the OS keyring offers no
+    /// lock primitive of its own.
     #[must_use]
     pub fn with_backend(backend: Backend, config_dir: &Path) -> Self {
         Self { backend, lock_path: config_dir.join(LOCK_FILE) }
@@ -529,7 +577,7 @@ impl CredentialStore {
     pub fn clear(&self, lock: &CredentialLock) -> StoreResult<()> {
         self.require_our_lock(lock)?;
         match &self.backend {
-            Backend::Keyring => keyring_backend::clear(),
+            Backend::Keyring { scope } => keyring_backend::clear(scope.as_deref()),
             Backend::File(path) => file::clear(path),
         }
     }
@@ -543,7 +591,7 @@ impl CredentialStore {
     pub fn purge_local(&self, lock: &CredentialLock) -> StoreResult<()> {
         self.require_our_lock(lock)?;
         match &self.backend {
-            Backend::Keyring => keyring_backend::purge_all(),
+            Backend::Keyring { scope } => keyring_backend::purge_all(scope.as_deref()),
             Backend::File(path) => file::clear(path),
         }
     }
@@ -596,7 +644,7 @@ impl CredentialStore {
     /// nothing.
     fn read(&self) -> StoreResult<Option<Document>> {
         let raw = match &self.backend {
-            Backend::Keyring => keyring_backend::read()?,
+            Backend::Keyring { scope } => keyring_backend::read(scope.as_deref())?,
             Backend::File(path) => file::read(path)?,
         };
         let Some(raw) = raw else { return Ok(None) };
@@ -626,7 +674,7 @@ impl CredentialStore {
         let raw = serde_json::to_string(&document)
             .expect("Document holds only a u32 and Strings, which always serialize");
         match &self.backend {
-            Backend::Keyring => keyring_backend::write(&raw),
+            Backend::Keyring { scope } => keyring_backend::write(scope.as_deref(), &raw),
             Backend::File(path) => file::write(path, &raw),
         }
     }

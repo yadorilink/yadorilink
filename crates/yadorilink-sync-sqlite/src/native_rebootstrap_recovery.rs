@@ -393,7 +393,7 @@ fn fsync_file(file: &fs::File, path: &Path) -> io::Result<()> {
     }
     #[cfg(not(test))]
     let _ = path;
-    file.sync_all()?;
+    yadorilink_fs_platform::flush::sync_file(file)?;
     #[cfg(test)]
     test_hooks::FILE_SYNCS.with(|n| n.set(n.get() + 1));
     Ok(())
@@ -422,7 +422,13 @@ pub(crate) fn directory_durability_available(root: &Path) -> bool {
     }
     #[cfg(not(test))]
     {
-        existing_ancestor(root).is_some_and(|dir| DurableNamespace::open(dir).is_ok())
+        existing_ancestor(root).is_some_and(|dir| match DurableNamespace::open(dir) {
+            Ok(_) => true,
+            Err(error) => {
+                tracing::warn!(%error, ?dir, "directory durability is not available here");
+                false
+            }
+        })
     }
 }
 

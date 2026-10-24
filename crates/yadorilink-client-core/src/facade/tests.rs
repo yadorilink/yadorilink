@@ -24,6 +24,15 @@ fn sign_in_steps_pass_through_and_the_client_layers_signed_in_is_left_to_the_ses
             verification_uri_complete: Some("u?c".into()),
             user_code: "c".into(),
         }),
+        Some(LoginEvent::ShowDeviceCode { verification_uri: "u?c".into(), user_code: "c".into() }),
+        "the link with the code filled in is the one to open"
+    );
+    assert_eq!(
+        login_event(Step::ShowDeviceCode {
+            verification_uri: "u".into(),
+            verification_uri_complete: None,
+            user_code: "c".into(),
+        }),
         Some(LoginEvent::ShowDeviceCode { verification_uri: "u".into(), user_code: "c".into() })
     );
     assert_eq!(
@@ -71,6 +80,14 @@ fn the_engine_api_version_is_the_one_the_engine_identity_pins() {
 }
 
 #[test]
+fn start_over_restarts_the_daemon_with_the_launch_the_host_configured() {
+    // `default_launch()` would find no engine beside a packaged app.
+    let launch = crate::dto::DaemonLaunch::ScheduledTask { name: "HostChosenTask".into() };
+    let core = ClientCore::new(CoreConfig { daemon_launch: launch.clone() });
+    assert_eq!(core.machine_ports().launch, launch);
+}
+
+#[test]
 fn the_default_folder_is_named_for_the_product_and_lives_in_the_home_directory() {
     let home = std::path::PathBuf::from("/Users/a");
     let folder = folders::default_folder_in(Some(home.clone().into_os_string())).unwrap();
@@ -84,4 +101,24 @@ fn the_default_folder_without_a_home_directory_is_refused() {
         let error = folders::default_folder_in(home).unwrap_err();
         assert!(matches!(error, DesktopError::InvalidInput { .. }), "{error:?}");
     }
+}
+
+/// An embedded host's status carries the host's own device name and never the environment's or
+/// the `hostname` command's: with none given it is the generic label.
+#[test]
+fn an_embedded_status_names_the_device_from_the_hosts_settings() {
+    use crate::coordination::credential_store::CredentialSettings;
+    use yadorilink_fapi_client::store::Backend;
+    use yadorilink_transport::KeyMirror;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = CredentialSettings::new(
+        Backend::File(dir.path().join("credentials.json")),
+        KeyMirror::Disabled,
+    );
+    assert_eq!(account_status_in(dir.path(), &settings, None).default_device_name, "My Device");
+    settings.host_name = Some("  Ada's iPhone ".to_owned());
+    assert_eq!(account_status_in(dir.path(), &settings, None).default_device_name, "Ada's iPhone");
+    settings.host_name = Some("   ".to_owned());
+    assert_eq!(account_status_in(dir.path(), &settings, None).default_device_name, "My Device");
 }

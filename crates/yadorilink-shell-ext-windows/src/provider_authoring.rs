@@ -90,7 +90,8 @@ impl Local for WindowsLocal {
                 target.write_all(&buffer[..n]).map_err(|e| CopyError::Failed(e.to_string()))?;
                 size += n as u64;
             }
-            target.sync_all().map_err(|e| CopyError::Failed(e.to_string()))?;
+            yadorilink_fs_platform::flush::sync_file(&target)
+                .map_err(|e| CopyError::Failed(e.to_string()))?;
             Ok((size, hasher.finalize().to_vec()))
         })();
         let (size, sha256) = match copy {

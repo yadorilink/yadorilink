@@ -437,7 +437,10 @@ async fn blocks_split_across_two_peers_each_holding_a_disjoint_subset() {
     connect_as_peer(&device_d, &device_c).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    hydration::hydrate(&device_d.state, GROUP, PATH).await.unwrap();
+    assert!(
+        hydration::hydrate_reporting(&device_d.state, GROUP, PATH).await.unwrap(),
+        "content that came from peers is a download"
+    );
 
     assert_eq!(
         device_d
@@ -450,6 +453,10 @@ async fn blocks_split_across_two_peers_each_holding_a_disjoint_subset() {
     );
     let reconstructed = std::fs::read(device_d.root.path().join(PATH)).unwrap();
     assert_eq!(reconstructed, content);
+    assert!(
+        !hydration::hydrate_reporting(&device_d.state, GROUP, PATH).await.unwrap(),
+        "asking again for a file that is now here fetches nothing"
+    );
 }
 
 /// one peer reports a block not found; a second connected peer
@@ -943,6 +950,65 @@ async fn cancelled_hydration_restores_placeholder_state() {
             .unwrap(),
         Some(MaterializationState::Remote),
         "cancelling hydration must not leave the file stuck Hydrating"
+    );
+}
+
+/// Cancelling a hydration stops its fetch lanes: once the future is dropped no further block
+/// arrives from the peer, so a cancelled read neither keeps downloading nor leaves the file
+/// assembled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_hydration_stops_fetching_blocks_from_the_peer() {
+    let content: Vec<u8> = (0..(DEFAULT_BLOCK_SIZE * 40)).map(|i| (i % 251) as u8).collect();
+    let (blocks, data_by_hash) = chunk_content(&content);
+    let peer = new_device("device-cancel-peer");
+    let hydrating = new_device("device-cancel-hydrating");
+    let _authority = support::shared_checkpoint_authority(
+        &[("device-cancel-peer", &peer.state), ("device-cancel-hydrating", &hydrating.state)],
+        &[GROUP.to_string()],
+    )
+    .await;
+    seed_published_serving_placeholder(
+        &peer,
+        &blocks,
+        content.len() as u64,
+        &blocks,
+        &data_by_hash,
+    )
+    .await;
+    seed_placeholder(&hydrating, &blocks, content.len() as u64, &[], &data_by_hash);
+    // About 10 s for the whole file: far longer than the test waits.
+    hydrating.state.rate_limiters.download.set_rate_bytes_per_sec(500_000);
+    connect_as_peer_sharing_hydrating_rate_limiters(&hydrating, &peer).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let present = || {
+        blocks
+            .iter()
+            .filter(|b| hydrating.state.block_store.exists(&hex::encode(&b.hash)).unwrap())
+            .count()
+    };
+    let state = hydrating.state.clone();
+    let task = tokio::spawn(async move { hydration::hydrate(&state, GROUP, PATH).await });
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while present() == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the fetch should have started");
+
+    task.abort();
+    let _ = task.await;
+    // Blocks already on their way when the cancel landed may still be stored; nothing new may be
+    // requested after that.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let settled = present();
+    assert!(settled < blocks.len(), "the whole file was fetched before the cancel");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(present(), settled, "blocks kept arriving after the hydration was cancelled");
+    assert!(
+        !hydrating.root.path().join(PATH).exists(),
+        "a cancelled hydration left an assembled file"
     );
 }
 

@@ -34,6 +34,9 @@ fn release(platform: &str, arch: &str, url: &str) -> ReleaseEntry {
         artifact_size: 1024,
         artifact_publisher_identity: String::new(),
         release_notes_url: "https://updates.yadorilink.example/beta/0.2.0/notes.html".into(),
+        state_schema_version: None,
+        state_schema_min_readable: None,
+        sparkle_build: None,
     }
 }
 
@@ -41,6 +44,7 @@ fn manifest_with_schema(schema_version: u32) -> UpdateManifest {
     UpdateManifest {
         schema_version,
         generated_at: "2026-07-04T00:00:00Z".into(),
+        expires_at: "2099-01-01T00:00:00Z".into(),
         withdrawn_versions: Vec::new(),
         releases: vec![
             release("macos", "aarch64", "https://updates.yadorilink.example/beta/a.pkg"),

@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 
 use crate::error::LocalCaptureError;
 use crate::scan_block_staging::ScanBlockStaging;
-use yadorilink_fs_platform::fs_identity::{disk_race_fingerprint_of, metadata_mtime_matches};
+use yadorilink_fs_platform::fs_identity::{
+    disk_race_fingerprint_of_handle, metadata_mtime_matches,
+};
 use yadorilink_local_storage::{chunk_open_file, CDC_SIZE_THRESHOLD};
 use yadorilink_replica_domain::file::{FileMeta, FileVersion, VersionBlock};
 use yadorilink_replica_domain::file::{FileRecord, RecordKind};
@@ -895,7 +897,7 @@ impl LocalChangeProcessor {
         // See that helper's own doc comment for the guard and for the
         // bound it buys.
         //
-        // `YADORILINK_DIAGNOSTIC_FORCE_FIXED_CHUNKING=1`
+        // `diagnostics::set_force_fixed_chunking`
         // routes a file that would normally take the CDC branch (`use_cdc`)
         // through `chunk_file_fixed_with_callback` instead of content-
         // defined chunking -- same hash-once/bulk-commit pipeline, only the
@@ -905,8 +907,7 @@ impl LocalChangeProcessor {
         // `T_detect` for a real 1 GiB transfer). Not a production
         // chunking-policy change -- `use_cdc`'s own decision is untouched
         // when this env var is unset (every existing caller/test).
-        let force_fixed_requested =
-            std::env::var("YADORILINK_DIAGNOSTIC_FORCE_FIXED_CHUNKING").as_deref() == Ok("1");
+        let force_fixed_requested = crate::diagnostics::force_fixed_chunking();
         // Read before `staging` is moved into the closure below; decides
         // who records this file's group block provenance further down.
         let staged_blocks = staging.is_some();
@@ -934,6 +935,7 @@ impl LocalChangeProcessor {
                 return Ok(None);
             };
             let before = file.metadata().map_err(source_read_error)?;
+            let fingerprint_before = disk_race_fingerprint_of_handle(&before, &file);
             // Chunking algorithm is chosen automatically from file size:
             // files at or above the size threshold use content-defined
             // chunking (so an internal edit re-transfers only the affected
@@ -977,9 +979,10 @@ impl LocalChangeProcessor {
             #[cfg(any(test, feature = "test-support"))]
             fire_content_read_race_hook(path);
             let after = file.metadata().map_err(source_read_error)?;
-            Ok(Some((blocks, before, after)))
+            let fingerprint_after = disk_race_fingerprint_of_handle(&after, &file);
+            Ok(Some((blocks, before, after, fingerprint_before == fingerprint_after)))
         });
-        let (blocks, before, after) = match chunk_result {
+        let (blocks, before, after, unchanged) = match chunk_result {
             Ok(Some(read)) => read,
             Ok(None) => return Ok((replaced_while_opening(group_id, &rel_path), None, None)),
             // The lstat above already confirmed `path` existed when this
@@ -1015,9 +1018,7 @@ impl LocalChangeProcessor {
             Err(e) => return Err(e),
         };
         let chunked_len: u64 = blocks.iter().map(|block| u64::from(block.size)).sum();
-        if disk_race_fingerprint_of(&before) != disk_race_fingerprint_of(&after)
-            || chunked_len != after.len()
-        {
+        if !unchanged || chunked_len != after.len() {
             tracing::info!(
                 group_id,
                 path = %rel_path,

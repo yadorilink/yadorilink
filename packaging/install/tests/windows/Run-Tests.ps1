@@ -21,9 +21,10 @@ function Ok($m) { $script:Pass++; Write-Host "ok   $m" }
 function Bad($m, $out) { $script:Fail++; Write-Host "FAIL $m"; if ($out) { ($out -split "`n") | ForEach-Object { Write-Host "     | $_" } } }
 
 # --- fake binaries (real PE files)
-foreach ($spec in @(@('0.2.0', 0), @('0.3.0', 0), @('fail', 7))) {
+foreach ($spec in @(@('0.2.0', 0), @('0.3.0', 0), @('fail', 7), @('ph', 0))) {
     $name = $spec[0]; $code = $spec[1]
-    $line = if ($name -eq 'fail') { '' } else { "System.Console.WriteLine(`"yadorilink fake $name`");" }
+    # 'ph' answers `status --json` with whatever YL_FAKE_STATUS holds, like a daemon of any schema.
+    $line = if ($name -eq 'fail') { '' } elseif ($name -eq 'ph') { 'if (a.Length > 0 && a[0] == "status") System.Console.WriteLine(System.Environment.GetEnvironmentVariable("YL_FAKE_STATUS"));' } else { "System.Console.WriteLine(`"yadorilink fake $name`");" }
     Add-Type -TypeDefinition "public static class P { public static int Main(string[] a) { $line return $code; } }" -OutputType ConsoleApplication -OutputAssembly (Join-Path $T "fake-$name.exe")
 }
 
@@ -42,18 +43,19 @@ function Fx([string]$Name, [string[]]$More) {
 }
 function Pub($Name) { (Get-Content (Join-Path $Srv "$Name\pubkey.hex") -Raw).Trim() }
 
-$script:Out = ''; $script:Rc = 0; $script:BaseOverride = $null; $script:MinGen = $null
+$script:Out = ''; $script:Rc = 0; $script:BaseOverride = $null; $script:MinGen = $null; $script:Now = $null
 function Inst([string]$Name, [string]$KeyFrom, [string]$Prefix, [string[]]$More, [string]$Arch = 'AMD64', [bool]$TestOn = $true) {
     $env:YADORILINK_INSTALL_TEST = $(if ($TestOn) { '1' } else { $null })
     $env:YADORILINK_INSTALL_PUBKEY_HEX = Pub $KeyFrom
     $env:YADORILINK_INSTALL_KEY_ID = (Get-Content (Join-Path $Srv "$KeyFrom\key_id") -Raw).Trim()
     $env:YADORILINK_INSTALL_BASE_URL = $(if ($script:BaseOverride) { $script:BaseOverride } else { "$Base/$Name" })
     $env:YADORILINK_INSTALL_MIN_GENERATED_AT = $(if ($script:MinGen) { $script:MinGen } else { $null })
+    $env:YADORILINK_INSTALL_NOW = $(if ($script:Now) { $script:Now } else { $null })
     $env:YADORILINK_INSTALL_ARCH = $Arch
     $args_ = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Installer, '-Prefix', $Prefix, '-Yes') + $More
     $script:Out = (& powershell.exe @args_ 2>&1 | ForEach-Object { "$_" }) -join "`n"
     $script:Rc = $LASTEXITCODE
-    foreach ($v in 'YADORILINK_INSTALL_TEST', 'YADORILINK_INSTALL_PUBKEY_HEX', 'YADORILINK_INSTALL_KEY_ID', 'YADORILINK_INSTALL_BASE_URL', 'YADORILINK_INSTALL_ARCH', 'YADORILINK_INSTALL_MIN_GENERATED_AT') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
+    foreach ($v in 'YADORILINK_INSTALL_TEST', 'YADORILINK_INSTALL_PUBKEY_HEX', 'YADORILINK_INSTALL_KEY_ID', 'YADORILINK_INSTALL_BASE_URL', 'YADORILINK_INSTALL_ARCH', 'YADORILINK_INSTALL_MIN_GENERATED_AT', 'YADORILINK_INSTALL_NOW') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 function Has($s) { $script:Out -like "*$s*" }
 function NewPrefix($n) { $p = Join-Path $T "p$n"; if (Test-Path $p) { Remove-Item $p -Recurse -Force }; $p }
@@ -182,6 +184,24 @@ try {
     if ($Rc -eq 0) { Ok 'manifest at the pinned floor accepted' } else { Bad 'floor equal' $Out }
     $script:MinGen = $null
 
+    # manifest expiry: the live manifest is refused after its expires_at, never before
+    Fx 'ex' '--exe', (Join-Path $T 'fake-0.2.0.exe'), '--generated-at', '2026-10-01T00:00:00Z', '--expires-at', '2026-10-02T00:00:00Z'
+    $p = NewPrefix 60; Inst 'ex' 'ex' $p @('-NoModifyPath')
+    if ($Rc -eq 4 -and (Has 'expired at 2026-10-02T00:00:00Z') -and (NothingInstalled $p)) { Ok 'expired manifest refused (real clock)' } else { Bad 'expired' $Out }
+    $script:Now = '2026-10-02T00:00:01Z'; $p = NewPrefix 61; Inst 'ex' 'ex' $p @('-NoModifyPath')
+    if ($Rc -eq 4 -and (Has 'expired at') -and (NothingInstalled $p)) { Ok 'manifest one second past expiry refused' } else { Bad 'expiry +1s' $Out }
+    $script:Now = '2026-10-02T00:00:00Z'; $p = NewPrefix 62; Inst 'ex' 'ex' $p @('-NoModifyPath')
+    if ($Rc -eq 0) { Ok 'manifest at its expiry second accepted' } else { Bad 'expiry boundary' $Out }
+    $script:Now = $null
+    Fx 'exgone' '--exe', (Join-Path $T 'fake-0.2.0.exe'), '--omit-expires'
+    $p = NewPrefix 63; Inst 'exgone' 'exgone' $p @('-NoModifyPath')
+    if ($Rc -eq 4 -and (Has 'invalid expires_at') -and (NothingInstalled $p)) { Ok 'manifest without expires_at refused' } else { Bad 'no expiry' $Out }
+
+    # snapshots published before expires_at existed stay usable
+    Fx 'lg' '--version', '0.3.0', '--extra-version', '0.2.0', '--legacy-snapshots', '--exe', (Join-Path $T 'fake-0.3.0.exe')
+    $p = NewPrefix 64; Inst 'lg' 'lg' $p @('-NoModifyPath', '-Version', '0.2.0')
+    if ($Rc -eq 0 -and (Has 'Installed YadoriLink 0.2.0')) { Ok 'pinned install from a legacy per-version manifest without expires_at' } else { Bad 'legacy pinned' $Out }
+
     # version-pinned installs: the live channel manifest has the last word
     Fx 'pv' '--version', '0.3.0', '--extra-version', '0.2.0', '--exe', (Join-Path $T 'fake-0.3.0.exe')
     $p = NewPrefix 47; Inst 'pv' 'pv' $p @('-NoModifyPath', '-Version', '0.3.0'); if ($Rc -eq 0 -and (Ver $p) -like '*0.3.0') { Ok 'pin to the channel current version' } else { Bad 'pin current' $Out }
@@ -270,6 +290,36 @@ try {
     if ($Rc -eq 0 -and -not (Test-Path (Join-Path $p 'versions')) -and -not (Test-Path $bin) -and -not (([Environment]::GetEnvironmentVariable('Path', 'User') -split ';') -contains $bin)) { Ok 'uninstall removes junction, files, PATH entry' } else { Bad 'uninstall' $Out }
     Inst 's1' 's1' $p @('-Uninstall'); if ($Rc -eq 0 -and (Has 'Nothing to uninstall')) { Ok 'uninstall twice is harmless' } else { Bad 'uninstall twice' $Out }
 
+    # U5: removal warns about files that were never downloaded and never assumes consent
+    $p = NewPrefix 74; Inst 's1' 's1' $p @('-NoModifyPath'); Inst 's1' 's1' $p @('-Uninstall')
+    if ($Rc -eq 0 -and (Has 'WARNING') -and (Has 'cannot count files that were never downloaded')) { Ok 'uninstall warns that placeholders cannot be counted when the daemon does not answer' } else { Bad 'uninstall unknown count warning' $Out }
+    Fx 'ph' '--exe', (Join-Path $T 'fake-ph.exe')
+    $schemas = @(
+        @{ n = 77; name = 'a folder without the count (older schema)'; json = '{"folders":[{"local_path":"C:/Y"}]}'; want = 'count is unknown'; warn = $true },
+        @{ n = 78; name = 'a null count'; json = '{"folders":[{"local_path":"C:/Y","on_demand":true,"placeholder_count":null}]}'; want = 'count is unknown'; warn = $true },
+        @{ n = 79; name = 'a folder without on_demand'; json = '{"folders":[{"local_path":"C:/Y","placeholder_count":0}]}'; want = 'count is unknown'; warn = $true },
+        @{ n = 75; name = 'a count of 3'; json = '{"folders":[{"local_path":"C:/Y","on_demand":true,"placeholder_count":3}]}'; want = '3 file(s) were never downloaded'; warn = $true },
+        @{ n = 80; name = 'a count of 0'; json = '{"folders":[{"local_path":"C:/Y","on_demand":true,"placeholder_count":0}]}'; want = $null; warn = $false }
+    )
+    foreach ($c in $schemas) {
+        # with -Yes: the warning (or none) is printed and the removal goes on
+        $env:YL_FAKE_STATUS = $c.json
+        $p = NewPrefix $c.n; Inst 'ph' 'ph' $p @('-NoModifyPath'); Inst 'ph' 'ph' $p @('-Uninstall')
+        $gone = -not (Test-Path (Join-Path $p 'install-receipt.txt'))
+        if ($c.warn) { $okc = $Rc -eq 0 -and $gone -and (Has 'WARNING') -and (Has $c.want) } else { $okc = $Rc -eq 0 -and $gone -and -not (Has 'WARNING') }
+        if ($okc) { Ok "uninstall -Yes, status with $($c.name)" } else { Bad "uninstall -Yes, status with $($c.name)" $Out }
+        # without -Yes and nobody to ask: refused exactly when the warning applies
+        $p = NewPrefix ($c.n + 20); Inst 'ph' 'ph' $p @('-NoModifyPath')
+        $env:YADORILINK_INSTALL_TEST = '1'
+        $o = ('' | & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer -Prefix $p -Uninstall 2>&1 | ForEach-Object { "$_" }) -join "`n"; $rc = $LASTEXITCODE
+        Remove-Item Env:YADORILINK_INSTALL_TEST -ErrorAction SilentlyContinue
+        $kept = Test-Path (Join-Path $p 'install-receipt.txt')
+        if ($c.warn) { $okc = $rc -ne 0 -and $kept } else { $okc = $rc -eq 0 -and -not $kept }
+        if ($okc) { Ok "uninstall without -Yes and nobody to ask, status with $($c.name)" } else { Bad "uninstall without -Yes, status with $($c.name)" $o }
+        Remove-Item Env:YL_FAKE_STATUS -ErrorAction SilentlyContinue
+        if ($kept) { Inst 'ph' 'ph' $p @('-Uninstall') }
+    }
+
     # the daemon-readable script marker sits beside the binaries (install_source.rs)
     $p = NewPrefix 72; Inst 's1' 's1' $p @('-NoModifyPath')
     $marker = Join-Path $p 'bin\install-receipt.json'
@@ -295,6 +345,10 @@ try {
     $o = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Get-Content -Raw '$Installer' | Invoke-Expression; exit 0" 2>&1 | ForEach-Object { "$_" }) -join "`n"
     foreach ($v in 'YADORILINK_INSTALL_TEST', 'YADORILINK_INSTALL_PUBKEY_HEX', 'YADORILINK_INSTALL_BASE_URL', 'YADORILINK_INSTALL_ARCH', 'YADORILINK_INSTALL_KEY_ID', 'YADORILINK_PREFIX', 'YADORILINK_YES', 'YADORILINK_NO_MODIFY_PATH') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
     if ((Test-Path (Join-Path $p 'bin\yadorilink.exe')) -and $o -like '*Installed YadoriLink 0.2.0*') { Ok 'iex form installs' } else { Bad 'iex form' $o }
+
+    # a prompt that interpolates "$name?" prints nothing for the name (PowerShell reads "name?" as the variable)
+    $bad = @(Select-String -LiteralPath $Installer -Pattern '"[^"]*\$[A-Za-z_]\w*\?[^"]*"' | ForEach-Object { "line $($_.LineNumber): $($_.Line.Trim())" })
+    if ($bad.Count -eq 0) { Ok 'no prompt interpolates a name followed by a question mark' } else { Bad 'prompt text interpolates $name?' ($bad -join "`n") }
 
     # embedded verifier agrees with the independent Python signer on a manifest it signed (positive case is every success above)
 } finally {

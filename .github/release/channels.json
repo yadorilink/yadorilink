@@ -1,0 +1,7 @@
+{
+  "channels": [
+    { "name": "nightly", "lane": "dev" },
+    { "name": "beta", "lane": "beta" },
+    { "name": "stable", "lane": "beta", "promotes_from": "beta" }
+  ]
+}

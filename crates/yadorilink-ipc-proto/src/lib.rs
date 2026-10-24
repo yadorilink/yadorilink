@@ -113,7 +113,9 @@ pub mod daemonctl {
     /// `36`: transfers the device sent can be listed (`list_sent_transfers`), canceled and
     /// retried by id like received ones, and a failed received transfer lists why it stopped.
     /// `37`: adds the code `ACCESS_DENIED`; link refuses with it when the system denies the folder.
-    pub const CONTROL_PROTOCOL_VERSION: u32 = 37;
+    /// `38`: adds `update_verified_entry`, which says whether an appcast item is covered by the
+    /// verified channel manifest's `app_bundle` entry and returns that entry.
+    pub const CONTROL_PROTOCOL_VERSION: u32 = 38;
 }
 
 #[cfg(test)]

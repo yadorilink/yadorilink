@@ -568,18 +568,14 @@ fn repair_interrupted_materializations_inner(
                     return Ok(());
                 }
             }
-            let committed = state.commit_recovered_materialized_state(
+            let committed = commit_recovered_object(
+                state,
                 group_id,
                 &path,
-                yadorilink_peer_session::ports::ExactActualState::Object {
-                    kind: RecordKind::File,
-                    version,
-                    identity: Box::new(Some(identity)),
-                },
-                yadorilink_peer_session::ports::ExpectedAuthoring {
-                    state: row_state,
-                    expected_version: Some(&version),
-                },
+                RecordKind::File,
+                version,
+                Some(identity),
+                row_state,
                 permit,
             )?;
             if committed {
@@ -646,6 +642,41 @@ fn repair_interrupted_materializations_inner(
                 path = %path,
                 "a Hydrated file is missing under an open delete intent; leaving it to that delete"
             );
+            return Ok(());
+        }
+        // A write that recorded its rename into place (durably) and was not
+        // proven since: the name is missing because the user removed it, or
+        // moved it, after the write placed it. It is a delete the receive
+        // never saw, so it is not rebuilt: the removal is journaled for
+        // capture and the write is closed over no identity, as the live
+        // receive closes a file removed before its commit. Capture then
+        // authors the delete of the `Present` row.
+        if on_disk_size.is_none()
+            && intent_kind == Some(MaterializationIntentKind::Materialize)
+            && state.write_landed_unproven(group_id, &path)?
+        {
+            if let Some(version) = row.current_version {
+                state.record_dirty_path(
+                    group_id,
+                    &path,
+                    "removed",
+                    repair_now_unix_nanos(),
+                    permit,
+                )?;
+                let committed = commit_recovered_object(
+                    state,
+                    group_id,
+                    &path,
+                    RecordKind::File,
+                    version,
+                    None,
+                    row_state,
+                    permit,
+                )?;
+                if committed {
+                    report.offline_deleted.push(path);
+                }
+            }
             return Ok(());
         }
         let has_intent = intent_kind.is_some();
@@ -1297,19 +1328,8 @@ fn repair_one_interrupted_single_object(
         };
         let identity =
             yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&out_path).ok();
-        let committed = state.commit_recovered_materialized_state(
-            group_id,
-            path,
-            yadorilink_peer_session::ports::ExactActualState::Object {
-                kind,
-                version,
-                identity: Box::new(identity),
-            },
-            yadorilink_peer_session::ports::ExpectedAuthoring {
-                state: state_now,
-                expected_version: Some(&version),
-            },
-            permit,
+        let committed = commit_recovered_object(
+            state, group_id, path, kind, version, identity, state_now, permit,
         )?;
         if committed && !proof_stands {
             report.reproven.push(path.to_string());
@@ -1697,6 +1717,35 @@ fn reconstruct_file_journaled(
 /// this pass emits (mirrors the observed-time stamp the disk scan's delete path
 /// uses). Monotonic-clock skew is irrelevant here — this is an observed-at
 /// timestamp on a local tombstone, not an ordering primitive.
+/// The one commit of a repaired object's recovered state: `version` (with `identity` when disk
+/// was observed) published while the row is still `row_state` at that version.
+#[allow(clippy::too_many_arguments)]
+fn commit_recovered_object(
+    state: &dyn MaterializationExecutionPort,
+    group_id: &str,
+    path: &str,
+    kind: RecordKind,
+    version: yadorilink_replica_domain::ids::VersionHash,
+    identity: Option<yadorilink_fs_platform::fs_identity::FileIdentity>,
+    row_state: MaterializationState,
+    permit: &RootCommitPermit,
+) -> Result<bool, MaterializationExecutionError> {
+    state.commit_recovered_materialized_state(
+        group_id,
+        path,
+        yadorilink_peer_session::ports::ExactActualState::Object {
+            kind,
+            version,
+            identity: Box::new(identity),
+        },
+        yadorilink_peer_session::ports::ExpectedAuthoring {
+            state: row_state,
+            expected_version: Some(&version),
+        },
+        permit,
+    )
+}
+
 fn repair_now_unix_nanos() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

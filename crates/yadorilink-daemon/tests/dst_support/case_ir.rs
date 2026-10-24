@@ -216,11 +216,68 @@ pub enum Fault {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NetFault {
     Drop,
-    Delay { millis: u64 },
+    Delay {
+        millis: u64,
+    },
     Reorder,
     Duplicate,
-    Partition { device_a: usize, device_b: usize },
-    Heal { device_a: usize, device_b: usize },
+    Partition {
+        device_a: usize,
+        device_b: usize,
+    },
+    Heal {
+        device_a: usize,
+        device_b: usize,
+    },
+    /// `from` can no longer reach `to`; `to` still reaches `from`.
+    PartitionOneWay {
+        from: usize,
+        to: usize,
+    },
+    HealOneWay {
+        from: usize,
+        to: usize,
+    },
+    /// Every `every_nth` datagram from `from` to `to` is sent twice,
+    /// starting at the one `seed % every_nth` selects.
+    DuplicateDatagrams {
+        from: usize,
+        to: usize,
+        every_nth: u64,
+        seed: u64,
+    },
+    StopDuplicating {
+        from: usize,
+        to: usize,
+    },
+    /// Every `every_nth` datagram arriving at `device` is held until
+    /// `release_after` later ones have overtaken it (reordering and delay),
+    /// or the wire goes idle.
+    HoldInbound {
+        device: usize,
+        every_nth: u64,
+        release_after: u32,
+        seed: u64,
+    },
+    StopHolding {
+        device: usize,
+    },
+}
+
+impl NetFault {
+    /// Whether only the substrate's datagram carrier can express this fault
+    /// (the in-process `FaultPlan` has no equivalent).
+    pub fn carrier_only(&self) -> bool {
+        matches!(
+            self,
+            NetFault::PartitionOneWay { .. }
+                | NetFault::HealOneWay { .. }
+                | NetFault::DuplicateDatagrams { .. }
+                | NetFault::StopDuplicating { .. }
+                | NetFault::HoldInbound { .. }
+                | NetFault::StopHolding { .. }
+        )
+    }
 }
 
 /// Shape for the faulting `BlockStore`/`SyncState` injectors.

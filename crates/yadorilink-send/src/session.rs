@@ -362,7 +362,7 @@ impl SendService {
             outbound_cancels: std::sync::atomic::AtomicU64::new(0),
             outbound_lifecycle: std::sync::Mutex::new(()),
             store,
-            block_store: SegmentBlockStore::new(block_store_root.as_ref())?,
+            block_store: SegmentBlockStore::open_process_locked(block_store_root.as_ref())?,
             directory,
             default_inbox_dir,
             #[cfg(any(test, feature = "test-support"))]

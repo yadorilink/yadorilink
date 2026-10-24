@@ -17,7 +17,10 @@ pub use creation_marker::{
     creation_marker_path, record_database_created, refuse_lost_database, LostDatabaseError,
 };
 pub use database::writer_gate_stats;
-pub use database::{current_thread_in_write_transaction, OpenOptions, SyncDatabase};
+pub use database::{
+    current_thread_in_write_transaction, record_writer_generation_in_transaction,
+    record_writer_generation_on, OpenOptions, SyncDatabase,
+};
 pub use error::{DatabaseError, SqlOperationError};
 pub use job_fence::{FenceWait, JobCompletion, JobFence, JobScope, FENCE_WARN_INTERVAL};
 #[cfg(any(test, feature = "test-support"))]

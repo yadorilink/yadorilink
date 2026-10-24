@@ -120,10 +120,6 @@ impl TopologyNode {
 }
 
 pub fn new_node(device_id: &str) -> TopologyNode {
-    // Every node this fixture builds is one a daemon will start a
-    // reconciliation stack for, so the process must already be off public
-    // relay infrastructure by the time the first one exists.
-    super::ensure_no_public_relays();
     // Suffixed with a per-process-unique counter: `ensure_isolated_config_
     // dir` gives each TEST BINARY (process) its own isolated pin-file
     // directory, but a test binary with more than one `#[tokio::test]`
@@ -150,7 +146,9 @@ pub fn new_node(device_id: &str) -> TopologyNode {
     let db_dir = tempfile::tempdir().unwrap();
     let db_path = db_dir.path().join("index.db");
     let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
-    let sync_state = Arc::new(ReplicaCoordinator::open(&db_path).unwrap());
+    let sync_state = Arc::new(
+        ReplicaCoordinator::open_with(&db_path, super::tuning_with_outside_witness()).unwrap(),
+    );
     let state = DaemonState::new(device_id.to_string(), sync_state, store);
     let signing_key = yadorilink_transport::DeviceSigningKeyPair::generate().signing;
     state.set_device_signing_key(signing_key.clone());
@@ -222,7 +220,7 @@ async fn restart_node_inner(node: TopologyNode, refused_links_expected: bool) ->
     // it never clears).
     let mut open_attempts = 0;
     let sync_state = loop {
-        match ReplicaCoordinator::open(&node.db_path) {
+        match ReplicaCoordinator::open_with(&node.db_path, super::tuning_with_outside_witness()) {
             Ok(coordinator) => break Arc::new(coordinator),
             Err(error) if open_attempts < 10 => {
                 open_attempts += 1;

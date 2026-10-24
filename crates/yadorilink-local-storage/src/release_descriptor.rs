@@ -53,6 +53,75 @@ pub fn identity_dir(exe: &Path) -> Option<PathBuf> {
     Some(beside.to_path_buf())
 }
 
+/// The state database generations one engine build handles: the version it stamps on the
+/// database it writes (`writes`) and the oldest it can still read (`reads_from`). An engine
+/// opens a database stamped within `reads_from..=writes`; any other stamp is refused before the
+/// engine writes anything. Today's engines open exactly their own generation (no migrations
+/// before release), so `reads_from == writes`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StateSchema {
+    pub writes: u32,
+    pub reads_from: u32,
+}
+
+/// Why a build cannot use the state database it would be given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateRefusal {
+    /// The database was written by a newer build than the target can read (a downgrade).
+    NewerThanReadable { on_disk: u32, newest_readable: u32 },
+    /// The database is older than the target can still read.
+    OlderThanReadable { on_disk: u32, oldest_readable: u32 },
+    /// The build's declaration is inconsistent (a minimum without a version, or above it), so
+    /// nothing can be concluded from it.
+    Undeclarable,
+}
+
+impl StateRefusal {
+    /// The explanation shown to the user. Nothing was changed.
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self {
+            StateRefusal::NewerThanReadable { on_disk, newest_readable } => format!(
+                "the data on this device uses state database version {on_disk} but that build \
+                 reads up to version {newest_readable}; downgrading to it is not supported and \
+                 nothing was changed. Use the build that last wrote this data, or a newer one"
+            ),
+            StateRefusal::OlderThanReadable { on_disk, oldest_readable } => format!(
+                "the data on this device uses state database version {on_disk} but that build \
+                 reads from version {oldest_readable} on; nothing was changed"
+            ),
+            StateRefusal::Undeclarable => "that build declares its state database versions \
+                 inconsistently; nothing was changed"
+                .to_string(),
+        }
+    }
+}
+
+impl StateSchema {
+    /// Whether a build declaring `target` can open a database stamped `on_disk`. A target that
+    /// declares nothing (`None`, a descriptor from before the field existed) cannot be judged
+    /// here and is accepted: the engine's own check when it opens the database still applies.
+    ///
+    /// # Errors
+    /// [`StateRefusal`] when `on_disk` is outside what the target reads.
+    pub fn check_readable(on_disk: u32, target: Option<Self>) -> Result<(), StateRefusal> {
+        let Some(target) = target else { return Ok(()) };
+        if on_disk > target.writes {
+            return Err(StateRefusal::NewerThanReadable {
+                on_disk,
+                newest_readable: target.writes,
+            });
+        }
+        if on_disk < target.reads_from {
+            return Err(StateRefusal::OlderThanReadable {
+                on_disk,
+                oldest_readable: target.reads_from,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// What `engine-identity.json` says about the build.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EngineIdentity {
@@ -62,6 +131,9 @@ pub struct EngineIdentity {
     pub channel: String,
     /// The local control surface version the bundle was built for.
     pub engine_api_version: u32,
+    /// The state database generations the bundle handles; `None` when the file declares none
+    /// (written before the field existed).
+    pub state_schema: Option<StateSchema>,
 }
 
 /// What a directory holds.
@@ -107,7 +179,40 @@ fn parse_identity(bytes: &[u8]) -> Result<EngineIdentity, String> {
         release_id: format!("{commit}:{digest}"),
         channel: text("channel").unwrap_or_default().to_string(),
         engine_api_version: api,
+        state_schema: parse_state_schema(&value)?,
     })
+}
+
+/// `state_schema_version` (what the build writes) and the optional `state_schema_min_readable`
+/// (the oldest it reads; the written version when absent). Both absent is a file from before the
+/// fields existed. A field that is present but unusable makes the file unreadable: a build that
+/// claims to declare compatibility and does so wrongly must not be trusted.
+fn parse_state_schema(value: &serde_json::Value) -> Result<Option<StateSchema>, String> {
+    let field = |key: &str| -> Result<Option<u32>, String> {
+        let Some(v) = value.get(key) else { return Ok(None) };
+        v.as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n >= 1)
+            .map(Some)
+            .ok_or_else(|| format!("{ENGINE_IDENTITY_FILE}: {key} is not a positive integer"))
+    };
+    let (writes, min) = (field("state_schema_version")?, field("state_schema_min_readable")?);
+    match (writes, min) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(format!(
+            "{ENGINE_IDENTITY_FILE} has state_schema_min_readable without state_schema_version"
+        )),
+        (Some(writes), min) => {
+            let reads_from = min.unwrap_or(writes);
+            if reads_from > writes {
+                return Err(format!(
+                    "{ENGINE_IDENTITY_FILE}: state_schema_min_readable {reads_from} is above \
+                     state_schema_version {writes}"
+                ));
+            }
+            Ok(Some(StateSchema { writes, reads_from }))
+        }
+    }
 }
 
 /// The descriptor of one running component.
@@ -122,6 +227,9 @@ pub struct ReleaseDescriptor {
     pub release_id: String,
     /// The local control surface version this component speaks.
     pub engine_api_version: u32,
+    /// The state database generations the installation's identity declares; `None` when it
+    /// declares none or carries no identity file.
+    pub state_schema: Option<StateSchema>,
 }
 
 /// Why a component's own descriptor cannot be trusted. Fail closed: such a component does not run.
@@ -135,6 +243,9 @@ pub enum DescriptorProblem {
     /// The identity beside the binaries names another build than the one compiled into the
     /// program: parts of two builds are mixed in one install.
     BuildMismatch { embedded: String, identity: String, identity_path: PathBuf },
+    /// The identity beside the binaries declares another state database version than the one the
+    /// binary writes: parts of two builds are mixed in one install.
+    StateSchemaMismatch { identity_writes: u32, binary_writes: u32, identity_path: PathBuf },
 }
 
 impl DescriptorProblem {
@@ -159,6 +270,19 @@ impl DescriptorProblem {
                  YadoriLink with the updater that installed it.",
                 identity_path.display()
             ),
+            DescriptorProblem::StateSchemaMismatch {
+                identity_writes,
+                binary_writes,
+                identity_path,
+            } => {
+                format!(
+                    "this installation mixes two builds: {} declares state database version \
+                     {identity_writes} but this program writes version {binary_writes}; nothing \
+                     was started. Finish updating (or reinstall) YadoriLink with the updater \
+                     that installed it.",
+                    identity_path.display()
+                )
+            }
         }
     }
 }
@@ -217,6 +341,7 @@ impl ReleaseDescriptor {
                 Some(identity)
             }
         };
+        let state_schema = from_file.as_ref().and_then(|i| i.state_schema);
         let (release_id, channel) = match (embedded, from_file) {
             (Some(built), _) => (built.release_id.to_string(), built.channel.to_string()),
             (None, Some(identity)) => (identity.release_id, identity.channel),
@@ -228,7 +353,32 @@ impl ReleaseDescriptor {
             install_source: install_source.to_string(),
             release_id,
             engine_api_version: binary_api,
+            state_schema,
         })
+    }
+
+    /// Confirms that the state database version the program writes (`binary_writes`) is the one
+    /// the identity beside it declares. An identity that declares none confirms nothing.
+    ///
+    /// # Errors
+    /// [`DescriptorProblem::StateSchemaMismatch`] when they differ.
+    pub fn confirm_state_schema(
+        self,
+        binary_writes: u32,
+        identity_dir: Option<&Path>,
+    ) -> Result<Self, DescriptorProblem> {
+        match self.state_schema {
+            Some(declared) if declared.writes != binary_writes => {
+                Err(DescriptorProblem::StateSchemaMismatch {
+                    identity_writes: declared.writes,
+                    binary_writes,
+                    identity_path: identity_dir
+                        .map(|d| d.join(ENGINE_IDENTITY_FILE))
+                        .unwrap_or_default(),
+                })
+            }
+            _ => Ok(self),
+        }
     }
 }
 

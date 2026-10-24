@@ -332,10 +332,11 @@ fn a_crash_between_levels_of_a_chain_leaves_only_published_levels() {
 #[test]
 fn an_open_windows_gate_leaves_each_volume_to_its_probe() {
     let dir = tempfile::tempdir().unwrap();
-    match (probe::cached_verdict(dir.path()), DurableNamespace::open(dir.path())) {
+    match (probe::cached_verdict(dir.path()).verdict, DurableNamespace::open(dir.path())) {
         (Capability::Supported, Ok(_)) => {}
-        (Capability::Unsupported, Err(NsError::Unavailable(UnavailableReason::Unsupported))) => {}
-        (Capability::Unknown, Err(NsError::Unavailable(UnavailableReason::Unknown))) => {}
+        (Capability::Unsupported, Err(NsError::Unavailable(UnavailableReason::Unsupported, _))) => {
+        }
+        (Capability::Unknown, Err(NsError::Unavailable(UnavailableReason::Unknown, _))) => {}
         (verdict, opened) => panic!("verdict {verdict:?} but open gave {opened:?}"),
     }
 }
@@ -346,14 +347,15 @@ fn an_open_windows_gate_leaves_each_volume_to_its_probe() {
 fn only_a_supported_verdict_opens_a_handle() {
     use UnavailableReason::{Unknown, Unsupported};
     let dir = tempfile::tempdir().unwrap();
-    assert!(DurableNamespace::from_verdict(Capability::Supported, dir.path()).is_ok());
+    assert!(DurableNamespace::from_verdict(Capability::Supported, Default::default(), dir.path())
+        .is_ok());
     for (verdict, reason) in
         [(Capability::Unsupported, Unsupported), (Capability::Unknown, Unknown)]
     {
-        let refused = DurableNamespace::from_verdict(verdict, dir.path());
-        assert!(matches!(&refused, Err(NsError::Unavailable(r)) if *r == reason), "{refused:?}");
+        let refused = DurableNamespace::from_verdict(verdict, Default::default(), dir.path());
+        assert!(matches!(&refused, Err(NsError::Unavailable(r, _)) if *r == reason), "{refused:?}");
         let fallback = DurableNamespace::only_a_closed_gate_may_fall_back(refused);
-        assert!(matches!(fallback, Err(NsError::Unavailable(r)) if r == reason), "{fallback:?}");
+        assert!(matches!(fallback, Err(NsError::Unavailable(r, _)) if r == reason), "{fallback:?}");
     }
 }
 
@@ -365,11 +367,11 @@ fn a_directory_that_cannot_be_probed_is_refused_as_unknown() {
     let missing = dir.path().join("no").join("such").join("directory");
     assert!(matches!(
         DurableNamespace::open(&missing),
-        Err(NsError::Unavailable(UnavailableReason::Unknown))
+        Err(NsError::Unavailable(UnavailableReason::Unknown, _))
     ));
     assert!(matches!(
         DurableNamespace::open_unless_gate_closed(&missing),
-        Err(NsError::Unavailable(UnavailableReason::Unknown))
+        Err(NsError::Unavailable(UnavailableReason::Unknown, _))
     ));
     #[cfg(windows)]
     {
@@ -776,13 +778,16 @@ fn move_durably_moves_a_file_or_a_directory_and_never_replaces_with_no_replace()
 fn only_a_closed_gate_lets_a_writer_fall_back_to_a_plain_rename() {
     use UnavailableReason::{GateClosed, Unknown, Unsupported};
     let fall_back = DurableNamespace::only_a_closed_gate_may_fall_back;
-    assert!(matches!(fall_back(Err(NsError::Unavailable(GateClosed))), Ok(None)));
+    assert!(matches!(
+        fall_back(Err(NsError::Unavailable(GateClosed, Default::default()))),
+        Ok(None)
+    ));
     assert!(matches!(fall_back(Ok(ns())), Ok(Some(_))));
     // A refused volume (ReFS, exFAT, SMB, a failed probe) is an error, never the plain path.
     for reason in [Unsupported, Unknown] {
         assert!(matches!(
-            fall_back(Err(NsError::Unavailable(reason))),
-            Err(NsError::Unavailable(r)) if r == reason
+            fall_back(Err(NsError::Unavailable(reason, Default::default()))),
+            Err(NsError::Unavailable(r, _)) if r == reason
         ));
     }
     assert!(matches!(fall_back(Err(NsError::NotFound)), Err(NsError::NotFound)));
@@ -874,4 +879,15 @@ fn only_a_removal_or_a_ledgered_leftover_reads_as_removed() {
     assert!(DiscardOutcome::Restored.removed().is_err());
     let err = left(RetainReason::OriginalOccupied).removed().unwrap_err();
     assert!(err.to_string().contains('d'), "{err}");
+}
+
+/// A closed gate says so in the message, with the flag that closes it.
+#[test]
+fn a_closed_gate_refusal_names_its_cause() {
+    let message = NsError::Unavailable(
+        UnavailableReason::GateClosed,
+        RefusalCause::new("WINDOWS_DIRECTORY_DURABILITY_VALIDATED is false"),
+    )
+    .to_string();
+    assert!(message.contains("GateClosed") && message.contains("VALIDATED"), "{message}");
 }

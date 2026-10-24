@@ -515,6 +515,62 @@ fn evict_aborts_when_disk_content_diverges_from_the_indexed_version() {
     );
 }
 
+/// The eviction bracket compares the disk identity before and after the custody step. On a volume
+/// whose change time cannot be read (Windows; simulated through the fingerprint seam, a no-op
+/// elsewhere) an untouched file must still reach custody (a never-equal sample would refuse every
+/// eviction), and a file rewritten while custody is asked must still be refused. The rewrite has the
+/// same length but its mtime moves, so the identity check refuses it (the bytes comparison against the
+/// indexed blocks, which also guards eviction, is not what this test isolates).
+/// The seam is thread-local: keep this test synchronous (or current-thread).
+#[test]
+fn eviction_with_an_unreadable_change_time_proceeds_when_untouched_and_refuses_a_changed_file() {
+    fn run(rewrite: bool) -> (usize, bool) {
+        let _unreadable = yadorilink_fs_platform::fs_identity::change_time_unreadable_for_test();
+        let state = std::rc::Rc::new(ReplicaCoordinator::open_in_memory().unwrap());
+        let root = tempfile::tempdir().unwrap();
+        adopt_root(&state, "group-a", root.path());
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = SegmentBlockStore::new(store_dir.path()).unwrap();
+        let content = b"content whose eviction bracket cannot read the change time";
+        let record = store_and_record(&store, "a.bin", content);
+        upsert_hydrated_file(&state, "group-a", &record, &RootCommitPermit::for_tests());
+        let target = root.path().join("a.bin");
+        std::fs::write(&target, content).unwrap();
+        let asked = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let _probe =
+            yadorilink_filesystem_sync::materialization_eviction::set_custody_probe_for_test({
+                let asked = asked.clone();
+                let target = target.clone();
+                move || {
+                    asked.set(asked.get() + 1);
+                    if rewrite {
+                        std::fs::write(&target, vec![b'x'; content.len()]).unwrap();
+                    }
+                }
+            });
+        let result = evict_file(
+            MaterializationContext {
+                state: &*state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+                permit: &RootCommitPermit::for_tests(),
+            },
+            "group-a",
+            "a.bin",
+            false,
+            &NeverConfirms,
+        );
+        (asked.get(), result.is_err())
+    }
+
+    let (asked, _) = run(false);
+    assert_eq!(asked, 1, "an untouched file must pass the identity check and reach custody");
+    let (asked, edit_kept) = run(true);
+    assert_eq!(asked, 1);
+    assert!(edit_kept, "the rewritten file must be refused, its edit kept");
+}
+
 /// Proves the impl above lets a real `Arc<ReplicaCoordinator>`
 /// unsize-coerce to `Arc<dyn MaterializationExecutionPort>`, and that
 /// calls through the coerced handle still dispatch correctly -- same

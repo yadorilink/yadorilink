@@ -151,7 +151,7 @@ async fn native_operation_leaves_no_dcf_state() {
 
     // Removals and a recursive removal.
     remove(&a, "after-restart.txt");
-    remove(&a, "dir");
+    remove_dir(&a, GROUP, "dir").await;
     converge_to(&[&a, &b], &[("doc.txt", &winner), (&copy, &tree[&copy])], "removals").await;
     converge_state(&[&a, &b], GROUP, "one native state after removals").await;
 

@@ -47,6 +47,8 @@ struct Fake {
     /// The installation the running daemon authenticates as: fixed when it starts.
     daemon_installation: Mutex<Option<String>>,
     restart_fails: Mutex<bool>,
+    /// Whether the host joins folders again itself (false: the embedded engine).
+    rejoins: bool,
 }
 
 impl Fake {
@@ -87,6 +89,7 @@ impl Fake {
             promote_fails: Mutex::new(false),
             daemon_installation: Mutex::new(Some("install-0".into())),
             restart_fails: Mutex::new(false),
+            rejoins: true,
         }
     }
 
@@ -157,10 +160,16 @@ impl StartOverPorts for Fake {
         Ok(())
     }
 
+    fn can_rejoin(&self) -> bool {
+        self.rejoins
+    }
+
     async fn restart_daemon_if_running(&self) -> Result<(), CoreError> {
         self.log("restart_daemon");
         if *self.restart_fails.lock().unwrap() {
-            return Err(CoreError::Other("the running daemon did not stop".into()));
+            // What the real restart reports (`ops::daemon`): the text and the next step.
+            return Err(CoreError::Other("the running daemon did not stop".into())
+                .hinted(crate::error::Hint::StopThenStartDaemon));
         }
         // The restarted daemon reads the stored sign-in.
         *self.daemon_installation.lock().unwrap() = self.installation.lock().unwrap().clone();
@@ -762,11 +771,13 @@ fn register_device_is_refused_while_a_start_over_is_mid_way() {
     )
     .unwrap();
 
-    let result = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(crate::ops::devices::register_device("laptop".into()));
+    let result =
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(
+            crate::ops::devices::register_device(
+                "laptop".into(),
+                &crate::ops::daemon::default_launch(),
+            ),
+        );
 
     std::env::remove_var("YADORILINK_CONFIG_DIR");
     assert!(
@@ -1294,6 +1305,12 @@ async fn a_daemon_that_cannot_be_restarted_refuses_before_any_device_is_register
     let error = start_over(&fake, false, "laptop".into()).await.unwrap_err();
 
     assert!(error.to_string().contains("nothing was registered or changed"), "{error}");
+    assert!(error.to_string().ends_with("the running daemon did not stop"), "{error}");
+    assert_eq!(
+        error.hint(),
+        Some(crate::error::Hint::StopThenStartDaemon),
+        "the restart's next step reaches the front end"
+    );
     assert_eq!(count(&fake, "register"), 0, "{:?}", fake.calls());
     assert_eq!(count(&fake, "supersede"), 0);
     assert_eq!(journal_stage(&fake), "retired");
@@ -1331,5 +1348,38 @@ async fn repeating_a_start_over_after_a_failed_join_keeps_one_device_and_one_cla
     let StartOverProgress::Finished(done) = done else { panic!("{done:?}") };
     assert!(done.complete);
     assert_eq!(count(&fake, "register"), 1);
+    assert!(!pending_in(fake.dir.path()));
+}
+
+/// A host that does not join folders again itself marks every linked folder as needing the
+/// person, joins and promotes nothing, and the start
+/// over still completes.
+#[tokio::test]
+async fn a_host_that_cannot_rejoin_marks_every_folder_and_still_completes() {
+    let mut fake = Fake::restored_sole_device();
+    fake.rejoins = false;
+    start_over(&fake, true, "laptop".into()).await.unwrap();
+    fake.sign_in();
+
+    let StartOverProgress::Finished(report) = start_over(&fake, false, "l".into()).await.unwrap()
+    else {
+        panic!()
+    };
+
+    assert!(report.complete);
+    assert!(report.rejoined.is_empty());
+    assert_eq!(report.not_rejoined.len(), 2);
+    // The host's own reason, not the "account does not own the group" one an empty group list
+    // would also produce.
+    assert!(
+        report.not_rejoined.iter().all(|f| f.message.contains("does not join a folder again")),
+        "{report:?}"
+    );
+    assert_eq!(*fake.marked.lock().unwrap(), ["/data/docs", "/data/photos"]);
+    let calls = fake.calls();
+    assert!(
+        !calls.iter().any(|c| c.starts_with("rejoin") || c.starts_with("promote")),
+        "{calls:?}"
+    );
     assert!(!pending_in(fake.dir.path()));
 }

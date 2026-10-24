@@ -991,3 +991,25 @@ fn a_store_on_windows_deletes_only_on_a_volume_the_production_verdict_accepts() 
         assert!(store.exists(&hash).unwrap());
     }
 }
+
+#[test]
+fn reads_across_many_segments_work_with_a_one_handle_cache() {
+    // The handle cache is a descriptor budget, not a correctness input: with room for one
+    // handle every read of another segment evicts and reopens, and still returns the bytes.
+    let dir = tempfile::tempdir().unwrap();
+    let limits = GroupCommitLimits {
+        segment_target_bytes: 4096,
+        max_cached_readers: 1,
+        ..GroupCommitLimits::default()
+    };
+    let store = SegmentBlockStore::with_limits_and_verdict(dir.path(), limits, |_| true).unwrap();
+    let blocks: Vec<LocallyHashedBlock> = (0..16u32).map(distinct_block_of(1000)).collect();
+    let receipts = store.put_durable_batch(&blocks).unwrap();
+    let segments: HashSet<u64> = receipts.iter().map(|r| r.segment_id).collect();
+    assert!(segments.len() > 2, "the blocks must span several segments");
+    for _ in 0..2 {
+        for block in &blocks {
+            assert_eq!(store.get(block.hash()).unwrap(), block.bytes());
+        }
+    }
+}

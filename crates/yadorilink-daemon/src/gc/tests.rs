@@ -115,6 +115,10 @@ impl BlockStore for BarrierBlockStore {
         self.inner.exists(hash)
     }
 
+    fn storage_root(&self) -> Option<&std::path::Path> {
+        self.inner.storage_root()
+    }
+
     fn list_by_prefix(&self, prefix: &str) -> Result<Vec<ContentHash>, StorageError> {
         self.inner.list_by_prefix(prefix)
     }
@@ -707,4 +711,239 @@ async fn gc_never_collects_a_block_while_a_marked_flush_pending_intent_is_open()
         .await
         .unwrap();
     assert!(state.block_store.exists(&hash).unwrap(), "the indexed row still references it");
+}
+
+// --- a projection writer against per-file eviction, with real tasks ------------------------------
+//
+// The writer is what a local capture or a peer receive does: it holds the block-reference guard
+// (`begin_write_activity`), stores the bytes (deduplicating onto the block already there) and
+// commits an index row that names the block. The eviction is the real `evict_file` with a
+// confirmed custody, so it ends in `reclaim_cached_blocks` under the exclusive deletion guard.
+// Both orderings are pinned by hand-offs, not by sleeps.
+
+struct EvictFixture {
+    state: Arc<DaemonState>,
+    root: tempfile::TempDir,
+    bytes: &'static [u8],
+    hash: ContentHash,
+    reclaim_started: std::sync::mpsc::Receiver<()>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+    _store_dir: tempfile::TempDir,
+}
+
+fn evictable_state(release_reclaim_immediately: bool) -> EvictFixture {
+    use yadorilink_replica_domain::session_state::MaterializationState;
+
+    let store_dir = tempfile::tempdir().unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+    let release = Arc::new((Mutex::new(release_reclaim_immediately), Condvar::new()));
+    let store = Arc::new(BarrierBlockStore {
+        inner: SegmentBlockStore::new(store_dir.path()).unwrap().with_volume_verdict(|_| true),
+        sweep_started: started_tx,
+        sweep_release: release.clone(),
+    });
+    let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+    let root = tempfile::tempdir().unwrap();
+    sync_state.link_repository().add_link(&root.path().to_string_lossy(), "group-a").unwrap();
+    yadorilink_root_authority::root_identity::VerifiedRoot::open(
+        root.path(),
+        "group-a",
+        sync_state.as_ref(),
+    )
+    .unwrap();
+    let state = DaemonState::new("device-a".into(), sync_state, store);
+    let bytes: &'static [u8] = b"block shared by an evicted file and a file being written";
+    std::fs::write(root.path().join("evicted.txt"), bytes).unwrap();
+    let hash = state.block_store.put(bytes).unwrap();
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+    state
+        .replica_coordinator
+        .file_index_repository()
+        .upsert_file("group-a", &record_of("evicted.txt", bytes, &hash), &permit)
+        .unwrap();
+    let materialization = state.replica_coordinator.materialization_state_repository();
+    materialization
+        .set_materialization_state("group-a", "evicted.txt", MaterializationState::Present, &permit)
+        .unwrap();
+    materialization
+        .record_placeholder_generation(
+            "group-a",
+            "evicted.txt",
+            yadorilink_local_storage::PlaceholderDiskIdentity { dev: 0, ino: 1 },
+            yadorilink_local_storage::WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
+            &permit,
+        )
+        .unwrap();
+    crate::replica_coordinator::set_test_windows_dehydrate_confirmed_for_path(
+        &root.path().join("evicted.txt"),
+        true,
+    );
+    EvictFixture {
+        state,
+        root,
+        bytes,
+        hash,
+        reclaim_started: started_rx,
+        release,
+        _store_dir: store_dir,
+    }
+}
+
+fn record_of(path: &str, bytes: &[u8], hash: &str) -> FileRecord {
+    FileRecord {
+        path: path.into(),
+        size: bytes.len() as u64,
+        mtime_unix_nanos: 0,
+        blocks: vec![BlockInfo {
+            hash: hex::decode(hash).unwrap(),
+            offset: 0,
+            size: bytes.len() as u32,
+        }],
+        deleted: false,
+    }
+}
+
+/// What a projection writer does for a new file whose content is already in the store.
+fn project_adopted_file(state: &DaemonState, bytes: &[u8], expected_hash: &str) {
+    assert_eq!(state.block_store.put(bytes).unwrap(), expected_hash, "the write must deduplicate");
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+    state
+        .replica_coordinator
+        .file_index_repository()
+        .upsert_file("group-a", &record_of("adopted.txt", bytes, expected_hash), &permit)
+        .unwrap();
+}
+
+fn spawn_eviction(
+    state: &Arc<DaemonState>,
+    root: &std::path::Path,
+) -> tokio::task::JoinHandle<yadorilink_filesystem_sync::materialization_eviction::EvictionOutcome>
+{
+    use yadorilink_filesystem_sync::materialization_eviction::{
+        evict_file, MaterializationContext,
+    };
+
+    let (state, root) = (state.clone(), root.to_path_buf());
+    tokio::task::spawn_blocking(move || {
+        let _exclusion =
+            yadorilink_filesystem_sync::materialization_eviction::assume_write_exclusion_for_test();
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        let block_reclamation = BlockStorePortsAdapter::new(state.block_store.clone());
+        evict_file(
+            MaterializationContext {
+                state: state.replica_coordinator.as_ref(),
+                liveness_gate: state.block_liveness_gate(),
+                store: &block_reclamation,
+                root: &root,
+                permit: &permit,
+            },
+            "group-a",
+            "evicted.txt",
+            false,
+            state.as_ref(),
+        )
+        .unwrap()
+    })
+}
+
+/// The writer is admitted while the eviction still holds its shared phase, then the eviction
+/// parks on the exclusive deletion guard behind it. Only then does the writer commit its row.
+/// The eviction, once admitted, must see that row and keep the block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_eviction_parked_behind_a_projection_writer_keeps_the_block_the_writer_adopts() {
+    use yadorilink_replica_domain::ids::VersionHash;
+
+    let f = evictable_state(true);
+    let (admitted_tx, admitted_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let admitted_rx = Mutex::new(admitted_rx);
+    let (commit_tx, commit_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (committed_tx, committed_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let commit_rx = Mutex::new(Some(commit_rx));
+    let writer: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+    let writer_state = f.state.clone();
+    let (bytes, hash) = (f.bytes, f.hash.clone());
+    // The custody question is asked inside the eviction's shared phase: the writer starts there.
+    f.state.set_custody_confirmer(Arc::new(
+        move |_: &str,
+              _: &str,
+              _: &VersionHash,
+              _: &[yadorilink_replica_domain::file::VersionBlock]| {
+            let (state, hash) = (writer_state.clone(), hash.clone());
+            let commit_rx = commit_rx.lock().unwrap().take().unwrap();
+            let (admitted_tx, committed_tx) = (admitted_tx.clone(), committed_tx.clone());
+            *writer.lock().unwrap() = Some(std::thread::spawn(move || {
+                let _write = state.begin_write_activity();
+                admitted_tx.send(()).unwrap();
+                commit_rx.recv().unwrap();
+                project_adopted_file(&state, bytes, &hash);
+                committed_tx.send(()).unwrap();
+            }));
+            admitted_rx.lock().unwrap().recv().unwrap();
+            true
+        },
+    ));
+
+    let eviction = spawn_eviction(&f.state, f.root.path());
+    // Parked on the deletion guard: the writer is admitted, so the eviction cannot start deleting.
+    let gate = f.state.replica_coordinator.block_liveness_gate();
+    let give_up = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while gate.waiting_deletions() == 0 {
+        assert!(std::time::Instant::now() < give_up, "the eviction never parked on the guard");
+        tokio::task::yield_now().await;
+    }
+    assert!(matches!(committed_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+    commit_tx.send(()).unwrap();
+    let outcome = eviction.await.unwrap();
+
+    committed_rx.recv().unwrap();
+    assert!(outcome.dehydrated);
+    assert!(outcome.blocks_retained, "the adopted row names the block: {outcome:?}");
+    assert_eq!(f.state.block_store.get(&f.hash).unwrap(), f.bytes);
+}
+
+/// The eviction holds the exclusive deletion guard (parked inside the store's reclaim) when the
+/// writer arrives: the writer must wait it out, and its dedup put then stores the bytes again, so
+/// the row it commits never names a block that is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_projection_writer_arriving_during_a_reclaim_waits_and_leaves_a_readable_block() {
+    use yadorilink_replica_domain::ids::VersionHash;
+
+    let f = evictable_state(false);
+    f.state.set_custody_confirmer(Arc::new(
+        |_: &str, _: &str, _: &VersionHash, _: &[yadorilink_replica_domain::file::VersionBlock]| {
+            true
+        },
+    ));
+    let eviction = spawn_eviction(&f.state, f.root.path());
+    let EvictFixture { reclaim_started, .. } = &f;
+    tokio::task::block_in_place(|| {
+        reclaim_started.recv_timeout(std::time::Duration::from_secs(60)).expect("reclaim reached")
+    });
+
+    let (committed_tx, committed_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (writer_state, bytes, hash) = (f.state.clone(), f.bytes, f.hash.clone());
+    let writer = tokio::task::spawn_blocking(move || {
+        let _write = writer_state.begin_write_activity();
+        project_adopted_file(&writer_state, bytes, &hash);
+        committed_tx.send(()).unwrap();
+    });
+    let gate = f.state.replica_coordinator.block_liveness_gate();
+    // The writer is parked at the gate behind the running deletion, with nothing committed.
+    let give_up = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while gate.blocked_writers() == 0 {
+        assert!(std::time::Instant::now() < give_up, "the writer never reached the gate");
+        tokio::task::yield_now().await;
+    }
+    assert!(matches!(committed_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+    {
+        let (released, wake) = &*f.release;
+        *released.lock().unwrap() = true;
+        wake.notify_all();
+    }
+    let outcome = eviction.await.unwrap();
+    writer.await.unwrap();
+
+    assert_eq!(outcome.blocks_reclaimed, 1, "nothing referenced the block yet: {outcome:?}");
+    committed_rx.recv().unwrap();
+    assert_eq!(f.state.block_store.get(&f.hash).unwrap(), f.bytes, "the row's block is readable");
 }

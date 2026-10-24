@@ -3,7 +3,7 @@
 //! What it removes is what the installer put there and recorded in its receipt: the two links in
 //! `<prefix>/bin`, the version tree `<prefix>/share/yadorilink`, and the PATH block the installer
 //! added to the shell profile. It never removes the user's synced folders. The data directory
-//! (device identity, sync database, saved versions, block store) is kept unless `--purge-data`
+//! (device identity, sync database, saved versions, block store) (and the sign-in credentials and the device key's OS keyring copy) is kept unless `--purge-data`
 //! is given. Every other install source is owned by another channel and is refused with that
 //! owner's own uninstall steps, exactly as `self-update` refuses it. Nothing is inferred from
 //! leftovers: an unreadable ownership record, a missing receipt or a path outside the recorded
@@ -13,10 +13,13 @@ use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use yadorilink_client_core::ops::{daemon, folders};
+use yadorilink_client_core::ops::{self, daemon, folders};
+use yadorilink_fapi_client::store::{CredentialLock, CredentialStore};
+use yadorilink_fapi_client::DEFAULT_LOCK_TIMEOUT;
 use yadorilink_fs_platform::state_dir::{self, PathOverride};
 use yadorilink_local_storage::daemon_lock::{self, AcquireError, HeldLock};
 use yadorilink_local_storage::ownership::{self, RecordState};
+use yadorilink_local_storage::resource_lock::DataResourceLocks;
 use yadorilink_sqlite_runtime::{read_link_registry, RegisteredLink};
 
 use crate::error::CliError;
@@ -60,7 +63,7 @@ fn receipt_get(receipt: &str, key: &str) -> Option<String> {
 }
 
 /// Whose uninstall this is. `Err` is a refusal that changes nothing.
-fn gate_on_record(record: &RecordState) -> Result<(), CliError> {
+fn gate_on_record(record: &RecordState, exe: &Path) -> Result<(), CliError> {
     match record {
         RecordState::Missing => Ok(()),
         RecordState::Unreadable(reason) => Err(refuse(format!(
@@ -79,8 +82,10 @@ fn gate_on_record(record: &RecordState) -> Result<(), CliError> {
             if r.owner == ownership::Owner::Gui || r.install_source != "script" {
                 return Err(refuse(format!(
                     "this YadoriLink is not a command-line install (source: {}), so `yadorilink \
-                     uninstall` does not touch it. Remove it the way it was installed.",
-                    if r.install_source.is_empty() { "unknown" } else { &r.install_source }
+                     uninstall` does not touch it. To remove it: {}. Your synced folders and \
+                     YadoriLink's data are kept either way.",
+                    if r.install_source.is_empty() { "unknown" } else { &r.install_source },
+                    super::update::unowned_install_steps(exe, false)
                 )));
             }
             Ok(())
@@ -91,11 +96,12 @@ fn gate_on_record(record: &RecordState) -> Result<(), CliError> {
 /// The installer prefix of `exe`, which must be the installer's layout.
 fn prefix_of(exe: &Path) -> Result<PathBuf, CliError> {
     super::update::prefix_from_exe(exe, false).ok_or_else(|| {
-        CliError::Other(
+        CliError::Other(format!(
             "this `yadorilink` does not run from an installer layout (<prefix>/share/yadorilink/…), \
-             so nothing was removed. Run `uninstall` from the installed copy."
-                .into(),
-        )
+             so nothing was removed. To remove this copy: {}. Your synced folders and YadoriLink's \
+             data are kept either way.",
+            super::update::unowned_install_steps(exe, false)
+        ))
     })
 }
 
@@ -111,7 +117,7 @@ pub(crate) fn build_plan(
     config_dir: &Path,
     purge: bool,
 ) -> Result<Plan, CliError> {
-    gate_on_record(record)?;
+    gate_on_record(record, exe)?;
     let exe = canon(exe);
     let prefix = prefix_of(&exe)?;
     let share = prefix.join("share").join("yadorilink");
@@ -266,6 +272,10 @@ fn describe(plan: &Plan) -> Vec<String> {
     }
     if let Some(d) = &plan.purge {
         lines.push(format!("DELETE YadoriLink's data directory {} (identity, sync database, saved versions, downloaded content)", d.display()));
+        lines.push(
+            "DELETE this installation's sign-in credentials and the device key's copy in the OS credential store"
+                .to_string(),
+        );
     }
     lines
 }
@@ -288,14 +298,18 @@ pub(crate) fn execute(plan: &Plan) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Empties the data directory but leaves the directory and the daemon lock file (which this
+/// Empties the data directory but leaves the directory and the daemon and credential lock files (which this
 /// process holds) in place: unlinking the lock file at any point would let a daemon that starts
 /// meanwhile create and lock a fresh one beside the deletion. What remains is an empty
-/// directory with one empty lock file, the state a first install starts from.
+/// directory with the empty lock files, the state a first install starts from.
 fn purge_dir(dir: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        if entry.file_name() == daemon_lock::LOCK_FILE_NAME {
+        // Both locks are held by this process; unlinking one would let a concurrent daemon or
+        // credential operation lock a fresh file beside the deletion.
+        if entry.file_name() == daemon_lock::LOCK_FILE_NAME
+            || entry.file_name() == yadorilink_fapi_client::store::LOCK_FILE
+        {
             continue;
         }
         if entry.file_type()?.is_dir() {
@@ -462,17 +476,46 @@ fn take_daemon_lock(config_dir: &Path) -> Result<HeldLock, CliError> {
     }
 }
 
-/// The removal itself, after the daemon is stopped: holds the daemon lock until it returns,
+/// Removes this installation's credentials (the configured credential store and the device key's
+/// OS keyring copies); `Some(text)` when a copy could not be removed. Run only with `--purge-data`.
+pub(crate) type CredentialPurge<'a> = Box<dyn FnOnce() -> Result<Option<String>, CliError> + 'a>;
+
+/// The removal itself, after the daemon is stopped: holds the daemon lock and the data-resource
+/// locks until it returns,
 /// re-checks the registered state under that lock, then removes. `locked` runs once the lock is
 /// held, before the check (tests use it to act as a competing daemon).
 pub(crate) fn remove_under_lock(
     plan: &Plan,
     layout: &StateLayout,
     locked: impl FnOnce(),
+    purge_credentials: Option<CredentialPurge<'_>>,
 ) -> Result<(), CliError> {
     let _lock = take_daemon_lock(&layout.config_dir)?;
+    // The block store and the sync database can be placed by override, so a daemon with another
+    // data directory may still own them; the daemon takes these locks too, in this order.
+    let _resources =
+        DataResourceLocks::acquire(&layout.block_store, &layout.sync_db).map_err(|e| {
+            CliError::Other(format!(
+            "cannot take the block store and sync database locks ({e}); a YadoriLink daemon may \
+             be using them, so nothing was removed. Stop it and run this again."
+        ))
+        })?;
     locked();
     check_removal_clear(plan, layout, &registered_links(layout)?)?;
+    // Credentials first: the keyring copies of the device key are found through the key files
+    // the data purge deletes, and a failed credential purge must leave them to retry from.
+    if let (Some(_), Some(purge)) = (plan.purge.as_ref(), purge_credentials) {
+        // A keyring copy that could not be removed stops the purge before any data is deleted:
+        // a later `credentials purge` finds retired copies through the retired identity
+        // directories, so deleting them now would make the retry impossible.
+        if let Some(remaining) = purge()? {
+            return Err(CliError::Other(format!(
+                "{remaining}. {}. The data directory was NOT deleted, so that retry can find what \
+                 remains; the credentials in the configured store are already removed.",
+                crate::error::CREDENTIAL_CLEANUP_ADVICE
+            )));
+        }
+    }
     execute(plan).map_err(|e| {
         CliError::Other(format!("removal stopped part-way: {e}. Run `yadorilink uninstall` again, or the installer with --uninstall."))
     })
@@ -493,6 +536,20 @@ fn confirm(question: &str) -> Result<(), CliError> {
     } else {
         Err(CliError::Cancelled("cancelled; nothing was removed".into()))
     }
+}
+
+/// The credential store and its lock (the one `credentials purge` takes, held until the removal
+/// is over), only for a purge: a program-only uninstall never reads the credential configuration.
+async fn hold_credential_store(
+    purge_data: bool,
+    open: impl FnOnce() -> Result<CredentialStore, CliError>,
+) -> Result<Option<(CredentialStore, CredentialLock)>, CliError> {
+    if !purge_data {
+        return Ok(None);
+    }
+    let store = open()?;
+    let lock = store.lock(DEFAULT_LOCK_TIMEOUT).await?;
+    Ok(Some((store, lock)))
 }
 
 /// `yadorilink uninstall [--dry-run] [--yes] [--purge-data]`.
@@ -571,17 +628,30 @@ pub async fn uninstall(dry_run: bool, yes: bool, purge_data: bool) -> Result<(),
     }
     if !yes {
         let question = if purge_data {
-            "Also delete the data directory, including saved versions that no other device may hold?"
+            "Also delete the data directory, including saved versions that no other device may hold, and this installation's sign-in credentials?"
         } else {
             "Uninstall YadoriLink?"
         };
         confirm(question)?;
     } else if purge_data {
-        println!("--purge-data with --yes: the data directory will be deleted.");
+        println!("--purge-data with --yes: the data directory and the sign-in credentials will be deleted.");
     }
 
     daemon::stop_and_wait(STOP_BUDGET).await?;
-    remove_under_lock(&plan, &layout, || {})?;
+    let held = hold_credential_store(purge_data, || {
+        let backend = yadorilink_fapi_client::store::Backend::from_env(&layout.config_dir)?;
+        Ok(CredentialStore::with_backend(backend, &layout.config_dir))
+    })
+    .await?;
+    let purge_credentials: Option<CredentialPurge<'_>> = held.as_ref().map(|(store, lock)| {
+        let dir = layout.config_dir.as_path();
+        Box::new(move || Ok(ops::auth::purge_local_credentials_locked(store, lock, dir)?))
+            as CredentialPurge<'_>
+    });
+    remove_under_lock(&plan, &layout, || {}, purge_credentials)?;
+    if purge_data {
+        println!("Credentials removed from this computer's credential store.");
+    }
     println!("Removed. Your device is still registered with your account; run `yadorilink logout` before uninstalling to revoke it, or remove it from another device.");
     Ok(())
 }
@@ -806,7 +876,7 @@ mod tests {
         std::fs::write(sync.join("doc.txt"), b"precious").unwrap();
         register(&t, &[(&sync, "none")]);
         let plan = build_plan(&RecordState::Missing, &t.exe, &t.home, &t.config, true).unwrap();
-        let err = remove_under_lock(&plan, &layout(&t), || {}).unwrap_err();
+        let err = remove_under_lock(&plan, &layout(&t), || {}, None).unwrap_err();
         assert!(err.to_string().contains("my-sync"), "{err}");
         assert!(
             sync.join("doc.txt").exists()
@@ -821,14 +891,14 @@ mod tests {
         let plan = build_plan(&RecordState::Missing, &t.exe, &t.home, &t.config, true).unwrap();
         let db = t.config.join("sync-state.sqlite3");
         std::fs::write(&db, b"not a database, just some bytes to be unreadable").unwrap();
-        let err = remove_under_lock(&plan, &layout(&t), || {}).unwrap_err();
+        let err = remove_under_lock(&plan, &layout(&t), || {}, None).unwrap_err();
         assert!(err.to_string().contains("--yes does not skip"), "{err}");
         assert!(t.exe.exists() && t.config.join("device.json").exists());
         // A database of another schema generation is unknown too.
         std::fs::remove_file(&db).unwrap();
         // An empty file is a database SQLite reads as version 0: not this build's schema.
         std::fs::File::create(&db).unwrap();
-        assert!(remove_under_lock(&plan, &layout(&t), || {}).is_err());
+        assert!(remove_under_lock(&plan, &layout(&t), || {}, None).is_err());
         assert!(t.exe.exists() && t.config.join("device.json").exists());
     }
 
@@ -837,14 +907,14 @@ mod tests {
         let t = tree();
         register(&t, &[(&t.outside, "none")]);
         let plan = build_plan(&RecordState::Missing, &t.exe, &t.home, &t.config, true).unwrap();
-        remove_under_lock(&plan, &layout(&t), || {}).unwrap();
+        remove_under_lock(&plan, &layout(&t), || {}, None).unwrap();
         assert!(!t.home.join(".local/share/yadorilink").exists());
         assert_eq!(listing(&t.config), vec![".daemon.lock".to_string()]);
         assert!(t.outside.join("keep.txt").exists());
         // No database at all: nothing was ever registered.
         let t = tree();
         let plan = build_plan(&RecordState::Missing, &t.exe, &t.home, &t.config, false).unwrap();
-        remove_under_lock(&plan, &layout(&t), || {}).unwrap();
+        remove_under_lock(&plan, &layout(&t), || {}, None).unwrap();
         assert!(!t.home.join(".local/share/yadorilink").exists());
     }
 
@@ -853,15 +923,113 @@ mod tests {
         let t = tree();
         std::fs::remove_dir_all(&t.config).unwrap();
         let plan = build_plan(&RecordState::Missing, &t.exe, &t.home, &t.config, false).unwrap();
-        remove_under_lock(&plan, &layout(&t), || {}).unwrap();
+        remove_under_lock(&plan, &layout(&t), || {}, None).unwrap();
         assert!(!t.home.join(".local/share/yadorilink").exists());
         let t = tree();
         std::fs::create_dir_all(t.config.join("blocks/ab")).unwrap();
         std::fs::write(t.config.join("blocks/ab/x"), b"b").unwrap();
         let plan = build_plan(&RecordState::Missing, &t.exe, &t.home, &t.config, true).unwrap();
-        remove_under_lock(&plan, &layout(&t), || {}).unwrap();
+        remove_under_lock(&plan, &layout(&t), || {}, None).unwrap();
         // Emptied, but the lock file stays so exclusion never lapses during the purge.
         assert_eq!(listing(&t.config), vec![".daemon.lock".to_string()]);
+    }
+
+    /// Runs a purge removal whose credential store is a file under the data directory and whose
+    /// device key mirror deleter records what it was asked to delete, and whether the key file it
+    /// names still existed at that moment.
+    async fn purge_with_fake_credentials(
+        t: &Tree,
+        purge: bool,
+        mirror_fails: bool,
+    ) -> (Result<(), CliError>, Vec<(PathBuf, bool)>) {
+        // Outside the data directory, as the OS credential store is, so only the credential purge
+        // can remove it.
+        let credentials = t.home.join("credentials.json");
+        std::fs::write(&credentials, b"{}").unwrap();
+        std::fs::write(t.config.join("signing_key"), b"k").unwrap();
+        let store = CredentialStore::with_backend(
+            yadorilink_fapi_client::store::Backend::File(credentials),
+            &t.config,
+        );
+        let lock = store.lock(DEFAULT_LOCK_TIMEOUT).await.unwrap();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let plan = build_plan(&RecordState::Missing, &t.exe, &t.home, &t.config, purge).unwrap();
+        let result = {
+            let (store, lock, dir, seen) = (&store, &lock, t.config.as_path(), &seen);
+            let credential_purge: CredentialPurge<'_> = Box::new(move || {
+                Ok(ops::auth::purge_local_credentials_locked_with(store, lock, dir, &|path| {
+                    seen.borrow_mut().push((path.to_path_buf(), path.exists()));
+                    if mirror_fails {
+                        Err(yadorilink_transport::TransportError::Io(std::io::Error::other(
+                            "keyring locked",
+                        )))
+                    } else {
+                        Ok(yadorilink_transport::KeyringDelete::Deleted)
+                    }
+                })?)
+            });
+            remove_under_lock(&plan, &layout(t), || {}, Some(credential_purge))
+        };
+        if purge {
+            // Both lock files survive the purge and the credential lock is still effective.
+            assert!(t.config.join(yadorilink_fapi_client::store::LOCK_FILE).exists());
+            assert!(store.lock(std::time::Duration::from_millis(100)).await.is_err());
+        }
+        (result, seen.into_inner())
+    }
+
+    #[tokio::test]
+    async fn purge_data_also_removes_the_credentials_and_the_device_key_mirror() {
+        let t = tree();
+        let (result, seen) = purge_with_fake_credentials(&t, true, false).await;
+        result.unwrap();
+        // The mirror was deleted while the key file naming it still existed.
+        assert_eq!(seen, vec![(t.config.join("signing_key"), true)]);
+        assert!(!t.home.join("credentials.json").exists());
+        assert_eq!(
+            listing(&t.config),
+            vec![".daemon.lock".to_string(), "credentials.lock".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_program_only_uninstall_never_opens_the_credential_store() {
+        let unconfigured = || Err(CliError::Other("unknown credential backend".into()));
+        assert!(hold_credential_store(false, unconfigured).await.unwrap().is_none());
+        assert!(hold_credential_store(true, unconfigured).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_device_key_mirror_that_cannot_be_removed_stops_before_any_data_is_deleted() {
+        let t = tree();
+        std::fs::create_dir_all(t.config.join("retired-devices/dev-1")).unwrap();
+        std::fs::write(t.config.join("retired-devices/dev-1/signing_key"), b"k").unwrap();
+        let (result, _) = purge_with_fake_credentials(&t, true, true).await;
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("may still be there"), "{message}");
+        assert!(
+            message.contains(
+                "keyring locked. Run `yadorilink credentials purge` to try again. The data \
+                 directory was NOT deleted"
+            ),
+            "{message}"
+        );
+        assert!(message.contains("NOT deleted"), "{message}");
+        // The retired identity directories a retry enumerates, and the key files, are still there.
+        assert!(t.config.join("retired-devices/dev-1/signing_key").exists());
+        assert!(t.config.join("signing_key").exists());
+        // The configured credential store is already purged; the retry is idempotent.
+        assert!(!t.home.join("credentials.json").exists());
+    }
+
+    #[tokio::test]
+    async fn without_purge_data_the_credentials_are_never_touched() {
+        let t = tree();
+        let (result, seen) = purge_with_fake_credentials(&t, false, false).await;
+        result.unwrap();
+        assert!(seen.is_empty());
+        assert!(t.home.join("credentials.json").exists());
+        assert!(t.config.join("signing_key").exists());
     }
 
     #[test]
@@ -871,12 +1039,17 @@ mod tests {
         let plan = build_plan(&RecordState::Missing, &t.exe, &t.home, &t.config, false).unwrap();
         let share = t.home.join(".local/share/yadorilink");
         let mut start_result = None;
-        remove_under_lock(&plan, &layout(&t), || {
-            // The daemon's own start takes this lock and is refused; nothing is removed yet.
-            start_result = Some(HeldLock::acquire_daemon_lock(&t.config));
-            assert_eq!(probe(&t.config), LockProbe::Held);
-            assert!(share.exists());
-        })
+        remove_under_lock(
+            &plan,
+            &layout(&t),
+            || {
+                // The daemon's own start takes this lock and is refused; nothing is removed yet.
+                start_result = Some(HeldLock::acquire_daemon_lock(&t.config));
+                assert_eq!(probe(&t.config), LockProbe::Held);
+                assert!(share.exists());
+            },
+            None,
+        )
         .unwrap();
         assert_eq!(start_result.unwrap().unwrap_err(), AcquireError::Contended);
         assert!(!share.exists());
@@ -885,19 +1058,44 @@ mod tests {
     }
 
     #[test]
+    fn a_daemon_of_another_data_directory_on_the_same_database_or_block_store_deletes_nothing() {
+        let t = tree();
+        let plan = build_plan(&RecordState::Missing, &t.exe, &t.home, &t.config, true).unwrap();
+        let other = t.outside.join("other-daemon");
+        std::fs::create_dir_all(&other).unwrap();
+        // That daemon holds its own data-directory lock; only the resources are shared.
+        let layout_of_ours = layout(&t);
+        for (db, blocks) in [
+            (layout_of_ours.sync_db.clone(), other.join("blocks")),
+            (other.join("db.sqlite3"), layout_of_ours.block_store.clone()),
+        ] {
+            let _theirs = DataResourceLocks::acquire(&blocks, &db).unwrap();
+            let err = remove_under_lock(&plan, &layout_of_ours, || panic!("must not run"), None)
+                .unwrap_err();
+            assert!(err.to_string().contains("nothing was removed"), "{err}");
+            assert!(t.exe.exists() && t.config.join("device.json").exists());
+        }
+        // Released, the removal goes ahead.
+        remove_under_lock(&plan, &layout_of_ours, || {}, None).unwrap();
+        assert!(!t.exe.exists());
+    }
+
+    #[test]
     fn failing_to_take_the_lock_deletes_nothing() {
         let t = tree();
         let plan = build_plan(&RecordState::Missing, &t.exe, &t.home, &t.config, true).unwrap();
         // Held by a daemon.
         let held = HeldLock::acquire_daemon_lock(&t.config).unwrap();
-        let err = remove_under_lock(&plan, &layout(&t), || panic!("must not run")).unwrap_err();
+        let err =
+            remove_under_lock(&plan, &layout(&t), || panic!("must not run"), None).unwrap_err();
         assert!(err.to_string().contains("lock is held"), "{err}");
         assert!(t.exe.exists() && t.config.join("device.json").exists());
         drop(held);
         // Unusable lock file.
         std::fs::remove_file(t.config.join(".daemon.lock")).unwrap();
         std::fs::create_dir(t.config.join(".daemon.lock")).unwrap();
-        let err = remove_under_lock(&plan, &layout(&t), || panic!("must not run")).unwrap_err();
+        let err =
+            remove_under_lock(&plan, &layout(&t), || panic!("must not run"), None).unwrap_err();
         assert!(err.to_string().contains("cannot take the data-area lock"), "{err}");
         assert!(t.exe.exists() && t.config.join("device.json").exists());
     }
@@ -954,6 +1152,26 @@ mod tests {
         let err = build_plan(&RecordState::Missing, &t.exe, &t.home, &t.config, false).unwrap_err();
         assert!(err.to_string().contains("no readable install receipt"));
         assert!(t.exe.exists());
+    }
+
+    #[test]
+    fn a_standalone_copy_gets_cargo_or_by_hand_removal_steps_and_nothing_is_removed() {
+        let t = tree();
+        let standalone = RecordState::Present(OwnershipRecord {
+            owner: Owner::Cli,
+            install_source: "standalone".into(),
+            install_root: "/x".into(),
+            release_id: String::new(),
+            written_at: 1,
+        });
+        let err = build_plan(&standalone, &t.exe, &t.home, &t.config, true).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("delete the binaries you placed by hand"), "{text}");
+        assert!(text.contains("data are kept"), "{text}");
+        let cargo = t.home.join(".cargo/bin/yadorilink");
+        let err = build_plan(&RecordState::Missing, &cargo, &t.home, &t.config, true).unwrap_err();
+        assert!(err.to_string().contains("cargo uninstall yadorilink-cli"), "{err}");
+        assert!(t.exe.exists() && t.config.join("device.json").exists());
     }
 
     #[test]
@@ -1024,6 +1242,7 @@ mod tests {
             text.contains("share/yadorilink")
                 && text.contains("PATH lines")
                 && text.contains("DELETE")
+                && text.contains("credentials")
         );
         assert_eq!(text.matches("remove link").count(), 2);
     }

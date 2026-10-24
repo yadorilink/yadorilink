@@ -118,7 +118,7 @@ const _: () = assert!(MAX_PATHS_PER_RECONCILE_ATTEMPT <= MAX_RECONCILE_PATHS_OVE
 /// much as a throughput one.
 ///
 /// Read fresh per call rather than cached, matching
-/// `block_fetch_concurrency`'s own seam: this runs once per group per tick,
+/// the block fetch concurrency's own seam: this runs once per group per tick,
 /// nowhere near hot, and a sweep can then vary it run-to-run with no
 /// rebuild. Invalid or absent falls back to the compiled default, so an
 /// unset environment behaves exactly as before this existed.
@@ -128,11 +128,9 @@ const _: () = assert!(MAX_PATHS_PER_RECONCILE_ATTEMPT <= MAX_RECONCILE_PATHS_OVE
 /// The unit tests in this module deliberately keep using the `const`: they
 /// pin the shipped default's behaviour, and should not start tracking
 /// whatever a sweep happens to have exported.
-fn max_paths_per_reconcile_attempt() -> usize {
-    parse_reconcile_paths(std::env::var(RECONCILE_PATHS_VAR).ok().as_deref())
+fn max_paths_per_reconcile_attempt(tuning: &crate::engine_tuning::EngineTuning) -> usize {
+    tuning.reconcile_paths_per_attempt
 }
-
-const RECONCILE_PATHS_VAR: &str = "YADORILINK_DIAGNOSTIC_RECONCILE_PATHS";
 
 /// The parsing half of [`max_paths_per_reconcile_attempt`], split out so it
 /// can be tested without touching the process environment.
@@ -142,7 +140,7 @@ const RECONCILE_PATHS_VAR: &str = "YADORILINK_DIAGNOSTIC_RECONCILE_PATHS";
 /// set the real variable would be visible to whichever of them happened to
 /// be running concurrently, and would make THEM flaky rather than failing
 /// itself. A pure function has no such reach.
-fn parse_reconcile_paths(raw: Option<&str>) -> usize {
+pub(crate) fn parse_reconcile_paths(raw: Option<&str>) -> usize {
     raw.and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .map_or(MAX_PATHS_PER_RECONCILE_ATTEMPT, |n| n.min(MAX_RECONCILE_PATHS_OVERRIDE))
@@ -878,7 +876,7 @@ fn track_disk_space_wait(
         return;
     };
     if let Some(wait) = &attempt.disk_pressure {
-        state.mark_link_degraded(
+        state.mark_link_waiting_for_disk_space(
             &local_path,
             crate::link_registry::waiting_for_disk_space_reason(
                 &wait.volume,
@@ -1114,8 +1112,11 @@ async fn process_group_via_obligations(
     all_paths.sort();
     let path_budget_start =
         engine.obligation_rotation.path_budget_start(&group_id, all_paths.len());
-    let budget_indices =
-        rotation_indices(all_paths.len(), path_budget_start, max_paths_per_reconcile_attempt());
+    let budget_indices = rotation_indices(
+        all_paths.len(),
+        path_budget_start,
+        max_paths_per_reconcile_attempt(state.tuning()),
+    );
     let windowed_paths: Vec<String> =
         budget_indices.iter().map(|&i| all_paths[i].clone()).collect();
     engine.obligation_rotation.set_path_budget_next(

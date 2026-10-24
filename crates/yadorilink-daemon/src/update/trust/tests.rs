@@ -12,6 +12,7 @@ fn doc() -> UpdateManifest {
     UpdateManifest {
         schema_version: MANIFEST_SCHEMA_VERSION,
         generated_at: "2026-07-01T00:00:00Z".into(),
+        expires_at: "2099-01-01T00:00:00Z".into(),
         withdrawn_versions: Vec::new(),
         releases: vec![ReleaseEntry {
             channel: "beta".into(),
@@ -28,6 +29,9 @@ fn doc() -> UpdateManifest {
             artifact_size: 1,
             artifact_publisher_identity: String::new(),
             release_notes_url: String::new(),
+            state_schema_version: None,
+            state_schema_min_readable: None,
+            sparkle_build: None,
         }],
     }
 }

@@ -145,7 +145,15 @@ impl DaemonLifecyclePort for DaemonLifecycleAdapter {
         Box::pin(super::safe_stop::request(&self.state, deadline))
     }
 
+    fn request_safe_stop_to_restart(
+        &self,
+        deadline: std::time::Duration,
+    ) -> BoxFuture<'_, crate::application::ports::SafeStopOutcome> {
+        Box::pin(super::safe_stop::request_to_restart(&self.state, deadline))
+    }
+
     fn request_shutdown(&self) {
-        let _ = self.state.shutdown_tx.send(true);
+        // `send_replace`: the value must change even when nobody has subscribed yet.
+        self.state.shutdown_tx.send_replace(true);
     }
 }

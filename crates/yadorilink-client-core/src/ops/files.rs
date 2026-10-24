@@ -104,10 +104,14 @@ pub async fn materialization_status(
     Ok(status)
 }
 
-/// Fetches a placeholder file's real content.
-pub async fn hydrate_file(absolute_path: String) -> Result<(), CoreError> {
-    control::send(ReqPayload::Hydrate(HydrateRequest { absolute_path })).await?;
-    Ok(())
+/// Fetches a placeholder file's real content. Returns whether the daemon downloaded anything:
+/// `false` means the content was already on this device.
+pub async fn hydrate_file(absolute_path: String) -> Result<bool, CoreError> {
+    let resp = control::send(ReqPayload::Hydrate(HydrateRequest { absolute_path })).await?;
+    let Some(RespPayload::Hydrate(hydrate)) = resp.payload else {
+        return Err(unexpected());
+    };
+    Ok(hydrate.downloaded)
 }
 
 /// Converts a hydrated file back into a placeholder to reclaim local disk

@@ -105,10 +105,47 @@ pub struct DegradedLinkInfo {
     pub next_recheck_unix: i64,
     /// Terminal (ownership lost): never rechecked; only relink/restart clears it.
     pub terminal: bool,
+    /// Why the link is degraded. Status reports this, never a match on `reason`.
+    pub cause: DegradedCause,
 }
 
-/// Prefix of the Degraded reason of a link whose receive waits for free disk space.
-pub const WAITING_FOR_DISK_SPACE: &str = "Waiting for disk space";
+/// Why a link is degraded: the one typed cause every consumer (status, rollup, shells) keys on.
+/// The human text beside it (`DegradedLinkInfo::reason`) is detail only and never decides
+/// anything. Mirrors the wire `DegradedCause`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DegradedCause {
+    /// A receive or provider read was refused for lack of disk space; clears by itself.
+    WaitingForDiskSpace,
+    /// The OS file-watch limit is hit; only the user can raise it.
+    FileWatchLimit,
+    /// The ownership marker is gone; only re-linking or a restart clears it.
+    OwnershipLost,
+    /// An orphaned link: no longer joined to its folder group.
+    NotJoined,
+    /// Stopped with no more specific cause: shown as a stopped folder.
+    Stopped,
+}
+
+impl DegradedCause {
+    pub fn to_wire(self) -> yadorilink_ipc_proto::daemonctl::DegradedCause {
+        use yadorilink_ipc_proto::daemonctl::DegradedCause as Wire;
+        match self {
+            Self::WaitingForDiskSpace => Wire::WaitingForDiskSpace,
+            Self::FileWatchLimit => Wire::FileWatchLimit,
+            Self::OwnershipLost => Wire::OwnershipLost,
+            Self::NotJoined => Wire::NotJoined,
+            Self::Stopped => Wire::Unspecified,
+        }
+    }
+}
+
+/// The detail of a folder whose build has no OS watcher.
+pub const NO_CHANGE_SOURCE_REASON: &str = "This build cannot watch ordinary folders for changes, \
+     so this folder is not syncing. Use a provider folder on this platform.";
+
+/// Opening words of the human detail of a link waiting for free disk space. Text only: nothing
+/// may decide the state from it (see `DegradedLinkInfo::cause`).
+const WAITING_FOR_DISK_SPACE_DETAIL: &str = "Waiting for disk space";
 
 /// The Degraded reason of a link that is waiting for free disk space: what stalled, how much
 /// room is left, how much must stay free, and what to do. Sync resumes by itself once the
@@ -119,17 +156,17 @@ pub fn waiting_for_disk_space_reason(
     required_free_bytes: u64,
 ) -> String {
     format!(
-        "{WAITING_FOR_DISK_SPACE} on {volume}: {available_bytes} bytes free, \
+        "{WAITING_FOR_DISK_SPACE_DETAIL} on {volume}: {available_bytes} bytes free, \
          {required_free_bytes} bytes must stay free; free up space on that volume and \
          syncing resumes automatically"
     )
 }
 
-/// `DegradedLinkInfo::reason` of an ownership-lost link; the status rollup keys on it.
+/// `DegradedLinkInfo::reason` (human detail) of an ownership-lost link.
 pub const OWNERSHIP_LOST_REASON: &str = "ownership_lost";
 
 /// The degraded reason of an orphaned link (one that no longer takes part in sync because its
-/// folder group was not joined again, or its authorization is gone); the status rollup keys on it.
+/// folder group was not joined again, or its authorization is gone). Human detail only.
 pub const NOT_JOINED_REASON: &str =
     "not joined to its folder group; accept an invite to it again, or unlink this folder";
 
@@ -511,6 +548,7 @@ impl LinkRegistry {
         &self,
         local_path: &str,
         reason: String,
+        cause: DegradedCause,
         now_unix: i64,
         recheck_delay_secs: impl FnOnce(u32) -> i64,
     ) {
@@ -531,6 +569,7 @@ impl LinkRegistry {
                 backoff_attempt,
                 next_recheck_unix,
                 terminal: false,
+                cause,
             },
         );
     }
@@ -550,19 +589,41 @@ impl LinkRegistry {
                 backoff_attempt: 0,
                 next_recheck_unix: i64::MAX,
                 terminal: true,
+                cause: DegradedCause::OwnershipLost,
             },
         );
         true
     }
 
     pub fn is_ownership_lost(&self, local_path: &str) -> bool {
-        self.lock_degraded().get(local_path).is_some_and(|i| i.terminal)
+        self.lock_degraded()
+            .get(local_path)
+            .is_some_and(|i| i.terminal && i.cause == DegradedCause::OwnershipLost)
+    }
+
+    /// Marks `local_path` stopped because this build has no OS watcher, so the folder has no
+    /// source of changes. Terminal: nothing in this build clears it but unlinking.
+    pub fn mark_no_change_source(&self, local_path: &str, now_unix: i64) {
+        self.lock_degraded().insert(
+            local_path.to_string(),
+            DegradedLinkInfo {
+                reason: NO_CHANGE_SOURCE_REASON.to_string(),
+                since_unix: now_unix,
+                backoff_attempt: 0,
+                next_recheck_unix: i64::MAX,
+                terminal: true,
+                cause: DegradedCause::Stopped,
+            },
+        );
     }
 
     /// Clears a terminal OwnershipLost mark (a fresh link start).
     pub fn clear_ownership_lost(&self, local_path: &str) {
         let mut degraded = self.lock_degraded();
-        if degraded.get(local_path).is_some_and(|i| i.terminal) {
+        if degraded
+            .get(local_path)
+            .is_some_and(|i| i.terminal && i.cause == DegradedCause::OwnershipLost)
+        {
             degraded.remove(local_path);
         }
     }
@@ -585,12 +646,12 @@ impl LinkRegistry {
     }
 
     /// Every Degraded link whose `next_recheck_unix` has elapsed, as
-    /// `(local_path, reason)` pairs -- the re-check sweep's own input.
-    pub fn degraded_due_snapshot(&self, now_unix: i64) -> Vec<(String, String)> {
+    /// `(local_path, info)` pairs -- the re-check sweep's own input.
+    pub fn degraded_due_snapshot(&self, now_unix: i64) -> Vec<(String, DegradedLinkInfo)> {
         self.lock_degraded()
             .iter()
             .filter(|(_, info)| !info.terminal && info.next_recheck_unix <= now_unix)
-            .map(|(path, info)| (path.clone(), info.reason.clone()))
+            .map(|(path, info)| (path.clone(), info.clone()))
             .collect()
     }
 
@@ -602,5 +663,43 @@ impl LinkRegistry {
         if let Some(info) = self.lock_degraded().get_mut(local_path) {
             info.next_recheck_unix = now_unix - 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod no_change_source_tests {
+    use super::*;
+
+    /// A folder with no source of changes is shown stopped, with the reason, and is not mistaken
+    /// for a lost ownership marker (which a fresh link start clears).
+    #[test]
+    fn a_folder_without_a_change_source_is_stopped_with_its_reason() {
+        let links = LinkRegistry::new();
+        links.mark_no_change_source("/f", 7);
+        let info = links.degraded_info("/f").unwrap();
+        assert_eq!(info.cause, DegradedCause::Stopped);
+        assert_eq!(
+            info.cause.to_wire(),
+            yadorilink_ipc_proto::daemonctl::DegradedCause::Unspecified
+        );
+        assert!(info.reason.contains("cannot watch ordinary folders"));
+        assert!(info.terminal);
+        assert!(!links.is_ownership_lost("/f"));
+        links.clear_ownership_lost("/f");
+        links.clear_degraded("/f");
+        assert!(links.degraded_info("/f").is_some(), "neither clears it");
+    }
+
+    #[test]
+    fn the_no_watcher_source_refuses_instead_of_running_without_changes() {
+        use yadorilink_filesystem_sync::watcher::{FolderWatchSource, NoWatchSource};
+        let dir = tempfile::tempdir().unwrap();
+        let ignore = Arc::new(
+            yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet::load_for_link_root(
+                dir.path(),
+            )
+            .unwrap(),
+        );
+        assert!(NoWatchSource.watch(dir.path(), ignore).is_err());
     }
 }

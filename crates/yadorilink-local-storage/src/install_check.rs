@@ -49,6 +49,7 @@ impl RunningInstall {
             install_source: self.install_source.clone(),
             release_id: self.release_id.clone(),
             engine_api_version: self.engine_api_version,
+            state_schema: None,
         }
     }
 }

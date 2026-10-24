@@ -111,9 +111,17 @@ impl Roots {
                 app_bundles.push(root);
             }
         }
-        let system_root = std::env::var_os("SystemRoot")
-            .map_or_else(|| PathBuf::from("C:\\Windows"), PathBuf::from);
-        Self { home, system_root, app_bundles }
+        Self { home, system_root: PathBuf::from("C:\\Windows"), app_bundles }
+    }
+
+    /// These roots with the Windows system root the caller read from its environment
+    /// (`%SystemRoot%`), when it set one, instead of the conventional `C:\Windows`.
+    #[must_use]
+    pub fn with_system_root(mut self, system_root: Option<std::ffi::OsString>) -> Self {
+        if let Some(root) = system_root {
+            self.system_root = PathBuf::from(root);
+        }
+        self
     }
 }
 

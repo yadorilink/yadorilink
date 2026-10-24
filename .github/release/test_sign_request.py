@@ -66,7 +66,7 @@ class SignRequest(unittest.TestCase):
         self.td = tempfile.TemporaryDirectory()
         self.addCleanup(self.td.cleanup)
         self.tool = Path(self.td.name) / "tool"
-        self.tool.write_text(TOOL % sys.executable)
+        self.tool.write_text(TOOL % sys.executable, encoding="utf-8")
         self.tool.chmod(self.tool.stat().st_mode | stat.S_IXUSR)
 
     def sign(self, req=None, **kw):
@@ -174,7 +174,7 @@ class SignRequest(unittest.TestCase):
         self.refused("private half", request(target="production"), target="production", key_hex=OTHER_SEED.hex())
 
     def test_a_failing_tool_signs_nothing(self):
-        self.tool.write_text("#!/bin/sh\nexit 3\n")
+        self.tool.write_text("#!/bin/sh\nexit 3\n", encoding="utf-8")
         self.refused("signing tool failed")
         self.refused("signing tool not found", sign_tool=str(Path(self.td.name) / "nope"))
 
@@ -255,10 +255,10 @@ class CommandLine(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             tool = td / "tool"
-            tool.write_text(TOOL % sys.executable)
+            tool.write_text(TOOL % sys.executable, encoding="utf-8")
             tool.chmod(tool.stat().st_mode | stat.S_IXUSR)
-            (td / "req.json").write_text(json.dumps(request()))
-            (td / "trust-chain.json").write_text(CHAIN)
+            (td / "req.json").write_text(json.dumps(request()), encoding="utf-8")
+            (td / "trust-chain.json").write_text(CHAIN, encoding="utf-8")
             import os  # noqa: PLC0415
 
             os.environ["TEST_KEY"], os.environ["TEST_KEY_ID"] = SEED.hex(), ROOT_ID

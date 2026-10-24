@@ -75,9 +75,21 @@ use crate::peer_registry::{PeerReachability, UnreachableCategory};
 use crate::sync_adapter::address_directory::CoordinationAddressDirectory;
 pub use address_report::report_own_address;
 pub(crate) use peer_sessions::keep_peer_sessions;
+pub(crate) use reachability::peers_with_replaced;
 use reachability::{LinkId, LinkReachability};
 
-/// Comma-separated relay URLs for the reconciliation substrate.
+/// The `YADORILINK_SYNC_RELAYS` value that means "no relays, direct only".
+///
+/// Spelled out rather than expressed as an empty value, because an empty
+/// setting is indistinguishable from an unset one and must keep meaning "not
+/// configured" — a deployment that meant to turn relaying off and a
+/// deployment that never configured it want opposite things, and silently
+/// giving both the same answer would leave one of them with peers it cannot
+/// reach and no indication why.
+const NO_RELAYS: &str = "none";
+
+/// The substrate's network configuration for the engine's `sync_relays` setting (the desktop
+/// daemon maps `YADORILINK_SYNC_RELAYS` into it): comma-separated relay URLs.
 ///
 /// Unset means Iroh's own relay infrastructure — free, needs no configuration,
 /// and reachable from anywhere. Setting it moves to a specific relay set
@@ -89,21 +101,8 @@ use reachability::{LinkId, LinkReachability};
 /// strictly local-area and does not want a device reaching third-party
 /// infrastructure at all. That is a real configuration, not a way to select a
 /// different convergence path: there is only one.
-const SYNC_RELAYS_ENV: &str = "YADORILINK_SYNC_RELAYS";
-
-/// The [`SYNC_RELAYS_ENV`] value that means "no relays, direct only".
-///
-/// Spelled out rather than expressed as an empty value, because an empty
-/// setting is indistinguishable from an unset one and must keep meaning "not
-/// configured" — a deployment that meant to turn relaying off and a
-/// deployment that never configured it want opposite things, and silently
-/// giving both the same answer would leave one of them with peers it cannot
-/// reach and no indication why.
-const NO_RELAYS: &str = "none";
-
-/// The substrate's network configuration, from this daemon's environment.
-pub(crate) fn sync_network_config() -> NetworkConfig {
-    let configured = std::env::var(SYNC_RELAYS_ENV).unwrap_or_default();
+pub(crate) fn sync_network_config(sync_relays: Option<&str>) -> NetworkConfig {
+    let configured = sync_relays.unwrap_or_default();
     if configured.trim().eq_ignore_ascii_case(NO_RELAYS) {
         return NetworkConfig::direct_only().with_lan_discovery();
     }
@@ -912,38 +911,26 @@ mod tests {
     /// simply never configured relays want opposite things.
     #[test]
     fn only_an_explicit_none_turns_relaying_off() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: serialized against every other reader of this variable in
-        // this test module by `ENV_LOCK`.
-        unsafe { std::env::remove_var(SYNC_RELAYS_ENV) };
-        assert!(sync_network_config().relays_configured(), "unset must keep the default");
-
-        unsafe { std::env::set_var(SYNC_RELAYS_ENV, "   ") };
-        assert!(sync_network_config().relays_configured(), "empty must keep the default");
-
-        unsafe { std::env::set_var(SYNC_RELAYS_ENV, "None") };
-        assert!(!sync_network_config().relays_configured(), "`none` must turn relaying off");
-
-        unsafe { std::env::remove_var(SYNC_RELAYS_ENV) };
+        assert!(sync_network_config(None).relays_configured(), "unset must keep the default");
+        assert!(
+            sync_network_config(Some("   ")).relays_configured(),
+            "empty must keep the default"
+        );
+        assert!(
+            !sync_network_config(Some("None")).relays_configured(),
+            "`none` must turn relaying off"
+        );
     }
 
     /// Same-LAN lookup is on in every production configuration, including a
     /// strictly local one with relaying off -- that deployment needs it most.
     #[test]
     fn every_production_configuration_looks_peers_up_on_the_lan() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: serialized by `ENV_LOCK`, as above.
-        unsafe { std::env::remove_var(SYNC_RELAYS_ENV) };
-        assert!(sync_network_config().lan_discovery(), "default relays");
-
-        unsafe { std::env::set_var(SYNC_RELAYS_ENV, "none") };
-        assert!(sync_network_config().lan_discovery(), "relaying off");
-
-        unsafe { std::env::set_var(SYNC_RELAYS_ENV, "https://relay.example.test") };
-        assert!(sync_network_config().lan_discovery(), "custom relays");
-
-        unsafe { std::env::remove_var(SYNC_RELAYS_ENV) };
+        assert!(sync_network_config(None).lan_discovery(), "default relays");
+        assert!(sync_network_config(Some("none")).lan_discovery(), "relaying off");
+        assert!(
+            sync_network_config(Some("https://relay.example.test")).lan_discovery(),
+            "custom relays"
+        );
     }
-
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

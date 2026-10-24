@@ -29,7 +29,7 @@
 //! resulting small duplication of `BackoffConfig`'s jitter math.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -39,7 +39,6 @@ use yadorilink_transport::{diff_netmap, NetmapDiff, NetmapSnapshot};
 
 use crate::connection_trace::{AddressClass, AttemptOutcome, CandidateSource};
 use crate::daemon_state::DaemonState;
-use crate::device_config;
 use crate::error::DaemonError;
 use crate::supervise::{spawn_one_shot, BackoffConfig};
 
@@ -498,10 +497,10 @@ fn record_group_policy_states(
             ));
         }
         service_key_pins.insert(coordination_endpoint.to_string(), presented_hex);
-        save_service_key_pins(service_key_pins)?;
+        save_service_key_pins(state.config_dir(), service_key_pins)?;
     } else if pin_decision == PolicyServiceKeyPinDecision::NewPin {
         service_key_pins.insert(coordination_endpoint.to_string(), presented_hex);
-        save_service_key_pins(service_key_pins)?;
+        save_service_key_pins(state.config_dir(), service_key_pins)?;
     }
     // Marking the failed groups stale, clearing the verified ones and
     // swapping the trusted set happen in one critical section, so admission
@@ -655,7 +654,7 @@ pub(crate) fn restore_offline_group_policy_states(
     state: &Arc<DaemonState>,
     coordination_endpoint: &str,
 ) {
-    let pins = match load_service_key_pins() {
+    let pins = match load_service_key_pins(state.config_dir()) {
         Ok(pins) => pins,
         Err(error) => {
             tracing::warn!(%error, "could not read the pinned coordination service keys");
@@ -837,8 +836,10 @@ pub async fn run(config: OrchestratorConfig, state: Arc<DaemonState>) -> Result<
     let startup = retry_until_started(&state, |state| Box::pin(start_reconciliation(state)));
     let netmap = async {
         let mut attempt: u32 = 0;
+        let mut last_block: Option<yadorilink_fapi_client::CoordinationBlock> = None;
         loop {
             let started = tokio::time::Instant::now();
+            let mut failure: Option<DaemonError> = None;
             match run_netmap_attempt(&config, &state, &diff_state).await {
                 Ok(()) => {
                     tracing::warn!(attempt, "coordination netmap stream ended; reconnecting");
@@ -872,10 +873,13 @@ pub async fn run(config: OrchestratorConfig, state: Arc<DaemonState>) -> Result<
                         false,
                         None,
                     );
+                    failure = Some(e);
                 }
             }
             attempt = attempt_after_stream(attempt, started.elapsed());
-            let delay = reconnect_delay(attempt);
+            let blocked = config.auth.block();
+            log_block_change(&mut last_block, &blocked);
+            let delay = reconnect_delay_after(attempt, blocked.is_some(), failure.as_ref());
             tracing::info!(attempt, ?delay, "waiting before next coordination reconnect attempt");
             tokio::time::sleep(delay).await;
             attempt = attempt.saturating_add(1);
@@ -941,7 +945,13 @@ where
 /// retried by [`spawn_reconciliation_startup`] until it succeeds. Calling it
 /// with a driver already installed is a no-op.
 async fn start_reconciliation(state: &Arc<DaemonState>) {
-    start_reconciliation_with(state, crate::peer_connectivity_runtime::sync_network_config()).await
+    start_reconciliation_with(
+        state,
+        crate::peer_connectivity_runtime::sync_network_config(
+            state.tuning().sync_relays.as_deref(),
+        ),
+    )
+    .await
 }
 
 /// [`start_reconciliation`] against an explicit network configuration.
@@ -1001,6 +1011,63 @@ fn attempt_after_stream(attempt: u32, ran_for: Duration) -> u32 {
     } else {
         attempt
     }
+}
+
+/// How long the netmap loop waits between attempts while the coordination service refuses this
+/// device for a reason only a sign-in settles (the Terms are not accepted, or the session cannot
+/// be renewed), or answered the upgrade 403. One refused request per interval, never a tight loop; a sign-in is noticed within
+/// it.
+const BLOCKED_RECONNECT_DELAY: Duration = Duration::from_secs(60);
+
+/// Whether the service answered the netmap upgrade 403. The body of such an answer may arrive
+/// after the headers and is not read to the end, so the reason may not be recognised; a 403 is
+/// not transient either way, so the loop waits as it does for a recognised block.
+fn upgrade_was_forbidden(error: &DaemonError) -> bool {
+    matches!(
+        error,
+        DaemonError::WebSocket(boxed)
+            if matches!(
+                boxed.as_ref(),
+                tokio_tungstenite::tungstenite::Error::Http(r) if r.status() == 403
+            )
+    )
+}
+
+/// The wait before the next netmap attempt: the ordinary backoff, stretched to the blocked delay
+/// while the service refuses this device (`blocked`) or answered the upgrade 403 (`failure`).
+fn reconnect_delay_after(attempt: u32, blocked: bool, failure: Option<&DaemonError>) -> Duration {
+    reconnect_delay_for(attempt, blocked || failure.is_some_and(upgrade_was_forbidden))
+}
+
+fn reconnect_delay_for(attempt: u32, blocked: bool) -> Duration {
+    let delay = reconnect_delay(attempt);
+    if blocked {
+        delay.max(BLOCKED_RECONNECT_DELAY)
+    } else {
+        delay
+    }
+}
+
+/// One log line per change of the block, naming no credential.
+fn log_block_change(
+    last: &mut Option<yadorilink_fapi_client::CoordinationBlock>,
+    now: &Option<yadorilink_fapi_client::CoordinationBlock>,
+) {
+    use yadorilink_fapi_client::CoordinationBlock;
+    if last == now {
+        return;
+    }
+    match now {
+        Some(CoordinationBlock::TermsConsentRequired { terms_version }) => tracing::warn!(
+            terms_version = terms_version.as_deref().unwrap_or(""),
+            "the coordination service requires the updated Terms to be accepted; sync keeps its local state and this device stays registered. Run `yadorilink login` (or sign in from the app) to review and accept them; retrying once a minute until then"
+        ),
+        Some(CoordinationBlock::SignInRequired) => tracing::warn!(
+            "the coordination service refused to renew this device's session (the Terms may have changed); sync keeps its local state and this device stays registered. Run `yadorilink login` (or sign in from the app); retrying once a minute until then"
+        ),
+        None => tracing::info!("the coordination service accepts this device again"),
+    }
+    *last = now.clone();
 }
 
 /// Mirrors `supervise::BackoffConfig::RECONNECT`'s schedule (exponential
@@ -1073,12 +1140,12 @@ fn verify_or_pin_peer_key(
 
 /// This device's record of every peer's Ed25519 device key, pinned on first
 /// sight and refused on change.
-fn load_signing_key_pins() -> Result<HashMap<String, String>, DaemonError> {
-    load_key_pins(signing_key_pins_path())
+fn load_signing_key_pins(dir: &Path) -> Result<HashMap<String, String>, DaemonError> {
+    load_key_pins(signing_key_pins_path(dir))
 }
 
-fn load_service_key_pins() -> Result<HashMap<String, String>, DaemonError> {
-    load_key_pins(service_key_pins_path())
+fn load_service_key_pins(dir: &Path) -> Result<HashMap<String, String>, DaemonError> {
+    load_key_pins(service_key_pins_path(dir))
 }
 
 fn load_key_pins(path: PathBuf) -> Result<HashMap<String, String>, DaemonError> {
@@ -1109,6 +1176,7 @@ fn decode_peer_signing_key(encoded: &str) -> Option<[u8; 32]> {
 /// returning `true` when the key changed from a previously-pinned value so
 /// the caller refuses the peer.
 fn pin_peer_signing_key(
+    dir: &Path,
     pins: &mut HashMap<String, String>,
     device_id: &str,
     signing_key: &[u8; 32],
@@ -1116,7 +1184,7 @@ fn pin_peer_signing_key(
     match verify_or_pin_peer_key(pins, device_id, signing_key) {
         PeerKeyDecision::AlreadyPinned => Ok(false),
         PeerKeyDecision::NewlyPinned => {
-            save_signing_key_pins(pins)?;
+            save_signing_key_pins(dir, pins)?;
             Ok(false)
         }
         PeerKeyDecision::Mismatch => {
@@ -1145,12 +1213,12 @@ fn pin_peer_signing_key(
 /// hand. `rename` on both Unix and Windows replaces `path` atomically as
 /// a single filesystem operation — a concurrent reader either sees the
 /// old complete file or the new complete file, never a mix of both.
-fn save_signing_key_pins(pins: &HashMap<String, String>) -> Result<(), DaemonError> {
-    save_key_pins(signing_key_pins_path(), pins)
+fn save_signing_key_pins(dir: &Path, pins: &HashMap<String, String>) -> Result<(), DaemonError> {
+    save_key_pins(signing_key_pins_path(dir), pins)
 }
 
-fn save_service_key_pins(pins: &HashMap<String, String>) -> Result<(), DaemonError> {
-    save_key_pins(service_key_pins_path(), pins)
+fn save_service_key_pins(dir: &Path, pins: &HashMap<String, String>) -> Result<(), DaemonError> {
+    save_key_pins(service_key_pins_path(dir), pins)
 }
 
 fn save_key_pins(path: PathBuf, pins: &HashMap<String, String>) -> Result<(), DaemonError> {
@@ -1178,13 +1246,13 @@ fn save_key_pins(path: PathBuf, pins: &HashMap<String, String>) -> Result<(), Da
         let mut file = options.open(&tmp_path)?;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         serde_json::to_writer_pretty(&mut file, pins)?;
-        file.sync_all()?;
+        yadorilink_fs_platform::flush::sync_file(&file)?;
     }
     #[cfg(not(unix))]
     {
         let mut file = options.open(&tmp_path)?;
         serde_json::to_writer_pretty(&mut file, pins)?;
-        file.sync_all()?;
+        yadorilink_fs_platform::flush::sync_file(&file)?;
     }
     // Published by a durable move: a pinned key does not revert after a power loss.
     yadorilink_fs_platform::durable_dir::publish_durably(
@@ -1195,12 +1263,12 @@ fn save_key_pins(path: PathBuf, pins: &HashMap<String, String>) -> Result<(), Da
     Ok(())
 }
 
-fn signing_key_pins_path() -> PathBuf {
-    device_config::config_dir().join("signing_keys.json")
+fn signing_key_pins_path(dir: &Path) -> PathBuf {
+    dir.join("signing_keys.json")
 }
 
-fn service_key_pins_path() -> PathBuf {
-    device_config::config_dir().join("coordination_service_keys.json")
+fn service_key_pins_path(dir: &Path) -> PathBuf {
+    dir.join("coordination_service_keys.json")
 }
 
 /// Removes `peer_device_id`'s `PeerSyncSession` from the registry, so
@@ -1232,7 +1300,7 @@ fn end_session(state: &DaemonState, peer_device_id: &str) {
 /// is cleared, and `revoke_device` runs after the withdrawal has returned
 /// rather than inside it, so nothing is closed while the authority state
 /// is locked.
-fn teardown_peer(state: &Arc<DaemonState>, device_id: &str) {
+pub(crate) fn teardown_peer(state: &Arc<DaemonState>, device_id: &str) {
     let withdrawn_signing_key = state.authority.peer_signing_key(device_id);
     end_session(state, device_id);
     state.clear_peer_netmap_metadata(device_id);

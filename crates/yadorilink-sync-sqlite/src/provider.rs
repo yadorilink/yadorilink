@@ -901,45 +901,42 @@ impl ProviderRepository {
         version: yadorilink_replica_domain::ids::VersionHash,
     ) -> Result<Option<u64>, SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            yadorilink_sqlite_runtime::reconcile_provider_liveness(tx)?;
-            let row: Option<(String, String)> = tx
-                .query_row(
-                    "SELECT group_id, path FROM provider_items \
-                     WHERE root_id = ?1 AND item_id = ?2 AND live = 1",
-                    rusqlite::params![root_id, &item_id[..]],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            let Some((group_id, path)) = row else { return Ok(None) };
-            match current_version(tx, &group_id, &path)? {
-                Some(current) if current.version_hash == version => {}
-                _ => return Ok(None),
-            }
-            let content_sig: String = tx.query_row(
-                "SELECT size || '|' || blocks_json || '|' || record_kind || '|' \
-                        || COALESCE(CAST(symlink_target AS TEXT), '') \
-                 FROM files WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
-                rusqlite::params![group_id, path],
-                |r| r.get(0),
-            )?;
-            tx.execute(
-                "UPDATE provider_roots SET latest_evidence_seq = latest_evidence_seq + 1 \
-                 WHERE root_id = ?1",
-                [root_id],
-            )?;
-            let seq: i64 = tx.query_row(
-                "SELECT latest_evidence_seq FROM provider_roots WHERE root_id = ?1",
-                [root_id],
-                |r| r.get(0),
-            )?;
-            tx.execute(
-                "INSERT OR REPLACE INTO provider_handoffs \
-                    (root_id, item_id, version_hash, content_sig, evidence_seq) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![root_id, &item_id[..], &version.0[..], content_sig, seq],
-            )?;
-            Ok(Some(seq as u64))
+            record_ledger_in_tx(tx, HANDOFFS, root_id, item_id, version)
         })
+    }
+
+    /// Records that the daemon handed the OS a verified WINDOW of the current version `version`
+    /// (never the whole file). Same rules and evidence sequence as [`Self::record_handoff`], in
+    /// its own ledger: a window serve is never presence of the content.
+    pub fn record_window_serve(
+        &self,
+        root_id: &str,
+        item_id: &ItemId,
+        version: yadorilink_replica_domain::ids::VersionHash,
+    ) -> Result<Option<u64>, SyncSqliteError> {
+        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
+            record_ledger_in_tx(tx, WINDOW_SERVES, root_id, item_id, version)
+        })
+    }
+
+    /// The window-serve entry of an item: the version a window was last handed over for and the
+    /// evidence sequence it took.
+    pub fn window_serve(
+        &self,
+        root_id: &str,
+        item_id: &ItemId,
+    ) -> Result<Option<Handoff>, SyncSqliteError> {
+        self.read_ledger(WINDOW_SERVES, root_id, item_id)
+    }
+
+    /// Whether the version a window was last served for has exactly the content of the item's
+    /// current version. False when no window was served or either version is unreadable.
+    pub fn window_serve_has_current_content(
+        &self,
+        root_id: &str,
+        item_id: &ItemId,
+    ) -> Result<bool, SyncSqliteError> {
+        self.ledger_has_current_content(WINDOW_SERVES, root_id, item_id)
     }
 
     /// The ledger entry of an item: the version handed over and the evidence sequence it took.
@@ -948,11 +945,33 @@ impl ProviderRepository {
         root_id: &str,
         item_id: &ItemId,
     ) -> Result<Option<Handoff>, SyncSqliteError> {
+        self.read_ledger(HANDOFFS, root_id, item_id)
+    }
+
+    /// Whether the version last handed over for the item has exactly the content of its current
+    /// version (the metadata may differ). False when nothing was handed over or either version is
+    /// unreadable.
+    pub fn handoff_has_current_content(
+        &self,
+        root_id: &str,
+        item_id: &ItemId,
+    ) -> Result<bool, SyncSqliteError> {
+        self.ledger_has_current_content(HANDOFFS, root_id, item_id)
+    }
+
+    fn read_ledger(
+        &self,
+        table: &'static str,
+        root_id: &str,
+        item_id: &ItemId,
+    ) -> Result<Option<Handoff>, SyncSqliteError> {
         self.read_settled(|conn| {
             let row: Option<(Vec<u8>, i64)> = conn
                 .query_row(
-                    "SELECT version_hash, evidence_seq FROM provider_handoffs \
-                     WHERE root_id = ?1 AND item_id = ?2",
+                    &format!(
+                        "SELECT version_hash, evidence_seq FROM {table} \
+                         WHERE root_id = ?1 AND item_id = ?2"
+                    ),
                     rusqlite::params![root_id, &item_id[..]],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
@@ -964,20 +983,20 @@ impl ProviderRepository {
         })
     }
 
-    /// Whether the version last handed over for the item has exactly the content of its current
-    /// version (the metadata may differ). False when nothing was handed over or either version is
-    /// unreadable.
-    pub fn handoff_has_current_content(
+    fn ledger_has_current_content(
         &self,
+        table: &'static str,
         root_id: &str,
         item_id: &ItemId,
     ) -> Result<bool, SyncSqliteError> {
         self.read_settled(|conn| {
             let row: Option<(Vec<u8>, String, String)> = conn
                 .query_row(
-                    "SELECT h.version_hash, i.group_id, i.path FROM provider_handoffs h \
-                     JOIN provider_items i ON i.root_id = h.root_id AND i.item_id = h.item_id \
-                     WHERE h.root_id = ?1 AND h.item_id = ?2 AND i.live = 1",
+                    &format!(
+                        "SELECT h.version_hash, i.group_id, i.path FROM {table} h \
+                         JOIN provider_items i ON i.root_id = h.root_id AND i.item_id = h.item_id \
+                         WHERE h.root_id = ?1 AND h.item_id = ?2 AND i.live = 1"
+                    ),
                     rusqlite::params![root_id, &item_id[..]],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
@@ -1797,6 +1816,7 @@ pub(crate) fn delete_provider_state(
     // whose state must survive the acknowledgement of the old root's removal.
     for table in [
         "provider_handoffs",
+        "provider_window_serves",
         "provider_download_failures",
         "provider_apply_log",
         "provider_apply_sessions",
@@ -1907,6 +1927,7 @@ fn rebootstrap_in_tx(
         |r| r.get(0),
     )?;
     tx.execute("DELETE FROM provider_handoffs WHERE root_id = ?1", [&old_root])?;
+    tx.execute("DELETE FROM provider_window_serves WHERE root_id = ?1", [&old_root])?;
     tx.execute("DELETE FROM provider_download_failures WHERE root_id = ?1", [&old_root])?;
     tx.execute("DELETE FROM provider_apply_log WHERE root_id = ?1", [&old_root])?;
     // `provider_pending_ingest` is NOT touched: the journal of an undecided upload outlives its root
@@ -2135,6 +2156,71 @@ pub(crate) fn append_event(
         rusqlite::params![root_id, seq],
     )?;
     Ok(seq as u64)
+}
+
+/// [`ProviderRepository::record_handoff`] inside the caller's transaction: the authoring path
+/// records the version it commits (the OS supplied those bytes) in the transaction of the change.
+pub(crate) fn record_handoff_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    root_id: &str,
+    item_id: &ItemId,
+    version: yadorilink_replica_domain::ids::VersionHash,
+) -> Result<Option<u64>, SyncSqliteError> {
+    record_ledger_in_tx(tx, HANDOFFS, root_id, item_id, version)
+}
+
+/// The ledger of whole-version handoffs.
+const HANDOFFS: &str = "provider_handoffs";
+/// The ledger of versions served to the OS in windows only.
+const WINDOW_SERVES: &str = "provider_window_serves";
+
+fn record_ledger_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    table: &'static str,
+    root_id: &str,
+    item_id: &ItemId,
+    version: yadorilink_replica_domain::ids::VersionHash,
+) -> Result<Option<u64>, SyncSqliteError> {
+    yadorilink_sqlite_runtime::reconcile_provider_liveness(tx)?;
+    let row: Option<(String, String)> = tx
+        .query_row(
+            "SELECT group_id, path FROM provider_items \
+                 WHERE root_id = ?1 AND item_id = ?2 AND live = 1",
+            rusqlite::params![root_id, &item_id[..]],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((group_id, path)) = row else { return Ok(None) };
+    match current_version(tx, &group_id, &path)? {
+        Some(current) if current.version_hash == version => {}
+        _ => return Ok(None),
+    }
+    let content_sig: String = tx.query_row(
+        "SELECT size || '|' || blocks_json || '|' || record_kind || '|' \
+                    || COALESCE(CAST(symlink_target AS TEXT), '') \
+             FROM files WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
+        rusqlite::params![group_id, path],
+        |r| r.get(0),
+    )?;
+    tx.execute(
+        "UPDATE provider_roots SET latest_evidence_seq = latest_evidence_seq + 1 \
+             WHERE root_id = ?1",
+        [root_id],
+    )?;
+    let seq: i64 = tx.query_row(
+        "SELECT latest_evidence_seq FROM provider_roots WHERE root_id = ?1",
+        [root_id],
+        |r| r.get(0),
+    )?;
+    tx.execute(
+        &format!(
+            "INSERT OR REPLACE INTO {table} \
+                (root_id, item_id, version_hash, content_sig, evidence_seq) \
+             VALUES (?1, ?2, ?3, ?4, ?5)"
+        ),
+        rusqlite::params![root_id, &item_id[..], &version.0[..], content_sig, seq],
+    )?;
+    Ok(Some(seq as u64))
 }
 
 #[cfg(test)]

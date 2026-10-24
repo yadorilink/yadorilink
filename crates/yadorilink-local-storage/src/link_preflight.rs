@@ -16,7 +16,7 @@
 //! folder still returns promptly with `scan_truncated: true` rather than
 //! walking the whole tree.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::free_space::{self, FreeSpaceState, VolumeFreeSpace};
 
@@ -268,6 +268,17 @@ pub fn run_preflight(
     existing_link_paths: &[String],
     headroom_override_bytes: Option<u64>,
 ) -> LinkPreflightReport {
+    run_preflight_at_home(local_path, existing_link_paths, headroom_override_bytes, None)
+}
+
+/// [`run_preflight`] that also flags `home` (the user's home directory, which the caller
+/// knows; a host with no home directory passes `None`) as a risky place to link.
+pub fn run_preflight_at_home(
+    local_path: &Path,
+    existing_link_paths: &[String],
+    headroom_override_bytes: Option<u64>,
+    home: Option<&Path>,
+) -> LinkPreflightReport {
     let mut report = LinkPreflightReport { path_exists: local_path.exists(), ..Default::default() };
     if !report.path_exists {
         return report;
@@ -284,7 +295,7 @@ pub fn run_preflight(
     }
     report.free_space = free_space::classify_volume(local_path, headroom_override_bytes).ok();
     report.nested_conflicts = detect_nested_conflicts(local_path, existing_link_paths);
-    report.risky_location = detect_risky_location(local_path);
+    report.risky_location = detect_risky_location(local_path, home);
     report
 }
 
@@ -501,11 +512,11 @@ pub fn detect_topology_conflicts(
         .collect()
 }
 
-fn detect_risky_location(path: &Path) -> Option<RiskyLocation> {
+fn detect_risky_location(path: &Path, home: Option<&Path>) -> Option<RiskyLocation> {
     if path.parent().is_none() {
         return Some(RiskyLocation::FilesystemRoot);
     }
-    if is_home_directory(path) {
+    if is_home_directory(path, home) {
         return Some(RiskyLocation::HomeDirectory);
     }
     for component in path.components() {
@@ -521,12 +532,11 @@ fn detect_risky_location(path: &Path) -> Option<RiskyLocation> {
     None
 }
 
-fn is_home_directory(path: &Path) -> bool {
-    let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
+fn is_home_directory(path: &Path, home: Option<&Path>) -> bool {
+    let Some(home) = home else {
         return false;
     };
-    let home = PathBuf::from(home);
-    let home = home.canonicalize().unwrap_or(home);
+    let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
     let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     home == target
 }

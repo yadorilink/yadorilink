@@ -146,6 +146,11 @@ pub struct ReplicaCoordinator {
     /// This replica's author identity, opened when the device's signing key
     /// is wired (see [`Self::open_local_author`]).
     local_author: Mutex<Option<Arc<crate::author_identity::ReplicaAuthor>>>,
+    /// The engine's tuning and measurement settings, given at construction (nothing reads the
+    /// process environment for them).
+    tuning: Arc<crate::engine_tuning::EngineTuning>,
+    /// Concurrent receive file assemblies of this engine, sized by the tuning.
+    receive_write_gate: Arc<tokio::sync::Semaphore>,
     /// Set while the author identity is refused because the database was
     /// restored or copied (`install_witness`); what status reports.
     database_restored: Mutex<Option<crate::install_witness::Restored>>,
@@ -248,6 +253,22 @@ impl ReplicaCoordinator {
         path_lock_registry: Arc<PathLockRegistry>,
         startup_readiness: Arc<StartupReadinessRegistry>,
     ) -> Result<Self, yadorilink_sqlite_runtime::DatabaseError> {
+        Self::from_database_with(
+            database,
+            path_lock_registry,
+            startup_readiness,
+            Self::beside_database_tuning(),
+        )
+    }
+
+    /// [`Self::from_database`] with the engine's tuning and measurement settings.
+    pub fn from_database_with(
+        database: Arc<SyncDatabase>,
+        path_lock_registry: Arc<PathLockRegistry>,
+        startup_readiness: Arc<StartupReadinessRegistry>,
+        tuning: crate::engine_tuning::EngineTuning,
+    ) -> Result<Self, yadorilink_sqlite_runtime::DatabaseError> {
+        let tuning = Arc::new(tuning);
         let sqlite = Arc::new(yadorilink_sync_sqlite::SqliteSyncStore::new(database.clone()));
         // Closes that outstanding removal tickets hold, back in place before
         // anything can ask for a custody lease.
@@ -320,6 +341,8 @@ impl ReplicaCoordinator {
             custody_hold_wake: Arc::new(tokio::sync::Notify::new()),
             local_policy_head_provider: Mutex::new(None),
             local_author: Mutex::new(None),
+            receive_write_gate: Arc::new(tokio::sync::Semaphore::new(tuning.receive_write_permits)),
+            tuning,
             database_restored: Mutex::new(None),
             author_unavailable: Mutex::new(false),
             capture_passes: Mutex::new(std::collections::HashMap::new()),
@@ -356,12 +379,30 @@ impl ReplicaCoordinator {
     pub fn open(
         path: impl AsRef<std::path::Path>,
     ) -> Result<Self, yadorilink_sqlite_runtime::DatabaseError> {
-        let database = Arc::new(SyncDatabase::open(path, schema_init)?);
-        Self::from_database(
+        Self::open_with(path, Self::beside_database_tuning())
+    }
+
+    /// [`Self::open`] with the engine's tuning and measurement settings.
+    pub fn open_with(
+        path: impl AsRef<std::path::Path>,
+        tuning: crate::engine_tuning::EngineTuning,
+    ) -> Result<Self, yadorilink_sqlite_runtime::DatabaseError> {
+        let database = Arc::new(SyncDatabase::open_process_locked(path, schema_init)?);
+        Self::from_database_with(
             database,
             Arc::new(PathLockRegistry::new()),
             Arc::new(StartupReadinessRegistry::new()),
+            tuning,
         )
+    }
+
+    /// The tuning of a coordinator opened without one (tests and tools): the defaults, with the
+    /// installation witness explicitly beside the database.
+    fn beside_database_tuning() -> crate::engine_tuning::EngineTuning {
+        crate::engine_tuning::EngineTuning {
+            witness: crate::install_witness::WitnessPlacement::BesideDatabase,
+            ..crate::engine_tuning::EngineTuning::default()
+        }
     }
 
     // --- Accessors needed by the port impls below, so callers can reach
@@ -436,10 +477,21 @@ impl ReplicaCoordinator {
         &self.materialization_state_repository
     }
 
+    /// The semaphore bounding this engine's concurrent receive file assemblies.
+    pub(crate) fn receive_write_gate(&self) -> Arc<tokio::sync::Semaphore> {
+        self.receive_write_gate.clone()
+    }
+
+    /// The engine's tuning and measurement settings.
+    #[must_use]
+    pub fn tuning(&self) -> &crate::engine_tuning::EngineTuning {
+        &self.tuning
+    }
+
     /// Whether the receive path's commits run on the blocking pool while the
     /// awaiting task keeps polling (see `SyncDatabase::write_immediate_offloaded`):
-    /// on unless `YADORILINK_RECEIVE_ASYNC_COMMIT` is `0`. A/B knob for the
-    /// measurement, to be deleted afterwards. Read per call.
+    /// on unless the engine's tuning turned it off. A/B knob for the measurement, to be deleted
+    /// afterwards.
     pub(crate) fn async_commit(&self) -> bool {
         #[cfg(test)]
         match self.test_observers.async_commit_override.load(std::sync::atomic::Ordering::Relaxed) {
@@ -447,7 +499,7 @@ impl ReplicaCoordinator {
             2 => return false,
             _ => {}
         }
-        async_commit_from_env()
+        self.tuning.receive_async_commit
     }
 
     pub fn sqlite(&self) -> &yadorilink_sync_sqlite::SqliteSyncStore {
@@ -482,8 +534,12 @@ impl ReplicaCoordinator {
                 return Ok(current);
             }
         }
-        let opened =
-            crate::author_identity::ReplicaAuthor::open(&self.database, device_id, signing_key);
+        let opened = crate::author_identity::ReplicaAuthor::open(
+            &self.database,
+            &self.tuning.witness,
+            device_id,
+            signing_key,
+        );
         *self.database_restored.lock().unwrap_or_else(|p| p.into_inner()) = match &opened {
             Err(crate::author_identity::AuthorIdentityError::DatabaseRestored(reason)) => {
                 Some(*reason)
@@ -1244,12 +1300,6 @@ impl Drop for RetentionPause {
 
 #[cfg(test)]
 pub(crate) mod test_observers;
-
-const ASYNC_COMMIT_VAR: &str = "YADORILINK_RECEIVE_ASYNC_COMMIT";
-
-fn async_commit_from_env() -> bool {
-    std::env::var(ASYNC_COMMIT_VAR).ok().as_deref().map(str::trim) != Some("0")
-}
 
 #[cfg(test)]
 mod materialization_intent_tests;

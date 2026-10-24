@@ -43,7 +43,7 @@ def main():
     if not path.exists():
         print(f"no log at {path}")
         return 0
-    lines = [TS.sub("", ANSI.sub("", l.rstrip("\n"))) for l in path.read_text(errors="replace").splitlines()]
+    lines = [TS.sub("", ANSI.sub("", l.rstrip("\n"))) for l in path.read_text(errors="replace", encoding="utf-8").splitlines()]
     failed, panics, binaries, results, build_errors = parse(lines)
     if not (failed or binaries or build_errors):
         print("no failing tests in the log")

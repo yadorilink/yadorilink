@@ -651,7 +651,7 @@ async fn a_late_joining_caller_observes_the_leaders_result_as_a_follower() {
     tokio::task::yield_now().await;
 
     let leader_result = hydrate_inner(&state, "group-1", "doc.txt", Some(&test_stall())).await;
-    leader.complete(leader_result.as_ref().map(|_| ()).map_err(|_| ()));
+    leader.complete(leader_result.as_ref().map(|fetched| *fetched).map_err(|_| ()));
 
     let follower_result = follower_task.await.unwrap();
 
@@ -873,6 +873,93 @@ async fn hydrate_of_an_already_hydrated_path_is_a_no_op_and_never_touches_disk()
             .unwrap(),
         Some(MaterializationState::Present),
         "the row's state must be left exactly as it was"
+    );
+}
+
+/// A proof that names a superseded version over bytes and metadata that are already right is
+/// healed in place: nothing is fetched, so nothing is reported as downloaded.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_proof_healed_over_matching_disk_reports_no_download() {
+    use std::os::unix::fs::PermissionsExt;
+    let (state, _store_dir) = test_state();
+    let root = tempfile::tempdir().unwrap();
+    state
+        .replica_coordinator
+        .link_repository()
+        .add_link(&root.path().to_string_lossy(), GROUP)
+        .unwrap();
+    state.install_test_root_commit_authority(GROUP);
+    yadorilink_root_authority::root_identity::VerifiedRoot::open(
+        root.path(),
+        GROUP,
+        state.replica_coordinator.as_ref(),
+    )
+    .unwrap();
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+    let content = b"already exactly right on disk";
+    let block = put_block(&state, GROUP, content);
+    let record = record_with_blocks(PATH, vec![block], content.len() as u64);
+    state
+        .replica_coordinator
+        .file_index_repository()
+        .upsert_file_with_origin(GROUP, &record, "device-a", &permit)
+        .unwrap();
+    std::fs::write(root.path().join(PATH), content).unwrap();
+    let stale_version = crate::test_support::seed_prior_cycle_proof(
+        &state.replica_coordinator,
+        GROUP,
+        PATH,
+        &root.path().join(PATH),
+        &permit,
+    );
+    // The bump records the mode disk already has, so only the version moves.
+    let disk_mode =
+        std::fs::metadata(root.path().join(PATH)).unwrap().permissions().mode() & 0o7777;
+    state
+        .replica_coordinator
+        .file_index_repository()
+        .set_unix_mode(GROUP, PATH, Some(disk_mode), &permit)
+        .unwrap();
+    assert_ne!(current_version_hash(&state, PATH), stale_version);
+
+    let fetched = hydrate_inner(&state, GROUP, PATH, Some(&test_stall())).await.unwrap();
+
+    assert!(!fetched, "a proof healed over matching disk fetches nothing");
+    assert!(state
+        .replica_coordinator
+        .sqlite()
+        .dag_usable_proof_names_current_version(GROUP, PATH)
+        .unwrap());
+}
+
+/// What `hydrate_inner` reports to the control request that says "downloaded": a file already
+/// here, or one rebuilt from blocks this device holds, fetches nothing from peers (the fetch
+/// case is in `multi_peer_hydration`).
+#[tokio::test]
+async fn hydrate_reports_no_fetch_for_a_file_already_here_or_rebuilt_from_local_blocks() {
+    let (state, sync_state, root_dir, _indexed_content) = setup_legitimately_hydrated_doc().await;
+    assert!(
+        !hydrate_inner(&state, "group-1", "doc.txt", Some(&test_stall())).await.unwrap(),
+        "a file that is already here is not a download"
+    );
+
+    // Evicted: the row is Remote and the file gone.
+    std::fs::remove_file(root_dir.path().join("doc.txt")).unwrap();
+    sync_state
+        .materialization_state_repository()
+        .set_materialization_state(
+            "group-1",
+            "doc.txt",
+            MaterializationState::Remote,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    // The block is still in the local store here, so the file is rebuilt without any peer:
+    // that is not a download either.
+    assert!(
+        !hydrate_inner(&state, "group-1", "doc.txt", Some(&test_stall())).await.unwrap(),
+        "rebuilding a file from blocks this device holds fetches nothing"
     );
 }
 
@@ -2283,6 +2370,7 @@ async fn restore_does_not_rename_over_a_save_that_lands_during_assembly() {
     assert!(matches!(result, Err(SyncError::PathChangedLocally(_))), "got {result:?}");
     assert_eq!(std::fs::read(root.path().join(PATH)).unwrap(), b"saved during the restore");
     assert!(state.replica_coordinator.dirty_path_repository().is_path_dirty(GROUP, PATH).unwrap());
+    assert_eq!(restore_journal_rows(&state), 0, "a refused restore removes its own journal row");
     let stray: Vec<_> = std::fs::read_dir(root.path())
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -3833,7 +3921,7 @@ async fn a_convergence_rehydration_that_fails_after_its_fence_bump_leaves_presen
 async fn hydrate_one_with_metadata(
     mode: u32,
     xattrs: &[(String, Vec<u8>)],
-) -> (Arc<ReplicaCoordinator>, tempfile::TempDir, Result<(), SyncError>) {
+) -> (Arc<ReplicaCoordinator>, tempfile::TempDir, Result<bool, SyncError>) {
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());

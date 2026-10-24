@@ -379,7 +379,7 @@ fn all<'a>(
 /// Applies the seeded mutation batches and updates `oracle`. Deletes, renames and the directory
 /// move are applied on the first device; edits and creations on the second; the third (if any)
 /// edits a large file. The three sets are disjoint, so the expected result is unambiguous.
-fn mutate(nodes: &[&TopologyNode], plan: &Plan, oracle: &mut Oracle) {
+async fn mutate(nodes: &[&TopologyNode], plan: &Plan, oracle: &mut Oracle) {
     let (a, b) = (nodes[0], nodes[1]);
     let editor_of_large = nodes.get(2).copied().unwrap_or(b);
     let mut rng = Rng(plan.seed ^ 0xA5A5_A5A5);
@@ -414,7 +414,7 @@ fn mutate(nodes: &[&TopologyNode], plan: &Plan, oracle: &mut Oracle) {
     }
     // A whole directory moves, and keeps its files.
     std::fs::create_dir_all(a.root.path().join("archive")).unwrap();
-    rename(a, "moved-tree", "archive/moved-tree-renamed");
+    rename_dir(a, GROUP, "moved-tree", "archive/moved-tree-renamed").await;
     let moved: Vec<String> =
         oracle.keys().filter(|p| p.starts_with("moved-tree/")).cloned().collect();
     for path in moved {
@@ -447,7 +447,7 @@ fn peak_rss_bytes() -> u64 {
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
     let raw = usage.ru_maxrss as u64;
-    if cfg!(target_os = "macos") {
+    if cfg!(target_vendor = "apple") {
         raw
     } else {
         raw * 1024
@@ -542,7 +542,7 @@ async fn large_tree_converges_across_real_daemons() {
     }
 
     let mutate_started = Instant::now();
-    mutate(&all(&a, &b, &c), &plan, &mut oracle);
+    mutate(&all(&a, &b, &c), &plan, &mut oracle).await;
     await_tree(&all(&a, &b, &c), &oracle, converge, "after the mutation batches").await;
     phases.push(("mutation_sync", mutate_started.elapsed().as_secs_f64()));
     assert_settled(&all(&a, &b, &c), &oracle, converge, "after the mutations").await;

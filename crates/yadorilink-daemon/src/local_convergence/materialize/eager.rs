@@ -8,7 +8,9 @@ use yadorilink_replica_domain::session_state::MaterializationState;
 
 use super::super::types::*;
 use super::MaterializationPlan;
-use yadorilink_fs_platform::fs_identity::{disk_race_fingerprint, DiskRaceFingerprint};
+use yadorilink_fs_platform::fs_identity::{
+    disk_race_fingerprint_or_stat, disk_race_fingerprint_or_stat_observed, DiskRaceFingerprint,
+};
 
 // The eager lane is a pipeline. Each stage consumes the value the
 // previous one produced, so a stage can only run once everything before it
@@ -47,6 +49,15 @@ struct RevalidatedTarget {
     baseline: TargetBaseline,
 }
 
+#[derive(Clone)]
+enum BaselineBytes {
+    /// The fingerprint can show a rewrite, or the path is not a regular file.
+    NotNeeded,
+    Hashed(Vec<yadorilink_replica_domain::file::BlockInfo>),
+    /// The bytes could not be read: handled as a mismatch, like at the rename.
+    Unreadable,
+}
+
 /// What the target looked like at the moment it was last found free of
 /// uncaptured local state.
 #[derive(Clone)]
@@ -55,6 +66,9 @@ struct TargetBaseline {
     /// Whether the path was already journaled dirty then. A path that
     /// becomes dirty afterwards was written to by someone else.
     was_dirty: bool,
+    /// The target's bytes at the baseline, read only where the fingerprint is
+    /// stat-only (it cannot then show a same-size rewrite with a restored mtime).
+    disk_bytes: BaselineBytes,
 }
 
 /// Whether an assembled temp file was published.
@@ -153,7 +167,7 @@ impl super::super::LocalConvergenceExecutor {
         if let Some(reason) = &plan.hazard_reason {
             return self.hold_for_hazard(plan, reason);
         }
-        let Some(target) = self.revalidate_target(plan, located)? else {
+        let Some(target) = self.revalidate_target(plan, located).await? else {
             return Ok(MaterializeResult::RetryRequired.into());
         };
         // Do not record unfetched content as hydrated:
@@ -302,7 +316,7 @@ impl super::super::LocalConvergenceExecutor {
         // if it had always been there; only a comparison against what was
         // on disk before the request went out can tell the two apart.
         let out_path_for_race_check = self.local_file_path(group_id, &record.path)?;
-        let pre_fetch_disk_state = disk_race_fingerprint(&out_path_for_race_check);
+        let pre_fetch_disk_state = disk_race_fingerprint_or_stat(&out_path_for_race_check);
         // The second fork: by the time an incoming change is about to be
         // written, are this device's own local bytes still on disk? If a
         // local write is lost despite the flush guard running, the length
@@ -362,7 +376,7 @@ impl super::super::LocalConvergenceExecutor {
 
     /// Stage 3: revalidate the target right before anything is written.
     /// `None` declines this pass for retry.
-    fn revalidate_target(
+    async fn revalidate_target(
         &self,
         plan: &MaterializationPlan<'_>,
         located: LocatedContent,
@@ -387,7 +401,7 @@ impl super::super::LocalConvergenceExecutor {
         // first pass the fingerprint was taken moments ago by this same
         // call with the lock already held, so there is no window for it to
         // describe and nothing to compare it against.
-        let post_fetch_disk_state = disk_race_fingerprint(&out_path_for_race_check);
+        let post_fetch_disk_state = disk_race_fingerprint_or_stat(&out_path_for_race_check);
         if satisfied.is_some_and(|r| post_fetch_disk_state != r.observed_disk) {
             tracing::info!(
                 group_id,
@@ -482,6 +496,42 @@ impl super::super::LocalConvergenceExecutor {
         // skipped, and both are how a file still being written (a `git
         // clone`'s pack) got this device's own older version of it written
         // back over it.
+        // The baseline is sampled BEFORE the byte decision below, from one
+        // query: fingerprint, whether it is stat-only, and the dirty flag, then
+        // (stat-only volumes) a hash of the bytes. A same-size rewrite with a
+        // restored mtime landing before the decision is read by the decision and
+        // refused by it (or, for the rows it does not read, was never visible to
+        // the fingerprint either); one landing after the hash is caught by the
+        // pre-rename compare against that hash. The hash is not taken after the
+        // decision, which would let it adopt an edit as the baseline.
+        let observed = disk_race_fingerprint_or_stat_observed(&out_path_for_race_check);
+        let was_dirty = self.state.is_path_dirty(group_id, &record.path)?;
+        let disk_bytes = match observed {
+            Some((_, true)) => {
+                let hash_path = out_path_for_race_check.clone();
+                tokio::task::spawn_blocking(move || {
+                    if !std::fs::symlink_metadata(&hash_path).is_ok_and(|meta| meta.is_file()) {
+                        return BaselineBytes::NotNeeded;
+                    }
+                    match yadorilink_local_storage::chunker::hash_file_blocks(
+                        &hash_path,
+                        true,
+                        |_, _| Ok::<(), yadorilink_local_storage::StorageError>(()),
+                    ) {
+                        Ok(blocks) => BaselineBytes::Hashed(blocks),
+                        Err(_) => BaselineBytes::Unreadable,
+                    }
+                })
+                .await
+                .map_err(|error| PeerSessionError::HydrationFailed(error.to_string()))?
+            }
+            _ => BaselineBytes::NotNeeded,
+        };
+        let baseline = TargetBaseline {
+            fingerprint: observed.map(|(fingerprint, _)| fingerprint),
+            was_dirty,
+            disk_bytes,
+        };
         if self.disk_holds_uncaptured_local_bytes(
             group_id,
             &record.path,
@@ -504,10 +554,6 @@ impl super::super::LocalConvergenceExecutor {
             });
             return Ok(None);
         }
-        let baseline = TargetBaseline {
-            fingerprint: disk_race_fingerprint(&out_path_for_race_check),
-            was_dirty: self.state.is_path_dirty(group_id, &record.path)?,
-        };
         Ok(Some(RevalidatedTarget { all_present, baseline }))
     }
 
@@ -840,6 +886,27 @@ impl super::super::LocalConvergenceExecutor {
         // nothing records that a write was in flight, and no proof has
         // landed. Dropping the guard unclear is inert -- it has no
         // `Drop` behaviour of its own, and the commit owns the clear.
+        //
+        // A write whose rename is on stable storage says so before anything else
+        // happens to it: from here a missing name is the user's, which the open
+        // intent alone cannot tell from a crash before the rename. A batched
+        // write has not reached stable storage, so it says nothing.
+        if deferred_tmp.is_none() {
+            if let Err(error) = self.state.materialization_intent_repository().mark_write_landed(
+                group_id,
+                &record.path,
+                content_write_mutation_generation,
+                root_commit_permit,
+            ) {
+                tracing::warn!(
+                    group_id,
+                    path = %record.path,
+                    %error,
+                    "could not record that the write landed; a removal made before its commit \
+                     is not told apart from a crash"
+                );
+            }
+        }
         drop(intent_guard);
         Ok(Reconstruction::Written(Box::new(WrittenObject {
             deferred_tmp,
@@ -885,6 +952,7 @@ impl super::super::LocalConvergenceExecutor {
             Arc::new(self.state.temp_ledger(group_id)),
             None,
             durability,
+            self.state.receive_write_gate(),
         )
         .await?;
         crate::receive_diag::mark(crate::receive_diag::Stage::TempWritten);
@@ -904,8 +972,41 @@ impl super::super::LocalConvergenceExecutor {
                 probe.pass(crate::local_convergence::ProbeSeam::BeforeRename, &record.path).await;
             }
         }
-        let fingerprint = disk_race_fingerprint(out_path);
-        let moved = fingerprint != baseline.fingerprint
+        // Where the volume cannot answer the change time / USN, the fingerprint
+        // is stat-only and misses a same-size rewrite with a restored mtime, and
+        // the watcher may not have journaled it yet. The bytes are asked again,
+        // against what the baseline read; unreadable bytes refuse. This full read
+        // comes FIRST: the fingerprint and the dirty journal are sampled right
+        // after it, immediately before the rename, so a write that lands during
+        // the read and moves the mtime is still seen by them.
+        let bytes_moved = match &baseline.disk_bytes {
+            BaselineBytes::NotNeeded => false,
+            BaselineBytes::Unreadable => true,
+            BaselineBytes::Hashed(blocks) => {
+                let blocks = blocks.clone();
+                let check_path = out_path.to_path_buf();
+                let compared = tokio::task::spawn_blocking(move || {
+                    !matches!(
+                        yadorilink_local_storage::disk_content_comparison(&check_path, &blocks),
+                        Ok(yadorilink_local_storage::DiskContentComparison::Matched)
+                    )
+                })
+                .await;
+                match compared {
+                    Ok(moved) => moved,
+                    Err(error) => {
+                        yadorilink_local_storage::discard_temp_file(
+                            &tmp_path,
+                            &self.state.temp_ledger(group_id),
+                        );
+                        return Err(PeerSessionError::HydrationFailed(error.to_string()));
+                    }
+                }
+            }
+        };
+        let fingerprint = disk_race_fingerprint_or_stat(out_path);
+        let moved = bytes_moved
+            || fingerprint != baseline.fingerprint
             || (!baseline.was_dirty && self.state.is_path_dirty(group_id, &record.path)?);
         if moved {
             yadorilink_local_storage::discard_temp_file(

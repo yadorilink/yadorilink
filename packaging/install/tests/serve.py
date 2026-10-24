@@ -19,7 +19,7 @@ class H(http.server.SimpleHTTPRequestHandler):
         super().__init__(*a, directory=str(root), **k)
 
     def log_message(self, fmt, *args):
-        with open(log, "a") as f:
+        with open(log, "a", encoding="utf-8") as f:
             f.write(self.path + "\n")
 
     def do_GET(self):
@@ -49,6 +49,6 @@ class H(http.server.SimpleHTTPRequestHandler):
 srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
 # Publish the port atomically so a reader never sees a missing or partial file.
 tmp = portfile.with_name(portfile.name + ".tmp")
-tmp.write_text(str(srv.server_address[1]))
+tmp.write_text(str(srv.server_address[1]), encoding="utf-8")
 os.replace(tmp, portfile)
 srv.serve_forever()

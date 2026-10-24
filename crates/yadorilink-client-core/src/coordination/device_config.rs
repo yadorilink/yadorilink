@@ -43,7 +43,12 @@ pub fn control_pipe_name() -> String {
 }
 
 pub fn save(cfg: &DeviceConfig) -> Result<(), crate::error::CoreError> {
-    let path = config_path()?;
+    save_in(&config_dir()?, cfg)
+}
+
+/// [`save`] into the state directory `dir`.
+pub fn save_in(dir: &Path, cfg: &DeviceConfig) -> Result<(), crate::error::CoreError> {
+    let path = dir.join("device.json");
     if let Some(parent) = path.parent() {
         yadorilink_fs_platform::durable_dir::create_dir_all_durably(parent)?;
     }
@@ -54,9 +59,14 @@ pub fn save(cfg: &DeviceConfig) -> Result<(), crate::error::CoreError> {
 /// Reads the canonical pre-release device config. No development-version
 /// migration or compatibility fallback is attempted.
 pub fn load() -> std::io::Result<DeviceConfig> {
-    let contents = std::fs::read_to_string(
-        config_path().map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?,
-    )?;
+    load_in(
+        &config_dir().map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?,
+    )
+}
+
+/// [`load`] from the state directory `dir`.
+pub fn load_in(dir: &Path) -> std::io::Result<DeviceConfig> {
+    let contents = std::fs::read_to_string(dir.join("device.json"))?;
     let config: DeviceConfig = serde_json::from_str(&contents)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     if config.config_version != CONFIG_VERSION {
@@ -108,7 +118,7 @@ fn write_config_file_with(
         let mut file = create_owner_only(&temporary)?;
         file.write_all(contents.as_bytes())?;
         after(WriteStep::TempWritten)?;
-        file.sync_all()?;
+        yadorilink_fs_platform::flush::sync_file(&file)?;
         drop(file);
         after(WriteStep::TempSynced)?;
         // A durable publish: the new name is on disk when this returns.

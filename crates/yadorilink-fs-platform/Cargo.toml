@@ -36,7 +36,7 @@ libc = "0.2"
 
 # `durable_dir`'s Windows write-through move and volume probe.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
 ] }
@@ -46,7 +46,7 @@ workspace = true
 
 # The Windows evidence tests call the raw file APIs directly.
 [target.'cfg(windows)'.dev-dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",

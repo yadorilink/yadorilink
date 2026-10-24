@@ -26,75 +26,12 @@ use yadorilink_sync_sqlite::materialized_generation::MaterializedObjectKind;
 
 use super::ReplicaCoordinator;
 
-/// Process-wide cache for [`dag_zero_work_settlement_if_already_current`]'s
-/// disk revalidation. A real granularity probe (`fs_capabilities::
-/// probe_birth_time_granularity`) performs its own file creation/deletion
-/// to measure clock resolution -- genuine physical work, which is exactly
-/// what the zero-work pre-check exists to avoid paying on every call.
-/// Probing once per sync root and reusing the result for the rest of the
-/// daemon's process lifetime keeps the *steady-state* cost at zero, at the
-/// price of one one-time bootstrap probe the first time any path under a
-/// given root is checked. `TimestampGranularity::Coarse` unconditionally
-/// (no probe at all) was tried first and rejected: on a filesystem that
-/// does not expose `generation_or_usn` (unprivileged `FS_IOC_GETVERSION`
-/// is commonly unavailable, and never available on overlayfs -- see
-/// `FileIdentity::compare`'s own doc), `Coarse` treats even a perfectly
-/// matching birth time as `Ambiguous`, never `SameObject` -- meaning the
-/// zero-work close could never fire at all on such a filesystem, not
-/// merely miss an optimization on it.
-///
-/// Keyed by the sync root's `VolumeIdentity`, not its path: this crate's
-/// own `fs_capabilities` module (see `CapabilityCacheKey`'s own doc, and
-/// its module doc's "a volume change... always misses the cache") already
-/// establishes that a path is not a stable proxy for a filesystem --
-/// removable drives can be reformatted at the same mountpoint, and
-/// network/container mounts can be replaced entirely, both without the
-/// path ever changing. `PeerSyncSession` itself already re-verifies root
-/// identity immediately before a write for exactly this reason (see
-/// `verify_root`'s own call sites), so this is an established, defended-
-/// against failure mode in this codebase, not a hypothetical one. A
-/// path-keyed cache would silently keep serving a stale volume's
-/// granularity after a remount at the same path, which could let a
-/// `Coarse`-appropriate replacement filesystem be wrongly treated as
-/// `Fine` and turn a false `SameObject` into an incorrect zero-work close.
-/// Keying by `VolumeIdentity` instead makes a remount (a different
-/// identity at the same path) a fresh cache miss automatically, exactly
-/// like `CapabilityCacheKey` already does for every other probed
-/// capability. Falls back to an uncached probe (never a stale answer) if
-/// the volume identity itself cannot even be observed.
-static BIRTH_TIME_GRANULARITY_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<
-        HashMap<
-            yadorilink_fs_platform::fs_identity::VolumeIdentity,
-            yadorilink_fs_platform::fs_identity::TimestampGranularity,
-        >,
-    >,
-> = std::sync::OnceLock::new();
-
+/// The birth-time granularity of `sync_root`'s volume, from the one per-volume cache in
+/// `yadorilink-fs-platform` (a measurement that could not be made is never kept there).
 pub(in crate::replica_coordinator) fn cached_birth_time_granularity(
     sync_root: &Path,
 ) -> yadorilink_fs_platform::fs_identity::TimestampGranularity {
-    let Ok(volume_identity) =
-        yadorilink_fs_platform::fs_capabilities::observe_volume_identity(sync_root)
-    else {
-        return yadorilink_fs_platform::fs_capabilities::probe_birth_time_granularity(sync_root);
-    };
-    cached_granularity_for_volume(volume_identity, || {
-        yadorilink_fs_platform::fs_capabilities::probe_birth_time_granularity(sync_root)
-    })
-}
-
-/// The pure caching decision `cached_birth_time_granularity` delegates to,
-/// factored out so a test can exercise "same volume identity reuses the
-/// cached probe; a different one re-probes" directly with synthetic
-/// identities, without needing to actually remount a real volume.
-fn cached_granularity_for_volume(
-    volume_identity: yadorilink_fs_platform::fs_identity::VolumeIdentity,
-    probe: impl FnOnce() -> yadorilink_fs_platform::fs_identity::TimestampGranularity,
-) -> yadorilink_fs_platform::fs_identity::TimestampGranularity {
-    let cache = BIRTH_TIME_GRANULARITY_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    *guard.entry(volume_identity).or_insert_with(probe)
+    yadorilink_fs_platform::fs_capabilities::cached_probe_birth_time_granularity(sync_root)
 }
 
 impl ReplicaCoordinator {

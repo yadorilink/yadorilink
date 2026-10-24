@@ -2,7 +2,8 @@
 //! message tell the user what kind of thing went wrong, not just that
 //! something did.
 
-use yadorilink_client_core::CoreError;
+use yadorilink_client_core::error::StartOverRefusal;
+use yadorilink_client_core::{CoreError, Hint};
 use yadorilink_ipc_proto::daemonctl::ApplicationErrorCode;
 
 #[derive(Debug, thiserror::Error)]
@@ -20,6 +21,13 @@ pub enum CliError {
 
     #[error("authentication failed: {0}")]
     AuthFailed(String),
+
+    /// The account has not accepted the current Terms (the service answered
+    /// `403 terms_consent_required`) or the service refused to renew this computer's session
+    /// (`invalid_grant`; the Terms may have changed). Nothing local was changed: `yadorilink
+    /// login` signs in again as this installation and shows the consent screen in the browser.
+    #[error("{0} — run `yadorilink login` to sign in again; your files and folders are kept")]
+    SignInRequired(String),
 
     #[error("could not reach the YadoriLink server: {0}")]
     CoordinationPlaneUnreachable(String),
@@ -136,6 +144,32 @@ impl RewindExit {
 }
 
 impl CliError {
+    /// This error with the command line that carries out `hint`: the client layer's texts are
+    /// host-neutral, so the commands are this front end's to spell. A category whose text is
+    /// fixed (`DaemonNotRunning` and the like) already names its own remedy and is unchanged.
+    #[must_use]
+    pub fn with_hint(self, hint: Hint) -> Self {
+        // The one hint whose commands sit inside the sentence: this front end keeps the whole
+        // text it always printed.
+        if hint == Hint::AlreadyEnrolled {
+            if let CliError::AuthFailed(_) = self {
+                return CliError::AuthFailed(ALREADY_ENROLLED.to_owned());
+            }
+        }
+        let advice = cli_hint_text(hint);
+        match self {
+            CliError::Other(message) => CliError::Other(format!("{message}{advice}")),
+            CliError::AuthFailed(message) => CliError::AuthFailed(format!("{message}{advice}")),
+            other => other,
+        }
+    }
+
+    /// Whether signing in again, as this installation, is what settles this failure.
+    #[must_use]
+    pub fn is_sign_in_required(&self) -> bool {
+        matches!(self, CliError::SignInRequired(_))
+    }
+
     /// Why the daemon is not running, when it refused to start over its data:
     /// printed under "daemon is not running", which alone sends the user to
     /// `daemon start`, which cannot help.
@@ -153,7 +187,7 @@ impl CliError {
 
     pub fn exit_code(&self) -> i32 {
         match self {
-            CliError::NotLoggedIn | CliError::AuthFailed(_) => 10,
+            CliError::NotLoggedIn | CliError::AuthFailed(_) | CliError::SignInRequired(_) => 10,
             CliError::CredentialStore(_) => 9,
             CliError::CoordinationPlaneUnreachable(_) => 3,
             CliError::DaemonNotRunning => 4,
@@ -193,6 +227,7 @@ impl CliError {
             CliError::NotLoggedIn => "cli_not_logged_in",
             CliError::CredentialStore(_) => "cli_credential_store",
             CliError::AuthFailed(_) => "cli_auth_failed",
+            CliError::SignInRequired(_) => "cli_sign_in_required",
             CliError::CoordinationPlaneUnreachable(_) => "cli_coordination_plane_unreachable",
             CliError::DaemonNotRunning => "cli_daemon_not_running",
             CliError::Other(_) => "cli_command_failed",
@@ -207,6 +242,40 @@ impl CliError {
         }
     }
 }
+
+/// The command line that carries out a client-layer [`Hint`], as a suffix to its message.
+fn cli_hint_text(hint: Hint) -> &'static str {
+    match hint {
+        Hint::StartDaemon => "; run `yadorilink daemon start`",
+        Hint::WaitThenStartDaemon => " and run `yadorilink daemon start`",
+        Hint::StopThenStartDaemon => {
+            "; restart it with `yadorilink daemon stop` and `yadorilink daemon start`"
+        }
+        // Replaced whole in `with_hint`; the suffix only serves a category that cannot carry it.
+        Hint::AlreadyEnrolled => ". Run `yadorilink logout` first to enrol again",
+        Hint::SignInAgain => ". Run `yadorilink login` again and open the link it prints.",
+        Hint::CreateOrAcceptShare => {
+            " (run `yadorilink share create` to make one, or `yadorilink share accept` to join \
+             one you were invited to)"
+        }
+        Hint::ListJoinableShares => {
+            " (run `yadorilink share joinable` to see what this account can join)"
+        }
+    }
+}
+
+/// What to do about a device-key copy that could not be removed (the client layer's warning
+/// names the failure only).
+pub(crate) const CREDENTIAL_CLEANUP_ADVICE: &str =
+    "Run `yadorilink credentials purge` to try again";
+
+/// What the command line has always said when this installation is already enrolled.
+const ALREADY_ENROLLED: &str = "this installation is already enrolled. `yadorilink logout` first \
+    if you mean to enrol it again -- re-enrolling mints a NEW identity rather than repairing the \
+    old one, and the old one stays live until it is revoked. The sign-in belongs to this computer \
+    user, not to one data directory: if the data directory was removed without signing out, \
+    `yadorilink credentials purge` deletes the leftover sign-in from this computer (it does not \
+    revoke it on the server).";
 
 /// The credential manager's failures, classified the one way
 /// `yadorilink-client-core` classifies them, then mapped onto this CLI's
@@ -228,6 +297,13 @@ impl From<CoreError> for CliError {
             CoreError::NotLoggedIn => CliError::NotLoggedIn,
             CoreError::CredentialStore(store) => CliError::CredentialStore(store),
             CoreError::AuthFailed(message) => CliError::AuthFailed(message),
+            CoreError::DeviceSuperseded => CliError::AuthFailed(e.to_string()),
+            CoreError::TermsConsentRequired { .. } => {
+                CliError::SignInRequired("the Terms must be accepted to continue".to_owned())
+            }
+            CoreError::SignInRequired => {
+                CliError::SignInRequired("sign-in required (the Terms may have changed)".to_owned())
+            }
             CoreError::CoordinationPlaneUnreachable(message) => {
                 CliError::CoordinationPlaneUnreachable(message)
             }
@@ -272,7 +348,14 @@ impl From<CoreError> for CliError {
                 )
             }
             CoreError::StatePlacement(refusal) => CliError::StatePlacement(refusal),
+            CoreError::StartOverRefused(StartOverRefusal::InProgress) => CliError::Other(
+                "a start over as a new device is under way on this computer; finish it \
+                 (`yadorilink device start-over`) before registering"
+                    .to_owned(),
+            ),
             CoreError::StartOverRefused(refusal) => CliError::Other(refusal.to_string()),
+            CoreError::Hinted { error, hint } => CliError::from(*error).with_hint(hint),
+            e @ CoreError::ReauthenticationRequired => CliError::Other(e.to_string()),
             CoreError::Forbidden(message)
             | CoreError::DaemonRejected(message)
             | CoreError::DaemonCommand { message, .. }

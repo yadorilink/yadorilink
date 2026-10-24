@@ -74,9 +74,8 @@ async fn a_contested_path_keeps_the_disk_until_it_is_forked() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_winner_replaces_the_loser_only_after_the_loser_stands_at_its_copy() {
-    if !yadorilink_fs_platform::fs_capabilities::temp_dir_proves_object_identity_for_test() {
-        return;
-    }
+    // No identity-proof gate: on a volume whose identity proof is inconclusive (overlayfs,
+    // tmpfs: no inode generation, coarse birth time) the copy's bytes still answer the guard.
     let (h, mine, _theirs) = local_x_loses_to_a_peer("guard").await;
     h.fork_own_contests();
 
@@ -133,6 +132,38 @@ async fn without_directory_durability_the_conflict_is_resolved_but_the_file_wait
         pass(&h).await;
     }
     assert_ne!(std::fs::read(h.path("x")).unwrap(), b"windows: this device's x");
+}
+
+/// The guard's question is whether the displaced content stands under the other name, and
+/// the other name's bytes decide it: other bytes there keep the original path waiting, and
+/// the loser's own bytes (even rewritten, so no identity proof can vouch for the file) let it go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_original_waits_while_the_copy_holds_other_bytes() {
+    if !crate::test_support::windows_durability_gate_allows_tests("the guard's clearance") {
+        return;
+    }
+    let (h, mine, theirs) = local_x_loses_to_a_peer("bytes").await;
+    let root = h.convergence.sync_root(GROUP).unwrap();
+    yadorilink_sync_sqlite::displacement_guard::set_force_no_directory_durability(&root, true);
+    h.fork_own_contests();
+    for _ in 0..4 {
+        pass(&h).await;
+    }
+    let copy = copy_path("x", &mine);
+    assert_eq!(std::fs::read(h.path(&copy)).unwrap(), b"bytes: this device's x", "the copy");
+    yadorilink_sync_sqlite::displacement_guard::set_force_no_directory_durability(&root, false);
+
+    std::fs::write(h.path(&copy), b"something else entirely").unwrap();
+    assert!(
+        !h.convergence.displacement_allowed(GROUP, "x", Some(&theirs)).await.unwrap(),
+        "other bytes at the copy do not preserve the loser"
+    );
+
+    std::fs::write(h.path(&copy), b"bytes: this device's x").unwrap();
+    assert!(
+        h.convergence.displacement_allowed(GROUP, "x", Some(&theirs)).await.unwrap(),
+        "the loser's bytes at the copy preserve it, whatever the identity proof says"
+    );
 }
 
 /// An on-demand folder with the loser hydrated at `x`: the loser's fork is a copy

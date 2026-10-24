@@ -165,6 +165,17 @@ impl Error {
         }
     }
 
+    /// Whether the Authorization Server refused a refresh or a grant with
+    /// `invalid_grant` (HTTP 400). This installation's grant is not usable now:
+    /// a revoked or reused refresh token, or an account that has not accepted
+    /// the current Terms. It says nothing about the client registration, and
+    /// the stored credential is kept.
+    #[must_use]
+    pub fn is_invalid_grant(&self) -> bool {
+        matches!(self, Error::Response { status: 400, .. })
+            && self.oauth_error() == Some("invalid_grant")
+    }
+
     /// The HTTP status, when the failure came from a response rather than the
     /// transport.
     #[must_use]

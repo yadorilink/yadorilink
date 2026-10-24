@@ -242,7 +242,7 @@ pub struct HeadroomPolicy {
     /// `false` leaves `preflight_disk_headroom` an unconditional `Ok` -- see
     /// its doc comment for why that, not enforcement, is the default.
     pub enforced: bool,
-    /// `None` means the built-in `max(1 GiB, 5%)` formula.
+    /// `None` means the built-in default headroom formula (`free_space`).
     pub override_bytes: Option<u64>,
 }
 
@@ -261,10 +261,12 @@ pub mod types;
 use types::*;
 pub mod call_timer;
 mod completion_window;
+pub(crate) use completion_window::{parse_batch_completion, parse_deferred_flush};
 mod knobs;
 mod materialize;
 pub mod obligation_claims;
 mod receive_write_gate;
+pub(crate) use receive_write_gate::parse_permits;
 mod received_flush_barrier;
 mod volume_probe;
 
@@ -355,6 +357,8 @@ mod completion_window_tests;
 mod receive_deferred_flush_tests;
 #[cfg(test)]
 mod receive_edit_crash_sequence_tests;
+#[cfg(test)]
+mod receive_rename_edit_crash_sequence_tests;
 
 #[cfg(all(test, unix))]
 mod power_cut_tests;
@@ -407,6 +411,7 @@ mod namespace_steps;
 mod reconcile;
 pub(crate) use reconcile::{reserve_volume_headroom, HeadroomReservation};
 pub(crate) mod reconcile_native;
+pub(crate) use reconcile_native::{parse_collector_flush_cap, parse_receive_write_concurrency};
 
 /// What `LocalConvergenceExecutor::own_capture_on_disk` found about a
 /// head's relation to the disk it would be projected onto.

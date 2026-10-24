@@ -2,20 +2,18 @@
 
 use super::*;
 use crate::background_custody::NotCorroboratedReason;
+use crate::link_registry::DegradedCause;
 use crate::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_replica_domain::file::FileRecord;
 
-/// `YADORILINK_CONFIG_DIR` is a process-global env var (same pattern
-/// used by `tests/reporting_ipc.rs` and `yadorilink-cli`'s
-/// `tests/materialization.rs`) — every test in this module that
-/// touches it holds this mutex for its whole body, so concurrently-
-/// running tests in this same lib test binary never observe each
-/// other's override. Shared with `device_config.rs` and
-/// `reporting/retry.rs` (see `crate::test_support`'s doc comment) —
-/// a module-local mutex here alone does not serialize against those
-/// other modules' own tests touching the same env var.
-use crate::test_support::CONFIG_ENV_MUTEX;
+/// A state whose governance config lives in a directory of its own, so a headroom override a
+/// test sets reaches no other test through the process-wide `YADORILINK_CONFIG_DIR`.
+fn test_state_with_own_config() -> Arc<DaemonState> {
+    let store = Arc::new(SegmentBlockStore::new(tempfile::tempdir().unwrap().keep()).unwrap());
+    let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+    DaemonState::new_in(tempfile::tempdir().unwrap().keep(), "device-a".into(), sync_state, store)
+}
 
 fn test_state() -> Arc<DaemonState> {
     let store = Arc::new(SegmentBlockStore::new(tempfile::tempdir().unwrap().keep()).unwrap());
@@ -530,7 +528,10 @@ async fn mark_link_degraded_makes_the_link_report_degraded_with_a_reason() {
     let state = test_state();
     assert!(!state.is_link_degraded("/links/photos"));
 
-    state.mark_link_degraded("/links/photos", "disk pressure on /links/photos".to_string());
+    state.mark_link_waiting_for_disk_space(
+        "/links/photos",
+        "disk pressure on /links/photos".to_string(),
+    );
 
     assert!(state.is_link_degraded("/links/photos"));
     let info = state.degraded_link_info("/links/photos").unwrap();
@@ -544,7 +545,7 @@ async fn mark_link_degraded_makes_the_link_report_degraded_with_a_reason() {
 #[tokio::test]
 async fn clear_link_degraded_removes_the_entry() {
     let state = test_state();
-    state.mark_link_degraded("/links/photos", "disk pressure".to_string());
+    state.mark_link_waiting_for_disk_space("/links/photos", "disk pressure".to_string());
     assert!(state.is_link_degraded("/links/photos"));
 
     state.clear_link_degraded("/links/photos");
@@ -562,11 +563,11 @@ async fn clear_link_degraded_removes_the_entry() {
 #[tokio::test]
 async fn repeated_disk_pressure_increases_backoff_instead_of_resetting_it() {
     let state = test_state();
-    state.mark_link_degraded("/links/photos", "disk pressure".to_string());
+    state.mark_link_waiting_for_disk_space("/links/photos", "disk pressure".to_string());
     let first = state.degraded_link_info("/links/photos").unwrap();
     assert_eq!(first.backoff_attempt, 0);
 
-    state.mark_link_degraded("/links/photos", "disk pressure".to_string());
+    state.mark_link_waiting_for_disk_space("/links/photos", "disk pressure".to_string());
     let second = state.degraded_link_info("/links/photos").unwrap();
     assert_eq!(second.backoff_attempt, 1);
     assert!(
@@ -578,7 +579,7 @@ async fn repeated_disk_pressure_increases_backoff_instead_of_resetting_it() {
     // been degraded, not just "since the last re-check."
     assert_eq!(second.since_unix, first.since_unix);
 
-    state.mark_link_degraded("/links/photos", "disk pressure".to_string());
+    state.mark_link_waiting_for_disk_space("/links/photos", "disk pressure".to_string());
     let third = state.degraded_link_info("/links/photos").unwrap();
     assert_eq!(third.backoff_attempt, 2);
     assert!(third.next_recheck_unix >= second.next_recheck_unix);
@@ -587,23 +588,16 @@ async fn repeated_disk_pressure_increases_backoff_instead_of_resetting_it() {
 /// a Degraded link recovers once its volume's free-space
 /// check succeeds again — exercised through the real periodic
 /// `recheck_degraded_links` sweep (not just the mark/clear API
-/// directly), using an isolated `YADORILINK_CONFIG_DIR` so this test's
-/// governance config never touches the real host config directory
-/// (same pattern `tests/reporting_ipc.rs` already established for this
-/// exact env var).
+/// directly), over a state with its own governance config directory.
 #[tokio::test]
 async fn recheck_degraded_links_clears_a_link_once_headroom_check_succeeds() {
-    let _guard = CONFIG_ENV_MUTEX.lock().await;
-    let config_dir = tempfile::tempdir().unwrap();
-    std::env::set_var("YADORILINK_CONFIG_DIR", config_dir.path());
-
-    let state = test_state();
+    let state = test_state_with_own_config();
     let link_root = tempfile::tempdir().unwrap();
     let link_path = link_root.path().to_string_lossy().to_string();
 
     // Mark the link degraded directly (bypassing a real preflight
     // call) so this test only exercises the re-check/clear half.
-    state.mark_link_degraded(&link_path, "disk pressure".to_string());
+    state.mark_link_waiting_for_disk_space(&link_path, "disk pressure".to_string());
     assert!(state.is_link_degraded(&link_path));
 
     // A headroom override of `0` ("no headroom required") always
@@ -622,8 +616,34 @@ async fn recheck_degraded_links_clears_a_link_once_headroom_check_succeeds() {
         !state.is_link_degraded(&link_path),
         "expected the link to clear once headroom check succeeds"
     );
+}
 
-    std::env::remove_var("YADORILINK_CONFIG_DIR");
+/// The typed disk-space wait survives the re-check that reschedules it, and plain
+/// disk-pressure degradation is never reported as that wait whatever its text says.
+#[tokio::test]
+async fn recheck_keeps_the_typed_disk_space_wait() {
+    let state = test_state_with_own_config();
+    let link_root = tempfile::tempdir().unwrap();
+    let link_path = link_root.path().to_string_lossy().to_string();
+
+    state.mark_link_waiting_for_disk_space(&link_path, "free some room".to_string());
+    state.governance_config.set_headroom_override_bytes(Some(u64::MAX / 2)).unwrap();
+    state.links.force_degraded_recheck_due_now(&link_path, now_unix());
+    state.recheck_degraded_links();
+
+    let info = state.degraded_link_info(&link_path).unwrap();
+    assert_eq!(info.cause, DegradedCause::WaitingForDiskSpace);
+    assert_eq!(info.reason, "free some room");
+
+    state.mark_link_degraded(
+        "/links/other",
+        DegradedCause::FileWatchLimit,
+        "Waiting for disk space on /v".to_string(),
+    );
+    assert_eq!(
+        state.degraded_link_info("/links/other").unwrap().cause,
+        DegradedCause::FileWatchLimit
+    );
 }
 
 /// the mirror case — a link stays Degraded (rescheduled with
@@ -631,15 +651,11 @@ async fn recheck_degraded_links_clears_a_link_once_headroom_check_succeeds() {
 /// pressure at re-check time.
 #[tokio::test]
 async fn recheck_degraded_links_reschedules_a_link_still_under_pressure() {
-    let _guard = CONFIG_ENV_MUTEX.lock().await;
-    let config_dir = tempfile::tempdir().unwrap();
-    std::env::set_var("YADORILINK_CONFIG_DIR", config_dir.path());
-
-    let state = test_state();
+    let state = test_state_with_own_config();
     let link_root = tempfile::tempdir().unwrap();
     let link_path = link_root.path().to_string_lossy().to_string();
 
-    state.mark_link_degraded(&link_path, "disk pressure".to_string());
+    state.mark_link_waiting_for_disk_space(&link_path, "disk pressure".to_string());
     // A headroom override far larger than any real disk's free space
     // keeps this link `Critical` no matter what.
     state.governance_config.set_headroom_override_bytes(Some(u64::MAX / 2)).unwrap();
@@ -654,8 +670,6 @@ async fn recheck_degraded_links_reschedules_a_link_still_under_pressure() {
         after.backoff_attempt > before.backoff_attempt,
         "a still-failing re-check must bump backoff, not just repeat the same window"
     );
-
-    std::env::remove_var("YADORILINK_CONFIG_DIR");
 }
 
 #[tokio::test]
@@ -1239,14 +1253,10 @@ async fn enabling_headroom_enforcement_reaches_the_convergence_executor() {
 /// populated and then dropped. So an operator who configures a reserve gets
 /// it enforced on block writes and on degraded-link re-checks, while the
 /// materialize preflight silently keeps using the built-in
-/// `max(1 GiB, 5%)` formula. Older and separate from that regression.
+/// default headroom formula (`free_space`). Older and separate from that regression.
 #[tokio::test]
 async fn the_governance_headroom_override_reaches_the_convergence_executor() {
-    let _guard = CONFIG_ENV_MUTEX.lock().await;
-    let config_dir = tempfile::tempdir().unwrap();
-    std::env::set_var("YADORILINK_CONFIG_DIR", config_dir.path());
-
-    let state = test_state();
+    let state = test_state_with_own_config();
     assert_eq!(
         state.local_convergence().headroom_override_bytes(),
         None,
@@ -1260,8 +1270,6 @@ async fn the_governance_headroom_override_reaches_the_convergence_executor() {
         Some(7_000_000_000),
         "the configured reserve must be the one the materialize preflight checks against"
     );
-
-    std::env::remove_var("YADORILINK_CONFIG_DIR");
 }
 
 /// The release is acknowledged only when the coordination service ended its
@@ -1385,4 +1393,129 @@ async fn a_release_that_does_not_reach_the_plane_keeps_the_local_pin() {
 
     assert!(!state.release_owned_handoff_lease("group-release", "lease-release").await);
     assert!(!repo.leased_version_keys_for_group("group-release", now_unix()).unwrap().is_empty());
+}
+
+/// The pin deadline is this device's own clock reading, compared on every
+/// enforcement: a stepped clock moves when a pin ends but never makes an
+/// expired lease pin again at the same reading, and never pins past the
+/// deadline for a reading at or after it.
+#[tokio::test]
+async fn a_lease_pin_follows_the_local_clock_through_jumps() {
+    let state = test_state();
+    let repo = state.replica_coordinator.handoff_lease_repository();
+    let created = 1_800_000_000_i64;
+    let expires = created + 900;
+    repo.record_handoff_lease(
+        "group-clock",
+        "lease-clock",
+        [9u8; 32],
+        &[pinned_version("a.txt")],
+        created,
+        expires,
+    )
+    .unwrap();
+    let pinned =
+        |now: i64| !repo.leased_version_keys_for_group("group-clock", now).unwrap().is_empty();
+
+    assert!(pinned(created), "control: a live lease pins");
+    assert!(pinned(expires - 1));
+    assert!(!pinned(expires), "the deadline itself no longer pins");
+    assert!(!pinned(expires + 365 * 24 * 3600), "a forward jump ends the pin");
+    // A backward step re-reads the same deadline: protection returns only
+    // while the reading is before the deadline, and ends at it again.
+    assert!(pinned(created - 30 * 24 * 3600), "a backward step is the safe direction");
+    assert!(!pinned(expires), "and the deadline still ends it afterwards");
+}
+
+mod superseded_devices {
+    use super::*;
+    use crate::peer_registry::{PeerReachability, UnreachableCategory};
+
+    const OLD: &str = "device-old";
+    const NEW: &str = "device-new";
+    const KEY: [u8; 32] = [7u8; 32];
+    const GROUP: &str = "group-a";
+
+    fn groups() -> HashSet<String> {
+        HashSet::from([GROUP.to_string()])
+    }
+
+    fn supersede(state: &Arc<DaemonState>) {
+        state.apply_supersessions(HashMap::from([(OLD.to_string(), NEW.to_string())]));
+    }
+
+    fn admits(state: &DaemonState) -> bool {
+        state.authority.peer_signing_key(OLD).is_some()
+            || state.authority.device_id_for_signing_key(&KEY).is_some()
+            || state.authority.is_authorized_lan_peer(&KEY)
+            || !state.authority.authorized_groups_for_peer(OLD).is_empty()
+    }
+
+    /// A peer that was admitted and is then reported replaced loses every admission at once.
+    #[tokio::test]
+    async fn a_replaced_peer_is_withdrawn_everywhere() {
+        let state = test_state();
+        state.replace_peer_netmap_metadata(OLD, Some(KEY), &groups(), &HashSet::new());
+        assert!(admits(&state), "sanity: the peer was admitted");
+
+        supersede(&state);
+
+        assert!(!admits(&state), "a replaced device kept an admission");
+        assert_eq!(state.authority.superseded_by(OLD).as_deref(), Some(NEW));
+    }
+
+    /// The netmap, a key pin, a writer grant or the offline snapshot cannot admit it again.
+    #[tokio::test]
+    async fn no_write_path_readmits_a_replaced_peer() {
+        let state = test_state();
+        supersede(&state);
+
+        state.replace_peer_netmap_metadata(OLD, Some(KEY), &groups(), &groups());
+        state.seed_netmap_peer_identity(OLD, Some(KEY));
+        state.record_peer_signing_key(OLD, KEY);
+        state.set_peer_group_writer(OLD, GROUP, true);
+
+        assert!(!admits(&state), "a write path re-admitted a replaced device");
+        assert!(state.authority.authorized_peer_snapshot().is_empty());
+    }
+
+    /// A Track Send grant from a replaced device is not recorded either.
+    #[tokio::test]
+    async fn a_replaced_device_gets_no_send_grant_peer() {
+        let state = test_state();
+        let grant = |now_plus: i64| SendGrantPeer {
+            device_id: OLD.to_string(),
+            signing_key: KEY,
+            reachability: Default::default(),
+            grant_id: "g".into(),
+            nonce: "n".into(),
+            expires_at_unix: now_unix() + now_plus,
+        };
+        state.record_send_grant_peer(grant(600));
+        assert!(state.send_grant_peer_by_key(&KEY).is_some(), "sanity: a grant is recorded");
+
+        supersede(&state);
+        assert!(state.send_grant_peer_by_key(&KEY).is_none(), "an existing grant survived");
+        state.record_send_grant_peer(grant(600));
+        assert!(state.send_grant_peer_by_key(&KEY).is_none(), "a new grant was recorded");
+    }
+
+    /// Status names the reason: unreachable because replaced, and by whom.
+    #[tokio::test]
+    async fn a_replaced_peer_is_reported_with_its_own_reason() {
+        let state = test_state();
+        supersede(&state);
+
+        // Even one with live links before it was replaced is reported only as replaced.
+        let before = vec![(OLD.to_string(), PeerReachability::Connecting)];
+        let all = crate::peer_connectivity_runtime::peers_with_replaced(before, &state.authority);
+        assert_eq!(
+            all,
+            vec![(
+                OLD.to_string(),
+                PeerReachability::Unreachable(UnreachableCategory::DeviceReplaced)
+            )]
+        );
+        assert_eq!(state.authority.superseded_by(OLD).as_deref(), Some(NEW));
+    }
 }

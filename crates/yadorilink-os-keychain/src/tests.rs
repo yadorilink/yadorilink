@@ -1,3 +1,4 @@
+// apple-cfg-file: ios-explicit the iOS-simulator keychain test
 //! Off-device tests: the attribute sets the crate builds, and its
 //! update-or-add / absence / purge logic, over an in-memory backend. No
 //! keychain is touched.
@@ -98,7 +99,7 @@ fn identity_attrs() -> Vec<Attr> {
     vec![
         Attr::ClassGenericPassword,
         Attr::Service("yadorilink".into()),
-        Attr::AccessGroup("594UQF7QX3.com.juntaki.yadorilink.credentials".into()),
+        Attr::AccessGroup(ACCESS_GROUP.into()),
         Attr::UseDataProtectionKeychain(true),
         Attr::Synchronizable(false),
     ]
@@ -113,7 +114,11 @@ fn assert_identity(attrs: &[Attr], expect_account: Option<&str>) {
 
 #[test]
 fn the_group_and_service_are_the_ones_the_entitlements_name() {
-    assert_eq!(ACCESS_GROUP, "594UQF7QX3.com.juntaki.yadorilink.credentials");
+    assert_eq!(MACOS_ACCESS_GROUP, "594UQF7QX3.com.juntaki.yadorilink.credentials");
+    assert_eq!(IOS_ACCESS_GROUP, "594UQF7QX3.com.juntaki.yadorilink.ios.shared");
+    assert_ne!(MACOS_ACCESS_GROUP, IOS_ACCESS_GROUP);
+    let expected = if cfg!(target_os = "ios") { IOS_ACCESS_GROUP } else { MACOS_ACCESS_GROUP };
+    assert_eq!(ACCESS_GROUP, expected);
     assert_eq!(SERVICE, "yadorilink");
 }
 
@@ -245,4 +250,22 @@ fn os_status_mapping() {
     assert_eq!(Status::from_os_status(-25300), Status::NotFound);
     assert_eq!(Status::from_os_status(-25299), Status::Duplicate);
     assert_eq!(Status::from_os_status(-1), Status::Other(-1));
+}
+
+/// The real SecItem path on an iOS simulator. A test binary carries no
+/// `keychain-access-groups` entitlement, so the system must refuse: with
+/// `errSecMissingEntitlement` (-34018), or with `errSecNotAvailable` (-25291)
+/// when the standalone simulator process has no keychain at all. Either has to
+/// surface as an error, never as a stored or absent secret; the missing
+/// entitlement also names the file-store switch.
+#[cfg(all(target_os = "ios", target_abi = "sim"))]
+#[test]
+fn the_system_keychain_without_the_entitlement_fails_closed() {
+    let keychain = Keychain::system();
+    let err = keychain.write("simulator-test", b"secret").expect_err("an unentitled write");
+    assert!([-34018, -25291].contains(&err.code()), "unexpected status {}", err.code());
+    if err.code() == -34018 {
+        assert!(err.to_string().contains("YADORILINK_CREDENTIAL_STORE=file"));
+    }
+    assert!(keychain.read("simulator-test").is_err(), "a read must not report absence");
 }

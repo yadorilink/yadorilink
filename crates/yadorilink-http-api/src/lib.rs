@@ -396,7 +396,7 @@ const MAX_CONCURRENT_REQUESTS: usize = 128;
 /// `Timeout<ConcurrencyLimit<Router>>`), and its clock starts only once a
 /// request has actually been dispatched to the inner service, so time
 /// spent queued behind `MAX_CONCURRENT_REQUESTS` is *not* covered by this
-/// timer (traced through `tower_http` 0.6.11's `Timeout::poll_ready`,
+/// timer (traced through `tower_http` 0.7.1's `Timeout::poll_ready`,
 /// which just delegates to `ConcurrencyLimit`'s own `poll_ready`, and
 /// hyper-util's `TowerToHyperService`, which drives readiness via
 /// `Oneshot` before `Timeout::call` ever starts sleeping).

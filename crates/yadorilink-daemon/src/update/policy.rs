@@ -58,6 +58,9 @@ impl UpdateState {
 /// established convention in this workspace.
 pub type ErrorCategory = String;
 
+/// The error category of a check refused because the manifest had expired.
+pub const EXPIRED_CATEGORY: &str = "update_manifest_expired";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UpdatePolicy {
@@ -65,6 +68,14 @@ pub struct UpdatePolicy {
     pub automatic_checks_enabled: bool,
     /// Unix seconds; `None` means "never checked".
     pub last_check_unix: Option<i64>,
+    /// Unix seconds of the last check that fetched and accepted a manifest (or found the channel
+    /// empty); `None` means "never succeeded". Unlike `last_check_unix` a failed check leaves it.
+    #[serde(default)]
+    pub last_success_unix: Option<i64>,
+    /// `expires_at` of the manifest the last check saw, kept also when that manifest was refused
+    /// as expired; `None` before the first manifest or for a channel with none.
+    #[serde(default)]
+    pub manifest_expires_at: Option<String>,
     pub last_error_category: Option<ErrorCategory>,
     pub last_error_message: Option<String>,
     pub state: UpdateState,
@@ -113,10 +124,20 @@ fn cohort_rollout_bucket(cohort: &str) -> u8 {
 }
 
 impl UpdatePolicy {
+    /// The last check refused the channel manifest because it had expired.
+    pub fn manifest_expired(&self) -> bool {
+        self.last_error_category.as_deref() == Some(EXPIRED_CATEGORY)
+    }
+
     /// Whether `running` is below the signed minimum supported version, i.e. this device can no
     /// longer sync with devices on the current protocol generation until it updates. Equal to the
-    /// minimum is supported. A missing or unparseable minimum requires nothing.
+    /// minimum is supported. A missing or unparseable minimum requires nothing. While the
+    /// channel manifest is expired the recorded minimum cannot be confirmed, so nothing is
+    /// required: the status reads "cannot confirm update", never "update required".
     pub fn update_required(&self, running: &semver::Version) -> bool {
+        if self.manifest_expired() {
+            return false;
+        }
         self.minimum_supported_version
             .as_deref()
             .and_then(|raw| super::manifest::parse_semver(raw).ok())
@@ -147,6 +168,8 @@ impl Default for UpdatePolicy {
             channel: "beta".to_string(),
             automatic_checks_enabled: true,
             last_check_unix: None,
+            last_success_unix: None,
+            manifest_expires_at: None,
             last_error_category: None,
             last_error_message: None,
             state: UpdateState::Idle,

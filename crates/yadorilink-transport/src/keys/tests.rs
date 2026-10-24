@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use super::*;
+use crate::key_secret_store::KeyMirror;
 
 #[cfg(unix)]
 #[test]
@@ -10,7 +11,7 @@ fn signing_key_load_or_generate_creates_private_key_with_owner_only_permissions(
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sign_key");
 
-    DeviceSigningKeyPair::load_or_generate(&path).unwrap();
+    DeviceSigningKeyPair::load_or_generate(&path, KeyMirror::OsKeyring).unwrap();
 
     let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
@@ -20,9 +21,9 @@ fn signing_key_load_or_generate_creates_private_key_with_owner_only_permissions(
 fn signing_key_load_or_generate_reuses_existing_private_key() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sign_key");
-    let first = DeviceSigningKeyPair::load_or_generate(&path).unwrap();
+    let first = DeviceSigningKeyPair::load_or_generate(&path, KeyMirror::OsKeyring).unwrap();
 
-    let second = DeviceSigningKeyPair::load_or_generate(&path).unwrap();
+    let second = DeviceSigningKeyPair::load_or_generate(&path, KeyMirror::OsKeyring).unwrap();
 
     assert_eq!(second.signing.to_bytes(), first.signing.to_bytes());
     assert_eq!(second.public_bytes(), first.public_bytes());
@@ -49,7 +50,7 @@ fn signing_key_load_existing_reports_a_missing_key_instead_of_generating_one() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sign_key");
 
-    let Err(err) = DeviceSigningKeyPair::load_existing(&path) else {
+    let Err(err) = DeviceSigningKeyPair::load_existing(&path, KeyMirror::OsKeyring) else {
         panic!("load_existing must not mint a signing identity for a device that has none");
     };
 
@@ -72,7 +73,7 @@ fn load_existing_separates_an_unreadable_key_from_a_missing_one() {
     let path = dir.path().join("device_key");
     std::fs::create_dir(&path).unwrap();
 
-    let Err(err) = DeviceSigningKeyPair::load_existing(&path) else {
+    let Err(err) = DeviceSigningKeyPair::load_existing(&path, KeyMirror::OsKeyring) else {
         panic!("a key path that cannot be read must not load as a usable identity");
     };
 
@@ -83,9 +84,9 @@ fn load_existing_separates_an_unreadable_key_from_a_missing_one() {
 fn signing_key_load_existing_returns_the_persisted_identity() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sign_key");
-    let created = DeviceSigningKeyPair::generate_and_persist(&path).unwrap();
+    let created = DeviceSigningKeyPair::generate_and_persist(&path, KeyMirror::OsKeyring).unwrap();
 
-    let loaded = DeviceSigningKeyPair::load_existing(&path).unwrap();
+    let loaded = DeviceSigningKeyPair::load_existing(&path, KeyMirror::OsKeyring).unwrap();
 
     assert_eq!(loaded.signing.to_bytes(), created.signing.to_bytes());
     assert_eq!(loaded.public_bytes(), created.public_bytes());
@@ -99,11 +100,11 @@ fn load_or_generate_still_creates_an_identity_for_an_unkeyed_device() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("device_key");
 
-    let created = DeviceSigningKeyPair::load_or_generate(&path).unwrap();
+    let created = DeviceSigningKeyPair::load_or_generate(&path, KeyMirror::OsKeyring).unwrap();
 
     assert!(path.exists());
     assert_eq!(
-        DeviceSigningKeyPair::load_existing(&path).unwrap().public_bytes(),
+        DeviceSigningKeyPair::load_existing(&path, KeyMirror::OsKeyring).unwrap().public_bytes(),
         created.public_bytes()
     );
 }
@@ -117,9 +118,9 @@ fn load_or_generate_still_creates_an_identity_for_an_unkeyed_device() {
 fn generate_and_persist_adopts_an_identity_that_already_exists() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("device_key");
-    let first = DeviceSigningKeyPair::generate_and_persist(&path).unwrap();
+    let first = DeviceSigningKeyPair::generate_and_persist(&path, KeyMirror::OsKeyring).unwrap();
 
-    let second = DeviceSigningKeyPair::generate_and_persist(&path).unwrap();
+    let second = DeviceSigningKeyPair::generate_and_persist(&path, KeyMirror::OsKeyring).unwrap();
 
     assert_eq!(
         second.public_bytes(),

@@ -25,7 +25,7 @@ tokio = { version = "1", features = ["full", "test-util"] }
 # `0o600`, since a new file would otherwise inherit the parent directory's
 # weaker ACL). Same crate/version the daemon uses for its named-pipe DACL.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
@@ -42,7 +42,7 @@ windows-sys = { version = "0.59", features = [
 [target.'cfg(all(not(turmoil), any(windows, target_os = "linux")))'.dependencies]
 keyring = { version = "3", features = ["windows-native", "linux-native"] }
 
-[target.'cfg(all(not(turmoil), target_os = "macos"))'.dependencies]
+[target.'cfg(all(not(turmoil), target_vendor = "apple"))'.dependencies]
 yadorilink-os-keychain = { path = "../yadorilink-os-keychain" }
 
 # The simulated socket `sim_net` swaps in. A normal dependency rather than a

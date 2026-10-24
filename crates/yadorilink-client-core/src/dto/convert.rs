@@ -16,7 +16,7 @@ use yadorilink_ipc_proto::daemonctl::{
     LinkStatus, MaterializationStatusResponse, MintedInviteInfo, PeerStatus,
     ReceiveTransferResponse, ReplicaMembershipCommandOutcome, RestoreTrashOperationResponse,
     SendFileResponse, StatusResponse, TrashedFileInfo, UpdateConfigResponse, UpdateInstallResponse,
-    UpdateStatusResponse, VolumeFreeSpace,
+    UpdateStatusResponse, UpdateVerifiedEntryResponse, VolumeFreeSpace,
 };
 use yadorilink_local_storage::free_space::FreeSpaceState as LocalFreeSpace;
 use yadorilink_local_storage::link_preflight::{self, LinkPreflightReport, RiskyLocation};
@@ -216,6 +216,7 @@ fn peer_summary(peer: &PeerStatus) -> PeerSummary {
             wire::UnreachableCategory::HandshakeRefused => {
                 Some(UnreachableCategory::HandshakeRefused)
             }
+            wire::UnreachableCategory::DeviceReplaced => Some(UnreachableCategory::DeviceReplaced),
             wire::UnreachableCategory::Unspecified => None,
         },
         route: route(Some(peer)),
@@ -313,6 +314,7 @@ fn product_action(action: view::ProductAction) -> ProductAction {
         view::ProductAction::ConfirmDisk => ProductAction::ConfirmDisk,
         view::ProductAction::Resume => ProductAction::Resume,
         view::ProductAction::StartOverAsNewDevice => ProductAction::StartOverAsNewDevice,
+        view::ProductAction::SignIn => ProductAction::SignIn,
     }
 }
 
@@ -377,14 +379,28 @@ fn attention_category(item: view::AttentionItem) -> AttentionCategory {
         | I::ApprovalPending
         | I::DatabaseRestored
         | I::AuthorUnavailable
+        | I::WaitingForDiskSpace
         | I::ReplacementUnconfirmed
         | I::ReplacementWaiting
         | I::ReplacementSignInRequired
+        | I::TermsConsentRequired
+        | I::SignInRequired
         | I::NotJoined
+        | I::FileWatchLimit
         | I::UnreadableFiles
         | I::UnsupportedFilename
         | I::FileNotReadable
         | I::Unrecognized => AttentionCategory::Unrecognized,
+    }
+}
+
+fn degraded_cause(cause: view::DegradedCause) -> DegradedCause {
+    match cause {
+        view::DegradedCause::Stopped => DegradedCause::Stopped,
+        view::DegradedCause::WaitingForDiskSpace => DegradedCause::WaitingForDiskSpace,
+        view::DegradedCause::FileWatchLimit => DegradedCause::FileWatchLimit,
+        view::DegradedCause::OwnershipLost => DegradedCause::OwnershipLost,
+        view::DegradedCause::NotJoined => DegradedCause::NotJoined,
     }
 }
 
@@ -464,6 +480,7 @@ pub fn folder_summary(
         ambiguous_local_paths: derived.ambiguous_local_paths,
         degraded: derived.degraded,
         degraded_reason: text(&derived.degraded_reason),
+        degraded_cause: derived.degraded_cause.map(degraded_cause),
         volume: volumes.iter().find(|v| v.path == link.local_path).map(volume_summary),
         provider: !link.provider_display_name.is_empty(),
         provider_status: provider_status(link, provider_roots),
@@ -537,6 +554,7 @@ fn provider_status(
         root_id: root.root_id.clone(),
         display_name: root.display_name.clone(),
         readiness: root.readiness.clone(),
+        sync_root_path: (!root.sync_root_path.is_empty()).then(|| root.sync_root_path.clone()),
         counters: (!root.counters_unreadable).then(|| ProviderCounters {
             eager: root.eager.then(|| ProviderEagerProgress {
                 state: root.eager_state.clone(),
@@ -559,7 +577,8 @@ fn provider_status(
     })
 }
 
-/// The folders' availability and protection and the overall answer as JSON, for `status --json`.
+/// The folders' availability, protection and never-downloaded file count and the overall answer
+/// as JSON, for `status --json`.
 /// States are the stable snake_case names `yadorilink-product-view` documents; device ids are for
 /// lookup, never display.
 pub fn status_dimensions_json(response: &StatusResponse) -> serde_json::Value {
@@ -586,6 +605,9 @@ pub fn status_dimensions_json(response: &StatusResponse) -> serde_json::Value {
             serde_json::json!({
                 "local_path": link.local_path,
                 "group_id": link.group_id,
+                "on_demand": link.materialization_policy == "ondemand",
+                // Files whose content is not on this computer; an uninstaller warns about them.
+                "placeholder_count": link.placeholder_count,
                 "availability": availability(&view::AvailabilitySummary::from_link(link)),
                 "protection": protection(&view::ProtectionSummary::from_link(link)),
             })
@@ -1211,6 +1233,9 @@ pub fn update_status(status: &UpdateStatusResponse) -> UpdateStatus {
         channel: status.channel.clone(),
         install_source: status.install_source.clone(),
         last_checked_at: unix_secs(status.last_check_unix),
+        last_successful_check_at: unix_secs(status.last_success_unix),
+        manifest_expires_at: text(&status.manifest_expires_at),
+        manifest_expired: status.manifest_expired,
         state: update_state(&status.state),
         available_version: text(&status.available_version),
         release_notes_url: text(&status.release_notes_url),
@@ -1220,6 +1245,60 @@ pub fn update_status(status: &UpdateStatusResponse) -> UpdateStatus {
         last_error_message: text(&status.last_error_message),
         package_managed: crate::ops::updates::is_package_managed(&status.install_source),
         config: UpdateConfig { automatic_checks: status.automatic_checks_enabled },
+    }
+}
+
+pub fn appcast_item_check(resp: &UpdateVerifiedEntryResponse) -> AppcastItemCheck {
+    use AppcastItemReason as R;
+    let outcome = match resp.outcome.as_str() {
+        "allowed" => AppcastItemOutcome::Allowed,
+        "refused" => AppcastItemOutcome::Refused,
+        "cannot_confirm" => AppcastItemOutcome::CannotConfirm,
+        other => AppcastItemOutcome::Unknown { raw: other.to_owned() },
+    };
+    let reason = (!resp.reason_code.is_empty()).then(|| match resp.reason_code.as_str() {
+        "not_checked" => R::NotChecked,
+        "stale" => R::Stale,
+        "manifest_expired" => R::ManifestExpired,
+        "no_manifest" => R::NoManifest,
+        "invalid_version" => R::InvalidVersion,
+        "withdrawn" => R::Withdrawn,
+        "kill_switched" => R::KillSwitched,
+        "below_minimum" => R::BelowMinimum,
+        "not_offered" => R::NotOffered,
+        "version_mismatch" => R::VersionMismatch,
+        "held_back" => R::HeldBack,
+        "state_incompatible" => R::StateIncompatible,
+        "channel_mismatch" => R::ChannelMismatch,
+        "build_missing" => R::BuildMissing,
+        "build_not_declared" => R::BuildNotDeclared,
+        "build_mismatch" => R::BuildMismatch,
+        "url_missing" => R::UrlMissing,
+        "url_mismatch" => R::UrlMismatch,
+        "length_missing" => R::LengthMissing,
+        "length_mismatch" => R::LengthMismatch,
+        "sha256_missing" => R::Sha256Missing,
+        "sha256_mismatch" => R::Sha256Mismatch,
+        other => R::Unknown { raw: other.to_owned() },
+    });
+    AppcastItemCheck {
+        outcome,
+        reason,
+        message: text(&resp.reason),
+        entry: resp.entry.as_ref().map(|e| VerifiedAppEntry {
+            channel: e.channel.clone(),
+            version: e.version.clone(),
+            sparkle_build: (e.sparkle_build != 0).then_some(e.sparkle_build),
+            minimum_supported_version: e.minimum_supported_version.clone(),
+            file: e.file.clone(),
+            sha256: e.sha256.clone(),
+            size: e.size,
+            kill_switch: e.kill_switch,
+            rollout_percentage: e.rollout_percentage,
+            generated_at: e.generated_at.clone(),
+            expires_at: e.expires_at.clone(),
+            update_required: e.update_required,
+        }),
     }
 }
 
@@ -1236,6 +1315,24 @@ pub fn update_download_guidance(
 ) -> Result<UpdateDownloadGuidance, String> {
     let (guidance, url) = crate::ops::updates::check_download_reply(response)?;
     Ok(UpdateDownloadGuidance { guidance, url })
+}
+
+pub fn account_deletion_impact(
+    impact: &crate::ops::account::DeletionImpact,
+) -> AccountDeletionImpact {
+    let groups = |list: &[crate::ops::account::ImpactGroup]| {
+        list.iter()
+            .map(|g| AccountDeletionImpactGroup {
+                group_id: g.group_id.clone(),
+                name: g.name.clone(),
+                guest_devices: g.guest_devices,
+            })
+            .collect()
+    };
+    AccountDeletionImpact {
+        foreign_groups_at_risk: groups(&impact.foreign_groups_at_risk),
+        owned_groups_with_guests: groups(&impact.owned_groups_with_guests),
+    }
 }
 
 pub fn account_deletion_status(status: &DeletionStatus) -> AccountDeletionStatus {

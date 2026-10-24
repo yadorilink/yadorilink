@@ -32,6 +32,9 @@ pub enum ProductAction {
     /// Retire this computer's device identity and register it again as a new device, keeping its
     /// files. Offered when the replica database was restored or copied.
     StartOverAsNewDevice,
+    /// Open the sign-in page for this installation. The browser shows the Terms consent screen
+    /// when it is due. Local files, device and folders are kept.
+    SignIn,
 }
 
 /// Whether time alone can fix an item.
@@ -72,6 +75,14 @@ pub enum AttentionScope {
 pub enum AttentionItem {
     /// The folder stopped on a problem and will try again.
     FolderStopped,
+    /// The OS file-watch limit is hit: changes arrive late, or (when the watch could not start)
+    /// not at all, until the user raises the limit. Typed on its own: the daemon reports
+    /// `LinkStatus.degraded_cause` `FILE_WATCH_LIMIT` and the rollup code `file_watch_limit`.
+    FileWatchLimit,
+    /// The folder waits for free space on its disk; sync resumes by itself once there is room.
+    /// Typed on its own (never a `FolderStopped` with a recognizable text): the daemon reports
+    /// `LinkStatus.waiting_for_disk_space` and the rollup code `waiting_for_disk_space`.
+    WaitingForDiskSpace,
     /// The folder group is linked at more than one place, so nothing syncs.
     LinkedTwice,
     OwnershipLost,
@@ -138,6 +149,13 @@ pub enum AttentionItem {
     /// automatically; shown beside [`Self::ReplacementUnconfirmed`] so a wait is not mistaken for
     /// a stall.
     ReplacementWaiting,
+    /// The coordination service refuses this account's requests until it accepts the current
+    /// Terms (`403 terms_consent_required`). Sync of already-known folders keeps its local state;
+    /// nothing is unlinked or unregistered. Signing in again shows the consent screen.
+    TermsConsentRequired,
+    /// The coordination service refuses to renew this installation's session (`invalid_grant`;
+    /// the Terms may have changed). Local state is kept; signing in again is the remedy.
+    SignInRequired,
     /// A code this build does not know.
     Unrecognized,
 }
@@ -163,6 +181,8 @@ impl AttentionItem {
     pub fn key(self) -> &'static str {
         match self {
             Self::FolderStopped => "folder_stopped",
+            Self::WaitingForDiskSpace => "waiting_for_disk_space",
+            Self::FileWatchLimit => "file_watch_limit",
             Self::LinkedTwice => "linked_twice",
             Self::OwnershipLost => "ownership_lost",
             Self::VolumeChanged => "volume_changed",
@@ -194,6 +214,8 @@ impl AttentionItem {
             Self::ReplacementSignInRequired => "replacement_unconfirmed_sign_in_required",
             Self::ReplacementWaiting => "replacement_unconfirmed_waiting",
             Self::NotJoined => "not_joined",
+            Self::TermsConsentRequired => "terms_consent_required",
+            Self::SignInRequired => "sign_in_required",
             Self::UnreadableFiles => "unreadable_files",
             Self::Unrecognized => "unrecognized",
         }
@@ -207,6 +229,7 @@ impl AttentionItem {
             | Self::ContentAvailabilityUnknown
             | Self::ReplacementUnconfirmed
             | Self::ReplacementWaiting
+            | Self::WaitingForDiskSpace
             | Self::PeerUnavailable => AttentionKind::Waiting,
             Self::FolderStopped
             | Self::ProviderFilesFailing
@@ -215,6 +238,7 @@ impl AttentionItem {
             Self::LinkedTwice
             | Self::OwnershipLost
             | Self::NotJoined
+            | Self::FileWatchLimit
             | Self::VolumeChanged
             | Self::VolumeUnconfirmed
             | Self::NoSafeCopy
@@ -230,6 +254,8 @@ impl AttentionItem {
             | Self::DatabaseRestored
             | Self::AuthorUnavailable
             | Self::ReplacementSignInRequired
+            | Self::TermsConsentRequired
+            | Self::SignInRequired
             | Self::EditsKeptBeside
             | Self::ProviderOrphan
             | Self::DiskFull
@@ -246,6 +272,7 @@ impl AttentionItem {
             | Self::LinkedTwice
             | Self::OwnershipLost
             | Self::NotJoined
+            | Self::FileWatchLimit
             | Self::NoSafeCopy
             | Self::DatabaseRestored
             | Self::AuthorUnavailable
@@ -264,14 +291,18 @@ impl AttentionItem {
             | Self::UpdateFailed => ProductAction::Retry,
             Self::ConflictNeedsReview => ProductAction::ReviewConflict,
             Self::ApprovalPending => ProductAction::ReviewApproval,
-            Self::DiskFull | Self::DiskLow => ProductAction::FreeUpSpace,
+            Self::DiskFull | Self::DiskLow | Self::WaitingForDiskSpace => {
+                ProductAction::FreeUpSpace
+            }
             Self::UnsupportedFilename | Self::FileNotReadable => ProductAction::RevealPath,
             Self::ProviderNotReady | Self::ProviderOrphan => ProductAction::OpenSettings,
             Self::UpdateRequired => ProductAction::DownloadUpdate,
+            Self::TermsConsentRequired | Self::SignInRequired => ProductAction::SignIn,
             Self::VolumeUnconfirmed => ProductAction::ConfirmDisk,
             Self::LinkedTwice
             | Self::OwnershipLost
             | Self::NotJoined
+            | Self::FileWatchLimit
             | Self::VolumeChanged
             | Self::NoSafeCopy
             | Self::SafeCopyUnconfirmed
@@ -334,6 +365,8 @@ impl Attention {
         let provider = |item| (item, AttentionScope::ProviderFolder(subject.clone()));
         let (item, scope) = match code {
             "degraded" => folder(AttentionItem::FolderStopped),
+            "waiting_for_disk_space" => folder(AttentionItem::WaitingForDiskSpace),
+            "file_watch_limit" => folder(AttentionItem::FileWatchLimit),
             "ambiguous" => folder(AttentionItem::LinkedTwice),
             "ownership_lost" => folder(AttentionItem::OwnershipLost),
             "not_joined" => folder(AttentionItem::NotJoined),
@@ -376,6 +409,10 @@ impl Attention {
             "replacement_unconfirmed_waiting" => {
                 (AttentionItem::ReplacementWaiting, AttentionScope::General)
             }
+            "terms_consent_required" => {
+                (AttentionItem::TermsConsentRequired, AttentionScope::General)
+            }
+            "sign_in_required" => (AttentionItem::SignInRequired, AttentionScope::General),
             "replacement_unconfirmed_sign_in_required" => {
                 (AttentionItem::ReplacementSignInRequired, AttentionScope::General)
             }

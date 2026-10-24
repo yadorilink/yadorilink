@@ -23,7 +23,7 @@ use yadorilink_filesystem_sync::watcher::FsChangeKind;
 use yadorilink_local_capture::LocalChangeProcessor;
 use yadorilink_local_storage::{BlockStore, SegmentBlockStore};
 
-use super::case_ir::{ContentTable, Op};
+use super::case_ir::{ContentTable, Fault, Op};
 use super::clock::HarnessClock;
 use super::directory_model::{ExplicitModel, ModelEntry};
 use super::fs_events::{coalesce, decompose, FsOp, WatchEvent};
@@ -60,6 +60,9 @@ pub enum Step {
     Op(Op),
     Pause,
     Retry,
+    /// The device's clock jumps to this absolute time (forwards or back);
+    /// later writes are stamped from there.
+    Clock(i64),
 }
 
 /// A deliberate product defect, injected into the event stream so a test can
@@ -145,6 +148,26 @@ impl Device {
         Self::with_state(Arc::new(ReplicaCoordinator::open(db).expect("index file")))
     }
 
+    /// The device's current clock reading, in nanoseconds.
+    pub fn clock_now(&self) -> i64 {
+        self.clock.now_nanos()
+    }
+
+    /// Applies a clock fault from a `Case` schedule to this device's clock:
+    /// a jump lands the clock on its absolute time, a skew shifts it by its
+    /// delta. Returns the clock before and after, so a test can show the
+    /// fault moved something. Any other fault is not this device's to apply.
+    pub fn apply_clock_fault(&self, fault: &Fault) -> Option<(i64, i64)> {
+        let before = self.clock.now_nanos();
+        let after = match fault {
+            Fault::ClockJump { to_unix_nanos, .. } => *to_unix_nanos,
+            Fault::ClockSkew { delta_nanos, .. } => before.wrapping_add(*delta_nanos),
+            _ => return None,
+        };
+        self.clock.set_now(after);
+        Some((before, after))
+    }
+
     pub fn write_file(&self, path: &str, content_id: u64) {
         apply_op(
             &self.clock,
@@ -170,17 +193,32 @@ impl Device {
         &self,
         events: Vec<WatchEvent>,
     ) -> impl std::future::Future<Output = ()> + '_ {
+        async move {
+            self.try_flush_events(events).await.expect("process_flush");
+        }
+    }
+
+    /// [`flush_events`](Self::flush_events), returning the pipeline's refusal
+    /// instead of panicking: an exploration walk keeps going past a refused
+    /// flush, as a daemon does.
+    pub async fn try_flush_events(&self, events: Vec<WatchEvent>) -> Result<(), String> {
         let paths: Vec<(PathBuf, FsChangeKind, i64)> =
             events.into_iter().map(|e| (self.root.join(&e.path), e.kind, 1)).collect();
-        async move {
-            if paths.is_empty() {
-                return;
-            }
-            self.processor
-                .process_flush(GROUP, &self.root, DebounceFlush::Paths(paths))
-                .await
-                .expect("process_flush");
+        if paths.is_empty() {
+            return Ok(());
         }
+        self.processor
+            .process_flush(GROUP, &self.root, DebounceFlush::Paths(paths))
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Applies `op` to the disk only, and returns the watcher events it would
+    /// raise, for the caller to deliver, hold or lose.
+    pub fn apply_to_disk(&self, op: &Op) -> Vec<WatchEvent> {
+        apply_op(&self.clock, &self.root, op, &table()).expect("apply op");
+        decompose(&Self::fs_op(op))
     }
 
     /// Runs `ops` against the disk and the pipeline, skipping every op the
@@ -232,6 +270,9 @@ impl Device {
                 Step::Retry => {
                     self.flush_events(coalesce(std::mem::take(&mut window))).await;
                     paused = false;
+                }
+                Step::Clock(nanos) => {
+                    self.clock.set_now(*nanos);
                 }
                 Step::Op(op) => {
                     if model.apply(op).is_err() {

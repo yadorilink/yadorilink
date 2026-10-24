@@ -176,6 +176,9 @@ pub(crate) enum TempOutcome {
     VersionOutOfDate,
     /// A ranged request whose offset is past the end of the version. Nothing was fetched.
     RangeNotSatisfiable,
+    /// A ranged request whose window is longer than the daemon serves
+    /// (`MAX_RANGE_WINDOW_LEN`). Nothing was fetched; the caller asks for the whole file.
+    RangeTooLarge,
 }
 
 /// The retention policy in force at one path, apart from what is stored there.
@@ -204,11 +207,13 @@ pub(crate) trait MaterializationPort: Send + Sync {
         request: TempMaterialization<'a>,
     ) -> BoxFuture<'a, Result<TempOutcome, SyncError>>;
 
+    /// Fetches what is not here yet. Returns whether any content was fetched from peers:
+    /// `false` when everything asked for was already on this device.
     fn hydrate<'a>(
         &'a self,
         group_id: &'a str,
         path: &'a str,
-    ) -> BoxFuture<'a, Result<(), SyncError>>;
+    ) -> BoxFuture<'a, Result<bool, SyncError>>;
 
     /// Synchronous: eviction is a local index/block-store operation with no
     /// remote round trip, unlike `hydrate`.

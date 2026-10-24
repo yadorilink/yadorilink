@@ -5,7 +5,7 @@
 //! self-update` covers script installs; GUI installs are updated by their app
 //! updater:
 //! `standalone`, `apt` (Linux, via `dpkg-query -S`), `homebrew` (macOS,
-//! via the Cask-written marker), `microsoft_store` / `winget` (Windows),
+//! via the Cask-written marker), `microsoft_store` / `winget` (Windows), `app_store` (iOS),
 //! and, on every platform, `app_bundle` (the executable lies inside a macOS
 //! application bundle), `container` (the image sets
 //! `YADORILINK_INSTALL_SOURCE=container`) and `script` (the one-liner's
@@ -30,6 +30,7 @@ pub fn manual_update_guidance(install_source: &str) -> String {
         "apt" => "This install is managed by apt; run `sudo apt update && sudo apt install --only-upgrade yadorilink`.".to_string(),
         "winget" => "This install is managed by WinGet; run `winget upgrade yadorilink`.".to_string(),
         "microsoft_store" => "This install is managed by the Microsoft Store; open Store > Library > Updates.".to_string(),
+        "app_store" => "This install is managed by the App Store; updates arrive through the App Store.".to_string(),
         "app_bundle" => "This install is managed by the YadoriLink app; open YadoriLink and choose Check for Updates.".to_string(),
         "container" => "This install is managed by its container image; pull a newer image.".to_string(),
         _ => format!("Download the new version from {DOWNLOAD_PAGE_URL}"),
@@ -41,7 +42,8 @@ pub fn manual_update_guidance(install_source: &str) -> String {
 /// guidance.
 pub fn manual_update_page(install_source: &str) -> Option<&'static str> {
     match install_source {
-        "homebrew" | "apt" | "winget" | "microsoft_store" | "app_bundle" | "container" => None,
+        "homebrew" | "apt" | "winget" | "microsoft_store" | "app_store" | "app_bundle"
+        | "container" => None,
         _ => Some(DOWNLOAD_PAGE_URL),
     }
 }
@@ -214,6 +216,9 @@ fn detect_macos_install_source_at(path: &Path) -> String {
 pub enum InstallSource {
     Standalone,
     MicrosoftStore,
+    /// An iOS install: the App Store (or TestFlight) is the only source, so the engine never
+    /// offers a download.
+    AppStore,
 }
 
 impl InstallSource {
@@ -221,6 +226,7 @@ impl InstallSource {
         match self {
             InstallSource::Standalone => "standalone",
             InstallSource::MicrosoftStore => "microsoft_store",
+            InstallSource::AppStore => "app_store",
         }
     }
 }
@@ -228,18 +234,16 @@ impl InstallSource {
 /// Detects whether the currently-running executable was installed via
 /// the Microsoft Store (MSIX packages are placed under
 /// `%ProgramFiles%\WindowsApps\...` regardless of the app's own install
-/// logic) or is a standalone install (this repo's Inno Setup
-/// `%ProgramFiles%\yadorilink\` layout). Spec "Microsoft Store install
+/// logic) or is a standalone install (a directly
+/// installed `%ProgramFiles%\yadorilink\` layout). Spec "Microsoft Store install
 /// delegates update": a Store install must never fetch or run a
 /// standalone installer, so this detection gates that entirely — see
 /// `manager::PlatformInfo::detect`.
 ///
-/// This repo does not currently produce an MSIX/Store package
-/// (the Windows installer's `verify-installer.ps1`'s own documented gap), so in
-/// practice every real build today detects as `Standalone`; this function
-/// exists so that gap is a detection question answered at runtime, not an
-/// assumption baked into the update flow that would need revisiting once
-/// Store distribution exists.
+/// The Windows app ships through the Microsoft Store as an MSIX package, and
+/// that is what detects as `MicrosoftStore`; any other Windows install
+/// detects as `Standalone`. The values `standalone` and `microsoft_store` are
+/// what the Windows app and the update manifest already use, so they stay.
 pub fn detect_windows_install_source(current_exe_path: &Path) -> InstallSource {
     let path_str = current_exe_path.to_string_lossy();
     if path_str.contains("WindowsApps") {
@@ -249,8 +253,7 @@ pub fn detect_windows_install_source(current_exe_path: &Path) -> InstallSource {
     }
 }
 
-/// Registry location the Inno Setup installer (the Windows installer's `yadorilink.iss`)
-/// writes to when it is invoked with a `/PACKAGEMANAGER=<name>` command-line
+/// Registry location the Windows installer writes to when it is invoked with a `/PACKAGEMANAGER=<name>` command-line
 /// parameter. `HKEY_LOCAL_MACHINE` (not `HKCU`) because the installer itself
 /// always runs elevated (`PrivilegesRequired=admin`) and the value must be
 /// readable regardless of which user account the daemon later runs as.
@@ -265,7 +268,7 @@ pub const PACKAGE_MANAGER_MARKER_VALUE: &str = "InstallSource";
 ///
 /// Unlike the Microsoft Store (whose MSIX layout is a structural,
 /// unforgeable signal — see [`detect_windows_install_source`] above), WinGet runs
-/// this exact same Inno Setup installer a manual download would, into the
+/// this exact same installer a manual download would, into the
 /// exact same `%ProgramFiles%\yadorilink` layout: there is no path-based
 /// signal to key off. This explicit, installer-written marker is the only
 /// reliable way to tell the two apart. Returns `None` when the value is

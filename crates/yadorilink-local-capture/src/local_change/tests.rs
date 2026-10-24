@@ -3179,8 +3179,10 @@ fn the_backstop_does_not_open_a_fifo_that_replaced_a_reported_file() {
     let Some(bad) = make_unreadable(&root, "bad.txt", b"secret") else { return };
     proc.scan_existing_files("group-1", &root).unwrap();
     std::fs::remove_file(&bad).unwrap();
-    let made = std::process::Command::new("mkfifo").arg(&bad).status().unwrap();
-    assert!(made.success());
+    // `mkfifo(3)` rather than the `mkfifo` program, which an iOS simulator does not provide.
+    let name = std::ffi::CString::new(bad.to_str().unwrap()).unwrap();
+    // SAFETY: `name` is a NUL-terminated path that outlives the call.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
 
     proc.reconcile_added_files("group-1", &root).unwrap();
 
@@ -5970,6 +5972,39 @@ fn scan_existing_files_records_a_symlink_with_correct_target_text() {
     // entries, not one dereferenced into the other.
     let target_record = records.iter().find(|r| r.path == "real.txt").unwrap();
     assert!(!target_record.blocks.is_empty());
+}
+
+/// A symlink retargeted to a same-length target with its mtime put back (or retargeted inside
+/// one timestamp tick) keeps the size and mtime the index recorded: a rescan must read the
+/// target text, not trust the stat.
+#[cfg(unix)]
+#[test]
+fn rescan_notices_a_same_length_retarget_that_keeps_the_symlink_mtime() {
+    let (proc, state, _store_dir, root_dir) = processor();
+    let root = canonical_root(&root_dir);
+    std::os::unix::fs::symlink("one.txt", root.join("link.txt")).unwrap();
+    proc.scan_existing_files("group-1", &root).unwrap();
+
+    let reference = root_dir.path().join("mtime-reference");
+    std::fs::write(&reference, b"x").unwrap();
+    let recorded = std::fs::symlink_metadata(root.join("link.txt")).unwrap().modified().unwrap();
+    std::fs::File::options().write(true).open(&reference).unwrap().set_modified(recorded).unwrap();
+    std::fs::remove_file(root.join("link.txt")).unwrap();
+    std::os::unix::fs::symlink("two.txt", root.join("link.txt")).unwrap();
+    let restored = std::process::Command::new("touch")
+        .args(["-h", "-r"])
+        .arg(&reference)
+        .arg(root.join("link.txt"))
+        .status()
+        .unwrap();
+    assert!(restored.success());
+
+    proc.scan_existing_files("group-1", &root).unwrap();
+
+    assert_eq!(
+        state.file_index_repository().get_symlink_target("group-1", "link.txt").unwrap(),
+        Some(b"two.txt".to_vec())
+    );
 }
 
 /// a symlinked directory's contents never appear as
@@ -9892,6 +9927,106 @@ async fn a_write_between_the_batch_fingerprint_check_and_the_identity_observatio
         Some(yadorilink_local_storage::hash_block_bytes(b"version two!!")),
         "the re-driven capture must index the rewritten file"
     );
+}
+
+/// Prepares one batched upsert of `name` holding `bytes` (not yet flushed).
+async fn prepare_batched_upsert(
+    proc: &LocalChangeProcessor,
+    root: &Path,
+    name: &str,
+    bytes: &[u8],
+) -> (std::path::PathBuf, Vec<flush::PendingBatchedCommit>) {
+    let path = root.join(name);
+    std::fs::write(&path, bytes).unwrap();
+    let ignore_set = EffectiveIgnoreSet::from_user_patterns("");
+    let mut pending = Vec::new();
+    let outcome = proc
+        .process_event_with_ignore_at(
+            "group-1",
+            root,
+            &FsChangeEvent { path: path.clone(), kind: FsChangeKind::CreatedOrModified },
+            &ignore_set,
+            Some(0),
+            Some(&mut pending),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, EventOutcome::Deferred), "test precondition: upsert is batched");
+    (path, pending)
+}
+
+/// on a volume whose change time/USN cannot be read, a batched capture must not starve.
+/// An untouched file commits (the strict fingerprint never compared equal, so every attempt was
+/// excluded and re-driven forever), and no actual-state proof is published from the stat-only
+/// sample. Seam: thread-local, so this runs on the current thread; on Unix the seam is a no-op
+/// and the commit publishes its proof as before.
+#[tokio::test(flavor = "current_thread")]
+async fn a_batched_capture_commits_when_the_change_time_is_unreadable_and_publishes_no_proof() {
+    let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
+    let root = canonical_root(&root_dir);
+    adopt_root(&state, "group-1", &root);
+    let _unreadable = yadorilink_fs_platform::fs_identity::change_time_unreadable_for_test();
+    let (_path, mut pending) =
+        prepare_batched_upsert(&proc, &root, "d.txt", b"version one!!").await;
+
+    let resolved = proc.flush_pending_batch("group-1", &root, &mut pending).await.unwrap();
+    assert_eq!(resolved.len(), 1, "an untouched file must commit, not starve");
+    let proof = state.sqlite().dag_lookup_materialized_generation("group-1", "d.txt").unwrap();
+    #[cfg(windows)]
+    assert!(proof.is_none(), "a stat-only sample must publish no actual-state proof");
+    #[cfg(not(windows))]
+    assert!(proof.is_some());
+}
+
+/// a volume whose whole identity query errors (so `FileIdentity::observe_path` fails
+/// too) must not starve the batched capture either: the commit needs no identity when it
+/// publishes no proof.
+#[tokio::test(flavor = "current_thread")]
+async fn a_batched_capture_commits_when_the_whole_identity_query_errors() {
+    let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
+    let root = canonical_root(&root_dir);
+    adopt_root(&state, "group-1", &root);
+    let _unreadable = yadorilink_fs_platform::fs_identity::change_time_unreadable_for_test();
+    let (_path, mut pending) =
+        prepare_batched_upsert(&proc, &root, "g.txt", b"version one!!").await;
+    let _no_identity = yadorilink_fs_platform::fs_identity::identity_query_unreadable_for_test();
+
+    let resolved = proc.flush_pending_batch("group-1", &root, &mut pending).await.unwrap();
+    assert_eq!(resolved.len(), 1, "an untouched file must commit without an identity");
+}
+
+/// where the fingerprint is stat-only, a same-size rewrite with a restored mtime between
+/// prepare and commit is invisible to it, so the bytes under the path lock must refuse the
+/// commit (the user's edit stays in the dirty journal for re-drive; the stale record is never
+/// committed). On Unix ctime shows the rewrite instead, so the test holds without the seam.
+#[tokio::test(flavor = "current_thread")]
+async fn a_same_size_mtime_restoring_rewrite_before_commit_is_not_committed_as_stale() {
+    let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
+    let root = canonical_root(&root_dir);
+    adopt_root(&state, "group-1", &root);
+    let _unreadable = yadorilink_fs_platform::fs_identity::change_time_unreadable_for_test();
+    let (path, mut pending) = prepare_batched_upsert(&proc, &root, "e.txt", b"version one!!").await;
+
+    overwrite_in_place_preserving_size_and_mtime(&path, b"version two!!");
+    let resolved = proc.flush_pending_batch("group-1", &root, &mut pending).await.unwrap();
+    assert!(resolved.is_empty(), "the stale record must not be committed over the rewrite");
+    assert!(state.file_index_repository().get_file("group-1", "e.txt").unwrap().is_none());
+}
+
+/// a closing sample that is stat-only is never a proof, even when it equals the prepare
+/// sample (Windows; elsewhere the seam is a no-op and the proof is produced).
+#[test]
+fn a_degraded_closing_sample_yields_no_closed_observation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f.bin");
+    std::fs::write(&path, b"v1").unwrap();
+    let _unreadable = yadorilink_fs_platform::fs_identity::change_time_unreadable_for_test();
+    let before = yadorilink_fs_platform::fs_identity::disk_race_fingerprint_or_stat(&path);
+    let observation = closed_disk_observation_if_unraced(&path, before);
+    #[cfg(windows)]
+    assert!(observation.is_none(), "a stat-only sample must not close an observation");
+    #[cfg(not(windows))]
+    assert!(observation.is_some());
 }
 
 /// A batched delete whose prepared fingerprint is that of a sibling the path

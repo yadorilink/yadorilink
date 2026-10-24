@@ -201,24 +201,17 @@ fn decompress_block(
 }
 
 /// Default bounded concurrency for `ensure_blocks_present`'s
-/// per-block fetch loop, overridable via `YADORILINK_BLOCK_FETCH_
-/// CONCURRENCY` for measurement sweeps (see [`block_fetch_concurrency`]'s
-/// own doc comment). 32 blocks in flight at
+/// per-block fetch loop, overridable through the engine's tuning for
+/// measurement sweeps (see [`parse_block_fetch_concurrency`]). 32 blocks in flight at
 /// `DEFAULT_BLOCK_SIZE` (128 KiB) is ~4 MiB of concurrent in-flight
 /// content -- comfortably bounded, not chosen to be optimal on its own.
 pub const DEFAULT_BLOCK_FETCH_CONCURRENCY: usize = 32;
 
-/// `YADORILINK_BLOCK_FETCH_CONCURRENCY` env override for
-/// `ensure_blocks_present`'s bounded concurrent block-fetch window --
-/// read fresh on every call (cheap, not on any hot per-block path) so
-/// a benchmark sweep can vary it run-to-run with no rebuild. Invalid
-/// or absent falls back to `DEFAULT_BLOCK_FETCH_CONCURRENCY`. Follows
-/// this codebase's existing `YADORILINK_*` runtime-override convention
-/// (e.g. `device_config.rs`'s `YADORILINK_CONFIG_DIR`).
-pub fn block_fetch_concurrency() -> usize {
-    std::env::var("YADORILINK_BLOCK_FETCH_CONCURRENCY")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
+/// The block-fetch concurrency a setting selects: `raw` (the desktop daemon maps
+/// `YADORILINK_BLOCK_FETCH_CONCURRENCY` into the engine's tuning) when it is a positive number,
+/// else `DEFAULT_BLOCK_FETCH_CONCURRENCY`. Nothing here reads the process environment.
+pub fn parse_block_fetch_concurrency(raw: Option<&str>) -> usize {
+    raw.and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or(DEFAULT_BLOCK_FETCH_CONCURRENCY)
 }

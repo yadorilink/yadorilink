@@ -52,6 +52,20 @@ Windows のデスクトップアプリは、このリポジトリとは別に配
 を参照してください。Linux のインストール手順、初回起動、更新、アンインストールは
 [Linux の README](packaging/linux/README.md) に記載しています。
 
+### インストール
+
+- **Linux（Debian/Ubuntu）:** GitHub Releases から `.deb` をダウンロードし、`.sha256` を
+  確認してから `sudo apt install ./yadorilink-linux-amd64.deb` でインストールします。
+- **全プラットフォーム、エンジンのみ:** お使いのプラットフォーム向けのエンジンバンドルを
+  展開し、`yadorilink` と `yadorilink-daemon` を `PATH` に置きます。
+- **計画中（未公開）:** コマンドライン用の 1 行インストーラー（macOS と Linux では
+  `curl -fsSL https://yadori.link/install.sh | sh`、Windows では PowerShell 版）。
+  管理者権限なしでホームディレクトリ配下にインストールし、使う前にすべてのダウンロードを
+  署名付きリリースマニフェストと照合します。あわせて、apt リポジトリ、ビルド済みバイナリ
+  の Homebrew formula、WinGet、Docker イメージも代替手段として計画しています。どの方法で
+  インストールしても、更新はそのツールが行います。これらが公開されるまでは、上の方法を
+  使ってください。
+
 コマンドライン用インストーラーの仕組み、`yadorilink self-update` と
 `yadorilink uninstall` の動作、アンインストール後に残るものについては、
 [インストール・更新・アンインストールの FAQ](docs/INSTALL_FAQ.md)（英語）を参照してください。

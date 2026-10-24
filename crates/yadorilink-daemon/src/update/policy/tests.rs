@@ -83,6 +83,9 @@ fn release_entry(version: &str, rollout_percentage: u8) -> ReleaseEntry {
         artifact_size: 1024,
         artifact_publisher_identity: String::new(),
         release_notes_url: String::new(),
+        state_schema_version: None,
+        state_schema_min_readable: None,
+        sparkle_build: None,
     }
 }
 
@@ -90,6 +93,7 @@ fn manifest_with(entry: ReleaseEntry) -> UpdateManifest {
     UpdateManifest {
         schema_version: 1,
         generated_at: "2026-01-01T00:00:00Z".into(),
+        expires_at: "2099-01-01T00:00:00Z".into(),
         withdrawn_versions: Vec::new(),
         releases: vec![entry],
     }
@@ -103,6 +107,7 @@ fn ctx_for(policy: &UpdatePolicy, current: &str) -> LocalContext {
         arch: "aarch64".into(),
         install_source: "standalone".into(),
         rollout_bucket: policy.effective_rollout_bucket(),
+        state_schema_version: 10,
     }
 }
 
@@ -199,6 +204,19 @@ fn an_update_is_required_only_while_the_running_version_is_below_the_minimum() {
     assert!(!policy.update_required(&v("0.3.0")), "current == minimum is supported");
     assert!(!policy.update_required(&v("0.3.1")));
     assert!(!policy.update_required(&v("1.0.0")));
+}
+
+/// An expired channel manifest cannot confirm the recorded minimum: the status says nothing is
+/// required (the update check reports "manifest expired" instead) until a check succeeds.
+#[test]
+fn an_expired_manifest_never_reports_an_update_as_required() {
+    let mut policy = policy_with_minimum(Some("0.3.0"));
+    assert!(policy.update_required(&v("0.2.0")));
+    policy.last_error_category = Some(EXPIRED_CATEGORY.to_owned());
+    assert!(!policy.update_required(&v("0.2.0")));
+    // An ordinary failed check (offline) keeps the verified minimum.
+    policy.last_error_category = Some("update_manifest_fetch_failed".to_owned());
+    assert!(policy.update_required(&v("0.2.0")));
 }
 
 /// Read against the version running NOW, never a remembered verdict: a build that was updated

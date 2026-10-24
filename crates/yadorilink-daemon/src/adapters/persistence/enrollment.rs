@@ -65,6 +65,16 @@ impl EnrollmentRepository for SyncStateEnrollmentRepository {
         self.state.link_repository().list_links().map_err(SyncError::from)
     }
 
+    fn provider_display_name_taken(&self, display_name: &str) -> Result<bool, SyncError> {
+        Ok(self
+            .state
+            .provider_repository()
+            .list_declared_roots()
+            .map_err(SyncError::from)?
+            .iter()
+            .any(|root| root.display_name == display_name))
+    }
+
     fn creation_digest(&self, locator: &str) -> Result<Option<String>, SyncError> {
         self.state.link_repository().creation_digest(locator).map_err(SyncError::from)
     }

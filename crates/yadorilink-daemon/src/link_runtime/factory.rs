@@ -152,6 +152,20 @@ impl LinkRuntimeFactory {
                 "removed stale temp files from linked folder on startup"
             );
         }
+        // Capability-probe artefacts a killed process left. The root lock is held, so no
+        // probe of another process runs here, and nothing is probing yet in this one.
+        let probe_sweep =
+            yadorilink_fs_platform::fs_capabilities::sweep_probe_artefacts(Path::new(&local_path));
+        if !probe_sweep.removed.is_empty() {
+            tracing::info!(
+                count = probe_sweep.removed.len(),
+                local_path = %local_path,
+                "removed stale probe artefacts from linked folder on startup"
+            );
+        }
+        for (path, error) in &probe_sweep.failed {
+            tracing::warn!(%error, path = %path.display(), "could not sweep a probe artefact; left for the next start");
+        }
         {
             let report =
                 crate::link_runtime::operations::repair_materialization::reconcile_restore_operations(

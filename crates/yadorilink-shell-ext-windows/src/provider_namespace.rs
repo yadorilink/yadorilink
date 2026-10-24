@@ -221,7 +221,7 @@ fn delete_on_close(handle: &Handle) -> Result<(), AdoptError> {
     use windows_sys::Win32::Storage::FileSystem::{
         FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
     };
-    let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
     // SAFETY: `handle` is open with DELETE access; the structure outlives the call.
     let ok = unsafe {
         SetFileInformationByHandle(

@@ -4,74 +4,45 @@ use super::*;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-/// Polls for `attempts` to reach `target` instead of sleeping a fixed
-/// duration and then asserting a threshold. A fixed sleep + count
-/// assertion assumes the host
-/// scheduler gives this task's ~1-5ms backoff loop enough real
-/// wall-clock progress within that fixed window; under heavy
-/// concurrent CPU load (many parallel builds/tests contending for
-/// cores) that assumption can be false even though the supervised
-/// task's actual restart behavior is correct — this waits (bounded by
-/// a generous `timeout`) for the real condition instead, so the test
-/// still fails (via the caller's own assertion) on a genuine
-/// regression where restarts stop happening, but tolerates transient
-/// scheduling delays rather than racing a fixed clock.
-async fn wait_for_attempts(attempts: &AtomicU32, target: u32, timeout: Duration) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    while attempts.load(Ordering::SeqCst) < target {
-        if tokio::time::Instant::now() > deadline {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-}
-
-#[tokio::test]
-async fn spawn_restarting_retries_after_a_returning_task() {
-    let attempts = Arc::new(AtomicU32::new(0));
+/// Runs `spawn_restarting` on a paused clock and waits for `target` attempts.
+/// Every attempt reports on a channel, so the wait is for the event itself and
+/// the backoff sleeps cost no real time.
+async fn attempts_reported(name: &'static str, target: usize, panic_first: usize) -> usize {
     let backoff =
         BackoffConfig { initial: Duration::from_millis(1), max: Duration::from_millis(5) };
-    let counted = attempts.clone();
-    let handle = spawn_restarting("test-task", backoff, move || {
-        let attempts = counted.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let counted = Arc::new(AtomicU32::new(0));
+    let handle = spawn_restarting(name, backoff, move || {
+        let tx = tx.clone();
+        let counted = counted.clone();
         async move {
-            attempts.fetch_add(1, Ordering::SeqCst);
-        }
-    });
-
-    wait_for_attempts(&attempts, 3, Duration::from_secs(10)).await;
-    handle.abort();
-    assert!(
-        attempts.load(Ordering::SeqCst) >= 3,
-        "expected several restarts of ~1-5ms backoff within 10s of polling"
-    );
-}
-
-#[tokio::test]
-async fn spawn_restarting_retries_after_a_panic() {
-    let attempts = Arc::new(AtomicU32::new(0));
-    let backoff =
-        BackoffConfig { initial: Duration::from_millis(1), max: Duration::from_millis(5) };
-    let counted = attempts.clone();
-    let handle = spawn_restarting("panicky-task", backoff, move || {
-        let attempts = counted.clone();
-        async move {
-            let n = attempts.fetch_add(1, Ordering::SeqCst);
-            if n < 2 {
+            let n = counted.fetch_add(1, Ordering::SeqCst) as usize;
+            let _ = tx.send(n);
+            if n < panic_first {
                 panic!("simulated failure");
             }
         }
     });
-
-    wait_for_attempts(&attempts, 3, Duration::from_secs(10)).await;
+    let mut seen = 0;
+    while seen < target {
+        rx.recv().await.expect("the supervisor keeps restarting the task");
+        seen += 1;
+    }
     handle.abort();
-    assert!(
-        attempts.load(Ordering::SeqCst) >= 3,
-        "expected retries past the panicking attempts within 10s of polling"
-    );
+    seen
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
+async fn spawn_restarting_retries_after_a_returning_task() {
+    assert_eq!(attempts_reported("test-task", 3, 0).await, 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn spawn_restarting_retries_after_a_panic() {
+    assert_eq!(attempts_reported("panicky-task", 3, 2).await, 3);
+}
+
+#[tokio::test(start_paused = true)]
 async fn spawn_restarting_stops_when_aborted_from_outside() {
     let attempts = Arc::new(AtomicU32::new(0));
     let backoff =
@@ -158,7 +129,7 @@ async fn a_one_shot_task_that_fails_is_still_a_warning() {
     assert!(logs.contains("WARN") && logs.contains("boom"), "a failure must be a warning: {logs}");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn aborting_the_supervisor_stops_the_task_it_supervises() {
     let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counting = ticks.clone();
@@ -186,7 +157,7 @@ async fn aborting_the_supervisor_stops_the_task_it_supervises() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn every_task_spawned_under_a_collector_can_be_stopped() {
     let ticks = Arc::new(AtomicU32::new(0));
     let (_, handles) = collect_spawned_tasks(|| {

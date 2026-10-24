@@ -275,7 +275,7 @@ fn split_offline_directory_removals(
     (removed, rest)
 }
 
-/// Sleeps for `YADORILINK_DIAGNOSTIC_SCAN_SNAPSHOT_DELAY_MS`
+/// Sleeps for the delay `diagnostics::set_snapshot_delay_ms` set
 /// at the point a reconciliation pass has read the index but committed
 /// nothing. A measurement seam for one specific question — "can two
 /// reconciliation passes for one group overlap, and which callers are
@@ -286,10 +286,9 @@ fn split_offline_directory_removals(
 /// make a timer-driven race land on demand instead of only on a folder
 /// large enough to scan for minutes. Read fresh on every call, not cached:
 /// a repro wants to arm this for one pass. Unset (every production
-/// process) is a single failed env lookup and no sleep.
+/// process) is one relaxed load and no sleep.
 pub(super) fn diagnostic_post_snapshot_delay() {
-    let Ok(raw) = std::env::var("YADORILINK_DIAGNOSTIC_SCAN_SNAPSHOT_DELAY_MS") else { return };
-    let Ok(ms) = raw.trim().parse::<u64>() else { return };
+    let ms = crate::diagnostics::snapshot_delay_ms();
     if ms == 0 {
         return;
     }
@@ -1691,8 +1690,9 @@ impl LocalChangeProcessor {
             // `build_record_for_created_or_modified` below, which re-chunks
             // and re-versions. Symlinks carry no blocks (their identity is
             // the target text, checked in `build_symlink_record`), so they
-            // keep the stat-only verdict and fall through to that path
-            // unchanged. The read cost is bounded: it lands only on files
+            // are never "already current" on a stat: a same-length retarget
+            // inside one timestamp tick leaves size and mtime alone, and
+            // that path reads the target and compares it. The read cost is bounded: it lands only on files
             // that already matched size+mtime, only on the infrequent full
             // startup/burst-fallback scan — the high-frequency `AddOnly`
             // backstop never reaches this path for an already-indexed file
@@ -1712,9 +1712,9 @@ impl LocalChangeProcessor {
                 (Some(existing), Some(metadata)) => {
                     !existing.deleted
                         && existing.size == metadata.len()
+                        && file_type.is_file()
                         && metadata_mtime_matches(metadata, existing.mtime_unix_nanos)
-                        && (!file_type.is_file()
-                            || indexed_bytes_match(path, existing, metadata.len())?)
+                        && indexed_bytes_match(path, existing, metadata.len())?
                 }
                 _ => false,
             };

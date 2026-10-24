@@ -82,14 +82,10 @@ use crate::replica_coordinator::{
 /// measurement.
 pub(crate) const DEFAULT_MAX_LATENCY: Duration = Duration::from_millis(20);
 
-const BATCH_COMPLETION_VAR: &str = "YADORILINK_RECEIVE_BATCH_COMPLETION";
-const BATCH_OPEN_VAR: &str = "YADORILINK_RECEIVE_BATCH_OPEN";
-const DEFERRED_FSYNC_VAR: &str = "YADORILINK_RECEIVE_DEFERRED_FSYNC";
-
 /// How received files are flushed: once per batch instead of once per file.
 /// `1` flushes every file with `F_FULLFSYNC` off the critical path and every
 /// parent directory once; `2` (experimental) issues `fsync(2)` for each and a
-/// single `F_FULLFSYNC`; `0` keeps the per-file flush. Unset means `1` on macOS
+/// single `F_FULLFSYNC`; `0` keeps the per-file flush. Unset means `1` on Apple platforms
 /// and off elsewhere; any other value is off. Every platform but Unix is off.
 pub(crate) fn parse_deferred_flush(
     raw: Option<&str>,
@@ -100,21 +96,11 @@ pub(crate) fn parse_deferred_flush(
     match raw.map(str::trim) {
         Some("1") => Some(yadorilink_local_storage::ReceivedFlushMode::FullFsyncEach),
         Some("2") => Some(yadorilink_local_storage::ReceivedFlushMode::FsyncThenOneFullFsync),
-        None if cfg!(target_os = "macos") => {
+        None if cfg!(target_vendor = "apple") => {
             Some(yadorilink_local_storage::ReceivedFlushMode::FullFsyncEach)
         }
         _ => None,
     }
-}
-
-pub(crate) fn deferred_flush_from_env() -> Option<yadorilink_local_storage::ReceivedFlushMode> {
-    let raw = std::env::var(DEFERRED_FSYNC_VAR).ok();
-    // A test build flushes per file unless the variable asks otherwise, so the
-    // many tests that settle a received file by itself do not depend on the
-    // host's default. The default itself is pinned through `parse_deferred_flush`.
-    #[cfg(any(test, feature = "test-support"))]
-    raw.as_ref()?;
-    parse_deferred_flush(raw.as_deref())
 }
 
 /// A received file renamed into place whose flush the window's batch owes.
@@ -140,16 +126,6 @@ pub(crate) struct PendingFlush {
 /// A/B knob for the measurement.
 pub(crate) fn parse_batch_completion(raw: Option<&str>) -> bool {
     raw.map(str::trim) != Some("0")
-}
-
-pub(crate) fn batch_completion_from_env() -> bool {
-    parse_batch_completion(std::env::var(BATCH_COMPLETION_VAR).ok().as_deref())
-}
-
-/// Whether the open of a file's write is batched: on unless the variable is
-/// `0`. A/B knob for the measurement.
-pub(crate) fn batch_open_from_env() -> bool {
-    parse_batch_completion(std::env::var(BATCH_OPEN_VAR).ok().as_deref())
 }
 
 tokio::task_local! {

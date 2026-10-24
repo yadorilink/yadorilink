@@ -280,7 +280,7 @@ fn the_same_folder_conflicts_only_with_a_different_group() {
 
 /// Where the platform's filesystems fold case, a differently-cased spelling
 /// is the same folder, even for a folder that does not exist yet.
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_vendor = "apple", windows))]
 #[test]
 fn a_case_folded_spelling_is_the_same_folder() {
     let dir = tempdir();

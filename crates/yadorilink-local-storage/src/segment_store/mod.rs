@@ -75,7 +75,7 @@ use crate::traits::{
 };
 
 pub use compaction::{CompactionReport, COMPACTION_DEAD_RATIO, COMPACTION_MIN_DEAD_BYTES};
-pub use coordinator::{DurableReceipt, GroupCommitLimits};
+pub use coordinator::{DurableReceipt, GroupCommitLimits, DEFAULT_CACHED_SEGMENT_READERS};
 pub use fault::{CommitPoint, FaultPlan};
 pub use recovery::RecoveryReport;
 
@@ -90,10 +90,6 @@ use segment::{read_record_payload, segment_path, RecordReadError};
 /// these is obvious at a glance.
 const FORMAT_MARKER_FILE: &str = "FORMAT";
 
-/// How many segment file descriptors the read path keeps open at once.
-/// Reads concentrate on recent segments, so a small cache serves nearly
-/// every read while leaving the process's descriptor budget alone.
-const MAX_CACHED_SEGMENT_READERS: usize = 128;
 const INDEX_FILE: &str = "index.sqlite3";
 
 /// A store's full accounting, beyond what `BlockStore::usage`'s
@@ -163,6 +159,8 @@ pub struct SegmentBlockStore {
     /// makes both eviction under pressure and evicting a retired
     /// segment's handle safe.
     readers: RwLock<HashMap<u64, CachedReader>>,
+    /// How many read-only handles the cache keeps open (`GroupCommitLimits::max_cached_readers`).
+    max_cached_readers: usize,
     /// Monotonic tick stamped onto a cached handle whenever it is used, so
     /// eviction can pick the stalest one. Relaxed throughout: an
     /// approximate recency order is all an eviction policy needs.
@@ -209,14 +207,60 @@ struct CachedReader {
 }
 
 impl SegmentBlockStore {
-    /// Opens (creating if absent) the store at `root`, running recovery.
+    /// Opens (creating if absent) the store at `root`, running recovery, for a process that
+    /// already holds the data area's OS-level exclusion (the desktop daemon's
+    /// `ResourceLock`/`DataResourceLocks`). Recovery truncates and removes bytes a live writer
+    /// may have staged, so a caller with no such lock must use [`Self::open_exclusive`].
     ///
     /// Cost is proportional to the number of segments, not to the bytes
     /// they hold: no payload is read and nothing is hashed.
-    pub fn new(root: impl Into<PathBuf>) -> Result<Self, StorageError> {
-        Self::with_limits(root, GroupCommitLimits::from_env())
+    pub fn open_process_locked(root: impl Into<PathBuf>) -> Result<Self, StorageError> {
+        Self::open_process_locked_with(root, GroupCommitLimits::default())
     }
 
+    /// [`Self::open_process_locked`] with the group-commit limits the engine's settings choose.
+    pub fn open_process_locked_with(
+        root: impl Into<PathBuf>,
+        limits: GroupCommitLimits,
+    ) -> Result<Self, StorageError> {
+        Self::open_with_limits(
+            root,
+            limits,
+            yadorilink_fs_platform::durable_dir::volume_offers_durable_namespace,
+            None,
+        )
+    }
+
+    /// Opens the store (running recovery) only while `lease` still proves this process is the
+    /// data area's one writer. A host with no daemon in front must open through this, not
+    /// [`Self::open_process_locked`]. A stale or expired lease is refused before anything on
+    /// disk is touched. `limits` are the group-commit bounds the engine's settings choose
+    /// ([`GroupCommitLimits::default`] unless it tunes them).
+    pub fn open_exclusive(
+        root: impl Into<PathBuf>,
+        lease: &yadorilink_root_authority::writer_lease::WriterLease,
+        limits: GroupCommitLimits,
+    ) -> Result<Self, StorageError> {
+        lease.verify().map_err(|e| StorageError::WriterLease(e.to_string()))?;
+        // Recovery truncates and removes bytes a live writer may have staged, and the open
+        // takes time proportional to the segments: the lease is verified again right before
+        // recovery's first destructive step, so a writer that lost it meanwhile destroys nothing.
+        Self::open_with_limits(
+            root,
+            limits,
+            yadorilink_fs_platform::durable_dir::volume_offers_durable_namespace,
+            Some(lease),
+        )
+    }
+
+    /// Unlocked open with the default limits, for tests that own their directory.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new(root: impl Into<PathBuf>) -> Result<Self, StorageError> {
+        Self::open_process_locked(root)
+    }
+
+    /// Unlocked open with explicit limits, for tests that own their directory.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_limits(
         root: impl Into<PathBuf>,
         limits: GroupCommitLimits,
@@ -231,10 +275,20 @@ impl SegmentBlockStore {
     /// [`Self::with_limits`] with the volume verdict that gates every physical deletion, recovery
     /// on open included: where the segments directory's volume is not known durable and recovery
     /// would delete or truncate anything, the open is refused and nothing is touched.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_limits_and_verdict(
         root: impl Into<PathBuf>,
         limits: GroupCommitLimits,
         verdict: impl Fn(Option<&Path>) -> bool + Send + Sync + 'static,
+    ) -> Result<Self, StorageError> {
+        Self::open_with_limits(root, limits, verdict, None)
+    }
+
+    fn open_with_limits(
+        root: impl Into<PathBuf>,
+        limits: GroupCommitLimits,
+        verdict: impl Fn(Option<&Path>) -> bool + Send + Sync + 'static,
+        fence: Option<&yadorilink_root_authority::writer_lease::WriterLease>,
     ) -> Result<Self, StorageError> {
         let volume_durable: VolumeVerdict = Arc::new(verdict);
         let root = root.into();
@@ -262,6 +316,9 @@ impl SegmentBlockStore {
             &root,
             &index,
             || {
+                if let Some(lease) = fence {
+                    lease.verify().map_err(|e| StorageError::WriterLease(e.to_string()))?;
+                }
                 if volume_durable(Some(&root.join(segment::SEGMENTS_DIR))) {
                     Ok(())
                 } else {
@@ -299,6 +356,7 @@ impl SegmentBlockStore {
             index,
             coordinator,
             readers: RwLock::new(HashMap::new()),
+            max_cached_readers: limits.max_cached_readers.max(1),
             reader_clock: AtomicU64::new(0),
             headroom_enforced: AtomicBool::new(false),
             headroom_override_bytes: Mutex::new(None),
@@ -618,7 +676,7 @@ impl SegmentBlockStore {
         }
         let file = Arc::new(File::open(segment_path(&self.root, segment_id))?);
         let mut readers = self.readers.write().unwrap_or_else(|p| p.into_inner());
-        if readers.len() >= MAX_CACHED_SEGMENT_READERS && !readers.contains_key(&segment_id) {
+        if readers.len() >= self.max_cached_readers && !readers.contains_key(&segment_id) {
             if let Some(stalest) = readers
                 .iter()
                 .min_by_key(|(_, entry)| entry.last_used.load(Ordering::Relaxed))

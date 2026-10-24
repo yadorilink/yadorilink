@@ -58,7 +58,10 @@ def main() -> int:
         r"\bfs::hard_link\(": (0, "hard-link publication primitive (retired)"),
         r"\bfs::remove_file\(": (1, "physical removal primitive"),
         r"\bfs::rename\(": (1, "atomic replace primitive"),
-        r"fs::File::open\(path\)\?\.sync_all\(": (1, "Unix directory durability sync"),
+        r"flush::sync_directory\(&fs::File::open\(path\)\?\)": (
+            1,
+            "Unix directory durability sync (through the flush helper)",
+        ),
         # Windows documents no directory flush: namespace changes there are the
         # write-through moves of `yadorilink_fs_platform::durable_dir`, and
         # this seam holds neither a directory handle nor a flush.

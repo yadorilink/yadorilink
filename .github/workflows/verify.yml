@@ -41,8 +41,6 @@ jobs:
           components: rustfmt, clippy
           token: ${{ github.token }}
       - run: cargo fmt --all -- --check
-      - if: always()
-        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Architecture and invariant checks
         if: always()
         run: |
@@ -71,6 +69,8 @@ jobs:
           bash .github/checks/check_removed_features.sh
           python3 .github/release/check-release-gates.py
           python3 .github/release/check-release-gates.py --self-test
+          bash .github/release/docker-image-tags.sh --self-test
+          bash .github/release/require-verify.sh --self-test
           python3 .github/release/check-verifier-workflow.py
           python3 .github/release/check-verifier-workflow.py --self-test
           python3 .github/release/build-engine-bundle.py --self-test
@@ -102,13 +102,18 @@ jobs:
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         if: always()
         with:
-          tool: cargo-audit,cargo-deny
-      - if: always()
-        run: cargo audit
-      - if: always()
-        run: cargo audit --file crates/yadorilink-verify/Cargo.lock
+          tool: cargo-deny
       - if: always()
         run: cargo deny --config .config/deny.toml check
+
+  # The checks the release repeats on the tag, from the same workflows, so a
+  # commit that is green here cannot fail them there: Clippy on every OS and
+  # the dependency audit.
+  lint:
+    uses: ./.github/workflows/lint.yml
+
+  audit:
+    uses: ./.github/workflows/audit.yml
 
   # The C# binding of the client facade (the Windows app's boundary): it must
   # generate from the library built here, match the checked-in API surface, and

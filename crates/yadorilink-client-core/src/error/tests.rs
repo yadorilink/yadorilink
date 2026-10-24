@@ -131,7 +131,14 @@ fn refusals_by_the_coordination_plane_are_permission_denied_with_their_reason() 
     let store = yadorilink_fapi_client::store::StoreError::UnknownBackend("bad".into());
     let cases = [
         (CoreError::AuthFailed("expired".into()), PermissionDeniedReason::SessionRejected),
+        (CoreError::SignInRequired, PermissionDeniedReason::SessionRejected),
+        (
+            CoreError::TermsConsentRequired { terms_version: Some("v1".into()) },
+            PermissionDeniedReason::TermsConsentRequired,
+        ),
+        (CoreError::DeviceSuperseded, PermissionDeniedReason::DeviceSuperseded),
         (CoreError::Forbidden("not yours".into()), PermissionDeniedReason::Forbidden),
+        (CoreError::ReauthenticationRequired, PermissionDeniedReason::ReauthenticationRequired),
         (command(ApplicationErrorCode::CoordinationRejected), PermissionDeniedReason::Forbidden),
         (command(ApplicationErrorCode::ActivationRejected), PermissionDeniedReason::Forbidden),
         (command(ApplicationErrorCode::PreparationRejected), PermissionDeniedReason::Forbidden),
@@ -322,4 +329,133 @@ fn an_engine_mismatch_is_typed_not_a_protocol_mismatch() {
             }
         );
     }
+}
+
+#[test]
+fn an_expired_device_authorization_is_a_session_refusal_that_says_to_start_again() {
+    let error = CoreError::from(yadorilink_fapi_client::Error::DeviceAuthorizationExpired);
+    match error {
+        CoreError::AuthFailed(message) => {
+            assert!(message.contains("expired"), "{message}");
+            assert!(message.contains("start the sign-in again"), "{message}");
+        }
+        other => panic!("expected AuthFailed, got {other:?}"),
+    }
+}
+
+#[test]
+fn no_core_error_text_names_a_cli_command() {
+    let refusals = [
+        StartOverRefusal::NotConfirmed,
+        StartOverRefusal::NotRestored,
+        StartOverRefusal::InProgress,
+    ];
+    let mut texts = vec![
+        CoreError::NotLoggedIn.to_string(),
+        CoreError::DaemonNotRunning.to_string(),
+        CoreError::DaemonUnresponsive.to_string(),
+    ];
+    texts.extend(refusals.iter().map(ToString::to_string));
+    for text in texts {
+        for command in [
+            "yadorilink login",
+            "yadorilink logout",
+            "yadorilink daemon start",
+            "yadorilink daemon stop",
+            "yadorilink device ",
+            "yadorilink share ",
+            "yadorilink credentials ",
+            "yadorilink doctor",
+        ] {
+            assert!(!text.contains(command), "a host-neutral text names a command: {text}");
+        }
+        assert!(!text.contains('`'), "a host-neutral text quotes a command: {text}");
+    }
+}
+
+#[test]
+fn a_daemon_hint_reaches_a_gui_as_a_typed_start_reason_and_keeps_the_neutral_text() {
+    for (hint, stop_first) in [(Hint::StartDaemon, false), (Hint::StopThenStartDaemon, true)] {
+        let error = CoreError::Other("the daemon did not answer".into()).hinted(hint);
+        assert_eq!(error.hint(), Some(hint));
+        assert_eq!(
+            desktop(error),
+            DesktopError::DaemonUnavailable {
+                message: "the daemon did not answer".into(),
+                reason: DaemonUnavailableReason::StartNeeded { stop_first },
+            }
+        );
+    }
+}
+
+#[test]
+fn a_non_daemon_hint_keeps_the_category_of_the_error_it_wraps() {
+    let error = CoreError::AuthFailed("already enrolled".into()).hinted(Hint::AlreadyEnrolled);
+    assert_eq!(
+        desktop(error),
+        DesktopError::PermissionDenied {
+            message: "authentication failed: already enrolled".into(),
+            reason: PermissionDeniedReason::SessionRejected,
+        }
+    );
+    let error = CoreError::InvalidInput("no group".into()).hinted(Hint::CreateOrAcceptShare);
+    assert!(matches!(desktop(error), DesktopError::InvalidInput { .. }));
+}
+
+#[test]
+fn a_hint_is_seen_through_and_carried_by_context() {
+    let hinted = CoreError::Other("x".into()).hinted(Hint::StartDaemon);
+    assert!(matches!(hinted.into_unhinted(), CoreError::Other(m) if m == "x"));
+    let nested =
+        CoreError::AuthFailed("y".into()).hinted(Hint::SignInAgain).hinted(Hint::StartDaemon);
+    assert!(matches!(nested.into_unhinted(), CoreError::AuthFailed(m) if m == "y"));
+
+    let carried = CoreError::Other("inner".into())
+        .hinted(Hint::StopThenStartDaemon)
+        .with_context(|why| format!("outer: {why}"), Some(Hint::StartDaemon));
+    assert_eq!(carried.hint(), Some(Hint::StopThenStartDaemon));
+    assert_eq!(carried.to_string(), "outer: inner");
+    let fallback = CoreError::Other("inner".into())
+        .with_context(|why| why.to_owned(), Some(Hint::StartDaemon));
+    assert_eq!(fallback.hint(), Some(Hint::StartDaemon));
+    let none = CoreError::Other("inner".into()).with_context(|why| why.to_owned(), None);
+    assert_eq!(none.hint(), None);
+}
+
+#[test]
+fn the_start_over_in_progress_text_is_exact() {
+    assert_eq!(
+        StartOverRefusal::InProgress.to_string(),
+        "a start over as a new device is under way on this computer; finish it before registering"
+    );
+}
+
+/// A refused refresh (`invalid_grant` at the token endpoint) is the sign-in-required refusal, but
+/// the same answer to any other step (a wrong authorization code, say) stays an ordinary failure.
+#[test]
+fn only_a_refused_refresh_is_sign_in_required() {
+    use yadorilink_fapi_client::Error as Fapi;
+    let body = r#"{"error":"invalid_grant"}"#.to_owned();
+    let refresh = Fapi::Response {
+        step: "refresh",
+        status: 400,
+        body: body.clone(),
+        parsed: serde_json::from_str(&body).ok(),
+    };
+    assert!(matches!(CoreError::from(refresh), CoreError::SignInRequired));
+    let code = Fapi::Response {
+        step: "token",
+        status: 400,
+        body: body.clone(),
+        parsed: serde_json::from_str(&body).ok(),
+    };
+    assert!(matches!(CoreError::from(code), CoreError::AuthFailed(_)));
+    let revoked = r#"{"error":"invalid_client"}"#.to_owned();
+    let client = Fapi::Response {
+        step: "refresh",
+        status: 401,
+        body: revoked.clone(),
+        parsed: serde_json::from_str(&revoked).ok(),
+    };
+    assert!(matches!(CoreError::from(client), CoreError::AuthFailed(_)));
 }

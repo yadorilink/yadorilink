@@ -9,6 +9,7 @@
 //! `test_support::TestReplica` instead -- see that module's own doc
 //! comment for why a bare `ReplicaCoordinator` does not compile there.
 
+pub mod diagnostics;
 pub mod error;
 pub mod local_change;
 pub mod ports;

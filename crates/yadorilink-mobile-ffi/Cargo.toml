@@ -1,0 +1,45 @@
+[package]
+name = "yadorilink-mobile-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The UniFFI binding of the embedded host for the iOS app and its File Provider
+# extension. It exports `MobileHost` (lifecycle, typed commands with cancel handles
+# and deadlines) and `ProviderChannel` (the provider protocol as encoded messages).
+# Nothing here adds engine behavior: each method forwards to yadorilink-embedded-host.
+# It is a separate library from yadorilink-client-ffi, which is the desktop facade.
+
+[lib]
+# UniFFI derives every exported symbol and its API checksums from this library name,
+# and the bundle ships `libyadorilink_mobile_ffi.a`. Renaming it is an ABI switch.
+name = "yadorilink_mobile_ffi"
+# `staticlib` is what the iOS targets link; `lib` lets the bindgen and the tests use
+# the crate as an ordinary Rust library.
+crate-type = ["staticlib", "lib"]
+
+[[bin]]
+# Generates the Swift binding from the built library:
+# `.github/release/generate-ios-binding.sh` runs it.
+name = "uniffi-bindgen-swift-mobile"
+path = "src/bin/uniffi-bindgen-swift-mobile.rs"
+required-features = ["bindgen"]
+
+[features]
+default = []
+bindgen = ["uniffi/cli"]
+
+[dependencies]
+yadorilink-embedded-host = { path = "../yadorilink-embedded-host" }
+yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
+prost = "0.14.4"
+uniffi.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tracing.workspace = true
+
+[lints]
+workspace = true

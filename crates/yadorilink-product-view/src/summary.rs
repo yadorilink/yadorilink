@@ -28,6 +28,7 @@
 
 use crate::attention::{AttentionItem, ProductAction};
 use crate::availability::AvailabilitySummary;
+use crate::folder::DegradedCause;
 use crate::protection::ProtectionSummary;
 use yadorilink_ipc_proto::daemonctl::{FetchAvailability, GroupDurabilityStatus, LinkStatus};
 
@@ -56,8 +57,8 @@ impl ProductState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttentionReason {
     Conflict,
-    /// The daemon marks the folder degraded (disk pressure, lost ownership, an orphaned link).
-    Degraded,
+    /// The daemon marks the folder degraded, for the typed cause (`LinkStatus.degraded_cause`).
+    Degraded(DegradedCause),
     LinkedTwice,
     VolumeChanged,
     /// The folder's disk was mounted again and only the user can confirm it.
@@ -80,7 +81,7 @@ impl AttentionReason {
     pub fn item(self) -> AttentionItem {
         match self {
             AttentionReason::Conflict => AttentionItem::ConflictNeedsReview,
-            AttentionReason::Degraded => AttentionItem::FolderStopped,
+            AttentionReason::Degraded(cause) => cause.item(),
             AttentionReason::LinkedTwice => AttentionItem::LinkedTwice,
             AttentionReason::VolumeChanged => AttentionItem::VolumeChanged,
             AttentionReason::VolumeUnconfirmed => AttentionItem::VolumeUnconfirmed,
@@ -153,7 +154,10 @@ fn flags(link: &LinkStatus) -> Flags {
             ) && !link.durability_check_pending,
             AttentionReason::DurabilityUnconfirmed,
         ),
-        (link.degraded, AttentionReason::Degraded),
+        (
+            link.degraded,
+            AttentionReason::Degraded(DegradedCause::of(link).unwrap_or(DegradedCause::Stopped)),
+        ),
         (link.ambiguous, AttentionReason::LinkedTwice),
         (link.capture_volume_changed, AttentionReason::VolumeChanged),
         (link.capture_volume_unconfirmed, AttentionReason::VolumeUnconfirmed),
@@ -232,7 +236,8 @@ impl ProductStatusSummary {
                 // `max_by_key` keeps the last of equal keys; the reverse keeps the first reported.
                 .rev()
                 .max_by_key(|item| item.severity())
-                .map(|item| item.primary_action()),
+                // A summary knows no volume's reclaim, so free-up-space falls back to details.
+                .map(|item| item.offered_action(false)),
             ProductState::Paused => Some(ProductAction::Resume),
             ProductState::Syncing | ProductState::Waiting | ProductState::UpToDate => None,
         };

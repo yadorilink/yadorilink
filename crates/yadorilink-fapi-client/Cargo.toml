@@ -55,6 +55,8 @@ sha2 = { workspace = true }
 base64 = "0.23"
 serde = { workspace = true }
 serde_json = "1"
+# Rebuilds a 403 response after its body was read to recognise a consent refusal.
+http = "1"
 # The PKCE verifier's entropy. Already resolved at 0.4.3.
 getrandom = "0.4"
 # `jti` on both the client assertion and the DPoP proof. Both are
@@ -80,6 +82,8 @@ tokio = { version = "1", default-features = false, features = ["time", "sync"] }
 # across platforms (flock on Unix, LockFileEx on Windows). Already a direct
 # dependency of `yadorilink-daemon`, so nothing new enters the lock file.
 fs2 = "0.4"
+# Whether two paths are one file, as the operating system says (already in the lock file).
+same-file = "1"
 tracing = { workspace = true }
 
 # The OS-native credential store backend on Windows and Linux. macOS does not
@@ -90,7 +94,7 @@ tracing = { workspace = true }
 [target.'cfg(any(windows, target_os = "linux"))'.dependencies]
 keyring = { version = "3", features = ["windows-native", "linux-native"] }
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(target_vendor = "apple")'.dependencies]
 yadorilink-os-keychain = { path = "../yadorilink-os-keychain" }
 
 [dev-dependencies]
@@ -102,7 +106,7 @@ yadorilink-os-keychain = { path = "../yadorilink-os-keychain" }
 # is what makes that module visible to `tests/` without making it visible to
 # anything that links this crate normally.
 yadorilink-fapi-client = { path = ".", features = ["test-support"] }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 # A local HTTP server for the endpoints the hosted service does not serve yet (client
 # bootstrap, the device grant) and for driving the token cache's refresh clock

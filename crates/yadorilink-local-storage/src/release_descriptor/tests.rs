@@ -20,6 +20,7 @@ fn descriptor(release_id: &str, api: u32, source: &str) -> ReleaseDescriptor {
         install_source: source.into(),
         release_id: release_id.into(),
         engine_api_version: api,
+        state_schema: None,
     }
 }
 
@@ -198,4 +199,97 @@ fn an_embedded_build_pairs_with_the_daemon_of_the_same_build_only() {
         check_pair(&mine, &descriptor("other:build", 1, "script")),
         Err(PairMismatch::Build { .. })
     ));
+}
+
+fn write_identity_with(dir: &Path, extra: &str) {
+    std::fs::write(
+        dir.join(ENGINE_IDENTITY_FILE),
+        format!(
+            r#"{{"public_commit_sha":"{COMMIT}","build_config_digest":"{DIGEST}","engine_api_version":1,"channel":"beta"{extra}}}"#
+        ),
+    )
+    .unwrap();
+}
+
+fn state_of(dir: &Path) -> Option<StateSchema> {
+    ReleaseDescriptor::of_program("1", "script", 1, Some(dir)).unwrap().state_schema
+}
+
+#[test]
+fn an_old_identity_without_the_state_fields_still_parses() {
+    let dir = tempfile::tempdir().unwrap();
+    write_identity(dir.path(), 1);
+    assert_eq!(state_of(dir.path()), None);
+}
+
+#[test]
+fn a_new_identity_declares_what_it_writes_and_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    write_identity_with(
+        dir.path(),
+        r#","state_schema_version":132,"state_schema_min_readable":130"#,
+    );
+    assert_eq!(state_of(dir.path()), Some(StateSchema { writes: 132, reads_from: 130 }));
+    // The oldest readable defaults to the written version.
+    write_identity_with(dir.path(), r#","state_schema_version":132"#);
+    assert_eq!(state_of(dir.path()), Some(StateSchema { writes: 132, reads_from: 132 }));
+}
+
+#[test]
+fn a_malformed_state_declaration_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    for extra in [
+        r#","state_schema_min_readable":5"#,
+        r#","state_schema_version":"132""#,
+        r#","state_schema_version":0"#,
+        r#","state_schema_version":-3"#,
+        r#","state_schema_version":5,"state_schema_min_readable":6"#,
+        r#","state_schema_version":5,"state_schema_min_readable":null"#,
+    ] {
+        write_identity_with(dir.path(), extra);
+        let problem =
+            ReleaseDescriptor::of_program("1", "script", 1, Some(dir.path())).unwrap_err();
+        assert!(matches!(problem, DescriptorProblem::Unreadable { .. }), "{extra}");
+    }
+}
+
+#[test]
+fn an_incompatible_upgrade_or_downgrade_is_refused() {
+    let target = Some(StateSchema { writes: 10, reads_from: 8 });
+    // Equal and older (within the readable range) are accepted.
+    for on_disk in [8, 9, 10] {
+        assert_eq!(StateSchema::check_readable(on_disk, target), Ok(()), "{on_disk}");
+    }
+    // A downgrade onto state written by a newer build is refused, with a plain message.
+    let refusal = StateSchema::check_readable(11, target).unwrap_err();
+    assert_eq!(refusal, StateRefusal::NewerThanReadable { on_disk: 11, newest_readable: 10 });
+    assert!(
+        refusal.message().contains("downgrading")
+            && refusal.message().contains("nothing was changed")
+    );
+    // An upgrade across a gap the target cannot read is refused too.
+    assert_eq!(
+        StateSchema::check_readable(7, target),
+        Err(StateRefusal::OlderThanReadable { on_disk: 7, oldest_readable: 8 })
+    );
+}
+
+#[test]
+fn a_target_that_declares_nothing_is_not_judged() {
+    assert_eq!(StateSchema::check_readable(9999, None), Ok(()));
+}
+
+#[test]
+fn a_binary_that_writes_another_state_version_than_its_identity_declares_is_a_mixed_bundle() {
+    let dir = tempfile::tempdir().unwrap();
+    write_identity_with(dir.path(), r#","state_schema_version":132"#);
+    let d = ReleaseDescriptor::of_program("1", "script", 1, Some(dir.path())).unwrap();
+    assert!(d.clone().confirm_state_schema(132, Some(dir.path())).is_ok());
+    let problem = d.confirm_state_schema(133, Some(dir.path())).unwrap_err();
+    assert!(matches!(problem, DescriptorProblem::StateSchemaMismatch { .. }));
+    assert!(problem.message().contains("nothing was started"));
+    // An identity without the declaration confirms nothing and refuses nothing.
+    write_identity(dir.path(), 1);
+    let d = ReleaseDescriptor::of_program("1", "script", 1, Some(dir.path())).unwrap();
+    assert!(d.confirm_state_schema(133, Some(dir.path())).is_ok());
 }

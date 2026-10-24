@@ -13,6 +13,7 @@ pub(crate) mod preserved;
 pub(crate) mod replica_role;
 pub(crate) mod reporting;
 pub(crate) mod runtime_control;
+#[cfg(feature = "process-model")]
 pub(crate) mod update;
 pub(crate) mod version_restore;
 
@@ -63,6 +64,7 @@ pub(crate) use runtime_control::{
     safe_stop_deadline, DaemonLifecyclePort, GcCommandError, GcCommandOutcome, GcPort,
     LinkPauseResumePort, SafeStopBusy, SafeStopOutcome,
 };
+#[cfg(feature = "process-model")]
 #[allow(unused_imports)]
 pub(crate) use update::{
     UpdateCommandPort, UpdateConfigCommand, UpdatePolicyView, UpdateVersionCheckKind,

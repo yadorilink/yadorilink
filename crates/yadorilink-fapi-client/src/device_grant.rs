@@ -112,6 +112,25 @@ impl FapiClient {
     /// `scope` must include `offline_access` to receive a refresh token, and
     /// `openid` to receive a subject.
     pub async fn request_device_authorization(&self, scope: &str) -> Result<DeviceAuthorization> {
+        self.device_authorization(scope, false).await
+    }
+
+    /// Begin a device authorization for a step-up of an already signed-in
+    /// installation. `max_age=0` is for our own Authorization Server only: it
+    /// makes it run an interaction even when the user's browser holds a session
+    /// for this client. It is never forwarded to the identity provider.
+    pub async fn request_fresh_device_authorization(
+        &self,
+        scope: &str,
+    ) -> Result<DeviceAuthorization> {
+        self.device_authorization(scope, true).await
+    }
+
+    async fn device_authorization(
+        &self,
+        scope: &str,
+        fresh_authentication: bool,
+    ) -> Result<DeviceAuthorization> {
         let endpoint = self
             .metadata()
             .device_authorization_endpoint
@@ -119,12 +138,15 @@ impl FapiClient {
             .ok_or(Error::MissingMetadata("device_authorization_endpoint"))?;
 
         let assertion = self.client_assertion()?;
-        let form = [
+        let mut form = vec![
             ("client_id", self.client_id()),
             ("scope", scope),
             ("client_assertion_type", crate::assertion::ASSERTION_TYPE),
-            ("client_assertion", &assertion),
+            ("client_assertion", assertion.as_str()),
         ];
+        if fresh_authentication {
+            form.push(("max_age", "0"));
+        }
 
         let response = self.http().post(self.to_local(&endpoint)?).form(&form).send().await?;
         let status = response.status();
@@ -194,20 +216,37 @@ impl FapiClient {
         &self,
         authorization: &DeviceAuthorization,
     ) -> Result<TokenResponse> {
-        let deadline =
-            std::time::Instant::now() + Duration::from_secs(authorization.expires_in.max(1));
-        let mut interval = authorization.poll_interval();
+        poll_until_granted(authorization, || {
+            self.poll_device_authorization(&authorization.device_code)
+        })
+        .await
+    }
+}
 
-        loop {
-            tokio::time::sleep(interval).await;
-            if std::time::Instant::now() >= deadline {
-                return Err(Error::DeviceAuthorizationExpired);
-            }
-            match self.poll_device_authorization(&authorization.device_code).await? {
-                DevicePoll::Granted(tokens) => return Ok(*tokens),
-                DevicePoll::Pending => {}
-                DevicePoll::SlowDown => interval += Duration::from_secs(5),
-            }
+/// The RFC 8628 section 3.5 polling rules, apart from the network: wait the
+/// interval before every poll, widen it by five seconds on every `slow_down`
+/// and keep it widened, and stop at the authorization's own `expires_in`.
+async fn poll_until_granted<F, Fut>(
+    authorization: &DeviceAuthorization,
+    mut poll: F,
+) -> Result<TokenResponse>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<DevicePoll>>,
+{
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(authorization.expires_in.max(1));
+    let mut interval = authorization.poll_interval();
+
+    loop {
+        tokio::time::sleep(interval).await;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Error::DeviceAuthorizationExpired);
+        }
+        match poll().await? {
+            DevicePoll::Granted(tokens) => return Ok(*tokens),
+            DevicePoll::Pending => {}
+            DevicePoll::SlowDown => interval += Duration::from_secs(5),
         }
     }
 }

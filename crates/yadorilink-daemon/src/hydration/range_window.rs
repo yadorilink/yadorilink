@@ -9,6 +9,13 @@ use yadorilink_replica_domain::file::BlockInfo;
 use crate::application::ports::ByteRange;
 use crate::sync_error::SyncError;
 
+/// The longest window (bytes actually served, after clamping to the file) a ranged read may ask
+/// for. A window is assembled from its covering blocks and then cut out of them, so staging needs
+/// up to twice the window plus the partial blocks at its two ends; this bound keeps that need small
+/// next to the free-space check that guards the staging directory. A longer window is refused and
+/// the caller fetches the whole file instead.
+pub(crate) const MAX_RANGE_WINDOW_LEN: u64 = 256 << 20;
+
 /// The blocks covering one range, and where the range sits inside their concatenation.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct RangeWindow {
@@ -22,6 +29,11 @@ pub(super) struct RangeWindow {
 }
 
 impl RangeWindow {
+    /// Whether the served length is within [`MAX_RANGE_WINDOW_LEN`].
+    pub(super) fn within_cap(&self) -> bool {
+        self.served.len <= MAX_RANGE_WINDOW_LEN
+    }
+
     pub(super) fn window_len(&self) -> u64 {
         self.blocks.iter().map(|b| u64::from(b.size)).sum()
     }
@@ -144,6 +156,24 @@ mod tests {
             .unwrap()
             .blocks
             .is_empty());
+    }
+
+    #[test]
+    fn the_window_cap_is_inclusive_and_applies_after_clamping() {
+        let block = 4 << 20;
+        let count = (MAX_RANGE_WINDOW_LEN / block) as usize + 2;
+        let (blocks, size) = layout(&vec![block as u32; count]);
+        let at = |offset, len| plan(&blocks, size, ByteRange { offset, len }).unwrap().unwrap();
+        assert!(at(0, 0).within_cap());
+        assert!(at(0, MAX_RANGE_WINDOW_LEN).within_cap());
+        assert!(!at(0, MAX_RANGE_WINDOW_LEN + 1).within_cap());
+        assert!(!at(0, u64::MAX).within_cap(), "an overflowing length clamps to a too-long window");
+        assert!(!at(1, u64::MAX).within_cap());
+        // The cap bounds what is served, not what was asked: a long ask near the end is small.
+        assert!(at(size - 10, u64::MAX).within_cap());
+        let (small, small_size) = layout(&[10]);
+        let window = plan(&small, small_size, ByteRange { offset: 0, len: u64::MAX }).unwrap();
+        assert!(window.unwrap().within_cap());
     }
 
     #[test]

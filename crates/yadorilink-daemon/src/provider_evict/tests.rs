@@ -368,6 +368,79 @@ async fn a_listed_item_without_a_handoff_is_not_dropped_on_the_hosts_word() {
     assert!(log(&fx).iter().all(|entry| entry != "host_evict"));
 }
 
+/// A large file is read through the OS in windows, so the daemon never hands it over whole. Once
+/// the host lists it after the last window, freeing it asks the host to drop its copy and, with
+/// the lease, frees the blocks; a window serve is still not presence of the content.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_the_os_holds_from_windows_is_evicted() {
+    let fx = Fx::new();
+    let blocks = fx.commit("a.bin", 1, &[&data_of(1, 4096), &data_of(2, 4096)]);
+    let item = fx.item("a.bin");
+    fx.os_holds_windows(item);
+    let repo = fx.state.replica_coordinator.provider_repository();
+    assert!(repo.handoff(&fx.root, &item).unwrap().is_none());
+    assert!(!crate::provider_evidence::os_holds_current_content(
+        &fx.state.replica_coordinator,
+        &fx.membership,
+        &fx.root,
+        &item
+    ));
+
+    let outcome = evictor(&fx, fx.reclaim()).evict(GROUP, "a.bin").await.unwrap();
+
+    assert!(outcome.dehydrated);
+    assert_eq!(outcome.retained, None);
+    assert_eq!(outcome.reclaimed.blocks, 2);
+    assert_eq!(log(&fx), ["acquire", "host_evict"]);
+    assert!(blocks.iter().all(|hash| !fx.cached(hash)));
+}
+
+/// Windows served for a version that has since changed content are no evidence for the new one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn windows_of_an_older_version_do_not_confirm_a_newer_one() {
+    let fx = Fx::new();
+    fx.commit("a.bin", 1, &[&data_of(1, 4096)]);
+    let item = fx.item("a.bin");
+    fx.os_holds_windows(item);
+    let newer = fx.commit("a.bin", 2, &[&data_of(2, 4096)]);
+
+    let outcome = evictor(&fx, fx.reclaim()).evict(GROUP, "a.bin").await.unwrap();
+
+    assert!(!outcome.dehydrated);
+    assert!(log(&fx).iter().all(|entry| entry != "host_evict"));
+    assert!(fx.cached(&newer[0]));
+}
+
+/// A window served after the host's last report may already be on the OS without being listed:
+/// the answer is "not confirmed yet", never "nothing there".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_window_newer_than_the_hosts_report_is_not_confirmed_yet() {
+    let fx = Fx::new();
+    let blocks = fx.commit("a.bin", 1, &[&data_of(1, 4096)]);
+    let item = fx.item("a.bin");
+    let repo = fx.state.replica_coordinator.provider_repository();
+    let latest = repo.latest_evidence_seq(&fx.root).unwrap().unwrap();
+    let empty = yadorilink_ipc_proto::shellipc::ProviderMaterializedReport {
+        root_id: hex::decode(&fx.root).unwrap(),
+        reporter_epoch: 60,
+        report_seq: 1,
+        full: true,
+        observed_after_seq: latest,
+        upserts: Vec::new(),
+        removed: Vec::new(),
+        more: false,
+    };
+    assert!(!fx.membership.apply(&empty, latest).needs_full);
+    let version = repo.current_version_hash(&fx.root, &item).unwrap().unwrap();
+    repo.record_window_serve(&fx.root, &item, version).unwrap().unwrap();
+
+    let outcome = evictor(&fx, fx.reclaim()).evict(GROUP, "a.bin").await.unwrap();
+
+    assert!(!outcome.dehydrated);
+    assert_eq!(outcome.retained, Some(Retained::NotConfirmed));
+    assert!(fx.cached(&blocks[0]));
+}
+
 /// The host is asked only when the item's CONTENT is what was handed over: a content update since
 /// the handoff (even one that is already published and still listed) is not dropped on the host's
 /// word, whatever later metadata-only change follows.

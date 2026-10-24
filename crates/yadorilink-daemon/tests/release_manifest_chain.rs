@@ -193,6 +193,7 @@ fn local_context(entry: &manifest::ReleaseEntry, channel: &str) -> manifest::Loc
         arch: entry.arch.clone(),
         install_source: entry.install_source.clone(),
         rollout_bucket: 0,
+        state_schema_version: 10,
     }
 }
 
@@ -222,6 +223,14 @@ fn release_is_signed_and_verifies_end_to_end(channel: &str, version: &str, other
     let envelope = std::fs::read_to_string(&envelope_path).unwrap();
     let parsed = manifest::verify_and_parse_with_keys(&envelope, &trust(&key.public_hex))
         .expect("the client must accept the manifest the pipeline signed");
+    // The pipeline stamps the expiry the client requires: sixty days after generation, and
+    // not yet past at the moment the manifest was made.
+    let generated =
+        chrono::NaiveDateTime::parse_from_str(&parsed.generated_at, "%Y-%m-%dT%H:%M:%SZ").unwrap();
+    let expires =
+        chrono::NaiveDateTime::parse_from_str(&parsed.expires_at, "%Y-%m-%dT%H:%M:%SZ").unwrap();
+    assert_eq!(expires - generated, chrono::Duration::days(60));
+    assert_eq!(manifest::check_not_expired(&parsed, generated.and_utc().timestamp()), Ok(()));
     assert_eq!(parsed.releases.len(), 1);
     let entry = &parsed.releases[0];
     let bytes = std::fs::read(&artifact).unwrap();

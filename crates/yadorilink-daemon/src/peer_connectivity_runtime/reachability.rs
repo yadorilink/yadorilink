@@ -195,6 +195,29 @@ impl LinkReachability {
     }
 }
 
+/// Every peer with something to report, plus every device the account replaced -- always listed,
+/// as unreachable for being replaced ([`UnreachableCategory::DeviceReplaced`]) whatever its links
+/// did before it was refused: the typed reason, not a silent absence.
+pub(crate) fn peers_with_replaced(
+    links: Vec<(String, PeerReachability)>,
+    authority: &crate::daemon_state::PeerAuthorityState,
+) -> Vec<(String, PeerReachability)> {
+    let replaced = authority.superseded_snapshot();
+    let mut all: Vec<_> = links
+        .into_iter()
+        .filter(|(device, _)| !replaced.iter().any(|(old, _)| old == device))
+        .collect();
+    all.extend(replaced.into_iter().map(|(old, _)| {
+        (
+            old,
+            PeerReachability::Unreachable(
+                crate::peer_registry::UnreachableCategory::DeviceReplaced,
+            ),
+        )
+    }));
+    all
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -314,7 +314,7 @@ impl TrustStore {
         let mut file = std::fs::File::create(&tmp)?;
         file.write_all(json.as_bytes())?;
         after(SaveStep::TempWritten)?;
-        file.sync_all()?;
+        yadorilink_fs_platform::flush::sync_file(&file)?;
         drop(file);
         after(SaveStep::TempSynced)?;
         publish_durably(&tmp, &self.path, Replace::Yes)?;

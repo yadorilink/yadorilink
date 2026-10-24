@@ -17,6 +17,7 @@
 
 pub mod canonical_fold;
 pub mod durable_dir;
+pub mod flush;
 pub mod fs_capabilities;
 pub mod fs_identity;
 pub mod generation;

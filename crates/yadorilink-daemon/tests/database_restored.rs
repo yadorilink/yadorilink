@@ -55,10 +55,25 @@ mod unix_tests {
         daemon_as(data, socket, "device-under-test", 7).await
     }
 
+    /// One witness directory for the whole test process, kept outside every data set. Witness
+    /// files are named by database path, so the tests do not share a witness.
+    fn outside_witness() -> yadorilink_daemon::engine_tuning::EngineTuning {
+        static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let dir = DIR.get_or_init(|| tempfile::tempdir().unwrap());
+        yadorilink_daemon::engine_tuning::EngineTuning {
+            witness: yadorilink_daemon::install_witness::WitnessPlacement::At(
+                dir.path().to_path_buf(),
+            ),
+            ..Default::default()
+        }
+    }
+
     /// [`daemon`] running as `device_id`, signing with the key made from `key_byte`.
     async fn daemon_as(data: &Path, socket: &Path, device_id: &str, key_byte: u8) -> Daemon {
         let store = Arc::new(SegmentBlockStore::new(data.join("blocks")).unwrap());
-        let coordinator = Arc::new(ReplicaCoordinator::open(data.join("sync.sqlite3")).unwrap());
+        let coordinator = Arc::new(
+            ReplicaCoordinator::open_with(data.join("sync.sqlite3"), outside_witness()).unwrap(),
+        );
         let state = DaemonState::new(device_id.into(), coordinator, store);
         state.set_device_signing_key(ed25519_dalek::SigningKey::from_bytes(&[key_byte; 32]));
         let serve_state = state.clone();
@@ -113,27 +128,9 @@ mod unix_tests {
         }
     }
 
-    /// One witness directory for the whole test process, kept outside every data set. The variable
-    /// is process-wide and the tests run in parallel, so a per-test directory would let one test's
-    /// daemon write its witness under another test's directory (removed when that test ends).
-    /// Witness files are named by database path, so the tests do not share a witness.
-    fn use_witness_dir() {
-        static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-        let dir = DIR.get_or_init(|| {
-            let dir = tempfile::tempdir().unwrap();
-            std::env::set_var("YADORILINK_WITNESS_DIR", dir.path());
-            dir
-        });
-        assert_eq!(
-            std::env::var_os("YADORILINK_WITNESS_DIR").as_deref(),
-            Some(dir.path().as_os_str())
-        );
-    }
-
     #[tokio::test]
     async fn an_older_copy_of_the_database_is_refused_and_reported() {
         let root = tempfile::tempdir().unwrap();
-        use_witness_dir();
         let data = root.path().join("data");
         std::fs::create_dir_all(&data).unwrap();
         let socket = root.path().join("daemon.sock");
@@ -188,7 +185,6 @@ mod unix_tests {
     #[tokio::test]
     async fn the_same_database_opened_as_a_new_device_authors_and_keeps_the_old_author() {
         let root = tempfile::tempdir().unwrap();
-        use_witness_dir();
         let data = root.path().join("data");
         std::fs::create_dir_all(&data).unwrap();
         let socket = root.path().join("daemon.sock");

@@ -210,6 +210,49 @@ pub(crate) fn materialize_message(
     }
 }
 
+/// What an operator needs to see about one provider fetch that ends without an answer: the
+/// extension went away (its own timeout, a cancel, a crash) while the engine was still working.
+/// The task is aborted then and cannot log by itself, so this does it when it is dropped.
+struct FetchAccount {
+    started: std::time::Instant,
+    progress: Option<Arc<AssemblyProgress>>,
+    ranged: bool,
+    finished: bool,
+}
+
+impl FetchAccount {
+    fn new(request: &MaterializeToTempRequest, progress: Option<Arc<AssemblyProgress>>) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            progress,
+            ranged: request.ranged,
+            finished: false,
+        }
+    }
+
+    /// Bytes verified so far and milliseconds since the request started; the fetch has ended.
+    fn finish(&mut self) -> (u64, u64) {
+        self.finished = true;
+        let bytes = self.progress.as_ref().and_then(|p| p.snapshot()).map_or(0, |(done, _)| done);
+        (bytes, u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX))
+    }
+}
+
+impl Drop for FetchAccount {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let (bytes, elapsed_ms) = self.finish();
+        tracing::info!(
+            bytes,
+            elapsed_ms,
+            ranged = self.ranged,
+            "a provider fetch ended before it was answered (the extension went away or cancelled)"
+        );
+    }
+}
+
 fn start(
     context: &Arc<ShellContext>,
     requests: &MaterializeRequests,
@@ -248,6 +291,7 @@ fn start(
     let handle = tokio::spawn(async move {
         let _reserved = reserved;
         let progress = request.report_progress.then(|| Arc::new(AssemblyProgress::default()));
+        let mut account = FetchAccount::new(&request, progress.clone());
         let outcome = match &progress {
             Some(progress) => run_reporting(&context, &request, progress, &reply).await,
             None => run(&context, &request, None).await,
@@ -255,7 +299,11 @@ fn start(
         if let Err((failure, error)) = &outcome {
             // The message can quote a path: debug only.
             tracing::debug!(%error, "the failed provider fetch's message");
-            tracing::warn!(?failure, "a provider fetch failed");
+            let (bytes, elapsed_ms) = account.finish();
+            tracing::warn!(?failure, bytes, elapsed_ms, "a provider fetch failed");
+        } else {
+            let (bytes, elapsed_ms) = account.finish();
+            tracing::info!(bytes, elapsed_ms, ranged = request.ranged, "a provider fetch finished");
         }
         #[cfg(test)]
         hook("before_claim", &task_id).await;
@@ -306,10 +354,21 @@ fn after_response(context: &ShellContext, mut handoff: Handoff) {
     // the presence-evidence ledger (below) and the file is dropped here.
     if handoff.ranged {
         // The OS gets a window of the bytes, never the file: no handoff is recorded, so the item
-        // stays "not present" and nothing may evict or reclaim on the strength of it. Nor is the
-        // content recorded as served: that summary vouches for a whole version's content, which
-        // a window is not. The file has been registered for revocation since before the response
-        // was sent (see `run`); here it only ages out like any unconsumed handoff.
+        // stays "not present" and nothing may reclaim on the strength of it. Nor is the content
+        // recorded as served: that summary vouches for a whole version's content, which a window
+        // is not. The window itself is recorded in its own ledger, which only lets an explicit
+        // eviction ask the host to drop what the OS holds of this exact version. The file has been
+        // registered for revocation since before the response was sent (see `run`); here it only
+        // ages out like any unconsumed handoff.
+        if let Err(error) = crate::provider_evidence::record_window_serve(
+            &context.replica_coordinator,
+            &context.provider_host,
+            &handoff.root,
+            &handoff.item,
+            handoff.version,
+        ) {
+            tracing::warn!(%error, "could not record a provider window; the item cannot be evicted yet");
+        }
         handoff.file.keep();
         if let Some(root) = context.handoff.get() {
             root.sweep_later(handoff.root.clone(), handoff.item, handoff.name.clone());
@@ -511,6 +570,12 @@ async fn run(
             return Err(fail(
                 MaterializeFailure::RangeNotSatisfiable,
                 "the range starts past the end of the version",
+            ));
+        }
+        TempOutcome::RangeTooLarge => {
+            return Err(fail(
+                MaterializeFailure::RangeNotSatisfiable,
+                "the range is longer than a window may be; fetch the whole file",
             ));
         }
     };

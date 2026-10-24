@@ -89,8 +89,11 @@ impl Fx {
             ));
             offset += data.len() as u64;
         }
-        let blocks = format!("[{}]", entries.join(","));
-        let total = offset as i64;
+        self.insert_version(path, seq, &format!("[{}]", entries.join(",")), offset as i64);
+    }
+
+    /// Makes `blocks` (a JSON block list totalling `total` bytes) the current version of `path`.
+    fn insert_version(&self, path: &str, seq: i64, blocks: &str, total: i64) {
         self.state
             .replica_coordinator
             .database()
@@ -1215,6 +1218,45 @@ async fn a_ranged_request_needs_the_version_and_a_reachable_offset() {
     assert_eq!(fx.handoff_names().len(), 1, "a refused request left a file");
 }
 
+/// A window longer than the cap is refused with the retryable-as-whole-file answer before any
+/// block is fetched; the cap itself, zero, and an overflowing length on a short file are not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ranged_request_longer_than_the_cap_is_refused_before_any_fetch() {
+    use crate::hydration::MAX_RANGE_WINDOW_LEN as CAP;
+    let mut fx = Fx::new().await;
+    // Blocks that exist only in the index: a refused window never reaches the block store.
+    const BLOCK: u64 = 16 << 20;
+    let count = CAP / BLOCK + 1;
+    let size = count * BLOCK;
+    assert!(size > CAP + 1);
+    let blocks: Vec<String> = (0..count)
+        .map(|n| {
+            let hash = vec![n as u8 + 1; 32];
+            format!(r#"{{"hash":{hash:?},"offset":{},"size":{BLOCK}}}"#, n * BLOCK)
+        })
+        .collect();
+    let blocks = format!("[{}]", blocks.join(","));
+    fx.insert_version("big.bin", 1, &blocks, size as i64);
+    let item = fx.repo().mint_item(&fx.root, "big.bin").unwrap();
+    let version = fx.current_hash(&item).0.to_vec();
+
+    for (id, len) in [(&b"req-c1"[..], CAP + 1), (b"req-c2", u64::MAX)] {
+        let refused = fx.ask_range(id, &item, &version, 0, len).await;
+        assert!(!refused.ok);
+        assert_eq!(failure(&refused), MaterializeFailure::RangeNotSatisfiable);
+        assert!(refused.error.contains("whole file"), "{}", refused.error);
+    }
+    // At the cap the request goes on to fetch (the block is absent, so it fails as unobtainable).
+    let at_cap = fx.ask_range(b"req-c3", &item, &version, 0, CAP).await;
+    assert_ne!(failure(&at_cap), MaterializeFailure::RangeNotSatisfiable, "{}", at_cap.error);
+    // The cap bounds the served window: a huge length near the end clamps below it.
+    let tail = fx.ask_range(b"req-c4", &item, &version, size, u64::MAX).await;
+    assert!(tail.ok && tail.range_length == 0, "{}", tail.error);
+    let zero = fx.ask_range(b"req-c5", &item, &version, 0, 0).await;
+    assert!(zero.ok && zero.range_length == 0, "{}", zero.error);
+    assert!(fx.handoff_names().len() == 2, "a refused request left a file");
+}
+
 // ---- a window is revocable from the moment its response can be read ------------------------
 
 impl Fx {
@@ -1286,6 +1328,199 @@ async fn a_windows_tracking_is_dropped_on_a_failed_response_and_after_delivery()
     assert_eq!(fx.handoff_root().tracked_handoffs(), 1);
     eventually("the lifetime to end", || fx.handoff_root().tracked_handoffs() == 0).await;
     assert!(fx.handoff_names().is_empty());
+}
+
+// ---- ranged failures: exact reasons, never unverified bytes --------------------------------
+
+impl Fx {
+    /// An item of three blocks (40_000, 50_000, 30_000 bytes) whose last block is in nobody's
+    /// store: the first two blocks can be read, the third cannot be had.
+    fn item_missing_last_block(&self, path: &str) -> (ItemId, Vec<u8>, Vec<Vec<u8>>) {
+        let chunks = three_blocks();
+        let mut offset = 0u64;
+        let mut entries = Vec::new();
+        for (n, data) in chunks.iter().enumerate() {
+            let hash_bytes = if n < 2 {
+                let hash = self.state.block_store.put(data).unwrap();
+                let hash_bytes = hex::decode(&hash).unwrap();
+                self.state
+                    .replica_coordinator
+                    .record_block_provenance(GROUP, std::slice::from_ref(&hash_bytes))
+                    .unwrap();
+                hash_bytes
+            } else {
+                vec![9u8; 32]
+            };
+            entries.push(format!(
+                r#"{{"hash":{:?},"offset":{offset},"size":{}}}"#,
+                hash_bytes,
+                data.len()
+            ));
+            offset += data.len() as u64;
+        }
+        self.insert_version(path, 1, &format!("[{}]", entries.join(",")), offset as i64);
+        let item = self.repo().mint_item(&self.root, path).unwrap();
+        self.repo().publish_first(&self.root, &item, self.current_hash(&item)).unwrap();
+        let version = self.current_hash(&item).0.to_vec();
+        (item, version, chunks.to_vec())
+    }
+}
+
+/// A window needs only the blocks that cover it: with the last block unobtainable, a window in
+/// the first blocks is answered with the right bytes, and a window touching the last block is
+/// refused as unobtainable with nothing handed over (never a short or partial success).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_window_needs_only_its_covering_blocks_and_one_missing_block_refuses_it() {
+    let mut fx = Fx::new().await;
+    let (item, version, chunks) = fx.item_missing_last_block("gap-r.bin");
+    let whole: Vec<u8> = chunks.concat();
+
+    let early = fx.ask_range(b"gap-1", &item, &version, 30_000, 20_000).await;
+    assert!(early.ok && early.ranged, "{}", early.error);
+    assert_eq!(
+        std::fs::read(fx.handoff_dir().join(&early.handoff_name)).unwrap(),
+        whole[30_000..50_000]
+    );
+
+    // Starts in a block we hold but ends in the one we lack: the whole window is refused.
+    let across = fx.ask_range(b"gap-2", &item, &version, 89_990, 20).await;
+    assert!(!across.ok);
+    assert_eq!(failure(&across), MaterializeFailure::Unobtainable);
+    assert!(across.handoff_name.is_empty());
+    assert_eq!(fx.handoff_names().len(), 1, "a refused window left a file");
+    assert!(names_in(&fx.staging()).is_empty());
+    assert_eq!(fx.repo().served(&fx.root, &item).unwrap(), Served::Never);
+}
+
+/// A delivered window is recorded in its own ledger (the OS may hold some bytes of this exact
+/// version), never as a handoff of the content; a refused one records nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delivered_window_is_recorded_as_a_window_and_not_as_a_handoff() {
+    let mut fx = Fx::new().await;
+    let (item, version) = fx.ranged_item("win-ledger.bin");
+    let refused = fx.ask_range(b"win-bad", &item, &[7u8; 32], 10, 20).await;
+    assert!(!refused.ok);
+    assert!(fx.repo().window_serve(&fx.root, &item).unwrap().is_none());
+
+    let served = fx.ask_range(b"win-ok", &item, &version, 10, 20).await;
+    assert!(served.ok && served.ranged, "{}", served.error);
+
+    eventually("the window to be recorded", || {
+        fx.repo().window_serve(&fx.root, &item).unwrap().is_some()
+    })
+    .await;
+    let recorded = fx.repo().window_serve(&fx.root, &item).unwrap().unwrap();
+    assert_eq!(recorded.version_hash.0.to_vec(), version);
+    assert!(fx.repo().handoff(&fx.root, &item).unwrap().is_none());
+    assert_eq!(fx.repo().served(&fx.root, &item).unwrap(), Served::Never);
+}
+
+/// A window whose covering bytes fail verification hands over nothing: no file, no tracking, no
+/// served record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_window_with_a_damaged_covering_block_is_refused_and_hands_over_nothing() {
+    let mut fx = Fx::new().await;
+    let (item, version) = fx.ranged_item("dmg-r.bin");
+    set_hook(
+        "dmg-r.bin",
+        Arc::new(|assembled: &Path| {
+            // The window is blocks 0 and 1 (90_000 bytes); damage the second one.
+            let mut file = std::fs::OpenOptions::new().write(true).open(assembled).unwrap();
+            std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(40_000 + 7)).unwrap();
+            std::io::Write::write_all(&mut file, &[0xAA; 8]).unwrap();
+            Box::pin(async {})
+        }),
+    );
+    let response = fx.ask_range(b"dmg-1", &item, &version, 39_990, 100).await;
+    assert!(!response.ok);
+    assert_eq!(failure(&response), MaterializeFailure::Unobtainable);
+    assert!(response.handoff_name.is_empty() && !response.ranged);
+    assert!(fx.handoff_names().is_empty(), "damaged bytes were handed over");
+    assert!(names_in(&fx.staging()).is_empty());
+    assert_eq!(fx.handoff_root().tracked_handoffs(), 0);
+    assert_eq!(fx.repo().served(&fx.root, &item).unwrap(), Served::Never);
+}
+
+/// A window refused for lack of room says so (the same typed reason as a whole-file read), hands
+/// nothing over, and is served once the room is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_window_on_a_full_volume_is_refused_as_low_disk_and_works_once_space_returns() {
+    let mut fx = Fx::new().await;
+    let (item, version) = fx.ranged_item("low-r.bin");
+    fx.state.enable_disk_headroom_enforcement();
+    fx.state.governance_config.set_headroom_override_bytes(Some(u64::MAX / 2)).unwrap();
+    fx.state.block_store.set_headroom_override_bytes(Some(u64::MAX / 2));
+
+    let refused = fx.ask_range(b"low-r1", &item, &version, 0, 100).await;
+    assert!(!refused.ok);
+    assert_eq!(failure(&refused), MaterializeFailure::LowDisk, "{}", refused.error);
+    assert!(fx.handoff_names().is_empty());
+    assert!(names_in(&fx.staging()).is_empty());
+
+    fx.state.governance_config.set_headroom_override_bytes(Some(0)).unwrap();
+    fx.state.block_store.set_headroom_override_bytes(Some(0));
+    let served = fx.ask_range(b"low-r2", &item, &version, 0, 100).await;
+    assert!(served.ok, "{}", served.error);
+    assert_eq!(served.range_length, 100);
+}
+
+/// A window of an item whose newer content is behind the publication fence is refused, and one
+/// whose named version is replaced while its blocks are assembled is out of date: neither hands
+/// bytes of the old version over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_window_is_refused_behind_the_fence_and_when_its_version_moves_mid_assembly() {
+    let mut fx = Fx::new().await;
+    let (item, version) = fx.ranged_item("fence-r.bin");
+    fx.commit("fence-r.bin", 2, &data_of(11, 31_000));
+    let fenced = fx.ask_range(b"fence-1", &item, &version, 0, 10).await;
+    assert_eq!(failure(&fenced), MaterializeFailure::PublicationPending);
+    assert!(fx.handoff_names().is_empty());
+
+    let (item, version) = fx.ranged_item("mid-r.bin");
+    let state = fx.state.clone();
+    let root = fx.root.clone();
+    let committed = Arc::new(AtomicBool::new(false));
+    set_hook(
+        "mid-r.bin",
+        Arc::new(move |_: &Path| {
+            if !committed.swap(true, Ordering::SeqCst) {
+                Fx::over(&state, &root).commit("mid-r.bin", 2, &data_of(7, 42_000));
+            }
+            Box::pin(async {})
+        }),
+    );
+    let moved = fx.ask_range(b"fence-2", &item, &version, 0, 10).await;
+    assert_eq!(failure(&moved), MaterializeFailure::VersionOutOfDate);
+    assert!(fx.handoff_names().is_empty(), "old bytes were handed over");
+    assert!(names_in(&fx.staging()).is_empty());
+    assert_eq!(fx.handoff_root().tracked_handoffs(), 0);
+}
+
+/// A ranged request that asks for progress is told the size of its covering blocks, not of the
+/// file, and completes only after they verified.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_windows_progress_counts_its_covering_blocks_only() {
+    let mut fx = Fx::new().await;
+    let (item, version) = fx.ranged_item("prog-r.bin");
+    let message = ShellIpcMessage {
+        payload: Some(Payload::MaterializeToTempRequest(MaterializeToTempRequest {
+            request_id: b"prog-r1".to_vec(),
+            root_id: hex::decode(&fx.root).unwrap(),
+            item_id: item.to_vec(),
+            requested_version_hash: version,
+            ranged: true,
+            range_offset: 10,
+            range_length: 20,
+            report_progress: true,
+        })),
+    };
+    assert!(materialize_message(&fx.context, &fx.requests, &fx.tx, &message));
+    let (progress, response) = fx.progress_then_response().await;
+    assert!(response.ok && response.ranged, "{}", response.error);
+    assert!(progress.iter().all(|m| m.total == 40_000), "{progress:?}");
+    let last = progress.last().unwrap();
+    assert!(last.done && last.completed == 40_000);
+    assert!(progress.iter().filter(|m| !m.done).all(|m| m.completed < m.total));
 }
 
 // ---- progress ------------------------------------------------------------------------------
@@ -1409,6 +1644,116 @@ async fn a_failed_verification_never_reports_completion() {
     assert!(fx.handoff_names().is_empty());
 }
 
+/// Holds the first assembly that reaches the hook for `path` until the returned `Notify` is
+/// released; later ones run through. The second `Notify` fires when the first one is held.
+fn hold_first_assembly(path: &str) -> (Arc<Notify>, Arc<Notify>) {
+    let reached = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let taken = Arc::new(AtomicBool::new(false));
+    {
+        let (reached, release) = (reached.clone(), release.clone());
+        set_hook(
+            path,
+            Arc::new(move |_: &Path| {
+                let (reached, release) = (reached.clone(), release.clone());
+                let first = !taken.swap(true, Ordering::SeqCst);
+                Box::pin(async move {
+                    if first {
+                        reached.notify_one();
+                        release.notified().await;
+                    }
+                })
+            }),
+        );
+    }
+    (reached, release)
+}
+
+/// A read cancelled while its bytes are written but not yet verified reports no completion (no
+/// `done`, nothing at the total), answers cancelled, and leaves no staging file, handoff file,
+/// registration or record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_read_never_reports_completion_and_leaves_nothing_behind() {
+    let mut fx = Fx::new().await;
+    let chunks = four_chunks();
+    let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+    fx.commit_blocks("cp.bin", 1, &refs);
+    let item = fx.repo().mint_item(&fx.root, "cp.bin").unwrap();
+    let (reached, _release) = hold_first_assembly("cp.bin");
+    fx.request_with_progress(b"req-cp", &item);
+    tokio::time::timeout(Duration::from_secs(10), reached.notified()).await.expect("assembly");
+    fx.cancel(b"req-cp");
+    let (progress, response) = fx.progress_then_response().await;
+    assert_eq!(failure(&response), MaterializeFailure::Cancelled);
+    assert!(progress.iter().all(|m| !m.done && m.completed < m.total), "{progress:?}");
+    eventually("the staging file to go", || names_in(&fx.staging()).is_empty()).await;
+    assert!(fx.handoff_names().is_empty());
+    assert_eq!(fx.handoff_root().tracked_handoffs(), 0);
+    assert!(fx.repo().handoff(&fx.root, &item).unwrap().is_none());
+    assert_eq!(fx.repo().served(&fx.root, &item).unwrap(), Served::Never);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(fx.rx.try_recv().is_err(), "a message followed the cancel");
+}
+
+/// A window cancelled mid-assembly leaves nothing either: no staging, no window file, nothing
+/// registered for revocation, nothing recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_window_leaves_no_file_no_registration_and_no_record() {
+    let mut fx = Fx::new().await;
+    let (item, version) = fx.ranged_item("cw.bin");
+    let (reached, _release) = hold_first_assembly("cw.bin");
+    fx.request_range(b"req-cw", &item, &version, 39_990, 100);
+    tokio::time::timeout(Duration::from_secs(10), reached.notified()).await.expect("assembly");
+    fx.cancel(b"req-cw");
+    let cancelled = fx.response().await;
+    assert_eq!(failure(&cancelled), MaterializeFailure::Cancelled);
+    assert!(cancelled.handoff_name.is_empty());
+    eventually("the staging file to go", || names_in(&fx.staging()).is_empty()).await;
+    assert!(fx.handoff_names().is_empty());
+    assert_eq!(fx.handoff_root().tracked_handoffs(), 0);
+    assert_eq!(fx.repo().served(&fx.root, &item).unwrap(), Served::Never);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(fx.rx.try_recv().is_err(), "a message followed the cancel");
+}
+
+/// The first bytes are readable before the whole file is assembled: while a whole-file request
+/// of the item is still assembling (no response, nothing handed over for it), a window of the
+/// same version is answered with exactly its verified bytes. Finishing the whole file afterwards
+/// is unaffected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_window_is_answered_while_the_whole_file_is_still_assembling() {
+    let mut fx = Fx::new().await;
+    let chunks = three_blocks();
+    let whole: Vec<u8> = chunks.concat();
+    let (item, version) = fx.ranged_item("early.bin");
+    let (reached, release) = hold_first_assembly("early.bin");
+    fx.request_with_progress(b"req-whole", &item);
+    tokio::time::timeout(Duration::from_secs(10), reached.notified()).await.expect("assembly");
+
+    fx.request_range(b"req-win", &item, &version, 0, 4096);
+    let window = loop {
+        let delivery = fx.delivery().await;
+        if let Some(written) = delivery.written {
+            let _ = written.send(true);
+        }
+        match delivery.message.payload {
+            Some(Payload::MaterializeProgress(_)) => {}
+            Some(Payload::MaterializeToTempResponse(response)) => break response,
+            other => panic!("unexpected message {other:?}"),
+        }
+    };
+    assert_eq!(window.request_id, b"req-win".to_vec(), "the unfinished request answered");
+    assert!(window.ok && window.ranged, "{}", window.error);
+    assert_eq!(std::fs::read(fx.handoff_dir().join(&window.handoff_name)).unwrap(), whole[..4096]);
+    assert_eq!(fx.handoff_names().len(), 1, "the unfinished whole file was named in handoff/");
+    assert!(fx.repo().handoff(&fx.root, &item).unwrap().is_none());
+
+    release.notify_one();
+    let (_progress, full) = fx.progress_then_response().await;
+    assert!(full.ok && !full.ranged, "{}", full.error);
+    assert_eq!(std::fs::read(fx.handoff_dir().join(&full.handoff_name)).unwrap(), whole);
+}
+
 /// A request that did not ask for progress gets only its response.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_progress_is_sent_unless_asked_for() {
@@ -1441,4 +1786,110 @@ fn assembly_progress_is_monotonic_bounded_and_complete_only_when_finished() {
     let empty = AssemblyProgress::default();
     empty.begin(0);
     assert_eq!(empty.snapshot(), None);
+}
+
+impl Fx {
+    fn link_key(&self) -> String {
+        self.state
+            .replica_coordinator
+            .link_repository()
+            .live_link_key_for_group(GROUP)
+            .unwrap()
+            .expect("the provider link")
+    }
+
+    fn pin_headroom(&self, bytes: u64) {
+        self.state.enable_disk_headroom_enforcement();
+        self.state.governance_config.set_headroom_override_bytes(Some(bytes)).unwrap();
+    }
+}
+
+/// A first read refused for lack of room shows the folder as waiting for disk space (the receive
+/// path's wording) while still handing nothing over; a read that gets through once the room is
+/// back clears it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_read_marks_the_link_waiting_for_disk_space_and_a_later_read_clears_it() {
+    let mut fx = Fx::new().await;
+    let item = fx.published_item("big.bin", &data_of(31, 1000));
+    let key = fx.link_key();
+    fx.pin_headroom(u64::MAX / 2);
+
+    let refused = fx.ask(b"low-1", &item).await;
+    assert_eq!(failure(&refused), MaterializeFailure::LowDisk);
+    assert!(fx.handoff_names().is_empty());
+    let info = fx.state.degraded_link_info(&key).expect("the refusal marks the link degraded");
+    assert!(
+        info.cause == crate::link_registry::DegradedCause::WaitingForDiskSpace,
+        "{}",
+        info.reason
+    );
+
+    // Still refused: stays degraded, one entry.
+    assert_eq!(failure(&fx.ask(b"low-2", &item).await), MaterializeFailure::LowDisk);
+    assert!(fx.state.is_link_degraded(&key));
+
+    fx.pin_headroom(0);
+    let served = fx.ask(b"ok-1", &item).await;
+    assert!(served.ok, "{}", served.error);
+    assert!(!fx.state.is_link_degraded(&key), "a read after space returned clears the state");
+}
+
+/// A read that fails for another reason never claims the disk is full.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unrelated_read_failure_does_not_mark_the_link_waiting_for_disk_space() {
+    let mut fx = Fx::new().await;
+    fx.pin_headroom(0);
+    let key = fx.link_key();
+    let response = fx.ask(b"nf", &[7; 16]).await;
+    assert_eq!(failure(&response), MaterializeFailure::NotFound);
+    assert!(!fx.state.is_link_degraded(&key));
+    // A version that is no longer current.
+    let item = fx.unpublished_item("old.bin", &data_of(32, 1000));
+    fx.request(b"stale", &item, &[9; 32]);
+    let response = fx.response().await;
+    assert_eq!(failure(&response), MaterializeFailure::VersionOutOfDate);
+    assert!(!fx.state.is_link_degraded(&key));
+}
+
+/// With no further read, the periodic re-check measures the staging volume (the link key is not
+/// a path) and clears the waiting state once room is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_periodic_recheck_clears_a_provider_link_once_space_is_back() {
+    let mut fx = Fx::new().await;
+    let item = fx.published_item("big.bin", &data_of(33, 1000));
+    let key = fx.link_key();
+    fx.pin_headroom(u64::MAX / 2);
+    assert_eq!(failure(&fx.ask(b"low", &item).await), MaterializeFailure::LowDisk);
+    fx.state.links.force_degraded_recheck_due_now(&key, 1);
+    fx.state.recheck_degraded_links();
+    assert!(fx.state.is_link_degraded(&key), "still no room");
+    fx.pin_headroom(0);
+    fx.state.links.force_degraded_recheck_due_now(&key, 1);
+    fx.state.recheck_degraded_links();
+    assert!(!fx.state.is_link_degraded(&key));
+}
+
+/// A first read that finds the volume short of free space is refused with the low-disk reason,
+/// hands nothing to the OS and leaves nothing behind; once the space is back the same read
+/// succeeds with the right bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_on_a_full_volume_is_refused_as_low_disk_and_works_once_space_returns() {
+    let mut fx = Fx::new().await;
+    let data = data_of(51, 30_000);
+    let item = fx.published_item("big.bin", &data);
+    fx.state.enable_disk_headroom_enforcement();
+    // A reserve no real disk can meet stands for a full volume.
+    fx.state.governance_config.set_headroom_override_bytes(Some(u64::MAX / 2)).unwrap();
+    fx.state.block_store.set_headroom_override_bytes(Some(u64::MAX / 2));
+
+    let response = fx.ask(b"req-full", &item).await;
+    assert!(!response.ok);
+    assert_eq!(failure(&response), MaterializeFailure::LowDisk, "{}", response.error);
+    assert!(fx.handoff_names().is_empty(), "nothing is handed over: {:?}", fx.handoff_names());
+    assert!(names_in(&fx.staging()).is_empty(), "staging is left clean");
+
+    fx.state.governance_config.set_headroom_override_bytes(Some(0)).unwrap();
+    fx.state.block_store.set_headroom_override_bytes(Some(0));
+    let response = fx.ask(b"req-room", &item).await;
+    assert!(response.ok, "{}", response.error);
 }

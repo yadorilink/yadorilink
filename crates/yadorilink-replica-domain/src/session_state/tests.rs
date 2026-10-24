@@ -1,3 +1,4 @@
+// apple-cfg-file: macos-only mirrors for_host_platform
 #![cfg(test)]
 
 use super::{EnrollmentKind, MaterializationPolicy, MaterializationState, ProviderKind};
@@ -38,6 +39,7 @@ fn provider_kinds_persist_under_their_exact_names() {
         (ProviderKind::None, "none"),
         (ProviderKind::MacFileProvider, "mac_file_provider"),
         (ProviderKind::WindowsCfapi, "windows_cfapi"),
+        (ProviderKind::IosFileProvider, "ios_file_provider"),
     ] {
         assert_eq!(kind.as_db_str(), name);
         assert_eq!(ProviderKind::from_db_str(name), kind);
@@ -46,7 +48,10 @@ fn provider_kinds_persist_under_their_exact_names() {
 
 #[test]
 fn the_host_platform_selects_its_own_provider_adapter() {
-    let expected = if cfg!(target_os = "macos") {
+    // apple-cfg: ios-explicit iOS serves its own File Provider kind
+    let expected = if cfg!(target_os = "ios") {
+        Some(ProviderKind::IosFileProvider)
+    } else if cfg!(target_vendor = "apple") {
         Some(ProviderKind::MacFileProvider)
     } else if cfg!(windows) {
         Some(ProviderKind::WindowsCfapi)

@@ -177,6 +177,10 @@ impl From<yadorilink_root_authority::RootAuthorityError> for SyncSqliteError {
             // A pause that will lift: an I/O-shaped failure to retry, deliberately not
             // `NotFound`, which callers may read as "nothing there".
             E::Quiescing(msg) => SyncSqliteError::Io(std::io::Error::other(msg)),
+            // Fenced out or refused at open: an `Io`-shaped refusal, like a lost sidecar.
+            E::StaleWriter(msg) | E::WriterLeaseHeld(msg) => {
+                SyncSqliteError::Io(std::io::Error::other(msg))
+            }
             // Lossless, not flattened to a message string: `link.rs` gives
             // `AmbiguousLink` a real sync-sqlite call site with the same "callers match on the
             // structured variant, not the message" requirement

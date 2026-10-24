@@ -97,7 +97,14 @@ pub struct GroupCommitLimits {
     /// barrier), small enough that compacting one segment is a bounded
     /// amount of work.
     pub segment_target_bytes: u64,
+    /// Read-only segment handles the store keeps open (a cache: a dropped handle costs a
+    /// reopen). Open descriptors are shared by everything in the process, so an embedding host
+    /// with several engines lowers it per engine.
+    pub max_cached_readers: usize,
 }
+
+/// Segment handles an engine caches by default.
+pub const DEFAULT_CACHED_SEGMENT_READERS: usize = 128;
 
 impl Default for GroupCommitLimits {
     fn default() -> Self {
@@ -107,13 +114,14 @@ impl Default for GroupCommitLimits {
             max_delay: Duration::from_millis(5),
             queue_max_bytes: 256 * 1024 * 1024,
             segment_target_bytes: 1024 * 1024 * 1024,
+            max_cached_readers: DEFAULT_CACHED_SEGMENT_READERS,
         }
     }
 }
 
 impl GroupCommitLimits {
-    /// The defaults, with any bound a diagnostic environment variable
-    /// overrides.
+    /// The defaults, with any bound `lookup` (a name to value mapping, such as the desktop
+    /// daemon's diagnostic environment variables) overrides.
     ///
     /// A **measurement seam, not a tuning knob**. Whether a given host's
     /// storage absorbs a wider group is a property of that storage, and
@@ -122,26 +130,25 @@ impl GroupCommitLimits {
     /// the comparison. Hard-coding whatever one machine's sweep liked is
     /// precisely the mistake this exists to avoid, which is why nothing in
     /// a shipping binary sets any of these and unset is exactly
-    /// [`GroupCommitLimits::default`].
+    /// [`GroupCommitLimits::default`]. This function never reads the process
+    /// environment; its caller supplies the lookup.
     ///
     /// A value that does not parse, or parses to zero, is ignored rather
     /// than honoured: zero would make every group empty or every segment
     /// roll over on its first record.
-    pub fn from_env() -> Self {
-        fn override_usize(name: &str, default: usize) -> usize {
-            std::env::var(name)
-                .ok()
+    pub fn from_lookup(lookup: &dyn Fn(&str) -> Option<String>) -> Self {
+        let override_usize = |name: &str, default: usize| -> usize {
+            lookup(name)
                 .and_then(|raw| raw.trim().parse::<usize>().ok())
                 .filter(|&value| value > 0)
                 .unwrap_or(default)
-        }
-        fn override_u64(name: &str, default: u64) -> u64 {
-            std::env::var(name)
-                .ok()
+        };
+        let override_u64 = |name: &str, default: u64| -> u64 {
+            lookup(name)
                 .and_then(|raw| raw.trim().parse::<u64>().ok())
                 .filter(|&value| value > 0)
                 .unwrap_or(default)
-        }
+        };
         let defaults = Self::default();
         Self {
             max_blocks: override_usize(
@@ -160,6 +167,10 @@ impl GroupCommitLimits {
             segment_target_bytes: override_u64(
                 "YADORILINK_DIAGNOSTIC_SEGMENT_TARGET_BYTES",
                 defaults.segment_target_bytes,
+            ),
+            max_cached_readers: override_usize(
+                "YADORILINK_DIAGNOSTIC_SEGMENT_READERS",
+                defaults.max_cached_readers,
             ),
         }
     }
@@ -1126,4 +1137,28 @@ pub(crate) fn ensure_segments_directory(root: &Path) -> Result<(), StorageError>
         crate::fs_ops::sync_directory(root)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod limits_lookup_tests {
+    use super::*;
+
+    /// The lookup a caller supplies selects the bounds; a value that is not a positive number
+    /// keeps the default, and nothing here reads the process environment.
+    #[test]
+    fn a_lookup_overrides_the_named_bounds_and_ignores_unusable_values() {
+        let defaults = GroupCommitLimits::default();
+        let tuned = GroupCommitLimits::from_lookup(&|name| match name {
+            "YADORILINK_DIAGNOSTIC_GROUP_MAX_BLOCKS" => Some("7".to_owned()),
+            "YADORILINK_DIAGNOSTIC_SEGMENT_TARGET_BYTES" => Some("0".to_owned()),
+            "YADORILINK_DIAGNOSTIC_SEGMENT_READERS" => Some("9".to_owned()),
+            "YADORILINK_DIAGNOSTIC_GROUP_MAX_BYTES" => Some("many".to_owned()),
+            _ => None,
+        });
+        assert_eq!(tuned.max_blocks, 7);
+        assert_eq!(tuned.max_cached_readers, 9);
+        assert_eq!(tuned.segment_target_bytes, defaults.segment_target_bytes);
+        assert_eq!(tuned.max_bytes, defaults.max_bytes);
+        assert_eq!(GroupCommitLimits::from_lookup(&|_| None).max_blocks, defaults.max_blocks);
+    }
 }

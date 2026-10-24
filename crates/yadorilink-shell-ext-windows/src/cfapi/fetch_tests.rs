@@ -7,13 +7,15 @@
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_ipc_proto::shellipc::shell_ipc_message::Payload;
-use yadorilink_ipc_proto::shellipc::{MaterializeToTempResponse, ShellIpcMessage};
+use yadorilink_ipc_proto::shellipc::{
+    MaterializeProgress, MaterializeToTempResponse, ShellIpcMessage,
+};
 
 use crate::provider_namespace::{evict, placeholder_info};
 
@@ -42,19 +44,43 @@ fn content() -> Vec<u8> {
 
 /// A daemon that answers every materialization with a fresh handoff file of [`content`].
 fn spawn_daemon(pipe: String, handoff: PathBuf, requests: Arc<AtomicUsize>, size: usize) {
+    spawn_refusing_daemon(pipe, handoff, requests, size, Arc::new(AtomicI32::new(0)));
+}
+
+/// Like [`spawn_daemon`], but while `refuse` holds a `MaterializeFailure` number other than 0
+/// every request is answered with that failure instead of bytes.
+fn spawn_refusing_daemon(
+    pipe: String,
+    handoff: PathBuf,
+    requests: Arc<AtomicUsize>,
+    size: usize,
+    refuse: Arc<AtomicI32>,
+) {
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        runtime.block_on(accept_forever(pipe, handoff, requests, size));
+        runtime.block_on(accept_forever(pipe, handoff, requests, size, refuse));
     });
 }
 
-async fn accept_forever(pipe: String, handoff: PathBuf, requests: Arc<AtomicUsize>, size: usize) {
+async fn accept_forever(
+    pipe: String,
+    handoff: PathBuf,
+    requests: Arc<AtomicUsize>,
+    size: usize,
+    refuse: Arc<AtomicI32>,
+) {
     let mut server = ServerOptions::new().first_pipe_instance(true).create(&pipe).unwrap();
     loop {
         server.connect().await.unwrap();
         let stream = server;
         server = ServerOptions::new().create(&pipe).unwrap();
-        tokio::spawn(serve_connection(stream, handoff.clone(), requests.clone(), size));
+        tokio::spawn(serve_connection(
+            stream,
+            handoff.clone(),
+            requests.clone(),
+            size,
+            refuse.clone(),
+        ));
     }
 }
 
@@ -63,12 +89,41 @@ async fn serve_connection(
     handoff: PathBuf,
     requests: Arc<AtomicUsize>,
     size: usize,
+    refuse: Arc<AtomicI32>,
 ) {
     while let Ok(Some(message)) = read_message::<ShellIpcMessage>(&mut stream).await {
         let Some(Payload::MaterializeToTempRequest(request)) = message.payload else {
             continue;
         };
         let n = requests.fetch_add(1, Ordering::SeqCst) + 1;
+        let refusal = refuse.load(Ordering::SeqCst);
+        if refusal != 0 {
+            let response = MaterializeToTempResponse {
+                request_id: request.request_id,
+                ok: false,
+                failure: refusal,
+                error: "refused by the stand-in daemon".into(),
+                ..Default::default()
+            };
+            let reply = Payload::MaterializeToTempResponse(response);
+            let _ = write_message(&mut stream, &ShellIpcMessage { payload: Some(reply) }).await;
+            continue;
+        }
+        // A request that asked for progress gets it before the answer, as the daemon does:
+        // monotonic, below the total until the content is verified, then one `done`.
+        if request.report_progress {
+            for step in 1..=4u64 {
+                let progress = Payload::MaterializeProgress(MaterializeProgress {
+                    request_id: request.request_id.clone(),
+                    completed: step * 25,
+                    total: 100,
+                    done: step == 4,
+                });
+                let _ =
+                    write_message(&mut stream, &ShellIpcMessage { payload: Some(progress) }).await;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
         let name = format!("handoff-{n}.bin");
         // A ranged request is answered with that window of the version it names; a request
         // that does not ask for one gets the whole file.
@@ -175,6 +230,74 @@ fn a_provider_item_is_fetched_evicted_and_fetched_again() {
     let tail = read_window(&path, (SIZE - 10) as u64, 10);
     assert_eq!(tail, (SIZE - 10..SIZE).map(byte_at).collect::<Vec<_>>());
     assert_eq!(requests.load(Ordering::SeqCst), 2);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = super::unregister(&root);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// The peer is unreachable or the disk is full (the daemon answers with a failure, not bytes):
+/// the read of a not-downloaded file fails instead of hanging or returning short data, the
+/// placeholder stays not downloaded, and once the daemon can serve again the same file reads
+/// back exactly.
+#[test]
+#[ignore = "real Cloud Files state; run on a Windows machine"]
+fn a_refused_fetch_fails_the_read_and_the_file_reads_once_the_daemon_can_serve() {
+    use yadorilink_ipc_proto::shellipc::MaterializeFailure;
+    let _serial = one_at_a_time();
+    let tmp = std::env::temp_dir().join(format!("yl-refuse-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let (root, handoff) = (tmp.join("root"), tmp.join("provider").join("handoff"));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&handoff).unwrap();
+    let pipe = format!(r"\\.\pipe\yl-refuse-test-{}", std::process::id());
+    // SAFETY: this test runs alone (`--test-threads=1`); nothing else reads the environment.
+    unsafe {
+        std::env::set_var("YADORILINK_PROVIDER_TEMP_ROOT", tmp.join("provider"));
+        std::env::set_var("YADORILINK_SHELL_IPC_PIPE", &pipe);
+    }
+    super::FETCHES.lock().unwrap().clear();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let refuse = Arc::new(AtomicI32::new(MaterializeFailure::Unobtainable as i32));
+    spawn_refusing_daemon(pipe, handoff.clone(), requests.clone(), SIZE, refuse.clone());
+
+    let mut content_version = VERSION.to_vec();
+    content_version.extend_from_slice(&1u64.to_le_bytes());
+    crate::provider_client::set_shown_versions(ROOT_ID, [(ITEM_ID, content_version.as_slice())]);
+    super::register_and_connect_provider(ROOT_ID, &root).expect("register and connect");
+    super::create_item_placeholder(
+        &yadorilink_fs_platform::durable_dir::NoLedger,
+        &root,
+        "away.bin",
+        ITEM_ID,
+        SIZE as u64,
+        0,
+        false,
+    )
+    .expect("the placeholder");
+    let path = root.join("away.bin");
+
+    for failure in [MaterializeFailure::Unobtainable, MaterializeFailure::LowDisk] {
+        refuse.store(failure as i32, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        // The read runs on its own thread so a hang fails this test instead of blocking it.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let read_path = path.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(std::fs::read(&read_path).map(|bytes| bytes.len()));
+        });
+        let read = receiver
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("{failure:?}: the read hung for over 60 s"));
+        println!("{failure:?}: read {read:?} after {:?}", started.elapsed());
+        assert!(read.is_err(), "{failure:?}: a refused fetch must fail the read");
+        let info = placeholder_info(&path).unwrap();
+        assert!(info.dehydrated, "{failure:?}: nothing is downloaded after a refusal: {info:?}");
+        assert!(std::fs::read_dir(&handoff).unwrap().next().is_none(), "a handoff file was left");
+    }
+
+    refuse.store(0, Ordering::SeqCst);
+    assert_eq!(std::fs::read(&path).unwrap(), content(), "the file reads once the daemon serves");
 
     let _ = std::fs::remove_file(&path);
     let _ = super::unregister(&root);
@@ -482,4 +605,130 @@ fn a_cancelled_fetch_stops_asking_for_windows() {
     );
     let _ = receiver.recv_timeout(std::time::Duration::from_secs(30));
     room.finish();
+}
+
+/// Reads a not-downloaded provider item whose fetch the daemon refuses with `failure`, and
+/// returns the error the reader gets.
+fn refused_read_error(failure: i32) -> std::io::Error {
+    let _serial = one_at_a_time();
+    let tmp = std::env::temp_dir().join(format!("yl-refused-{}-{failure}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let (root, handoff) = (tmp.join("root"), tmp.join("provider").join("handoff"));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&handoff).unwrap();
+    let pipe = format!(r"\\.\pipe\yl-refused-test-{}-{failure}", std::process::id());
+    // SAFETY: the tests of this module run one at a time.
+    unsafe {
+        std::env::set_var("YADORILINK_PROVIDER_TEMP_ROOT", tmp.join("provider"));
+        std::env::set_var("YADORILINK_SHELL_IPC_PIPE", &pipe);
+    }
+    spawn_refusing_daemon(
+        pipe,
+        handoff,
+        Arc::new(AtomicUsize::new(0)),
+        SIZE,
+        Arc::new(AtomicI32::new(failure)),
+    );
+    let mut content_version = VERSION.to_vec();
+    content_version.extend_from_slice(&1u64.to_le_bytes());
+    crate::provider_client::set_shown_versions(ROOT_ID, [(ITEM_ID, content_version.as_slice())]);
+    super::register_and_connect_provider(ROOT_ID, &root).expect("register and connect");
+    super::create_item_placeholder(
+        &yadorilink_fs_platform::durable_dir::NoLedger,
+        &root,
+        "big.bin",
+        ITEM_ID,
+        SIZE as u64,
+        0,
+        false,
+    )
+    .expect("the placeholder");
+    let path = root.join("big.bin");
+    let error = std::fs::read(&path).expect_err("a refused fetch must fail the read");
+    assert!(placeholder_info(&path).unwrap().dehydrated, "nothing was downloaded");
+    let _ = std::fs::remove_file(&path);
+    let _ = super::unregister(&root);
+    let _ = std::fs::remove_dir_all(&tmp);
+    error
+}
+
+/// Explorer and applications can tell a full disk from an unreachable device: each refusal ends
+/// the read with its own error, not one generic cloud-file failure.
+#[test]
+#[ignore = "real Cloud Files state; run on a Windows machine"]
+fn a_refused_fetch_fails_the_read_with_the_reason() {
+    use yadorilink_ipc_proto::shellipc::MaterializeFailure;
+    let disk = refused_read_error(MaterializeFailure::LowDisk as i32);
+    let offline = refused_read_error(MaterializeFailure::Unobtainable as i32);
+    let other = refused_read_error(MaterializeFailure::NotReady as i32);
+    let moved = refused_read_error(MaterializeFailure::VersionOutOfDate as i32);
+    println!(
+        "low disk: {disk:?}\nunobtainable: {offline:?}\nnot ready: {other:?}\nversion: {moved:?}"
+    );
+    let codes = [
+        disk.raw_os_error(),
+        offline.raw_os_error(),
+        other.raw_os_error(),
+        moved.raw_os_error(),
+    ];
+    for (i, a) in codes.iter().enumerate() {
+        for b in &codes[i + 1..] {
+            assert_ne!(a, b, "{codes:?}");
+        }
+    }
+    // ERROR_CLOUD_FILE_INSUFFICIENT_RESOURCES, ..._NETWORK_UNAVAILABLE, ..._UNSUCCESSFUL, and
+    // ..._NOT_IN_SYNC for a version that is no longer available.
+    let not_in_sync = windows::Win32::Foundation::ERROR_CLOUD_FILE_NOT_IN_SYNC.0 as i32;
+    assert_eq!(codes, [Some(387), Some(388), Some(389), Some(not_in_sync)]);
+}
+
+/// Reading a not-downloaded file reports how far the fetch is to the operating system: every
+/// report below the total (the read is what completes it), never backwards, and the content
+/// is complete and right afterwards.
+#[test]
+#[ignore = "real Cloud Files state; run on a Windows machine"]
+fn a_fetch_reports_truthful_progress_to_the_system() {
+    let _serial = one_at_a_time();
+    let tmp = std::env::temp_dir().join(format!("yl-progress-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let (root, handoff) = (tmp.join("root"), tmp.join("provider").join("handoff"));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&handoff).unwrap();
+    let pipe = format!(r"\\.\pipe\yl-progress-test-{}", std::process::id());
+    // SAFETY: the tests of this module run one at a time.
+    unsafe {
+        std::env::set_var("YADORILINK_PROVIDER_TEMP_ROOT", tmp.join("provider"));
+        std::env::set_var("YADORILINK_SHELL_IPC_PIPE", &pipe);
+    }
+    spawn_daemon(pipe, handoff, Arc::new(AtomicUsize::new(0)), SIZE);
+    let mut content_version = VERSION.to_vec();
+    content_version.extend_from_slice(&1u64.to_le_bytes());
+    crate::provider_client::set_shown_versions(ROOT_ID, [(ITEM_ID, content_version.as_slice())]);
+    super::register_and_connect_provider(ROOT_ID, &root).expect("register and connect");
+    super::create_item_placeholder(
+        &yadorilink_fs_platform::durable_dir::NoLedger,
+        &root,
+        "progress.bin",
+        ITEM_ID,
+        SIZE as u64,
+        0,
+        false,
+    )
+    .expect("the placeholder");
+    let path = root.join("progress.bin");
+    super::PROGRESS_REPORTS.lock().unwrap().clear();
+    assert_eq!(std::fs::read(&path).unwrap(), content());
+    let reports = super::PROGRESS_REPORTS.lock().unwrap().clone();
+    println!("progress reports: {reports:?}");
+    assert!(reports.len() >= 2, "the fetch reported progress: {reports:?}");
+    let mut last = 0;
+    for (total, completed) in &reports {
+        assert_eq!(*total, SIZE as u64, "the total is the range the reader needed");
+        assert!(*completed < *total, "complete before the read is: {reports:?}");
+        assert!(*completed > last, "not increasing: {reports:?}");
+        last = *completed;
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = super::unregister(&root);
+    let _ = std::fs::remove_dir_all(&tmp);
 }

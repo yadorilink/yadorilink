@@ -41,3 +41,4 @@ add a line naming the release that first carries the new pair:
     - Generation PROTOCOL_VERSION = N, RPC_VERSION = M: first release X.Y.Z
 
 - Generation PROTOCOL_VERSION = 4, RPC_VERSION = 2: first release 0.0.0
+- SCHEMA_VERSION = 133: adds the ledger of file windows served to the OS (lets a large file read through the OS partial-content API be freed); local state is not migrated before 1.0, so the local state must be recreated.

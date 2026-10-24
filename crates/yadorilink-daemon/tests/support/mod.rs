@@ -38,6 +38,7 @@ pub mod control_socket_client;
 #[allow(dead_code)]
 pub mod dag_sec;
 pub mod fake_coordination;
+pub mod quiescence;
 pub mod topology;
 
 use fake_coordination::FakeCoordination;
@@ -60,7 +61,6 @@ pub async fn register_with_fake(
     device_id: &str,
     groups: &[&str],
 ) {
-    ensure_no_public_relays();
     let verifying = ensure_device_signing_key(state);
     fake.register_device(device_id, verifying, NETMAP_ENDPOINT_PLACEHOLDER.to_string(), groups);
 }
@@ -73,30 +73,28 @@ pub async fn register_with_fake(
 /// well-formed. Port 0 makes it an address nothing can be reached at.
 pub const NETMAP_ENDPOINT_PLACEHOLDER: &str = "127.0.0.1:0";
 
-/// Keeps this test process off public relay infrastructure.
-///
-/// A daemon now starts its reconciliation stack unconditionally, and its
-/// default relay configuration is Iroh's own public relays. That is right for
-/// production and wrong for a test: a suite whose result depends on reachable
-/// third-party servers reports the network's state as often as the code's, and
-/// a test that quietly relays through public infrastructure is also telling
-/// that infrastructure who is running it.
-///
-/// A test that needs a relay runs one in-process — see
-/// `yadorilink_sync_substrate::testing::InProcessRelay` — and configures it
-/// explicitly rather than inheriting one.
-///
-/// Called from [`ensure_isolated_config_dir`] rather than left to each test,
-/// for the same reason that function exists: a hermetic-test property nobody
-/// has to remember is the only kind that holds.
-pub fn ensure_no_public_relays() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        // SAFETY: inside a `Once`, before any test in this process has had a
-        // chance to read it -- the same single-shot, process-wide pattern
-        // `ensure_isolated_config_dir` itself uses.
-        unsafe { std::env::set_var("YADORILINK_SYNC_RELAYS", "none") };
-    });
+/// Renames `from`, tolerating only that it was already gone: a peer's delete may have
+/// materialized between the caller's existence check and the rename. Any other failure (on Windows,
+/// a file the daemon holds open) is a real defect and fails the test.
+#[allow(dead_code)]
+pub fn rename_unless_vanished(from: &std::path::Path, to: &std::path::Path) {
+    // quiescence-exempt: callers pass files, or a directory they quiesced first
+    match std::fs::rename(from, to) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("rename {} -> {} failed: {e}", from.display(), to.display()),
+    }
+}
+
+/// Removes the file `path`, tolerating only that it was already gone. Any other failure is a real
+/// defect and fails the test.
+#[allow(dead_code)]
+pub fn remove_file_unless_vanished(path: &std::path::Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("remove {} failed: {e}", path.display()),
+    }
 }
 
 /// Test-isolation fix (found investigating a session-wide daemon-test
@@ -115,7 +113,6 @@ pub fn ensure_no_public_relays() {
 /// no daemon-level test ever touches real per-user state, and concurrent test
 /// processes can never collide on this path.
 pub fn ensure_isolated_config_dir() {
-    ensure_no_public_relays();
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
         // Leaked deliberately: this directory must outlive every test in this
@@ -497,6 +494,19 @@ pub fn real_entry_names(dir: &std::path::Path) -> Vec<String> {
     // one conflict copy, listed the other way round.
     names.sort();
     names
+}
+
+/// The engine tuning of a test engine whose installation witness is kept outside every data
+/// area, in one directory for the whole test process, as a backup of the data would not include
+/// it. Witness files are named by database path, so engines do not share a witness.
+#[allow(dead_code)]
+pub fn tuning_with_outside_witness() -> yadorilink_daemon::engine_tuning::EngineTuning {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let dir = DIR.get_or_init(|| tempfile::tempdir().unwrap());
+    yadorilink_daemon::engine_tuning::EngineTuning {
+        witness: yadorilink_daemon::install_witness::WitnessPlacement::At(dir.path().to_path_buf()),
+        ..Default::default()
+    }
 }
 
 /// Opens a `SyncState` the same way production does (`SyncState::open` —

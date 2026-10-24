@@ -191,10 +191,13 @@ fn device_key_pinning_refuses_a_changed_key() {
 
     // Already-pinned matching key: accepted, no change.
     pins.insert("device-a".to_string(), hex::encode([7u8; 32]));
-    assert!(!pin_peer_signing_key(&mut pins, "device-a", &[7u8; 32]).unwrap());
+    assert!(!pin_peer_signing_key(std::path::Path::new("."), &mut pins, "device-a", &[7u8; 32])
+        .unwrap());
 
     // Changed key: refused.
-    assert!(pin_peer_signing_key(&mut pins, "device-a", &[9u8; 32]).unwrap());
+    assert!(
+        pin_peer_signing_key(std::path::Path::new("."), &mut pins, "device-a", &[9u8; 32]).unwrap()
+    );
 }
 
 /// Everything that is not a 32-byte Ed25519 key is one outcome:
@@ -870,7 +873,7 @@ async fn netmap_connection_enables_tcp_keepalive() {
     ws_netmap::enable_dead_peer_detection(&stream).unwrap();
     let sock = socket2::SockRef::from(&stream);
     assert!(sock.keepalive().unwrap());
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     assert_eq!(sock.tcp_keepalive_time().unwrap(), Duration::from_secs(30));
 }
 
@@ -1414,4 +1417,104 @@ async fn a_batch_pending_across_a_restart_is_published_once_the_plane_is_back() 
         second.stop_background_tasks_for_tests();
         second.release_reference_cycles_for_tests();
     }
+}
+
+/// A netmap upgrade answered with the exact `403 terms_consent_required` body of the coordination
+/// service: the attempt fails, the credential learns the block (status shows it), and nothing the
+/// device knows is withdrawn (peers and authorization stay).
+#[tokio::test]
+async fn a_consent_refused_netmap_upgrade_is_remembered_and_withdraws_nothing() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let body = r#"{"error":"terms_consent_required","terms_version":"placeholder-v0","message":"m"}"#;
+            let response = format!(
+                "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+
+    let state = test_state();
+    state.seed_netmap_peer_identity("device-b", Some([7u8; 32]));
+    let config = OrchestratorConfig {
+        coordination_addr: format!("http://{addr}"),
+        auth: yadorilink_fapi_client::test_support::offline_auth(),
+        device_id: "local-device".into(),
+    };
+    assert_eq!(config.auth.block(), None);
+    let diff_state = NetmapDiffState::seeded_from_current_authorization(&state);
+
+    let outcome = run_netmap_attempt(&config, &state, &diff_state).await;
+
+    assert!(outcome.is_err(), "a refused upgrade is a failed attempt");
+    assert_eq!(
+        config.auth.block(),
+        Some(yadorilink_fapi_client::CoordinationBlock::TermsConsentRequired {
+            terms_version: Some("placeholder-v0".into())
+        })
+    );
+    assert_eq!(state.authority.peer_signing_key("device-b"), Some([7u8; 32]));
+}
+
+/// While blocked the loop waits at least a minute between attempts, however fresh its backoff.
+#[test]
+fn a_blocked_coordination_service_is_retried_no_faster_than_once_a_minute() {
+    for attempt in 0..4 {
+        assert!(reconnect_delay_for(attempt, true) >= BLOCKED_RECONNECT_DELAY);
+    }
+    assert!(reconnect_delay_for(0, false) < BLOCKED_RECONNECT_DELAY);
+}
+
+/// The refusal's body may arrive after its headers; it is then not recognised (and must not clear
+/// anything), but the 403 alone still slows the loop down.
+#[tokio::test]
+async fn a_forbidden_upgrade_with_a_late_body_is_not_misread_and_still_backs_off() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let body = r#"{"error":"terms_consent_required","terms_version":"v"}"#;
+            let head = format!(
+                "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes()).await;
+            let _ = stream.flush().await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = stream.write_all(body.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    let state = test_state();
+    let config = OrchestratorConfig {
+        coordination_addr: format!("http://{addr}"),
+        auth: yadorilink_fapi_client::test_support::offline_auth(),
+        device_id: "local-device".into(),
+    };
+    let diff_state = NetmapDiffState::seeded_from_current_authorization(&state);
+    // A block learned earlier from a complete refusal stays: the unread body clears nothing.
+    config.auth.observe_status(403, br#"{"error":"terms_consent_required","terms_version":"v"}"#);
+    let error = run_netmap_attempt(&config, &state, &diff_state).await.expect_err("refused");
+    assert!(upgrade_was_forbidden(&error), "{error}");
+    assert!(!upgrade_was_forbidden(&DaemonError::Config("x".into())));
+    assert!(config.auth.block().is_some(), "an unreadable 403 body must not lift the block");
+    // The loop's wiring: a forbidden upgrade or a block waits the full blocked delay, an ordinary
+    // failure or a clean end does not.
+    assert!(reconnect_delay_after(0, false, Some(&error)) >= BLOCKED_RECONNECT_DELAY);
+    assert!(reconnect_delay_after(0, true, None) >= BLOCKED_RECONNECT_DELAY);
+    assert!(reconnect_delay_after(0, false, None) < BLOCKED_RECONNECT_DELAY);
+    assert!(
+        reconnect_delay_after(0, false, Some(&DaemonError::Config("x".into())))
+            < BLOCKED_RECONNECT_DELAY
+    );
 }

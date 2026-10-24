@@ -513,6 +513,76 @@ pub fn probe_artefact_name(
     )
 }
 
+/// What [`sweep_probe_artefacts`] did under one root.
+#[derive(Debug, Default)]
+pub struct ProbeSweep {
+    /// Probe artefacts a killed process left, now removed.
+    pub removed: Vec<PathBuf>,
+    /// Probe artefacts or directories that could not be read or removed, kept for the next sweep.
+    pub failed: Vec<(PathBuf, io::Error)>,
+}
+
+/// Removes the probe artefacts (`.yadorilink-v1-probe.<id>`) a process killed mid-probe left
+/// under `root`, at any depth.
+///
+/// A probe removes its own artefact on every exit it controls, so one that is still there was
+/// stranded by a kill. The caller must hold the root's exclusive ownership (the sync root lock
+/// or a writer lease): that is what makes every probe artefact under it residue rather than a
+/// live probe of another process. Only names the engine's own reserved namespace
+/// ([`crate::reserved_namespace::ArtefactKind::Probe`]) produces are touched, and a symbolic
+/// link is never followed: a link with such a name is removed as the link it is.
+#[must_use]
+pub fn sweep_probe_artefacts(root: &Path) -> ProbeSweep {
+    let mut sweep = ProbeSweep::default();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                sweep.failed.push((dir, error));
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    sweep.failed.push((dir.clone(), error));
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    sweep.failed.push((path, error));
+                    continue;
+                }
+            };
+            let is_probe = entry.file_name().to_str().is_some_and(|name| {
+                matches!(
+                    crate::reserved_namespace::parse_artefact_component(name),
+                    Some((crate::reserved_namespace::ArtefactKind::Probe, _))
+                )
+            });
+            if is_probe {
+                let removal = if file_type.is_dir() {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
+                match removal {
+                    Ok(()) => sweep.removed.push(path),
+                    Err(error) => sweep.failed.push((path, error)),
+                }
+            } else if file_type.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    sweep
+}
+
 /// How many fresh names a probe will try before giving up on
 /// [`create_probe_artefact`] or [`reserve_probe_artefact_path`]. A single
 /// collision is plausible noise; this many in a row means something is
@@ -969,13 +1039,12 @@ fn probe_durable_file_flush(dir: &Path) -> Capability {
 
 #[cfg(target_vendor = "apple")]
 fn platform_durable_file_flush(file: &File) -> Capability {
-    use std::os::unix::io::AsRawFd;
-    platform_full_fsync(file.as_raw_fd())
+    platform_full_fsync(file, crate::flush::Target::File)
 }
 
 #[cfg(all(unix, not(target_vendor = "apple")))]
 fn platform_durable_file_flush(file: &File) -> Capability {
-    match file.sync_all() {
+    match crate::flush::sync_file(file) {
         Ok(()) => Capability::Supported,
         // `fsync(2)`'s only documented "this fd doesn't support
         // synchronization" case is a non-regular-file special file, which
@@ -988,7 +1057,7 @@ fn platform_durable_file_flush(file: &File) -> Capability {
 
 #[cfg(windows)]
 fn platform_durable_file_flush(file: &File) -> Capability {
-    match file.sync_all() {
+    match crate::flush::sync_file(file) {
         Ok(()) => Capability::Supported,
         // `sync_all` on Windows maps to `FlushFileBuffers`, which has no
         // portable errno-style signal this module can use to distinguish
@@ -1014,14 +1083,12 @@ fn platform_durable_file_flush(file: &File) -> Capability {
 /// other required input to `derive_durability_level`'s `PowerLossSafe`
 /// decision.
 #[cfg(target_vendor = "apple")]
-fn platform_full_fsync(fd: std::os::unix::io::RawFd) -> Capability {
-    // SAFETY: `fd` is a valid, open file descriptor for the duration of
-    // the call (both callers hold the owning `File` alive across it).
-    let (ret, errno) =
-        retry_eintr(|| call_and_capture_errno!(unsafe { libc::fcntl(fd, libc::F_FULLFSYNC) }));
-    if ret == 0 {
+fn platform_full_fsync(file: &File, target: crate::flush::Target) -> Capability {
+    let result = crate::flush::full_fsync(file, target);
+    if result.is_ok() {
         return Capability::Supported;
     }
+    let errno = result.err().and_then(|error| error.raw_os_error());
     // `fcntl(2)` documents `ENOTSUP` for `F_FULLFSYNC` when the underlying
     // device does not support it (seen on some older/external drives).
     classify_errno(errno, &[libc::ENOTSUP, libc::ENOSYS])
@@ -1037,13 +1104,12 @@ fn probe_durable_directory_flush(dir: &Path) -> Capability {
 
 #[cfg(target_vendor = "apple")]
 fn platform_durable_directory_flush(handle: &File) -> Capability {
-    use std::os::unix::io::AsRawFd;
-    platform_full_fsync(handle.as_raw_fd())
+    platform_full_fsync(handle, crate::flush::Target::Directory)
 }
 
 #[cfg(all(unix, not(target_vendor = "apple")))]
 fn platform_durable_directory_flush(handle: &File) -> Capability {
-    match handle.sync_all() {
+    match crate::flush::sync_directory(handle) {
         Ok(()) => Capability::Supported,
         Err(err) => classify_errno(err.raw_os_error(), &[libc::ENOSYS]),
     }
@@ -1060,7 +1126,7 @@ fn probe_durable_directory_flush(dir: &Path) -> Capability {
     use crate::durable_dir::{DurableNamespace, NsError, UnavailableReason};
     match DurableNamespace::open(dir) {
         Ok(_) => Capability::Supported,
-        Err(NsError::Unavailable(UnavailableReason::Unknown)) => Capability::Unknown,
+        Err(NsError::Unavailable(UnavailableReason::Unknown, _)) => Capability::Unknown,
         Err(_) => Capability::Unsupported,
     }
 }
@@ -1123,6 +1189,14 @@ pub fn probe_birth_time_granularity_call_count_for_test() -> u64 {
 }
 
 pub fn probe_birth_time_granularity(dir: &Path) -> TimestampGranularity {
+    measure_birth_time_granularity(dir).unwrap_or(TimestampGranularity::Coarse)
+}
+
+/// [`probe_birth_time_granularity`], but `None` when the measurement could not be made
+/// (an artefact could not be created: the directory vanished, a permission or space error).
+/// That says nothing about the volume, so it must not be kept as the volume's answer. A volume
+/// that reports no birth time at all is a conclusive `Coarse`.
+fn measure_birth_time_granularity(dir: &Path) -> Option<TimestampGranularity> {
     PROBE_BIRTH_TIME_GRANULARITY_CALLS.fetch_add(1, Ordering::Relaxed);
     let mut created = Vec::with_capacity(GRANULARITY_SAMPLE_COUNT);
     let mut timestamps = Vec::with_capacity(GRANULARITY_SAMPLE_COUNT);
@@ -1143,15 +1217,18 @@ pub fn probe_birth_time_granularity(dir: &Path) -> TimestampGranularity {
     for path in &created {
         let _ = std::fs::remove_file(path);
     }
+    if created.len() < GRANULARITY_SAMPLE_COUNT {
+        return None;
+    }
 
     if timestamps.len() < 2 {
-        return TimestampGranularity::Coarse;
+        return Some(TimestampGranularity::Coarse);
     }
 
     if timestamps.windows(2).any(|pair| pair[0] == pair[1]) {
-        return TimestampGranularity::Coarse;
+        return Some(TimestampGranularity::Coarse);
     }
-    TimestampGranularity::Fine
+    Some(TimestampGranularity::Fine)
 }
 
 /// Whether the filesystem holding the process temp dir can prove object identity across
@@ -1213,7 +1290,7 @@ pub fn cached_probe_birth_time_granularity(dir: &Path) -> TimestampGranularity {
     let Ok(volume_identity) = observe_volume_identity(dir) else {
         return probe_birth_time_granularity(dir);
     };
-    cached_granularity_for_volume(volume_identity, || probe_birth_time_granularity(dir))
+    cached_granularity_for_volume(volume_identity, || measure_birth_time_granularity(dir))
 }
 
 /// The pure caching decision [`cached_probe_birth_time_granularity`]
@@ -1230,13 +1307,26 @@ pub fn cached_probe_birth_time_granularity(dir: &Path) -> TimestampGranularity {
 /// cost, a thundering herd of exactly the syscall storm this cache exists
 /// to remove. `RootLease::begin_operation` is reachable concurrently from
 /// many in-flight operations, so the first-probe race is not theoretical.
+///
+/// Only a conclusive measurement (`Some`) is kept. A probe that could not run (`None`) answers
+/// `Coarse` for this call (the fail-closed side) and is measured again next time, so a
+/// directory that vanished mid-probe cannot fix the volume's answer for the whole process.
 fn cached_granularity_for_volume(
     volume_identity: VolumeIdentity,
-    probe: impl FnOnce() -> TimestampGranularity,
+    probe: impl FnOnce() -> Option<TimestampGranularity>,
 ) -> TimestampGranularity {
     let cache = BIRTH_TIME_GRANULARITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    *guard.entry(volume_identity).or_insert_with(probe)
+    if let Some(known) = guard.get(&volume_identity) {
+        return *known;
+    }
+    match probe() {
+        Some(measured) => {
+            guard.insert(volume_identity, measured);
+            measured
+        }
+        None => TimestampGranularity::Coarse,
+    }
 }
 
 /// The outcome of [`rename_no_replace`].

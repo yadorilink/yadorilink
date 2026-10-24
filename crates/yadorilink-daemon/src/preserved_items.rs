@@ -26,14 +26,6 @@ use crate::native_rebootstrap::{DaemonContent, RECOVERY_FETCH_PASS_CAP};
 /// The default total size of recovery items above which status warns.
 pub const RECOVERY_ITEMS_WARN_BYTES_DEFAULT: u64 = 1 << 30;
 
-/// The size above which status warns, from `YADORILINK_RECOVERY_ITEMS_WARN_BYTES` when set.
-pub fn recovery_items_warn_bytes() -> u64 {
-    std::env::var("YADORILINK_RECOVERY_ITEMS_WARN_BYTES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(RECOVERY_ITEMS_WARN_BYTES_DEFAULT)
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PreservedKind {
     /// A version of another device that the replacing state does not contain.
@@ -234,8 +226,8 @@ pub async fn list(state: &Arc<DaemonState>) -> Result<Vec<PreservedItem>, Preser
 fn list_blocking(state: &Arc<DaemonState>) -> Result<Vec<PreservedItem>, PreservedError> {
     let linked = linked_groups(state);
     let (items_root, recovery_root) = (
-        crate::device_config::recovery_items_root_of(&state.device_id),
-        crate::device_config::recovery_root_of(&state.device_id),
+        crate::device_config::recovery_items_root_of(state.config_dir(), &state.device_id),
+        crate::device_config::recovery_root_of(state.config_dir(), &state.device_id),
     );
     let mut out = Vec::new();
     state
@@ -306,8 +298,10 @@ fn content_name(content: ItemContent) -> &'static str {
 
 /// What `status` reports about the device's preserved data.
 pub fn summary(state: &Arc<DaemonState>) -> PreservedSummary {
-    let mut summary =
-        PreservedSummary { warn_bytes: recovery_items_warn_bytes(), ..Default::default() };
+    let mut summary = PreservedSummary {
+        warn_bytes: state.tuning().recovery_items_warn_bytes,
+        ..Default::default()
+    };
     let Ok(items) = list_blocking(state) else { return summary };
     for item in items {
         match item.kind {
@@ -342,7 +336,8 @@ pub async fn discard(
 ) -> Result<(), PreservedError> {
     let (db, group, item_id) =
         (state.replica_coordinator.database(), FolderGroupId(group.to_owned()), item_id.to_owned());
-    let items_root = crate::device_config::recovery_items_root_of(&state.device_id);
+    let items_root =
+        crate::device_config::recovery_items_root_of(state.config_dir(), &state.device_id);
     let found = tokio::task::spawn_blocking(move || {
         db.write::<_, SyncSqliteError>(|conn| {
             discard_recovery_item(conn, &items_root, &group, &item_id)
@@ -361,7 +356,8 @@ pub async fn discard(
 /// connected peers within a time cap, and completes the ones that arrived whole. Best effort;
 /// an item that cannot be completed stays as it is.
 pub async fn complete_unavailable_items(state: &Arc<DaemonState>, group: &FolderGroupId) {
-    let items_root = crate::device_config::recovery_items_root_of(&state.device_id);
+    let items_root =
+        crate::device_config::recovery_items_root_of(state.config_dir(), &state.device_id);
     let pending = {
         let (db, group, root) =
             (state.replica_coordinator.database(), group.clone(), items_root.clone());
@@ -505,7 +501,8 @@ fn restore_blocking(
         .replica_coordinator
         .open_local_author(&state.device_id, key)
         .map_err(|e| PreservedError::Failed(e.to_string()))?;
-    let items_root = crate::device_config::recovery_items_root_of(&state.device_id);
+    let items_root =
+        crate::device_config::recovery_items_root_of(state.config_dir(), &state.device_id);
     let db = state.replica_coordinator.database();
     let mut failure: Option<RestoreError> = None;
     state
@@ -600,7 +597,8 @@ fn retry_blocking(
         .map_err(|e| PreservedError::Failed(e.to_string()))?;
     let authority =
         crate::native_rebootstrap::DaemonAuthority { state: state.clone(), group: group.clone() };
-    let recovery_root = crate::device_config::recovery_root_of(&state.device_id);
+    let recovery_root =
+        crate::device_config::recovery_root_of(state.config_dir(), &state.device_id);
     let db = state.replica_coordinator.database();
     let mut failure: Option<RetryError> = None;
     state

@@ -163,6 +163,7 @@ impl Fx {
                 root_id: hex::decode(&self.root).unwrap(),
                 exclude_item_ids: exclude.iter().map(|i| i.to_vec()).collect(),
                 max,
+                request_id: Vec::new(),
             },
         )
     }
@@ -283,6 +284,7 @@ async fn unobtainable_content_backs_off_per_version_and_survives_a_restart() {
             root_id: hex::decode(&fx.root).unwrap(),
             exclude_item_ids: Vec::new(),
             max: 2,
+            request_id: Vec::new(),
         },
     );
     assert!(!Fx::offered(&response).contains(&item.to_vec()));
@@ -313,6 +315,49 @@ async fn a_stuck_item_is_listed_and_does_not_block_done() {
     assert_eq!(status.state, DriverState::Done, "a stuck item blocked done");
 }
 
+/// The answer names the query it answers (request id and root), on every path, so a host that
+/// asked twice can drop the late answer to the first; a host that sends no id gets an empty one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_answer_echoes_the_request_id_and_root() {
+    let fx = Fx::new();
+    fx.item("a.bin", 10);
+    let root_id = hex::decode(&fx.root).unwrap();
+    let ask = |root: Vec<u8>, request_id: &[u8]| {
+        fx.driver.next_downloads(
+            &fx.inputs(),
+            &NextProviderDownloadsRequest {
+                root_id: root,
+                exclude_item_ids: Vec::new(),
+                max: 2,
+                request_id: request_id.to_vec(),
+            },
+        )
+    };
+    // Two queries with different ids: each answer carries its own.
+    let first = ask(root_id.clone(), b"one");
+    let second = ask(root_id.clone(), b"two");
+    assert_eq!(
+        (first.request_id.as_slice(), first.root_id.as_slice()),
+        (&b"one"[..], &root_id[..])
+    );
+    assert_eq!(second.request_id, b"two");
+    assert!(!first.downloads.is_empty());
+
+    // An unknown root is answered (empty) with the same echo.
+    let unknown = ask(vec![9; 16], b"three");
+    assert!(unknown.downloads.is_empty());
+    assert_eq!(
+        (unknown.request_id.as_slice(), unknown.root_id.as_slice()),
+        (&b"three"[..], &[9u8; 16][..])
+    );
+
+    // A host that predates the id: answered with an empty id.
+    let old_host = ask(root_id.clone(), b"");
+    assert!(old_host.request_id.is_empty());
+    assert_eq!(old_host.root_id, root_id);
+    assert!(!old_host.downloads.is_empty());
+}
+
 /// No offers while the disk is low, while no peer is reachable, or while the provider side is
 /// not ready.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -339,6 +384,7 @@ async fn pause_states_offer_nothing() {
         root_id: hex::decode(&fx.root).unwrap(),
         exclude_item_ids: Vec::new(),
         max: 2,
+        request_id: Vec::new(),
     };
     let response = fx.driver.next_downloads(&inputs, &request);
     assert_eq!(Fx::state_of(&response), DriverState::WaitingProvider);

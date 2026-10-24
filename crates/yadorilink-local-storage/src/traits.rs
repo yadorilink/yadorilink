@@ -330,7 +330,7 @@ pub trait BlockStore: Send + Sync {
     fn set_headroom_enforced(&self, _enforced: bool) {}
 
     /// Sets or clears an explicit headroom override (`None` = the default
-    /// `max(1 GiB, 5%)` formula). Default: a no-op, mirroring
+    /// default headroom formula (`free_space`)). Default: a no-op, mirroring
     /// `set_headroom_enforced`.
     fn set_headroom_override_bytes(&self, _headroom_bytes: Option<u64>) {}
 

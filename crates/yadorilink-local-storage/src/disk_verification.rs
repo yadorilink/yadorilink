@@ -17,7 +17,7 @@ use crate::StorageError;
 /// temp file is created -- when completing a write of `additional_bytes`
 /// more would breach the configured headroom.
 ///
-/// `headroom_override_bytes`: `None` uses the default `max(1 GiB, 5%)`
+/// `headroom_override_bytes`: `None` uses the default `default headroom`
 /// formula; `Some(_)` is an explicit override, both resolved the same way
 /// the block-store preflight resolves it. Callers that haven't opted into
 /// disk-pressure enforcement at all should not call this at all rather

@@ -286,7 +286,8 @@ impl ClientCore {
     /// # Errors
     /// Daemon failures.
     pub async fn hydrate_file(&self, absolute_path: String) -> Result<(), DesktopError> {
-        Ok(ops::files::hydrate_file(absolute_path).await?)
+        ops::files::hydrate_file(absolute_path).await?;
+        Ok(())
     }
 
     /// # Errors

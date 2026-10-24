@@ -35,6 +35,7 @@ yadorilink-sqlite-runtime = { path = "../yadorilink-sqlite-runtime" }
 # single place that decides it.
 rusqlite = "0.31"
 thiserror.workspace = true
+anyhow.workspace = true
 sha2.workspace = true
 tracing.workspace = true
 hex = "0.4"
@@ -51,7 +52,7 @@ walkdir = "2"
 tokio.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
@@ -64,6 +65,9 @@ windows-sys = { version = "0.59", features = [
 libc = "0.2"
 
 [dev-dependencies]
+# The unlocked opens the integration tests use are `test-support`-only; `cfg(test)` is not set for
+# a package's own `tests/` binaries.
+yadorilink-local-storage = { path = ".", features = ["test-support"] }
 # The durable-move trace and failpoints the publish tests drive.
 yadorilink-root-authority = { path = "../yadorilink-root-authority", features = ["test-support"] }
 tempfile = "3"

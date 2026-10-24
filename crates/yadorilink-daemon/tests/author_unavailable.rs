@@ -42,13 +42,19 @@ mod unix_tests {
         // The witness directory is a path below a regular file: it can never be created.
         let blocker = root.path().join("not-a-directory");
         std::fs::write(&blocker, b"x").unwrap();
-        std::env::set_var("YADORILINK_WITNESS_DIR", blocker.join("witness"));
         let data = root.path().join("data");
         std::fs::create_dir_all(&data).unwrap();
         let socket = root.path().join("daemon.sock");
 
         let store = Arc::new(SegmentBlockStore::new(data.join("blocks")).unwrap());
-        let coordinator = Arc::new(ReplicaCoordinator::open(data.join("sync.sqlite3")).unwrap());
+        let tuning = yadorilink_daemon::engine_tuning::EngineTuning {
+            witness: yadorilink_daemon::install_witness::WitnessPlacement::At(
+                blocker.join("witness"),
+            ),
+            ..Default::default()
+        };
+        let coordinator =
+            Arc::new(ReplicaCoordinator::open_with(data.join("sync.sqlite3"), tuning).unwrap());
         let state = DaemonState::new("device-under-test".into(), coordinator, store);
         state.set_device_signing_key(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
         assert!(state.local_author().is_none(), "no witness, no author");

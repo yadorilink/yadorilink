@@ -1181,7 +1181,8 @@ fn item_generation(tx: Tx<'_>, root_id: &str, item: &ItemId) -> Result<u64, Appl
 /// The edit this device just authored is what the OS shows and holds: it is published, the
 /// item's served summary becomes `Single` of that content on this write's OWN path (the OS
 /// supplied those bytes and holds exactly them; never applied to a mixed item), and, when it
-/// changes what the item shows, the generation advances. All in the transaction of the change.
+/// changes what the item shows, the generation advances, and the version is recorded as handed
+/// over (the presence ledger). All in the transaction of the change.
 fn set_published(
     tx: Tx<'_>,
     root_id: &str,
@@ -1206,6 +1207,11 @@ fn set_published(
         item,
         &crate::provider_provenance::content_sig(version),
     )?;
+    // The OS holds exactly these bytes, so the edit is also the ledger's handoff of the version:
+    // an item authored here is present, never offered back to the OS as a download.
+    if version.meta.record_kind != RecordKind::Directory {
+        crate::provider::record_handoff_in_tx(tx, root_id, item, version.version_hash)?;
+    }
     Ok(())
 }
 

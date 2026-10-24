@@ -195,6 +195,11 @@ def main():
     ap.add_argument("--asset-name")
     ap.add_argument("--min-version", default="0.1.0")
     ap.add_argument("--generated-at", default="2026-10-18T00:00:00Z")
+    ap.add_argument("--expires-at", default="2099-01-01T00:00:00Z",
+                    help="expires_at of the channel manifest (far future by default so a fixture never ages out)")
+    ap.add_argument("--legacy-snapshots", action="store_true",
+                    help="per-version manifests carry no expires_at, as those published before it existed")
+    ap.add_argument("--omit-expires", action="store_true", help="leave expires_at out of the channel manifest")
     ap.add_argument("--withdrawn", default="", help="comma-separated withdrawn_versions of the channel manifest")
     ap.add_argument("--extra-version", action="append", default=[],
                     help="also build this version's zips and signed per-version manifest")
@@ -207,8 +212,8 @@ def main():
     (out / args.channel).mkdir()
     seed = bytes.fromhex(args.seed)
     pub = keypair(seed)[2]
-    (out / "pubkey.hex").write_text(pub.hex())
-    (out / "key_id").write_text(args.key_id)
+    (out / "pubkey.hex").write_text(pub.hex(), encoding="utf-8")
+    (out / "key_id").write_text(args.key_id, encoding="utf-8")
 
     def envelope_for(body_obj):
         body = json.dumps(body_obj, indent=2).encode()
@@ -236,17 +241,23 @@ def main():
         return entries
 
     channel_body = {"schema_version": 2, "generated_at": args.generated_at,
+                    "expires_at": args.expires_at,
                     "releases": entries_for(args.version, args.kill_switch)}
+    if args.omit_expires:
+        del channel_body["expires_at"]
     if args.withdrawn:
         channel_body["withdrawn_versions"] = args.withdrawn.split(",")
-    (out / args.channel / "manifest.json").write_text(json.dumps(envelope_for(channel_body)))
+    (out / args.channel / "manifest.json").write_text(json.dumps(envelope_for(channel_body)), encoding="utf-8")
     # The signed per-version manifest of every version this fixture carries: that version's
     # script entries only, never kill-switched (it cannot carry a later withdrawal).
     for version in [args.version, *args.extra_version]:
         (out / version).mkdir(exist_ok=True)
         snap = {"schema_version": 2, "generated_at": "2026-10-01T00:00:00Z",
+                "expires_at": "2099-01-01T00:00:00Z",
                 "releases": entries_for(version, False)}
-        (out / version / "manifest.json").write_text(json.dumps(envelope_for(snap)))
+        if args.legacy_snapshots:
+            del snap["expires_at"]
+        (out / version / "manifest.json").write_text(json.dumps(envelope_for(snap)), encoding="utf-8")
     return 0
 
 

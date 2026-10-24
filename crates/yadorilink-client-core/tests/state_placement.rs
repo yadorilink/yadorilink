@@ -26,7 +26,10 @@ async fn a_packaged_process_creates_nothing_under_appdata() {
     yadorilink_fs_platform::state_dir::set_package_identity_for_test(true);
 
     // Every writer that derives its path from the state directory.
-    is_refusal(ops::devices::register_device("laptop".into()).await, "register_device");
+    is_refusal(
+        ops::devices::register_device("laptop".into(), &ops::daemon::default_launch()).await,
+        "register_device",
+    );
     is_refusal(device_config::config_dir().map_err(CoreError::from), "config_dir");
     is_refusal(
         device_config::save(&device_config::DeviceConfig {

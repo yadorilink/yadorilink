@@ -54,14 +54,65 @@ async fn this_device_is_never_listed_offline_even_when_the_service_says_so() {
         })))
         .mount(&server)
         .await;
-    let _guard = crate::coordination::http_client::COORDINATION_ADDR_ENV_LOCK.lock().await;
-    std::env::set_var("YADORILINK_COORDINATION_ADDR", server.uri());
-    let devices =
-        fetch_devices(&yadorilink_fapi_client::test_support::offline_auth(), Some("this-device"))
-            .await;
-    std::env::remove_var("YADORILINK_COORDINATION_ADDR");
+    let devices = fetch_devices(
+        &crate::coordination::http_client::CoordinationAccess::new(
+            yadorilink_fapi_client::test_support::offline_auth(),
+            server.uri(),
+        ),
+        Some("this-device"),
+    )
+    .await;
     let devices = devices.unwrap();
 
     assert!(devices.iter().find(|d| d.device_id == "this-device").unwrap().online);
     assert!(!devices.iter().find(|d| d.device_id == "other-device").unwrap().online);
+}
+
+/// The registration stays done; the restart's own next step reaches the front end instead of
+/// being spelled into the text and replaced by another.
+#[test]
+fn a_restart_that_failed_after_registration_carries_the_restarts_own_next_step() {
+    let stuck = CoreError::Other("the running daemon did not stop".into())
+        .hinted(Hint::StopThenStartDaemon);
+    let error = restart_failed_after_registration("dev-1", stuck, None);
+    assert_eq!(error.hint(), Some(Hint::StopThenStartDaemon));
+    assert_eq!(
+        error.to_string(),
+        "this device is registered (dev-1), but the daemon could not be restarted to pick it up: \
+         the running daemon did not stop"
+    );
+    // A restart failure with no step of its own falls back to starting the daemon.
+    let error = restart_failed_after_registration("dev-1", CoreError::DaemonNotRunning, None);
+    assert_eq!(error.hint(), Some(Hint::StartDaemon));
+    // Through a desktop front end it is the typed start reason, with the stop step kept.
+    let stuck = CoreError::Other("x".into()).hinted(Hint::StopThenStartDaemon);
+    assert!(matches!(
+        crate::error::DesktopError::from(restart_failed_after_registration("dev-1", stuck, None)),
+        crate::error::DesktopError::DaemonUnavailable {
+            reason: crate::error::DaemonUnavailableReason::StartNeeded { stop_first: true },
+            ..
+        }
+    ));
+}
+
+/// Where starting cannot help, no start step is invented: a recorded startup refusal, or another
+/// owner managing the daemon, stays what it was (and is not a GUI "start needed").
+#[test]
+fn no_start_step_is_invented_where_starting_cannot_help() {
+    let refused = restart_failed_after_registration(
+        "dev-1",
+        crate::ops::daemon::did_not_answer(Some("reset steps".into())),
+        Some("reset steps".into()),
+    );
+    assert_eq!(refused.hint(), None);
+    assert!(matches!(
+        crate::error::DesktopError::from(refused),
+        crate::error::DesktopError::Internal { .. }
+    ));
+    let elsewhere = restart_failed_after_registration(
+        "dev-1",
+        CoreError::ManagedElsewhere("the app owns it".into()),
+        None,
+    );
+    assert_eq!(elsewhere.hint(), None);
 }

@@ -143,6 +143,20 @@ fn a_database_stamped_above_the_supported_version_is_refused() {
     );
 }
 
+/// An older engine pointed at state written by a newer one must leave it exactly as it was.
+#[test]
+fn a_database_stamped_above_the_supported_version_is_left_byte_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = stamped_database_file(&dir, SCHEMA_VERSION + 1);
+    let before = std::fs::read(&path).unwrap();
+
+    let result = crate::SyncDatabase::open(&path, replica_schema_init);
+
+    assert!(matches!(result, Err(DatabaseError::UnsupportedSchemaDowngrade { .. })));
+    drop(result);
+    assert_eq!(std::fs::read(&path).unwrap(), before, "a refused database must be untouched");
+}
+
 /// The case `check_schema_version_supported` alone cannot see, and which
 /// accepting `user_version == 0` unconditionally used to admit.
 #[test]

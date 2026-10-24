@@ -6,7 +6,7 @@
 //!   "32 random bytes via `rand::fill`, hex-encoded" shape (`rand = "0.10.2"`
 //!   is the version this whole workspace already pins for exactly this kind
 //!   of use);
-//! - storage: `yadorilink-daemon::resource_lock::open_sidecar_file` /
+//! - storage: `yadorilink-local-storage::resource_lock::open_sidecar_file` /
 //!   `shell_ipc::unix_transport::serve`'s "our own sidecar file, `0o600` on
 //!   Unix, parent directory `0o700`" convention -- the same reasoning
 //!   `control_socket::unix_transport::serve`'s own doc comment gives for its

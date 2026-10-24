@@ -481,10 +481,7 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         &self,
         operation_id: &str,
     ) -> Result<(), MaterializationExecutionError> {
-        Ok(self
-            .restore_operation_repository()
-            .discard_restore_operation(operation_id)
-            .map_err(SyncError::from)?)
+        self.abandon_restore_operation(operation_id)
     }
 
     fn verify_root(
@@ -563,6 +560,19 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
                 .policy
                 == yadorilink_sync_sqlite::RetentionPolicy::Pinned,
         })
+    }
+
+    fn write_landed_unproven(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, MaterializationExecutionError> {
+        Ok(self
+            .database
+            .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+                yadorilink_sync_sqlite::write_landed_unproven(conn, group_id, path)
+            })
+            .map_err(SyncError::from)?)
     }
 
     fn flush_pending_proof_identity(
@@ -933,6 +943,18 @@ pub(crate) fn set_test_windows_dehydrate_confirmed_for_path(path: &Path, armed: 
 mod tests;
 
 impl ReplicaCoordinator {
+    /// Drops a restore-journal row whose write will not be published: recovery found it needs no
+    /// replay, or the restore itself declined before publishing anything.
+    pub(crate) fn abandon_restore_operation(
+        &self,
+        operation_id: &str,
+    ) -> Result<(), MaterializationExecutionError> {
+        Ok(self
+            .restore_operation_repository()
+            .discard_restore_operation(operation_id)
+            .map_err(SyncError::from)?)
+    }
+
     /// The recovery commit behind [`MaterializationExecutionPort::commit_recovered_materialized_state`]
     /// and [`Self::finish_matching_in_flight_write`]: one guarded transaction that publishes the
     /// proof of the version the caller compared the bytes on disk against, sets the row

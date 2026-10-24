@@ -227,6 +227,30 @@ async fn a_listed_item_without_a_handoff_has_no_current_content() {
     assert_eq!(fx.presence(&id), (true, false));
 }
 
+/// WINDOWS: bytes served to the OS in windows are a separate fact. They never make the content
+/// present, they confirm an OS copy only for an explicit eviction and only once a report that
+/// began after the last window lists the item, and a content update takes them away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn served_windows_confirm_an_os_copy_but_never_present_content() {
+    let fx = Fx::new();
+    let id = fx.item("a.txt", 10);
+    let os_copy = || os_copy(&fx.state.replica_coordinator, &fx.membership, &fx.root, &id);
+    fx.report(1, 1, true, 0, &[id], &[]); // began before the window
+    let version = fx.current(&id);
+    let seq = fx.repo().record_window_serve(&fx.root, &id, version).unwrap().unwrap();
+    assert_eq!(fx.presence(&id), (true, false), "a window made the content present");
+    assert_eq!(os_copy(), OsCopy::Unconfirmed, "an old report confirmed a newer window");
+
+    fx.report(1, 2, false, seq, &[id], &[]);
+    assert_eq!(os_copy(), OsCopy::Windows);
+    assert_eq!(fx.presence(&id), (true, false));
+
+    // A content update removes the window record in the transaction that commits it.
+    fx.commit("a.txt", 2, 99, 100);
+    assert!(fx.repo().window_serve(&fx.root, &id).unwrap().is_none());
+    assert_eq!(os_copy(), OsCopy::Unconfirmed);
+}
+
 /// FRESHNESS: an old snapshot is never combined with a newer handoff. The item was listed by a
 /// report that began before the handoff; only a report that began after it proves the handoff.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

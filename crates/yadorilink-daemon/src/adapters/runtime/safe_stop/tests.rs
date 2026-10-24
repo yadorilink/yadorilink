@@ -431,3 +431,199 @@ async fn an_already_stopping_daemon_answers_at_once_even_with_a_link_starting() 
     f.state.shutdown_tx.send_replace(true);
     assert_eq!(request(&f.state, 5 * SECOND).await, stopping(true));
 }
+
+// The stop's reason is part of the commit: the shutdown signal never fires before it is recorded.
+
+/// What a shutdown observer (the main task) could see at the instant the signal had fired.
+struct AtSignal {
+    state: Arc<DaemonState>,
+    seen: std::sync::Mutex<Option<(bool, bool)>>,
+}
+
+impl StepHook for AtSignal {
+    fn after(&self, step: Step) -> Result<(), String> {
+        if step == Step::Committed {
+            let signalled = *self.state.shutdown_tx.borrow();
+            let restart = self.state.restart_on_exit.load(std::sync::atomic::Ordering::SeqCst);
+            *self.seen.lock().unwrap() = Some((signalled, restart));
+        }
+        Ok(())
+    }
+}
+
+fn restart_flag(state: &DaemonState) -> bool {
+    state.restart_on_exit.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[tokio::test]
+async fn the_restart_reason_is_recorded_before_the_shutdown_signal_is_visible() {
+    let f = fixture();
+    let hook = AtSignal { state: f.state.clone(), seen: std::sync::Mutex::new(None) };
+    let outcome = run_as(&f.state, 5 * SECOND, &hook, leases(1), StopIntent::Restart).await;
+    assert_eq!(outcome, stopping(false));
+    assert_eq!(
+        *hook.seen.lock().unwrap(),
+        Some((true, true)),
+        "at the moment the signal is visible the restart reason already is"
+    );
+}
+
+/// Looks at the restart reason at the point inside the commit that sits between recording it and
+/// setting the shutdown signal.
+struct AtRecorded {
+    state: Arc<DaemonState>,
+    restart_seen: std::sync::Mutex<Option<bool>>,
+}
+
+impl StepHook for AtRecorded {
+    fn after(&self, step: Step) -> Result<(), String> {
+        if step == Step::ReasonRecorded {
+            *self.restart_seen.lock().unwrap() = Some(restart_flag(&self.state));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn the_restart_reason_is_recorded_before_the_signal_is_set() {
+    // The commit runs under the shutdown channel's lock, so no observer can tell the order apart;
+    // this pins it anyway: the hook between the two operations sees the reason already recorded
+    // (a commit that set the signal first would show `false` here).
+    let f = fixture();
+    let hook = AtRecorded { state: f.state.clone(), restart_seen: std::sync::Mutex::new(None) };
+    assert_eq!(
+        run_as(&f.state, 5 * SECOND, &hook, leases(1), StopIntent::Restart).await,
+        stopping(false)
+    );
+    assert_eq!(*hook.restart_seen.lock().unwrap(), Some(true));
+}
+
+/// Fires a stop from elsewhere (as the control socket or a signal does) at one step.
+struct StopAt {
+    state: Arc<DaemonState>,
+    at: Step,
+}
+
+impl StepHook for StopAt {
+    fn after(&self, step: Step) -> Result<(), String> {
+        if step == self.at {
+            self.state.shutdown_tx.send_replace(true);
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_stop_from_elsewhere_during_the_drain_or_the_checkpoint_is_not_turned_into_a_restart() {
+    for at in [Step::Paused, Step::Drained, Step::Checkpointed] {
+        let f = fixture();
+        let hook = StopAt { state: f.state.clone(), at };
+        let outcome = run_as(&f.state, 5 * SECOND, &hook, leases(1), StopIntent::Restart).await;
+        assert_eq!(outcome, stopping(true), "{at:?}");
+        assert!(!restart_flag(&f.state), "{at:?}: somebody else's stop is not a restart");
+    }
+}
+
+#[tokio::test]
+async fn a_plain_stop_never_records_a_restart() {
+    let f = fixture();
+    let hook = AtSignal { state: f.state.clone(), seen: std::sync::Mutex::new(None) };
+    assert_eq!(
+        run_as(&f.state, 5 * SECOND, &hook, leases(1), StopIntent::Plain).await,
+        stopping(false)
+    );
+    assert_eq!(*hook.seen.lock().unwrap(), Some((true, false)));
+    assert!(!restart_flag(&f.state));
+}
+
+#[tokio::test]
+async fn a_restart_request_that_does_not_commit_records_nothing() {
+    // Busy: a write that does not finish.
+    let f = fixture();
+    let links = leases(1);
+    let held = links[0].begin_operation().unwrap();
+    let outcome =
+        run_as(&f.state, Duration::from_millis(150), &NoHook, links.clone(), StopIntent::Restart)
+            .await;
+    assert!(is_busy(&outcome, SafeStopBusy::WritesInProgress));
+    assert!(!restart_flag(&f.state));
+    drop(held);
+
+    // Another source already shut the daemon down.
+    f.state.shutdown_tx.send_replace(true);
+    let outcome = run_as(&f.state, 5 * SECOND, &NoHook, links, StopIntent::Restart).await;
+    assert_eq!(outcome, stopping(true));
+    assert!(!restart_flag(&f.state), "a stop somebody else began is not a restart");
+}
+
+#[tokio::test]
+async fn a_restart_request_after_another_safe_stop_committed_records_nothing() {
+    let f = fixture();
+    assert_eq!(
+        run_as(&f.state, 5 * SECOND, &NoHook, leases(1), StopIntent::Plain).await,
+        stopping(false)
+    );
+    let outcome = run_as(&f.state, 5 * SECOND, &NoHook, leases(1), StopIntent::Restart).await;
+    assert_eq!(outcome, stopping(true));
+    assert!(!restart_flag(&f.state));
+}
+
+#[tokio::test]
+async fn the_real_adapter_and_the_watch_end_in_a_restart_exit_for_the_watchs_own_stop() {
+    use crate::adapters::runtime::runtime_control::DaemonLifecycleAdapter;
+    use crate::application::ports::DaemonLifecyclePort;
+    use crate::exe_replaced::{watch_with, Observation, ReplacedConfig, Target};
+
+    let f = fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("daemon");
+    std::fs::write(&exe, "v1").unwrap();
+    let target = Target::new(exe.clone());
+    let Observation::Present(baseline) = target.observe() else { panic!("present") };
+    std::fs::write(&exe, "version-2").unwrap();
+
+    let lifecycle: Arc<dyn DaemonLifecyclePort> =
+        Arc::new(DaemonLifecycleAdapter::new(f.state.clone()));
+    let mut main_task = f.state.shutdown_tx.subscribe();
+    let config = ReplacedConfig {
+        interval: Duration::from_millis(10),
+        stop_deadline: 5 * SECOND,
+        busy_backoff_cap: Duration::from_millis(50),
+    };
+    let watch = tokio::spawn(watch_with(
+        config,
+        lifecycle,
+        baseline,
+        f.state.shutdown_tx.subscribe(),
+        move || target.observe(),
+    ));
+    tokio::time::timeout(5 * SECOND, main_task.changed()).await.unwrap().unwrap();
+    // What the main task does the moment it sees the shutdown.
+    assert!(restart_flag(&f.state), "the reason was there when the shutdown became visible");
+    watch.await.unwrap();
+}
+
+#[tokio::test]
+async fn the_real_adapter_leaves_a_stop_by_someone_else_as_a_plain_exit() {
+    use crate::adapters::runtime::runtime_control::DaemonLifecycleAdapter;
+    use crate::application::ports::DaemonLifecyclePort;
+
+    let f = fixture();
+    let adapter = DaemonLifecycleAdapter::new(f.state.clone());
+    // `request_shutdown` only takes effect while somebody listens, as in the running daemon.
+    let _listener = f.state.shutdown_tx.subscribe();
+    adapter.request_shutdown();
+    assert_eq!(adapter.request_safe_stop_to_restart(5 * SECOND).await, stopping(true));
+    assert!(!restart_flag(&f.state));
+}
+
+#[tokio::test]
+async fn a_shutdown_request_nobody_subscribed_to_yet_is_not_lost() {
+    use crate::adapters::runtime::runtime_control::DaemonLifecycleAdapter;
+    use crate::application::ports::DaemonLifecyclePort;
+    let f = fixture();
+    assert_eq!(f.state.shutdown_tx.receiver_count(), 0);
+    DaemonLifecycleAdapter::new(f.state.clone()).request_shutdown();
+    assert!(*f.state.shutdown_tx.borrow());
+    assert!(*f.state.shutdown_tx.subscribe().borrow());
+}

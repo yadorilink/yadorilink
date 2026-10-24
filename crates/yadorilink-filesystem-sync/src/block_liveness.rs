@@ -8,6 +8,8 @@ struct State {
     /// Deletions blocked in [`BlockLivenessGate::begin_physical_deletion`]. While non-zero,
     /// fair writers yield, so overlapping writers cannot keep `writers` above zero forever.
     delete_waiters: usize,
+    /// Writers blocked in [`BlockLivenessGate::begin_reference_write`] behind a running deletion.
+    blocked_writers: usize,
 }
 
 /// How long a fair writer yields to a waiting deletion before admitting itself anyway.
@@ -56,12 +58,15 @@ impl BlockLivenessGate {
                     self.yields.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 let timeout = if state.deleting { None } else { Some(remaining) };
+                let blocked = state.deleting;
+                state.blocked_writers += usize::from(blocked);
                 state = match timeout {
                     Some(t) => {
                         self.changed.wait_timeout(state, t).unwrap_or_else(|e| e.into_inner()).0
                     }
                     None => self.changed.wait(state).unwrap_or_else(|e| e.into_inner()),
                 };
+                state.blocked_writers -= usize::from(blocked);
             } else {
                 break;
             }
@@ -103,6 +108,18 @@ impl BlockLivenessGate {
 }
 
 impl BlockLivenessGate {
+    /// How many deletions are blocked in [`Self::begin_physical_deletion`] right now. Lets a
+    /// test run a writer at exactly the point a deletion is parked behind the admitted writers.
+    pub fn waiting_deletions(&self) -> usize {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).delete_waiters
+    }
+
+    /// How many fair writers are blocked right now behind a running deletion. Lets a test release
+    /// the deletion only once a writer is known to be parked at the gate.
+    pub fn blocked_writers(&self) -> usize {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).blocked_writers
+    }
+
     /// [`Self::begin_physical_deletion`] that never waits: `None` while a reference write or
     /// another deletion is in progress. For a caller that holds something a writer may be
     /// waiting for, and so must not wait for the writers itself.

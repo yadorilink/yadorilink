@@ -1,0 +1,61 @@
+{
+  "schema": 1,
+  "about": "Operation-count baseline for the receive path. Counts, not times: they do not depend on the machine. See .github/checks/check-perf-baseline.py for the update procedure.",
+  "frozen_settings": {
+    "receive_window_paths": 32,
+    "block_fetch_concurrency": 32
+  },
+  "write_transactions_per_received_path_max": 4,
+  "storage_workload": {
+    "files": 12,
+    "directories": 3,
+    "blocks_in_batch": 16,
+    "publish_each": {
+      "file_fsync": 12,
+      "dir_fsync": 12,
+      "rename": 12,
+      "directory_syncs": 12,
+      "file_flushes": 12
+    },
+    "publish_deferred_then_flush": {
+      "file_fsync": 12,
+      "dir_fsync": 3,
+      "rename": 12,
+      "directory_syncs": 3,
+      "file_flushes": 12
+    },
+    "block_batch": {
+      "group_commit": 1,
+      "segment_fsync": 1,
+      "directory_syncs": 1,
+      "file_flushes": 2
+    }
+  },
+  "revision": 3,
+  "digest": "42a3b0a70cbf033b97c273613bd2b76949538616fc929df3950b8f2143a28b21",
+  "changes": [
+    {
+      "revision": 1,
+      "digest": "f2bb5430785f868cb39be62a0fded898f8928512855386e3fbcfdbfdaac1dc59",
+      "why": "initial baseline: counts observed on the frozen receive path (full flush per file, one flush per directory in macOS mode 1, 4 write transactions per path)"
+    },
+    {
+      "revision": 2,
+      "digest": "a0c3519d33692bcf1622151ffbae5f4efb03f60edb14da91bd438851386fcd21",
+      "why": "add end-to-end receive flush counts measured through the daemon engine in an isolated process"
+    },
+    {
+      "revision": 3,
+      "digest": "42a3b0a70cbf033b97c273613bd2b76949538616fc929df3950b8f2143a28b21",
+      "why": "count every flush at the platform layer's one helper: add file_flushes, and directory_syncs now includes the flush barrier's directory syncs (3 in deferred mode); no flush added or dropped"
+    }
+  ],
+  "receive_engine_workload": {
+    "files": 3,
+    "file_fsync": 3,
+    "dir_fsync": 3,
+    "rename": 3,
+    "directory_syncs": 3,
+    "file_flushes": 3
+  }
+}

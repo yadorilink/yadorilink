@@ -698,11 +698,16 @@ fn an_unreadable_path_does_not_match_a_delete_prepared_for_an_absent_one() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("p")).unwrap();
     let missing = dir.path().join("p/gone");
-    assert!(super::disk_observation::disk_matches_prepare(&missing, &None), "sanity: absent");
+    assert!(
+        (super::disk_observation::prepare_match(&missing, &None)
+            != super::disk_observation::PrepareMatch::Changed),
+        "sanity: absent"
+    );
     let Some(_unsearchable) = Unsearchable::new(&dir.path().join("p")) else { return };
 
     assert!(
-        !super::disk_observation::disk_matches_prepare(&missing, &None),
+        !(super::disk_observation::prepare_match(&missing, &None)
+            != super::disk_observation::PrepareMatch::Changed),
         "unreadable is not absent"
     );
 }

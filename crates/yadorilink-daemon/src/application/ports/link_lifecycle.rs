@@ -80,8 +80,17 @@ pub(crate) trait LinkRepositoryPort: Send + Sync {
     fn list_link_paths_and_groups(&self) -> Result<Vec<(String, String)>, SyncError>;
 
     /// The headroom reserve the preflight's free-space reading is measured against; `None` is the
-    /// default `max(1 GiB, 5%)`.
+    /// default `default headroom`.
     fn preflight_headroom_override_bytes(&self) -> Option<u64>;
+
+    /// The user's home directory, which the preflight flags as a risky place to link; `None` for
+    /// a host with no home directory.
+    fn preflight_home_dir(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    /// The state directory the recovery areas live under, which no linked folder may overlap.
+    fn state_dir(&self) -> std::path::PathBuf;
 
     /// Commits the link row. Reports what that did to the row (inserted, or
     /// updated a row that already existed for the same path and group) so a
@@ -90,6 +99,16 @@ pub(crate) trait LinkRepositoryPort: Send + Sync {
         &self,
         local_path: &str,
         group_id: &str,
+    ) -> Result<LinkRowWrite, SyncError>;
+
+    /// Atomically inserts the link row of a provider folder and declares its root, with no
+    /// pending-enrollment marker or journal row (the invite-acceptance shape). Reports what it did
+    /// to the link row, like [`Self::commit_plain_link`].
+    fn commit_provider_link_plain(
+        &self,
+        local_path: &str,
+        group_id: &str,
+        provider: &ProviderLinkTarget,
     ) -> Result<LinkRowWrite, SyncError>;
 
     /// Atomically inserts the link row AND the pending-enrollment marker,

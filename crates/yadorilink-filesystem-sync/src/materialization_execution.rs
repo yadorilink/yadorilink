@@ -439,6 +439,19 @@ pub trait MaterializationExecutionPort: Send + Sync {
         path: &str,
     ) -> Result<Option<MaterializationIntentKind>, MaterializationExecutionError>;
 
+    /// Whether the write open on `path` recorded that its bytes were renamed
+    /// into place, durably, and nothing has proven or moved it since. A path
+    /// that is missing then was removed or moved by the user after the write
+    /// placed it; with the intent alone it cannot be told from a write that
+    /// crashed before the rename.
+    fn write_landed_unproven(
+        &self,
+        _group_id: &str,
+        _path: &str,
+    ) -> Result<bool, MaterializationExecutionError> {
+        Ok(false)
+    }
+
     /// For a path whose write intent waits for the batch flush of a received
     /// file (the write's proof was published, its file may not have reached
     /// stable storage): the identity that proof recorded for the file. `None`

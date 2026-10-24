@@ -62,7 +62,7 @@ def _load_validator():
     return mod.validate_manifest
 
 
-def verify(envelope_json: str, trusted: dict[str, str]) -> list[str]:
+def verify(envelope_json: str, trusted: dict[str, str], *, snapshot: bool = False) -> list[str]:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
     from cryptography.exceptions import InvalidSignature
 
@@ -98,7 +98,7 @@ def verify(envelope_json: str, trusted: dict[str, str]) -> list[str]:
     except json.JSONDecodeError as e:
         return [f"signed manifest body is not valid JSON: {e}"]
     validate_manifest = _load_validator()
-    problems.extend(validate_manifest(manifest, check_urls=False))
+    problems.extend(validate_manifest(manifest, check_urls=False, snapshot=snapshot))
     return problems
 
 
@@ -137,6 +137,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--key-id", default=None, help="key id for --public-key-hex")
     ap.add_argument("--dev-trust-root", action="store_true",
                     help="verify against the development key instead (never for a release manifest)")
+    ap.add_argument("--snapshot", action="store_true",
+                    help="the envelope is a per-version manifest, which never expires and may lack expires_at")
     ap.add_argument("--artifacts-dir", default=None,
                     help="directory holding the artifacts; check their size and SHA-256 against the manifest")
     args = ap.parse_args(argv)
@@ -165,7 +167,7 @@ def main(argv: list[str]) -> int:
         print("error: pass an envelope path or --check-signer-id", file=sys.stderr)
         return 2
     envelope_json = Path(args.envelope).read_text(encoding="utf-8")
-    problems = verify(envelope_json, trusted)
+    problems = verify(envelope_json, trusted, snapshot=args.snapshot)
     if not problems and args.artifacts_dir:
         problems = check_artifacts(envelope_json, Path(args.artifacts_dir))
     if problems:

@@ -246,6 +246,25 @@ impl LinkRepository {
         })
     }
 
+    /// Inserts the link row of a provider folder and declares its root in the same transaction,
+    /// with the local history floor of a first link (a joined group has history this device did
+    /// not originate). The plain-link counterpart of
+    /// `EnrollmentRepository::add_link_with_pending_enrollment_and_begin_setup`: no marker and no
+    /// journal row.
+    pub fn add_provider_link(
+        &self,
+        local_path: &str,
+        group_id: &str,
+        provider: &crate::provider::ProviderLinkSpec,
+    ) -> Result<LinkRowWrite, SyncSqliteError> {
+        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
+            let write = Self::insert_link_row(tx, local_path, group_id)?;
+            crate::provider::declare_link_root_in_tx(tx, group_id, provider)?;
+            crate::rewind_plan::record_local_history_floor_for_a_first_link(tx, group_id)?;
+            Ok(write)
+        })
+    }
+
     /// Whether this device holds a live (non-orphaned) filesystem link for `group_id`: the
     /// question "does this group owe a startup scan". A provider-backed link has no folder to
     /// scan and never registers a startup gate, so it does not count (counting it made the
@@ -1266,3 +1285,6 @@ mod local_history_floor_tests;
 
 #[cfg(test)]
 mod pause_lifecycle_tests;
+
+#[cfg(test)]
+mod provider_link_tests;

@@ -159,7 +159,7 @@ impl DirHandle {
     }
 
     pub(super) fn sync(&self) -> io::Result<()> {
-        self.0.sync_all()
+        crate::flush::sync_directory(&self.0)
     }
 }
 
@@ -194,7 +194,7 @@ pub fn durable_flush_directory(dir: &Path) -> io::Result<()> {
         if !handle.metadata()?.is_dir() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a directory"));
         }
-        handle.sync_all()
+        crate::flush::sync_directory(&handle)
     }
     #[cfg(not(any(unix, windows)))]
     {

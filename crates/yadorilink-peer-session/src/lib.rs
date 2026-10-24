@@ -15,10 +15,10 @@ pub mod service_rpc;
 
 pub use error::PeerSessionError;
 
-/// DST-only targeted trace: set `DST_TRACE_PATH=<exact sync path>` to get
-/// stderr tracing of every write-side decision touching exactly that path.
-/// Zero-cost when the variable is unset (one `OnceLock` read and a pointer
-/// compare per call site).
+/// DST-only targeted trace: in a test build, set `DST_TRACE_PATH=<exact sync path>` to get
+/// stderr tracing of every write-side decision touching exactly that path. A build without
+/// `test-support` never reads the variable. Zero-cost when it is unset (one `OnceLock` read and
+/// a pointer compare per call site).
 pub fn dst_trace(path: &str, msg: impl FnOnce() -> String) {
     if dst_trace_enabled(path) {
         eprintln!("[DSTTRACE {path}] {}", msg());
@@ -27,8 +27,14 @@ pub fn dst_trace(path: &str, msg: impl FnOnce() -> String) {
 
 /// Whether `DST_TRACE_PATH` selects `path`. See `dst_trace`'s doc comment.
 pub fn dst_trace_enabled(path: &str) -> bool {
-    static TRACED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    let traced = TRACED.get_or_init(|| std::env::var("DST_TRACE_PATH").ok());
+    // Only a test build reads the selector: a release engine, embedded or not, never does.
+    #[cfg(any(test, feature = "test-support"))]
+    let traced = {
+        static TRACED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        TRACED.get_or_init(|| std::env::var("DST_TRACE_PATH").ok())
+    };
+    #[cfg(not(any(test, feature = "test-support")))]
+    let traced: &Option<String> = &None;
     match traced.as_deref() {
         None => false,
         Some("*") => true,

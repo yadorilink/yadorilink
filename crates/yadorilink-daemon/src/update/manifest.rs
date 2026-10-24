@@ -19,6 +19,8 @@
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
+use yadorilink_local_storage::release_descriptor::{StateRefusal, StateSchema};
+
 use super::trust::{self, SignedTrustRecord, TrustError, TrustState};
 
 /// Bumped whenever the manifest schema's field set changes in a way that
@@ -179,14 +181,8 @@ const ALLOW_PLACEHOLDER_TRUST_ROOT_VALUE: &str = "1";
 /// any other test in this binary reading the same var). A missing value
 /// (`None`), or any value other than `1` (including `0`, `false`, empty, or
 /// blank/whitespace), does NOT bypass the gate.
-fn dev_override_value_enabled(raw: Option<&str>) -> bool {
+pub fn dev_override_value_enabled(raw: Option<&str>) -> bool {
     raw.map(|v| v.trim() == ALLOW_PLACEHOLDER_TRUST_ROOT_VALUE).unwrap_or(false)
-}
-
-/// Whether the opt-out env var is set to exactly the required value. Thin
-/// wrapper over `dev_override_value_enabled` that supplies the live env.
-fn dev_override_enabled() -> bool {
-    dev_override_value_enabled(std::env::var(ALLOW_PLACEHOLDER_TRUST_ROOT_ENV).ok().as_deref())
 }
 
 /// The release gate: rejects a build that still pins the forgeable
@@ -206,8 +202,11 @@ fn dev_override_enabled() -> bool {
 /// root with nothing failing to catch it. Tying enforcement to a release
 /// build feature (fail-closed) instead means the failure mode of "forgetting
 /// to flip something" now points the safe way.
-pub fn enforce_release_trust_root_gate() -> Result<(), String> {
-    evaluate_release_gate(TRUSTED_KEYS, dev_override_enabled())
+///
+/// `override_value` is the value of [`ALLOW_PLACEHOLDER_TRUST_ROOT_ENV`], which the
+/// daemon's startup reads and passes in: this gate never reads the environment itself.
+pub fn enforce_release_trust_root_gate(override_value: Option<&str>) -> Result<(), String> {
+    evaluate_release_gate(TRUSTED_KEYS, dev_override_value_enabled(override_value))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -230,6 +229,16 @@ pub enum ManifestError {
     MalformedBody(String),
     #[error("manifest schema version {found} is not supported (expected {expected})")]
     UnsupportedSchemaVersion { found: u32, expected: u32 },
+    #[error(
+        "the update manifest for this channel expired at {expires_at}; check the system clock \
+         or retry later"
+    )]
+    Expired { expires_at: String },
+    #[error(
+        "the update manifest for this channel was generated at {generated_at}, which is in the \
+         future; check the system clock or retry later"
+    )]
+    FutureDated { generated_at: String },
 }
 
 /// One release entry within a manifest — the manifest field list plus
@@ -281,7 +290,7 @@ pub struct ReleaseEntry {
     /// never make a client stream an unbounded response to disk.
     pub artifact_size: u64,
     /// Expected platform publisher identity substring (e.g. a Developer
-    /// ID Installer common name on macOS, or an Authenticode signer
+    /// ID Installer common name on macOS, or a code-signing
     /// subject on Windows) — consulted by `verify::verify_artifact`.
     /// Empty means "no specific identity pinned for this entry" (`verify`
     /// still requires *a* valid platform signature; it simply can't also
@@ -290,12 +299,52 @@ pub struct ReleaseEntry {
     pub artifact_publisher_identity: String,
     #[serde(default)]
     pub release_notes_url: String,
+    /// The state database version the release's engine stamps, as its engine identity declares
+    /// it. Absent: the release declares nothing and the engine's own check at open still applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_schema_version: Option<u32>,
+    /// The oldest state database version the release's engine still reads; the written version
+    /// when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_schema_min_readable: Option<u32>,
+    /// The app bundle's `CFBundleVersion` (what Sparkle compares), a positive integer. Carried by
+    /// `app_bundle` entries only, so the app can tie an appcast item to this exact entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sparkle_build: Option<u64>,
+}
+
+impl ReleaseEntry {
+    /// The artifact's file name: the last path segment of `artifact_url`.
+    pub fn artifact_file(&self) -> &str {
+        self.artifact_url.rsplit('/').next().unwrap_or_default()
+    }
+
+    /// Whether the release's engine can open the state database this install has now. An entry
+    /// that declares nothing cannot be judged here and is accepted. A declaration that does not
+    /// hold together (a minimum without a version, or above it) is refused: it claims to declare
+    /// compatibility and does so wrongly.
+    fn check_state_readable(&self, on_disk: u32) -> Result<(), StateRefusal> {
+        let target = match (self.state_schema_version, self.state_schema_min_readable) {
+            (None, None) => None,
+            (Some(writes), min) if min.is_none_or(|m| m <= writes) => {
+                Some(StateSchema { writes, reads_from: min.unwrap_or(writes) })
+            }
+            _ => return Err(StateRefusal::Undeclarable),
+        };
+        StateSchema::check_readable(on_disk, target)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateManifest {
     pub schema_version: u32,
     pub generated_at: String,
+    /// When this manifest stops being valid for update checks (`YYYY-MM-DDTHH:MM:SSZ`, strictly
+    /// after `generated_at`). Required: a body without it is malformed, so stripping the field
+    /// cannot dodge the freshness check. See [`check_not_expired`]. This type is the live channel
+    /// manifest only; the per-version manifests (never expired, and older ones carry no
+    /// `expires_at`) are read by the installers and the publisher, never by the daemon.
+    pub expires_at: String,
     pub releases: Vec<ReleaseEntry>,
     /// Versions the publisher withdrew from this channel (a yank repoints the entry to an older
     /// good version, which would otherwise make the bad one look like any old release). Absent
@@ -389,7 +438,56 @@ pub fn verify_envelope(
             expected: MANIFEST_SCHEMA_VERSION,
         });
     }
+    let generated = parse_manifest_time(&manifest.generated_at).ok_or_else(|| {
+        ManifestError::MalformedBody("generated_at is not a YYYY-MM-DDTHH:MM:SSZ timestamp".into())
+    })?;
+    let expires = parse_manifest_time(&manifest.expires_at).ok_or_else(|| {
+        ManifestError::MalformedBody("expires_at is not a YYYY-MM-DDTHH:MM:SSZ timestamp".into())
+    })?;
+    if expires <= generated {
+        return Err(ManifestError::MalformedBody("expires_at is not after generated_at".into()));
+    }
     Ok(manifest)
+}
+
+/// Strict `YYYY-MM-DDTHH:MM:SSZ`, the only timestamp form the publisher emits.
+fn parse_manifest_time(raw: &str) -> Option<chrono::NaiveDateTime> {
+    if raw.len() != 20 {
+        return None;
+    }
+    chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%SZ").ok()
+}
+
+/// Refuses a verified manifest whose `expires_at` is in the past at `now_unix` (Unix seconds).
+/// The clock is not a trust root and no skew allowance is made: the validity window is weeks, and
+/// an allowance would only lengthen what a withheld newer manifest can hide. Callers run this
+/// before the replay floor moves, so an expired manifest never counts as accepted.
+pub fn check_not_expired(manifest: &UpdateManifest, now_unix: i64) -> Result<(), ManifestError> {
+    let expires = parse_manifest_time(&manifest.expires_at)
+        .ok_or_else(|| ManifestError::MalformedBody("expires_at is not a timestamp".into()))?;
+    if now_unix > expires.and_utc().timestamp() {
+        return Err(ManifestError::Expired { expires_at: manifest.expires_at.clone() });
+    }
+    Ok(())
+}
+
+/// The most a manifest's `generated_at` may lead the local clock. Expiry has no allowance (see
+/// above); this one exists only so a mis-stamped manifest cannot set the replay floor beyond
+/// reach of every later, correctly stamped one: the floor is a server value and never expires.
+pub const MAX_FUTURE_SKEW_SECS: i64 = 24 * 60 * 60;
+
+/// Refuses a verified manifest generated more than [`MAX_FUTURE_SKEW_SECS`] after `now_unix`.
+/// Callers run this before the replay floor moves.
+pub fn check_not_future_dated(
+    manifest: &UpdateManifest,
+    now_unix: i64,
+) -> Result<(), ManifestError> {
+    let generated = parse_manifest_time(&manifest.generated_at)
+        .ok_or_else(|| ManifestError::MalformedBody("generated_at is not a timestamp".into()))?;
+    if generated.and_utc().timestamp() > now_unix.saturating_add(MAX_FUTURE_SKEW_SECS) {
+        return Err(ManifestError::FutureDated { generated_at: manifest.generated_at.clone() });
+    }
+    Ok(())
 }
 
 /// This installation's coarse identity for manifest-entry matching
@@ -408,6 +506,10 @@ pub struct LocalContext {
     /// the same rollout percentage give a consistent held-back/eligible
     /// answer instead of flapping — see `policy::UpdatePolicy::rollout_bucket`.
     pub rollout_bucket: u8,
+    /// The state database version this install's data is stamped with (the running engine's own;
+    /// the daemon holds that database open). An update or roll-back to an engine that cannot
+    /// read it is refused.
+    pub state_schema_version: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -428,6 +530,9 @@ pub enum Applicability {
     /// never installed, automatically or manually, until the kill switch
     /// is cleared in a later manifest.
     KillSwitched { entry: ReleaseEntry, version: semver::Version },
+    /// A newer version exists but its engine cannot open the state database this install has
+    /// written; it is never offered.
+    StateIncompatible { entry: ReleaseEntry, version: semver::Version, refusal: StateRefusal },
 }
 
 /// Selects the best applicable release entry for `ctx` out of an already
@@ -467,6 +572,10 @@ pub fn select_applicable(manifest: &UpdateManifest, ctx: &LocalContext) -> Appli
         return Applicability::KillSwitched { entry, version };
     }
 
+    if let Err(refusal) = entry.check_state_readable(ctx.state_schema_version) {
+        return Applicability::StateIncompatible { entry, version, refusal };
+    }
+
     let mandatory = is_mandatory(&entry, ctx);
 
     if !mandatory && !rollout_selected(ctx.rollout_bucket, entry.rollout_percentage) {
@@ -504,6 +613,77 @@ pub enum VersionRefusal {
     NotServed { version: String, served: String },
     #[error("version {0} is not yet rolled out to this install")]
     HeldBack(String),
+    #[error("version {version} cannot be used with the data on this device: {}", .refusal.message())]
+    StateIncompatible { version: String, refusal: StateRefusal },
+    #[error("the appcast item names channel {item}, this install is on {served}")]
+    ChannelMismatch { item: String, served: String },
+    #[error("the appcast item must name a build number")]
+    BuildMissing,
+    #[error("the channel manifest does not declare a build number for this release")]
+    BuildNotDeclared,
+    #[error("build {item} is not the build the channel manifest serves ({served})")]
+    BuildMismatch { item: u64, served: u64 },
+    #[error("the appcast item must name its enclosure URL")]
+    UrlMissing,
+    #[error("enclosure URL {item} is not the URL the channel manifest serves ({served})")]
+    UrlMismatch { item: String, served: String },
+    #[error("the appcast item must name its enclosure length")]
+    LengthMissing,
+    #[error("enclosure length {item} is not the size the channel manifest serves ({served})")]
+    LengthMismatch { item: u64, served: u64 },
+    #[error("the downloaded file's sha256 is required for this check")]
+    Sha256Missing,
+    #[error("the downloaded file's sha256 is not the sha256 the channel manifest serves")]
+    Sha256Mismatch,
+}
+
+impl VersionRefusal {
+    /// A stable machine-readable code for apps to branch on.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidVersion(_) => "invalid_version",
+            Self::Withdrawn(_) => "withdrawn",
+            Self::KillSwitched(_) => "kill_switched",
+            Self::BelowMinimum { .. } => "below_minimum",
+            Self::NotOffered => "not_offered",
+            Self::NotServed { .. } => "version_mismatch",
+            Self::HeldBack(_) => "held_back",
+            Self::StateIncompatible { .. } => "state_incompatible",
+            Self::ChannelMismatch { .. } => "channel_mismatch",
+            Self::BuildMissing => "build_missing",
+            Self::BuildNotDeclared => "build_not_declared",
+            Self::BuildMismatch { .. } => "build_mismatch",
+            Self::UrlMissing => "url_missing",
+            Self::UrlMismatch { .. } => "url_mismatch",
+            Self::LengthMissing => "length_missing",
+            Self::LengthMismatch { .. } => "length_mismatch",
+            Self::Sha256Missing => "sha256_missing",
+            Self::Sha256Mismatch => "sha256_mismatch",
+        }
+    }
+}
+
+/// An appcast item as the app sees it. `version`, `sparkle_build`, `url` (the whole enclosure
+/// URL) and `length` are required: an item that leaves one out is refused, never skipped. `channel`
+/// is compared when given (the daemon's own channel is authoritative). `sha256` is the downloaded
+/// file's digest, required by [`AppcastPhase::Downloaded`].
+#[derive(Debug, Clone, Default)]
+pub struct AppcastItem {
+    pub version: String,
+    pub sparkle_build: u64,
+    pub channel: Option<String>,
+    pub url: String,
+    pub length: u64,
+    pub sha256: Option<String>,
+}
+
+/// Which of the two checks the app is making. `Enclosure` is before the download, from the
+/// appcast alone; `Downloaded` is once the file is on disk and its digest is known, before the
+/// updater installs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppcastPhase {
+    Enclosure,
+    Downloaded,
 }
 
 fn matching_entries<'a>(
@@ -538,8 +718,14 @@ pub fn check_pinned_install(
         return Err(VersionRefusal::Withdrawn(wanted.to_string()));
     }
     for entry in matching_entries(manifest, ctx) {
-        if entry.kill_switch && parse_semver(&entry.version).ok().as_ref() == Some(&wanted) {
+        let is_wanted = parse_semver(&entry.version).ok().as_ref() == Some(&wanted);
+        if entry.kill_switch && is_wanted {
             return Err(VersionRefusal::KillSwitched(wanted.to_string()));
+        }
+        if is_wanted {
+            entry.check_state_readable(ctx.state_schema_version).map_err(|refusal| {
+                VersionRefusal::StateIncompatible { version: wanted.to_string(), refusal }
+            })?;
         }
         if let Ok(min) = parse_semver(&entry.minimum_supported_version) {
             if wanted < min {
@@ -579,9 +765,71 @@ pub fn check_appcast_item(
     if entry.kill_switch {
         return Err(VersionRefusal::KillSwitched(item.to_string()));
     }
+    entry.check_state_readable(ctx.state_schema_version).map_err(|refusal| {
+        VersionRefusal::StateIncompatible { version: item.to_string(), refusal }
+    })?;
     if !is_mandatory(entry, ctx) && !rollout_selected(ctx.rollout_bucket, entry.rollout_percentage)
     {
         return Err(VersionRefusal::HeldBack(item.to_string()));
+    }
+    Ok(())
+}
+
+/// The strict form of [`check_appcast_item`]: the item must also equal the served `app_bundle`
+/// entry in build, whole enclosure URL and length, and (in the `Downloaded` phase) the sha256 of
+/// the downloaded file. A required field the item leaves out is refused.
+pub fn check_appcast_entry(
+    manifest: &UpdateManifest,
+    ctx: &LocalContext,
+    item: &AppcastItem,
+    phase: AppcastPhase,
+) -> Result<(), VersionRefusal> {
+    if let Some(channel) = item.channel.as_deref() {
+        if channel != ctx.channel {
+            return Err(VersionRefusal::ChannelMismatch {
+                item: channel.into(),
+                served: ctx.channel.clone(),
+            });
+        }
+    }
+    if item.sparkle_build == 0 {
+        return Err(VersionRefusal::BuildMissing);
+    }
+    if item.url.is_empty() {
+        return Err(VersionRefusal::UrlMissing);
+    }
+    if item.length == 0 {
+        return Err(VersionRefusal::LengthMissing);
+    }
+    let sha256 = item.sha256.as_deref().filter(|s| !s.is_empty());
+    if phase == AppcastPhase::Downloaded && sha256.is_none() {
+        return Err(VersionRefusal::Sha256Missing);
+    }
+    check_appcast_item(manifest, ctx, &item.version)?;
+    let entry = matching_entries(manifest, ctx).next().ok_or(VersionRefusal::NotOffered)?;
+    match entry.sparkle_build {
+        None => return Err(VersionRefusal::BuildNotDeclared),
+        Some(served) if served != item.sparkle_build => {
+            return Err(VersionRefusal::BuildMismatch { item: item.sparkle_build, served });
+        }
+        Some(_) => {}
+    }
+    if item.url != entry.artifact_url {
+        return Err(VersionRefusal::UrlMismatch {
+            item: item.url.clone(),
+            served: entry.artifact_url.clone(),
+        });
+    }
+    if item.length != entry.artifact_size {
+        return Err(VersionRefusal::LengthMismatch {
+            item: item.length,
+            served: entry.artifact_size,
+        });
+    }
+    if let Some(sha256) = sha256 {
+        if !sha256.eq_ignore_ascii_case(&entry.artifact_sha256) {
+            return Err(VersionRefusal::Sha256Mismatch);
+        }
     }
     Ok(())
 }

@@ -231,7 +231,7 @@ fn write_and_publish(
     // `sync_all`, not `flush`: flush only pushes the bytes out of the process,
     // which a power cut discards. The fsync must complete before the final name
     // exists, or the name could be published pointing at unwritten blocks.
-    file.sync_all()?;
+    yadorilink_fs_platform::flush::sync_file(&file)?;
     drop(file);
 
     use yadorilink_fs_platform::durable_dir::{publish_durably, Replace};
@@ -279,7 +279,7 @@ fn harden_key_file(path: &Path) -> Result<(), TransportError> {
 //   * not(test), turmoil             -> no-op (simulation stays deterministic
 //                                       and never reaches for a real keychain).
 // On top of these, `YADORILINK_DISABLE_OS_KEYRING=1` short-circuits both entry
-// points before any backend is reached (see `DISABLE_OS_KEYRING_VAR`).
+// points before any backend is reached (see `KeyMirror::Disabled`).
 
 /// Outcome of mirroring the on-disk secret into the OS keyring.
 ///
@@ -312,6 +312,27 @@ enum KeyringProbe {
     Unavailable,
 }
 
+/// What deleting the keyring copy of a device key found. Not-found is a success: the goal is that
+/// no entry is left, and none was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyringDelete {
+    /// An entry existed and is gone.
+    Deleted,
+    /// The keyring answered and held no entry for the key file.
+    NotFound,
+    /// The OS keyring is switched off (`KeyMirror::Disabled`), so no mirror was ever
+    /// made and nothing was touched.
+    KeyringDisabled,
+}
+
+/// The answer of the OS store to deleting one username.
+#[cfg_attr(all(not(test), turmoil), allow(dead_code))]
+enum StoreDelete {
+    Deleted,
+    Absent,
+    Failed(String),
+}
+
 /// The raw answer of the OS store for one username.
 #[cfg(all(not(test), not(turmoil)))]
 enum StoreRead {
@@ -324,7 +345,6 @@ enum StoreRead {
 /// path. Each device-key file therefore maps 1:1 to its own keyring entry and
 /// cannot collide with another key file or with the coordination-token entries
 /// (which use fixed, non-path usernames).
-#[cfg(any(test, not(turmoil)))]
 fn keyring_username(path: &Path) -> String {
     let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     format!("device-key:{}", abs.to_string_lossy())
@@ -349,17 +369,47 @@ fn os_store_set(username: &str, value: &str) -> bool {
     keyring::Entry::new(KEYRING_SERVICE, username).is_ok_and(|e| e.set_password(value).is_ok())
 }
 
-/// A target with no OS store backend (iOS until it has a Data Protection Keychain backend, the
+#[cfg(all(not(test), not(turmoil), any(windows, target_os = "linux")))]
+fn os_store_delete(username: &str) -> StoreDelete {
+    let entry = match keyring::Entry::new(KEYRING_SERVICE, username) {
+        Ok(entry) => entry,
+        Err(err) => return StoreDelete::Failed(err.to_string()),
+    };
+    match entry.delete_credential() {
+        Ok(()) => StoreDelete::Deleted,
+        Err(keyring::Error::NoEntry) => StoreDelete::Absent,
+        Err(err) => StoreDelete::Failed(err.to_string()),
+    }
+}
+
+/// A target with no OS store backend (the
 /// BSDs): the mirror is honestly `Unavailable` and the hardened key file stays the only copy. There
 /// is no store that could hold a retired key, so a lookup finds the entry absent.
 /// `keyring` is not a dependency here, so nothing can fall back to its in-memory mock, which
 /// would report a mirrored secret that vanishes at the next process start.
-#[cfg(all(not(test), not(turmoil), not(any(windows, target_os = "linux", target_os = "macos"))))]
+#[cfg(all(
+    not(test),
+    not(turmoil),
+    not(any(windows, target_os = "linux", target_vendor = "apple"))
+))]
 fn os_store_read(_username: &str) -> StoreRead {
     StoreRead::Absent
 }
 
-#[cfg(all(not(test), not(turmoil), not(any(windows, target_os = "linux", target_os = "macos"))))]
+#[cfg(all(
+    not(test),
+    not(turmoil),
+    not(any(windows, target_os = "linux", target_vendor = "apple"))
+))]
+fn os_store_delete(_username: &str) -> StoreDelete {
+    StoreDelete::Absent
+}
+
+#[cfg(all(
+    not(test),
+    not(turmoil),
+    not(any(windows, target_os = "linux", target_vendor = "apple"))
+))]
 fn os_store_set(_username: &str, _value: &str) -> bool {
     false
 }
@@ -368,12 +418,26 @@ fn os_store_set(_username: &str, _value: &str) -> bool {
 /// access group (`yadorilink-os-keychain`). A process not signed with the group
 /// (an extension, an unsigned dev build) gets an error here, which is the
 /// `Unavailable` outcome: the key file stays the source of truth.
-#[cfg(all(not(test), not(turmoil), target_os = "macos"))]
+#[cfg(all(not(test), not(turmoil), target_vendor = "apple"))]
 fn os_store_read(username: &str) -> StoreRead {
     match yadorilink_os_keychain::Keychain::system().read(username) {
         Ok(Some(bytes)) => String::from_utf8(bytes).map_or(StoreRead::Absent, StoreRead::Value),
         Ok(None) => StoreRead::Absent,
         Err(_) => StoreRead::Failed,
+    }
+}
+
+#[cfg(all(not(test), not(turmoil), target_vendor = "apple"))]
+fn os_store_delete(username: &str) -> StoreDelete {
+    let keychain = yadorilink_os_keychain::Keychain::system();
+    match keychain.read(username) {
+        Ok(None) => return StoreDelete::Absent,
+        Ok(Some(_)) => {}
+        Err(err) => return StoreDelete::Failed(err.to_string()),
+    }
+    match keychain.delete(username) {
+        Ok(()) => StoreDelete::Deleted,
+        Err(err) => StoreDelete::Failed(err.to_string()),
     }
 }
 
@@ -385,7 +449,7 @@ fn os_store_get(username: &str) -> Option<String> {
     }
 }
 
-#[cfg(all(not(test), not(turmoil), target_os = "macos"))]
+#[cfg(all(not(test), not(turmoil), target_vendor = "apple"))]
 fn os_store_set(username: &str, value: &str) -> bool {
     yadorilink_os_keychain::Keychain::system().write(username, value.as_bytes()).is_ok()
 }
@@ -436,6 +500,21 @@ fn keyring_mirror_backend(path: &Path, secret: &[u8; 32]) -> KeyringMirror {
         Some(v) if v.as_slice() == secret.as_slice() => KeyringMirror::Present,
         _ => KeyringMirror::Unavailable,
     }
+}
+
+#[cfg(all(not(test), not(turmoil)))]
+fn keyring_delete_backend(path: &Path) -> StoreDelete {
+    os_store_delete(&keyring_username(path))
+}
+
+#[cfg(all(not(test), turmoil))]
+fn keyring_delete_backend(_path: &Path) -> StoreDelete {
+    StoreDelete::Absent
+}
+
+#[cfg(test)]
+fn keyring_delete_backend(path: &Path) -> StoreDelete {
+    test_keyring::delete(&keyring_username(path))
 }
 
 /// Overwrites the keyring entry of `path` with `secret`. Only [`replace_retiring`] calls it, after
@@ -500,42 +579,55 @@ fn keyring_mirror_backend(path: &Path, secret: &[u8; 32]) -> KeyringMirror {
     }
 }
 
-/// Environment switch that turns the OS keyring mirror off entirely: with
-/// `YADORILINK_DISABLE_OS_KEYRING=1` no keyring read, write or probe is ever
-/// issued and the hardened key file is the only copy (the same "OS keyring
-/// unavailable, using file at rest" path as a headless host). Production
-/// default is unchanged: unset means the keyring is used. Test and sweep
-/// harnesses set it (`.config/nextest.toml`)
-/// so a run never touches the developer's real keychain; the credential store
-/// has its own, existing `YADORILINK_CREDENTIAL_STORE=file`, which the same
-/// harnesses set alongside.
-#[cfg(not(test))]
-const DISABLE_OS_KEYRING_VAR: &str = "YADORILINK_DISABLE_OS_KEYRING";
-
-/// Whether `value` of [`DISABLE_OS_KEYRING_VAR`] switches the keyring off.
-fn disables_keyring(value: Option<&str>) -> bool {
-    matches!(value, Some("1"))
+/// Whether a device key is mirrored into the OS keyring.
+///
+/// Chosen once by the composition root and passed down with every key operation, so an
+/// embedded host never depends on the process environment. [`KeyMirror::Disabled`] issues no
+/// keyring read, write or probe at all: the hardened key file is the only copy (the same
+/// "OS keyring unavailable, using file at rest" path as a headless host).
+/// [`KeyMirror::from_env`] is the desktop binaries' mapping of
+/// `YADORILINK_DISABLE_OS_KEYRING=1`, which test and sweep harnesses set so that a run never
+/// touches the developer's real keychain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyMirror {
+    /// Mirror into the OS keyring when one is available.
+    OsKeyring,
+    /// Never touch the OS keyring.
+    Disabled,
 }
 
-/// Unit tests ignore the environment (the harness sets it for the whole run,
-/// and the in-memory keyring tests must still exercise the mirror); they drive
-/// the switch through `test_keyring::set_disabled` instead.
-fn os_keyring_disabled() -> bool {
-    #[cfg(test)]
-    return test_keyring::disabled();
-    #[cfg(not(test))]
-    return disables_keyring(std::env::var(DISABLE_OS_KEYRING_VAR).ok().as_deref());
+impl KeyMirror {
+    /// The desktop mapping of the process environment: `YADORILINK_DISABLE_OS_KEYRING=1`
+    /// disables the mirror, anything else (or unset) keeps it.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self::from_disable_flag(std::env::var("YADORILINK_DISABLE_OS_KEYRING").ok().as_deref())
+    }
+
+    /// The value of the disable flag, already read.
+    #[must_use]
+    pub fn from_disable_flag(value: Option<&str>) -> Self {
+        if matches!(value, Some("1")) {
+            Self::Disabled
+        } else {
+            Self::OsKeyring
+        }
+    }
 }
 
-fn keyring_load(path: &Path) -> Option<Zeroizing<[u8; 32]>> {
-    if os_keyring_disabled() {
+fn os_keyring_disabled(mirror: KeyMirror) -> bool {
+    mirror == KeyMirror::Disabled
+}
+
+fn keyring_load(path: &Path, mirror: KeyMirror) -> Option<Zeroizing<[u8; 32]>> {
+    if os_keyring_disabled(mirror) {
         return None;
     }
     keyring_load_backend(path)
 }
 
-fn keyring_mirror(path: &Path, secret: &[u8; 32]) -> KeyringMirror {
-    if os_keyring_disabled() {
+fn keyring_mirror(path: &Path, secret: &[u8; 32], mirror: KeyMirror) -> KeyringMirror {
+    if os_keyring_disabled(mirror) {
         return KeyringMirror::Unavailable;
     }
     keyring_mirror_backend(path, secret)
@@ -554,6 +646,7 @@ fn keyring_mirror(path: &Path, secret: &[u8; 32]) -> KeyringMirror {
 /// deleted, so the device identity cannot be lost.
 pub(crate) fn load_persisted_secret(
     path: &Path,
+    mirror: KeyMirror,
 ) -> Result<Option<Zeroizing<[u8; 32]>>, TransportError> {
     match read_secret_file(path)? {
         KeyFile::Secret(secret) => {
@@ -565,7 +658,7 @@ pub(crate) fn load_persisted_secret(
             if let Err(err) = harden_key_file(path) {
                 tracing::warn!("could not re-restrict permissions on device key file: {err}");
             }
-            match keyring_mirror(path, &secret) {
+            match keyring_mirror(path, &secret, mirror) {
                 KeyringMirror::Present => {
                     tracing::debug!(
                         "device key loaded from hardened file; OS keyring copy present"
@@ -588,7 +681,7 @@ pub(crate) fn load_persisted_secret(
         }
 
         // The config directory was wiped while the OS credential store survived.
-        KeyFile::Missing => recover_from_keyring(path),
+        KeyFile::Missing => recover_from_keyring(path, mirror),
 
         // A file that exists but does not decode is what a power cut during a
         // pre-atomic write leaves behind. The keyring may still hold the
@@ -596,7 +689,7 @@ pub(crate) fn load_persisted_secret(
         // the decode error here would strand a device whose key the OS keyring
         // could have handed back.
         KeyFile::Corrupt(err) => {
-            let Some(secret) = keyring_load(path) else {
+            let Some(secret) = keyring_load(path, mirror) else {
                 return Err(err);
             };
             // Deliberately not a regenerate: the file is unreadable, not
@@ -612,8 +705,11 @@ pub(crate) fn load_persisted_secret(
 }
 
 /// Restores the on-disk source of truth from the keyring copy, if there is one.
-fn recover_from_keyring(path: &Path) -> Result<Option<Zeroizing<[u8; 32]>>, TransportError> {
-    let Some(secret) = keyring_load(path) else {
+fn recover_from_keyring(
+    path: &Path,
+    mirror: KeyMirror,
+) -> Result<Option<Zeroizing<[u8; 32]>>, TransportError> {
+    let Some(secret) = keyring_load(path, mirror) else {
         return Ok(None);
     };
     match write_secret_file(path, &secret, Publish::CreateNew) {
@@ -638,9 +734,13 @@ fn recover_from_keyring(path: &Path) -> Result<Option<Zeroizing<[u8; 32]>>, Tran
 /// device identity is durably recorded on disk before anything else, then
 /// mirrors it into the keyring best-effort. Surfaces `AlreadyExists` so the
 /// caller can run its create-race recovery.
-pub(crate) fn persist_new_secret(path: &Path, secret: &[u8; 32]) -> Result<(), TransportError> {
+pub(crate) fn persist_new_secret(
+    path: &Path,
+    secret: &[u8; 32],
+    mirror: KeyMirror,
+) -> Result<(), TransportError> {
     write_secret_file(path, secret, Publish::CreateNew)?;
-    match keyring_mirror(path, secret) {
+    match keyring_mirror(path, secret, mirror) {
         KeyringMirror::Present => {
             tracing::debug!("device key persisted to hardened file and OS keyring");
         }
@@ -660,9 +760,32 @@ pub(crate) fn persist_new_secret(path: &Path, secret: &[u8; 32]) -> Result<(), T
     Ok(())
 }
 
+/// Deletes the keyring copy of the device key stored at `path`; the key file is not touched.
+///
+/// For the paths that end an identity (sign-out, forgetting the credential, retiring a key,
+/// uninstalling): the copy would otherwise outlive them in the OS credential store. An entry that
+/// is not there is success. A keyring that cannot be asked, or refuses the delete, is an error:
+/// the entry may still exist, and the caller says so rather than claiming it is gone.
+pub(crate) fn delete_keyring_entry(
+    path: &Path,
+    mirror: KeyMirror,
+) -> Result<KeyringDelete, TransportError> {
+    if os_keyring_disabled(mirror) {
+        return Ok(KeyringDelete::KeyringDisabled);
+    }
+    match keyring_delete_backend(path) {
+        StoreDelete::Deleted => Ok(KeyringDelete::Deleted),
+        StoreDelete::Absent => Ok(KeyringDelete::NotFound),
+        StoreDelete::Failed(why) => Err(TransportError::Io(std::io::Error::other(format!(
+            "could not delete the OS keyring entry of the device key ({}): {why}",
+            keyring_username(path)
+        )))),
+    }
+}
+
 /// Replaces the identity at `path` with `new`, keeping the displaced one at `retired`.
 ///
-/// The displaced secret is written to `retired` (file and keyring copy) first; only then is `path`
+/// The displaced secret is written to `retired` (file and keyring copy) first (its keyring copy is deleted again at the end, the file stays); only then is `path`
 /// replaced and its keyring entry overwritten, so the overwrite destroys nothing, and a lost key
 /// file at `path` recovers `new` rather than the retired identity. A `retired` name that already
 /// holds a different secret is an error and nothing is replaced. Running it again after an
@@ -671,8 +794,9 @@ pub(crate) fn replace_retiring(
     path: &Path,
     retired: &Path,
     new: &[u8; 32],
+    mirror: KeyMirror,
 ) -> Result<(), TransportError> {
-    let current = load_persisted_secret(path)?.ok_or_else(|| {
+    let current = load_persisted_secret(path, mirror)?.ok_or_else(|| {
         TransportError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "no device key to retire",
@@ -680,12 +804,14 @@ pub(crate) fn replace_retiring(
     })?;
     if current.as_slice() == new.as_slice() {
         // Replaced before an interruption; only the keyring entry may still be behind.
-        return overwrite_keyring_entry(path, new);
+        overwrite_keyring_entry(path, new, mirror)?;
+        delete_keyring_entry(retired, mirror)?;
+        return Ok(());
     }
-    match persist_new_secret(retired, &current) {
+    match persist_new_secret(retired, &current, mirror) {
         Ok(()) => {}
         Err(TransportError::Io(err)) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            match load_persisted_secret(retired)? {
+            match load_persisted_secret(retired, mirror)? {
                 Some(kept) if kept.as_slice() == current.as_slice() => {}
                 Some(_) => {
                     return Err(TransportError::InvalidKey(
@@ -702,14 +828,21 @@ pub(crate) fn replace_retiring(
         Err(err) => return Err(err),
     }
     write_secret_file(path, new, Publish::Replace)?;
-    overwrite_keyring_entry(path, new)
+    overwrite_keyring_entry(path, new, mirror)?;
+    // The retired identity is out of use; its file stays, its OS keyring copy does not.
+    delete_keyring_entry(retired, mirror)?;
+    Ok(())
 }
 
 /// Makes the keyring entry of `path` hold `new`, when the keyring holds an entry for `path` at all.
 /// A keyring that cannot be read is an error, never an absent entry. An entry that cannot be replaced is an error: a lost key file would otherwise recover the
 /// retired identity from it. Running the replacement again repairs the entry.
-fn overwrite_keyring_entry(path: &Path, new: &[u8; 32]) -> Result<(), TransportError> {
-    if os_keyring_disabled() {
+fn overwrite_keyring_entry(
+    path: &Path,
+    new: &[u8; 32],
+    mirror: KeyMirror,
+) -> Result<(), TransportError> {
+    if os_keyring_disabled(mirror) {
         return Ok(());
     }
     match keyring_probe_backend(path) {
@@ -726,7 +859,7 @@ fn overwrite_keyring_entry(path: &Path, new: &[u8; 32]) -> Result<(), TransportE
         }
     }
     keyring_overwrite_backend(path, new);
-    match keyring_load(path) {
+    match keyring_load(path, mirror) {
         Some(entry) if entry.as_slice() == new.as_slice() => Ok(()),
         _ => Err(TransportError::InvalidKey(
             "the OS keyring entry for the device key could not be replaced; run the same step \

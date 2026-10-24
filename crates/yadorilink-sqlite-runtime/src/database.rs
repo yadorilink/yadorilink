@@ -251,6 +251,54 @@ pub fn current_thread_in_write_transaction() -> bool {
     IN_WRITE.with(|f| f.get())
 }
 
+/// Records `presented`, the generation of the writer lease the caller holds over the data
+/// area, in the database behind `conn` (`writer_generation`), in one immediate transaction: the
+/// check and the write cannot interleave with another writer's. See
+/// [`record_writer_generation_in_transaction`] for the rules, and for opening with the caller's
+/// own initialization in the same transaction.
+pub fn record_writer_generation_on(conn: &Connection, presented: u64) -> Result<(), DatabaseError> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    record_writer_generation_in_transaction(&tx, presented)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// The statements of [`record_writer_generation_on`], for a caller that holds its own
+/// immediate transaction on `conn` and commits the record together with other work, so no
+/// other writer can record a newer generation between the record and that work. A database that
+/// already records a newer generation refuses with [`DatabaseError::StaleWriter`] and is left
+/// as it was. The runtime knows only the number; the caller proves the lease.
+pub fn record_writer_generation_in_transaction(
+    conn: &Connection,
+    presented: u64,
+) -> Result<(), DatabaseError> {
+    debug_assert!(!conn.is_autocommit(), "the record must run inside the caller's transaction");
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS writer_generation (
+             id         INTEGER PRIMARY KEY CHECK (id = 1),
+             generation INTEGER NOT NULL
+         )",
+    )?;
+    let recorded: Option<i64> = conn
+        .query_row("SELECT generation FROM writer_generation WHERE id = 1", [], |r| r.get(0))
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })?;
+    if let Some(recorded) = recorded.and_then(|g| u64::try_from(g).ok()) {
+        if recorded > presented {
+            return Err(DatabaseError::StaleWriter { recorded, presented });
+        }
+    }
+    conn.execute(
+        "INSERT INTO writer_generation (id, generation) VALUES (1, ?1)
+         ON CONFLICT(id) DO UPDATE SET generation = excluded.generation",
+        [i64::try_from(presented).unwrap_or(i64::MAX)],
+    )?;
+    Ok(())
+}
+
 pub struct SyncDatabase {
     /// Each call checks out its own pooled connection (`r2d2` +
     /// `r2d2_sqlite`) against a WAL-mode database, so multiple readers
@@ -357,15 +405,102 @@ impl SyncDatabase {
     /// `open` returns -- the sole place schema initialization happens.
     /// This crate knows no domain-specific name (native state, filesystem
     /// transaction, materialization job, ...) here or anywhere else.
+    ///
+    /// This is for a process that already holds the database's OS-level exclusion (the desktop
+    /// daemon's resource locks); a host without one proves a writer lease first and then
+    /// [`Self::record_writer_generation`].
+    pub fn open_process_locked(
+        path: impl AsRef<Path>,
+        schema_init: impl FnOnce(&Connection) -> Result<(), DatabaseError>,
+    ) -> Result<Self, DatabaseError> {
+        Self::open_impl(path, OpenOptions::default(), schema_init)
+    }
+
+    /// Records `presented`, the generation of the writer lease the caller holds over this
+    /// database's data area, in the database (`writer_generation`). See
+    /// [`record_writer_generation_on`].
+    pub fn record_writer_generation(&self, presented: u64) -> Result<(), DatabaseError> {
+        self.write::<_, DatabaseError>(|conn| record_writer_generation_on(conn, presented))
+    }
+
+    /// Reads the writer generation recorded in the database file at `path` without creating,
+    /// initializing or writing anything: the file is opened read-only, and a missing file or
+    /// one with no record yields `None`. For a caller that must refuse a stale writer before
+    /// running any initialization of its own.
+    pub fn peek_writer_generation(path: impl AsRef<Path>) -> Result<Option<u64>, DatabaseError> {
+        let conn = match Connection::open_with_flags(
+            path.as_ref(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) {
+            Ok(conn) => conn,
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::CannotOpen && !path.as_ref().exists() =>
+            {
+                return Ok(None);
+            }
+            Err(e) => return Err(e.into()),
+        };
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' \
+             AND name = 'writer_generation')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Ok(None);
+        }
+        match conn.query_row("SELECT generation FROM writer_generation WHERE id = 1", [], |r| {
+            r.get::<_, i64>(0)
+        }) {
+            Ok(g) => Ok(u64::try_from(g).ok()),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The writer generation last recorded by [`Self::record_writer_generation`], if any.
+    pub fn recorded_writer_generation(&self) -> Result<Option<u64>, DatabaseError> {
+        self.read::<_, DatabaseError>(|conn| {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' \
+                 AND name = 'writer_generation')",
+                [],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                return Ok(None);
+            }
+            match conn.query_row("SELECT generation FROM writer_generation WHERE id = 1", [], |r| {
+                r.get::<_, i64>(0)
+            }) {
+                Ok(g) => Ok(u64::try_from(g).ok()),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(e.into()),
+            }
+        })
+    }
+
+    /// Unlocked open for tests that own their file.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn open(
         path: impl AsRef<Path>,
         schema_init: impl FnOnce(&Connection) -> Result<(), DatabaseError>,
     ) -> Result<Self, DatabaseError> {
-        Self::open_with_options(path, OpenOptions::default(), schema_init)
+        Self::open_impl(path, OpenOptions::default(), schema_init)
     }
 
-    /// [`Self::open`] with explicit durability options.
+    /// [`Self::open`] with explicit durability options, for tests that own their file.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn open_with_options(
+        path: impl AsRef<Path>,
+        options: OpenOptions,
+        schema_init: impl FnOnce(&Connection) -> Result<(), DatabaseError>,
+    ) -> Result<Self, DatabaseError> {
+        Self::open_impl(path, options, schema_init)
+    }
+
+    fn open_impl(
         path: impl AsRef<Path>,
         options: OpenOptions,
         schema_init: impl FnOnce(&Connection) -> Result<(), DatabaseError>,

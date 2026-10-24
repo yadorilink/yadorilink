@@ -43,7 +43,7 @@ libc = "0.2"
 
 # Windows: a protected current-user-only DACL on the recovery area.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
@@ -52,6 +52,7 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [dev-dependencies]
+yadorilink-sqlite-runtime = { path = "../yadorilink-sqlite-runtime", features = ["test-support"] }
 tempfile = "3"
 # `hooks` for the progress handler the scale tests count SQLite's work
 # with: a count, unlike a timing, does not move with machine load.

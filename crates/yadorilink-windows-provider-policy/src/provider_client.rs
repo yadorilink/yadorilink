@@ -6,18 +6,19 @@
 //! empty success: a caller that reconciles the local namespace against an answer must not read
 //! "could not ask" as "nothing there".
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::runtime::Runtime;
 use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_ipc_proto::shellipc::shell_ipc_message::Payload;
 use yadorilink_ipc_proto::shellipc::{
-    ActivityKind, EnumerateChildrenRequest, ExtensionHandshake, MaterializeToTempRequest,
-    MaterializeToTempResponse, ProviderActivity, ProviderApplyChangeRequest,
-    ProviderApplyChangeResponse, ProviderItem, ShellIpcMessage,
+    ActivityKind, EnumerateChildrenRequest, ExtensionHandshake, MaterializeProgress,
+    MaterializeToTempRequest, MaterializeToTempResponse, ProviderActivity,
+    ProviderApplyChangeRequest, ProviderApplyChangeResponse, ProviderItem, ShellIpcMessage,
 };
 
 /// How the host reaches the daemon: one new connection per call. The Windows crate implements
@@ -30,8 +31,9 @@ pub trait Connect {
 }
 
 const ENUMERATE_TIMEOUT: Duration = Duration::from_secs(10);
-/// One materialization request. A fetch is served in bounded windows (see `windowed_fetch`), so
-/// this bounds one window and does not grow with the size of the file.
+/// How long one materialization request may go without a progress message from the daemon (see
+/// `call_unless`): a stall, not a total, so a window or a file that keeps arriving over a slow
+/// route is never cut off by its size.
 pub const MATERIALIZE_TIMEOUT: Duration = Duration::from_secs(40);
 /// The request that records a whole version after its windows were delivered. The daemon
 /// assembles the whole file from blocks it already has, which takes as long as the file is big;
@@ -98,6 +100,11 @@ fn call<T>(
 
 /// [`call`] that gives up as soon as `cancel` is set: the connection is dropped, which makes the
 /// daemon abort the request.
+///
+/// `timeout` is how long the request may go without a sign of life, not its total duration: every
+/// progress message of the daemon starts it over, so a long transfer that keeps moving is never cut
+/// off, and one that stalls for `timeout` is. A request the daemon does not report progress for
+/// is bounded in total, as before.
 fn call_unless<T>(
     connector: &impl Connect,
     timeout: Duration,
@@ -107,18 +114,36 @@ fn call_unless<T>(
     pick: impl Fn(Payload) -> Option<T>,
 ) -> Option<T> {
     runtime().block_on(async {
-        let work = tokio::time::timeout(timeout, async {
+        let last_sign = Cell::new(Instant::now());
+        let work = async {
             let mut stream = connector.connect().await.ok()?;
-            exchange(&mut stream, root, request, pick).await
-        });
+            exchange(&mut stream, root, request, |payload| {
+                if matches!(payload, Payload::MaterializeProgress(_)) {
+                    last_sign.set(Instant::now());
+                }
+                pick(payload)
+            })
+            .await
+        };
+        tokio::pin!(work);
         let cancelled = async {
             while !cancel.load(Ordering::Relaxed) {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         };
-        tokio::select! {
-            answer = work => answer.ok()?,
-            () = cancelled => None,
+        tokio::pin!(cancelled);
+        loop {
+            let stalled_at = tokio::time::Instant::from_std(last_sign.get() + timeout);
+            tokio::select! {
+                answer = &mut work => return answer,
+                () = &mut cancelled => return None,
+                () = tokio::time::sleep_until(stalled_at) => {
+                    // A sign of life since this wait began moved the deadline: wait again.
+                    if last_sign.get().elapsed() >= timeout {
+                        return None;
+                    }
+                }
+            }
         }
     })
 }
@@ -224,7 +249,7 @@ pub fn materialize_request(
         ranged: range.is_some(),
         range_offset: range.map_or(0, |r| r.0),
         range_length: range.map_or(0, |r| r.1),
-        // This client waits for the one response.
+        // Set by the caller that wants progress; the default waits for the one response.
         report_progress: false,
     }
 }
@@ -263,14 +288,45 @@ pub fn materialize_within(
     request_id: &[u8],
     target: Option<FetchTarget>,
 ) -> Option<MaterializeToTempResponse> {
+    materialize_reporting(connector, timeout, cancel, root, item, request_id, target, None)
+}
+
+/// [`materialize_within`] that also asks the daemon for progress and passes each message for this
+/// request to `on_progress` as `(completed, total)` bytes before the answer arrives. A daemon
+/// that predates progress sends none, which is "no information", never "no progress".
+#[allow(clippy::too_many_arguments)]
+pub fn materialize_reporting(
+    connector: &impl Connect,
+    timeout: Duration,
+    cancel: &AtomicBool,
+    root: &[u8],
+    item: &[u8],
+    request_id: &[u8],
+    target: Option<FetchTarget>,
+    on_progress: Option<&dyn Fn(u64, u64)>,
+) -> Option<MaterializeToTempResponse> {
+    let mut request = materialize_request(root, item, request_id, target);
+    request.report_progress = on_progress.is_some();
     call_unless(
         connector,
         timeout,
         cancel,
         root,
-        Payload::MaterializeToTempRequest(materialize_request(root, item, request_id, target)),
+        Payload::MaterializeToTempRequest(request),
         move |payload| match payload {
             Payload::MaterializeToTempResponse(r) if r.request_id == request_id => Some(r),
+            // A message for another request id is stale.
+            Payload::MaterializeProgress(MaterializeProgress {
+                request_id: id,
+                completed,
+                total,
+                ..
+            }) if id == request_id => {
+                if let Some(report) = on_progress {
+                    report(completed, total);
+                }
+                None
+            }
             _ => None,
         },
     )
@@ -384,6 +440,206 @@ mod tests {
 
     use super::*;
     use yadorilink_ipc_proto::shellipc::{EnumerateChildrenResponse, StatusPush};
+
+    /// A daemon end of an in-memory connection, handed out once.
+    struct Scripted(std::sync::Mutex<Option<tokio::io::DuplexStream>>);
+
+    impl Connect for Scripted {
+        type Stream = tokio::io::DuplexStream;
+        async fn connect(&self) -> std::io::Result<Self::Stream> {
+            self.0.lock().unwrap().take().ok_or_else(|| std::io::ErrorKind::NotFound.into())
+        }
+    }
+
+    fn scripted_daemon(
+        script: impl FnOnce(MaterializeToTempRequest) -> Vec<Payload> + Send + 'static,
+    ) -> Scripted {
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        runtime().spawn(async move {
+            let _handshake: ShellIpcMessage = read_message(&mut server).await.unwrap().unwrap();
+            let request: ShellIpcMessage = read_message(&mut server).await.unwrap().unwrap();
+            let Some(Payload::MaterializeToTempRequest(request)) = request.payload else {
+                panic!("not a materialization request");
+            };
+            for payload in script(request) {
+                write_message(&mut server, &ShellIpcMessage { payload: Some(payload) })
+                    .await
+                    .unwrap();
+            }
+            // Keep the connection open until the client has read everything and left.
+            let _ = read_message::<ShellIpcMessage>(&mut server).await;
+        });
+        Scripted(std::sync::Mutex::new(Some(client)))
+    }
+
+    /// Progress is asked for, delivered in order for this request only, and the answer still
+    /// comes last; messages for another request are ignored.
+    #[test]
+    fn progress_of_this_request_is_passed_on_before_the_answer() {
+        let daemon = scripted_daemon(|request| {
+            assert!(request.report_progress, "the request asks for progress");
+            let progress = |id: &[u8], completed, done| {
+                Payload::MaterializeProgress(MaterializeProgress {
+                    request_id: id.to_vec(),
+                    completed,
+                    total: 100,
+                    done,
+                })
+            };
+            vec![
+                progress(b"id", 10, false),
+                progress(b"other", 99, false),
+                progress(b"id", 60, false),
+                progress(b"id", 100, true),
+                Payload::MaterializeToTempResponse(MaterializeToTempResponse {
+                    request_id: b"id".to_vec(),
+                    ok: true,
+                    ..Default::default()
+                }),
+            ]
+        });
+        let seen = std::cell::RefCell::new(Vec::new());
+        let answer = materialize_reporting(
+            &daemon,
+            Duration::from_secs(10),
+            &AtomicBool::new(false),
+            b"root",
+            b"item",
+            b"id",
+            None,
+            Some(&|completed, total| seen.borrow_mut().push((completed, total))),
+        )
+        .expect("answered");
+        assert!(answer.ok);
+        assert_eq!(*seen.borrow(), [(10, 100), (60, 100), (100, 100)]);
+    }
+
+    /// A daemon end that sends `progress_messages` progress messages `gap` apart and then, when
+    /// `answer` is set, the response.
+    fn slow_daemon(progress_messages: u64, gap: Duration, answer: bool) -> Scripted {
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        runtime().spawn(async move {
+            let _handshake: ShellIpcMessage = read_message(&mut server).await.unwrap().unwrap();
+            let request: ShellIpcMessage = read_message(&mut server).await.unwrap().unwrap();
+            let Some(Payload::MaterializeToTempRequest(request)) = request.payload else {
+                panic!("not a materialization request");
+            };
+            for completed in 1..=progress_messages {
+                tokio::time::sleep(gap).await;
+                let progress = Payload::MaterializeProgress(MaterializeProgress {
+                    request_id: request.request_id.clone(),
+                    completed,
+                    total: progress_messages,
+                    done: false,
+                });
+                write_message(&mut server, &ShellIpcMessage { payload: Some(progress) })
+                    .await
+                    .unwrap();
+            }
+            if answer {
+                let response = Payload::MaterializeToTempResponse(MaterializeToTempResponse {
+                    request_id: request.request_id,
+                    ok: true,
+                    ..Default::default()
+                });
+                write_message(&mut server, &ShellIpcMessage { payload: Some(response) })
+                    .await
+                    .unwrap();
+            }
+            let _ = read_message::<ShellIpcMessage>(&mut server).await;
+        });
+        Scripted(std::sync::Mutex::new(Some(client)))
+    }
+
+    /// A transfer that keeps reporting progress outlives the request timeout: the timeout is a
+    /// stall bound, not a cap on how long a large file may take.
+    #[test]
+    fn a_transfer_that_keeps_moving_outlives_the_timeout() {
+        let timeout = Duration::from_millis(400);
+        let started = Instant::now();
+        // Ten messages 120 ms apart: 1.2 s in total, three times the timeout.
+        let daemon = slow_daemon(10, Duration::from_millis(120), true);
+        let answer = materialize_reporting(
+            &daemon,
+            timeout,
+            &AtomicBool::new(false),
+            b"root",
+            b"item",
+            b"id",
+            None,
+            Some(&|_, _| {}),
+        );
+        assert!(answer.is_some_and(|a| a.ok), "a moving transfer is not cut off");
+        assert!(started.elapsed() > timeout * 2);
+    }
+
+    /// A transfer that stops reporting for the timeout is abandoned, however much it had done.
+    #[test]
+    fn a_stalled_transfer_is_abandoned_after_the_timeout() {
+        let timeout = Duration::from_millis(400);
+        let started = Instant::now();
+        let daemon = slow_daemon(3, Duration::from_millis(100), false);
+        let answer = materialize_reporting(
+            &daemon,
+            timeout,
+            &AtomicBool::new(false),
+            b"root",
+            b"item",
+            b"id",
+            None,
+            Some(&|_, _| {}),
+        );
+        assert!(answer.is_none());
+        assert!(started.elapsed() >= timeout + Duration::from_millis(300));
+    }
+
+    /// Without a progress sink the daemon is not asked to send any.
+    #[test]
+    fn no_progress_is_asked_for_without_a_sink() {
+        let daemon = scripted_daemon(|request| {
+            assert!(!request.report_progress);
+            vec![Payload::MaterializeToTempResponse(MaterializeToTempResponse {
+                request_id: request.request_id,
+                ok: true,
+                ..Default::default()
+            })]
+        });
+        let answer = materialize_within(
+            &daemon,
+            Duration::from_secs(10),
+            &AtomicBool::new(false),
+            b"r",
+            b"i",
+            b"id",
+            None,
+        );
+        assert!(answer.is_some_and(|a| a.ok));
+    }
+
+    /// A cancel while the daemon is still working drops the call without an answer.
+    #[test]
+    fn a_cancel_abandons_a_request_still_in_progress() {
+        let daemon = scripted_daemon(|request| {
+            vec![Payload::MaterializeProgress(MaterializeProgress {
+                request_id: request.request_id,
+                completed: 1,
+                total: 2,
+                done: false,
+            })]
+        });
+        let cancel = AtomicBool::new(false);
+        let answer = materialize_reporting(
+            &daemon,
+            Duration::from_secs(30),
+            &cancel,
+            b"root",
+            b"item",
+            b"id",
+            None,
+            Some(&|_, _| cancel.store(true, Ordering::Relaxed)),
+        );
+        assert!(answer.is_none());
+    }
 
     /// The handshake precedes the request, pushes in between are skipped, and the matching
     /// response is returned.

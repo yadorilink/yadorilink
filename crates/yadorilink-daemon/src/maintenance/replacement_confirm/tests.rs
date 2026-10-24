@@ -349,8 +349,10 @@ fn only_a_complete_running_eager_folder_counts_as_synced() {
         (
             "degraded",
             Box::new(|v| {
-                v.degraded =
-                    Some(crate::queries::link_status::DegradedLinkView { reason: "disk".into() })
+                v.degraded = Some(crate::queries::link_status::DegradedLinkView {
+                    reason: "disk".into(),
+                    cause: crate::link_registry::DegradedCause::WaitingForDiskSpace,
+                })
             }),
         ),
         ("ambiguous", Box::new(|v| v.ambiguous_local_paths = vec!["/a".into(), "/b".into()])),
@@ -513,8 +515,8 @@ fn file_entry(path: &str, content: &[u8]) -> ExpectedEntry {
 fn restored_folder() -> (tempfile::TempDir, tempfile::TempDir, Fake) {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("sub")).unwrap();
-    std::fs::write(root.path().join("a.txt"), b"alpha bytes").unwrap();
-    std::fs::write(root.path().join("sub/b.txt"), b"bravo bytes").unwrap();
+    write_settled(root.path().join("a.txt"), b"alpha bytes").unwrap();
+    write_settled(root.path().join("sub/b.txt"), b"bravo bytes").unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     replacement_unconfirmed::write(state_dir.path(), &record(&["g1"])).unwrap();
     let mut v = view("g1");
@@ -543,8 +545,8 @@ fn restored_folder_at(root: &tempfile::TempDir) -> ((), tempfile::TempDir, Fake)
     let (_, state_dir, fake) = restored_folder();
     // Repoint the fake at `root`, populated like `restored_folder`.
     std::fs::create_dir_all(root.path().join("sub")).unwrap();
-    std::fs::write(root.path().join("a.txt"), b"alpha bytes").unwrap();
-    std::fs::write(root.path().join("sub/b.txt"), b"bravo bytes").unwrap();
+    write_settled(root.path().join("a.txt"), b"alpha bytes").unwrap();
+    write_settled(root.path().join("sub/b.txt"), b"bravo bytes").unwrap();
     fake.views.lock().unwrap()[0].local_path = root.path().to_string_lossy().into_owned();
     ((), state_dir, fake)
 }
@@ -560,22 +562,20 @@ async fn a_missing_file_never_confirms() {
 #[tokio::test]
 async fn a_truncated_file_never_confirms() {
     let root = tempfile::tempdir().unwrap();
-    refused_with_disk_mismatch(&root, |r| std::fs::write(r.join("a.txt"), b"alpha").unwrap()).await;
+    refused_with_disk_mismatch(&root, |r| write_settled(r.join("a.txt"), b"alpha").unwrap()).await;
 }
 
 #[tokio::test]
 async fn a_file_with_extra_bytes_never_confirms() {
     let root = tempfile::tempdir().unwrap();
-    refused_with_disk_mismatch(&root, |r| {
-        std::fs::write(r.join("a.txt"), b"alpha bytes+").unwrap()
-    })
-    .await;
+    refused_with_disk_mismatch(&root, |r| write_settled(r.join("a.txt"), b"alpha bytes+").unwrap())
+        .await;
 }
 
 #[tokio::test]
 async fn a_file_with_wrong_bytes_never_confirms() {
     let root = tempfile::tempdir().unwrap();
-    refused_with_disk_mismatch(&root, |r| std::fs::write(r.join("a.txt"), b"ALPHA bytes").unwrap())
+    refused_with_disk_mismatch(&root, |r| write_settled(r.join("a.txt"), b"ALPHA bytes").unwrap())
         .await;
 }
 
@@ -631,10 +631,10 @@ async fn a_folder_that_matches_the_index_confirms_once() {
 async fn a_failed_verification_starts_over_and_confirms_after_the_repair() {
     let (root, state_dir, fake) = restored_folder();
     let damaged = root.path().join("a.txt");
-    std::fs::write(&damaged, b"broken").unwrap();
+    write_settled(&damaged, b"broken").unwrap();
     let job = job(&fake, &state_dir);
     assert!(matches!(job.run_once().await, Outcome::Waiting(_)));
-    std::fs::write(&damaged, b"alpha bytes").unwrap();
+    write_settled(&damaged, b"alpha bytes").unwrap();
     assert_eq!(job.run_once().await, Outcome::Confirmed);
 }
 
@@ -648,7 +648,7 @@ fn verification_is_incremental_and_resumes_from_its_cursor() {
     let mut entries = Vec::new();
     for n in 0..5 {
         let content = format!("file {n}");
-        std::fs::write(root.path().join(format!("f{n}")), &content).unwrap();
+        write_settled(root.path().join(format!("f{n}")), &content).unwrap();
         entries.push(file_entry(&format!("f{n}"), content.as_bytes()));
     }
     let mut state = state_of(entries);
@@ -692,7 +692,7 @@ fn an_entry_path_outside_the_folder_fails_the_verification() {
 #[test]
 fn a_parent_directory_that_is_a_link_fails_the_verification() {
     let outside = tempfile::tempdir().unwrap();
-    std::fs::write(outside.path().join("b.txt"), b"bravo bytes").unwrap();
+    write_settled(outside.path().join("b.txt"), b"bravo bytes").unwrap();
     let root = tempfile::tempdir().unwrap();
     std::os::unix::fs::symlink(outside.path(), root.path().join("sub")).unwrap();
     let mut state = state_of(vec![file_entry("sub/b.txt", b"bravo bytes")]);
@@ -733,7 +733,7 @@ async fn a_file_damaged_after_a_409_stops_the_retry_from_confirming() {
     assert_eq!(job.run_once().await, Outcome::WaitingForMembership);
     assert_eq!(fake.confirms.lock().unwrap().len(), 1);
     // Damage: same-size different bytes, then a deletion.
-    std::fs::write(root.path().join("a.txt"), b"ALPHA bytes").unwrap();
+    write_settled(root.path().join("a.txt"), b"ALPHA bytes").unwrap();
     let outcome = job.run_once().await;
     assert!(
         matches!(&outcome, Outcome::Waiting(why) if why.contains("does not match")),
@@ -745,7 +745,7 @@ async fn a_file_damaged_after_a_409_stops_the_retry_from_confirming() {
     assert!(matches!(job.run_once().await, Outcome::Waiting(_)));
     assert_eq!(fake.confirms.lock().unwrap().len(), 1);
     // Repaired: verified again, then the retry confirms.
-    std::fs::write(root.path().join("a.txt"), b"alpha bytes").unwrap();
+    write_settled(root.path().join("a.txt"), b"alpha bytes").unwrap();
     assert_eq!(job.run_once().await, Outcome::Confirmed);
     assert_eq!(fake.confirms.lock().unwrap().len(), 2);
 }
@@ -760,7 +760,7 @@ async fn a_same_size_rewrite_with_a_restored_mtime_is_caught_by_ctime_and_inode(
     assert_eq!(job.run_once().await, Outcome::WaitingForMembership);
     let file = root.path().join("a.txt");
     let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
-    std::fs::write(&file, b"ALPHA bytes").unwrap();
+    write_settled(&file, b"ALPHA bytes").unwrap();
     std::fs::File::options().write(true).open(&file).unwrap().set_modified(mtime).unwrap();
     assert!(matches!(job.run_once().await, Outcome::Waiting(_)));
     assert_eq!(fake.confirms.lock().unwrap().len(), 1);
@@ -780,7 +780,7 @@ async fn several_large_groups_all_progress_each_pass_and_reach_the_confirm() {
         let mut list = Vec::new();
         for n in 0..30 {
             let content = format!("{group} file {n}");
-            std::fs::write(root.path().join(format!("f{n}")), &content).unwrap();
+            write_settled(root.path().join(format!("f{n}")), &content).unwrap();
             list.push(file_entry(&format!("f{n}"), content.as_bytes()));
         }
         let mut v = view(group);
@@ -812,7 +812,7 @@ async fn a_changing_file_keeps_earlier_progress_and_never_confirms_unverified_da
     let job = job(&fake, &state_dir).with_budgets(u64::MAX, 1);
     // First pass verifies a.txt only.
     assert!(matches!(job.run_once().await, Outcome::Waiting(why) if why.contains("1 of 2")));
-    std::fs::write(root.path().join("sub/b.txt"), b"being written").unwrap();
+    write_settled(root.path().join("sub/b.txt"), b"being written").unwrap();
     assert!(
         matches!(job.run_once().await, Outcome::Waiting(why) if why.contains("does not match"))
     );
@@ -823,7 +823,7 @@ async fn a_changing_file_keeps_earlier_progress_and_never_confirms_unverified_da
         assert!(!state.done);
     }
     assert!(fake.confirms.lock().unwrap().is_empty());
-    std::fs::write(root.path().join("sub/b.txt"), b"bravo bytes").unwrap();
+    write_settled(root.path().join("sub/b.txt"), b"bravo bytes").unwrap();
     assert_eq!(job.run_once().await, Outcome::Confirmed);
 }
 
@@ -833,13 +833,14 @@ fn one_edit_costs_only_the_changed_entry_not_everything_after_the_cursor() {
     let mut entries = Vec::new();
     for n in 0..30 {
         let content = format!("file number {n:02}");
-        std::fs::write(root.path().join(format!("f{n:02}")), &content).unwrap();
+        write_settled(root.path().join(format!("f{n:02}")), &content).unwrap();
+        settle(&root.path().join(format!("f{n:02}")));
         entries.push(file_entry(&format!("f{n:02}"), content.as_bytes()));
     }
     let mut state = state_of(entries.clone());
     assert_eq!(content_check::verify_step(root.path(), &mut state, u64::MAX, 100), Step::Complete);
     // A legitimate edit of the first file: disk and index both change.
-    std::fs::write(root.path().join("f00"), b"edited!!file 00").unwrap();
+    write_settled(root.path().join("f00"), b"edited!!file 00").unwrap();
     entries[0] = file_entry("f00", b"edited!!file 00");
     state.resume_at = Some("f00".into());
     state.reload(entries);
@@ -859,11 +860,25 @@ async fn a_transfer_tick_does_not_move_the_cursor_back() {
     assert_eq!(job.run_once().await, Outcome::Confirmed);
 }
 
+/// Backdates a file's mtime so its stat is trusted (a file modified moments ago is "racy" and is
+/// re-read instead).
+fn write_settled(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+    std::fs::write(path.as_ref(), bytes)?;
+    settle(path.as_ref());
+    Ok(())
+}
+
+fn settle(path: &Path) {
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::options().write(true).open(path).unwrap().set_modified(old).unwrap();
+}
+
 fn thirty_files(root: &Path) -> Vec<ExpectedEntry> {
     (0..30)
         .map(|n| {
             let content = format!("file number {n:02}");
-            std::fs::write(root.join(format!("f{n:02}")), &content).unwrap();
+            write_settled(root.join(format!("f{n:02}")), &content).unwrap();
+            settle(&root.join(format!("f{n:02}")));
             file_entry(&format!("f{n:02}"), content.as_bytes())
         })
         .collect()
@@ -877,7 +892,7 @@ fn skipped_entries_do_not_consume_the_entry_budget() {
     let mut entries = thirty_files(root.path());
     let mut state = state_of(entries.clone());
     while content_check::verify_step(root.path(), &mut state, u64::MAX, 1) != Step::Complete {}
-    std::fs::write(root.path().join("f00"), b"edited!!file 00").unwrap();
+    write_settled(root.path().join("f00"), b"edited!!file 00").unwrap();
     entries[0] = file_entry("f00", b"edited!!file 00");
     state.resume_at = Some("f00".into());
     state.reload(entries);
@@ -903,7 +918,7 @@ async fn a_frequently_rewritten_early_file_still_converges_to_the_confirm() {
     let job = job(&fake, &state_dir).with_budgets(u64::MAX, 2);
     for round in 0..8 {
         let content = format!("rewritten {round:02}!!");
-        std::fs::write(root.path().join("f00"), &content).unwrap();
+        write_settled(root.path().join("f00"), &content).unwrap();
         fake.entries.lock().unwrap().get_mut("g1").unwrap()[0] =
             file_entry("f00", content.as_bytes());
         assert!(matches!(job.run_once().await, Outcome::Waiting(_)), "round {round}");
@@ -951,7 +966,7 @@ async fn an_index_change_after_the_snapshot_is_noticed_right_before_the_confirm(
         "{outcome:?}"
     );
     assert_eq!(fake.confirms.lock().unwrap().len(), 1);
-    std::fs::write(root.path().join("a.txt"), b"newer index").unwrap();
+    write_settled(root.path().join("a.txt"), b"newer index").unwrap();
     assert_eq!(job.run_once().await, Outcome::Confirmed);
 }
 
@@ -961,19 +976,19 @@ async fn an_index_change_after_the_snapshot_is_noticed_right_before_the_confirm(
 fn a_file_changed_while_it_is_hashed_is_not_accepted() {
     let root = tempfile::tempdir().unwrap();
     let mut state = state_of(vec![file_entry("a.txt", b"alpha bytes")]);
-    std::fs::write(root.path().join("a.txt"), b"alpha bytes").unwrap();
+    write_settled(root.path().join("a.txt"), b"alpha bytes").unwrap();
     let file = root.path().join("a.txt");
     let result = content_check::verify_one_observed(
         root.path(),
         &mut state,
         0,
         &mut std::collections::HashSet::new(),
-        &|| std::fs::write(&file, b"alpha bytes, then more").unwrap(),
+        &|| write_settled(&file, b"alpha bytes, then more").unwrap(),
     );
     assert!(result.is_err());
     assert!(state.fingerprints[0].is_none());
     // Left alone, the same entry verifies.
-    std::fs::write(&file, b"alpha bytes").unwrap();
+    write_settled(&file, b"alpha bytes").unwrap();
     assert!(content_check::verify_one_observed(
         root.path(),
         &mut state,
@@ -984,10 +999,57 @@ fn a_file_changed_while_it_is_hashed_is_not_accepted() {
     .is_ok());
 }
 
-/// A group refreshed early must still be unchanged when the last group's refresh is over: a
-/// change made during a later group's (possibly long) re-hash stops the confirm.
+/// A same-size rewrite that leaves size and mtime as they were (a coarse timestamp tick, or a
+/// restored mtime) is noticed by the refresh, because a file modified moments before it was
+/// verified is read again rather than trusted by its stat.
+#[test]
+fn a_same_size_rewrite_with_the_same_mtime_is_noticed() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("a.txt");
+    std::fs::write(&file, b"alpha bytes").unwrap();
+    let mut state = state_of(vec![file_entry("a.txt", b"alpha bytes")]);
+    assert_eq!(
+        content_check::verify_step(root.path(), &mut state, u64::MAX, usize::MAX),
+        Step::Complete
+    );
+    let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
+    let write = |bytes: &[u8]| {
+        std::fs::write(&file, bytes).unwrap();
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(modified).unwrap();
+    };
+    write(b"ALPHA bytes");
+    let step = content_check::refresh(root.path(), &mut state);
+    assert!(matches!(step, Step::Failed { .. }), "{step:?}");
+    // Repaired: verifies again.
+    write(b"alpha bytes");
+    assert_eq!(content_check::refresh(root.path(), &mut state), Step::Complete);
+}
+
+/// The final sweep is stat-only: it never reads content, so an entry whose recorded stat is racy
+/// fails closed even though its bytes are right (a sweep that hashed would pass it), and it passes
+/// once the file has settled and been verified again.
+#[test]
+fn the_final_sweep_never_reads_content_and_fails_closed_on_a_racy_entry() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("a.txt");
+    std::fs::write(&file, b"alpha bytes").unwrap();
+    let mut state = state_of(vec![file_entry("a.txt", b"alpha bytes")]);
+    assert_eq!(
+        content_check::verify_step(root.path(), &mut state, u64::MAX, usize::MAX),
+        Step::Complete
+    );
+    let step = content_check::still_unchanged(root.path(), &state);
+    assert!(matches!(&step, Step::Failed { why, .. } if why.contains("changed since")), "{step:?}");
+    settle(&file);
+    assert_eq!(content_check::refresh(root.path(), &mut state), Step::Complete);
+    assert_eq!(content_check::still_unchanged(root.path(), &state), Step::Complete);
+}
+
+/// A file of a later group that is still racy while an earlier group's file is modified during
+/// the later group's refresh: the stat-only sweep catches the earlier one and fails closed; the
+/// racy file alone also waits, and everything confirms once both have settled.
 #[tokio::test]
-async fn damage_during_a_later_groups_refresh_stops_the_confirm() {
+async fn a_racy_later_group_and_damage_to_an_earlier_one_fail_closed() {
     let state_dir = tempfile::tempdir().unwrap();
     replacement_unconfirmed::write(state_dir.path(), &record(&["g1", "g2"])).unwrap();
     let fake = Fake::new(vec![], vec![ConfirmAnswer::Confirmed]);
@@ -995,7 +1057,11 @@ async fn damage_during_a_later_groups_refresh_stops_the_confirm() {
     let mut views = Vec::new();
     for group in ["g1", "g2"] {
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("f"), format!("{group} bytes")).unwrap();
+        let file = root.path().join("f");
+        std::fs::write(&file, format!("{group} bytes")).unwrap();
+        if group == "g1" {
+            settle(&file);
+        }
         let mut v = view(group);
         v.local_path = root.path().to_string_lossy().into_owned();
         views.push(v);
@@ -1010,7 +1076,50 @@ async fn damage_during_a_later_groups_refresh_stops_the_confirm() {
     let g1 = roots[0].path().join("f");
     *job.after_refresh.lock().unwrap() = Some(Box::new(move |group| {
         if group == "g2" {
-            std::fs::write(&g1, b"G1 bytes").unwrap();
+            write_settled(&g1, b"G1 bytes").unwrap();
+        }
+    }));
+    let outcome = job.run_once().await;
+    assert!(
+        matches!(&outcome, Outcome::Waiting(why) if why.contains("changed since")),
+        "{outcome:?}"
+    );
+    *job.after_refresh.lock().unwrap() = None;
+    write_settled(roots[0].path().join("f"), b"g1 bytes").unwrap();
+    // g2 is still racy: waits, never confirms.
+    assert!(matches!(job.run_once().await, Outcome::Waiting(_)));
+    assert!(fake.confirms.lock().unwrap().is_empty(), "must not confirm");
+    settle(&roots[1].path().join("f"));
+    assert_eq!(job.run_once().await, Outcome::Confirmed);
+}
+
+/// A group refreshed early must still be unchanged when the last group's refresh is over: a
+/// change made during a later group's (possibly long) re-hash stops the confirm.
+#[tokio::test]
+async fn damage_during_a_later_groups_refresh_stops_the_confirm() {
+    let state_dir = tempfile::tempdir().unwrap();
+    replacement_unconfirmed::write(state_dir.path(), &record(&["g1", "g2"])).unwrap();
+    let fake = Fake::new(vec![], vec![ConfirmAnswer::Confirmed]);
+    let mut roots = Vec::new();
+    let mut views = Vec::new();
+    for group in ["g1", "g2"] {
+        let root = tempfile::tempdir().unwrap();
+        write_settled(root.path().join("f"), format!("{group} bytes")).unwrap();
+        let mut v = view(group);
+        v.local_path = root.path().to_string_lossy().into_owned();
+        views.push(v);
+        fake.entries
+            .lock()
+            .unwrap()
+            .insert(group.into(), vec![file_entry("f", format!("{group} bytes").as_bytes())]);
+        roots.push(root);
+    }
+    *fake.views.lock().unwrap() = views;
+    let job = job(&fake, &state_dir);
+    let g1 = roots[0].path().join("f");
+    *job.after_refresh.lock().unwrap() = Some(Box::new(move |group| {
+        if group == "g2" {
+            write_settled(&g1, b"G1 bytes").unwrap();
         }
     }));
     let outcome = job.run_once().await;
@@ -1023,7 +1132,7 @@ async fn damage_during_a_later_groups_refresh_stops_the_confirm() {
     *job.after_refresh.lock().unwrap() = None;
     assert!(matches!(job.run_once().await, Outcome::Waiting(_)));
     // ... and once repaired it confirms.
-    std::fs::write(roots[0].path().join("f"), b"g1 bytes").unwrap();
+    write_settled(roots[0].path().join("f"), b"g1 bytes").unwrap();
     assert_eq!(job.run_once().await, Outcome::Confirmed);
 }
 

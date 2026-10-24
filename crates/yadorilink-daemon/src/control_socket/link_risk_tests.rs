@@ -204,6 +204,7 @@ async fn an_unacknowledged_risky_invite_acceptance_is_refused_before_redeeming()
             local_path: dir.path().to_string_lossy().into_owned(),
             on_demand: false,
             acknowledge_risks: false,
+            ..Default::default()
         }),
     )
     .await;
@@ -231,6 +232,7 @@ async fn an_acknowledged_invite_acceptance_reaches_the_enrollment() {
             local_path: dir.path().to_string_lossy().into_owned(),
             on_demand: false,
             acknowledge_risks: true,
+            ..Default::default()
         }),
     )
     .await;
@@ -353,6 +355,7 @@ async fn the_gate_checks_the_folder_a_symlink_names() {
             local_path: alias.to_string_lossy().into_owned(),
             on_demand: false,
             acknowledge_risks: false,
+            ..Default::default()
         }),
     )
     .await;
@@ -411,6 +414,7 @@ async fn an_invite_acceptance_nested_in_a_linked_folder_is_refused_as_path_not_a
             local_path: child.to_string_lossy().into_owned(),
             on_demand: false,
             acknowledge_risks: false,
+            ..Default::default()
         }),
     )
     .await;

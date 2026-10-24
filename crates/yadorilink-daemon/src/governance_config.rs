@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 /// Global transfer rate limits and disk-space headroom override. `0` for
 /// either rate means unlimited (the default) — a bucket at rate `0` is
 /// bypassed entirely, so an unconfigured install imposes no throttling.
-/// `headroom_override_bytes` `None` means "use the default `max(1 GiB,
-/// 5%)` formula"; `Some(_)` is an explicit override.
+/// `headroom_override_bytes` `None` means "use the default headroom
+/// formula"; `Some(_)` is an explicit override.
 // Unlike `reporting::ConsentState` (which needs a hand-written `Default`
 // impl because one of its fields defaults to `true`), every field here
 // genuinely defaults to Rust's own zero-value default (`0`/`None`) — the

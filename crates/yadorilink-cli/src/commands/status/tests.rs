@@ -490,6 +490,7 @@ fn base_peer() -> PeerStatus {
         unreachable_category: UnreachableCategory::Unspecified as i32,
         route_kind: RouteKind::Direct as i32,
         version_incompatible: false,
+        replaced_by_device_id: String::new(),
     }
 }
 
@@ -844,6 +845,7 @@ fn provider_roots_are_explained() {
         unconfirmed_publications: 1,
         unconfirmed_oldest_ms: 5 * 3_600_000,
         counters_unreadable: false,
+        sync_root_path: String::new(),
     }];
     let lines = status_lines(&status, &DeviceNames::default(), false);
     let has = |needle: &str| lines.iter().any(|l| l.contains(needle));
@@ -934,6 +936,10 @@ fn unreadable_file_advice_names_a_fix_that_exists_on_this_platform() {
 fn every_known_reason_code_has_a_sentence_and_a_next_step() {
     let attention = [
         "degraded:g",
+        "waiting_for_disk_space:g",
+        "file_watch_limit:g",
+        "ownership_lost:g",
+        "not_joined:g",
         "ambiguous:g",
         "durability_at_risk:g",
         "durability_unknown:g",

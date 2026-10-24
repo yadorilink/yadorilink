@@ -9,7 +9,7 @@
 //!
 //! The model: a `ProviderKind::None` root runs the direct-filesystem pipeline and NEVER enters the File
 //! Provider capability (it has no on-demand mechanism, so it never holds dataless items); a
-//! provider root (`MacFileProvider` or `WindowsCfapi`) may only when its readiness
+//! provider root (`MacFileProvider`, `IosFileProvider` or `WindowsCfapi`) may only when its readiness
 //! evidence says Ready. There is no global switch.
 
 use yadorilink_replica_domain::session_state::Readiness;

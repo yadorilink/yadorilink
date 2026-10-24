@@ -17,13 +17,13 @@ use crate::error::DesktopError;
 mod convert;
 
 pub use convert::{
-    account_deletion_status, attention_reason, conflict_summary, daemon_identity,
-    file_availability, file_retention, file_version, file_versions, folder_detail,
-    folder_restore_outcome, folder_summary, gc_report, handoff_summary, incoming_transfer,
-    invite_summary, member_summary, membership_outcome, outgoing_transfer,
-    pending_approval_summary, pending_invite_summary, pin_outcome, preflight_result,
-    received_transfer, retained_original, retained_release, rewind_preview, rewind_run,
-    rewind_run_missing, rewind_start, safe_stop_outcome, sent_transfer, share_summary,
+    account_deletion_impact, account_deletion_status, appcast_item_check, attention_reason,
+    conflict_summary, daemon_identity, file_availability, file_retention, file_version,
+    file_versions, folder_detail, folder_restore_outcome, folder_summary, gc_report,
+    handoff_summary, incoming_transfer, invite_summary, member_summary, membership_outcome,
+    outgoing_transfer, pending_approval_summary, pending_invite_summary, pin_outcome,
+    preflight_result, received_transfer, retained_original, retained_release, rewind_preview,
+    rewind_run, rewind_run_missing, rewind_start, safe_stop_outcome, sent_transfer, share_summary,
     space_management, space_reclaim_preview, start_over_progress, status_dimensions_json,
     status_snapshot, trashed_file, update_config, update_download_guidance, update_status,
     RUN_MISSING_MESSAGE,
@@ -130,6 +130,9 @@ pub enum SignOutKind {
 #[cfg_attr(feature = "ffi", derive(uniffi::Record))]
 pub struct SignOutOutcome {
     pub kind: SignOutKind,
+    /// Set when the device key's copy in the OS credential store could not be removed. The
+    /// sign-out itself is complete.
+    pub key_cleanup_warning: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -153,6 +156,28 @@ pub struct AccountDeletionStatus {
     pub state: AccountDeletionState,
     pub grace_expires_at: Option<SystemTime>,
     pub remaining: Option<Duration>,
+}
+
+/// A folder group that deleting the account affects.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct AccountDeletionImpactGroup {
+    pub group_id: String,
+    pub name: String,
+    /// Devices of other accounts in a group this account owns; `None` for a foreign group.
+    pub guest_devices: Option<u32>,
+}
+
+/// What deleting the account does to other people's access and data custody. When either list
+/// is non-empty, `request_account_deletion` is refused (`DurabilityBlocked`, `can_force`) until
+/// the person acknowledges it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct AccountDeletionImpact {
+    /// Groups owned by someone else where this account's devices are the only full replicas.
+    pub foreign_groups_at_risk: Vec<AccountDeletionImpactGroup>,
+    /// Groups this account owns that other accounts' devices belong to.
+    pub owned_groups_with_guests: Vec<AccountDeletionImpactGroup>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -200,12 +225,26 @@ pub enum BrowserPurpose {
 #[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
 pub enum LoginEvent {
     Enrolling,
-    OpenBrowser { url: String, purpose: BrowserPurpose },
-    WaitingForApproval { expires_in: Duration },
+    OpenBrowser {
+        url: String,
+        purpose: BrowserPurpose,
+    },
+    WaitingForApproval {
+        expires_in: Duration,
+    },
     WaitingForAuthorization,
-    ShowDeviceCode { verification_uri: String, user_code: String },
-    SignedIn { account: AccountStatus },
-    Failed { error: DesktopError },
+    /// `verification_uri` is the page to open: the link with the code filled in when the
+    /// server offered one. `user_code` is shown as well, to check against the page.
+    ShowDeviceCode {
+        verification_uri: String,
+        user_code: String,
+    },
+    SignedIn {
+        account: AccountStatus,
+    },
+    Failed {
+        error: DesktopError,
+    },
     Cancelled,
 }
 
@@ -298,6 +337,10 @@ pub enum ProductAction {
     /// Look at the requests to join a folder group that wait for this account's decision
     /// (`list_pending_approvals`, then `approve_request` or `deny_request`).
     ReviewApproval,
+    /// Sign in again as this installation (the step-up sign-in); the browser shows the Terms
+    /// consent screen when it is due. Offered for `terms_consent_required` and
+    /// `sign_in_required`; nothing local is removed.
+    SignIn,
 }
 
 /// How much an attention reason matters. Critical is what the daemon's rollup calls degraded;
@@ -413,6 +456,23 @@ pub enum DurabilityEvidence {
     CorroboratedIndex,
     VerifiedPayload,
     Unknown,
+}
+
+/// Why a folder is degraded. The attention key of each cause is its snake_case name
+/// (`stopped` is `folder_stopped`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum DegradedCause {
+    /// Stopped with no more specific cause; it retries.
+    Stopped,
+    /// Waits for free space on its disk; resumes by itself.
+    WaitingForDiskSpace,
+    /// The OS file-watch limit is hit; only the user can raise it.
+    FileWatchLimit,
+    /// The ownership marker is gone; re-link or restart.
+    OwnershipLost,
+    /// No longer joined to its folder group.
+    NotJoined,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -551,6 +611,9 @@ pub struct FolderSummary {
     pub degraded: bool,
     /// Diagnostic text for a tooltip.
     pub degraded_reason: Option<String>,
+    /// Typed cause of `degraded` (`None` when the folder is not degraded). `degraded_reason` is
+    /// human detail only; never match its text.
+    pub degraded_cause: Option<DegradedCause>,
     pub volume: Option<VolumeSummary>,
     /// A provider-backed folder: it has no directory, so `local_path` is only its identity key and
     /// nothing may reveal, open or restore into it as a path.
@@ -625,6 +688,11 @@ pub struct ProviderRootStatus {
     pub display_name: String,
     /// "ready", or why not, in the daemon's words.
     pub readiness: String,
+    /// The folder the operating system shows this root in (the Windows sync root, under
+    /// `%USERPROFILE%\YadoriLink`), as the host registered it. `None` when the host has not
+    /// registered it yet or the platform has no such folder. The folder's `local_path` is only an
+    /// identity key for a provider folder, so this is the place to match an item against.
+    pub sync_root_path: Option<String>,
     /// `None` when the counters could not be read: they are unknown, never zero.
     pub counters: Option<ProviderCounters>,
 }
@@ -687,6 +755,8 @@ pub enum UnreachableCategory {
     NoResponse,
     UdpBlocked,
     HandshakeRefused,
+    /// The account replaced this device with another one; it is refused for good.
+    DeviceReplaced,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1395,6 +1465,19 @@ pub struct ProviderFolderOutcome {
     pub already_existed: bool,
 }
 
+/// An invite redeemed as a provider-backed folder: it has no local path, the operating system's
+/// root is the folder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct ProviderInviteOutcome {
+    pub group_id: String,
+    pub root_id: String,
+    pub display_name: String,
+    pub mode: FolderMode,
+    /// The folder exists but syncs nothing until the group owner approves.
+    pub awaiting_approval: bool,
+}
+
 // ---- send and receive, storage, settings, updates ---------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1635,7 +1718,7 @@ pub struct DaemonIdentity {
     pub engine_api_version: u32,
     /// The exact engine build; `None` when the installation carries no engine identity.
     pub release_id: Option<String>,
-    /// `script`, `standalone`, `app_bundle`, `microsoft_store`, `homebrew`, `apt`, `winget` or
+    /// `script`, `standalone`, `app_bundle`, `microsoft_store`, `app_store`, `homebrew`, `apt`, `winget` or
     /// `container`.
     pub install_source: String,
     pub install_root: String,
@@ -1652,6 +1735,13 @@ pub struct UpdateStatus {
     pub channel: String,
     pub install_source: String,
     pub last_checked_at: Option<SystemTime>,
+    /// The last check that accepted a manifest; a failed check does not move it.
+    pub last_successful_check_at: Option<SystemTime>,
+    /// `expires_at` of the manifest the last check saw, as the publisher wrote it.
+    pub manifest_expires_at: Option<String>,
+    /// The last check refused the channel manifest as expired. Only update checks stop; sync
+    /// and running apps are unaffected.
+    pub manifest_expired: bool,
     pub state: UpdateState,
     pub available_version: Option<String>,
     pub release_notes_url: Option<String>,
@@ -1674,6 +1764,118 @@ pub struct UpdateStatus {
 pub struct UpdateDownloadGuidance {
     pub guidance: String,
     pub url: Option<String>,
+}
+
+/// An appcast item as the app sees it, to check against the verified channel manifest.
+/// `version`, `sparkle_build` (the item's `sparkle:version`, a positive integer), `url` (the
+/// whole enclosure URL) and `length` (the enclosure length) are required in both phases; an
+/// empty or zero one is refused, never skipped. `channel` is compared when given. `sha256` is
+/// the downloaded file's digest and is required by [`AppcastItemPhase::Downloaded`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct AppcastItem {
+    pub version: String,
+    pub sparkle_build: u64,
+    pub channel: Option<String>,
+    pub url: String,
+    pub length: u64,
+    pub sha256: Option<String>,
+}
+
+/// Which of the two checks is being made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum AppcastItemPhase {
+    /// Before the download, from the appcast alone (version, build, URL, length).
+    Enclosure,
+    /// The file is on disk and its sha256 is known; before the updater installs it.
+    Downloaded,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum AppcastItemOutcome {
+    /// Every field the phase requires equals what the verified manifest serves to this install.
+    /// After `Enclosure` this does not cover the file's bytes; only `Downloaded` does.
+    Allowed,
+    /// The manifest is known and does not cover the item: do not hand it to the updater.
+    Refused,
+    /// No fresh, unexpired verified manifest: nothing is known to be wrong. Do not hand the item
+    /// to the updater; show "cannot confirm", never "update required".
+    CannotConfirm,
+    Unknown {
+        raw: String,
+    },
+}
+
+/// Why an item was not allowed. The first four mean `CannotConfirm`, the rest `Refused`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum AppcastItemReason {
+    /// No manifest was verified since the daemon started or the channel changed.
+    NotChecked,
+    /// The last verified manifest is too old to rely on.
+    Stale,
+    ManifestExpired,
+    /// The channel has no manifest.
+    NoManifest,
+    InvalidVersion,
+    Withdrawn,
+    KillSwitched,
+    BelowMinimum,
+    /// The manifest has no `app_bundle` entry for this install.
+    NotOffered,
+    VersionMismatch,
+    HeldBack,
+    StateIncompatible,
+    ChannelMismatch,
+    BuildMissing,
+    BuildNotDeclared,
+    BuildMismatch,
+    UrlMissing,
+    UrlMismatch,
+    LengthMissing,
+    LengthMismatch,
+    /// The `Downloaded` phase needs the file's sha256.
+    Sha256Missing,
+    Sha256Mismatch,
+    Unknown {
+        raw: String,
+    },
+}
+
+/// The verified `app_bundle` entry for this install, for the app to cache.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct VerifiedAppEntry {
+    pub channel: String,
+    pub version: String,
+    /// `None` when the manifest declares none.
+    pub sparkle_build: Option<u64>,
+    pub minimum_supported_version: String,
+    pub file: String,
+    pub sha256: String,
+    pub size: u64,
+    pub kill_switch: bool,
+    pub rollout_percentage: u32,
+    pub generated_at: String,
+    /// When the entry stops being valid, as the publisher wrote it (`YYYY-MM-DDTHH:MM:SSZ`).
+    pub expires_at: String,
+    /// This build is below `minimum_supported_version`.
+    pub update_required: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct AppcastItemCheck {
+    pub outcome: AppcastItemOutcome,
+    /// `None` when allowed.
+    pub reason: Option<AppcastItemReason>,
+    /// The daemon's wording of the reason, for diagnostics.
+    pub message: Option<String>,
+    /// Set whenever a fresh verified manifest has an entry for this install, also when refused;
+    /// never set for `CannotConfirm`.
+    pub entry: Option<VerifiedAppEntry>,
 }
 
 #[cfg(test)]

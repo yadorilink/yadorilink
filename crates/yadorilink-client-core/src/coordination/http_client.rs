@@ -86,22 +86,11 @@ const LOOPBACK_COORDINATION_ADDR: &str = "http://127.0.0.1:8787";
 /// Endpoint baked in at build time. Release builds set
 /// `YADORILINK_DEFAULT_COORDINATION_ADDR` while compiling; other builds leave
 /// it unset and fall back to loopback.
-const COMPILED_COORDINATION_ADDR: Option<&str> =
+pub(crate) const COMPILED_COORDINATION_ADDR: Option<&str> =
     option_env!("YADORILINK_DEFAULT_COORDINATION_ADDR");
 
-/// The coordination endpoint: the `YADORILINK_COORDINATION_ADDR` environment
-/// variable if set, else the build-time default, else loopback. This is the
-/// single resolver for the request base URL and for the endpoint recorded in
-/// `device.json` at registration.
-pub fn coordination_addr() -> String {
-    resolve_coordination_addr(
-        std::env::var("YADORILINK_COORDINATION_ADDR").ok().as_deref(),
-        COMPILED_COORDINATION_ADDR,
-    )
-}
-
-fn resolve_coordination_addr(env: Option<&str>, compiled: Option<&str>) -> String {
-    [env, compiled]
+pub(crate) fn resolve_coordination_addr(setting: Option<&str>, compiled: Option<&str>) -> String {
+    [setting, compiled]
         .into_iter()
         .flatten()
         .map(str::trim)
@@ -118,6 +107,10 @@ fn resolve_coordination_addr(env: Option<&str>, compiled: Option<&str>) -> Strin
 /// where the issuer is the deployed hostname and the socket is loopback —
 /// exactly the split `FapiClient::to_local` was built for.
 pub const AUTH_SERVER_ADDR_VAR: &str = "YADORILINK_AUTH_SERVER_ADDR";
+
+/// The variable the command line and the desktop daemon map into
+/// [`CredentialSettings::coordination_addr`](crate::coordination::credential_store::CredentialSettings).
+pub const COORDINATION_ADDR_VAR: &str = "YADORILINK_COORDINATION_ADDR";
 
 /// The credential for an authenticated coordination call, or
 /// [`CoreError::NotLoggedIn`] if this installation has not enrolled.
@@ -142,19 +135,91 @@ pub const AUTH_SERVER_ADDR_VAR: &str = "YADORILINK_AUTH_SERVER_ADDR";
 /// Built per call rather than cached in a process-global: a CLI process runs
 /// one command, and a cached manager would hold the refresh lock's peer view
 /// of the store across a command that deliberately rewrites it (`logout`).
-pub async fn require_auth() -> Result<CoordinationAuth, CoreError> {
-    bounded(build_auth()).await
+pub async fn require_auth() -> Result<CoordinationAccess, CoreError> {
+    let dir = crate::coordination::credential_store::process_dir()?;
+    let settings = crate::coordination::credential_store::CredentialSettings::from_env(&dir)?;
+    require_auth_in(&dir, &settings).await
 }
 
-async fn build_auth() -> Result<CoordinationAuth, CoreError> {
-    let store = crate::coordination::credential_store::open()?;
+/// [`require_auth`] over the credential store of the state directory `dir`.
+pub async fn require_auth_in(
+    dir: &std::path::Path,
+    settings: &crate::coordination::credential_store::CredentialSettings,
+) -> Result<CoordinationAccess, CoreError> {
+    let store = crate::coordination::credential_store::open_in(dir, settings)?;
+    let auth = bounded(build_auth(store, settings.auth_server_addr.as_deref())).await?;
+    Ok(CoordinationAccess { auth, addr: settings.coordination_addr() })
+}
+
+/// A coordination credential together with the coordination service it is for, so a request
+/// goes to the address its settings name and never to one read from the process environment.
+/// [`require_auth_in`] (and [`require_auth`] over it) builds it from the credential store.
+#[derive(Clone)]
+pub struct CoordinationAccess {
+    auth: CoordinationAuth,
+    addr: String,
+}
+
+impl CoordinationAccess {
+    /// An access over `auth` for the coordination service at `addr`. A `CoordinationAuth` only
+    /// exists over an enrolled credential, so this adds no way to a credential; it names where
+    /// the requests go.
+    #[must_use]
+    pub fn new(auth: CoordinationAuth, addr: impl Into<String>) -> Self {
+        Self { auth, addr: addr.into() }
+    }
+
+    /// The coordination service this access is for.
+    #[must_use]
+    pub fn addr(&self) -> &str {
+        &self.addr
+    }
+}
+
+impl std::fmt::Debug for CoordinationAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoordinationAccess").field("addr", &self.addr).finish_non_exhaustive()
+    }
+}
+
+impl std::ops::Deref for CoordinationAccess {
+    type Target = CoordinationAuth;
+
+    fn deref(&self) -> &CoordinationAuth {
+        &self.auth
+    }
+}
+
+async fn build_auth(
+    store: yadorilink_fapi_client::store::CredentialStore,
+    auth_server_addr: Option<&str>,
+) -> Result<CoordinationAuth, CoreError> {
+    Ok(CoordinationAuth::new(Arc::new(credential_manager_for(store, auth_server_addr).await?))?)
+}
+
+/// The credential manager for the stored installation, discovering the
+/// Authorization Server where the stored credential's issuer says it is (the
+/// settings' Authorization Server address wins). That address is not the
+/// coordination API's; every caller that talks OAuth goes through here. The
+/// credential store is the one of the state directory `dir` under `settings`.
+pub(crate) async fn credential_manager_in(
+    dir: &std::path::Path,
+    settings: &crate::coordination::credential_store::CredentialSettings,
+) -> Result<CredentialManager, CoreError> {
+    credential_manager_for(
+        crate::coordination::credential_store::open_in(dir, settings)?,
+        settings.auth_server_addr.as_deref(),
+    )
+    .await
+}
+
+async fn credential_manager_for(
+    store: yadorilink_fapi_client::store::CredentialStore,
+    auth_server_addr: Option<&str>,
+) -> Result<CredentialManager, CoreError> {
     let credentials = store.load()?.ok_or(CoreError::NotLoggedIn)?;
-    let base =
-        std::env::var(AUTH_SERVER_ADDR_VAR).unwrap_or_else(|_| credentials.issuer().to_owned());
-    let manager =
-        CredentialManager::from_credentials(client()?, &base, Arc::new(store), &credentials)
-            .await?;
-    Ok(CoordinationAuth::new(Arc::new(manager))?)
+    let base = auth_server_addr.map_or_else(|| credentials.issuer().to_owned(), str::to_owned);
+    Ok(CredentialManager::from_credentials(client()?, &base, Arc::new(store), &credentials).await?)
 }
 
 /// Whether this machine holds any credential at all.
@@ -320,6 +385,16 @@ fn error_from_body(status: u16, body: &serde_json::Value) -> CoreError {
         return CoreError::LimitExceeded { message: msg, kind: LimitKind::RateLimited };
     }
 
+    if status == 403 && code == "terms_consent_required" {
+        return CoreError::TermsConsentRequired {
+            terms_version: body.get("terms_version").and_then(|v| v.as_str()).map(str::to_owned),
+        };
+    }
+
+    if status == 401 && code == "device_superseded" {
+        return CoreError::DeviceSuperseded;
+    }
+
     let message = if code.is_empty() { "request failed".to_string() } else { code.to_string() };
     match status {
         401 => CoreError::AuthFailed(message),
@@ -331,18 +406,17 @@ fn error_from_body(status: u16, body: &serde_json::Value) -> CoreError {
 
 /// Builds the request URL for `path` after checking the configured coordination
 /// address is one this client will talk to at all.
-fn endpoint(path: &str) -> Result<String, CoreError> {
-    let addr = coordination_addr();
-    validate_addr(&addr)?;
+fn endpoint(addr: &str, path: &str) -> Result<String, CoreError> {
+    validate_addr(addr)?;
     Ok(format!("{addr}{path}"))
 }
 
 pub async fn post_json<Req: Serialize, Resp: DeserializeOwned>(
     path: &str,
     body: &Req,
-    auth: &CoordinationAuth,
+    auth: &CoordinationAccess,
 ) -> Result<Resp, CoreError> {
-    let url = endpoint(path)?;
+    let url = endpoint(auth.addr(), path)?;
     bounded(async {
         let resp = auth.execute(client()?.post(&url).json(body)).await?;
         handle_response(resp).await
@@ -379,9 +453,9 @@ impl ApiFailure {
 pub async fn post_json_with_failure<Req: Serialize, Resp: DeserializeOwned>(
     path: &str,
     body: &Req,
-    auth: &CoordinationAuth,
+    auth: &CoordinationAccess,
 ) -> Result<Result<Resp, ApiFailure>, CoreError> {
-    let url = endpoint(path)?;
+    let url = endpoint(auth.addr(), path)?;
     bounded(async {
         let resp = auth.execute(client()?.post(&url).json(body)).await?;
         let status = resp.status();
@@ -404,9 +478,9 @@ pub async fn post_json_with_failure<Req: Serialize, Resp: DeserializeOwned>(
 pub async fn post_json_no_content<Req: Serialize>(
     path: &str,
     body: &Req,
-    auth: &CoordinationAuth,
+    auth: &CoordinationAccess,
 ) -> Result<(), CoreError> {
-    let url = endpoint(path)?;
+    let url = endpoint(auth.addr(), path)?;
     bounded(async {
         let resp = auth.execute(client()?.post(&url).json(body)).await?;
         if resp.status().is_success() {
@@ -417,11 +491,29 @@ pub async fn post_json_no_content<Req: Serialize>(
     .await
 }
 
+/// A `GET` that carries no credential, for the one question a revoked installation can still
+/// ask. Never use it for anything that needs an account.
+pub async fn get_json_unauthenticated<Resp: DeserializeOwned>(
+    addr: &str,
+    path: &str,
+) -> Result<Resp, CoreError> {
+    let url = endpoint(addr, path)?;
+    bounded(async {
+        let resp = client()?
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| CoreError::CoordinationPlaneUnreachable(e.to_string()))?;
+        handle_response(resp).await
+    })
+    .await
+}
+
 pub async fn get_json<Resp: DeserializeOwned>(
     path: &str,
-    auth: &CoordinationAuth,
+    auth: &CoordinationAccess,
 ) -> Result<Resp, CoreError> {
-    let url = endpoint(path)?;
+    let url = endpoint(auth.addr(), path)?;
     bounded(async {
         let resp = auth.execute(client()?.get(&url)).await?;
         handle_response(resp).await
@@ -431,8 +523,8 @@ pub async fn get_json<Resp: DeserializeOwned>(
 
 /// Issues a `DELETE` with no request body for endpoints that return
 /// `204 No Content` on success (e.g. terminal single-group delete).
-pub async fn delete_no_content(path: &str, auth: &CoordinationAuth) -> Result<(), CoreError> {
-    let url = endpoint(path)?;
+pub async fn delete_no_content(path: &str, auth: &CoordinationAccess) -> Result<(), CoreError> {
+    let url = endpoint(auth.addr(), path)?;
     bounded(async {
         let resp = auth.execute(client()?.delete(&url)).await?;
         if resp.status().is_success() {

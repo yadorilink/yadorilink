@@ -278,7 +278,7 @@ impl Workload {
         let temp = dir.join(format!(".tmp-{name}"));
         let mut file = fs::File::create(&temp)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
+        yadorilink_fs_platform::flush::sync_file(&file)?;
         drop(file);
         let target = dir.join(name);
         if write_through {

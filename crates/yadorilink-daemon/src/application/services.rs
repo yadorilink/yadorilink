@@ -11,10 +11,12 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "process-model")]
+use super::ports::UpdateCommandPort;
 use super::ports::{
     DaemonLifecyclePort, DurabilityCommandPort, GcPort, GovernanceCommandPort, GroupAdministration,
     HandoffCommandPort, LinkPauseResumePort, MaterializationPort, PreservedPort,
-    ReportingCommandPort, UpdateCommandPort,
+    ReportingCommandPort,
 };
 use super::{
     EnrollmentRecoveryService, EnrollmentService, LinkLifecycleService, ReplicaMembershipService,
@@ -37,14 +39,17 @@ pub(crate) struct ApplicationServices {
     pub(crate) version_restore: Arc<VersionRestoreService>,
     pub(crate) governance: Arc<dyn GovernanceCommandPort>,
     pub(crate) reporting: Arc<dyn ReportingCommandPort>,
+    #[cfg(feature = "process-model")]
     pub(crate) update: Arc<dyn UpdateCommandPort>,
     pub(crate) link_lifecycle: Arc<LinkLifecycleService>,
     /// Track Send's `send`/`receive` commands -- see `crate::send_transfer`'s
     /// own module doc comment for why this is a thin wrapper rather than a
     /// full ports/adapters service like the fields above.
+    #[cfg(feature = "process-model")]
     pub(crate) send_transfer: Arc<crate::send_transfer::SendTransferService>,
     /// Sessions for managing another device on this account -- see
     /// `crate::nas_admin_bridge`.
+    #[cfg(feature = "process-model")]
     pub(crate) nas_admin: Arc<crate::nas_admin_bridge::NasAdminSessions>,
     /// Folder Rewind's execution: a thin wrapper like `send_transfer`; the
     /// run itself is `crate::rewind`'s.

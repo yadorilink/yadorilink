@@ -546,6 +546,85 @@ async fn a_device_grant_polls_past_pending_and_slow_down_to_a_token() {
     assert_eq!(tokens.refresh_token(), "rt-device");
 }
 
+// --- step-up of an enrolled installation -------------------------------------
+
+#[tokio::test]
+async fn a_fresh_device_authorization_asks_for_max_age_zero_and_an_ordinary_one_does_not() {
+    let server = MockServer::start().await;
+    serve_discovery(&server, true).await;
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let recorder = bodies.clone();
+    Mock::given(method("POST"))
+        .and(path("/device/auth"))
+        .respond_with(move |request: &Request| {
+            recorder
+                .lock()
+                .expect("lock")
+                .push(String::from_utf8_lossy(&request.body).into_owned());
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "dc-1", "user_code": "BCDF-GHJK-LMNP",
+                "verification_uri": "https://as.test/device", "expires_in": 600,
+            }))
+        })
+        .mount(&server)
+        .await;
+    let client = FapiClient::discover(
+        reqwest::Client::new(),
+        &server.uri(),
+        "ylk-test-installation",
+        Es256Key::generate(),
+        Es256Key::generate(),
+    )
+    .await
+    .expect("discover");
+
+    client.request_device_authorization("openid offline_access").await.expect("ordinary");
+    client.request_fresh_device_authorization("openid offline_access").await.expect("fresh");
+
+    let bodies = bodies.lock().expect("lock");
+    assert!(!bodies[0].contains("max_age"), "{}", bodies[0]);
+    assert!(bodies[1].contains("max_age=0"), "{}", bodies[1]);
+}
+
+/// A step-up is a login by the registration the store already holds. Adopting
+/// its tokens swaps the refresh token and nothing else: same client id, same
+/// client key, same issuer.
+#[tokio::test]
+async fn adopting_a_step_up_keeps_the_installation_identity_and_swaps_only_the_refresh_token() {
+    let server = MockServer::start().await;
+    serve_discovery(&server, true).await;
+    Mock::given(method("POST"))
+        .and(path("/device/auth"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "device_code": "dc-1", "user_code": "BCDF-GHJK-LMNP",
+            "verification_uri": "https://as.test/device", "expires_in": 600, "interval": 1,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(token_body("at-up", "rt-up", 300)))
+        .mount(&server)
+        .await;
+
+    let enrolled = enrol(&server.uri(), "rt-original").await;
+    let before = enrolled.store.load().expect("load").expect("enrolled");
+    let manager = manager(&server, &enrolled).await;
+
+    let client = manager.client();
+    let authorization =
+        client.request_fresh_device_authorization("openid offline_access").await.expect("device");
+    let tokens = client.complete_device_authorization(&authorization).await.expect("granted");
+    manager.adopt(&tokens).await.expect("adopt");
+
+    let after = enrolled.store.load().expect("load").expect("still enrolled");
+    assert_eq!(after.client_id(), before.client_id());
+    assert_eq!(after.issuer(), before.issuer());
+    assert_eq!(after.client_key_jwk(), before.client_key_jwk());
+    assert_eq!(after.refresh_token(), "rt-up");
+    assert_eq!(manager.client_id(), before.client_id());
+}
+
 /// `access_denied` and `expired_token` are terminal. Treating them as pending
 /// would poll a dead code until its ten minutes ran out and then report the
 /// wrong reason.

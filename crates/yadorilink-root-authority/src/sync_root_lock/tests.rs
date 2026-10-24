@@ -25,7 +25,7 @@ fn wire_path_form_is_top_level_only_and_matches_case_and_ads_variants() {
 /// held, must be refused. Real `fs2` OS locks, not a mock: `flock`
 /// conflicts between two open file descriptions of the same file even
 /// within a single process (the same property
-/// `yadorilink-daemon::resource_lock`'s equivalent tests rely on), so
+/// `yadorilink-local-storage::resource_lock`'s equivalent tests rely on), so
 /// this genuinely exercises the OS lock, not an in-process flag.
 #[test]
 fn a_second_acquisition_is_refused_while_the_first_is_held() {

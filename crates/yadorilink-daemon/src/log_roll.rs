@@ -1,3 +1,4 @@
+// apple-cfg-file: macos-only the default log file is the launchd daemon log; the iOS host supplies its own log destination
 //! Size-capped rolling log file for the macOS LaunchAgent and the Windows background daemon.
 //!
 //! launchd's `StandardOutPath` files are never rotated, and a plist cannot
@@ -30,10 +31,16 @@ pub struct RollingLog(Arc<Mutex<Inner>>);
 /// started by launchd (no `YADORILINK_CONFIG_DIR` override, stderr not a
 /// terminal) uses `~/Library/Logs/yadorilink/daemon.log`. Anywhere else it
 /// logs to stderr.
-pub fn log_file_path() -> Option<PathBuf> {
-    use yadorilink_fs_platform::state_dir::{process_override, PathOverride};
+///
+/// `env` and `home` are the process's placement environment and `HOME`, which the binary's
+/// `main` reads and passes in.
+pub fn log_file_path(
+    env: &yadorilink_fs_platform::state_dir::Env,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    use yadorilink_fs_platform::state_dir::{checked_override, PathOverride};
     // A refused log location logs to stderr; the daemon's start reports the refusal.
-    match process_override(PathOverride::LogFile) {
+    match checked_override(env, PathOverride::LogFile) {
         Err(_) => return None,
         Ok(Some(path)) => return Some(path),
         Ok(None) => {}
@@ -41,18 +48,13 @@ pub fn log_file_path() -> Option<PathBuf> {
     if cfg!(windows) {
         // A logon task or packaged start has no console, so without a file its failures are
         // invisible. A refused state directory logs to stderr like a refused log location.
-        let env = yadorilink_fs_platform::state_dir::Env::from_process();
-        let dir = yadorilink_fs_platform::state_dir::checked_state_dir(&env).ok();
+        let dir = yadorilink_fs_platform::state_dir::checked_state_dir(env).ok();
         return windows_default_log_file(dir, env.config_dir.is_some(), io::stderr().is_terminal());
     }
     if !cfg!(target_os = "macos") {
         return None;
     }
-    default_log_file(
-        std::env::var_os("HOME"),
-        yadorilink_fs_platform::state_dir::Env::from_process().config_dir.is_some(),
-        io::stderr().is_terminal(),
-    )
+    default_log_file(home, env.config_dir.is_some(), io::stderr().is_terminal())
 }
 
 /// Logs can hold local paths: a directory made for them is private to the user.

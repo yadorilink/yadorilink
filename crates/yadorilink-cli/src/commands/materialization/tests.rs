@@ -11,6 +11,13 @@ fn reclaimable() -> RetentionState {
 }
 
 #[test]
+fn a_hydrate_report_claims_a_download_only_when_one_happened() {
+    assert_eq!(hydrate_report("a.bin", true), "Downloaded a.bin");
+    let text = hydrate_report("a.bin", false);
+    assert!(!text.contains("Downloaded") && text.contains("already on this device"), "{text}");
+}
+
+#[test]
 fn a_pin_report_says_the_path_is_kept() {
     let report = pin_report(
         "photos/a.jpg",

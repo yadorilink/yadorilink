@@ -31,6 +31,7 @@ pub mod queue;
 // unchanged now that the dependency-free RFC 3339 helpers live in
 // `yadorilink-reporting::local_store` alongside the other storage that
 // moved there.
+#[cfg(feature = "process-model")]
 pub(crate) use yadorilink_reporting::local_store::time;
 
 use std::collections::BTreeMap;
@@ -48,8 +49,8 @@ use queue::QueueStore;
 
 /// `<config_dir>/reporting` — a sibling of `device.json`/the block store,
 /// never inside a linked/synced folder.
-pub fn reporting_dir() -> PathBuf {
-    crate::device_config::config_dir().join("reporting")
+pub fn reporting_dir_in(config_dir: &std::path::Path) -> PathBuf {
+    config_dir.join("reporting")
 }
 
 pub struct ReportingStorage {
@@ -60,13 +61,6 @@ pub struct ReportingStorage {
 }
 
 impl ReportingStorage {
-    /// Opens (without eagerly writing anything — see `consent_store`'s
-    /// doc comment) reporting storage rooted at the daemon's normal
-    /// config directory.
-    pub fn open_default() -> Self {
-        Self::open(reporting_dir())
-    }
-
     pub fn open(reporting_dir: impl Into<PathBuf>) -> Self {
         let dir = reporting_dir.into();
         ReportingStorage {

@@ -269,9 +269,9 @@ async fn with_the_knob_off_every_file_closes_durably_by_itself() {
 fn only_macos_defers_by_default_and_zero_opts_out() {
     use super::completion_window::parse_deferred_flush;
     use yadorilink_local_storage::ReceivedFlushMode::{FsyncThenOneFullFsync, FullFsyncEach};
-    // Unset: the macOS default is the conservative mode (one F_FULLFSYNC per
+    // Unset: the Apple default is the conservative mode (one F_FULLFSYNC per
     // file, off the critical path); every other platform keeps the per-file flush.
-    let unset = if cfg!(target_os = "macos") { Some(FullFsyncEach) } else { None };
+    let unset = if cfg!(target_vendor = "apple") { Some(FullFsyncEach) } else { None };
     assert_eq!(parse_deferred_flush(None), unset);
     // The opt-out, an empty value and anything unrecognised keep the per-file flush.
     assert_eq!(parse_deferred_flush(Some("0")), None);

@@ -44,7 +44,7 @@ fn a_conflict_copy_names_a_folder_at_its_source_path() {
 
     let service = FileHistoryQueryService::new(
         coordinator.clone(),
-        Arc::new(LinkedPathResolver::new(coordinator.clone())),
+        Arc::new(LinkedPathResolver::new(coordinator.clone(), std::path::PathBuf::from("unused"))),
     );
     let reasons: Vec<(String, ConflictCopyReason)> =
         service.list_conflicts().unwrap().into_iter().map(|c| (c.path, c.reason)).collect();

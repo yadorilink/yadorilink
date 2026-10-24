@@ -18,6 +18,11 @@
 //! `#[cfg(windows)]` and has not been compiled or run on this
 //! (non-Windows) development machine; verify on real Windows hardware
 //! before relying on it.
+//!
+//! The message handling here (`handle_connection` and the provider handlers) is the engine's
+//! provider surface and is compiled in every build, including the embedded host, which serves
+//! it over in-memory channels. Only the socket and pipe transports and the reference client
+//! belong to the desktop process model (`process-model` feature).
 
 use std::sync::Arc;
 
@@ -34,6 +39,10 @@ use yadorilink_ipc_proto::shellipc::{
 use crate::shell_context::ShellContext;
 use crate::shell_status::{resolve_materialization_state, resolve_status_detail};
 
+// Only the transports below accept connections.
+#[cfg(feature = "process-model")]
+// apple-cfg: ios-explicit only the AF_UNIX transport, which iOS does not compile, uses it
+#[cfg(not(target_os = "ios"))]
 const MAX_SHELL_IPC_CONNECTIONS: usize = 64;
 
 fn shell_entry_kind(
@@ -505,7 +514,7 @@ async fn handle_message(context: &ShellContext, msg: ShellIpcMessage) -> Option<
             let response = match context.queries.linked_path.resolve(&req.path) {
                 Some((group_id, rel_path)) => {
                     match context.application.materialization.hydrate(&group_id, &rel_path).await {
-                        Ok(()) => HydrateResponse { ok: true, error: String::new() },
+                        Ok(_) => HydrateResponse { ok: true, error: String::new() },
                         Err(e) => HydrateResponse { ok: false, error: e.to_string() },
                     }
                 }
@@ -951,6 +960,7 @@ type ItemIdBytes = yadorilink_sync_sqlite::provider::ItemId;
 /// this exact pattern — bounded timeout, `Unspecified` (no overlay) on
 /// any failure, never blocking the file manager UI waiting on a daemon
 /// that might not be running.
+#[cfg(feature = "process-model")]
 pub mod client {
     #[cfg(unix)]
     use std::path::Path;
@@ -1034,7 +1044,9 @@ pub mod client {
     }
 }
 
-#[cfg(unix)]
+// apple-cfg: ios-explicit the iOS host serves the provider surface over in-memory channels only; no
+// AF_UNIX path logic is compiled for it
+#[cfg(all(unix, not(target_os = "ios"), feature = "process-model"))]
 pub mod unix_transport {
     use std::path::Path;
     use std::sync::Arc;
@@ -1124,7 +1136,7 @@ pub mod unix_transport {
 /// against a real Windows 11 VM — see `control_socket::windows_transport`'s
 /// doc comment for the concurrent-connection pipe-instance race this
 /// structure specifically avoids).
-#[cfg(windows)]
+#[cfg(all(windows, feature = "process-model"))]
 pub mod windows_transport {
     use std::sync::Arc;
 

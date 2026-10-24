@@ -51,7 +51,7 @@ pub enum SyncError {
     Json(#[from] serde_json::Error),
 
     #[error("filesystem watcher error: {0}")]
-    Watch(#[from] notify::Error),
+    Watch(#[from] yadorilink_filesystem_sync::watcher::WatchError),
 
     #[error("protobuf decode error: {0}")]
     Decode(#[from] prost::DecodeError),
@@ -371,6 +371,12 @@ impl From<yadorilink_sqlite_runtime::DatabaseError> for SyncError {
             yadorilink_sqlite_runtime::DatabaseError::CorruptSchema(msg) => {
                 SyncError::CorruptState(msg)
             }
+            // Another writer owns the data area: the same "in use" outcome as an OS lock held
+            // elsewhere.
+            refused @ (yadorilink_sqlite_runtime::DatabaseError::WriterLease(_)
+            | yadorilink_sqlite_runtime::DatabaseError::StaleWriter { .. }) => SyncError::Io(
+                std::io::Error::new(std::io::ErrorKind::ResourceBusy, refused.to_string()),
+            ),
         }
     }
 }
@@ -544,6 +550,14 @@ impl From<yadorilink_root_authority::RootAuthorityError> for SyncError {
             yadorilink_root_authority::RootAuthorityError::OwnershipLost(msg) => {
                 SyncError::OwnershipLost(msg)
             }
+            // A fenced-out writer can no longer prove it owns the data area: terminal, like a
+            // lost sidecar.
+            yadorilink_root_authority::RootAuthorityError::StaleWriter(msg) => {
+                SyncError::OwnershipLost(msg)
+            }
+            yadorilink_root_authority::RootAuthorityError::WriterLeaseHeld(msg) => {
+                SyncError::Io(std::io::Error::other(msg))
+            }
             // A pause that will lift: retryable, and not `NotFound` ("nothing there").
             yadorilink_root_authority::RootAuthorityError::Quiescing(msg) => {
                 SyncError::Io(std::io::Error::other(msg))
@@ -659,7 +673,7 @@ impl From<yadorilink_filesystem_sync::materialization_execution::Materialization
 /// `SyncError` (that crate cannot depend back on this one), so any caller
 /// that still needs `SyncError` converts here, losslessly -- this reproduces
 /// exactly the `SyncError::Io`/`SyncError::Watch` split
-/// (`std::io::Error` via `SyncError::from`, `notify::Error` via the same
+/// (`std::io::Error` via `SyncError::from`, `WatchError` via the same
 /// `#[from]`-derived path), just crossing one extra conversion step.
 impl From<yadorilink_filesystem_sync::watcher::WatcherError> for SyncError {
     fn from(err: yadorilink_filesystem_sync::watcher::WatcherError) -> Self {

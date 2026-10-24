@@ -1,4 +1,5 @@
-//! The macOS credential keychain: generic-password items in the **Data
+// apple-cfg-file: ios-explicit the access group differs on iOS (shared with the File Provider extension); every other Apple platform is the macOS group
+//! The Apple credential keychain (macOS and iOS): generic-password items in the **Data
 //! Protection Keychain**, in one dedicated keychain access group.
 //!
 //! # Why this and not the login keychain
@@ -9,8 +10,9 @@
 //! item has no ACL: which processes may read it is decided entirely by the
 //! `keychain-access-groups` entitlement they are signed with. The host app, the
 //! daemon helper and the CLI executable inside the host app carry
-//! [`ACCESS_GROUP`]; the FinderSync and File Provider extensions carry no
-//! keychain group and therefore cannot read these items.
+//! [`ACCESS_GROUP`]; on macOS the FinderSync and File Provider extensions carry no
+//! keychain group and therefore cannot read these items. On iOS the app and its
+//! File Provider extension carry the same group ([`IOS_ACCESS_GROUP`]).
 //!
 //! No `SecAccessCreate`, no ACL, no legacy-keychain call anywhere in this crate,
 //! and no read of a login-keychain item from an earlier build: an installation
@@ -39,19 +41,36 @@
 
 use std::fmt;
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 mod sec;
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 pub use sec::SecItems;
 
-/// The keychain access group shared ONLY by the host app, the daemon helper and
-/// the CLI. The team prefix is the Developer ID team. Permanent once shipped:
-/// renaming it orphans every stored credential. Must equal the string in
-/// `App.entitlements` and `Daemon.entitlements`
-/// (the macOS installer's `validate-macos-profiles.py` checks the signed
-/// bundles).
-pub const ACCESS_GROUP: &str = "594UQF7QX3.com.juntaki.yadorilink.credentials";
+/// The macOS group, shared ONLY by the host app, the daemon helper and the CLI.
+/// The team prefix is the Developer ID team. Permanent once shipped: renaming
+/// it orphans every stored credential. Must equal the string in
+/// `App.entitlements` and `Daemon.entitlements` (the macOS installer's
+/// `validate-macos-profiles.py` checks the signed bundles).
+pub const MACOS_ACCESS_GROUP: &str = "594UQF7QX3.com.juntaki.yadorilink.credentials";
+
+/// The iOS group, shared by the app and its File Provider extension (the engine
+/// writer), which read and write the same items. Both entitlement files declare
+/// `$(AppIdentifierPrefix)com.juntaki.yadorilink.ios.shared`; this runtime value
+/// assumes that Team ID prefix `594UQF7QX3` applies to the iOS app signature (not
+/// yet verified against a signed iOS build). The Apple repository's
+/// `check-ios-identifiers.py` keeps the two entitlement files identical and
+/// documents this value; a change here must change both.
+pub const IOS_ACCESS_GROUP: &str = "594UQF7QX3.com.juntaki.yadorilink.ios.shared";
+
+/// The access group of the platform this build targets.
+#[cfg(target_os = "ios")]
+pub const ACCESS_GROUP: &str = IOS_ACCESS_GROUP;
+
+/// The access group of the platform this build targets.
+#[cfg(not(target_os = "ios"))]
+pub const ACCESS_GROUP: &str = MACOS_ACCESS_GROUP;
+
 /// The generic-password service of every item this crate writes.
 pub const SERVICE: &str = "yadorilink";
 
@@ -124,7 +143,7 @@ pub trait Backend {
 
 /// A keychain operation that failed (never "not found": that is absence).
 #[derive(Debug, thiserror::Error)]
-#[error("macOS keychain {op} failed (OSStatus {code}){}", hint(*.code))]
+#[error("keychain {op} failed (OSStatus {code}){}", hint(*.code))]
 pub struct KeychainError {
     op: &'static str,
     code: i32,
@@ -171,7 +190,7 @@ pub struct Keychain<B> {
     backend: B,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 impl Keychain<SecItems> {
     /// The system keychain.
     #[must_use]

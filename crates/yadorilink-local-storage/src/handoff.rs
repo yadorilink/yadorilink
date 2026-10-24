@@ -29,7 +29,9 @@ use std::time::Duration;
 use crate::daemon_lock::{self, AcquireError, HeldLock, LockProbe};
 use crate::install_check::{self, Facts, RunningInstall, Severity};
 use crate::ownership::{self, Owner, OwnershipRecord, RecordState};
-use crate::release_descriptor::{self, DescriptorProblem, IdentityFile, ReleaseDescriptor};
+use crate::release_descriptor::{
+    self, DescriptorProblem, IdentityFile, ReleaseDescriptor, StateRefusal, StateSchema,
+};
 use crate::service_registrations::{self, Kind, Roots};
 use journal::{Journal, JournalState, MutationKind, MutationState, Phase, RegistrationPlan};
 use services::ServiceManager;
@@ -78,6 +80,9 @@ pub trait Host {
 #[derive(Clone, Debug)]
 pub struct Context {
     pub config_dir: PathBuf,
+    /// The sync index database the daemon opens (the default in `config_dir`, or the path an
+    /// override names).
+    pub sync_db: PathBuf,
     pub roots: Roots,
     /// How long the daemon may take to reach a safe point.
     pub stop_deadline: Duration,
@@ -115,6 +120,12 @@ pub enum Refused {
     PackageManagerOwned(Box<OwnershipRecord>),
     TargetInvalid(String),
     TargetIncompatible(String),
+    /// The app's engine cannot open the state database the current install has written
+    /// (a downgrade, or a generation it no longer reads).
+    StateIncompatible(StateRefusal),
+    /// The previous installation's engine identity cannot be read, so a roll-back to it cannot
+    /// be judged.
+    PreviousUnreadable(String),
     /// Failed doctor checks, each with its fix.
     Preflight(Vec<String>),
     RegistrationNotRemovable {
@@ -352,6 +363,41 @@ pub fn start_refusal(config_dir: &Path) -> Option<ownership::Refusal> {
     }
 }
 
+/// The version stamped on the sync index database at `path` (`PRAGMA user_version`), `None` when there is
+/// no database, it is unstamped, or it cannot be read. Read-only and WAL-aware: a running
+/// daemon's committed stamp may live only in the write-ahead log, so the main file's header is
+/// not enough.
+fn persisted_state_version(path: &Path) -> Option<u32> {
+    use rusqlite::OpenFlags;
+    if !path.is_file() {
+        return None;
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    conn.busy_timeout(Duration::from_secs(2)).ok()?;
+    let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).ok()?;
+    u32::try_from(version).ok().filter(|v| *v > 0)
+}
+
+/// The state database generations the previous installation's engine declares, read from the
+/// identity beside its daemon. An installation that ships no identity declares nothing; one that
+/// is gone, or whose identity cannot be read, cannot be judged and is refused.
+fn previous_state_schema(previous: &OwnershipRecord) -> Result<Option<StateSchema>, Refused> {
+    let root = Path::new(&previous.install_root);
+    if !root.is_dir() {
+        return Err(Refused::PreviousUnreadable(format!("{} is gone", root.display())));
+    }
+    let daemon = root.join("yadorilink-daemon");
+    match release_descriptor::read_identity(release_descriptor::identity_dir(&daemon).as_deref()) {
+        IdentityFile::Absent => Ok(None),
+        IdentityFile::Present(identity) => Ok(identity.state_schema),
+        IdentityFile::Unreadable(reason) => Err(Refused::PreviousUnreadable(reason)),
+    }
+}
+
 async fn preflight<H: Host>(host: &H, ctx: &Context, req: &Request) -> Result<Plan, Refused> {
     let previous = match ownership::read(&ctx.config_dir) {
         RecordState::Missing => {
@@ -382,6 +428,13 @@ async fn preflight<H: Host>(host: &H, ctx: &Context, req: &Request) -> Result<Pl
                 identity.engine_api_version, local.engine_api_version
             )));
         }
+    }
+    // The state database on disk must be readable by the app's engine. The stamp is read from
+    // the database itself: the installed bundle may have been updated without its daemon having
+    // opened (and so restamped) the data.
+    if let Some(persisted) = persisted_state_version(&ctx.sync_db) {
+        StateSchema::check_readable(persisted, identity.state_schema)
+            .map_err(Refused::StateIncompatible)?;
     }
 
     let running = host.identify().await;
@@ -793,6 +846,15 @@ pub async fn rollback<H: Host>(host: &H, ctx: &Context) -> Result<Outcome, Hando
         }
         JournalState::Present(j) => *j,
     };
+    // The previous engine must be able to open the data as it now stands: the app's daemon may
+    // have restamped it. The engine judged is the one `start_previous` will start, the
+    // installation the journal recorded, not the program that runs this call. Judged before
+    // anything is stopped, so a refusal leaves the app running.
+    if let Some(persisted) = persisted_state_version(&ctx.sync_db) {
+        let declared = previous_state_schema(&journal.previous).map_err(HandoffError::Refused)?;
+        StateSchema::check_readable(persisted, declared)
+            .map_err(|refusal| HandoffError::Refused(Refused::StateIncompatible(refusal)))?;
+    }
     let lock = stop_and_lock(host, ctx).await.map_err(HandoffError::Refused)?;
     match finish_rollback(host, ctx, &mut journal, lock).await {
         Ok(previous) => Ok(Outcome::RolledBack(previous)),
@@ -903,6 +965,13 @@ impl Refused {
                 format!(
                     "the app is not compatible with this data area: {reason}; nothing was changed."
                 )
+            }
+            Refused::PreviousUnreadable(reason) => format!(
+                "the previous installation cannot be checked against the data on this device: \
+                 {reason}; nothing was changed."
+            ),
+            Refused::StateIncompatible(refusal) => {
+                format!("the app is not compatible with this data area: {}.", refusal.message())
             }
             Refused::Preflight(rows) => format!(
                 "the installation checks failed, so nothing was changed:\n  {}",

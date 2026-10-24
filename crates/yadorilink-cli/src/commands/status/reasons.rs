@@ -9,6 +9,8 @@ fn cause(item: AttentionItem) -> &'static str {
     use AttentionItem as I;
     match item {
         I::FolderStopped => "This folder is paused by a problem and will retry.",
+        I::WaitingForDiskSpace => "This folder is waiting for free space on its disk; syncing resumes by itself once there is room.",
+        I::FileWatchLimit => "The system's limit on watched files is reached, so changes in this folder are picked up late or not at all until the limit is raised.",
         I::LinkedTwice => "This folder is linked in more than one place, so nothing syncs.",
         I::OwnershipLost => "This folder's ownership marker is gone; re-link or restart to continue.",
         I::NotJoined => "This folder is not joined to its folder group, so it no longer syncs. Its files are kept as they are.",
@@ -41,6 +43,8 @@ fn cause(item: AttentionItem) -> &'static str {
         I::ReplacementUnconfirmed => "This device replaced another one that may have held the only complete copy of some folders, and the service has not confirmed the replacement yet. It is retried automatically; your files are kept.",
         I::ReplacementWaiting => "The device replacement cannot be confirmed yet; the reason is in brackets. It is retried every minute and goes through by itself once the reason clears and you have acknowledged that changes made after the backup may be missing (yadorilink device acknowledge-replacement).",
         I::ReplacementSignInRequired => "The confirmation of the device replacement was refused because you are signed out. Sign in again so it can go through; your files are kept.",
+        I::TermsConsentRequired => "The service is refusing requests until you accept the updated Terms. Your files, folders and this device are kept and nothing is unlinked; sync of what is already set up keeps its local state. Sign in again to review and accept the Terms in your browser.",
+        I::SignInRequired => "Signing in again is required (the Terms may have changed): the service refused to renew this computer's session. Your files, folders and this device are kept. Sign in again to continue.",
         I::Unrecognized => "Needs attention.",
     }
 }
@@ -51,15 +55,20 @@ fn next_step(item: AttentionItem) -> &'static str {
     match item {
         I::LinkedTwice | I::OwnershipLost | I::VolumeChanged => "yadorilink links",
         I::DatabaseRestored => "yadorilink device start-over",
-        I::ReplacementSignInRequired => "yadorilink login",
+        I::ReplacementSignInRequired | I::TermsConsentRequired | I::SignInRequired => {
+            "yadorilink login"
+        }
         I::NotJoined => "accept a new invite to the folder group into this folder (yadorilink share accept <invite> --path <folder>), or unlink it (yadorilink unlink)",
         I::VolumeUnconfirmed => {
             "check the right disk is mounted, then: yadorilink readopt <folder>"
         }
         I::ConflictNeedsReview => "yadorilink conflicts list",
         I::ApprovalPending => "yadorilink share pending",
-        I::DiskFull | I::DiskLow => "yadorilink gc --dry-run",
-        I::ContentUnavailable | I::ContentAvailabilityUnknown | I::PeerUnavailable => {
+        I::DiskFull | I::DiskLow | I::WaitingForDiskSpace => "yadorilink gc --dry-run",
+        I::ContentUnavailable
+        | I::ContentAvailabilityUnknown
+        | I::PeerUnavailable
+        | I::FileWatchLimit => {
             "yadorilink doctor"
         }
         I::UpdateFailed | I::UpdateRequired => "yadorilink update status",

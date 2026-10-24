@@ -136,6 +136,36 @@ async fn get(tcp: &mut TcpStream, path: &str) -> String {
     }
 }
 
+/// A new browser connection that gets its page: while slots released by
+/// connections that just closed are still being returned, the NAS answers
+/// busy and ends the connection without a page, so retry on a fresh one.
+async fn connect_served(addr: SocketAddr, path: &str) -> TcpStream {
+    let deadline = tokio::time::Instant::now() + STEP;
+    loop {
+        let mut tcp = TcpStream::connect(addr).await.unwrap();
+        let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        if tcp.write_all(request.as_bytes()).await.is_ok() {
+            let want = format!("page:{path}");
+            let mut seen = Vec::new();
+            let mut chunk = [0u8; 1024];
+            let _ = tokio::time::timeout(Duration::from_millis(500), async {
+                while !String::from_utf8_lossy(&seen).contains(&want) {
+                    match tcp.read(&mut chunk).await {
+                        Ok(n) if n > 0 => seen.extend_from_slice(&chunk[..n]),
+                        _ => break,
+                    }
+                }
+            })
+            .await;
+            if String::from_utf8_lossy(&seen).contains(&want) {
+                return tcp;
+            }
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no slot ever served {path}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 type Socket = tokio_tungstenite::WebSocketStream<TcpStream>;
 
 async fn websocket(addr: SocketAddr) -> Socket {
@@ -604,16 +634,13 @@ async fn a_closed_browser_connection_returns_its_slot() {
     let addr = served.addr;
 
     for round in 0..SLOTS * 3 {
-        let mut tcp = TcpStream::connect(addr).await.unwrap();
-        assert_eq!(get(&mut tcp, &format!("/{round}")).await, format!("page:/{round}"));
+        connect_served(addr, &format!("/{round}")).await;
     }
     // The bridge's own check is gone, so all SLOTS can be held by browsers;
     // one more is refused by the NAS (busy) and is closed without a page.
     let mut held = Vec::new();
     for round in 0..SLOTS {
-        let mut tcp = TcpStream::connect(addr).await.unwrap();
-        assert_eq!(get(&mut tcp, &format!("/held{round}")).await, format!("page:/held{round}"));
-        held.push(tcp);
+        held.push(connect_served(addr, &format!("/held{round}")).await);
     }
     let mut extra = TcpStream::connect(addr).await.unwrap();
     extra.write_all(b"GET /extra HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();

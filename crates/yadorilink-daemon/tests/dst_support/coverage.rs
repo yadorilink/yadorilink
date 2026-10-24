@@ -80,6 +80,12 @@ fn net_label(n: &NetFault) -> &'static str {
         NetFault::Duplicate => "Duplicate",
         NetFault::Partition { .. } => "Partition",
         NetFault::Heal { .. } => "Heal",
+        NetFault::PartitionOneWay { .. } => "PartitionOneWay",
+        NetFault::HealOneWay { .. } => "HealOneWay",
+        NetFault::DuplicateDatagrams { .. } => "DuplicateDatagrams",
+        NetFault::StopDuplicating { .. } => "StopDuplicating",
+        NetFault::HoldInbound { .. } => "HoldInbound",
+        NetFault::StopHolding { .. } => "StopHolding",
     }
 }
 

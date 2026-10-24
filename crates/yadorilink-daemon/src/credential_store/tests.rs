@@ -2,13 +2,12 @@
 
 use super::*;
 
-/// Serializes this module's tests against each other: they set the
-/// process-global credential-store environment variables. A
-/// `tokio::sync::Mutex` because the guard is deliberately held across the
-/// `coordination_auth().await` those variables have to stay stable for,
-/// which is exactly what `clippy::await_holding_lock` flags on the `std`
-/// one.
-static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// An engine configuration over the file store at `path`, with the Authorization Server at
+/// `socket`: what the tests below used to select through the process environment.
+fn file_config(path: &std::path::Path, socket: &str) -> CredentialConfig {
+    CredentialConfig::new(Backend::File(path.to_path_buf()), KeyMirror::Disabled)
+        .with_auth_server_addr(socket)
+}
 
 /// The daemon half of that requirement. An installation that has not enrolled gets
 /// `None`, and getting there does not touch the network -- the
@@ -17,16 +16,9 @@ static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 #[tokio::test]
 async fn an_empty_credential_store_is_not_enrolled_and_reaches_no_network() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let _guard = ENV_LOCK.lock().await;
-    std::env::set_var("YADORILINK_CREDENTIAL_STORE", "file");
-    std::env::set_var("YADORILINK_CREDENTIAL_FILE", dir.path().join("credentials.json"));
-    std::env::set_var(AUTH_SERVER_ADDR_VAR, "http://127.0.0.1:1");
+    let config = file_config(&dir.path().join("credentials.json"), "http://127.0.0.1:1");
 
-    let result = coordination_auth().await;
-
-    std::env::remove_var(AUTH_SERVER_ADDR_VAR);
-    std::env::remove_var("YADORILINK_CREDENTIAL_FILE");
-    std::env::remove_var("YADORILINK_CREDENTIAL_STORE");
+    let result = coordination_auth(dir.path(), &config).await;
 
     match result {
         Ok(None) => {}
@@ -54,14 +46,9 @@ async fn a_pre_cutover_store_stops_the_daemon_rather_than_reading_as_signed_out(
             .expect("owner-only");
     }
 
-    let _guard = ENV_LOCK.lock().await;
-    std::env::set_var("YADORILINK_CREDENTIAL_STORE", "file");
-    std::env::set_var("YADORILINK_CREDENTIAL_FILE", &path);
+    let config = CredentialConfig::new(Backend::File(path.clone()), KeyMirror::Disabled);
 
-    let result = coordination_auth().await;
-
-    std::env::remove_var("YADORILINK_CREDENTIAL_FILE");
-    std::env::remove_var("YADORILINK_CREDENTIAL_STORE");
+    let result = coordination_auth(dir.path(), &config).await;
 
     assert!(result.is_err(), "a pre-cutover store was accepted: {result:?}");
 }
@@ -124,18 +111,9 @@ async fn an_unreachable_authorization_server_starts_from_the_remembered_document
     write_enrolled_credential(&credential_path, socket).await;
     write_remembered_discovery_document(dir.path(), socket);
 
-    let _guard = ENV_LOCK.lock().await;
-    std::env::set_var("YADORILINK_CONFIG_DIR", dir.path());
-    std::env::set_var("YADORILINK_CREDENTIAL_STORE", "file");
-    std::env::set_var("YADORILINK_CREDENTIAL_FILE", &credential_path);
-    std::env::set_var(AUTH_SERVER_ADDR_VAR, socket);
+    let config = file_config(&credential_path, socket);
 
-    let result = coordination_auth().await;
-
-    std::env::remove_var(AUTH_SERVER_ADDR_VAR);
-    std::env::remove_var("YADORILINK_CREDENTIAL_FILE");
-    std::env::remove_var("YADORILINK_CREDENTIAL_STORE");
-    std::env::remove_var("YADORILINK_CONFIG_DIR");
+    let result = coordination_auth(dir.path(), &config).await;
 
     match result {
         Ok(Some(_)) => {}
@@ -156,18 +134,9 @@ async fn an_unreachable_authorization_server_with_no_remembered_document_still_r
     let credential_path = dir.path().join("credentials.json");
     write_enrolled_credential(&credential_path, socket).await;
 
-    let _guard = ENV_LOCK.lock().await;
-    std::env::set_var("YADORILINK_CONFIG_DIR", dir.path());
-    std::env::set_var("YADORILINK_CREDENTIAL_STORE", "file");
-    std::env::set_var("YADORILINK_CREDENTIAL_FILE", &credential_path);
-    std::env::set_var(AUTH_SERVER_ADDR_VAR, socket);
+    let config = file_config(&credential_path, socket);
 
-    let result = coordination_auth().await;
-
-    std::env::remove_var(AUTH_SERVER_ADDR_VAR);
-    std::env::remove_var("YADORILINK_CREDENTIAL_FILE");
-    std::env::remove_var("YADORILINK_CREDENTIAL_STORE");
-    std::env::remove_var("YADORILINK_CONFIG_DIR");
+    let result = coordination_auth(dir.path(), &config).await;
 
     assert!(
         result.is_err(),
@@ -187,18 +156,9 @@ async fn a_document_remembered_for_another_socket_is_not_used() {
     write_enrolled_credential(&credential_path, socket).await;
     write_remembered_discovery_document(dir.path(), "http://127.0.0.1:2");
 
-    let _guard = ENV_LOCK.lock().await;
-    std::env::set_var("YADORILINK_CONFIG_DIR", dir.path());
-    std::env::set_var("YADORILINK_CREDENTIAL_STORE", "file");
-    std::env::set_var("YADORILINK_CREDENTIAL_FILE", &credential_path);
-    std::env::set_var(AUTH_SERVER_ADDR_VAR, socket);
+    let config = file_config(&credential_path, socket);
 
-    let result = coordination_auth().await;
-
-    std::env::remove_var(AUTH_SERVER_ADDR_VAR);
-    std::env::remove_var("YADORILINK_CREDENTIAL_FILE");
-    std::env::remove_var("YADORILINK_CREDENTIAL_STORE");
-    std::env::remove_var("YADORILINK_CONFIG_DIR");
+    let result = coordination_auth(dir.path(), &config).await;
 
     assert!(
         result.is_err(),

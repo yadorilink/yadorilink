@@ -114,6 +114,9 @@ pub(crate) struct AcceptInviteCommand {
     pub(crate) code: String,
     pub(crate) absolute_path: PathBuf,
     pub(crate) on_demand: bool,
+    /// `Some` joins the invited group as a provider-backed folder: `absolute_path` is ignored and
+    /// the folder is keyed by the request token, the client's retry identity.
+    pub(crate) provider: Option<ProviderCreation>,
 }
 
 /// A stable operation id derived from `(code, device_id)` rather than a
@@ -646,7 +649,7 @@ impl EnrollmentService {
     ) -> Result<EnrollmentOutcome, EnrollmentError> {
         // Measurement only: see `join_and_link`. The group id is known once
         // the invite is prepared, so the inner call reports it back.
-        let tracked = !command.on_demand;
+        let tracked = !command.on_demand && command.provider.is_none();
         let mut begun = None;
         let result = self.accept_invite_and_link_inner(command, tracked, &mut begun).await;
         if let Some((group_id, attempt)) = begun {
@@ -668,6 +671,53 @@ impl EnrollmentService {
         }
         let storage_mode = if command.on_demand { "on-demand" } else { "eager" };
         let operation_id = invite_accept_operation_id(&command.code, &self.device_id);
+        let mut command = command;
+        // One provider creation at a time, like create and join: the display-name check below and
+        // the link commit must not interleave with another creation.
+        let _provider_guard = match &command.provider {
+            Some(_) => Some(self.provider_creation.lock().await),
+            None => None,
+        };
+        let provider_kind = match &command.provider {
+            Some(_) => Some(self.require_provider_kind()?),
+            None => None,
+        };
+        if let Some(creation) = &command.provider {
+            // Everything that can be known without the redemption is checked before the one-use
+            // invite is redeemed: a redeemed invite is not given back.
+            // The name must be one a provider root can have (the rule of the root declaration).
+            if creation.display_name.trim().is_empty() {
+                return Err(EnrollmentError::PreparationRejected {
+                    detail: "a provider folder needs a name".to_string(),
+                });
+            }
+            let locator = creation.locator();
+            let links = self.repository.list_links()?;
+            // The token's earlier link binds it to its request: this very request (the group
+            // that link is of) must match what was recorded, or the token is another request's.
+            let earlier = links.iter().find(|l| l.key() == locator);
+            if let Some(link) = earlier {
+                let digest = creation_digest(creation, &link.group_id, command.on_demand, "invite");
+                if self.repository.creation_digest(&locator)?.as_deref() != Some(&digest) {
+                    return Err(EnrollmentError::PreparationRejected {
+                        detail: "this request token was already used for a different request"
+                            .to_string(),
+                    });
+                }
+            }
+            // A retry of this very request finds its own earlier link, whose name is not a clash.
+            if earlier.is_none()
+                && self.repository.provider_display_name_taken(&creation.display_name)?
+            {
+                return Err(EnrollmentError::PreparationRejected {
+                    detail: format!(
+                        "a provider folder named '{}' already exists on this device",
+                        creation.display_name
+                    ),
+                });
+            }
+            command.absolute_path = PathBuf::from(creation.locator());
+        }
 
         let group_id = match self
             .coordination
@@ -694,7 +744,25 @@ impl EnrollmentService {
         }
 
         let local_path = command.absolute_path.clone();
-        match self.links.commit_plain(&group_id, &command.absolute_path, command.on_demand).await {
+        // What can only be known with the group the invite named. A refusal here leaves the
+        // acceptance redeemed and pending remotely with nothing committed locally, so it is
+        // cancelled, exactly like a link that failed to commit. Cancelling is safe: another
+        // group than the token's earlier link means another invite code, hence another operation.
+        let provider_target = match self.provider_target(&command, provider_kind, &group_id) {
+            Ok(target) => target,
+            Err(error) => {
+                let _ = self
+                    .coordination
+                    .cancel_invite_accept(&group_id, &operation_id, &self.device_id)
+                    .await;
+                return Err(error);
+            }
+        };
+        match self
+            .links
+            .commit_plain(&group_id, &command.absolute_path, command.on_demand, provider_target)
+            .await
+        {
             Ok(()) => {}
             Err(EnrollmentLinkError::NotCommitted { detail, refusal }) => {
                 // Confirmed nothing was committed locally -- safe to
@@ -782,6 +850,36 @@ impl EnrollmentService {
                 Err(EnrollmentError::ActivationAmbiguous { operation_id, detail })
             }
         }
+    }
+
+    /// The provider target of an invite accepted as a provider folder, `None` for a plain folder.
+    /// The request is bound to its token and the group the invite named: the same token with
+    /// another request is refused, never silently linked as the earlier one.
+    fn provider_target(
+        &self,
+        command: &AcceptInviteCommand,
+        kind: Option<yadorilink_replica_domain::session_state::ProviderKind>,
+        group_id: &str,
+    ) -> Result<Option<crate::application::ports::ProviderLinkTarget>, EnrollmentError> {
+        let (Some(creation), Some(kind)) = (&command.provider, kind) else {
+            return Ok(None);
+        };
+        let digest = creation_digest(creation, group_id, command.on_demand, "invite");
+        let locator = creation.locator();
+        if self.repository.list_links()?.iter().any(|l| l.key() == locator)
+            && self.repository.creation_digest(&locator)?.as_deref() != Some(&digest)
+        {
+            return Err(EnrollmentError::PreparationRejected {
+                detail: "this request token was already used for a different request".to_string(),
+            });
+        }
+        Ok(Some(crate::application::ports::ProviderLinkTarget {
+            kind,
+            display_name: creation.display_name.clone(),
+            empty_owner: false,
+            on_demand: command.on_demand,
+            creation_digest: digest,
+        }))
     }
 
     /// Mints a one-use, expiring cross-account invite for `group_id`,

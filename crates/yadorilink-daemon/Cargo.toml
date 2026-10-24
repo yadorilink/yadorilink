@@ -1,3 +1,4 @@
+# apple-cfg-file: macos-only App Group lookup for the macOS shell socket
 [package]
 name = "yadorilink-daemon"
 version.workspace = true
@@ -7,6 +8,7 @@ license.workspace = true
 [[bin]]
 name = "yadorilink-daemon"
 path = "src/main.rs"
+required-features = ["process-model"]
 
 [[bin]]
 # Offline release-manifest signing tool —
@@ -15,8 +17,10 @@ path = "src/main.rs"
 # types directly) rather than a whole new workspace member.
 name = "yadorilink-sign-manifest"
 path = "src/bin/sign_manifest.rs"
+required-features = ["process-model"]
 
 [features]
+default = ["process-model"]
 # Turns the update trust-root release gate into a HARD startup tripwire: a
 # daemon built with this feature requires the release key id/public key at
 # compile time and refuses to start if they resolve to the development key (or
@@ -26,6 +30,23 @@ path = "src/bin/sign_manifest.rs"
 # YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX and enable this feature. See
 # `update::manifest::enforce_release_trust_root_gate`.
 enforce-release-trust-root = []
+# The desktop daemon's process model: control socket, shell IPC, self-update, NAS admin, send
+# transfer, signal handling, process-lifetime locks, and the `yadorilink-daemon` binary. On by
+# default. A host that embeds the engine in its own process (`yadorilink-embedded-host`) depends on
+# this crate with `default-features = false` and gets the engine without any of it. The feature is
+# additive on purpose: Cargo unifies features across a workspace build, so a feature that removed
+# code would break the daemon binary whenever both were built together.
+#
+# It also turns on the OS folder watcher (`yadorilink-filesystem-sync/os-watch`, `notify`) and
+# tokio's `signal` and `process`: the embedded host has linked folders owned by the operating
+# system and no process to signal, so it carries none of them.
+process-model = [
+    "dep:yadorilink-http-api",
+    "dep:fs2",
+    "yadorilink-filesystem-sync/os-watch",
+    "tokio/signal",
+    "tokio/process",
+]
 # Exposes this crate's own `#[cfg(test)]`-only test fixtures (currently
 # just `DaemonState::install_test_root_commit_authority`) to integration
 # test binaries in OTHER crates that depend on this one as an ordinary
@@ -94,7 +115,7 @@ yadorilink-sqlite-runtime = { path = "../yadorilink-sqlite-runtime" }
 yadorilink-peer-session = { path = "../yadorilink-peer-session" }
 yadorilink-fs-platform = { path = "../yadorilink-fs-platform" }
 yadorilink-root-authority = { path = "../yadorilink-root-authority" }
-yadorilink-filesystem-sync = { path = "../yadorilink-filesystem-sync" }
+yadorilink-filesystem-sync = { path = "../yadorilink-filesystem-sync", default-features = false }
 yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
 yadorilink-replica-engine = { path = "../yadorilink-replica-engine" }
 yadorilink-transport = { path = "../yadorilink-transport" }
@@ -114,7 +135,7 @@ yadorilink-reporting = { path = "../yadorilink-reporting" }
 # like any other control-socket client (see that crate's own module docs) --
 # not given an `Arc<DaemonState>`/`ControlContext`, so it can add no daemon
 # capability this crate doesn't already expose over that socket.
-yadorilink-http-api = { workspace = true }
+yadorilink-http-api = { workspace = true, optional = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
@@ -129,7 +150,6 @@ serde.workspace = true
 serde_json = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
 r2d2 = "0.8"
-notify = "8"
 sha2.workspace = true
 uuid = { version = "1", features = ["v4"] }
 # Signed-manifest HTTPS fetch and artifact
@@ -159,7 +179,7 @@ rand = "0.10.2"
 # the sole netmap subscription transport. rustls-tls-webpki-roots to match
 # this workspace's existing rustls-only choice (reqwest above, and
 # yadorilink-reporting's own client) rather than pulling in native-tls.
-tokio-tungstenite = { version = "0.24", default-features = false, features = [
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
     "connect",
     "rustls-tls-webpki-roots",
 ] }
@@ -171,7 +191,7 @@ url = { version = "2" }
 # TCP keepalive on the netmap stream, so a connection that went dead without a
 # FIN or RST (sleep/wake, Wi-Fi switch, IP change) is noticed and redialled.
 socket2 = { version = "0.6", features = ["all"] }
-fs2 = "0.4"
+fs2 = { version = "0.4", optional = true }
 # Optional, and reachable only from `test_support`, which is itself behind
 # `cfg(any(test, feature = "test-support"))`: the peer-session fixture builds
 # each device a real root directory and a real block store. A `[dev-
@@ -263,7 +283,7 @@ zstd = { workspace = true }
 # (`connect`); the `handshake` feature adds `derive_accept_key` +
 # `WebSocketStream::from_raw_socket` for accepting an upgraded connection.
 # Dev-dependency features only affect the test build, never `cargo build`.
-tokio-tungstenite = { version = "0.24", features = ["handshake"] }
+tokio-tungstenite = { version = "0.30", features = ["handshake"] }
 futures-util = "0.3"
 # A real local HTTP listener for
 # the daemon-side queue-retry integration tests (mirrors
@@ -289,12 +309,15 @@ objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSFileManager", "NSString", "NSURL", "NSArray", "NSError"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+# The host's registry of where each provider root is served, for the status line.
+yadorilink-windows-provider-policy = { path = "../yadorilink-windows-provider-policy" }
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_CloudFilters",
     "Win32_Storage_FileSystem",
+    "Win32_System_Console",
     "Win32_System_CorrelationVector",
     "Win32_System_IO",
     "Win32_System_Registry",

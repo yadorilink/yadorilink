@@ -171,6 +171,10 @@ derived from them. Returns typed results; never prints, prompts or exits.
 crates = [
   "yadorilink-client-core",
   "yadorilink-product-view",
+  # The embedded host composes the engine (the application layer) with the client layer's
+  # sign-in, registration and account operations over the engine's own state directory, so it
+  # sits with the client layer: a lower layer may not depend on a higher one.
+  "yadorilink-embedded-host",
 ]
 
 [layer.interface]
@@ -180,6 +184,7 @@ its results.
 """
 crates = [
   "yadorilink-client-ffi",
+  "yadorilink-mobile-ffi",
   "yadorilink-cli",
 ]
 
@@ -396,6 +401,16 @@ runtime the calls run on, so the apps reach the daemon and the coordination
 plane exactly the way every other front end does.
 """
 workspace_dependencies = ["yadorilink-client-core"]
+
+[crate."yadorilink-mobile-ffi"]
+reason = """
+The UniFFI binding of the embedded host for the iOS app and its File Provider
+extension. It forwards to yadorilink-embedded-host (lifecycle, typed commands,
+the provider channel) and encodes the channel's messages with the shell IPC
+schema (yadorilink-ipc-proto); it never links the daemon or the desktop client
+layer, so the iOS library carries exactly the embedded engine.
+"""
+workspace_dependencies = ["yadorilink-embedded-host", "yadorilink-ipc-proto"]
 
 [crate."yadorilink-cli"]
 reason = """

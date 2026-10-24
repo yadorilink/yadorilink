@@ -10,9 +10,10 @@ use yadorilink_local_storage::BlockStore;
 
 use crate::gc_state::GcState;
 use crate::governance_config::GovernanceConfigStore;
-use crate::peer_connectivity_runtime::PeerConnectivityRuntime;
+use crate::peer_connectivity_runtime::{peers_with_replaced, PeerConnectivityRuntime};
 use crate::peer_registry::PeerReachability;
 use crate::queries::link_status::{LinkStatusQueryService, LinkStatusView};
+#[cfg(feature = "process-model")]
 use crate::queries::update_status::{UpdateStatusQueryService, UpdateStatusView};
 use crate::runtime_telemetry::RuntimeTelemetry;
 use yadorilink_peer_session::rate_limiter::RateLimiters;
@@ -23,6 +24,8 @@ pub(crate) struct PeerStatusView {
     pub(crate) reachability: PeerReachability,
     /// Reachable, but speaks another protocol version: sync with it is paused until both match.
     pub(crate) version_incompatible: bool,
+    /// The device that replaced this one, when the account replaced it.
+    pub(crate) replaced_by_device_id: Option<String>,
 }
 
 /// The volume entry for the block store (the volume holding the daemon's data).
@@ -70,6 +73,7 @@ pub(crate) struct RuntimeStatusView {
     pub(crate) current_upload_bytes_per_sec: u64,
     pub(crate) current_download_bytes_per_sec: u64,
     pub(crate) volumes: Vec<VolumeSpaceView>,
+    #[cfg(feature = "process-model")]
     pub(crate) update: UpdateStatusView,
     pub(crate) block_store: BlockStoreUsageView,
     pub(crate) last_gc_unix: i64,
@@ -80,43 +84,59 @@ pub(crate) struct RuntimeStatusView {
     pub(crate) database_restored: Option<&'static str>,
     /// The author identity cannot be opened (not a restored database): nothing is signed.
     pub(crate) author_unavailable: bool,
+    /// Why the coordination service refuses this device although its credential is intact
+    /// (the Terms are not accepted, or the session cannot be renewed); `None` when it does not.
+    pub(crate) coordination_block: Option<yadorilink_fapi_client::CoordinationBlock>,
 }
+
+/// Reads the coordination block of the credential this daemon authenticates with; `None` until
+/// the daemon has one.
+pub(crate) type CoordinationBlockSource =
+    Arc<dyn Fn() -> Option<yadorilink_fapi_client::CoordinationBlock> + Send + Sync>;
 
 pub(crate) struct RuntimeStatusQueryService {
     link_status: Arc<LinkStatusQueryService>,
+    #[cfg(feature = "process-model")]
     update_status: Arc<UpdateStatusQueryService>,
     peers: Arc<PeerConnectivityRuntime>,
+    authority: Arc<crate::daemon_state::PeerAuthorityState>,
     telemetry: Arc<RuntimeTelemetry>,
     governance: Arc<GovernanceConfigStore>,
     block_store: Arc<dyn BlockStore + Send + Sync>,
     gc: Arc<GcState>,
     rate_limiters: Arc<RateLimiters>,
     replica: Arc<crate::replica_coordinator::ReplicaCoordinator>,
+    coordination_block: CoordinationBlockSource,
 }
 
 impl RuntimeStatusQueryService {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         link_status: Arc<LinkStatusQueryService>,
-        update_status: Arc<UpdateStatusQueryService>,
+        #[cfg(feature = "process-model")] update_status: Arc<UpdateStatusQueryService>,
         peers: Arc<PeerConnectivityRuntime>,
+        authority: Arc<crate::daemon_state::PeerAuthorityState>,
         telemetry: Arc<RuntimeTelemetry>,
         governance: Arc<GovernanceConfigStore>,
         block_store: Arc<dyn BlockStore + Send + Sync>,
         gc: Arc<GcState>,
         rate_limiters: Arc<RateLimiters>,
         replica: Arc<crate::replica_coordinator::ReplicaCoordinator>,
+        coordination_block: CoordinationBlockSource,
     ) -> Self {
         Self {
             link_status,
+            #[cfg(feature = "process-model")]
             update_status,
             peers,
+            authority,
             telemetry,
             governance,
             block_store,
             gc,
             rate_limiters,
             replica,
+            coordination_block,
         }
     }
 
@@ -132,20 +152,20 @@ impl RuntimeStatusQueryService {
 
     pub(crate) fn snapshot(&self) -> Result<RuntimeStatusView, crate::sync_error::SyncError> {
         let links = self.link_status.list_links()?;
-        let peers = self
-            .peers
-            .every_peer_reachability()
+        let peers = peers_with_replaced(self.peers.every_peer_reachability(), &self.authority)
             .into_iter()
             // A peer of another protocol version connects (the transport has one fixed ALPN) and
             // is refused at the lane hello: it stays reachable and is marked incompatible.
             .map(|(device_id, reachability)| PeerStatusView {
                 version_incompatible: self.peers.is_version_incompatible(&device_id),
+                replaced_by_device_id: self.authority.superseded_by(&device_id),
                 device_id,
                 reachability,
             })
             .collect();
         let governance = self.governance.load_or_default();
         let volumes = self.volumes_free_space(&links);
+        #[cfg(feature = "process-model")]
         let update = self.update_status.snapshot();
         let block_store_usage = self.block_store.usage().unwrap_or_default();
         let active_transfers = self
@@ -185,6 +205,7 @@ impl RuntimeStatusQueryService {
                 .download
                 .current_rate_bytes_per_sec(),
             volumes,
+            #[cfg(feature = "process-model")]
             update,
             block_store: BlockStoreUsageView {
                 total_bytes: block_store_usage.total_bytes,
@@ -196,6 +217,7 @@ impl RuntimeStatusQueryService {
             recent_errors,
             database_restored: self.replica.database_restored().map(|r| r.category()),
             author_unavailable: self.replica.author_unavailable(),
+            coordination_block: (self.coordination_block)(),
         })
     }
 

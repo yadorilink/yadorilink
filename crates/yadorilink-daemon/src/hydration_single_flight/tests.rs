@@ -16,7 +16,7 @@ async fn a_second_joiner_while_the_first_is_in_flight_becomes_a_follower() {
         Role::Follower(_) => {}
         Role::Leader(_) => panic!("second concurrent joiner must be a follower, not a leader"),
     }
-    leader.complete(Ok(()));
+    leader.complete(Ok(false));
 }
 
 #[tokio::test]
@@ -31,10 +31,10 @@ async fn a_follower_observes_the_leaders_successful_outcome() {
         Role::Leader(_) => panic!("second joiner must be a follower"),
     };
 
-    leader.complete(Ok(()));
+    leader.complete(Ok(false));
 
     follower_rx.changed().await.unwrap();
-    assert_eq!(*follower_rx.borrow(), Some(Ok(())));
+    assert_eq!(*follower_rx.borrow(), Some(Ok(false)));
 }
 
 #[tokio::test]
@@ -86,11 +86,11 @@ async fn a_new_round_starts_after_the_previous_one_completes() {
         Role::Leader(l) => l,
         Role::Follower(_) => panic!("first joiner must be the leader"),
     };
-    leader.complete(Ok(()));
+    leader.complete(Ok(false));
 
     let second_role = registry.join("group-1", "doc.txt");
     match second_role {
-        Role::Leader(l) => l.complete(Ok(())),
+        Role::Leader(l) => l.complete(Ok(false)),
         Role::Follower(_) => panic!(
             "a new round after the previous one finished must start \
                                       a fresh leader, not attach to a stale one"
@@ -114,7 +114,7 @@ async fn case_folded_paths_coalesce_onto_the_same_leader() {
             panic!("a case-folded-equivalent path must coalesce onto the same leader")
         }
     }
-    leader.complete(Ok(()));
+    leader.complete(Ok(false));
 }
 
 /// Unrelated paths never contend with each other -- both become
@@ -130,8 +130,8 @@ async fn unrelated_paths_do_not_coalesce() {
         Role::Leader(l) => l,
         Role::Follower(_) => panic!("an unrelated path must be its own leader"),
     };
-    a.complete(Ok(()));
-    b.complete(Ok(()));
+    a.complete(Ok(false));
+    b.complete(Ok(false));
 }
 
 /// Many concurrent followers all observe the same single leader's
@@ -157,13 +157,13 @@ async fn many_concurrent_followers_all_observe_one_leaders_result() {
         let observed = observed.clone();
         handles.push(tokio::spawn(async move {
             rx.changed().await.unwrap();
-            if *rx.borrow() == Some(Ok(())) {
+            if *rx.borrow() == Some(Ok(false)) {
                 observed.fetch_add(1, Ordering::SeqCst);
             }
         }));
     }
 
-    leader.complete(Ok(()));
+    leader.complete(Ok(false));
     for handle in handles {
         handle.await.unwrap();
     }

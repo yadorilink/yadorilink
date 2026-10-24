@@ -163,7 +163,14 @@ pub enum FaultClass {
     DiskSlow,
     SqliteBusy,
     SqliteLocked,
-    /// Closes a partition. A clearing entry has nothing to inject.
+    /// A cut of one direction of a link (carrier only).
+    NetOneWay,
+    /// Datagrams sent twice (carrier only).
+    NetWireDuplicate,
+    /// Datagrams held back, so reordered or delayed (carrier only).
+    NetWireHold,
+    /// Closes a partition or one of the carrier's wire faults. A clearing
+    /// entry has nothing to inject.
     Heal,
     /// A class with no injector seam here; the reason names the missing seam.
     Unsupported(&'static str),
@@ -173,7 +180,13 @@ impl FaultClass {
     pub fn of(fault: &Fault) -> FaultClass {
         match fault {
             Fault::Net(NetFault::Partition { .. }) => FaultClass::NetPartition,
-            Fault::Net(NetFault::Heal { .. }) => FaultClass::Heal,
+            Fault::Net(NetFault::Heal { .. })
+            | Fault::Net(NetFault::HealOneWay { .. })
+            | Fault::Net(NetFault::StopDuplicating { .. })
+            | Fault::Net(NetFault::StopHolding { .. }) => FaultClass::Heal,
+            Fault::Net(NetFault::PartitionOneWay { .. }) => FaultClass::NetOneWay,
+            Fault::Net(NetFault::DuplicateDatagrams { .. }) => FaultClass::NetWireDuplicate,
+            Fault::Net(NetFault::HoldInbound { .. }) => FaultClass::NetWireHold,
             Fault::Net(NetFault::Drop) => FaultClass::NetDrop,
             Fault::Net(NetFault::Duplicate) => FaultClass::NetDuplicate,
             Fault::Net(NetFault::Delay { .. }) => FaultClass::NetDelay,
@@ -214,11 +227,41 @@ struct LedgerEntry {
     at_nanos: u64,
     label: String,
     class: FaultClass,
+    /// The link `(from, to)` or endpoint `(device, device)` a carrier wire
+    /// fault applies to, so clearing one does not close another's window.
+    wire_target: Option<(usize, usize)>,
     fate: FaultFate,
     /// Whether this entry's window is still open. A `Heal` closes the
     /// partitions before it and `clear_all` closes every window it resets; a closed entry that was never injected stays
     /// unexercised, whatever a later window of the same class drops.
     open: bool,
+}
+
+/// What a carrier wire fault, or the entry that clears one, applies to.
+fn wire_target(fault: &Fault) -> Option<(usize, usize)> {
+    match fault {
+        Fault::Net(
+            NetFault::PartitionOneWay { from, to }
+            | NetFault::HealOneWay { from, to }
+            | NetFault::DuplicateDatagrams { from, to, .. }
+            | NetFault::StopDuplicating { from, to },
+        ) => Some((*from, *to)),
+        Fault::Net(NetFault::HoldInbound { device, .. } | NetFault::StopHolding { device }) => {
+            Some((*device, *device))
+        }
+        _ => None,
+    }
+}
+
+/// The carrier's evidence at one moment, per target and keyed by device
+/// index: datagrams discarded and sent twice per directed link `(from, to)`,
+/// datagrams delivered out of order per receiving device. See
+/// [`ScheduledInjectors::credit_carrier_wire`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WireEvidence {
+    pub dropped: std::collections::BTreeMap<(usize, usize), u64>,
+    pub duplicated: std::collections::BTreeMap<(usize, usize), u64>,
+    pub reordered: std::collections::BTreeMap<usize, u64>,
 }
 
 /// A specified fault that ended without being injected.
@@ -451,6 +494,7 @@ impl ScheduledInjectors {
                 at_nanos: at.as_nanos(),
                 label: format!("{fault:?}"),
                 class: FaultClass::of(fault),
+                wire_target: wire_target(fault),
                 fate: FaultFate::Stage(FaultStage::Specified),
                 open: false,
             })
@@ -462,8 +506,29 @@ impl ScheduledInjectors {
         self.apply(at_nanos, fault)?;
         let mut ledger = lock(&self.ledger);
         if matches!(FaultClass::of(fault), FaultClass::Heal) {
-            for earlier in ledger.iter_mut().filter(|e| e.class == FaultClass::NetPartition) {
+            let closes = match fault {
+                Fault::Net(NetFault::HealOneWay { .. }) => FaultClass::NetOneWay,
+                Fault::Net(NetFault::StopDuplicating { .. }) => FaultClass::NetWireDuplicate,
+                Fault::Net(NetFault::StopHolding { .. }) => FaultClass::NetWireHold,
+                _ => FaultClass::NetPartition,
+            };
+            let target = wire_target(fault);
+            for earlier in ledger
+                .iter_mut()
+                .filter(|e| e.class == closes && (target.is_none() || e.wire_target == target))
+            {
                 earlier.open = false;
+            }
+            // A symmetric heal restores both directions, so it ends the
+            // one-way cuts on that pair as well.
+            if let Fault::Net(NetFault::Heal { device_a, device_b }) = fault {
+                for earlier in ledger.iter_mut().filter(|e| {
+                    e.class == FaultClass::NetOneWay
+                        && (e.wire_target == Some((*device_a, *device_b))
+                            || e.wire_target == Some((*device_b, *device_a)))
+                }) {
+                    earlier.open = false;
+                }
             }
         }
         // Delay and reorder share the network plan's single delay slot: the
@@ -472,6 +537,16 @@ impl ScheduledInjectors {
         if matches!(FaultClass::of(fault), FaultClass::NetDelay | FaultClass::NetReorder) {
             for earlier in ledger.iter_mut().take(index) {
                 if matches!(earlier.class, FaultClass::NetDelay | FaultClass::NetReorder) {
+                    earlier.open = false;
+                }
+            }
+        }
+        // A hold or duplication policy replaces the earlier one on the same
+        // target, so the earlier window is over.
+        if matches!(FaultClass::of(fault), FaultClass::NetWireHold | FaultClass::NetWireDuplicate) {
+            let (class, target) = (FaultClass::of(fault), wire_target(fault));
+            for earlier in ledger.iter_mut().take(index) {
+                if earlier.class == class && earlier.wire_target == target {
                     earlier.open = false;
                 }
             }
@@ -533,6 +608,44 @@ impl ScheduledInjectors {
     pub fn credit_carrier_partition(&self, dropped_before: u64, dropped_now: u64) {
         if dropped_now > dropped_before {
             self.credit(FaultClass::NetPartition);
+        }
+    }
+
+    /// Credits the carrier's wire faults from its own per-target counters,
+    /// as [`credit_carrier_partition`](Self::credit_carrier_partition) does:
+    /// a one-way cut by the datagrams discarded on its link, duplication by
+    /// the datagrams sent twice on its link, a hold by the datagrams
+    /// delivered out of order at its device. Evidence on another link or
+    /// device, or an unchanged counter, credits nothing.
+    pub fn credit_carrier_wire(&self, before: &WireEvidence, now: &WireEvidence) {
+        let grew = |before: u64, now: u64| now > before;
+        for (target, count) in &now.dropped {
+            if grew(before.dropped.get(target).copied().unwrap_or(0), *count) {
+                self.credit_target(FaultClass::NetOneWay, *target);
+            }
+        }
+        for (target, count) in &now.duplicated {
+            if grew(before.duplicated.get(target).copied().unwrap_or(0), *count) {
+                self.credit_target(FaultClass::NetWireDuplicate, *target);
+            }
+        }
+        for (device, count) in &now.reordered {
+            if grew(before.reordered.get(device).copied().unwrap_or(0), *count) {
+                self.credit_target(FaultClass::NetWireHold, (*device, *device));
+            }
+        }
+    }
+
+    /// [`credit`](Self::credit) restricted to the entries aimed at `target`.
+    fn credit_target(&self, class: FaultClass, target: (usize, usize)) {
+        for entry in lock(&self.ledger).iter_mut() {
+            if entry.open
+                && entry.class == class
+                && entry.wire_target == Some(target)
+                && entry.fate == FaultFate::Stage(FaultStage::Enabled)
+            {
+                entry.fate = FaultFate::Stage(FaultStage::Injected);
+            }
         }
     }
 
@@ -599,7 +712,9 @@ impl ScheduledInjectors {
         // the plan below when there is not. Never to both: see `carrier`'s
         // own comment.
         #[cfg(turmoil)]
-        if matches!(net_fault, NetFault::Partition { .. } | NetFault::Heal { .. }) {
+        if matches!(net_fault, NetFault::Partition { .. } | NetFault::Heal { .. })
+            || net_fault.carrier_only()
+        {
             if let Some(carrier) = &self.carrier {
                 let outcome = carrier.apply(&Fault::Net(net_fault.clone()));
                 self.record(Activation::Carried { at_nanos, outcome });
@@ -607,6 +722,9 @@ impl ScheduledInjectors {
                     return Err(ScheduleError::UnknownDevice { at_nanos, device });
                 }
                 return Ok(());
+            }
+            if net_fault.carrier_only() {
+                return Err(ScheduleError::NoCarrier { at_nanos });
             }
         }
         let mut plan = lock(&self.net);
@@ -645,6 +763,13 @@ impl ScheduledInjectors {
                 plan.delay_nanos = REORDER_DELAY_NANOS;
                 Activation::Engaged { at_nanos, injector: InjectorKind::Net }
             }
+            // Only the carrier can express these; routed above.
+            NetFault::PartitionOneWay { .. }
+            | NetFault::HealOneWay { .. }
+            | NetFault::DuplicateDatagrams { .. }
+            | NetFault::StopDuplicating { .. }
+            | NetFault::HoldInbound { .. }
+            | NetFault::StopHolding { .. } => Activation::Deferred { at_nanos },
         };
         drop(plan);
         self.record(activation);
@@ -750,11 +875,21 @@ pub enum ScheduleError {
     /// with `for_spec`, so ledger entries would be advanced by the wrong
     /// faults.
     SpecMismatch { index: usize },
+    /// The schedule names a wire fault only the substrate carrier can
+    /// express, and this run has none.
+    #[cfg(turmoil)]
+    NoCarrier { at_nanos: u64 },
 }
 
 impl std::fmt::Display for ScheduleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(turmoil)]
+            ScheduleError::NoCarrier { at_nanos } => write!(
+                f,
+                "the schedule names a wire fault at {at_nanos}ns that only the substrate \
+                 carrier can inject, and this run has no carrier"
+            ),
             #[cfg(turmoil)]
             ScheduleError::UnknownDevice { at_nanos, device } => write!(
                 f,

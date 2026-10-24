@@ -82,9 +82,9 @@ def self_test() -> int:
         raise AssertionError("an empty notice must be refused")
     with tempfile.TemporaryDirectory() as tmp:
         f = Path(tmp) / "a.json"
-        f.write_text(json.dumps(a))
+        f.write_text(json.dumps(a), encoding="utf-8", newline="\n")
         out = Path(tmp) / "out"
-        assert main(["render", "--out", str(out), str(f)]) == 0 and "MIT text A" in out.read_text()
+        assert main(["render", "--out", str(out), str(f)]) == 0 and "MIT text A" in out.read_text(encoding="utf-8")
     print("ok")
     return 0
 
@@ -96,7 +96,7 @@ def main(argv: list[str]) -> int:
         print(__doc__, file=sys.stderr)
         return 2
     documents = [json.loads(Path(p).read_text(encoding="utf-8")) for p in argv[3:]]
-    Path(argv[2]).write_text(render(documents), encoding="utf-8")
+    Path(argv[2]).write_text(render(documents), encoding="utf-8", newline="\n")
     return 0
 
 

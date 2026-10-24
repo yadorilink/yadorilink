@@ -8,7 +8,6 @@ use yadorilink_replica_domain::session_state::LinkGate;
 use yadorilink_replica_domain::session_state::MaterializationPolicy;
 
 use super::types::*;
-use yadorilink_peer_session::peer_session::*;
 
 impl super::LocalConvergenceExecutor {
     pub async fn reconcile_paths_directly(
@@ -495,7 +494,7 @@ impl super::LocalConvergenceExecutor {
         // arrives as `version_hash`.
         let current_version_hash_hex = version_hash.to_hex();
         let mut all_present = true;
-        let concurrency = block_fetch_concurrency();
+        let concurrency = self.state.tuning().block_fetch_concurrency;
         // Bounded-concurrency block fetch rather than a strictly
         // one-at-a-time loop: per-block round-trip latency
         // (not transport throughput) dominates end-to-end time once bulk
@@ -712,7 +711,9 @@ impl super::LocalConvergenceExecutor {
         paths: &std::collections::BTreeSet<String>,
         call_timer: &crate::local_convergence::call_timer::ReconcileCallTimer,
     ) -> Result<HashMap<String, BlockRequirement>, PeerSessionError> {
-        let shape = PrefetchShape::Overlapped { fetches_in_flight: block_fetch_concurrency() };
+        let shape = PrefetchShape::Overlapped {
+            fetches_in_flight: self.state.tuning().block_fetch_concurrency,
+        };
         let (requirements, _outcomes) =
             self.obtain_missing_content_with(driver, group_id, paths, call_timer, shape).await?;
         Ok(requirements)

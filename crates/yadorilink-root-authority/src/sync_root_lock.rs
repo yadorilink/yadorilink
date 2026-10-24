@@ -16,7 +16,7 @@
 //! inside a *single* daemon process. An OS `flock` conflicts between two
 //! open file *descriptions* of the same file, even within one process, on
 //! Linux and macOS (see the identical precedent already relied on by
-//! `yadorilink-daemon::resource_lock::take_exclusive_lock`). Acquiring and
+//! `yadorilink-local-storage::resource_lock::take_exclusive_lock`). Acquiring and
 //! releasing a fresh lock on every `VerifiedRoot` construction would
 //! therefore make two concurrent in-process operations on the *same* root
 //! serialize-or-fail against each other — not what this guards against, and
@@ -27,7 +27,7 @@
 //! daemon starts actively managing a link, and held for as long as the
 //! daemon keeps that link active — mirroring the config-directory lock
 //! (`yadorilink-daemon::app::DaemonInstanceLock`) and the data-resource locks
-//! (`yadorilink-daemon::resource_lock::DataResourceLocks`), which are
+//! (`yadorilink-local-storage::resource_lock::DataResourceLocks`), which are
 //! likewise whole-process-lifetime locks rather than per-operation ones.
 //!
 //! # Mechanism
@@ -222,7 +222,7 @@ impl SyncRootLock {
     /// `root` must already exist (a link's root is created by the join/link
     /// flow before this runs); this deliberately does not create the
     /// directory itself, unlike the block-store root lock in
-    /// `yadorilink-daemon::resource_lock`, which owns a directory this crate
+    /// `yadorilink-local-storage::resource_lock`, which owns a directory this crate
     /// never does.
     pub fn acquire(root: &Path) -> Result<Self, RootAuthorityError> {
         let canonical = root.canonicalize().map_err(|e| {
@@ -538,7 +538,7 @@ fn open_sidecar_file_platform(
 /// contention error is `ERROR_LOCK_VIOLATION` (raw OS error 33), which does
 /// not map to `ErrorKind::WouldBlock` in std's Windows error-kind mapping —
 /// unlike Unix's `EWOULDBLOCK`, which does. Mirrors
-/// `yadorilink-daemon::resource_lock::take_exclusive_lock`'s identical
+/// `yadorilink-local-storage::resource_lock::take_exclusive_lock`'s identical
 /// comparison, for the identical reason (that module's own comment cites
 /// `fs2`'s test suite comparing the same way).
 fn take_exclusive_lock(

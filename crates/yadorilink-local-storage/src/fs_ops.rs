@@ -32,7 +32,7 @@ pub(crate) fn durable_namespace_beside(
     {
         let _ = path;
         if let Some(reason) = TEST_REFUSAL.with(std::cell::Cell::get) {
-            return Err(NsError::Unavailable(reason).into());
+            return Err(NsError::Unavailable(reason, Default::default()).into());
         }
         Ok(Some(DurableNamespace::unchecked_for_tests()))
     }
@@ -250,7 +250,7 @@ pub(crate) fn rename_path(source: &Path, destination: &Path) -> std::io::Result<
 /// creates a file it will later claim to be durable owes one of these.
 #[cfg(unix)]
 pub(crate) fn sync_directory(path: &Path) -> Result<(), StorageError> {
-    fs::File::open(path)?.sync_all()?;
+    yadorilink_fs_platform::flush::sync_directory(&fs::File::open(path)?)?;
     Ok(())
 }
 

@@ -984,7 +984,10 @@ async fn a_retry_whose_preserved_bytes_are_damaged_fails_and_keeps_the_unit_held
     let Some((a, b, unit)) = held_own_unit("retry-source").await else { return };
     let block = edit_block(&b);
     b.state.block_store.delete(&block).unwrap();
-    let root = yadorilink_daemon::device_config::recovery_root_of(&b.device_id);
+    let root = yadorilink_daemon::device_config::recovery_root_of(
+        &yadorilink_daemon::device_config::config_dir(),
+        &b.device_id,
+    );
     let mut damaged = 0;
     let mut pending = vec![root];
     while let Some(dir) = pending.pop() {

@@ -535,7 +535,7 @@ fn apply_op(root: &Path, path_level: u8, op_level: u8, device_idx: usize, op: Op
     if path_level == 2 && device_idx == 0 {
         if path.exists() {
             let renamed = root.join(format!("shared-renamed-r{round}.bin"));
-            std::fs::rename(&path, &renamed).unwrap();
+            support::rename_unless_vanished(&path, &renamed);
         } else {
             std::fs::write(&path, content.as_bytes()).unwrap();
         }
@@ -547,7 +547,7 @@ fn apply_op(root: &Path, path_level: u8, op_level: u8, device_idx: usize, op: Op
             std::fs::write(&path, content.as_bytes()).unwrap();
         }
         Op::Delete => {
-            let _ = std::fs::remove_file(&path);
+            support::remove_file_unless_vanished(&path);
         }
         Op::Rename => {
             if path.exists() {
@@ -564,24 +564,26 @@ fn apply_op(root: &Path, path_level: u8, op_level: u8, device_idx: usize, op: Op
                         target.file_name().unwrap().to_string_lossy()
                     ))
                 };
-                let _ = std::fs::rename(&path, dest);
+                support::rename_unless_vanished(&path, &dest);
             } else {
                 std::fs::write(&path, content.as_bytes()).unwrap();
             }
         }
     }
+}
 
-    // path_level 3 (nested directory): on round 0 only, device 0
-    // additionally renames the whole shared parent directory right after
-    // its own op inside it -- combining `directory_conflict_matrix.rs`'s
-    // "nested rename races a child edit" shape with this row's
-    // partition/churn/op axes for the first time.
-    if path_level == 3 && device_idx == 0 && round == 0 {
-        let dir = root.join("shared_dir");
-        if dir.exists() {
-            let _ = std::fs::rename(&dir, root.join("shared_dir-renamed"));
-        }
+/// path_level 3 (nested directory): on round 0 only, device 0 additionally renames the whole
+/// shared parent directory right after its own op inside it -- combining
+/// `directory_conflict_matrix.rs`'s "nested rename races a child edit" shape with this row's
+/// partition/churn/op axes for the first time. The rename waits for the device's own capture to
+/// be quiescent, so it races the peers' changes and not the daemon's own file opens.
+async fn rename_shared_dir(device: &TestDevice, group_id: &str) {
+    let dir = device.root.path().join("shared_dir");
+    if !dir.exists() {
+        return;
     }
+    support::quiescence::wait_quiescent(device.root.path(), &device.state, group_id).await;
+    support::rename_unless_vanished(&dir, &device.root.path().join("shared_dir-renamed"));
 }
 
 async fn apply_round_for_devices(
@@ -590,10 +592,14 @@ async fn apply_round_for_devices(
     op_level: u8,
     round: u32,
     stagger: Duration,
+    group_id: &str,
 ) {
     for (idx, device) in devices.iter().enumerate() {
         let op = op_for_device(op_level, idx);
         apply_op(device.root.path(), path_level, op_level, idx, op, round);
+        if path_level == 3 && idx == 0 && round == 0 {
+            rename_shared_dir(device, group_id).await;
+        }
         if !stagger.is_zero() {
             tokio::time::sleep(stagger).await;
         }
@@ -858,7 +864,7 @@ async fn run_taguchi_v3_row(
             pause(&devices[i]);
         }
     }
-    apply_round_for_devices(&devices, path_level, op_level, 0, stagger).await;
+    apply_round_for_devices(&devices, path_level, op_level, 0, stagger, group_id).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     if partition_level == 3 {
@@ -889,7 +895,7 @@ async fn run_taguchi_v3_row(
     let (excluded_idx, joined_device) =
         apply_churn(&fake, &devices, churn_level, row_name, group_id).await;
 
-    apply_round_for_devices(&devices, path_level, op_level, 1, stagger).await;
+    apply_round_for_devices(&devices, path_level, op_level, 1, stagger, group_id).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     if matches!(partition_level, 2..=4) {

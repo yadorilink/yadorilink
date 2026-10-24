@@ -27,6 +27,10 @@ impl DaemonLifecyclePort for FakeLifecycle {
         let answer = if answers.len() > 1 { answers.remove(0) } else { answers[0].clone() };
         Box::pin(async move { answer })
     }
+
+    fn request_safe_stop_to_restart(&self, d: Duration) -> BoxFuture<'_, SafeStopOutcome> {
+        self.request_safe_stop(d)
+    }
 }
 
 fn present(yes: bool) -> PathProbe {
@@ -182,6 +186,9 @@ impl DaemonLifecyclePort for Recording {
     fn request_safe_stop(&self, d: Duration) -> BoxFuture<'_, SafeStopOutcome> {
         self.1.lock().unwrap().push(self.2.elapsed());
         self.0.request_safe_stop(d)
+    }
+    fn request_safe_stop_to_restart(&self, d: Duration) -> BoxFuture<'_, SafeStopOutcome> {
+        self.request_safe_stop(d)
     }
 }
 

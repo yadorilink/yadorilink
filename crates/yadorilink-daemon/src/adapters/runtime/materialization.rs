@@ -48,7 +48,7 @@ impl DaemonMaterializationAdapter {
             self.state.nudge_custody_hold_reconciler();
             Ok(())
         } else {
-            self.hydrate(group_id, path).await
+            self.hydrate(group_id, path).await.map(|_| ())
         }
     }
 }
@@ -68,7 +68,7 @@ impl MaterializationPort for DaemonMaterializationAdapter {
             .await?
             {
                 hydration::Materialized::Temp(outcome) => Ok(outcome),
-                hydration::Materialized::InPlace => Err(SyncError::CorruptState(
+                hydration::Materialized::InPlace(_) => Err(SyncError::CorruptState(
                     "a temp materialization produced an in-place result".into(),
                 )),
             }
@@ -79,7 +79,7 @@ impl MaterializationPort for DaemonMaterializationAdapter {
         &'a self,
         group_id: &'a str,
         path: &'a str,
-    ) -> BoxFuture<'a, Result<(), SyncError>> {
+    ) -> BoxFuture<'a, Result<bool, SyncError>> {
         Box::pin(async move {
             let path = path.trim_end_matches('/');
             let result = if directory::is_indexed_directory(&self.state, group_id, path)? {
@@ -87,7 +87,12 @@ impl MaterializationPort for DaemonMaterializationAdapter {
             } else {
                 hydration::materialize_path(&self.state, group_id, path, hydration::Sink::InPlace)
                     .await
-                    .map(|_| ())
+                    .and_then(|materialized| match materialized {
+                        hydration::Materialized::InPlace(fetched) => Ok(fetched),
+                        hydration::Materialized::Temp(_) => Err(SyncError::CorruptState(
+                            "an in-place hydration produced a temp result".into(),
+                        )),
+                    })
             };
             // A rehydrated path no longer depends on a custody lease.
             self.state.nudge_custody_hold_reconciler();
@@ -206,7 +211,7 @@ impl MaterializationPort for DaemonMaterializationAdapter {
             )
             .is_err()
             {
-                (!cfg!(target_os = "macos")).then(|| {
+                (!cfg!(target_vendor = "apple")).then(|| {
                     "the files of this folder are downloaded by the operating system; the pin is \
                      recorded but does not download them"
                         .to_owned()

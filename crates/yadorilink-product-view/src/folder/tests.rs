@@ -145,3 +145,25 @@ fn no_active_transfer_means_no_transfer_progress() {
     let summary = FolderSummary::from(&base_link());
     assert_eq!(summary.transfer, None);
 }
+
+#[test]
+fn degraded_cause_follows_the_typed_wire_cause_and_never_the_text() {
+    use yadorilink_ipc_proto::daemonctl::DegradedCause as Wire;
+    assert_eq!(FolderSummary::from(&base_link()).degraded_cause, None);
+    // A reason that reads like a known cause, with no typed cause, is just a stopped folder.
+    let text_only = LinkStatus {
+        degraded: true,
+        degraded_reason: "OS file watch limit reached".into(),
+        ..base_link()
+    };
+    assert_eq!(FolderSummary::from(&text_only).degraded_cause, Some(DegradedCause::Stopped));
+    for (wire, cause) in [
+        (Wire::WaitingForDiskSpace, DegradedCause::WaitingForDiskSpace),
+        (Wire::FileWatchLimit, DegradedCause::FileWatchLimit),
+        (Wire::OwnershipLost, DegradedCause::OwnershipLost),
+        (Wire::NotJoined, DegradedCause::NotJoined),
+    ] {
+        let link = LinkStatus { degraded: true, degraded_cause: wire as i32, ..base_link() };
+        assert_eq!(FolderSummary::from(&link).degraded_cause, Some(cause));
+    }
+}

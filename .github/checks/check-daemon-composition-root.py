@@ -56,10 +56,14 @@ DEFINITION_FILE = "adapters/mod.rs"
 # `app.rs` builds the control socket's instance; the services are stateless
 # over `DaemonState`, so the two instances are interchangeable).
 # `daemon_state.rs` is deliberately NOT allowed: the state owner must never
-# drive an application workflow itself.
+# drive an application workflow itself. `engine_startup.rs` holds the start
+# phases `app.rs` and `embedded_host.rs` share, so it is where the builders
+# are called for both; `embedded_host.rs` is the embedded composition root.
 ALLOWED_BUILD_CALLERS = {
     "app.rs",
     "control_context.rs",
+    "embedded_host.rs",
+    "engine_startup.rs",
     "maintenance_coordinator.rs",
 }
 
@@ -103,6 +107,7 @@ def is_test_only_child(src_dir: Path, path: Path) -> bool:
 ALLOWED_MAINTENANCE_START_CALLERS = {
     "app.rs",
     "daemon_state.rs",
+    "engine_startup.rs",
 }
 
 CFG_TEST_ATTR = re.compile(r"#\[cfg\(\s*test\s*\)\]")

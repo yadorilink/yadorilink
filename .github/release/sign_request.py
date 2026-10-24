@@ -49,13 +49,14 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
+import release_channels  # noqa: E402
 import trust_chain as tc  # noqa: E402
 
 REQUEST_SCHEMA_VERSION = 1
 # The production trust chain; the signer consults no other chain.
 CHAIN_FILES = {"production": "trust-chain.json"}
 BUNDLE_SCHEMA_VERSION = 1  # must equal the bundle verifier's schema version (a test pins it)
-CHANNELS = ("nightly", "beta")
+CHANNELS = release_channels.CHANNELS
 TARGETS = ("production",)
 REQUEST_FIELDS = {
     "schema_version", "channel", "target", "generated_at", "ledger_sha256", "manifest_body_sha256",

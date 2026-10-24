@@ -71,13 +71,34 @@ impl ClientCore {
         ))
     }
 
+    /// A sign-in of THIS installation, for an action the server refused with
+    /// `PermissionDenied{ReauthenticationRequired}` (account deletion). Read
+    /// and cancelled exactly like [`Self::new_login_session`]; it keeps the
+    /// installation's identity and device, and a front end retries the refused
+    /// action after `SignedIn`.
+    #[must_use]
+    pub fn new_reauthentication_session(&self, options: LoginOptions) -> Arc<LoginSession> {
+        let device = options.flow == LoginFlow::DeviceCode;
+        Arc::new(LoginSession::with_flow(
+            options,
+            Box::new(|| {
+                if credential_store::installation()?.is_none() {
+                    return Err(DesktopError::from(CoreError::NotLoggedIn));
+                }
+                Ok(())
+            }),
+            Box::new(move |sink| Box::pin(step_up(device, sink))),
+        ))
+    }
+
     /// Revokes this installation on the server, then removes its credential.
     ///
     /// # Errors
     /// The credential is kept, and the error says why, whenever the
     /// revocation could not be confirmed.
     pub async fn sign_out(&self) -> Result<dto::SignOutOutcome, DesktopError> {
-        let kind = match ops::auth::sign_out().await? {
+        let report = ops::auth::sign_out().await?;
+        let kind = match report.kind {
             ops::auth::SignOutKind::Revoked { grants_revoked } => {
                 dto::SignOutKind::Revoked { grants_revoked }
             }
@@ -86,7 +107,7 @@ impl ClientCore {
                 dto::SignOutKind::ConfirmedRevokedAfterRejection
             }
         };
-        Ok(dto::SignOutOutcome { kind })
+        Ok(dto::SignOutOutcome { kind, key_cleanup_warning: report.key_cleanup_warning })
     }
 
     /// # Errors
@@ -95,8 +116,13 @@ impl ClientCore {
         &self,
         name: String,
     ) -> Result<dto::DeviceRegistration, DesktopError> {
-        let device_id = ops::devices::register_device(name).await?;
+        let device_id = ops::devices::register_device(name, &self.machine_ports().launch).await?;
         Ok(dto::DeviceRegistration { device_id })
+    }
+
+    /// The real machine, restarting and starting the daemon with this core's launch.
+    fn machine_ports(&self) -> ops::start_over::MachinePorts {
+        ops::start_over::MachinePorts { launch: self.config().daemon_launch.clone() }
     }
 
     /// Starts over as a new device after the replica database was restored or copied, or
@@ -118,8 +144,7 @@ impl ClientCore {
         confirmed: bool,
         name: String,
     ) -> Result<dto::StartOverProgress, DesktopError> {
-        let progress =
-            ops::start_over::start_over(&ops::start_over::MachinePorts, confirmed, name).await?;
+        let progress = ops::start_over::start_over(&self.machine_ports(), confirmed, name).await?;
         Ok(dto::start_over_progress(progress))
     }
 
@@ -201,27 +226,68 @@ async fn linked_folders() -> Option<bool> {
 /// the sign-in flow builds its result with this in the same step as its
 /// credential write.
 fn account_status_with(has_linked_folders: Option<bool>) -> AccountStatus {
-    let (sign_in, client_id) = match credential_store::installation() {
+    account_status_from(
+        credential_store::installation(),
+        ops::shares::own_device_id(),
+        crate::coordination::device_config::config_dir()
+            .is_ok_and(|dir| ops::start_over::pending_in(&dir)),
+        has_linked_folders,
+        desktop_device_name(),
+    )
+}
+
+/// [`ClientCore::account_status`] for the state directory `dir`, for a host that names its
+/// directory instead of leaving it to the environment. `has_linked_folders` is the host's own
+/// answer (this layer does not ask a daemon).
+#[must_use]
+pub fn account_status_in(
+    dir: &std::path::Path,
+    settings: &credential_store::CredentialSettings,
+    has_linked_folders: Option<bool>,
+) -> AccountStatus {
+    account_status_from(
+        credential_store::installation_in(dir, settings),
+        crate::coordination::device_config::load_in(dir).ok().map(|config| config.device_id),
+        ops::start_over::pending_in(dir),
+        has_linked_folders,
+        // The host's own name for the machine; no environment or process is consulted.
+        settings
+            .host_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("My Device")
+            .to_owned(),
+    )
+}
+
+fn account_status_from(
+    installation: Result<Option<yadorilink_fapi_client::store::Credentials>, CoreError>,
+    this_device_id: Option<String>,
+    start_over_pending: bool,
+    has_linked_folders: Option<bool>,
+    default_device_name: String,
+) -> AccountStatus {
+    let (sign_in, client_id) = match installation {
         Ok(Some(credentials)) => (SignInState::SignedIn, Some(credentials.client_id().to_owned())),
         Ok(None) => (SignInState::SignedOut, None),
         Err(e) => (SignInState::CredentialStoreUnusable { message: e.to_string() }, None),
     };
-    let this_device_id = ops::shares::own_device_id();
     AccountStatus {
         sign_in,
         client_id,
         device_registered: this_device_id.is_some(),
         this_device_id,
-        default_device_name: default_device_name(),
+        default_device_name,
         has_linked_folders,
-        start_over_pending: crate::coordination::device_config::config_dir()
-            .is_ok_and(|dir| ops::start_over::pending_in(&dir)),
+        start_over_pending,
     }
 }
 
-/// A prefill for the device-name field: the machine's name, else a generic
-/// one.
-fn default_device_name() -> String {
+/// A prefill for the device-name field on the desktop: the machine's name from the environment
+/// or the `hostname` command, else a generic one. An embedded host gives its own
+/// (`CredentialSettings::host_name`).
+fn desktop_device_name() -> String {
     for var in ["COMPUTERNAME", "HOSTNAME", "HOST"] {
         if let Ok(value) = std::env::var(var) {
             if !value.trim().is_empty() {
@@ -241,13 +307,93 @@ fn default_device_name() -> String {
 /// The real sign-in flow: the client layer's enrolment and login, with each
 /// step passed on as a product event.
 ///
-/// Nothing is awaited after the login's credential write: the session stops
-/// a cancelled flow at its next await, and a flow that has written must
-/// finish in that same step so it is reported as signed in. The daemon is
+/// Nothing is awaited after the login's credential write: the write and the
+/// flow's completion happen in one poll, and the session's gate makes a cancel
+/// wait for a poll in flight and forbid the next, so a flow that has written is
+/// reported as signed in and a cancelled one writes nothing. The daemon is
 /// therefore asked about linked folders before the login starts.
+/// A sign-in over the state directory `dir`: the same flow as
+/// [`ClientCore::new_login_session`], with the credential store and every record it writes in
+/// that directory.
+#[must_use]
+pub fn new_login_session_in(
+    dir: PathBuf,
+    settings: credential_store::CredentialSettings,
+    options: LoginOptions,
+) -> Arc<LoginSession> {
+    let device = options.flow == LoginFlow::DeviceCode;
+    let precheck_dir = dir.clone();
+    let precheck_settings = settings.clone();
+    Arc::new(LoginSession::with_flow(
+        options,
+        Box::new(move || {
+            ops::auth::ensure_not_enrolled_in(&precheck_dir, &precheck_settings)
+                .map_err(DesktopError::from)
+        }),
+        Box::new(move |sink| {
+            Box::pin(async move {
+                ops::auth::login_in(&dir, &settings, device, |event| {
+                    if let Some(event) = login_event(event) {
+                        sink.send(event);
+                    }
+                })
+                .await?;
+                Ok(account_status_in(&dir, &settings, None))
+            })
+        }),
+    ))
+}
+
+/// A step-up sign-in over the state directory `dir`: the same flow as
+/// [`ClientCore::new_reauthentication_session`], with the credential store in that directory
+/// and the host's settings.
+#[must_use]
+pub fn new_reauthentication_session_in(
+    dir: PathBuf,
+    settings: credential_store::CredentialSettings,
+    options: LoginOptions,
+) -> Arc<LoginSession> {
+    let device = options.flow == LoginFlow::DeviceCode;
+    let precheck_dir = dir.clone();
+    let precheck_settings = settings.clone();
+    Arc::new(LoginSession::with_flow(
+        options,
+        Box::new(move || {
+            if credential_store::installation_in(&precheck_dir, &precheck_settings)?.is_none() {
+                return Err(DesktopError::from(CoreError::NotLoggedIn));
+            }
+            Ok(())
+        }),
+        Box::new(move |sink| {
+            Box::pin(async move {
+                ops::auth::reauthenticate_in(&dir, &settings, device, |event| {
+                    if let Some(event) = login_event(event) {
+                        sink.send(event);
+                    }
+                })
+                .await?;
+                Ok(account_status_in(&dir, &settings, None))
+            })
+        }),
+    ))
+}
+
 async fn sign_in(device: bool, sink: LoginEventSink) -> Result<AccountStatus, DesktopError> {
     let has_linked_folders = linked_folders().await;
     ops::auth::login(device, |event| {
+        if let Some(event) = login_event(event) {
+            sink.send(event);
+        }
+    })
+    .await?;
+    Ok(account_status_with(has_linked_folders))
+}
+
+/// The step-up sign-in: [`ops::auth::reauthenticate`] with each step passed on
+/// as a product event.
+async fn step_up(device: bool, sink: LoginEventSink) -> Result<AccountStatus, DesktopError> {
+    let has_linked_folders = linked_folders().await;
+    ops::auth::reauthenticate(device, |event| {
         if let Some(event) = login_event(event) {
             sink.send(event);
         }
@@ -271,8 +417,13 @@ fn login_event(event: ops::auth::LoginEvent) -> Option<LoginEvent> {
         },
         Step::WaitingForApproval { expires_in } => LoginEvent::WaitingForApproval { expires_in },
         Step::WaitingForAuthorization => LoginEvent::WaitingForAuthorization,
-        Step::ShowDeviceCode { verification_uri, user_code, .. } => {
-            LoginEvent::ShowDeviceCode { verification_uri, user_code }
+        // The link to open is the one with the code filled in when the server offered it; the
+        // code is still shown so the person can check it against the page.
+        Step::ShowDeviceCode { verification_uri, verification_uri_complete, user_code } => {
+            LoginEvent::ShowDeviceCode {
+                verification_uri: verification_uri_complete.unwrap_or(verification_uri),
+                user_code,
+            }
         }
         Step::SignedIn { .. } => return None,
     })

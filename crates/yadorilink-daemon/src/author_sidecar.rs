@@ -84,7 +84,7 @@ pub fn write_sidecar(db_path: &Path, sidecar: &InstanceSidecar) -> io::Result<()
     let written = (|| {
         let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
         file.write_all(&encode(sidecar))?;
-        file.sync_all()?;
+        yadorilink_fs_platform::flush::sync_file(&file)?;
         drop(file);
         yadorilink_fs_platform::durable_dir::publish_durably(
             &temp,

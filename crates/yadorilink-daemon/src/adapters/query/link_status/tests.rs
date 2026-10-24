@@ -545,3 +545,39 @@ async fn more_placeholders_than_the_budget_fail_closed() {
     }
     assert_eq!(fetch_availability(&state), FetchAvailability::UnavailableNow);
 }
+
+/// Each way a link is degraded reaches the wire as its own typed cause, whatever the detail text
+/// says: the file-watch limit, a lost ownership marker and a disk-space wait.
+#[tokio::test]
+#[cfg(feature = "process-model")] // encodes through control_socket, compiled out of the engine-only build
+async fn each_degraded_state_reports_its_own_typed_cause() {
+    use crate::link_registry::DegradedCause;
+    use yadorilink_ipc_proto::daemonctl::DegradedCause as Wire;
+
+    let cause_of = |state: &Arc<DaemonState>| {
+        let view = reader_for(state.clone()).list_links().unwrap().remove(0);
+        let wire = crate::status_report::encode_link_status(view);
+        (wire.degraded, wire.degraded_cause(), wire.waiting_for_disk_space)
+    };
+
+    let state = test_state();
+    state.replica_coordinator.link_repository().add_link(PATH, GROUP).unwrap();
+    assert_eq!(cause_of(&state), (false, Wire::Unspecified, false));
+
+    state.mark_link_waiting_for_disk_space(PATH, "any wording".into());
+    assert_eq!(cause_of(&state), (true, Wire::WaitingForDiskSpace, true));
+    state.clear_link_degraded(PATH);
+
+    state.mark_link_degraded(PATH, DegradedCause::NotJoined, "Waiting for disk space".into());
+    assert_eq!(cause_of(&state), (true, Wire::NotJoined, false));
+    state.clear_link_degraded(PATH);
+
+    assert!(state.mark_link_ownership_lost(PATH));
+    assert_eq!(cause_of(&state), (true, Wire::OwnershipLost, false));
+    state.links.clear_ownership_lost(PATH);
+
+    // The watch limit outranks the other causes.
+    state.links.record_watch_limit_startup_failure(PATH);
+    state.mark_link_waiting_for_disk_space(PATH, "x".into());
+    assert_eq!(cause_of(&state), (true, Wire::FileWatchLimit, false));
+}

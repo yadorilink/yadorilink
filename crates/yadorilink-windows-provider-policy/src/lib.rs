@@ -5,6 +5,7 @@
 //! pipe transport, the Cloud Files calls, the NTFS change journal) and implements the traits
 //! declared here.
 
+pub mod fetch_report;
 pub mod host;
 pub mod host_paths;
 pub mod namespace_policy;

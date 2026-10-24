@@ -1,3 +1,4 @@
+// apple-cfg-file: macos-only the login-item switches manage the macOS launchd service
 //! The System Settings switches `yadorilink status` names when one is off. macOS only: elsewhere
 //! there are no such switches and nothing is printed. Asking the system never fails the command.
 //!

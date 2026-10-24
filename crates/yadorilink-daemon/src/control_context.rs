@@ -23,6 +23,9 @@ use crate::queries::QueryServices;
 pub struct ControlContext {
     pub(crate) application: Arc<ApplicationServices>,
     pub(crate) queries: Arc<QueryServices>,
+    /// The engine's state directory: the settings and recovery records `status` and the
+    /// settings verbs read live under it.
+    pub(crate) config_dir: std::path::PathBuf,
     /// The provider roots' lines of `status`, filled in by the shell side.
     pub(crate) provider_status: Arc<crate::provider_status::ProviderStatusSource>,
     /// Frees the local copy of a provider folder's file; installed by the shell side.
@@ -30,23 +33,31 @@ pub struct ControlContext {
     /// Automatic space management; installed by the shell side.
     pub(crate) auto_reclaim: Arc<crate::provider_auto_reclaim::AutoReclaimSlot>,
     /// Who this daemon is, for `identify`.
+    #[cfg(feature = "process-model")]
     pub(crate) identity: Arc<crate::identity::RuntimeIdentity>,
 }
 
 impl ControlContext {
-    pub(crate) fn new(application: Arc<ApplicationServices>, queries: Arc<QueryServices>) -> Self {
+    pub(crate) fn new(
+        application: Arc<ApplicationServices>,
+        queries: Arc<QueryServices>,
+        config_dir: std::path::PathBuf,
+    ) -> Self {
         Self {
             application,
             queries,
+            config_dir,
             provider_status: Arc::default(),
             provider_evict: Arc::default(),
             auto_reclaim: Arc::default(),
-            identity: Arc::new(crate::identity::RuntimeIdentity::detect(None)),
+            #[cfg(feature = "process-model")]
+            identity: Arc::new(crate::identity::RuntimeIdentity::detect(None, None)),
         }
     }
 
     /// Replaces the identity `identify` reports; the composition root passes the one it gated the
     /// start with, tests pass a chosen layout.
+    #[cfg(feature = "process-model")]
     #[must_use]
     pub fn with_identity(mut self, identity: Arc<crate::identity::RuntimeIdentity>) -> Self {
         self.identity = identity;
@@ -61,7 +72,8 @@ impl ControlContext {
     /// `DaemonState` to start from.
     pub fn from_state(state: Arc<crate::daemon_state::DaemonState>) -> Self {
         let application = crate::adapters::build_application_services(state.clone());
+        let config_dir = state.config_dir().to_path_buf();
         let queries = crate::adapters::build_query_services(state);
-        Self::new(application, queries)
+        Self::new(application, queries, config_dir)
     }
 }

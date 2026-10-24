@@ -17,8 +17,8 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+use crate::coordination::http_client::CoordinationAccess;
 use serde::{Deserialize, Serialize};
-use yadorilink_fapi_client::CoordinationAuth;
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::{
@@ -35,7 +35,7 @@ use crate::coordination::http_client::{
     delete_no_content, get_json, post_json, post_json_no_content, require_auth,
 };
 use crate::daemon::control;
-use crate::error::CoreError;
+use crate::error::{CoreError, Hint};
 
 /// Maps a storage-mode word to the daemon's `on_demand` flag: `eager`
 /// (store everything) links a fully-hydrated folder; `on-demand` (store only
@@ -112,7 +112,7 @@ pub async fn list_groups() -> Result<Vec<GroupSummary>, CoreError> {
 /// resolves to the account's OWN group, deterministically. The fallback
 /// grants nothing: authorization stays entirely server-side and per-route.
 pub async fn resolve_group_id(
-    auth: &CoordinationAuth,
+    auth: &CoordinationAccess,
     group_name: &str,
 ) -> Result<String, CoreError> {
     let owned: ListGroupsResponse = get_json("/shares/groups", auth).await?;
@@ -123,10 +123,9 @@ pub async fn resolve_group_id(
     shared.edges.into_iter().find(|e| e.group_name == group_name).map(|e| e.group_id).ok_or_else(
         || {
             CoreError::InvalidInput(format!(
-                "no folder group named {group_name:?} is visible to this account (run \
-                 `yadorilink share create` to make one, or `yadorilink share accept` to join \
-                 one you were invited to)"
+                "no folder group named {group_name:?} is visible to this account"
             ))
+            .hinted(Hint::CreateOrAcceptShare)
         },
     )
 }
@@ -568,7 +567,7 @@ pub async fn list_members_resolved(group_id: &str) -> Result<Vec<GroupMemberInfo
 /// every other device keeps the service's presence, and nothing that decides
 /// durability reads `online`.
 async fn fetch_members(
-    auth: &CoordinationAuth,
+    auth: &CoordinationAccess,
     group_id: &str,
     own_device_id: Option<&str>,
 ) -> Result<Vec<GroupMemberInfo>, CoreError> {
@@ -1078,12 +1077,18 @@ pub async fn list_joinable_groups() -> Result<Vec<GroupSummary>, CoreError> {
 /// `group_id`, searching the account's owned joinable set.
 pub async fn resolve_joinable_group_id(group_name: &str) -> Result<String, CoreError> {
     let auth = require_auth().await?;
-    let resp: ListJoinableResponse = get_json("/shares/joinable", &auth).await?;
+    resolve_joinable_group_id_with(&auth, group_name).await
+}
+
+/// [`resolve_joinable_group_id`] against a given coordination session.
+async fn resolve_joinable_group_id_with(
+    auth: &CoordinationAccess,
+    group_name: &str,
+) -> Result<String, CoreError> {
+    let resp: ListJoinableResponse = get_json("/shares/joinable", auth).await?;
     resp.groups.into_iter().find(|g| g.name == group_name).map(|g| g.group_id).ok_or_else(|| {
-        CoreError::InvalidInput(format!(
-            "no joinable folder group named {group_name:?} (run `yadorilink share joinable` \
-             to see what this account can join)"
-        ))
+        CoreError::InvalidInput(format!("no joinable folder group named {group_name:?}"))
+            .hinted(Hint::ListJoinableShares)
     })
 }
 
@@ -1172,6 +1177,7 @@ pub async fn accept_invite(
         local_path: absolute.to_string_lossy().to_string(),
         on_demand,
         acknowledge_risks: acknowledged,
+        ..Default::default()
     }))
     .await?;
     match response.payload {
@@ -1180,6 +1186,82 @@ pub async fn accept_invite(
                 Ok(AcceptInviteOutcome {
                     group_id: outcome.group_id,
                     awaiting_approval: outcome.awaiting_approval,
+                })
+            }
+            Some(accept_invite_command_response::Result::Error(error)) => {
+                Err(CoreError::from_command_error(error))
+            }
+            None => Err(CoreError::Other("daemon returned an empty accept result".into())),
+        },
+        _ => Err(CoreError::Other("unexpected daemon response to accept-invite".into())),
+    }
+}
+
+/// Redeems an invite and joins the group it names as a provider-backed folder named
+/// `display_name` (no directory: the File Provider or Cloud Files root is the folder). The request's
+/// retry identity is kept on disk like any provider-folder request, so repeating the SAME request,
+/// also after a restart, finishes the folder it began; the invite code itself is kept only as a
+/// digest. `awaiting_approval` is set when the owner must still approve the membership.
+pub async fn accept_invite_as_provider_folder(
+    code_or_url: &str,
+    display_name: String,
+    on_demand: bool,
+) -> Result<ProviderInviteAccepted, CoreError> {
+    use sha2::{Digest, Sha256};
+    let code = crate::wording::parse_invite_input(code_or_url)
+        .map_err(|e| CoreError::InvalidInput(e.to_string()))?
+        .to_string();
+    let code_digest: String =
+        Sha256::digest(code.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect();
+    let signature =
+        super::provider_pending::signature("invite", &code_digest, "", &display_name, on_demand);
+    let awaiting = std::sync::atomic::AtomicBool::new(false);
+    let created = with_durable_token(signature, |token| {
+        accept_invite_as_provider_folder_with_token(code, display_name, token, on_demand, &awaiting)
+    })
+    .await?;
+    Ok(ProviderInviteAccepted {
+        group_id: created.group_id,
+        root_id: created.root_id,
+        awaiting_approval: awaiting.load(std::sync::atomic::Ordering::Relaxed),
+    })
+}
+
+/// What redeeming an invite as a provider-backed folder produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderInviteAccepted {
+    pub group_id: String,
+    pub root_id: String,
+    /// The invite requires the group owner's approval: the folder exists but syncs nothing until
+    /// they approve.
+    pub awaiting_approval: bool,
+}
+
+async fn accept_invite_as_provider_folder_with_token(
+    code: String,
+    display_name: String,
+    request_token: String,
+    on_demand: bool,
+    awaiting_approval: &std::sync::atomic::AtomicBool,
+) -> Result<ProviderFolderCreated, CoreError> {
+    let response = control::send(ReqPayload::AcceptInviteCommand(AcceptInviteCommandRequest {
+        code,
+        local_path: String::new(),
+        on_demand,
+        acknowledge_risks: false,
+        provider_display_name: display_name,
+        request_token,
+    }))
+    .await?;
+    match response.payload {
+        Some(RespPayload::AcceptInviteCommand(response)) => match response.result {
+            Some(accept_invite_command_response::Result::Outcome(outcome)) => {
+                awaiting_approval
+                    .store(outcome.awaiting_approval, std::sync::atomic::Ordering::Relaxed);
+                Ok(ProviderFolderCreated {
+                    group_id: outcome.group_id,
+                    root_id: outcome.provider_root_id,
+                    already_existed: outcome.already_linked,
                 })
             }
             Some(accept_invite_command_response::Result::Error(error)) => {

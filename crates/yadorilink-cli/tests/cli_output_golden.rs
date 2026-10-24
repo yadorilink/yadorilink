@@ -531,7 +531,6 @@ async fn rewind_previews_a_linked_folder_and_refuses_to_run_without_confirmation
 async fn rewind_restores_a_watched_folder_through_the_command_line() {
     let _guard = DAEMON_MUTEX.lock().await;
     let env = Arc::new(Env::new());
-    std::env::set_var("YADORILINK_SYNC_RELAYS", "none");
     let state = start_daemon(&env).await;
     allow_writes(&state, "group-1");
     let folder = env.root().join("work").canonicalize_after_create();

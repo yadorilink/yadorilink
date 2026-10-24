@@ -68,6 +68,7 @@ $script:ManifestBase = 'https://yadori.link/dl'
 $script:TestMode = ($env:YADORILINK_INSTALL_TEST -eq '1')
 $script:TestArch = $null
 $script:TestFailReceipt = $false
+$script:TestNow = $null
 if ($script:TestMode) {
     if ($env:YADORILINK_INSTALL_PUBKEY_HEX) {
         $tid = if ($env:YADORILINK_INSTALL_KEY_ID) { $env:YADORILINK_INSTALL_KEY_ID } else { 'test-key' }
@@ -76,6 +77,7 @@ if ($script:TestMode) {
     if ($env:YADORILINK_INSTALL_TRUST_SET) { $script:TrustSet = @($env:YADORILINK_INSTALL_TRUST_SET -split ' ') }
     if ($env:YADORILINK_INSTALL_BASE_URL) { $script:ManifestBase = $env:YADORILINK_INSTALL_BASE_URL }
     if ($env:YADORILINK_INSTALL_MIN_GENERATED_AT) { $script:MinManifestGeneratedAt = $env:YADORILINK_INSTALL_MIN_GENERATED_AT }
+    if ($env:YADORILINK_INSTALL_NOW) { $script:TestNow = $env:YADORILINK_INSTALL_NOW }
     $script:TestArch = $env:YADORILINK_INSTALL_ARCH
     $script:TestFailReceipt = ($env:YADORILINK_INSTALL_FAIL_RECEIPT -eq '1')
     [Console]::Error.WriteLine('yadorilink-install: TEST MODE (trust root and endpoints overridden)')
@@ -350,12 +352,14 @@ function Read-Manifest([string]$Text, [string]$Channel, [bool]$Lenient) {
     $gm = [regex]::Match($Text, '"generated_at"\s*:\s*"([^"]*)"')
     $gen = if ($gm.Success) { $gm.Groups[1].Value } else { '' }
     if ($gen -notmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$') { Refuse 4 "update manifest has an invalid generated_at '$gen'. Nothing was installed." }
+    $xm = [regex]::Match($Text, '"expires_at"\s*:\s*"([^"]*)"')
+    $exp = if ($xm.Success) { $xm.Groups[1].Value } else { '' }
     $withdrawn = @()
     if ($m.PSObject.Properties['withdrawn_versions']) { $withdrawn = @($m.withdrawn_versions | ForEach-Object { [string]$_ }) }
     $found = @($m.releases | Where-Object { $_.channel -eq $Channel -and $_.platform -eq 'windows' -and $_.arch -eq 'x86_64' -and $_.install_source -eq 'script' })
     if ($found.Count -gt 1) { Refuse 4 "update manifest: ambiguous releases for $Channel/windows-x86_64. Nothing was installed." }
     if ($found.Count -eq 0 -and -not $Lenient) { Refuse 4 "update manifest: no matching release for $Channel/windows-x86_64. Nothing was installed." }
-    $r = [ordered]@{ Gen = $gen; Withdrawn = $withdrawn; HasEntry = ($found.Count -eq 1); Version = ''; Kill = $false; Min = ''; Url = ''; Sha = ''; Size = 0L; Notes = '' }
+    $r = [ordered]@{ Gen = $gen; Expires = $exp; Withdrawn = $withdrawn; HasEntry = ($found.Count -eq 1); Version = ''; Kill = $false; Min = ''; Url = ''; Sha = ''; Size = 0L; Notes = '' }
     if ($found.Count -eq 1) {
         $e = $found[0]
         $r.Version = [string]$e.version; $r.Kill = ($e.kill_switch -eq $true); $r.Min = [string]$e.minimum_supported_version
@@ -376,6 +380,20 @@ function Test-Entry($R) {
 function Assert-ReplayFloor([string]$Gen, [string]$Channel) {
     if ($script:MinManifestGeneratedAt -and [string]::CompareOrdinal($Gen, $script:MinManifestGeneratedAt) -lt 0) {
         Refuse 4 "the $Channel manifest was generated at $Gen, before $($script:MinManifestGeneratedAt), the oldest this installer accepts (a replayed old manifest?). Refusing. Nothing was installed."
+    }
+}
+
+# Assert-NotExpired EXPIRES GEN CHANNEL: the live manifest must not be past its expires_at. Installers
+# keep no state, so this is their only freshness control. It is required of the live channel
+# manifest only: the per-version manifests (integrity facts for a pinned or offline install,
+# published once and kept) never expire, so Read-Manifest does not look at expires_at and a
+# snapshot with or without it is accepted.
+function Assert-NotExpired([string]$Expires, [string]$Gen, [string]$Channel) {
+    if ($Expires -notmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$') { Refuse 4 "update manifest has an invalid expires_at '$Expires'. Nothing was installed." }
+    if ([string]::CompareOrdinal($Gen, $Expires) -ge 0) { Refuse 4 "update manifest expires_at $Expires is not after generated_at $Gen. Nothing was installed." }
+    $now = if ($script:TestNow) { $script:TestNow } else { [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture) }
+    if ([string]::CompareOrdinal($Expires, $now) -lt 0) {
+        Refuse 4 "the $Channel manifest expired at $Expires (it is $now now). Check that this computer's clock is correct, or try again later. Refusing. Nothing was installed."
     }
 }
 
@@ -447,6 +465,55 @@ function Remove-UserPath([string]$Dir) {
     [Environment]::SetEnvironmentVariable('Path', ($parts -join ';'), 'User')
 }
 
+# Files that were never downloaded to this PC (On-Demand placeholders) cannot be opened once
+# YadoriLink is removed. Returns the warning lines, empty when the running daemon reports none.
+# A daemon that does not answer leaves the count unknown, and unknown is not "none".
+function Get-PlaceholderWarnings([string]$Bin) {
+    $cli = Join-Path $Bin 'yadorilink.exe'
+    $folders = $null
+    if (Test-Path -LiteralPath $cli) {
+        try {
+            $raw = (& $cli status --json 2>$null | ForEach-Object { "$_" }) -join "`n"
+            if ($LASTEXITCODE -eq 0) {
+                $parsed = $raw | ConvertFrom-Json
+                if ($null -ne $parsed.PSObject.Properties['folders']) { $folders = @($parsed.folders) }
+            }
+        } catch { $folders = $null }
+    }
+    if ($null -eq $folders) {
+        return @('The daemon is not running, so YadoriLink cannot count files that were never downloaded to this computer (On-Demand placeholders). Such files cannot be opened here once YadoriLink is removed; they remain on your other devices. Start the daemon (yadorilink daemon start) to count them, or pass -Yes to continue.')
+    }
+    $lines = @()
+    $unknown = @()
+    $found = $false
+    foreach ($f in $folders) {
+        # An older daemon or CLI answers without these fields: absent or null is unknown, never zero.
+        $c = $f.PSObject.Properties['placeholder_count']
+        $o = $f.PSObject.Properties['on_demand']
+        if ($null -eq $c -or $null -eq $c.Value -or $null -eq $o -or $null -eq $o.Value) {
+            $unknown += "$($f.local_path)"
+            continue
+        }
+        $n = 0
+        if (-not [int64]::TryParse("$($c.Value)", [ref]$n)) { $unknown += "$($f.local_path)"; continue }
+        if ($n -gt 0) {
+            $found = $true
+            $tag = ''
+            if ($o.Value -eq $true) { $tag = ' (On-Demand folder)' }
+            $lines += "$($f.local_path): $n file(s) were never downloaded to this computer$tag."
+        }
+    }
+    foreach ($u in $unknown) {
+        $lines += "${u}: this YadoriLink does not report how many files were never downloaded, so the count is unknown."
+    }
+    if ($found) {
+        $lines += 'These files cannot be opened here once YadoriLink is removed; they remain on your other devices. Download the ones you need first, or pass -Yes to continue.'
+    } elseif ($unknown.Count -gt 0) {
+        $lines += 'Files that were never downloaded (On-Demand placeholders) cannot be opened here once YadoriLink is removed; they remain on your other devices. Pass -Yes to continue.'
+    }
+    $lines
+}
+
 function Invoke-Uninstall([string]$Prefix, [bool]$Yes) {
     $bin = Join-Path $Prefix 'bin'
     $receiptPath = Join-Path $Prefix 'install-receipt.txt'
@@ -454,7 +521,19 @@ function Invoke-Uninstall([string]$Prefix, [bool]$Yes) {
         Write-Host "Nothing to uninstall: no YadoriLink install found under $Prefix."
         return
     }
-    if (-not (Confirm-Action "Remove the YadoriLink install under $Prefix?" $Yes)) { Fail 'cancelled' }
+    $warnings = @(Get-PlaceholderWarnings $bin)
+    foreach ($w in $warnings) { Write-Host "WARNING: $w" }
+    if ($warnings.Count -gt 0 -and -not $Yes) {
+        # Losing unreadable files is confirmed on its own and never assumed when nobody can be asked.
+        $asked = $false
+        try {
+            if ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
+                $asked = ((Read-Host 'Remove YadoriLink anyway? [y/N]') -match '^(y|yes)$')
+            }
+        } catch { }
+        if (-not $asked) { Fail 'nothing was removed; re-run with -Yes to continue' }
+    }
+    if (-not (Confirm-Action "Remove the YadoriLink install under ${Prefix}?" $Yes)) { Fail 'cancelled' }
     try { $lock = [System.IO.File]::Open((Join-Path $Prefix '.lock'), 'OpenOrCreate', 'ReadWrite', 'None') }
     catch { Fail 'another yadorilink install is running' }
     $receipt = Get-Receipt $receiptPath
@@ -535,6 +614,7 @@ function Invoke-Install($Opt) {
                 $lv = Test-Envelope $liveEnv
                 $live = Read-Manifest $lv.Text $channel $true
                 Assert-ReplayFloor $live.Gen $channel
+                Assert-NotExpired $live.Expires $live.Gen $channel
                 Assert-LiveAllows $live $rel.Version $channel
                 Write-Host "The live $channel manifest does not withdraw $($rel.Version)."
             } else {
@@ -557,6 +637,7 @@ function Invoke-Install($Opt) {
             Write-Host "Manifest signature verified (key $($lv.Key), built-in Ed25519)."
             $live = Read-Manifest $lv.Text $channel $true
             Assert-ReplayFloor $live.Gen $channel
+            Assert-NotExpired $live.Expires $live.Gen $channel
             if ($wantVersion -and $wantVersion -ne $live.Version) {
                 # A pinned version: its signed per-version manifest proves integrity, the live
                 # manifest decides whether it may still be installed.
@@ -603,7 +684,7 @@ function Invoke-Install($Opt) {
         if (Test-Path -LiteralPath $bin) {
             if (-not (Test-IsOurJunction $bin $prefix)) { Fail "$bin already exists and was not created by this script. Remove it or choose another -Prefix. Nothing was changed." }
         }
-        $q = if ($installed) { "Upgrade YadoriLink $installed -> $version under $prefix?" } else { "Install YadoriLink $version under $prefix?" }
+        $q = if ($installed) { "Upgrade YadoriLink $installed -> $version under ${prefix}?" } else { "Install YadoriLink $version under ${prefix}?" }
         if (-not (Confirm-Action $q $Opt.Yes)) { Fail 'cancelled' }
 
         # 2. Bundle download, checked against the signed manifest.

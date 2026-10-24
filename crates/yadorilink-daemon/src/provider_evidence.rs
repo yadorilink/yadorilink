@@ -284,6 +284,24 @@ pub(crate) fn record_handoff(
     Ok(seq)
 }
 
+/// Records that a verified WINDOW of the item's current version was handed to the OS and pushes
+/// the new evidence sequence to the host app, like [`record_handoff`]. A window is never presence
+/// of the content (see [`provider_local_presence`]); the record only lets an explicit eviction
+/// know the OS may hold some of this version. `None`: not the current version, nothing recorded.
+pub(crate) fn record_window_serve(
+    coordinator: &ReplicaCoordinator,
+    host: &crate::provider_host_link::ProviderHostLink,
+    root_id: &str,
+    item: &ItemId,
+    version: yadorilink_replica_domain::ids::VersionHash,
+) -> Result<Option<u64>, crate::sync_error::SyncError> {
+    let seq = coordinator.provider_repository().record_window_serve(root_id, item, version)?;
+    if let Some(seq) = seq {
+        host.evidence_tick(root_id, seq);
+    }
+    Ok(seq)
+}
+
 /// What the daemon can honestly say the OS holds for an item: `object_present` is membership,
 /// `current_content_present` is the full evidence rule. Any error reads as "not present".
 pub(crate) fn provider_local_presence(
@@ -342,11 +360,36 @@ pub(crate) fn os_holds_current_content(
         )
 }
 
+/// Whether the OS may hold SOME bytes of the item's current content because the daemon served it
+/// windows of exactly that content: the host lists the item in a report that began after the last
+/// window, the version served has the content the item has now, and no content change is pending
+/// publication. Any error reads as "no".
+fn os_holds_served_windows(
+    coordinator: &ReplicaCoordinator,
+    membership: &ProviderMembership,
+    root_id: &str,
+    item: &ItemId,
+) -> bool {
+    let Some(stamp) = membership.stamp(root_id, item) else { return false };
+    let repo = coordinator.provider_repository();
+    let Ok(Some(served)) = repo.window_serve(root_id, item) else { return false };
+    stamp >= served.evidence_seq
+        && matches!(repo.window_serve_has_current_content(root_id, item), Ok(true))
+        && !matches!(
+            repo.publication(root_id, item),
+            Ok(Some(Publication::ContentPending)) | Err(_) | Ok(None)
+        )
+}
+
 /// What the daemon can say about the OS copy of an item, for deciding whether to drop it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OsCopy {
     /// The OS holds the current content ([`os_holds_current_content`]).
     Current,
+    /// The OS holds some of the current content: it was served to the OS in windows (a large file
+    /// is read that way), never as a whole. The OS copy may be dropped, which needs nothing the
+    /// whole file would; it is not presence of the content.
+    Windows,
     /// The OS is not known to hold anything of the item: no complete host report lists it, and
     /// none that predates the last download is the reason.
     Absent,
@@ -364,14 +407,25 @@ pub(crate) fn os_copy(
     if os_holds_current_content(coordinator, membership, root_id, item) {
         return OsCopy::Current;
     }
+    if os_holds_served_windows(coordinator, membership, root_id, item) {
+        return OsCopy::Windows;
+    }
     if membership.stamp(root_id, item).is_some() {
         return OsCopy::Unconfirmed;
     }
     let Some(observed) = membership.observed_after(root_id) else { return OsCopy::Absent };
-    match coordinator.provider_repository().handoff(root_id, item) {
-        Ok(Some(handoff)) if handoff.evidence_seq > observed => OsCopy::Unconfirmed,
-        Ok(_) => OsCopy::Absent,
-        Err(_) => OsCopy::Unconfirmed,
+    // Bytes given to the OS after the last host report may be on disk there without being listed.
+    let repo = coordinator.provider_repository();
+    match (repo.handoff(root_id, item), repo.window_serve(root_id, item)) {
+        (Ok(handoff), Ok(served)) => {
+            let newest = handoff.into_iter().chain(served).map(|h| h.evidence_seq).max();
+            if newest.is_some_and(|seq| seq > observed) {
+                OsCopy::Unconfirmed
+            } else {
+                OsCopy::Absent
+            }
+        }
+        _ => OsCopy::Unconfirmed,
     }
 }
 

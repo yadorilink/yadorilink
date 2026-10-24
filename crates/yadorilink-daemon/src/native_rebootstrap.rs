@@ -213,8 +213,14 @@ impl Machine {
             device: DeviceId(state.device_id.clone()),
             handle: tokio::runtime::Handle::current(),
             hook: state.native_replication.rebootstrap_hook(),
-            recovery_root: crate::device_config::recovery_root_of(&state.device_id),
-            items_root: crate::device_config::recovery_items_root_of(&state.device_id),
+            recovery_root: crate::device_config::recovery_root_of(
+                state.config_dir(),
+                &state.device_id,
+            ),
+            items_root: crate::device_config::recovery_items_root_of(
+                state.config_dir(),
+                &state.device_id,
+            ),
         }
     }
 
@@ -1148,7 +1154,8 @@ fn clean_up_retained_originals_held(
             links.iter().filter_map(|link| link.folder_path().map(PathBuf::from)).collect()
         })
         .unwrap_or_default();
-    let items_root = crate::device_config::recovery_items_root_of(&state.device_id);
+    let items_root =
+        crate::device_config::recovery_items_root_of(state.config_dir(), &state.device_id);
     let ctx = RetainedContext {
         items_root: &items_root,
         sync_roots: &sync_roots,

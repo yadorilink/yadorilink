@@ -498,6 +498,79 @@ async fn the_projector_builds_the_namespace_and_readiness_is_set_once() {
     assert!(declared_root(&fx).namespace_ready, "lag cleared readiness");
 }
 
+struct NoEnvironment;
+
+impl crate::provider_eager::EagerEnvironment for NoEnvironment {
+    fn low_disk(&self, _dir: &std::path::Path, _bytes: u64) -> bool {
+        false
+    }
+    fn peers_available(&self, _group_id: &str) -> bool {
+        true
+    }
+}
+
+/// An item the user created or edited on this device is already on the OS: once the host lists it
+/// as materialized, the Eager driver settles it and never offers it as a download, so it cannot
+/// hold one of the host's two download slots.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_authored_item_is_settled_by_the_eager_driver_and_never_offered() {
+    use yadorilink_ipc_proto::shellipc::{
+        NextProviderDownloadsRequest, ProviderMaterializedItem, ProviderMaterializedReport,
+    };
+    let mut fx = Fx::new().await;
+    fx.repo().mark_install_done(&fx.root).unwrap();
+    fx.repo().set_namespace_ready(&fx.root, true).unwrap();
+    let source = fx.put_ingest("copy-1", b"hello provider");
+    let created = fx.ask(fx.create(1, "a.txt", Some(source))).await;
+    assert!(created.ok, "{created:?}");
+    let item = created.item.unwrap().item_id;
+
+    // The host reports what the OS holds, in a report that began after the daemon's evidence.
+    let latest = fx.repo().latest_evidence_seq(&fx.root).unwrap().unwrap();
+    let ack = fx.context.membership.apply(
+        &ProviderMaterializedReport {
+            root_id: fx.root_id.clone(),
+            reporter_epoch: 1,
+            report_seq: 1,
+            full: true,
+            observed_after_seq: latest,
+            upserts: vec![ProviderMaterializedItem { item_id: item.clone() }],
+            removed: Vec::new(),
+            more: false,
+        },
+        latest,
+    );
+    assert!(!ack.needs_full);
+
+    let driver = crate::provider_eager::EagerDriver::new(
+        Arc::new(NoEnvironment),
+        crate::provider_eager::EagerConfig::default(),
+    );
+    let staging = tempfile::tempdir().unwrap();
+    let inputs = crate::provider_eager::EagerInputs {
+        coordinator: &fx.state.replica_coordinator,
+        membership: &fx.context.membership,
+        staging_dir: Some(staging.path()),
+        host_attached: true,
+    };
+    let ask = |exclude: Vec<Vec<u8>>| {
+        driver.next_downloads(
+            &inputs,
+            &NextProviderDownloadsRequest {
+                root_id: fx.root_id.clone(),
+                exclude_item_ids: exclude,
+                max: 2,
+                request_id: Vec::new(),
+            },
+        )
+    };
+    let offered = ask(Vec::new());
+    assert_eq!(offered.state, yadorilink_ipc_proto::shellipc::DriverState::Done as i32);
+    assert!(offered.downloads.is_empty(), "an authored item was offered for download");
+    let settled = ask(vec![item.clone()]);
+    assert_eq!(settled.settled_item_ids, vec![item], "an authored item was left outstanding");
+}
+
 // ---- enumeration over the connection ----
 
 async fn ask_children(

@@ -100,6 +100,17 @@ impl HarnessClock {
         next
     }
 
+    /// Moves the clock to exactly `nanos`, forwards or backwards: a clock
+    /// jump (an NTP step, a resume from suspend, a hand-set date). The next
+    /// `next_mtime` continues from here, so a backward jump makes later
+    /// writes carry mtimes older than earlier ones. Keeps the session-visible
+    /// override in lockstep, like `advance`.
+    pub fn set_now(&self, nanos: i64) -> i64 {
+        self.current.store(nanos, Ordering::SeqCst);
+        set_test_clock_override(nanos);
+        nanos
+    }
+
     /// Advances by one coarse round step (+1s) and returns the new "now" --
     /// the round-loop counterpart of the canonical
     /// `virtual_now_nanos = virtual_now_nanos.wrapping_add(1_000_000_000)`

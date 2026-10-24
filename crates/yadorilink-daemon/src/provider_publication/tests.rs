@@ -814,7 +814,11 @@ async fn dropping_the_driver_stops_its_retries() {
     }
     let driver = fx.driver(&host);
     driver.kick(&fx.root);
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    // Wait for the retries themselves, not for a stretch of wall-clock time.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while attempts.load(Ordering::SeqCst) < 2 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     drop(driver);
     tokio::time::sleep(Duration::from_millis(30)).await;
     let seen = attempts.load(Ordering::SeqCst);

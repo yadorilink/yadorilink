@@ -529,8 +529,7 @@ impl super::LocalConvergenceExecutor {
         let (Some(parent), Some(name)) = (out_path.parent(), out_path.file_name()) else {
             return Ok(None);
         };
-        let Ok(target) = std::fs::symlink_metadata(out_path) else { return Ok(None) };
-        Ok(entry_answering_under_another_name(parent, name, &target)?)
+        Ok(entry_answering_under_another_name(parent, name, out_path)?)
     }
 }
 
@@ -556,14 +555,14 @@ pub(super) fn listed_name_is(
     }
 }
 
-/// The name of the entry of `parent` that is the object `target` describes
-/// (as `symlink_metadata` of `name` reported it), when no entry of `parent`
-/// is spelled exactly `name`. `None` when `name` itself exists, or no entry
+/// The name of the entry of `parent` that is the object `target` (the path
+/// `parent/name` answered) names, when no entry of `parent` is spelled
+/// exactly `name`. `None` when `name` itself exists, or no entry
 /// is that object.
 fn entry_answering_under_another_name(
     parent: &Path,
     name: &std::ffi::OsStr,
-    target: &std::fs::Metadata,
+    target: &Path,
 ) -> std::io::Result<Option<String>> {
     let mut answered = None;
     for entry in std::fs::read_dir(parent)? {
@@ -571,39 +570,26 @@ fn entry_answering_under_another_name(
         if entry.file_name() == name {
             return Ok(None);
         }
-        // `DirEntry::metadata` does not follow a symlink (on Unix it is
-        // `symlink_metadata` of the entry): a symlink, dangling or not,
-        // compares as the link itself, as `target` does.
-        if let Ok(meta) = entry.metadata() {
-            if same_object(&meta, target) {
-                answered = entry.file_name().to_str().map(str::to_string);
-            }
+        // Object identity (not size and times, which two siblings can share); neither path is
+        // followed if it is a symlink: a symlink, dangling or not, compares as the link itself.
+        if yadorilink_fs_platform::fs_identity::same_live_object(&entry.path(), target) {
+            answered = entry.file_name().to_str().map(str::to_string);
         }
     }
     Ok(answered)
 }
 
-#[cfg(unix)]
-fn same_object(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    a.dev() == b.dev() && a.ino() == b.ino()
-}
-
-#[cfg(not(unix))]
-fn same_object(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
-    a.file_type() == b.file_type() && a.len() == b.len() && a.modified().ok() == b.modified().ok()
-}
-
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::entry_answering_under_another_name;
 
     /// What a folding volume's lookup of `name` returns, on any volume:
     /// the entry `A` itself, not what it points to.
-    fn lookup_answer(dir: &std::path::Path, spelled: &str) -> std::fs::Metadata {
-        std::fs::symlink_metadata(dir.join(spelled)).unwrap()
+    fn lookup_answer(dir: &std::path::Path, spelled: &str) -> std::path::PathBuf {
+        dir.join(spelled)
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlink_answering_under_another_spelling_is_found() {
         let dir = tempfile::tempdir().unwrap();
@@ -616,6 +602,7 @@ mod tests {
         assert_eq!(found.as_deref(), Some("A"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_dangling_symlink_answering_under_another_spelling_is_found() {
         let dir = tempfile::tempdir().unwrap();
@@ -627,6 +614,7 @@ mod tests {
         assert_eq!(found.as_deref(), Some("A"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlink_to_the_looked_up_object_is_not_the_entry_that_answered() {
         let dir = tempfile::tempdir().unwrap();
@@ -648,6 +636,24 @@ mod tests {
         let found = entry_answering_under_another_name(dir.path(), "a".as_ref(), &target).unwrap();
 
         assert_eq!(found, None);
+    }
+
+    /// Two siblings written together share size and times; only the entry that is the object
+    /// itself answers.
+    #[test]
+    fn a_sibling_with_the_same_size_and_times_is_not_the_entry_that_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        for name in ["A", "B"] {
+            let file = std::fs::File::create(dir.path().join(name)).unwrap();
+            std::io::Write::write_all(&mut &file, b"same").unwrap();
+            file.set_modified(when).unwrap();
+        }
+
+        let target = lookup_answer(dir.path(), "A");
+        let found = entry_answering_under_another_name(dir.path(), "a".as_ref(), &target).unwrap();
+
+        assert_eq!(found.as_deref(), Some("A"));
     }
 }
 

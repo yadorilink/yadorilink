@@ -257,7 +257,8 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut file = std::fs::File::create(&partial)
         .map_err(|e| format!("cannot write {}: {e}", partial.display()))?;
     file.write_all(bytes).map_err(|e| format!("cannot write {}: {e}", partial.display()))?;
-    file.sync_all().map_err(|e| format!("cannot flush {}: {e}", partial.display()))?;
+    yadorilink_fs_platform::flush::sync_file(&file)
+        .map_err(|e| format!("cannot flush {}: {e}", partial.display()))?;
     drop(file);
     yadorilink_fs_platform::durable_dir::publish_durably(&partial, path, Replace::No)
         .map_err(|e| format!("cannot publish {}: {e}", path.display()))

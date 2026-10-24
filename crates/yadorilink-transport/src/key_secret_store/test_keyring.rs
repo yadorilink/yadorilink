@@ -6,9 +6,29 @@ use std::collections::HashMap;
 thread_local! {
     static STORE: RefCell<HashMap<String, [u8; 32]>> = RefCell::new(HashMap::new());
     static CALLS: Cell<usize> = const { Cell::new(0) };
-    static DISABLED: Cell<bool> = const { Cell::new(false) };
     static AVAILABLE: Cell<bool> = const { Cell::new(false) };
     static FAIL_WRITES: Cell<bool> = const { Cell::new(false) };
+    static FAIL_DELETES: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Reads and writes keep working, deletes are refused.
+pub(super) fn set_fail_deletes(value: bool) {
+    FAIL_DELETES.with(|f| f.set(value));
+}
+
+/// Removes `key`; an unavailable keyring or a refused delete is a failure, a missing entry is not.
+pub(super) fn delete(key: &str) -> super::StoreDelete {
+    count_call();
+    if !is_available() {
+        return super::StoreDelete::Failed("keyring unavailable".into());
+    }
+    if FAIL_DELETES.with(Cell::get) {
+        return super::StoreDelete::Failed("delete refused".into());
+    }
+    match STORE.with(|s| s.borrow_mut().remove(key)) {
+        Some(_) => super::StoreDelete::Deleted,
+        None => super::StoreDelete::Absent,
+    }
 }
 
 /// Reads keep working, writes are refused (a locked keyring).
@@ -24,14 +44,6 @@ fn is_available() -> bool {
     AVAILABLE.with(Cell::get)
 }
 
-pub(super) fn set_disabled(value: bool) {
-    DISABLED.with(|d| d.set(value));
-}
-
-pub(super) fn disabled() -> bool {
-    DISABLED.with(Cell::get)
-}
-
 /// Backend operations (get/set) issued so far on this thread.
 pub(super) fn calls() -> usize {
     CALLS.with(Cell::get)
@@ -43,10 +55,10 @@ fn count_call() {
 
 pub(super) fn reset() {
     CALLS.with(|c| c.set(0));
-    set_disabled(false);
     STORE.with(|s| s.borrow_mut().clear());
     set_available(false);
     set_fail_writes(false);
+    set_fail_deletes(false);
 }
 
 pub(super) fn get(key: &str) -> Option<[u8; 32]> {

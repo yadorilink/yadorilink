@@ -484,6 +484,20 @@ fix the invariant where the state is written, so recovery can read it.
   own commit points (`CommitPoint`, `FaultPlan`) and a crash at each is tested.
   Folder rewind is crashed at every journal boundary
   (`rewind_crash_failpoints.rs`).
+- **Fault matrix.** `crates/yadorilink-daemon/tests/safety_gate_fault_matrix.rs`
+  injects one fault at each named failure point of the gates above (the
+  installation witness, the replacement record, every namespace failpoint and
+  commit point, the volume probe and identity, disk-pressure refusals, a denied
+  write, a planted symlink, the schema version, the update manifest and rollout
+  refusals, generation files) and asserts the same four things for each: the
+  attempt is refused with a typed reason (never accepted quietly), nothing is
+  lost or half written, a retry after the cause is gone succeeds, and the data
+  is still intact. Gates whose injection needs a fixture of their own are
+  indexed in the same table as pointers to the test that injects there, and a
+  gate that cannot be driven says why.
+  `.github/checks/check-safety-gate-matrix.py` fails when a section of this
+  document, a variant of a failpoint or refusal enum, or a test-injection seam
+  has no row.
 - **Boundary tests.** `crates/yadorilink-daemon/tests/dst_support/boundary_gate.rs` keeps one row per safety
   boundary with the invariant it protects, and each row also runs a version with
   a deliberate defect that the oracle must catch.

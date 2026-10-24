@@ -14,7 +14,7 @@ use yadorilink_replica_domain::session_state::MaterializationPolicy;
 
 use super::types::*;
 use super::{mode_and_xattrs_match_disk, Election, OwnCaptureOnDisk, OwnCaptureRule, Recapture};
-use yadorilink_fs_platform::fs_identity::disk_race_fingerprint;
+use yadorilink_fs_platform::fs_identity::disk_race_fingerprint_or_stat;
 use yadorilink_peer_session::peer_session::*;
 use yadorilink_replica_domain::native_plan::{NativePlannedNode, NativeRowIdentity};
 
@@ -36,7 +36,7 @@ impl super::LocalConvergenceExecutor {
         let observed_disk = self
             .local_file_path(group_id, path)
             .ok()
-            .and_then(|out_path| disk_race_fingerprint(&out_path));
+            .and_then(|out_path| disk_race_fingerprint_or_stat(&out_path));
         Ok(Some(BlockRequirement {
             path: path.to_string(),
             version_hash: version.version_hash,

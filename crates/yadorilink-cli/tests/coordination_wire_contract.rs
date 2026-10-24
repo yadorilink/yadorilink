@@ -67,6 +67,8 @@ use base64::Engine as _;
 use tokio::sync::Mutex;
 use yadorilink_cli::commands::{device, share};
 use yadorilink_client_core::coordination::{credential_store, http_client};
+use yadorilink_client_core::ops::daemon::default_launch;
+use yadorilink_client_core::ops::device_supersede;
 use yadorilink_client_core::ops::{account, devices, shares};
 use yadorilink_client_core::CoreError;
 use yadorilink_daemon::coordination_client::{ActivateOutcome, EnrollmentPrepareOutcome};
@@ -120,13 +122,17 @@ macro_rules! worker_addr_or_skip {
             Some(addr) => {
                 // The marker only proves `YADORILINK_WIRE_CONTRACT_ADDR` was
                 // set -- the real request traffic is driven by
-                // `coordination_addr`, which reads its own env var. The
+                // the settings' `coordination_addr`, which reads its own env var. The
                 // launching script sets both to the same value, but nothing
                 // enforced that agreement: a stray leftover service bound to
                 // the default address would let every test print this marker
                 // while silently talking to the wrong server.
                 assert_eq!(
-                    yadorilink_client_core::coordination::http_client::coordination_addr(),
+                    yadorilink_client_core::coordination::credential_store::CredentialSettings::from_env(
+                        std::path::Path::new("."),
+                    )
+                    .expect("the environment's credential settings")
+                    .coordination_addr(),
                     addr,
                     "YADORILINK_COORDINATION_ADDR must resolve to the same address as \
                      YADORILINK_WIRE_CONTRACT_ADDR, or every request below silently targets \
@@ -280,6 +286,9 @@ const LOGIN_SCOPE: &str = "openid offline_access";
 struct Enrolled {
     auth: CoordinationAuth,
     client_id: String,
+    /// The `sub` of the id token the login returned: the account the service
+    /// knows this installation under.
+    account_id: String,
     /// Every body the installation's own half of the flow received, so a test
     /// can assert what did NOT reach it.
     installation_saw: Vec<String>,
@@ -483,9 +492,15 @@ async fn enrol_and_sign_in(addr: &str, subject: &str) -> Enrolled {
         .expect("recording the completed login");
     let auth = CoordinationAuth::new(Arc::new(manager)).expect("a coordination credential");
 
+    let account_id = device_supersede::subject_of_id_token(
+        tokens.id_token().expect("the login returns an id token naming the account"),
+    )
+    .expect("the id token names the account");
+
     Enrolled {
         auth,
         client_id: registered.client_id,
+        account_id,
         installation_saw: registered.installation_saw,
     }
 }
@@ -493,8 +508,9 @@ async fn enrol_and_sign_in(addr: &str, subject: &str) -> Enrolled {
 /// Registers a device for the enrolled installation and returns its id.
 async fn register_a_device(label: &str) -> (String, tempfile::TempDir) {
     let config_dir = fresh_config_dir();
-    let device_id =
-        devices::register_device(unique(label)).await.expect("device registration should succeed");
+    let device_id = devices::register_device(unique(label), &default_launch())
+        .await
+        .expect("device registration should succeed");
     assert!(!device_id.is_empty(), "the service should assign a device id");
     (device_id, config_dir)
 }
@@ -613,6 +629,107 @@ async fn device_registration_and_listing_round_trip() {
     assert_eq!(keys.len(), 1, "the registered, signed-in device is listed as not signed out");
 }
 
+// --- 2b. replacing a device ---------------------------------------------------
+
+/// Enrols an installation of `subject` with `dir` as its state directory and
+/// records the account id there, as the shipped sign-in does.
+async fn enrol_in(addr: &str, subject: &str, dir: &std::path::Path) -> Enrolled {
+    std::env::set_var("YADORILINK_CONFIG_DIR", dir);
+    let enrolled = enrol_and_sign_in(addr, subject).await;
+    std::fs::write(dir.join("account_id"), &enrolled.account_id).expect("recording the account id");
+    enrolled
+}
+
+async fn listed_device_ids() -> Vec<String> {
+    devices::list_devices()
+        .await
+        .expect("listing devices should succeed")
+        .into_iter()
+        .map(|device| device.device_id)
+        .collect()
+}
+
+/// Enrols `subject`, registers a device, and signs that installation out, so
+/// the device is one a replacement may claim. Returns its id.
+async fn a_retired_device(addr: &str, subject: &str) -> (String, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("a state directory for the retired device");
+    enrol_in(addr, subject, dir.path()).await;
+    let id = devices::register_device(unique("old-device"), &default_launch())
+        .await
+        .expect("the retired device");
+    yadorilink_cli::commands::auth::logout(true).await.expect("signing the old installation out");
+    (id, dir)
+}
+
+/// A fresh installation of the same account registers the replacement and
+/// claims the retired device. The listing afterwards names only the
+/// replacement, and repeating the claim is an idempotent success.
+#[tokio::test]
+async fn replacing_a_device_supersedes_the_old_one_round_trip() {
+    let addr = worker_addr_or_skip!("replacing_a_device_supersedes_the_old_one_round_trip");
+    let _world = WORLD.lock().await;
+    let subject = unique("wire-contract-subject");
+
+    let (old_id, _old_dir) = a_retired_device(&addr, &subject).await;
+
+    let new_dir = tempfile::tempdir().expect("a state directory for the new device");
+    enrol_in(&addr, &subject, new_dir.path()).await;
+    let new_id = devices::register_device(unique("new-device"), &default_launch())
+        .await
+        .expect("new device");
+    assert_eq!(listed_device_ids().await.len(), 2, "both devices are listed before the claim");
+
+    let response = device_supersede::supersede_device(&old_id, &new_id)
+        .await
+        .expect("the supersede claim should be accepted");
+    assert_eq!(response.old_device_id, old_id);
+    assert_eq!(response.new_device_id, new_id);
+    assert!(response.superseded_at_unix > 0, "the service stamps the claim");
+    assert_eq!(response.protection, "healthy", "no group depended on the old device");
+
+    assert_eq!(listed_device_ids().await, vec![new_id.clone()], "only the replacement is listed");
+
+    let again = device_supersede::supersede_device(&old_id, &new_id).await;
+    assert!(again.is_ok(), "replaying the same claim should succeed, got {again:?}");
+
+    yadorilink_cli::commands::auth::logout(true).await.expect("signing out at the end");
+}
+
+/// The replacement's own installation was signed out and the account signed in
+/// again, so the replacement device is still bound to the old installation. The
+/// claim moves it onto the installation that makes it: the device keeps its
+/// identity across the re-login.
+#[tokio::test]
+async fn a_replacement_device_rebinds_to_the_new_installation_round_trip() {
+    let addr =
+        worker_addr_or_skip!("a_replacement_device_rebinds_to_the_new_installation_round_trip");
+    let _world = WORLD.lock().await;
+    let subject = unique("wire-contract-subject");
+
+    let (old_id, _old_dir) = a_retired_device(&addr, &subject).await;
+
+    let new_dir = tempfile::tempdir().expect("a state directory for the new device");
+    let before = enrol_in(&addr, &subject, new_dir.path()).await;
+    let new_id = devices::register_device(unique("new-device"), &default_launch())
+        .await
+        .expect("new device");
+    yadorilink_cli::commands::auth::logout(true).await.expect("signing the new installation out");
+
+    let after = enrol_in(&addr, &subject, new_dir.path()).await;
+    assert_ne!(before.client_id, after.client_id, "a new sign-in is a new installation");
+
+    device_supersede::supersede_device(&old_id, &new_id)
+        .await
+        .expect("the claim should move the replacement onto the new installation");
+    assert_eq!(
+        listed_device_ids().await,
+        vec![new_id],
+        "the rebound device is the only one listed"
+    );
+
+    yadorilink_cli::commands::auth::logout(true).await.expect("signing out at the end");
+}
+
 /// Folder-group enrollment plus every share listing the CLI reads.
 #[tokio::test]
 async fn folder_group_enrollment_and_share_listings_round_trip() {
@@ -629,10 +746,12 @@ async fn folder_group_enrollment_and_share_listings_round_trip() {
         "the created group should appear in the owner's listing"
     );
 
-    let resolved =
-        yadorilink_client_core::ops::shares::resolve_group_id(&enrolled.auth, &group_name)
-            .await
-            .expect("resolving a group by name should succeed");
+    let resolved = yadorilink_client_core::ops::shares::resolve_group_id(
+        &http_client::CoordinationAccess::new(enrolled.auth.clone(), &addr),
+        &group_name,
+    )
+    .await
+    .expect("resolving a group by name should succeed");
     assert_eq!(resolved, group_id, "name resolution should find the same group");
 
     share::list_shares().await.expect("listing shares should succeed");
@@ -673,7 +792,11 @@ async fn account_lifecycle_round_trips() {
         account::deletion_status().await.expect("reading the deletion status should succeed");
     assert_eq!(status.state, "active", "a fresh account should start active");
 
-    let requested = account::request_deletion().await.expect("requesting deletion should succeed");
+    let impact = account::deletion_impact().await.expect("reading the deletion impact should work");
+    assert!(impact.is_empty(), "a fresh account shares nothing, so deleting it affects no one");
+
+    let requested =
+        account::request_deletion(false).await.expect("requesting deletion should succeed");
     assert!(
         !requested.confirmation_token.is_empty(),
         "the service should return a confirmation token to quote back"
@@ -887,7 +1010,7 @@ async fn cross_account_invite_accept_round_trips() {
     let minted: serde_json::Value = http_client::post_json(
         &format!("/shares/groups/{group_id}/invites"),
         &serde_json::json!({ "mintingDeviceId": owner_device_id, "role": "editor" }),
-        &owner.auth,
+        &http_client::CoordinationAccess::new(owner.auth.clone(), &addr),
     )
     .await
     .expect("minting a cross-account invite should succeed");

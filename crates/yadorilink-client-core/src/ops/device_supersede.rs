@@ -17,9 +17,9 @@
 
 use std::path::Path;
 
+use crate::coordination::http_client::CoordinationAccess;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use yadorilink_fapi_client::CoordinationAuth;
 
 use crate::coordination::device_config;
 use crate::coordination::http_client::{post_json_with_failure, require_auth, ApiFailure};
@@ -131,14 +131,40 @@ pub async fn supersede_device(
     let Some(account_id) = recorded_account_id(&dir) else {
         return Err(SupersedeError::ReauthenticationRequired);
     };
-    let key = yadorilink_transport::DeviceSigningKeyPair::load_existing(dir.join("signing_key"))
-        .map_err(|e| CoreError::Other(e.to_string()))?;
+    let key = yadorilink_transport::DeviceSigningKeyPair::load_existing(
+        dir.join("signing_key"),
+        crate::coordination::credential_store::key_mirror(),
+    )
+    .map_err(|e| CoreError::Other(e.to_string()))?;
     let auth = require_auth().await?;
     send(&auth, &key, &account_id, old_device_id, new_device_id).await
 }
 
+/// [`supersede_device`] over the state directory `dir` and the credential `settings` of a host
+/// that names them (the embedded engine), instead of the process environment's.
+///
+/// # Errors
+/// [`SupersedeError`]; nothing is changed locally.
+pub async fn supersede_device_in(
+    dir: &Path,
+    settings: &crate::coordination::credential_store::CredentialSettings,
+    old_device_id: &str,
+    new_device_id: &str,
+) -> Result<SupersedeResponse, SupersedeError> {
+    let Some(account_id) = recorded_account_id(dir) else {
+        return Err(SupersedeError::ReauthenticationRequired);
+    };
+    let key = yadorilink_transport::DeviceSigningKeyPair::load_existing(
+        dir.join("signing_key"),
+        settings.key_mirror,
+    )
+    .map_err(|e| CoreError::Other(e.to_string()))?;
+    let auth = crate::coordination::http_client::require_auth_in(dir, settings).await?;
+    send(&auth, &key, &account_id, old_device_id, new_device_id).await
+}
+
 async fn send(
-    auth: &CoordinationAuth,
+    auth: &CoordinationAccess,
     key: &yadorilink_transport::DeviceSigningKeyPair,
     account_id: &str,
     old_device_id: &str,

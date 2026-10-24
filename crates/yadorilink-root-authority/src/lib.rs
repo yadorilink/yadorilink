@@ -16,12 +16,16 @@
 //! `yadorilink-daemon`'s `link_manager` territory, unchanged by this move
 //! -- see [`root_commit`]'s own module doc.
 
+pub(crate) mod blocking_work_core;
 pub mod error;
 pub mod root_commit;
 /// Sync-root identity: proves the directory a scan is about to treat as
 /// authoritative is really this link's folder, and not the bare mountpoint
 /// an unmounted volume leaves behind.
 pub mod root_identity;
+pub(crate) mod sync_facade;
 pub mod sync_root_lock;
+/// Time-bounded writer lease with a fence token, for hosts without a daemon.
+pub mod writer_lease;
 
 pub use error::RootAuthorityError;

@@ -481,7 +481,7 @@ impl HandoffRoot {
 fn sync_directory(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        std::fs::File::open(dir)?.sync_all()
+        yadorilink_fs_platform::flush::sync_directory(&std::fs::File::open(dir)?)
     }
     #[cfg(not(unix))]
     {

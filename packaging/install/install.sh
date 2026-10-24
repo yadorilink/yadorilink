@@ -81,6 +81,7 @@ TEST_OS=""
 TEST_ARCH=""
 TEST_VERIFIER_SHA=""
 TEST_FAIL_RECEIPT=0
+TEST_NOW=""
 if [ "${YADORILINK_INSTALL_TEST:-}" = "1" ]; then
     TEST_MODE=1
     if [ -n "${YADORILINK_INSTALL_PUBKEY_HEX:-}" ]; then
@@ -91,6 +92,7 @@ if [ "${YADORILINK_INSTALL_TEST:-}" = "1" ]; then
     TEST_VERIFIER_SHA=${YADORILINK_INSTALL_VERIFIER_SHA256:-}
     MANIFEST_BASE=${YADORILINK_INSTALL_BASE_URL:-$MANIFEST_BASE}
     MIN_MANIFEST_GENERATED_AT=${YADORILINK_INSTALL_MIN_GENERATED_AT:-$MIN_MANIFEST_GENERATED_AT}
+    TEST_NOW=${YADORILINK_INSTALL_NOW:-}
     TEST_OS=${YADORILINK_INSTALL_OS:-}
     TEST_ARCH=${YADORILINK_INSTALL_ARCH:-}
     TEST_FAIL_RECEIPT=${YADORILINK_INSTALL_FAIL_RECEIPT:-0}
@@ -315,7 +317,7 @@ envelope_field() {
 # select_entry FILE CHANNEL PLATFORM ARCH [lenient]: print "OK" then key=value lines
 # of the one release entry whose channel, platform, arch and install_source
 # ("script": the engine bundle for script installs) match, plus the manifest's
-# generated_at and withdrawn_versions; otherwise an "ERR <reason>" line. In
+# generated_at, expires_at and withdrawn_versions; otherwise an "ERR <reason>" line. In
 # lenient mode a manifest without a matching entry still prints "OK" (with the
 # entry fields empty): the live manifest of a channel is consulted for its
 # withdrawals even when it has no entry for this platform.
@@ -325,7 +327,7 @@ select_entry() {
     { body = $0 }
     function fail(m) { print "ERR " m; bad = 1; exit 0 }
     END {
-        n = length(body); depth = 0; i = 1; key = ""; expectkey = 0; matches = 0; schema = ""; gen = ""; withdrawn = ""
+        n = length(body); depth = 0; i = 1; key = ""; expectkey = 0; matches = 0; schema = ""; gen = ""; expv = ""; withdrawn = ""
         while (i <= n) {
             c = substr(body, i, 1)
             if (c ~ /[ \t\r\n,:]/) { i++; continue }
@@ -358,6 +360,7 @@ select_entry() {
                     if (depth == 3) e[key] = tok
                     else if (key == "schema_version") schema = tok
                     else if (key == "generated_at") gen = tok
+                    else if (key == "expires_at") expv = tok
                     expectkey = 0
                 }
             }
@@ -370,6 +373,7 @@ select_entry() {
         split("version minimum_supported_version kill_switch artifact_url artifact_sha256 artifact_size release_notes_url", names, " ")
         for (q = 1; q <= 7; q++) print names[q] "=" sel[names[q]]
         print "generated_at=" gen
+        print "expires_at=" expv
         print "withdrawn_versions=" withdrawn
     }' "$1"
 }
@@ -586,7 +590,7 @@ read_manifest() {
         OK*) ;;
         *) refuse 4 "update manifest: ${sel#ERR } for $CHANNEL/$TARGET. Nothing was installed." ;;
     esac
-    M_VERSION=""; M_KILL=""; M_URL=""; M_SHA=""; M_SIZE=""; M_NOTES=""; M_MIN=""; M_GEN=""; M_WITHDRAWN=""
+    M_VERSION=""; M_KILL=""; M_URL=""; M_SHA=""; M_SIZE=""; M_NOTES=""; M_MIN=""; M_GEN=""; M_EXPIRES=""; M_WITHDRAWN=""
     while IFS='=' read -r k v; do
         case $k in
             version) M_VERSION=$v ;;
@@ -597,6 +601,7 @@ read_manifest() {
             artifact_size) M_SIZE=$v ;;
             release_notes_url) M_NOTES=$v ;;
             generated_at) M_GEN=$v ;;
+            expires_at) M_EXPIRES=$v ;;
             withdrawn_versions) M_WITHDRAWN=$v ;;
         esac
     done <<EOF
@@ -632,6 +637,26 @@ check_entry() {
 check_replay_floor() {
     if [ -n "$MIN_MANIFEST_GENERATED_AT" ] && str_lt "$M_GEN" "$MIN_MANIFEST_GENERATED_AT"; then
         refuse 4 "the $CHANNEL manifest was generated at $M_GEN, before $MIN_MANIFEST_GENERATED_AT, the oldest this installer accepts (a replayed old manifest?). Refusing. Nothing was installed."
+    fi
+}
+
+# check_not_expired: the live manifest must not be past its expires_at. Installers keep no state,
+# so this is their only freshness control: a withheld newer manifest cannot hide behind an old
+# signed one for longer than its validity window. It is required of the live channel manifest
+# only: the per-version manifests (integrity facts for a pinned or offline install, published once
+# and kept) never expire, so read_manifest does not look at expires_at and a snapshot with or
+# without it is accepted.
+check_not_expired() {
+    case $M_EXPIRES in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) ;;
+        *) refuse 4 "update manifest has an invalid expires_at '$M_EXPIRES'. Nothing was installed." ;;
+    esac
+    if ! str_lt "$M_GEN" "$M_EXPIRES"; then
+        refuse 4 "update manifest expires_at $M_EXPIRES is not after generated_at $M_GEN. Nothing was installed."
+    fi
+    now=${TEST_NOW:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}
+    if str_lt "$M_EXPIRES" "$now"; then
+        refuse 4 "the $CHANNEL manifest expired at $M_EXPIRES (it is $now now). Check that this computer's clock is correct, or try again later. Refusing. Nothing was installed."
     fi
 }
 
@@ -700,6 +725,7 @@ do_install() {
             verify_envelope "$WORK/envelope.json" "$WORK/manifest.json"
             read_manifest "$WORK/manifest.json" lenient
             check_replay_floor
+            check_not_expired
             take_live
             check_live_allows "$VERSION"
             say "The live $CHANNEL manifest does not withdraw $VERSION."
@@ -721,6 +747,7 @@ do_install() {
         say "Manifest signature verified (key $ENV_KEY)."
         read_manifest "$WORK/manifest.json" lenient
         check_replay_floor
+        check_not_expired
         take_live
         if [ -n "$WANT_VERSION" ] && [ "$WANT_VERSION" != "$LIVE_VERSION" ]; then
             # A pinned version: its signed per-version manifest proves integrity, the live

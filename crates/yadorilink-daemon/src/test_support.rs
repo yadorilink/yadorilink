@@ -243,3 +243,18 @@ pub mod provider_evict_harness;
 /// whose subject is materialization, hydration and convergence move to this
 /// crate. See that module's own header for why it is here and what retires it.
 pub mod peer_session_fixture;
+
+/// Forces every local change still sitting in `group_id`'s debounce accumulator into the index
+/// and fails unless the dirty journal is empty afterwards, so no capture of the link's own is
+/// pending or opening files. Changes the operating system has not yet delivered to the
+/// accumulator are not covered: write a file and wait for its capture first (see the callers).
+#[cfg(any(test, feature = "test-support"))]
+pub async fn drain_pending_local_changes(
+    state: &crate::daemon_state::DaemonState,
+    group_id: &str,
+) -> Result<(), String> {
+    let runtime = state
+        .link_runtime_for(group_id)
+        .ok_or_else(|| format!("{group_id} has no running link"))?;
+    runtime.flush_pending_local_changes(group_id).await
+}

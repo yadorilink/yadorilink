@@ -145,6 +145,49 @@ impl std::fmt::Debug for RequestAuthorization {
 struct Current {
     manager: Arc<CredentialManager>,
     issuer: Url,
+    /// What this installation has learned about being refused. Scoped to the
+    /// installation: a swap to a new sign-in starts with a clean slate.
+    standing: std::sync::Mutex<Standing>,
+    /// Held from the cooldown check to the recorded outcome of a refresh, so callers that queue
+    /// behind a refresh the server refuses see its refusal instead of each sending their own.
+    refresh_gate: tokio::sync::Mutex<()>,
+}
+
+/// How long a refused refresh (`invalid_grant`) is remembered, so that a process
+/// whose grant cannot be used does not present the same refused refresh to the
+/// Authorization Server for every call it makes. A forced refresh
+/// ([`CoordinationAuth::confirm_registration_status`]) ignores it.
+pub const REFUSED_REFRESH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Default)]
+struct Standing {
+    /// The last refresh answered `invalid_grant`: when it may be tried again,
+    /// and the answer to replay until then.
+    refused: Option<Refused>,
+    /// A Coordination API call was answered `403 terms_consent_required`, with
+    /// the terms version the server named (when it named one).
+    terms: Option<Option<String>>,
+}
+
+struct Refused {
+    retry_at: std::time::Instant,
+    status: u16,
+    body: String,
+}
+
+/// Why this installation cannot use the Coordination service right now although
+/// its credential is intact. Neither is a revocation, a device replacement or a
+/// sign-out: the local state is kept, and signing in again (which shows the
+/// consent screen in the browser) is the remedy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoordinationBlock {
+    /// An API call was answered `403 terms_consent_required`: the account has
+    /// not accepted the current Terms.
+    TermsConsentRequired { terms_version: Option<String> },
+    /// The refresh was refused with `invalid_grant`. After a Terms change this is
+    /// how the server refuses every grant of an account without current consent;
+    /// a revoked grant answers the same way.
+    SignInRequired,
 }
 
 /// Asked, with the running `client_id`, for the manager over whatever
@@ -254,19 +297,31 @@ impl CoordinationAuth {
     /// instead, which derives both from the request it actually sends rather
     /// than trusting a caller to state them separately.
     pub async fn authorize(&self, method: &str, url: &str) -> Result<RequestAuthorization> {
+        Ok(self.authorize_with(method, url).await?.0)
+    }
+
+    /// [`Self::authorize`], also naming the installation that minted the credential, so what the
+    /// request learns is recorded against that installation and not against a later one.
+    async fn authorize_with(
+        &self,
+        method: &str,
+        url: &str,
+    ) -> Result<(RequestAuthorization, Arc<Current>)> {
         let mut current = self.current();
-        let access_token = match current.manager.access_token().await {
-            Err(Error::NotEnrolled | Error::InstallationChanged { .. })
-                if self.follow_store(&current).await? =>
-            {
-                current = self.current();
-                current.manager.access_token().await?
-            }
-            other => other?,
-        };
+        let mut result = current.access_token().await;
+        if matches!(result, Err(Error::NotEnrolled | Error::InstallationChanged { .. }))
+            && self.follow_store(&current).await?
+        {
+            current = self.current();
+            result = current.access_token().await;
+        }
+        let access_token = result?;
         let htu = htu_for(&current.issuer, url)?;
         let proof = current.manager.client().dpop_proof(method, &htu, Some(&access_token))?;
-        Ok(RequestAuthorization { authorization: format!("DPoP {access_token}"), dpop: proof })
+        Ok((
+            RequestAuthorization { authorization: format!("DPoP {access_token}"), dpop: proof },
+            current,
+        ))
     }
 
     /// Authenticate and send one Coordination API request.
@@ -289,25 +344,49 @@ impl CoordinationAuth {
         // the one whose token was just presented (the cached token outlives a
         // sign out / sign in by up to its lifetime). Follow the store and send
         // once more; a 401 that is about anything else comes back unchanged.
-        let used = self.current();
         let retry = built.try_clone();
-        let response = self.send_once(&client, built).await?;
+        let (response, used) = self.send_once(&client, built).await?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             if let Some(retry) = retry {
                 if self.follow_store(&used).await? {
-                    return self.send_once(&client, retry).await;
+                    let (response, now) = self.send_once(&client, retry).await?;
+                    return now.observe_response(response).await;
                 }
             }
         }
-        Ok(response)
+        used.observe_response(response).await
+    }
+
+    /// Why this installation cannot use the service right now although its
+    /// credential is intact, as far as this process has learned it. `None`
+    /// until a call was refused for that reason, and again after a call or a
+    /// refresh succeeded. Never reads or logs a credential.
+    #[must_use]
+    pub fn block(&self) -> Option<CoordinationBlock> {
+        let current = self.current();
+        let standing = current.standing.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(terms_version) = &standing.terms {
+            return Some(CoordinationBlock::TermsConsentRequired {
+                terms_version: terms_version.clone(),
+            });
+        }
+        standing.refused.is_some().then_some(CoordinationBlock::SignInRequired)
+    }
+
+    /// Record the outcome of an authenticated request that was not sent through
+    /// [`Self::execute`] (the netmap WebSocket upgrade): the HTTP status and, for
+    /// a refusal, the body.
+    pub fn observe_status(&self, status: u16, body: &[u8]) {
+        self.current().note_status(status, body);
     }
 
     async fn send_once(
         &self,
         client: &reqwest::Client,
         mut built: reqwest::Request,
-    ) -> Result<reqwest::Response> {
-        let headers = self.authorize(built.method().as_str(), built.url().as_str()).await?;
+    ) -> Result<(reqwest::Response, Arc<Current>)> {
+        let (headers, used) =
+            self.authorize_with(built.method().as_str(), built.url().as_str()).await?;
         built.headers_mut().insert(
             reqwest::header::AUTHORIZATION,
             reqwest::header::HeaderValue::from_str(headers.authorization()).map_err(|_| {
@@ -322,7 +401,7 @@ impl CoordinationAuth {
                 Error::InvalidHeaderValue("the DPoP proof is not a valid header value".into())
             })?,
         );
-        Ok(client.execute(built).await?)
+        Ok((client.execute(built).await?, used))
     }
 
     /// Ask the Authorization Server directly whether this registration still
@@ -360,7 +439,13 @@ impl CoordinationAuth {
     /// * anything else -- a transport failure, a different server error --
     ///   settles nothing either, and is reported the same way.
     pub async fn confirm_registration_status(&self) -> RegistrationStatus {
-        match self.current().manager.force_refresh().await {
+        let current = self.current();
+        let refreshed = current.manager.force_refresh().await;
+        match &refreshed {
+            Ok(_) => current.refresh_succeeded(),
+            Err(e) => current.refresh_failed(e),
+        }
+        match refreshed {
             Ok(_) => RegistrationStatus::Alive,
             Err(Error::Response { parsed: Some(oauth), .. }) if oauth.error == "invalid_client" => {
                 RegistrationStatus::Revoked
@@ -401,10 +486,105 @@ impl std::fmt::Debug for CoordinationAuth {
 }
 
 impl Current {
+    /// A live access token. During the cooldown after an `invalid_grant` the refusal is replayed
+    /// instead of asking the server, also for callers that were already waiting on the refresh
+    /// that was refused.
+    async fn access_token(&self) -> Result<String> {
+        self.replay_refused_refresh()?;
+        let _gate = self.refresh_gate.lock().await;
+        self.replay_refused_refresh()?;
+        let result = self.manager.access_token_and_origin().await;
+        match &result {
+            Ok((_, true)) => self.refresh_succeeded(),
+            // A cached token says nothing about what the server accepts now.
+            Ok((_, false)) => {}
+            Err(e) => self.refresh_failed(e),
+        }
+        result.map(|(token, _)| token)
+    }
+
+    /// During the cooldown after an `invalid_grant`, answer with that refusal
+    /// again instead of asking the server.
+    fn replay_refused_refresh(&self) -> Result<()> {
+        let standing = self.standing.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &standing.refused {
+            Some(refused) if std::time::Instant::now() < refused.retry_at => {
+                Err(Error::response("refresh", refused.status, refused.body.clone()))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// A refresh the server answered successfully: the consent gate and the grant are fine.
+    fn refresh_succeeded(&self) {
+        let mut standing = self.standing.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        standing.refused = None;
+        standing.terms = None;
+    }
+
+    fn refresh_failed(&self, error: &Error) {
+        if let Error::Response { status, body, .. } = error {
+            if error.is_invalid_grant() {
+                let mut standing =
+                    self.standing.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                standing.refused = Some(Refused {
+                    retry_at: std::time::Instant::now() + REFUSED_REFRESH_COOLDOWN,
+                    status: *status,
+                    body: body.clone(),
+                });
+            }
+        }
+    }
+
+    fn note_status(&self, status: u16, body: &[u8]) {
+        let mut standing = self.standing.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(version) = (status == 403).then(|| terms_consent_required_in(body)).flatten() {
+            standing.terms = Some(version);
+        } else if (200..300).contains(&status) || status == 101 {
+            // A success passed the consent gate. Any other answer (an unrecognised 403, a 404, a
+            // 429, a split-up body) proves nothing about it and leaves what is known as it is.
+            standing.terms = None;
+        }
+    }
+
+    /// Records what the response says about consent. A 403 body is read and the
+    /// response rebuilt unchanged for the caller; every other response is
+    /// passed through untouched.
+    async fn observe_response(&self, response: reqwest::Response) -> Result<reqwest::Response> {
+        let status = response.status();
+        if status != reqwest::StatusCode::FORBIDDEN {
+            self.note_status(status.as_u16(), &[]);
+            return Ok(response);
+        }
+        let headers = response.headers().clone();
+        let version = response.version();
+        let body = response.bytes().await?;
+        self.note_status(403, &body);
+        let mut rebuilt = http::Response::builder().status(status).version(version);
+        if let Some(h) = rebuilt.headers_mut() {
+            *h = headers;
+        }
+        let rebuilt = rebuilt.body(body).map_err(|e| Error::InvalidHeaderValue(e.to_string()))?;
+        Ok(reqwest::Response::from(rebuilt))
+    }
+
     fn over(manager: Arc<CredentialManager>) -> Result<Self> {
         let issuer = Url::parse(&manager.client().metadata().issuer)?;
-        Ok(Self { manager, issuer })
+        Ok(Self {
+            manager,
+            issuer,
+            standing: std::sync::Mutex::new(Standing::default()),
+            refresh_gate: tokio::sync::Mutex::new(()),
+        })
     }
+}
+
+/// The terms version of a `403 terms_consent_required` body: `Some(version)`
+/// (itself `None` when the body names none) when the body is that refusal.
+fn terms_consent_required_in(body: &[u8]) -> Option<Option<String>> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    (value.get("error")?.as_str()? == "terms_consent_required")
+        .then(|| value.get("terms_version").and_then(|v| v.as_str()).map(str::to_owned))
 }
 
 /// The `htu` for a request: the request's path, against the issuer's origin.

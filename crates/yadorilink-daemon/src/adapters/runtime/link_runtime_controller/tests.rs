@@ -614,14 +614,14 @@ async fn a_deleted_lock_sidecar_ends_the_links_repair_pass_and_only_relink_resto
     }
     assert_eq!(state.replica_coordinator.held_path_subscribers(), subscribers_running - 1);
     // Disk-pressure bookkeeping neither overwrites nor clears the terminal mark.
-    state.mark_link_degraded(&path, "disk".into());
+    state.mark_link_waiting_for_disk_space(&path, "disk".into());
     state.clear_link_degraded(&path);
     assert!(state.links.is_ownership_lost(&path));
     assert!(!state.links.mark_ownership_lost(&path, 0), "already terminal: no second transition");
     assert!(!sidecar.exists(), "the sidecar is never recreated automatically");
     assert!(state.links.degraded_due_snapshot(i64::MAX - 1).is_empty(), "never rechecked");
     let info = state.links.degraded_info(&path).unwrap();
-    assert_eq!(info.reason, crate::link_registry::OWNERSHIP_LOST_REASON);
+    assert_eq!(info.cause, crate::link_registry::DegradedCause::OwnershipLost);
 
     // Relink: stop, start again.
     LinkRuntimeController::new(state.clone()).stop(&path).await;
@@ -1015,7 +1015,7 @@ async fn watch_limit_at_startup_is_recorded_for_status() {
             yadorilink_filesystem_sync::watcher::FolderWatcher,
             yadorilink_filesystem_sync::watcher::WatcherError,
         > {
-            Err(notify::Error::new(notify::ErrorKind::MaxFilesWatch).into())
+            Err(yadorilink_filesystem_sync::watcher::WatchError::watch_limit().into())
         }
     }
 

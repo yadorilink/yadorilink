@@ -124,6 +124,7 @@ fn daemon_descriptor(report: &IdentifyResponse) -> ReleaseDescriptor {
         install_source: report.install_source.clone(),
         release_id: report.release_id.clone(),
         engine_api_version: report.engine_api_version,
+        state_schema: None,
     }
 }
 
@@ -395,6 +396,7 @@ mod tests {
             install_source: String::new(),
             release_id: release_id.into(),
             engine_api_version: yadorilink_ipc_proto::PROVIDER_HOST_API_VERSION,
+            state_schema: None,
         }
     }
 

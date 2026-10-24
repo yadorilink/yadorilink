@@ -131,7 +131,7 @@ impl SegmentWriter {
             OpenOptions::new().write(true).read(true).create_new(true).open(&path)
         })?;
         file.write_all(&encode_segment_header(segment_id))?;
-        file.sync_all()?;
+        yadorilink_fs_platform::flush::sync_file(&file)?;
         Ok(StagedSegment { segment_id, file, stage: path })
     }
 
@@ -227,7 +227,9 @@ impl SegmentWriter {
     /// data-integrity metadata, which `fdatasync` covers, and its
     /// directory entry is published separately, once per segment.
     pub(crate) fn sync(&self) -> Result<(), StorageError> {
-        io_diag::time(Op::SegmentFsync, 0, || self.file.sync_data())?;
+        io_diag::time(Op::SegmentFsync, 0, || {
+            yadorilink_fs_platform::flush::sync_data(&self.file)
+        })?;
         Ok(())
     }
 
@@ -243,7 +245,7 @@ impl SegmentWriter {
 
     pub(crate) fn truncate(&mut self, len: u64) -> Result<(), StorageError> {
         self.file.set_len(len)?;
-        self.file.sync_data()?;
+        yadorilink_fs_platform::flush::sync_data(&self.file)?;
         self.write_end = len;
         Ok(())
     }

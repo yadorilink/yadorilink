@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use yadorilink_fs_platform::fs_identity::{
-    disk_race_fingerprint, DiskRaceFingerprint, FileIdentity,
+    disk_race_fingerprint_or_stat_observed, DiskRaceFingerprint, FileIdentity,
 };
 use yadorilink_local_storage::CDC_SIZE_THRESHOLD;
 use yadorilink_replica_domain::file::FileRecord;
@@ -27,13 +27,55 @@ pub(super) fn is_confirmed_absent(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_err_and(|error| error_means_absent(&error))
 }
 
+/// What re-sampling a path against its prepare-time fingerprint found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PrepareMatch {
+    /// The disk no longer matches (or could not be observed): exclude and re-drive.
+    Changed,
+    /// Equal on a fingerprint that includes the change time/USN (always, on Unix).
+    Strict,
+    /// Equal, but only on size and write time because this volume cannot answer the change
+    /// time/USN query (Windows). That cannot show a same-size rewrite with a restored mtime, so
+    /// the caller verifies the bytes and publishes no actual-state proof.
+    Degraded,
+}
+
 /// Whether the disk at `path` still matches what a mutation was prepared
 /// against. Two failed observations are not "unchanged": a path that was
 /// absent at prepare must still be confirmed absent, not just unreadable.
-pub(super) fn disk_matches_prepare(path: &Path, at_prepare: &Option<DiskRaceFingerprint>) -> bool {
-    match (disk_race_fingerprint(path), at_prepare) {
-        (None, None) => is_confirmed_absent(path),
-        (current, prepared) => current == *prepared,
+///
+/// The prepare sample is `disk_race_fingerprint_or_stat`; this sample comes from one query, so
+/// the verdict and its degraded flag cannot disagree. A degraded sample equals a prepare sample
+/// only if that one was degraded too (a readable change time/USN is part of the strict value).
+pub(super) fn prepare_match(path: &Path, at_prepare: &Option<DiskRaceFingerprint>) -> PrepareMatch {
+    match (disk_race_fingerprint_or_stat_observed(path), at_prepare) {
+        (None, None) => {
+            if is_confirmed_absent(path) {
+                PrepareMatch::Strict
+            } else {
+                PrepareMatch::Changed
+            }
+        }
+        (Some((current, degraded)), Some(prepared)) if current == *prepared => {
+            if degraded {
+                warn_degraded_capture_once();
+                PrepareMatch::Degraded
+            } else {
+                PrepareMatch::Strict
+            }
+        }
+        _ => PrepareMatch::Changed,
+    }
+}
+
+/// Said once per process: capture is running on a volume that cannot prove file stability.
+fn warn_degraded_capture_once() {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "this volume cannot prove file stability (change time/USN unreadable): local capture \
+             verifies file bytes before committing and publishes no actual-state proof"
+        );
     }
 }
 
@@ -108,13 +150,15 @@ impl DiskObservation {
     }
 }
 
-/// The closed disk observation for `path`, but ONLY if
-/// `disk_race_fingerprint(path)` still matches `fingerprint_before_read`
+/// The closed disk observation for `path`, but ONLY if a fresh fingerprint that includes the
+/// change time/USN still matches `fingerprint_before_read`
 /// (a fingerprint captured before this path's own content was read) --
 /// `None` for either a fingerprint mismatch (something touched this path
 /// during the read/prepare window) or a failed observation. `None` here
 /// always means "publish no actual-state proof for this commit," never a
-/// hard failure of the capture itself.
+/// hard failure of the capture itself. Where the volume cannot answer the change time/USN query
+/// the closing sample is stat-only, which is no proof of unchanged bytes, so the answer is
+/// always `None` there (a proof is never published from a degraded sample).
 ///
 /// The identity is observed INSIDE the bracket and the fingerprint
 /// re-check closes it afterwards, not the other way around: a check
@@ -128,7 +172,8 @@ pub(super) fn closed_disk_observation_if_unraced(
 ) -> Option<DiskObservation> {
     fingerprint_before_read?;
     let identity = FileIdentity::observe_path(path).ok()?;
-    if disk_race_fingerprint(path) != fingerprint_before_read {
+    let (closing, degraded) = disk_race_fingerprint_or_stat_observed(path)?;
+    if degraded || Some(closing) != fingerprint_before_read {
         return None;
     }
     Some(DiskObservation { identity })

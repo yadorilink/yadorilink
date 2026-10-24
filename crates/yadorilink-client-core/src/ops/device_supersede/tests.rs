@@ -9,25 +9,27 @@ use super::*;
 
 fn key() -> (tempfile::TempDir, yadorilink_transport::DeviceSigningKeyPair) {
     let dir = tempfile::tempdir().unwrap();
-    let key =
-        yadorilink_transport::DeviceSigningKeyPair::generate_and_persist(dir.path().join("k"))
-            .unwrap();
+    let key = yadorilink_transport::DeviceSigningKeyPair::generate_and_persist(
+        dir.path().join("k"),
+        yadorilink_transport::KeyMirror::Disabled,
+    )
+    .unwrap();
     (dir, key)
 }
 
 async fn call(server: &MockServer) -> Result<SupersedeResponse, SupersedeError> {
-    let _guard = crate::coordination::http_client::COORDINATION_ADDR_ENV_LOCK.lock().await;
-    std::env::set_var("YADORILINK_COORDINATION_ADDR", server.uri());
     let (_dir, key) = key();
     let result = send(
-        &yadorilink_fapi_client::test_support::offline_auth(),
+        &crate::coordination::http_client::CoordinationAccess::new(
+            yadorilink_fapi_client::test_support::offline_auth(),
+            server.uri(),
+        ),
         &key,
         "acct-1",
         "old-1",
         "new-1",
     )
     .await;
-    std::env::remove_var("YADORILINK_COORDINATION_ADDR");
     result
 }
 
@@ -50,12 +52,13 @@ async fn the_request_is_camelcase_and_the_proof_verifies_under_the_new_key_only(
         })))
         .mount(&server)
         .await;
-    let _guard = crate::coordination::http_client::COORDINATION_ADDR_ENV_LOCK.lock().await;
-    std::env::set_var("YADORILINK_COORDINATION_ADDR", server.uri());
     let (_dir, key) = key();
     let (_other_dir, other) = key_pair();
     let response = send(
-        &yadorilink_fapi_client::test_support::offline_auth(),
+        &crate::coordination::http_client::CoordinationAccess::new(
+            yadorilink_fapi_client::test_support::offline_auth(),
+            server.uri(),
+        ),
         &key,
         "acct-1",
         "old-1",
@@ -63,7 +66,6 @@ async fn the_request_is_camelcase_and_the_proof_verifies_under_the_new_key_only(
     )
     .await
     .unwrap();
-    std::env::remove_var("YADORILINK_COORDINATION_ADDR");
     assert!(response.is_confirmed());
 
     let requests = server.received_requests().await.unwrap();

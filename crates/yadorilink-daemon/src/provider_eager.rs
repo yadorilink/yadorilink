@@ -363,6 +363,8 @@ impl EagerDriver {
             downloads: Vec::new(),
             settled_item_ids: Vec::new(),
             state: DriverState::Unspecified as i32,
+            request_id: request.request_id.clone(),
+            root_id: request.root_id.clone(),
         };
         let (root, scope) = match self.download_scope(coordinator, &root_id) {
             Ok(Some(found)) => found,

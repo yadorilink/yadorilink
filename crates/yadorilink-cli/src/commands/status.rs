@@ -397,6 +397,8 @@ fn reason_subject(
 ) -> String {
     match code {
         "degraded"
+        | "waiting_for_disk_space"
+        | "file_watch_limit"
         | "ambiguous"
         | "ownership_lost"
         | "not_joined"
@@ -611,6 +613,7 @@ fn unreachable_category_label(category: UnreachableCategory) -> &'static str {
         UnreachableCategory::NoResponse => "no response",
         UnreachableCategory::UdpBlocked => "UDP blocked",
         UnreachableCategory::HandshakeRefused => "handshake refused",
+        UnreachableCategory::DeviceReplaced => "this device was replaced by another device",
         UnreachableCategory::Unspecified => "unknown reason",
     }
 }

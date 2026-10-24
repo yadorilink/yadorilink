@@ -169,7 +169,7 @@ class SelfTest(unittest.TestCase):
 
     def write(self, name: str, chain) -> Path:
         p = self.tmp / name
-        p.write_text(json.dumps(chain, indent=2) + "\n")
+        p.write_text(json.dumps(chain, indent=2) + "\n", encoding="utf-8")
         return p
 
     def refused(self, fn, *a, text=""):

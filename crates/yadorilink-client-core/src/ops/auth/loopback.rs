@@ -40,7 +40,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use url::Url;
 
-use crate::error::CoreError;
+use crate::error::{CoreError, Hint};
 
 /// The path the redirect lands on. Part of the registered redirect URI, so it
 /// is fixed for the life of a registration.
@@ -93,10 +93,10 @@ impl Listener {
             let (stream, _) = match accepted {
                 Err(_) => {
                     return Err(CoreError::AuthFailed(format!(
-                        "no sign-in arrived within {} seconds. Run `yadorilink login` again and \
-                         open the link it prints.",
+                        "no sign-in arrived within {} seconds",
                         timeout.as_secs()
-                    )))
+                    ))
+                    .hinted(Hint::SignInAgain))
                 }
                 Ok(Ok(accepted)) => accepted,
                 Ok(Err(e)) => {

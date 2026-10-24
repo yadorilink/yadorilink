@@ -581,6 +581,7 @@ async fn run(
     .map_err(|e| Failure::new(ProviderApplyFailure::Retry, e.to_string()))?;
 
     if outcome.is_ok() {
+        push_evidence(context, repo, &root);
         context.writer.after_commit(&declared.group_id).await;
     }
 
@@ -597,6 +598,20 @@ async fn run(
         }
     }
     outcome.map_err(|error| map_error(error, &request.content))
+}
+
+/// The change recorded the handoff of the version it authored: tell the host, which echoes the
+/// sequence in the reports it begins afterwards.
+fn push_evidence(
+    context: &ShellContext,
+    repo: &yadorilink_sync_sqlite::provider::ProviderRepository,
+    root: &str,
+) {
+    match repo.latest_evidence_seq(root) {
+        Ok(Some(seq)) => context.provider_host.evidence_tick(root, seq),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(%error, "could not read the evidence sequence to push"),
+    }
 }
 
 fn map_ingest(error: IngestError) -> Failure {

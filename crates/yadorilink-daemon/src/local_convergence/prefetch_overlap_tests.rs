@@ -605,3 +605,122 @@ async fn a_path_that_gave_up_is_not_relabelled_by_a_later_shared_answer() {
     assert_eq!(outcomes.get("a"), Some(&PathPrefetch::Failed), "{outcomes:?}");
     assert_eq!(outcomes.get("b"), Some(&PathPrefetch::Incomplete), "{outcomes:?}");
 }
+
+/// Callers of the path fingerprint on a volume that cannot answer the change time or USN
+/// (Windows only; simulated through the thread-local seam, so these run on a current-thread
+/// runtime; the fingerprint reads under test are made on the test thread, while the blocking
+/// byte hash of the target is not and does not need the seam). A caller that used the strict
+/// fingerprint would get a sample that equals no other, so an untouched file would look changed
+/// and every materialize over an existing file would be declined for retry, forever. Elsewhere the
+/// seam changes nothing and these only pin the same invariant on the stat fingerprint.
+mod degraded_fingerprint_callers {
+    use super::*;
+    use crate::local_convergence::types::{LocalMaterializeOutcome, MaterializationPayload};
+    use yadorilink_fs_platform::fs_identity::{
+        change_time_unreadable_for_test, disk_race_fingerprint_or_stat,
+    };
+    use yadorilink_replica_domain::session_state::MaterializationPolicy;
+
+    /// A local file at `name` that is captured (indexed, clean), and a peer's put of `newer` that
+    /// supersedes it and whose blocks this device does not hold.
+    async fn local_file_superseded_by_missing_content(
+        h: &Harness,
+        name: &str,
+        newer: &Content,
+    ) -> std::path::PathBuf {
+        std::fs::write(h.path(name), b"the local v1 bytes").unwrap();
+        h.capture(name).await;
+        store_version(h, &newer.version);
+        admit_remote_ops(&h.state, GROUP, PEER, &[put(name, &newer.version)], Basis::CurrentHeads);
+        h.path(name)
+    }
+
+    /// The seam is in effect on this thread (Windows): the observed sample is stat-only.
+    fn assert_degraded(path: &std::path::Path) {
+        #[cfg(windows)]
+        assert!(
+            yadorilink_fs_platform::fs_identity::disk_race_fingerprint_or_stat_observed(path)
+                .expect("the file exists")
+                .1,
+            "fixture: the change time must read as unavailable"
+        );
+        #[cfg(not(windows))]
+        let _ = path;
+    }
+
+    /// reconcile.rs `block_requirement_for_version`: the sample the prefetch stage hands out is the
+    /// one a later bracket can equal.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_requirement_the_prefetch_plan_hands_out_carries_a_comparable_sample() {
+        let _unreadable = change_time_unreadable_for_test();
+        let h = Harness::new(false);
+        let newer = Content::one("the peer's v2 bytes");
+        let path = local_file_superseded_by_missing_content(&h, "w", &newer).await;
+        assert_degraded(&path);
+
+        let wanted: BTreeSet<String> = BTreeSet::from(["w".to_owned()]);
+        let required = h.convergence.content_missing_locally_from_native(GROUP, &wanted).unwrap();
+
+        assert_eq!(required.len(), 1, "{required:?}");
+        let sample = disk_race_fingerprint_or_stat(&path);
+        assert!(sample.is_some());
+        assert_eq!(required[0].observed_disk, sample, "an untouched file must compare equal");
+    }
+
+    /// eager.rs pre-fetch bracket (`observe_target`): the requirement the materialize itself
+    /// raises carries a comparable sample.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_requirement_the_materialize_raises_carries_a_comparable_sample() {
+        let _unreadable = change_time_unreadable_for_test();
+        let h = Harness::new(false);
+        let newer = Content::one("the peer's v2 bytes");
+        let path = local_file_superseded_by_missing_content(&h, "w", &newer).await;
+        assert_degraded(&path);
+        let payload = MaterializationPayload::from_version("w", newer.version.clone());
+
+        let outcome = h
+            .convergence
+            .materialize_local(
+                GROUP,
+                &payload,
+                MaterializationPolicy::Eager,
+                PEER,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let LocalMaterializeOutcome::NeedBlocks(required) = outcome else {
+            panic!("the content is not held here: {outcome:?}");
+        };
+        let sample = disk_race_fingerprint_or_stat(&path);
+        assert!(sample.is_some());
+        assert_eq!(required.observed_disk, sample, "an untouched file must compare equal");
+    }
+
+    /// The whole path, through the real callers: prefetch, the pre-fetch sample, the fetch, and the
+    /// post-fetch bracket (eager.rs `revalidate_target`). The file nobody touched is replaced.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_untouched_file_is_replaced_by_the_fetched_content() {
+        let _unreadable = change_time_unreadable_for_test();
+        let h = Harness::new(false);
+        let newer = Content::one("the peer's v2 bytes");
+        let path = local_file_superseded_by_missing_content(&h, "w", &newer).await;
+        assert_degraded(&path);
+        let peer = Arc::new(FakePeer::serving(&[&newer]));
+        let driver: Arc<dyn ConvergenceDriver> = peer.clone();
+
+        let _ = h
+            .convergence
+            .reconcile_paths_directly(&driver, GROUP, BTreeSet::from(["w".to_owned()]))
+            .await;
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"the peer's v2 bytes",
+            "the pass was declined as if the file had changed"
+        );
+    }
+}

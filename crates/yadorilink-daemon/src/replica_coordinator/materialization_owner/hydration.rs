@@ -293,6 +293,7 @@ impl ReplicaCoordinator {
         path: &str,
         out_path: &std::path::Path,
         lstat: Option<&std::fs::Metadata>,
+        lstat_identity: crate::hydration::DiskIdentity,
         record: &yadorilink_replica_domain::file::FileRecord,
         unix_mode: Option<u32>,
         xattrs: &[(String, Vec<u8>)],
@@ -321,8 +322,7 @@ impl ReplicaCoordinator {
                     )? && matches!(
                         yadorilink_local_storage::verify_replicated_xattrs_exact(out_path, xattrs),
                         Ok(true)
-                    ) && crate::hydration::disk_identity(out_path)?
-                        == Some(crate::hydration::disk_identity_of(lstat)))
+                    ) && crate::hydration::disk_identity(out_path)? == lstat_identity)
             }
         };
         if !may_replace {

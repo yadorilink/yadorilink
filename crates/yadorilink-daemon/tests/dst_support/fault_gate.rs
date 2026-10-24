@@ -562,6 +562,168 @@ fn a_carrier_partition_with_no_discards_earns_no_credit() {
     });
 }
 
+/// The wire faults are credited from the carrier's own per-target counters,
+/// each by its own evidence: a one-way cut by discards on its link, duplication
+/// by datagrams sent twice on its link, a hold by datagrams overtaken at its
+/// device. Evidence on another target credits nothing, and without a carrier
+/// the schedule is refused.
+#[test]
+fn carrier_wire_faults_are_credited_by_their_own_target_evidence() {
+    use super::device_network::DeviceNetworkFaults;
+    use super::fault_carrier::CarrierFaults;
+    use super::fault_schedule::WireEvidence;
+    use yadorilink_lane_ports::sim_fault::SimFaultController;
+
+    sim(|| async {
+        let hold = |device| {
+            Fault::Net(NetFault::HoldInbound { device, every_nth: 3, release_after: 1, seed: 0 })
+        };
+        let spec = vec![
+            (SimNanos::from_round(1), Fault::Net(NetFault::PartitionOneWay { from: 0, to: 1 })),
+            (
+                SimNanos::from_round(2),
+                Fault::Net(NetFault::DuplicateDatagrams { from: 0, to: 1, every_nth: 2, seed: 1 }),
+            ),
+            (SimNanos::from_round(3), hold(1)),
+            (SimNanos::from_round(4), hold(0)),
+        ];
+        let controller = SimFaultController::new();
+        let keys = [
+            iroh::SecretKey::from_bytes(&[1; 32]).public(),
+            iroh::SecretKey::from_bytes(&[2; 32]).public(),
+        ];
+        let carrier = CarrierFaults::new(controller.clone(), keys.to_vec());
+        let injectors = ScheduledInjectors::for_spec(&spec)
+            .unwrap()
+            .with_carrier(DeviceNetworkFaults::substrate_only(carrier));
+        run_schedule(spec.clone(), injectors.clone()).await.unwrap();
+        assert!(controller.is_cut(keys[0], keys[1]) && !controller.is_cut(keys[1], keys[0]));
+
+        let none = WireEvidence::default();
+        let with = |f: &dyn Fn(&mut WireEvidence)| {
+            let mut e = WireEvidence::default();
+            f(&mut e);
+            e
+        };
+        injectors.credit_carrier_wire(&none, &none);
+        assert_eq!(unexercised(&injectors.verify_gate().unwrap_err()), vec![0, 1, 2, 3]);
+        // Discards on the reverse link are not this cut's evidence.
+        injectors.credit_carrier_wire(&none, &with(&|e| drop(e.dropped.insert((1, 0), 5))));
+        assert_eq!(unexercised(&injectors.verify_gate().unwrap_err()), vec![0, 1, 2, 3]);
+        injectors.credit_carrier_wire(&none, &with(&|e| drop(e.dropped.insert((0, 1), 4))));
+        assert_eq!(unexercised(&injectors.verify_gate().unwrap_err()), vec![1, 2, 3]);
+        injectors.credit_carrier_wire(&none, &with(&|e| drop(e.duplicated.insert((0, 1), 1))));
+        assert_eq!(unexercised(&injectors.verify_gate().unwrap_err()), vec![2, 3]);
+        // Reordering at device 1 credits the hold on 1, not the one on 0.
+        injectors.credit_carrier_wire(&none, &with(&|e| drop(e.reordered.insert(1, 2))));
+        assert_eq!(unexercised(&injectors.verify_gate().unwrap_err()), vec![3]);
+        injectors.credit_carrier_wire(&none, &with(&|e| drop(e.reordered.insert(0, 1))));
+        injectors.assert_gate();
+
+        let no_carrier = ScheduledInjectors::for_spec(&spec).unwrap();
+        let err = run_schedule(spec, no_carrier).await.expect_err("ran without a carrier");
+        assert!(err.to_string().contains("no carrier"), "{err}");
+    });
+}
+
+/// Stopping the hold on one device closes that device's window only: the
+/// other device's hold stays open and can still be credited.
+#[test]
+fn stopping_one_wire_fault_leaves_the_same_class_on_another_target_open() {
+    use super::device_network::DeviceNetworkFaults;
+    use super::fault_carrier::CarrierFaults;
+    use super::fault_schedule::WireEvidence;
+    use yadorilink_lane_ports::sim_fault::SimFaultController;
+
+    sim(|| async {
+        let hold = |device| {
+            Fault::Net(NetFault::HoldInbound { device, every_nth: 2, release_after: 1, seed: 0 })
+        };
+        let spec = vec![
+            (SimNanos::from_round(1), hold(0)),
+            (SimNanos::from_round(2), hold(1)),
+            (SimNanos::from_round(3), Fault::Net(NetFault::StopHolding { device: 0 })),
+        ];
+        let keys = vec![
+            iroh::SecretKey::from_bytes(&[1; 32]).public(),
+            iroh::SecretKey::from_bytes(&[2; 32]).public(),
+        ];
+        let injectors = ScheduledInjectors::for_spec(&spec).unwrap().with_carrier(
+            DeviceNetworkFaults::substrate_only(CarrierFaults::new(
+                SimFaultController::new(),
+                keys,
+            )),
+        );
+        run_schedule(spec, injectors.clone()).await.unwrap();
+        let mut now = WireEvidence::default();
+        now.reordered.insert(0, 1);
+        now.reordered.insert(1, 1);
+        injectors.credit_carrier_wire(&WireEvidence::default(), &now);
+        assert_eq!(unexercised(&injectors.verify_gate().unwrap_err()), vec![0]);
+    });
+}
+
+/// A second hold on the same device replaces the first, so only the second can
+/// be credited by what happens afterwards.
+#[test]
+fn a_replaced_wire_policy_is_not_credited_by_its_replacements_evidence() {
+    use super::device_network::DeviceNetworkFaults;
+    use super::fault_carrier::CarrierFaults;
+    use super::fault_schedule::WireEvidence;
+    use yadorilink_lane_ports::sim_fault::SimFaultController;
+
+    sim(|| async {
+        let hold = |every_nth| {
+            Fault::Net(NetFault::HoldInbound { device: 0, every_nth, release_after: 1, seed: 0 })
+        };
+        let spec = vec![(SimNanos::from_round(1), hold(2)), (SimNanos::from_round(2), hold(3))];
+        let keys = vec![iroh::SecretKey::from_bytes(&[1; 32]).public()];
+        let injectors = ScheduledInjectors::for_spec(&spec).unwrap().with_carrier(
+            DeviceNetworkFaults::substrate_only(CarrierFaults::new(
+                SimFaultController::new(),
+                keys,
+            )),
+        );
+        run_schedule(spec, injectors.clone()).await.unwrap();
+        let mut now = WireEvidence::default();
+        now.reordered.insert(0, 1);
+        injectors.credit_carrier_wire(&WireEvidence::default(), &now);
+        assert_eq!(unexercised(&injectors.verify_gate().unwrap_err()), vec![0]);
+    });
+}
+
+/// A symmetric heal ends a one-way cut on the pair, so later discards on that
+/// link do not credit the cut.
+#[test]
+fn a_symmetric_heal_ends_a_one_way_cut_window() {
+    use super::device_network::DeviceNetworkFaults;
+    use super::fault_carrier::CarrierFaults;
+    use super::fault_schedule::WireEvidence;
+    use yadorilink_lane_ports::sim_fault::SimFaultController;
+
+    sim(|| async {
+        let spec = vec![
+            (SimNanos::from_round(1), Fault::Net(NetFault::PartitionOneWay { from: 0, to: 1 })),
+            (SimNanos::from_round(2), Fault::Net(NetFault::Heal { device_a: 0, device_b: 1 })),
+        ];
+        let keys = vec![
+            iroh::SecretKey::from_bytes(&[1; 32]).public(),
+            iroh::SecretKey::from_bytes(&[2; 32]).public(),
+        ];
+        let injectors = ScheduledInjectors::for_spec(&spec).unwrap().with_carrier(
+            DeviceNetworkFaults::substrate_only(CarrierFaults::new(
+                SimFaultController::new(),
+                keys,
+            )),
+        );
+        run_schedule(spec, injectors.clone()).await.unwrap();
+        let mut now = WireEvidence::default();
+        now.dropped.insert((0, 1), 3);
+        injectors.credit_carrier_wire(&WireEvidence::default(), &now);
+        assert_eq!(unexercised(&injectors.verify_gate().unwrap_err()), vec![0]);
+    });
+}
+
 /// Running a schedule that is not the spec the injectors were built from
 /// fails instead of advancing the wrong ledger entries.
 #[test]

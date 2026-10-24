@@ -33,6 +33,9 @@ pub enum UnreachableCategory {
     /// authorization mismatch, distinct from being unreachable on the
     /// network.
     HandshakeRefused,
+    /// The account replaced this device with another one (start over): it is refused, not
+    /// merely out of reach, and nothing will change that.
+    DeviceReplaced,
 }
 
 impl UnreachableCategory {
@@ -43,6 +46,7 @@ impl UnreachableCategory {
             UnreachableCategory::NoResponse => "no_response",
             UnreachableCategory::UdpBlocked => "udp_blocked",
             UnreachableCategory::HandshakeRefused => "handshake_refused",
+            UnreachableCategory::DeviceReplaced => "device_replaced",
         }
     }
 }

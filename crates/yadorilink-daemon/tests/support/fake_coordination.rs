@@ -1737,7 +1737,7 @@ async fn serve_netmap_subscription(
         guard.policy_send_watermarks.remove(&device_id);
         netmap_frame_for(&mut guard, &device_id)
     };
-    if ws.send(Message::Text(initial)).await.is_err() {
+    if ws.send(Message::Text(initial.into())).await.is_err() {
         inner.lock().unwrap().subscribers.remove(&device_id);
         return Ok(());
     }
@@ -1749,7 +1749,7 @@ async fn serve_netmap_subscription(
         tokio::select! {
             frame = rx.recv() => match frame {
                 Some(text) => {
-                    if ws.send(Message::Text(text)).await.is_err() { break; }
+                    if ws.send(Message::Text(text.into())).await.is_err() { break; }
                 }
                 None => break,
             },

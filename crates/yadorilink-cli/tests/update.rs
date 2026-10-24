@@ -17,16 +17,18 @@ use yadorilink_local_storage::SegmentBlockStore;
 async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("YADORILINK_CONFIG_DIR", dir.path());
-    // `DaemonState::new` spawns the periodic update-check scheduler
-    // immediately, which would otherwise try a real DNS lookup against
-    // the built-in placeholder manifest URL from every test in this
-    // file. Pointing it at a local port nothing listens on fails fast
-    // and deterministically (connection refused) instead of depending
-    // on network/DNS behavior in a test.
-    std::env::set_var("YADORILINK_UPDATE_MANIFEST_URL", "http://127.0.0.1:1/manifest.json");
+    // `DaemonState::new` spawns the periodic update-check scheduler immediately. The manifest
+    // URL is an explicit setting of the engine: a local port nothing listens on fails fast and
+    // deterministically (connection refused) instead of reaching the production manifest.
+    let tuning = yadorilink_daemon::engine_tuning::EngineTuning {
+        update_manifest_url: Some("http://127.0.0.1:1/manifest.json".into()),
+        witness: yadorilink_daemon::install_witness::WitnessPlacement::BesideDatabase,
+        ..Default::default()
+    };
 
     let store = Arc::new(SegmentBlockStore::new(dir.path().join("blocks")).unwrap());
-    let sync_state = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
+    let sync_state =
+        Arc::new(ReplicaCoordinator::open_with(dir.path().join("sync.sqlite3"), tuning).unwrap());
     let state = DaemonState::new("device-under-test".into(), sync_state, store);
 
     let socket_path = dir.path().join("daemon.sock");
@@ -69,9 +71,9 @@ async fn update_status_reports_daemon_not_running_clearly() {
 /// via the real IPC round trip. Deliberately does *not* assert
 /// `state == "idle"`: `DaemonState::new` spawns the periodic update-check
 /// scheduler immediately (it checks at daemon startup), and this test's
-/// daemon has no reachable manifest endpoint configured,
-/// so by the time this reads status the real startup check has usually
-/// already run and failed fast (a nonexistent-domain DNS lookup) --
+/// daemon's manifest URL points at a local port nothing listens on,
+/// so by the time this reads status the startup check has usually
+/// already run and failed fast (connection refused) --
 /// `state` can legitimately be `"checking"` or `"failed"` depending on
 /// exactly how far that race got, and either is correct behavior, not a
 /// bug this test should pin down.

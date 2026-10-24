@@ -50,10 +50,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use yadorilink_sync_substrate::{PathWatcher, PathWitness, TransferVerdict};
 
 /// Names the file this daemon writes its path evidence to.
-const PATH_VAR: &str = "YADORILINK_PATH_WITNESS_PATH";
+pub const PATH_VAR: &str = "YADORILINK_PATH_WITNESS_PATH";
 /// How many bytes the direct paths are expected to have carried, so a run
 /// that only ever handshook is refused rather than reported as direct.
-const EXPECT_VAR: &str = "YADORILINK_PATH_WITNESS_EXPECT_BYTES";
+pub const EXPECT_VAR: &str = "YADORILINK_PATH_WITNESS_EXPECT_BYTES";
 
 /// Collects a watcher for every link the daemon dials, and writes the verdict
 /// when the daemon shuts down.
@@ -97,8 +97,14 @@ static SINK: OnceLock<Option<Arc<PathWitnessSink>>> = OnceLock::new();
 /// certify any connection that carried a single direct byte as a successful
 /// gigabyte transfer -- fail-open, in the one place that exists to fail
 /// closed.
-pub fn configure_from_env() -> anyhow::Result<()> {
-    let configured = validate()?;
+///
+/// `output` and `expected_direct_bytes` are the values of [`PATH_VAR`] and [`EXPECT_VAR`]; the
+/// daemon's startup reads them from its environment and passes them in.
+pub fn configure(
+    output: Option<std::ffi::OsString>,
+    expected_direct_bytes: Option<String>,
+) -> anyhow::Result<()> {
+    let configured = validate(output, expected_direct_bytes)?;
     // Ignored if already set: a second call cannot change where this
     // process's evidence goes, so two halves of one run cannot disagree.
     let _ = SINK.set(configured);
@@ -107,19 +113,22 @@ pub fn configure_from_env() -> anyhow::Result<()> {
 
 /// The validation half, separated so it can be tested without touching the
 /// process-global the installer writes to.
-fn validate() -> anyhow::Result<Option<Arc<PathWitnessSink>>> {
-    let configured = match (std::env::var_os(PATH_VAR), std::env::var(EXPECT_VAR)) {
+fn validate(
+    output: Option<std::ffi::OsString>,
+    expected_direct_bytes: Option<String>,
+) -> anyhow::Result<Option<Arc<PathWitnessSink>>> {
+    let configured = match (output, expected_direct_bytes) {
         // The ordinary case: no instrument, nothing to validate.
-        (None, Err(_)) => None,
-        (None, Ok(_)) => anyhow::bail!(
+        (None, None) => None,
+        (None, Some(_)) => anyhow::bail!(
             "refusing to start: {EXPECT_VAR} is set but {PATH_VAR} is not, so this daemon \
              would measure which carriers its transfers use and write the answer nowhere"
         ),
-        (Some(_), Err(_)) => anyhow::bail!(
+        (Some(_), None) => anyhow::bail!(
             "refusing to start: {PATH_VAR} is set without {EXPECT_VAR}, so there is no size \
              to hold the run to and a connection carrying one byte would satisfy it"
         ),
-        (Some(output), Ok(raw)) => {
+        (Some(output), Some(raw)) => {
             let expected_direct_bytes: u64 = raw.trim().parse().map_err(|_| {
                 anyhow::anyhow!(
                     "refusing to start: {EXPECT_VAR} is {raw:?}, which is not a byte count"

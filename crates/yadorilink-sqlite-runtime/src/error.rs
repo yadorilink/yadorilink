@@ -17,6 +17,19 @@ pub enum DatabaseError {
 
     #[error("corrupt database schema: {0}")]
     CorruptSchema(String),
+
+    /// The writer lease did not hold at open: another process owns the data area, or this
+    /// lease ran out.
+    #[error("writer lease refused the open: {0}")]
+    WriterLease(String),
+
+    /// The database already records a newer writer generation than the lease being opened
+    /// with, so the caller is a stale writer.
+    #[error(
+        "database was last opened by writer generation {recorded}, newer than this lease's \
+         generation {presented}"
+    )]
+    StaleWriter { recorded: u64, presented: u64 },
 }
 
 /// The bound `SyncDatabase::read`/`write`/`write_immediate` require of a

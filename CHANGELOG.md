@@ -11,6 +11,18 @@ prerelease suffix (e.g. `v0.1.0-beta.1`).
 
 ## [Unreleased]
 
+## [v0.1.0-beta.6] - 2026-10-25
+
+### Added
+- The macOS engine binaries are signed and notarized.
+- The daemon can exit when an update replaces it so a supervisor can restart it (opt-in: `--restart-on-replace`).
+- Account deletion asks for a recent sign-in and warns about the shared groups it affects.
+- Windows: On-Demand fetch progress and clear failure reasons.
+
+### Fixed
+- Downloads that keep progressing are no longer cut off by a time limit.
+- Windows: freeing a large file and replacing an existing file no longer fail.
+
 ## [v0.1.0-beta.5] - 2026-10-24
 
 First public beta of YadoriLink: cloud-like file sync without cloud file

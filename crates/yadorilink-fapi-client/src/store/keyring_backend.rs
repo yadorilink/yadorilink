@@ -1,6 +1,6 @@
 //! The OS-native backend.
 //!
-//! On macOS this is the Data Protection Keychain, in the one keychain access
+//! On macOS and iOS this is the Data Protection Keychain, in the one keychain access
 //! group that the host app, the daemon helper and the CLI share
 //! (`yadorilink-os-keychain`): access is decided by the `keychain-access-groups`
 //! entitlement the process is signed with, not by a per-signer ACL, so none of
@@ -35,22 +35,24 @@
 
 use super::{StoreError, StoreResult};
 
-/// The single entry this build reads and writes, and the only entry name this
-/// crate knows.
-#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
-const CREDENTIALS_KEY: &str = "credentials";
+/// The entry name this build reads and writes: `credentials`, or `credentials.<scope>` for an
+/// engine with its own entry.
+#[cfg(any(windows, target_os = "linux", target_vendor = "apple"))]
+fn account(scope: Option<&str>) -> String {
+    scope.map_or_else(|| "credentials".to_owned(), |scope| format!("credentials.{scope}"))
+}
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 mod os {
-    use super::{StoreError, StoreResult, CREDENTIALS_KEY};
+    use super::{account, StoreError, StoreResult};
     use yadorilink_os_keychain::Keychain;
 
     fn err(e: yadorilink_os_keychain::KeychainError) -> StoreError {
         StoreError::Keyring(e.to_string())
     }
 
-    pub(super) fn read() -> StoreResult<Option<String>> {
-        let Some(bytes) = Keychain::system().read(CREDENTIALS_KEY).map_err(err)? else {
+    pub(super) fn read(scope: Option<&str>) -> StoreResult<Option<String>> {
+        let Some(bytes) = Keychain::system().read(&account(scope)).map_err(err)? else {
             return Ok(None);
         };
         String::from_utf8(bytes)
@@ -58,69 +60,73 @@ mod os {
             .map_err(|_| StoreError::Keyring("the stored credential is not valid UTF-8".to_owned()))
     }
 
-    pub(super) fn write(document: &str) -> StoreResult<()> {
-        Keychain::system().write(CREDENTIALS_KEY, document.as_bytes()).map_err(err)
+    pub(super) fn write(scope: Option<&str>, document: &str) -> StoreResult<()> {
+        Keychain::system().write(&account(scope), document.as_bytes()).map_err(err)
     }
 
-    pub(super) fn clear() -> StoreResult<()> {
-        Keychain::system().delete(CREDENTIALS_KEY).map_err(err)
+    pub(super) fn clear(scope: Option<&str>) -> StoreResult<()> {
+        Keychain::system().delete(&account(scope)).map_err(err)
     }
 
     /// Every item this product has in the credential access group (the
     /// credential and the device-key mirrors): the local purge behind
     /// `uninstall.sh --purge-data`.
-    pub(super) fn purge_all() -> StoreResult<()> {
-        Keychain::system().delete_all().map_err(err)
+    ///
+    /// An engine with its own scope removes only its own entry.
+    pub(super) fn purge_all(scope: Option<&str>) -> StoreResult<()> {
+        match scope {
+            None => Keychain::system().delete_all().map_err(err),
+            Some(_) => clear(scope),
+        }
     }
 }
 
 #[cfg(any(windows, target_os = "linux"))]
 mod os {
-    use super::{StoreError, StoreResult, CREDENTIALS_KEY};
+    use super::{account, StoreError, StoreResult};
 
     /// Unchanged from the modules this replaces, so an OS keyring that already
     /// holds YadoriLink entries keeps them under one service.
     const SERVICE: &str = "yadorilink";
 
-    /// The one entry this crate touches. Takes no argument on purpose: with no
-    /// key parameter, "this crate knows one keyring entry" is a fact about the
-    /// code rather than a claim in a comment.
-    fn entry() -> StoreResult<keyring::Entry> {
-        keyring::Entry::new(SERVICE, CREDENTIALS_KEY)
+    /// The one entry this engine touches: its scope names it, so "this engine knows one
+    /// keyring entry" is a fact about the code rather than a claim in a comment.
+    fn entry(scope: Option<&str>) -> StoreResult<keyring::Entry> {
+        keyring::Entry::new(SERVICE, &account(scope))
             .map_err(|e| StoreError::Keyring(e.to_string()))
     }
 
-    pub(super) fn read() -> StoreResult<Option<String>> {
-        match entry()?.get_password() {
+    pub(super) fn read(scope: Option<&str>) -> StoreResult<Option<String>> {
+        match entry(scope)?.get_password() {
             Ok(document) => Ok(Some(document)),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e) => Err(StoreError::Keyring(e.to_string())),
         }
     }
 
-    pub(super) fn write(document: &str) -> StoreResult<()> {
-        entry()?.set_password(document).map_err(|e| StoreError::Keyring(e.to_string()))
+    pub(super) fn write(scope: Option<&str>, document: &str) -> StoreResult<()> {
+        entry(scope)?.set_password(document).map_err(|e| StoreError::Keyring(e.to_string()))
     }
 
-    pub(super) fn clear() -> StoreResult<()> {
-        match entry()?.delete_credential() {
+    pub(super) fn clear(scope: Option<&str>) -> StoreResult<()> {
+        match entry(scope)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(e) => Err(StoreError::Keyring(e.to_string())),
         }
     }
 
     /// Windows and Linux hold only the one credential entry.
-    pub(super) fn purge_all() -> StoreResult<()> {
-        clear()
+    pub(super) fn purge_all(scope: Option<&str>) -> StoreResult<()> {
+        clear(scope)
     }
 }
 
-/// Every other target (iOS, the BSDs, ...): the `keyring` crate is not even a dependency here,
+/// Every other target (the BSDs, ...): the `keyring` crate is not even a dependency here,
 /// because without a native feature it would fall back to its in-memory mock, where
 /// `set_password` succeeds and the secret is gone at the next process start. A credential store
-/// that cannot persist must refuse, never pretend. iOS needs a Data Protection Keychain backend
-/// (`yadorilink-os-keychain`); until then it selects `YADORILINK_CREDENTIAL_STORE=file` or fails.
-#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+/// that cannot persist must refuse, never pretend. Such a target selects
+/// `YADORILINK_CREDENTIAL_STORE=file` or fails.
+#[cfg(not(any(windows, target_os = "linux", target_vendor = "apple")))]
 mod os {
     use super::{StoreError, StoreResult};
 
@@ -128,50 +134,50 @@ mod os {
         StoreError::Keyring("this target has no OS credential store backend".to_owned())
     }
 
-    pub(super) fn read() -> StoreResult<Option<String>> {
+    pub(super) fn read(_scope: Option<&str>) -> StoreResult<Option<String>> {
         Err(unsupported())
     }
 
-    pub(super) fn write(_document: &str) -> StoreResult<()> {
+    pub(super) fn write(_scope: Option<&str>, _document: &str) -> StoreResult<()> {
         Err(unsupported())
     }
 
-    pub(super) fn clear() -> StoreResult<()> {
+    pub(super) fn clear(_scope: Option<&str>) -> StoreResult<()> {
         Err(unsupported())
     }
 
-    pub(super) fn purge_all() -> StoreResult<()> {
+    pub(super) fn purge_all(_scope: Option<&str>) -> StoreResult<()> {
         Err(unsupported())
     }
 }
 
-pub(super) fn read() -> StoreResult<Option<String>> {
-    os::read()
+pub(super) fn read(scope: Option<&str>) -> StoreResult<Option<String>> {
+    os::read(scope)
 }
 
-pub(super) fn write(document: &str) -> StoreResult<()> {
-    os::write(document)
+pub(super) fn write(scope: Option<&str>, document: &str) -> StoreResult<()> {
+    os::write(scope, document)
 }
 
-pub(super) fn clear() -> StoreResult<()> {
-    os::clear()
+pub(super) fn clear(scope: Option<&str>) -> StoreResult<()> {
+    os::clear(scope)
 }
 
-pub(super) fn purge_all() -> StoreResult<()> {
-    os::purge_all()
+pub(super) fn purge_all(scope: Option<&str>) -> StoreResult<()> {
+    os::purge_all(scope)
 }
 
-/// Runs on the iOS simulator (`cargo test --target aarch64-apple-ios-sim`); on a target the
+/// Runs on a target without a store (the BSDs); on a target the
 /// `keyring` crate supports natively there is nothing to refuse.
-#[cfg(all(test, not(any(windows, target_os = "linux", target_os = "macos"))))]
+#[cfg(all(test, not(any(windows, target_os = "linux", target_vendor = "apple"))))]
 mod unsupported_target_tests {
     use super::*;
 
     #[test]
     fn a_target_without_a_native_store_refuses_instead_of_using_a_mock() {
-        assert!(write("{}").is_err(), "a write must not appear to succeed");
-        assert!(read().is_err(), "a read must not report an empty, enrollable store");
-        assert!(clear().is_err());
-        assert!(purge_all().is_err());
+        assert!(write(None, "{}").is_err(), "a write must not appear to succeed");
+        assert!(read(None).is_err(), "a read must not report an empty, enrollable store");
+        assert!(clear(None).is_err());
+        assert!(purge_all(None).is_err());
     }
 }

@@ -19,6 +19,9 @@ fn sample_entry(version: &str) -> ReleaseEntry {
         artifact_size: 1024,
         artifact_publisher_identity: String::new(),
         release_notes_url: "https://example.invalid/notes".into(),
+        state_schema_version: None,
+        state_schema_min_readable: None,
+        sparkle_build: None,
     }
 }
 
@@ -26,6 +29,7 @@ fn sample_manifest(entries: Vec<ReleaseEntry>) -> UpdateManifest {
     UpdateManifest {
         schema_version: MANIFEST_SCHEMA_VERSION,
         generated_at: "2026-07-01T00:00:00Z".into(),
+        expires_at: "2099-01-01T00:00:00Z".into(),
         withdrawn_versions: Vec::new(),
         releases: entries,
     }
@@ -39,6 +43,7 @@ fn sample_ctx() -> LocalContext {
         arch: "aarch64".into(),
         install_source: "standalone".into(),
         rollout_bucket: 0,
+        state_schema_version: 10,
     }
 }
 
@@ -202,16 +207,14 @@ fn dev_override_rejects_zero_false_empty_and_missing() {
 
 /// The release gate a real release pipeline actually runs
 /// (`enforce_release_trust_root_gate`) reads the live pinned
-/// `TRUSTED_KEYS` and the live opt-out env. This asserts the composed
-/// function agrees with its parts without mutating the ambient
-/// environment (which would race with any other test in this binary
-/// reading the same var), so it is stable regardless of how this test
+/// `TRUSTED_KEYS` and the opt-out value it is given. This asserts the composed
+/// function agrees with its parts, so it is stable regardless of how this test
 /// binary happens to be invoked.
 #[test]
 fn enforce_gate_composes_live_trust_root_and_live_override() {
     assert_eq!(
-        enforce_release_trust_root_gate(),
-        evaluate_release_gate(TRUSTED_KEYS, dev_override_enabled())
+        enforce_release_trust_root_gate(None),
+        evaluate_release_gate(TRUSTED_KEYS, dev_override_value_enabled(None))
     );
 }
 
@@ -230,6 +233,65 @@ fn unsupported_schema_version_is_rejected() {
             found: 999,
             expected: MANIFEST_SCHEMA_VERSION
         })
+    );
+}
+
+/// Signs `manifest_json` verbatim with the test key.
+fn sign_body(manifest_json: String) -> SignedManifestEnvelope {
+    use base64::Engine;
+    use ed25519_dalek::Signer;
+    let signature = test_signing_key().sign(manifest_json.as_bytes());
+    SignedManifestEnvelope {
+        key_id: TEST_KEY_ID.to_string(),
+        manifest_json,
+        signature_base64: base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()),
+        trust_chain: Vec::new(),
+    }
+}
+
+fn verify_body(manifest_json: String) -> Result<UpdateManifest, ManifestError> {
+    let keys = trusted_keys_hex(&test_trusted_keys());
+    let envelope = sign_body(manifest_json);
+    verify_and_parse_with_keys(&serde_json::to_string(&envelope).unwrap(), &keys)
+}
+
+/// A signed body without `expires_at` is malformed: stripping the field cannot dodge the check.
+#[test]
+fn a_body_without_expires_at_is_malformed() {
+    let mut body: serde_json::Value =
+        serde_json::to_value(sample_manifest(vec![sample_entry("0.2.0")])).unwrap();
+    body.as_object_mut().unwrap().remove("expires_at");
+    let result = verify_body(serde_json::to_string(&body).unwrap());
+    assert!(matches!(result, Err(ManifestError::MalformedBody(_))), "{result:?}");
+}
+
+/// `expires_at` must be strictly after `generated_at`, and both must be strict timestamps.
+#[test]
+fn an_expiry_that_is_not_after_generation_or_not_a_timestamp_is_malformed() {
+    for bad in ["2026-07-01T00:00:00Z", "2026-06-30T23:59:59Z", "tomorrow", "2026-09-01", ""] {
+        let mut m = sample_manifest(vec![sample_entry("0.2.0")]);
+        m.expires_at = bad.into();
+        let result = verify_body(serde_json::to_string(&m).unwrap());
+        assert!(matches!(result, Err(ManifestError::MalformedBody(_))), "{bad}: {result:?}");
+    }
+}
+
+/// Expired means `now > expires_at`; the boundary second itself is still valid.
+#[test]
+fn expiry_is_judged_against_the_clock_with_no_allowance() {
+    let mut m = sample_manifest(vec![sample_entry("0.2.0")]);
+    m.expires_at = "2026-09-01T00:00:00Z".into();
+    let at = chrono::NaiveDate::from_ymd_opt(2026, 9, 1)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp();
+    assert_eq!(check_not_expired(&m, at - 1), Ok(()));
+    assert_eq!(check_not_expired(&m, at), Ok(()));
+    assert_eq!(
+        check_not_expired(&m, at + 1),
+        Err(ManifestError::Expired { expires_at: "2026-09-01T00:00:00Z".into() })
     );
 }
 
@@ -478,4 +540,185 @@ fn withdrawn_versions_is_optional_on_the_wire() {
     assert!(!json.contains("withdrawn_versions"));
     let parsed: UpdateManifest = serde_json::from_str(&json).unwrap();
     assert!(parsed.withdrawn_versions.is_empty());
+}
+
+fn declaring(version: &str, writes: u32, min: Option<u32>) -> ReleaseEntry {
+    ReleaseEntry {
+        state_schema_version: Some(writes),
+        state_schema_min_readable: min,
+        sparkle_build: None,
+        ..sample_entry(version)
+    }
+}
+
+/// The context's data is stamped 10. A release whose engine cannot read that is never offered,
+/// whichever path asks, and the refusal says why.
+#[test]
+fn a_release_whose_engine_cannot_read_the_data_on_disk_is_refused_on_every_path() {
+    let ctx = sample_ctx();
+    for (entry, expected) in [
+        // A downgrade across a schema change.
+        (
+            declaring("0.2.0", 9, None),
+            StateRefusal::NewerThanReadable { on_disk: 10, newest_readable: 9 },
+        ),
+        // A gap the engine no longer reads.
+        (
+            declaring("0.2.0", 12, Some(11)),
+            StateRefusal::OlderThanReadable { on_disk: 10, oldest_readable: 11 },
+        ),
+        // A declaration that contradicts itself.
+        (declaring("0.2.0", 10, Some(11)), StateRefusal::Undeclarable),
+    ] {
+        let manifest = sample_manifest(vec![entry]);
+        match select_applicable(&manifest, &ctx) {
+            Applicability::StateIncompatible { refusal, .. } => assert_eq!(refusal, expected),
+            other => panic!("expected StateIncompatible, got {other:?}"),
+        }
+        for refused in [
+            check_pinned_install(&manifest, &ctx, "0.2.0").unwrap_err(),
+            check_appcast_item(&manifest, &ctx, "0.2.0").unwrap_err(),
+        ] {
+            assert_eq!(
+                refused,
+                VersionRefusal::StateIncompatible { version: "0.2.0".into(), refusal: expected }
+            );
+        }
+    }
+}
+
+#[test]
+fn a_release_that_reads_the_data_on_disk_or_declares_nothing_is_offered() {
+    let ctx = sample_ctx();
+    for entry in
+        [declaring("0.2.0", 10, None), declaring("0.2.0", 11, Some(10)), sample_entry("0.2.0")]
+    {
+        let manifest = sample_manifest(vec![entry]);
+        assert!(matches!(select_applicable(&manifest, &ctx), Applicability::Available { .. }));
+        check_pinned_install(&manifest, &ctx, "0.2.0").unwrap();
+        check_appcast_item(&manifest, &ctx, "0.2.0").unwrap();
+    }
+}
+
+#[test]
+fn the_state_declaration_survives_signing_and_older_entries_still_parse() {
+    let manifest = sample_manifest(vec![declaring("0.2.0", 11, Some(10))]);
+    let json = serde_json::to_string(&manifest).unwrap();
+    assert_eq!(serde_json::from_str::<UpdateManifest>(&json).unwrap(), manifest);
+    let without = serde_json::to_string(&sample_manifest(vec![sample_entry("0.2.0")])).unwrap();
+    assert!(!without.contains("state_schema"));
+    assert_eq!(
+        serde_json::from_str::<UpdateManifest>(&without).unwrap().releases[0].state_schema_version,
+        None
+    );
+}
+
+#[test]
+fn a_manifest_generated_far_in_the_future_is_refused_but_small_skew_is_not() {
+    let m = sample_manifest(vec![sample_entry("0.2.0")]);
+    let generated = chrono::NaiveDateTime::parse_from_str(&m.generated_at, "%Y-%m-%dT%H:%M:%SZ")
+        .unwrap()
+        .and_utc()
+        .timestamp();
+    assert_eq!(check_not_future_dated(&m, generated), Ok(()));
+    assert_eq!(check_not_future_dated(&m, generated - MAX_FUTURE_SKEW_SECS), Ok(()));
+    assert!(matches!(
+        check_not_future_dated(&m, generated - MAX_FUTURE_SKEW_SECS - 1),
+        Err(ManifestError::FutureDated { .. })
+    ));
+}
+
+#[test]
+fn the_artifact_file_is_the_last_segment_of_the_url() {
+    let mut e = sample_entry("1.0.0");
+    e.artifact_url = "https://yadori.link/dl/1.0.0/YadoriLink-1.0.0.dmg".into();
+    assert_eq!(e.artifact_file(), "YadoriLink-1.0.0.dmg");
+}
+
+/// A manifest written before `sparkle_build` existed still parses, and the field is left out of
+/// what is written when absent, so existing signed bytes do not change.
+#[test]
+fn sparkle_build_is_additive_in_the_manifest() {
+    let e = sample_entry("1.0.0");
+    let json = serde_json::to_string(&e).unwrap();
+    assert!(!json.contains("sparkle_build"));
+    let back: ReleaseEntry = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.sparkle_build, None);
+    let with = ReleaseEntry { sparkle_build: Some(7), ..e };
+    let back: ReleaseEntry = serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+    assert_eq!(back.sparkle_build, Some(7));
+}
+
+/// An appcast item is covered only by the served entry's exact version, build, whole URL and
+/// length (and, once downloaded, sha256); every other field is its own typed refusal, and a
+/// required field left out is refused, not skipped.
+#[test]
+fn an_appcast_item_that_differs_from_the_served_entry_is_refused_by_field() {
+    use AppcastPhase::{Downloaded, Enclosure};
+    let ctx = sample_ctx();
+    let url = "https://example.invalid/dl/0.2.0/YadoriLink-0.2.0.dmg";
+    let served = ReleaseEntry {
+        sparkle_build: Some(42),
+        artifact_url: url.into(),
+        artifact_size: 1024,
+        ..sample_entry("0.2.0")
+    };
+    let manifest = sample_manifest(vec![served]);
+    let item = AppcastItem {
+        version: "0.2.0".into(),
+        sparkle_build: 42,
+        channel: Some("beta".into()),
+        url: url.into(),
+        length: 1024,
+        sha256: None,
+    };
+    let with_sha = AppcastItem { sha256: Some("0".repeat(64)), ..item.clone() };
+    assert_eq!(check_appcast_entry(&manifest, &ctx, &item, Enclosure), Ok(()));
+    assert_eq!(check_appcast_entry(&manifest, &ctx, &with_sha, Downloaded), Ok(()));
+    let code = |item: AppcastItem, phase| {
+        check_appcast_entry(&manifest, &ctx, &item, phase).unwrap_err().code()
+    };
+    assert_eq!(
+        code(AppcastItem { sparkle_build: 41, ..item.clone() }, Enclosure),
+        "build_mismatch"
+    );
+    assert_eq!(code(AppcastItem { sparkle_build: 0, ..item.clone() }, Enclosure), "build_missing");
+    assert_eq!(code(AppcastItem { url: String::new(), ..item.clone() }, Enclosure), "url_missing");
+    // The same file name on another host, scheme or path is not the served URL.
+    for other in [
+        "https://evil.invalid/dl/0.2.0/YadoriLink-0.2.0.dmg",
+        "http://example.invalid/dl/0.2.0/YadoriLink-0.2.0.dmg",
+        "https://example.invalid/other/YadoriLink-0.2.0.dmg",
+        "YadoriLink-0.2.0.dmg",
+    ] {
+        assert_eq!(
+            code(AppcastItem { url: other.into(), ..item.clone() }, Enclosure),
+            "url_mismatch"
+        );
+    }
+    assert_eq!(code(AppcastItem { length: 0, ..item.clone() }, Enclosure), "length_missing");
+    assert_eq!(code(AppcastItem { length: 1025, ..item.clone() }, Enclosure), "length_mismatch");
+    assert_eq!(
+        code(AppcastItem { channel: Some("stable".into()), ..item.clone() }, Enclosure),
+        "channel_mismatch"
+    );
+    // The digest: required after the download, compared whenever it is given.
+    assert_eq!(code(item.clone(), Downloaded), "sha256_missing");
+    assert_eq!(
+        code(AppcastItem { sha256: Some(String::new()), ..item.clone() }, Downloaded),
+        "sha256_missing"
+    );
+    assert_eq!(
+        code(AppcastItem { sha256: Some("1".repeat(64)), ..item.clone() }, Downloaded),
+        "sha256_mismatch"
+    );
+    assert_eq!(
+        code(AppcastItem { sha256: Some("1".repeat(64)), ..item.clone() }, Enclosure),
+        "sha256_mismatch"
+    );
+    let undeclared = sample_manifest(vec![sample_entry("0.2.0")]);
+    assert_eq!(
+        check_appcast_entry(&undeclared, &ctx, &item, Enclosure).unwrap_err().code(),
+        "build_not_declared"
+    );
 }

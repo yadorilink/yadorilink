@@ -75,14 +75,17 @@ pub enum AuthorIdentityError {
 /// Opens the author identity of the replica database at `db_path` (module
 /// doc), for `device_id` signing with `signing_key`. `conn` must be a
 /// connection to that database outside any transaction.
+///
+/// `placement` is where the installation witness is kept. The engine's composition root chooses
+/// it; nothing is read from the environment here.
 pub fn open_author_identity(
     conn: &Connection,
     db_path: &Path,
+    placement: &crate::install_witness::WitnessPlacement,
     device_id: &str,
     signing_key: ed25519_dalek::SigningKey,
 ) -> Result<Arc<LocalAuthorKey>, AuthorIdentityError> {
-    let witness = crate::install_witness::FileWitnessStore::platform(db_path)
-        .map_err(AuthorIdentityError::Witness)?;
+    let witness = placement.store(db_path).map_err(AuthorIdentityError::Witness)?;
     open_author_identity_on(
         conn,
         db_path,
@@ -130,7 +133,7 @@ fn check_install_witness(
     device_id: &str,
     witness: &dyn crate::install_witness::WitnessStore,
 ) -> Result<(), AuthorIdentityError> {
-    use crate::install_witness::{judge, Verdict};
+    use crate::install_witness::{judge_with, Verdict};
     // A side copy that cannot be read cannot be compared: refused, and reported.
     let side = witness.read().unwrap_or(crate::install_witness::SideCopy::Unreadable);
     // A database with no author for this device has no identity to protect: it
@@ -138,8 +141,13 @@ fn check_install_witness(
     // rotates it away from the old device's author).
     let no_identity_here = author_incarnation::incarnation_record(conn)?
         .is_none_or(|record| record.author.device.as_str() != device_id);
-    match judge(author_incarnation::install_witness(conn)?, side, no_identity_here, rand::random())
-    {
+    match judge_with(
+        author_incarnation::install_witness(conn)?,
+        side,
+        no_identity_here,
+        rand::random(),
+        witness.persists(),
+    ) {
         Verdict::Refuse(reason) => Err(AuthorIdentityError::DatabaseRestored(reason)),
         Verdict::Record(next) => {
             author_incarnation::store_install_witness(conn, &next)?;
@@ -238,6 +246,7 @@ impl ReplicaAuthor {
     /// `signing_key`: [`open_author_identity`] for a database file.
     pub fn open(
         database: &yadorilink_sqlite_runtime::SyncDatabase,
+        placement: &crate::install_witness::WitnessPlacement,
         device_id: &str,
         signing_key: ed25519_dalek::SigningKey,
     ) -> Result<Self, AuthorIdentityError> {
@@ -245,7 +254,9 @@ impl ReplicaAuthor {
             .write::<_, IdentityStep>(|conn| {
                 let db_path = main_database_path(conn)?;
                 let handle = match &db_path {
-                    Some(path) => open_author_identity(conn, path, device_id, signing_key.clone())?,
+                    Some(path) => {
+                        open_author_identity(conn, path, placement, device_id, signing_key.clone())?
+                    }
                     None => Arc::new(LocalAuthorKey::new(
                         in_memory_record(conn, device_id)?.author,
                         signing_key.clone(),
@@ -776,6 +787,37 @@ mod tests {
         assert_eq!(author(&readable), author(&first));
         assert_eq!(replica.record().minted_reason, IncarnationMintReason::Install);
         replica.assert_consistent(&readable);
+    }
+
+    /// Opening through the real placements: with a persistent witness, one that has gone missing
+    /// (a purge) while the database records it refuses the open; with a clearable one the
+    /// witness is recorded again; and the first open of a fresh install works either way.
+    #[test]
+    fn a_purged_persistent_witness_refuses_the_open_and_a_clearable_one_is_recorded_again() {
+        use crate::install_witness::WitnessPlacement;
+        for (persistent, reopen_refused) in [(true, true), (false, false)] {
+            let replica = Replica::new();
+            let dir = replica._dir.path().join("witness");
+            let placement = if persistent {
+                WitnessPlacement::Persistent(dir.clone())
+            } else {
+                WitnessPlacement::At(dir.clone())
+            };
+            let open =
+                || open_author_identity(&replica.conn(), &replica.db, &placement, DEVICE, key());
+            open().expect("a fresh install opens");
+            open().expect("a normal restart opens");
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                std::fs::remove_file(entry.unwrap().path()).unwrap();
+            }
+            match open() {
+                Err(AuthorIdentityError::DatabaseRestored(
+                    crate::install_witness::Restored::Unverifiable,
+                )) => assert!(reopen_refused, "a clearable witness is recorded again"),
+                Ok(_) => assert!(!reopen_refused, "a persistent witness that vanished must refuse"),
+                Err(other) => panic!("unexpected: {other}"),
+            }
+        }
     }
 
     #[test]

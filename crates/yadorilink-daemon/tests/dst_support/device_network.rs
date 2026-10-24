@@ -107,6 +107,16 @@ impl ControlPlaneHosts {
                 }
                 Err(missing) => CarrierOutcome::UnknownDevice(missing),
             },
+            // The control plane rides Turmoil's sockets, which can hold or cut
+            // a link but not drop one direction, duplicate or reorder.
+            NetFault::PartitionOneWay { .. }
+            | NetFault::HealOneWay { .. }
+            | NetFault::DuplicateDatagrams { .. }
+            | NetFault::StopDuplicating { .. }
+            | NetFault::HoldInbound { .. }
+            | NetFault::StopHolding { .. } => {
+                CarrierOutcome::Unimplemented("wire fault on the control plane")
+            }
             NetFault::Drop => CarrierOutcome::Unimplemented("Drop"),
             NetFault::Delay { .. } => CarrierOutcome::Unimplemented("Delay"),
             NetFault::Reorder => CarrierOutcome::Unimplemented("Reorder"),

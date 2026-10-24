@@ -202,6 +202,7 @@ async fn an_unreachable_peer_shows_why_and_is_not_available_now() {
         (Why::NoResponse, UnreachableCategory::NoResponse),
         (Why::UdpBlocked, UnreachableCategory::UdpBlocked),
         (Why::HandshakeRefused, UnreachableCategory::HandshakeRefused),
+        (Why::DeviceReplaced, UnreachableCategory::DeviceReplaced),
     ] {
         let state = device_whose_content_only_the_peer_holds();
         observe(&state, PeerPath::Unreachable(why));
@@ -212,7 +213,11 @@ async fn an_unreachable_peer_shows_why_and_is_not_available_now() {
         assert_eq!(peer.unreachable_category(), shown, "the reason is carried through");
         assert_eq!(peer.route_kind(), RouteKind::Unspecified, "no path, so no route: {why:?}");
         assert_eq!(seen.connected_peer_count, 0, "{why:?}");
-        assert!(seen.flagged_disconnected, "an unreachable peer needs attention: {why:?}");
+        assert_eq!(
+            seen.flagged_disconnected,
+            why != Why::DeviceReplaced,
+            "an unreachable peer needs attention, a replaced one is gone for good: {why:?}"
+        );
         assert_eq!(seen.fetch, FetchAvailability::UnavailableNow, "{why:?}");
         assert_eq!(
             seen.durability,

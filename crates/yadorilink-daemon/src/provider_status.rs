@@ -171,6 +171,34 @@ fn unreadable_line(
     }
 }
 
+/// Where the host serves each declared root: root id (hex) to the folder the OS shows it in. The
+/// Windows host records the folders it registered in a file; nothing else knows them. Empty where
+/// there is no such folder, and when the record cannot be read (the line then carries no path).
+#[cfg(windows)]
+fn registered_sync_roots() -> std::collections::HashMap<String, std::path::PathBuf> {
+    use yadorilink_windows_provider_policy::{host, host_paths};
+    if host_paths::check().is_err() {
+        return Default::default();
+    }
+    host::read_registry_at(&host_paths::roots_registry_file()).unwrap_or_else(|error| {
+        tracing::warn!(%error, "could not read where the provider folders are registered");
+        Default::default()
+    })
+}
+
+#[cfg(not(windows))]
+fn registered_sync_roots() -> std::collections::HashMap<String, std::path::PathBuf> {
+    Default::default()
+}
+
+/// The folder of `root_id` in `registered`, as text; empty when there is none.
+fn sync_root_text(
+    registered: &std::collections::HashMap<String, std::path::PathBuf>,
+    root_id: &str,
+) -> String {
+    registered.get(root_id).map(|path| path.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
 /// One line per declared provider root, with the root's full id (the line carries only a prefix).
 /// Only the repository half of the line; the Eager progress is added by the caller.
 fn repository_lines(repo: &ProviderRepository, now_ms: i64) -> Vec<(String, ProviderRootStatus)> {
@@ -183,6 +211,7 @@ fn repository_lines(repo: &ProviderRepository, now_ms: i64) -> Vec<(String, Prov
             )];
         }
     };
+    let registered = registered_sync_roots();
     roots
         .iter()
         .map(|root| {
@@ -206,6 +235,7 @@ fn repository_lines(repo: &ProviderRepository, now_ms: i64) -> Vec<(String, Prov
                     root_id: root.root_id.chars().take(8).collect(),
                     display_name: root.display_name.clone(),
                     readiness: readiness_text(root),
+                    sync_root_path: sync_root_text(&registered, &root.root_id),
                     kept_edits: kept,
                     kept_edits_oldest_ms: first.map_or(0, |at| (now_ms - at).max(0) as u64),
                     ..Default::default()

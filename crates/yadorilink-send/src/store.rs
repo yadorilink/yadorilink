@@ -174,7 +174,7 @@ impl SendStore {
     /// here -- that is the sync engine's own DDL, for a different
     /// database file entirely.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let db = SyncDatabase::open(path, |conn| {
+        let db = SyncDatabase::open_process_locked(path, |conn| {
             conn.execute_batch(SCHEMA)?;
             Ok(())
         })

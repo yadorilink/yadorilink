@@ -224,7 +224,7 @@ async fn run(seq: &Sequence, window_opens: bool) -> Result<(), String> {
         }
         match f.state.degraded_link_info(&f.root.to_string_lossy()) {
             Some(info)
-                if info.reason.starts_with(crate::link_registry::WAITING_FOR_DISK_SPACE)
+                if info.cause == crate::link_registry::DegradedCause::WaitingForDiskSpace
                     && info.reason.contains(&format!("{MIB} bytes free"))
                     && info.reason.contains(&format!("{} bytes must stay free", 1u64 << 30)) => {}
             other => {

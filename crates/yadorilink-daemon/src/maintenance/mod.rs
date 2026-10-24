@@ -34,4 +34,5 @@ pub(crate) mod retention_expiry;
 // would otherwise sit unconstructed in every such build, warning as dead
 // code.
 #[cfg(not(test))]
+#[cfg(feature = "process-model")]
 pub(crate) mod update_check;

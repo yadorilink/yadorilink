@@ -41,6 +41,10 @@ pub(crate) trait EnrollmentRepository: Send + Sync {
 
     fn list_links(&self) -> Result<Vec<FolderLink>, SyncError>;
 
+    /// Whether a provider folder of this device already has `display_name`: a second one with
+    /// the same name is refused at link time, which an invite must learn before it is redeemed.
+    fn provider_display_name_taken(&self, display_name: &str) -> Result<bool, SyncError>;
+
     /// The creation digest recorded with a provider link (the token-bound request).
     fn creation_digest(&self, locator: &str) -> Result<Option<String>, SyncError>;
 
@@ -248,10 +252,14 @@ pub(crate) trait EnrollmentLinkPort: Send + Sync {
     /// this call and the matching activate call -- see
     /// `EnrollmentService::accept_invite_and_link`'s own doc comment for
     /// the full retry story this depends on.
+    ///
+    /// `provider` makes the link a provider folder (then `absolute_path` is its locator, never a
+    /// directory); it is committed the same way, without a journal row or marker.
     fn commit_plain<'a>(
         &'a self,
         group_id: &'a str,
         absolute_path: &'a std::path::Path,
         on_demand: bool,
+        provider: Option<super::ProviderLinkTarget>,
     ) -> BoxFuture<'a, Result<(), crate::application::EnrollmentLinkError>>;
 }

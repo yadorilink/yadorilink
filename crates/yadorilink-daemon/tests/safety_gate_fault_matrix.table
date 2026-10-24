@@ -1,0 +1,109 @@
+# Index of the table-driven fault-injection harness, safety_gate_fault_matrix.rs.
+#
+#   case     | <id> | <section> | <covers,...> | <invariant asserted>
+#   delegate | <section> | <covers,...> | <path>::<test fn>   (an existing sweep injects there)
+#   exempt   | <section, Enum::Variant or seam:name> | <reason>
+#
+# <section> is a "### 2.N" rule or the "## 3" durability model of SAFETY_INVARIANTS.md.
+# .github/checks/check-safety-gate-matrix.py fails when a section, a variant of a watched
+# failpoint or refusal enum, or a test-injection seam has no row.
+#
+# Real-OS and hardware acceptance stays manual and is not in this table: a power cut on a real
+# volume, Windows/macOS permission semantics, a packaged-app restart, a deployed coordination
+# service (device supersede, cloned old database).
+
+# ---- 2.1 releasing local content / 2.3 block custody ----
+case | deletion.non_durable_volume | 2.1 |  | A deletion on a volume not known durable is refused (DeletionRefused); the block is still stored and readable; allowed once the volume is durable
+delegate | 2.1 | seam:fail_directory_barrier_for_test | crates/yadorilink-daemon/src/replica_coordinator/materialization_execution/tests.rs::a_failed_sync_after_the_unlink_leaves_the_row_evicting
+delegate | 2.1 |  | crates/yadorilink-daemon/src/replica_coordinator/materialization_execution/tests.rs::eviction_must_not_delete_block_used_by_hydrated_file_in_another_group
+# ---- 2.2 losing a full-replica role ----
+delegate | 2.2 |  | crates/yadorilink-daemon/src/application/replica_role_service/tests.rs::last_full_replica_cannot_unlink
+delegate | 2.2 |  | crates/yadorilink-daemon/tests/role_loss_saga.rs::ambiguous_demote_keeps_prepared_journal
+# ---- 2.3 garbage collection ----
+delegate | 2.3 |  | crates/yadorilink-daemon/src/gc/tests.rs::gc_must_not_delete_old_deduplicated_block_adopted_after_live_snapshot
+# ---- 2.4 materialization, journal and startup repair ----
+case | disk_pressure.preflight | 2.4 |  | A write refused for disk pressure is decided before any temp file exists; retry once space returns
+case | disk_pressure.block_store | 2.4 |  | A block write refused for disk pressure leaves no bytes or files; the retry after space returns is durable and readable
+delegate | 2.4 |  | crates/yadorilink-daemon/src/convergence/receive_disk_pressure_sequence_tests.rs::files_refused_under_disk_pressure_land_by_themselves_when_space_returns
+delegate | 2.4 | seam:set_fail_after_rename_for_test | crates/yadorilink-daemon/src/replica_coordinator/materialization_execution/tests.rs::a_repair_reconstruct_that_fails_after_its_rename_keeps_the_object_and_the_intent
+delegate | 2.4 | seam:set_test_fail_repair_reconstruct_proof_commit | crates/yadorilink-daemon/src/replica_coordinator/materialization_execution/tests.rs::a_repair_reconstruct_whose_proof_commit_fails_keeps_its_intent_open
+delegate | 2.4 | seam:inject_startup_failures | crates/yadorilink-daemon/src/adapters/runtime/link_runtime_controller/tests.rs::a_startup_fault_that_outlasts_the_immediate_attempts_is_retried_until_it_clears
+delegate | 2.4 | seam:set_test_namespace_refusal,UnavailableReason::Unsupported | crates/yadorilink-local-storage/src/materialize_write/tests.rs::a_replacing_publish_keeps_the_old_bytes_and_creates_nothing_by_a_plain_rename
+delegate | 2.4 | Failpoint::BeforeCapture,Failpoint::AfterCapture,Failpoint::AfterTargetDurable,Failpoint::AfterRecoveryItem,Failpoint::AfterRemoteOnlyFiles,Failpoint::AfterRemoteOnlyRow,Failpoint::BeforeManifest,Failpoint::AfterManifest,Failpoint::AtPreserved | crates/yadorilink-sync-sqlite/src/native_bootstrap/tests/rebootstrap_crash.rs::a_stop_at_every_failpoint_restarts_clean
+delegate | 2.4 |  | crates/yadorilink-daemon/tests/rewind_crash_failpoints.rs::crash_between_chunks
+# ---- 2.5 conflicts ----
+delegate | 2.5 |  | crates/yadorilink-daemon/tests/conflict_resolution.rs::keep_this_refuses_while_the_original_has_an_unrecorded_edit
+delegate | 2.5 |  | crates/yadorilink-replica-domain/src/native_fork/tests.rs::a_full_bucket_of_unrelated_equal_heads_refuses_instead_of_dropping
+# ---- 2.6 admission and authority ----
+case | path_escape.planted_symlink | 2.6 |  | A write through a planted symlink is refused (PathEscapesRoot); nothing is created outside the root; retry inside the root works
+delegate | 2.6 |  | crates/yadorilink-replica-domain/src/proof_carrying_delta/tests.rs::a_delta_for_another_group_is_refused
+delegate | 2.6 |  | crates/yadorilink-replica-domain/src/proof_carrying_delta/tests.rs::a_delta_signed_by_a_different_key_than_the_checkpoint_vouches_for_is_refused
+# ---- 2.7 stale observations ----
+delegate | 2.7 |  | crates/yadorilink-sync-sqlite/src/provider_write/tests.rs::an_edit_on_a_stale_or_unknown_base_never_touches_the_canonical_version
+delegate | 2.7 | seam:arm_content_read_race_hook | crates/yadorilink-local-capture/src/local_change/tests.rs::a_file_that_grows_while_it_is_read_is_captured_from_one_consistent_look_or_retried
+delegate | 2.7 | seam:arm_post_capture_race_hook | crates/yadorilink-local-capture/src/local_change/tests.rs::a_write_between_a_batched_capture_and_its_commit_is_not_lost
+delegate | 2.7 | seam:arm_post_identity_race_hook | crates/yadorilink-local-capture/src/local_change/tests.rs::a_write_between_the_batch_fingerprint_check_and_the_identity_observation_is_not_lost
+# ---- 2.8 reads that fail closed (unreadable files) ----
+delegate | 2.8 |  | crates/yadorilink-daemon/tests/unreadable_file_convergence.rs::an_unreadable_local_file_is_not_overwritten_by_a_same_name_remote_file
+delegate | 2.8 |  | crates/yadorilink-daemon/tests/unreadable_file_convergence.rs::healthy_files_converge_while_an_unreadable_file_sits_in_the_root
+delegate | 2.8 |  | crates/yadorilink-daemon/tests/unreadable_file_attention.rs::an_unreadable_file_shows_up_and_clears_when_permission_is_restored
+# ---- 2.9 restored or copied database, start over, replaced device ----
+case | witness.side_unreadable | 2.9 | Restored::Unverifiable | An unreadable installation witness refuses the open (unverifiable) and is not rewritten; start over records a fresh witness
+case | witness.other_install | 2.9 | Restored::DifferentInstall | A database of another installation is refused (different_install); the side copy is untouched; start over recovers
+case | witness.older_generation | 2.9 | Restored::OlderGeneration | A database older than the newest recorded state is refused (older_generation); start over recovers
+case | witness.database_predates_witness | 2.9 | Restored::DifferentInstall | A database without a witness beside an installation that has one is refused; start over recovers
+case | replacement.record_unreadable | 2.9 |  | An unreadable replacement record counts as waiting (never confirmed) and is not dropped; rewriting it with the acknowledgement releases it
+case | replacement.possible_loss_not_acknowledged | 2.9 |  | A replacement is never confirmed before the person acknowledges possible loss; the record survives the acknowledgement
+delegate | 2.9 |  | crates/yadorilink-daemon/tests/start_over_not_rejoined.rs::a_folder_not_rejoined_stays_visible_across_a_restart_until_it_is_linked_again
+delegate | 2.9 |  | crates/yadorilink-client-core/src/ops/device_supersede/tests.rs::an_unknown_protection_value_is_never_read_as_healthy
+delegate | 2.9 |  | crates/yadorilink-client-core/src/ops/device_supersede/tests.rs::a_device_already_replaced_by_another_is_reported_as_such
+delegate | 2.9 |  | crates/yadorilink-client-core/src/ops/device_supersede/tests.rs::the_same_request_is_refused_as_stale_and_then_accepted_after_a_new_sign_in
+# ---- 2.10 updates, rollout and database generation ----
+case | schema.newer_database | 2.10 |  | A database newer than the build is refused (UnsupportedSchemaDowngrade) and not stamped; accepted when the version matches
+case | schema.older_database | 2.10 |  | An older database is never migrated or adopted (CorruptSchema); a fresh one is accepted
+case | schema.unstamped_with_tables | 2.10 |  | A database with tables and no version stamp is refused (CorruptSchema); a fresh one is accepted
+case | rollout.InvalidVersion | 2.10 | VersionRefusal::InvalidVersion | an unparseable version is refused; the next manifest or wider rollout allows it; an equal or older version is never offered
+case | rollout.Withdrawn | 2.10 | VersionRefusal::Withdrawn | a withdrawn version is refused; the next manifest or wider rollout allows it; an equal or older version is never offered
+case | rollout.KillSwitched | 2.10 | VersionRefusal::KillSwitched | a kill-switched release is refused; the next manifest or wider rollout allows it; an equal or older version is never offered
+case | rollout.BelowMinimum | 2.10 | VersionRefusal::BelowMinimum | a version below the channel minimum is refused; the next manifest or wider rollout allows it; an equal or older version is never offered
+case | rollout.NotOffered | 2.10 | VersionRefusal::NotOffered | a release not offered to this install is refused; the next manifest or wider rollout allows it; an equal or older version is never offered
+case | rollout.NotServed | 2.10 | VersionRefusal::NotServed | a stale appcast item other than the served version is refused; the next manifest or wider rollout allows it; an equal or older version is never offered
+case | rollout.HeldBack | 2.10 | VersionRefusal::HeldBack | a release outside the staged rollout is held back; the next manifest or wider rollout allows it; an equal or older version is never offered
+delegate | 2.10 | VersionRefusal::BuildMismatch,VersionRefusal::BuildMissing,VersionRefusal::BuildNotDeclared,VersionRefusal::ChannelMismatch,VersionRefusal::UrlMissing,VersionRefusal::UrlMismatch,VersionRefusal::LengthMissing,VersionRefusal::LengthMismatch,VersionRefusal::Sha256Missing,VersionRefusal::Sha256Mismatch | crates/yadorilink-daemon/src/update/manifest/tests.rs::an_appcast_item_that_differs_from_the_served_entry_is_refused_by_field
+delegate | 2.10 | VersionRefusal::StateIncompatible | crates/yadorilink-daemon/src/update/manifest/tests.rs::a_release_whose_engine_cannot_read_the_data_on_disk_is_refused_on_every_path
+case | manifest.tampered_body | 2.10 |  | A manifest changed after signing fails the signature check; the genuine one verifies
+case | manifest.unknown_key | 2.10 |  | A manifest signed under an unknown key id is refused; the genuine one verifies
+case | manifest.wrong_schema | 2.10 |  | A correctly signed manifest of another schema is refused as a schema error, not a signature error
+# ---- 3 durability model: block store, namespace, volume, generation files ----
+case | block_commit.BeforeAppend | 3 | CommitPoint::BeforeAppend,seam:arm_commit_fault_for_tests,seam:arm_fault | A crash at BeforeAppend never leaves the index naming a block that is not durable; committed blocks survive; the group is all-or-nothing; writes work after recovery
+case | block_commit.AfterSegmentStaged | 3 | CommitPoint::AfterSegmentStaged,seam:arm_commit_fault_for_tests,seam:arm_fault | A crash at AfterSegmentStaged never leaves the index naming a block that is not durable; committed blocks survive; the group is all-or-nothing; writes work after recovery
+case | block_commit.AfterSegmentPublished | 3 | CommitPoint::AfterSegmentPublished,seam:arm_commit_fault_for_tests,seam:arm_fault | A crash at AfterSegmentPublished never leaves the index naming a block that is not durable; committed blocks survive; the group is all-or-nothing; writes work after recovery
+case | block_commit.MidRecordAppend | 3 | CommitPoint::MidRecordAppend,seam:arm_commit_fault_for_tests,seam:arm_fault | A crash at MidRecordAppend never leaves the index naming a block that is not durable; committed blocks survive; the group is all-or-nothing; writes work after recovery
+case | block_commit.AfterAppendBeforeFsync | 3 | CommitPoint::AfterAppendBeforeFsync,seam:arm_commit_fault_for_tests,seam:arm_fault | A crash at AfterAppendBeforeFsync never leaves the index naming a block that is not durable; committed blocks survive; the group is all-or-nothing; writes work after recovery
+case | block_commit.AfterFsyncBeforeIndex | 3 | CommitPoint::AfterFsyncBeforeIndex,seam:arm_commit_fault_for_tests,seam:arm_fault | A crash at AfterFsyncBeforeIndex never leaves the index naming a block that is not durable; committed blocks survive; the group is all-or-nothing; writes work after recovery
+case | block_commit.DuringIndexTransaction | 3 | CommitPoint::DuringIndexTransaction,seam:arm_commit_fault_for_tests,seam:arm_fault | A crash at DuringIndexTransaction never leaves the index naming a block that is not durable; committed blocks survive; the group is all-or-nothing; writes work after recovery
+case | block_commit.AfterIndexCommitBeforeReceipt | 3 | CommitPoint::AfterIndexCommitBeforeReceipt,seam:arm_commit_fault_for_tests,seam:arm_fault | A crash at AfterIndexCommitBeforeReceipt never leaves the index naming a block that is not durable; committed blocks survive; the group is all-or-nothing; writes work after recovery
+case | block_commit.DuringRollover | 3 | CommitPoint::DuringRollover,seam:arm_commit_fault_for_tests,seam:arm_fault | A crash at DuringRollover never leaves the index naming a block that is not durable; committed blocks survive; the group is all-or-nothing; writes work after recovery
+case | ns_failpoint.AfterStage | 3 | NsFailpoint::AfterStage,seam:arm_failpoint | A stop at AfterStage leaves the target as the whole old or the whole new file; a retry publishes the new one
+case | ns_failpoint.BeforeMove | 3 | NsFailpoint::BeforeMove,seam:arm_failpoint | A stop at BeforeMove leaves the target as the whole old or the whole new file; a retry publishes the new one
+case | ns_failpoint.AfterMove | 3 | NsFailpoint::AfterMove,seam:arm_failpoint | A stop at AfterMove leaves the target as the whole old or the whole new file; a retry publishes the new one
+case | ns_failpoint.AfterDiscardBeforeUnlink | 3 | NsFailpoint::AfterDiscardBeforeUnlink,seam:arm_failpoint | A committed removal whose unlink was skipped is retained under its ledgered name with its bytes; recovery removes it
+case | ns_probe.unknown_volume | 3 | UnavailableReason::Unknown | A volume the probe cannot judge is refused as Unknown with nothing created; once reachable it gets a verdict
+delegate | 3 | UnavailableReason::GateClosed | crates/yadorilink-fs-platform/src/durable_dir/tests.rs::a_closed_gate_refusal_names_its_cause
+exempt | UnavailableReason::VolumeWithoutGuidPath | Reachable only on a Windows volume that has a DOS path but no volume GUID path; the refusal is produced by the Windows volume query and covered by the Windows durability evidence runs, which are manual real-OS acceptance
+case | access_denied.publish | 3 |  | A publish into a directory the user may not write is refused with PermissionDenied and leaves no residue; retry after the mode is restored publishes the whole file
+case | access_denied.remove | 3 |  | A removal in a directory the user may not write is refused and the file is intact; retry after the mode is restored removes it
+case | volume.observe_fails | 3 | VolumeMatch::Same | A failed volume observation is an error to retry, never a weaker identity
+case | volume.other_disk | 3 | VolumeMatch::Other | A folder on another identified volume is refused (Other); back on the recorded disk it is Same
+case | volume.recorded_unknown | 3 | VolumeMatch::Unconfirmed | A folder whose recorded volume has no stable identity needs the user to re-adopt it; an unknown volume never matches itself
+case | volume.observed_unknown | 3 | VolumeMatch::Unconfirmed | A folder now on a volume with no stable identity waits for the user; re-adoption on an identified volume is Same
+case | disk_pressure.admission_line | 3 |  | A write that lands exactly on the headroom line is refused; one byte more room admits it
+case | disk_pressure.hysteresis | 3 |  | The waiting-for-space state does not clear while free space hovers just above the line; it clears above the resume margin
+case | generation.torn_newest | 3 |  | A torn newest generation is never read as the clean latest record; the older complete generation is kept; the next publish recovers
+case | generation.unreadable_newest | 3 |  | An unreadable newest generation makes the record unproven (Invalid), never a first run; the next publish recovers
+case | generation.resurrected_after_retirement | 3 |  | A retired record stays retired when an old generation comes back; a new publish revives it
+# ---- injection seams of other gates ----
+delegate | 2.8 | seam:fail_placeholder_reads_for_path | crates/yadorilink-daemon/src/local_convergence/own_head_recapture_tests.rs::an_unreadable_placeholder_generation_stops_all_three_paths
+delegate | 2.8 | seam:fail_state_reads_for_path | crates/yadorilink-daemon/src/local_convergence/own_head_recapture_tests.rs::an_unreadable_materialization_state_never_brings_back_a_deleted_file
+delegate | 3 | seam:fail_received_flushes_of | crates/yadorilink-daemon/src/local_convergence/receive_deferred_flush_tests.rs::received_with_failed_barrier
+exempt | seam:fail_inbound | Test seam of the file-send store (an inbound transfer that fails after a cancel), not a SAFETY_INVARIANTS gate; its own test is crates/yadorilink-send/src/store/tests.rs failure_does_not_overwrite_a_cancel

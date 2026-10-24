@@ -343,3 +343,96 @@ async fn dropping_the_watch_stops_the_loop() {
     tokio::time::sleep(Duration::from_millis(60)).await;
     assert_eq!(polls.load(Ordering::SeqCst), after_drop);
 }
+
+// ---- cancel returns only after the flow can no longer write ---------------------------
+
+/// A flow whose single poll "writes the credential" slowly: it reports that it is inside the
+/// poll, holds the thread for `hold`, sets `written`, and signs in. Nothing is awaited between
+/// the start of the poll and the write, as in the product's flow.
+fn writing_in_one_poll(
+    entered: std::sync::mpsc::Sender<()>,
+    hold: Duration,
+    written: Arc<AtomicBool>,
+) -> LoginFlowFn {
+    Box::new(move |_sink| {
+        Box::pin(async move {
+            entered.send(()).unwrap();
+            std::thread::sleep(hold);
+            written.store(true, Ordering::SeqCst);
+            Ok(account())
+        })
+    })
+}
+
+/// The race of the issue: the poll task is in the middle of its credential write when the
+/// cancel arrives on another thread. The cancel must not return before that write is done, and
+/// then reports that the flow had finished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_waits_for_a_credential_write_that_is_in_flight() {
+    let (entered, in_poll) = std::sync::mpsc::channel();
+    let written = Arc::new(AtomicBool::new(false));
+    let session = Arc::new(LoginSession::with_flow(
+        options(None),
+        no_precheck(),
+        writing_in_one_poll(entered, Duration::from_millis(300), written.clone()),
+    ));
+    session.begin().unwrap();
+    tokio::task::spawn_blocking(move || in_poll.recv_timeout(Duration::from_secs(5)).unwrap())
+        .await
+        .unwrap();
+
+    let canceller = session.clone();
+    let (outcome, written_at_return) = tokio::task::spawn_blocking({
+        let written = written.clone();
+        move || {
+            let outcome = canceller.cancel();
+            (outcome, written.load(Ordering::SeqCst))
+        }
+    })
+    .await
+    .unwrap();
+    assert!(written_at_return, "cancel returned while the credential write was still running");
+    assert_eq!(outcome, CancelOutcome::AlreadyFinished);
+    // The flow did finish, so its own terminal event stands: the event never claims less.
+    assert_eq!(next(&session).await, Some(LoginEvent::SignedIn { account: account() }));
+}
+
+#[tokio::test]
+async fn cancelling_a_session_that_never_began_is_stopped_and_it_cannot_begin() {
+    let (_open, gate) = oneshot::channel();
+    let session = LoginSession::with_flow(
+        options(None),
+        no_precheck(),
+        gated_flow(vec![], gate, Arc::new(AtomicBool::new(false))),
+    );
+    assert_eq!(session.cancel(), CancelOutcome::Stopped);
+    assert!(matches!(session.begin(), Err(DesktopError::InvalidInput { .. })));
+    assert_eq!(next(&session).await, Some(LoginEvent::Cancelled));
+}
+
+/// The gate alone, without the run loop's stop branch: once a cancel has stopped it, a poll that
+/// arrives (a wake-up between the cancel taking the gate and its stop signal) never reaches the
+/// flow, so `CancelOutcome::Stopped` is never followed by a write.
+#[test]
+fn a_stopped_gate_never_polls_the_flow() {
+    let shared = Arc::new(LoginShared {
+        queue: Mutex::new(LoginQueue::default()),
+        gate: Mutex::new(Gate::default()),
+        ready: Notify::new(),
+        stop: Notify::new(),
+    });
+    let written = Arc::new(AtomicBool::new(false));
+    let flag = written.clone();
+    let mut gated = Box::pin(Gated {
+        shared: shared.clone(),
+        flow: Box::pin(async move {
+            flag.store(true, Ordering::SeqCst);
+            Ok(account())
+        }),
+    });
+    assert_eq!(shared.cancel(), CancelOutcome::Stopped);
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    assert!(gated.as_mut().poll(&mut cx).is_pending());
+    assert!(!written.load(Ordering::SeqCst), "a stopped gate polled the flow");
+}

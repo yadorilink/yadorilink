@@ -566,6 +566,7 @@ mod tests {
     mod rebootstrap_items;
     mod rebootstrap_preserve;
     mod rebootstrap_replay;
+    mod rebootstrap_sweep;
     mod retirement_cutoff;
     mod self_seal;
 

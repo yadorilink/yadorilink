@@ -10,6 +10,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use yadorilink_fs_platform::flush::{self, Target};
 
 /// How the batch is flushed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,8 +75,13 @@ pub fn completed_flushes_under(root: &Path) -> Vec<PathBuf> {
 }
 
 /// `fsync` (mode 2) or `F_FULLFSYNC` (`sync_all`, mode 1) of `file`, which was opened at `path`.
-fn flush_primitive(file: &fs::File, path: &Path, plain: bool) -> std::io::Result<()> {
-    let result = if plain { plain_fsync(file) } else { file.sync_all() };
+fn flush_primitive(
+    file: &fs::File,
+    path: &Path,
+    plain: bool,
+    target: Target,
+) -> std::io::Result<()> {
+    let result = if plain { plain_fsync(file, target) } else { flush::sync(file, target) };
     #[cfg(any(test, feature = "test-support"))]
     if result.is_ok() {
         TEST_FLUSH_LOG.lock().unwrap_or_else(|p| p.into_inner()).push(path.to_path_buf());
@@ -98,19 +104,13 @@ fn injected_failure(_path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn plain_fsync(file: &fs::File) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    // SAFETY: the descriptor is open for the duration of the call.
-    if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+fn plain_fsync(file: &fs::File, target: Target) -> std::io::Result<()> {
+    flush::fsync_plain(file, target)
 }
 
 #[cfg(not(unix))]
-fn plain_fsync(file: &fs::File) -> std::io::Result<()> {
-    file.sync_all()
+fn plain_fsync(file: &fs::File, target: Target) -> std::io::Result<()> {
+    flush::sync(file, target)
 }
 
 /// `(device, inode)` of the object at `path`: what a received file was when it was
@@ -153,8 +153,12 @@ fn flush_one(
     if expected.is_some() && key_of(&file) != expected {
         return Err(std::io::Error::other("the object at this path is not the one received"));
     }
-    let op = if is_dir { crate::io_diag::Op::DirFsync } else { crate::io_diag::Op::FileFsync };
-    crate::io_diag::time(op, 0, || flush_primitive(&file, path, plain))
+    let (op, target) = if is_dir {
+        (crate::io_diag::Op::DirFsync, Target::Directory)
+    } else {
+        (crate::io_diag::Op::FileFsync, Target::File)
+    };
+    crate::io_diag::time(op, 0, || flush_primitive(&file, path, plain, target))
 }
 
 /// Runs `job(index)` for every index with `workers` threads.
@@ -231,7 +235,9 @@ pub fn flush_received_objects(
             }
             let result = injected_failure(files.first().unwrap_or(dir)).and_then(|()| {
                 let handle = fs::File::open(dir)?;
-                crate::io_diag::time(crate::io_diag::Op::FileFsync, 0, || handle.sync_all())
+                crate::io_diag::time(crate::io_diag::Op::FileFsync, 0, || {
+                    flush::sync_directory(&handle)
+                })
             });
             barriers.insert(*device, result);
         }

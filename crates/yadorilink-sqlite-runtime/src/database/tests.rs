@@ -514,3 +514,34 @@ fn dropping_the_database_waits_for_a_connection_a_pool_worker_is_still_opening()
     assert!(!dir.path().join("closing.sqlite3-wal").exists());
     assert!(!dir.path().join("closing.sqlite3-shm").exists());
 }
+
+mod writer_generation {
+    use super::*;
+
+    #[test]
+    fn a_generation_is_recorded_and_a_higher_one_replaces_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_test_db(&dir.path().join("db.sqlite3"));
+        assert_eq!(db.recorded_writer_generation().unwrap(), None);
+        db.record_writer_generation(3).unwrap();
+        assert_eq!(db.recorded_writer_generation().unwrap(), Some(3));
+        db.record_writer_generation(3).unwrap();
+        db.record_writer_generation(7).unwrap();
+        assert_eq!(db.recorded_writer_generation().unwrap(), Some(7));
+    }
+
+    #[test]
+    fn an_older_generation_is_refused_and_leaves_the_record_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        open_test_db(&path).record_writer_generation(7).unwrap();
+
+        let db = open_test_db(&path);
+        let refused = db.record_writer_generation(6);
+        assert!(
+            matches!(refused, Err(DatabaseError::StaleWriter { recorded: 7, presented: 6 })),
+            "{refused:?}"
+        );
+        assert_eq!(db.recorded_writer_generation().unwrap(), Some(7));
+    }
+}

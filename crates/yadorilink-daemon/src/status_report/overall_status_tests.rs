@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use super::*;
+use yadorilink_ipc_proto::daemonctl::DegradedCause as Cause;
 
 /// A link with every status axis in its healthiest state (`Protected`,
 /// `AvailableNow`) and nothing else wrong -- the baseline every test
@@ -300,6 +301,32 @@ fn a_client_below_the_minimum_supported_version_is_update_required() {
     assert!(reasons.is_empty());
 }
 
+/// The disk-space wait is its own rollup code from the typed flag, whatever the detail text says,
+/// and it does not make the folder a stopped one. Text alone never sets it.
+#[test]
+fn waiting_for_disk_space_is_keyed_by_the_flag_not_the_reason_text() {
+    let waiting = LinkStatus {
+        degraded: true,
+        degraded_cause: Cause::WaitingForDiskSpace as i32,
+        degraded_reason: "any wording at all".into(),
+        ..protected_link("group-1")
+    };
+    let (state, reasons) =
+        overall_status(&StatusResponse { links: vec![waiting], ..Default::default() });
+    assert_eq!(state, OverallState::Attention);
+    assert_eq!(reasons, vec!["waiting_for_disk_space:group-1".to_string()]);
+
+    let lookalike = LinkStatus {
+        degraded: true,
+        degraded_reason: "Waiting for disk space on /v".into(),
+        ..protected_link("group-1")
+    };
+    let (state, reasons) =
+        overall_status(&StatusResponse { links: vec![lookalike], ..Default::default() });
+    assert_eq!(state, OverallState::Degraded);
+    assert_eq!(reasons, vec!["degraded:group-1".to_string()]);
+}
+
 /// A degraded link (disk-pressure elsewhere) takes
 /// precedence over -- and is reported alongside -- an unrelated
 /// attention-level issue.
@@ -364,7 +391,8 @@ fn an_ownership_lost_link_reports_its_own_reason() {
     let response = StatusResponse {
         links: vec![LinkStatus {
             degraded: true,
-            degraded_reason: crate::link_registry::OWNERSHIP_LOST_REASON.into(),
+            degraded_cause: Cause::OwnershipLost as i32,
+            degraded_reason: "any wording at all".into(),
             ..protected_link("group-1")
         }],
         ..Default::default()
@@ -372,6 +400,43 @@ fn an_ownership_lost_link_reports_its_own_reason() {
     let (state, reasons) = overall_status(&response);
     assert_eq!(state, OverallState::Degraded);
     assert_eq!(reasons, vec!["ownership_lost:group-1".to_string()]);
+}
+
+/// Every typed cause has its own rollup code, whatever the detail text says, and the text alone
+/// never picks one: the old exact-text constants no longer decide anything.
+#[test]
+fn every_degraded_cause_has_its_own_rollup_code_and_text_never_picks_one() {
+    for (cause, code) in [
+        (Cause::FileWatchLimit, "file_watch_limit"),
+        (Cause::OwnershipLost, "ownership_lost"),
+        (Cause::NotJoined, "not_joined"),
+        (Cause::Unspecified, "degraded"),
+    ] {
+        let link = LinkStatus {
+            degraded: true,
+            degraded_cause: cause as i32,
+            degraded_reason: "any wording at all".into(),
+            ..protected_link("group-1")
+        };
+        let (state, reasons) =
+            overall_status(&StatusResponse { links: vec![link], ..Default::default() });
+        assert_eq!(state, OverallState::Degraded, "{code}");
+        assert_eq!(reasons, vec![format!("{code}:group-1")]);
+    }
+    for text in [
+        crate::link_registry::OWNERSHIP_LOST_REASON,
+        crate::link_registry::NOT_JOINED_REASON,
+        "OS file watch limit reached; this folder is not syncing.",
+    ] {
+        let link = LinkStatus {
+            degraded: true,
+            degraded_reason: text.into(),
+            ..protected_link("group-1")
+        };
+        let (_, reasons) =
+            overall_status(&StatusResponse { links: vec![link], ..Default::default() });
+        assert_eq!(reasons, vec!["degraded:group-1".to_string()], "{text}");
+    }
 }
 
 /// The daemon's rollup and the canonical product summary must not disagree about whether a
@@ -546,7 +611,7 @@ fn the_reported_protection_and_the_rollup_agree() {
             }],
             ..Default::default()
         };
-        super::status_dimensions::fill_link_dimensions(&mut response);
+        crate::status_dimensions::fill_link_dimensions(&mut response);
         let reported =
             yadorilink_product_view::ProtectionSummary::from_link(&response.links[0]).protection;
         assert_eq!(reported, protection, "{durability:?}");
@@ -650,4 +715,29 @@ fn reclaimable_bytes_belong_to_entries_on_the_block_store_volume() {
     let mut none = vec![volume("<block store>")];
     attribute_reclaimable(&mut none, &std::collections::HashMap::new(), |_| true);
     assert_eq!(none[0].reclaimable_bytes, 0);
+}
+
+/// The coordination block is a first-class reason (never healthy meanwhile), keyed exactly as the
+/// product view reads it back, and nothing at all when there is no block.
+#[test]
+fn a_coordination_block_adds_its_key_first_and_is_never_healthy() {
+    use yadorilink_fapi_client::CoordinationBlock;
+    let (mut state, mut reasons) = overall_status(&StatusResponse::default());
+    apply_coordination_block(None, &mut state, &mut reasons);
+    assert_eq!((state, reasons.clone()), (OverallState::Healthy, vec![]));
+
+    let consent = CoordinationBlock::TermsConsentRequired { terms_version: Some("v".into()) };
+    apply_coordination_block(Some(&consent), &mut state, &mut reasons);
+    assert_eq!(state, OverallState::Attention);
+    assert_eq!(reasons, ["terms_consent_required"]);
+
+    let mut reasons = vec!["held:g1".to_owned()];
+    let mut state = OverallState::Degraded;
+    apply_coordination_block(Some(&CoordinationBlock::SignInRequired), &mut state, &mut reasons);
+    assert_eq!(state, OverallState::Degraded, "a worse state is not softened");
+    assert_eq!(reasons, ["sign_in_required", "held:g1"]);
+    for key in ["terms_consent_required", "sign_in_required"] {
+        let item = yadorilink_product_view::Attention::from_reason(key).item;
+        assert_eq!(item.key(), key, "the daemon's key and the product view's key agree");
+    }
 }
