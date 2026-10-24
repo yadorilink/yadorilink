@@ -33,6 +33,7 @@ while [ $# -gt 0 ]; do
     --base-url) BASE_URL="$2"; shift 2 ;;
     --rollout) ROLLOUT="$2"; shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
+    --trust-chain) TRUST_CHAIN="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
@@ -86,6 +87,7 @@ python3 .github/release/generate-update-manifest.py generate \
   --artifacts "$artifacts_json" \
   --sign-tool "$SIGN_TOOL" \
   --require-signature \
+  ${TRUST_CHAIN:+--trust-chain "$TRUST_CHAIN"} \
   --out "$OUT"
 
 rm -f "$artifacts_json"

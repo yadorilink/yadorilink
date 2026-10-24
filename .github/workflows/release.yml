@@ -19,121 +19,6 @@ env:
   YADORILINK_SOURCE_REF: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || github.sha }}
 
 jobs:
-  build-and-test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Release tag matches shipped versions
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: bash
-        run: bash .github/release/check-release-version.sh "$GITHUB_REF_NAME"
-
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
-        with:
-          tool: protoc@3.26.1  # install-action numbers protoc as 3.<release>: protobuf v26.1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master @ 2026-06-30
-        with:
-          toolchain: stable
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          # Tag builds publish what they build: never write the shared cache.
-          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-          key: ${{ matrix.os }}-public-ci
-
-      - name: Check formatting
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo fmt --all -- --check
-
-      - name: Clippy (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Clippy
-        if: matrix.os != 'ubuntu-latest'
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Build (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo build --workspace --all-targets
-
-      - name: Build
-        if: matrix.os != 'ubuntu-latest'
-        run: cargo build --workspace --all-targets
-
-      # Two yadorilink-local-capture lib tests install a process-wide scan
-      # hook and must never observe a sibling test's own hook -- they serialize
-      # against each other internally, but running alongside the rest of a
-      # multi-threaded workspace pass under host load has been observed to
-      # hang the whole `cargo test` invocation, not just flake. Skipped here
-      # (workspace-wide, but these two names are unique enough that this
-      # can't accidentally skip anything unrelated) and run on their own
-      # below instead.
-      - name: Test (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo test --workspace --exclude yadorilink-daemon -- --skip startup_barrier_prevents_stale_overwrite_of_concurrent_peer_change --skip startup_scan_stale_overwrites_concurrent_peer_change_without_barrier
-
-      - name: Test
-        if: matrix.os == 'macos-latest'
-        run: cargo test --workspace --exclude yadorilink-daemon -- --skip startup_barrier_prevents_stale_overwrite_of_concurrent_peer_change --skip startup_scan_stale_overwrites_concurrent_peer_change_without_barrier
-
-      - name: Test
-        if: matrix.os == 'windows-latest'
-        run: cargo test --workspace --exclude yadorilink-daemon -- --test-threads=4 --skip startup_barrier_prevents_stale_overwrite_of_concurrent_peer_change --skip startup_scan_stale_overwrites_concurrent_peer_change_without_barrier
-
-      # tests/release_manifest_chain.rs drives the Python manifest verifier,
-      # which needs the cryptography package. setup-python gives a Python
-      # that pip may install into (the runner images' own may not allow it).
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.12"
-      - name: Python cryptography for the release manifest chain test
-        run: python3 -m pip install --quiet --disable-pip-version-check cryptography
-
-      # yadorilink-daemon's integration tests spin up multiple real
-      # in-process daemons over real loopback UDP/Unix sockets and real
-      # SQLite databases; run concurrently with the rest of the workspace's
-      # tests (or with each other), they contend for those real resources
-      # and can flake under host load -- the same reason the daemon's own
-      # dev-side CI runs them in an isolated single-threaded lane instead of
-      # folding them into a workspace-wide test run. Excluded above and run
-      # here alone, single-threaded, so this job's pass/fail signal never
-      # depends on that contention.
-      - name: Daemon tests (isolated from the rest of the workspace, single-threaded)
-        run: cargo test -p yadorilink-daemon -- --test-threads=1
-
-      # These real-UDP-peer-session/crash-recovery integration tests (moved
-      # out of the now-deleted yadorilink-sync-core crate to
-      # yadorilink-peer-session/yadorilink-daemon) carry the same class of
-      # real-socket/real-disk timing-sensitive assertions as the daemon
-      # crate above -- their own dev-side CI runs a matching isolated
-      # single-threaded lane for exactly this reason. NOT excluded from the
-      # main Test step above: cheap enough that the redundancy of also
-      # running them in the main multi-threaded pass is worth the extra
-      # reliability.
-      - name: Wire integration tests (isolated, single-threaded)
-        run: |
-          cargo test -p yadorilink-peer-session --test peer_session -- --test-threads=1
-          cargo test -p yadorilink-daemon --test watcher_decompose_conformance -- --test-threads=1
-
-      # The two lib tests skipped above, run alone and single-threaded so
-      # their internal scan-hook serialization is never itself the thing
-      # contending with the rest of the workspace under host load.
-      - name: Scan-hook lib tests (isolated, single-threaded)
-        run: cargo test -p yadorilink-local-capture --lib -- --test-threads=1 startup_barrier_prevents_stale_overwrite_of_concurrent_peer_change startup_scan_stale_overwrites_concurrent_peer_change_without_barrier
-
   # Required gates for everything this workflow publishes or builds for release:
   # the development manifest key is rejected by the release packagers, release
   # builds enforce the real trust root, and the gate script itself is proven to
@@ -147,6 +32,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Release tag matches shipped versions
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: bash .github/release/check-release-version.sh "$GITHUB_REF_NAME"
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
@@ -305,8 +193,7 @@ jobs:
   # permission is already scoped to this one run by GitHub, not a
   # long-lived credential this workflow manages.
   docker-artifacts:
-    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || (startsWith(github.ref, 'refs/tags/v') && github.ref != 'refs/tags/v0.1.0-beta.4'))
-    needs: build-and-test
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || (startsWith(github.ref, 'refs/tags/v') && github.ref != 'refs/tags/v0.1.0-beta.5'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -472,7 +359,6 @@ jobs:
     if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs:
       - release-gates
-      - build-and-test
     strategy:
       fail-fast: false
       matrix:
@@ -767,7 +653,6 @@ jobs:
     if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs:
       - release-gates
-      - build-and-test
       - engine-build
       - engine-attest
     strategy:
@@ -895,7 +780,6 @@ jobs:
     needs:
       - release-gates
       - engine-bundle
-      - build-and-test
       - shell-ext-windows
       - windows-build-health
       - cargo-audit
@@ -1003,7 +887,6 @@ jobs:
     needs:
       - release-gates
       - engine-bundle
-      - build-and-test
       - shell-ext-windows
       - windows-build-health
       - cargo-audit

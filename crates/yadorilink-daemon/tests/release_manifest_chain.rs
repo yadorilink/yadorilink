@@ -111,6 +111,9 @@ fn build_manifest_for(
     version: &str,
     out_path: &Path,
 ) -> Output {
+    // The throwaway key is the root here, so the chain published for the real root cannot apply.
+    let empty_chain = out_path.with_extension("chain.json");
+    std::fs::write(&empty_chain, "[]").unwrap();
     run(Command::new("bash")
         .arg(".github/release/build-channel-manifest.sh")
         .args(["--channel", channel])
@@ -122,6 +125,8 @@ fn build_manifest_for(
         .args(["--base-url", "https://example.invalid/download"])
         .arg("--out")
         .arg(out_path)
+        .arg("--trust-chain")
+        .arg(&empty_chain)
         .env("MANIFEST_SIGNING_KEY", &key.private_hex)
         .env("MANIFEST_SIGNING_KEY_ID", KEY_ID)
         .env("YADORILINK_SIGN_MANIFEST", signer()))
