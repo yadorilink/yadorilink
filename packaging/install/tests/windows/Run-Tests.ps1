@@ -341,9 +341,9 @@ try {
     # the `irm | iex` form: script text evaluated, configured through environment variables
     $p = NewPrefix 21
     $env:YADORILINK_INSTALL_TEST = '1'; $env:YADORILINK_INSTALL_PUBKEY_HEX = Pub 's1'; $env:YADORILINK_INSTALL_BASE_URL = "$Base/s1"; $env:YADORILINK_INSTALL_ARCH = 'AMD64'; $env:YADORILINK_INSTALL_KEY_ID = (Get-Content (Join-Path $Srv 's1\key_id') -Raw).Trim()
-    $env:YADORILINK_PREFIX = $p; $env:YADORILINK_YES = '1'; $env:YADORILINK_NO_MODIFY_PATH = '1'
+    $env:YADORILINK_PREFIX = $p; $env:YADORILINK_YES = '1'; $env:YADORILINK_NO_MODIFY_PATH = '1'; $env:YADORILINK_INSTALL_MIN_GENERATED_AT = '2000-01-01T00:00:00Z'
     $o = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Get-Content -Raw '$Installer' | Invoke-Expression; exit 0" 2>&1 | ForEach-Object { "$_" }) -join "`n"
-    foreach ($v in 'YADORILINK_INSTALL_TEST', 'YADORILINK_INSTALL_PUBKEY_HEX', 'YADORILINK_INSTALL_BASE_URL', 'YADORILINK_INSTALL_ARCH', 'YADORILINK_INSTALL_KEY_ID', 'YADORILINK_PREFIX', 'YADORILINK_YES', 'YADORILINK_NO_MODIFY_PATH') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
+    foreach ($v in 'YADORILINK_INSTALL_TEST', 'YADORILINK_INSTALL_PUBKEY_HEX', 'YADORILINK_INSTALL_BASE_URL', 'YADORILINK_INSTALL_ARCH', 'YADORILINK_INSTALL_KEY_ID', 'YADORILINK_PREFIX', 'YADORILINK_YES', 'YADORILINK_NO_MODIFY_PATH', 'YADORILINK_INSTALL_MIN_GENERATED_AT') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
     if ((Test-Path (Join-Path $p 'bin\yadorilink.exe')) -and $o -like '*Installed YadoriLink 0.2.0*') { Ok 'iex form installs' } else { Bad 'iex form' $o }
 
     # a prompt that interpolates "$name?" prints nothing for the name (PowerShell reads "name?" as the variable)
