@@ -19,8 +19,10 @@ replay floor, and no pinned key is the public development key (unless --allow-de
 CI passes it for a tagged release, so an engine tag cannot ship installers that pin no verifier.
 --require-floor likewise fails while the manifest floor is empty: installers keep no state, so
 an unset floor lets any manifest ever signed (an old one, with an unexpired window or not
-yet expired) pass a first install. Set it to the `generated_at` of the first manifest that
-carries `expires_at` (`set --min-generated-at`), and roll it forward when a release needs to.
+yet expired) pass a first install. Set it (`set --min-generated-at T`) to an explicit UTC bootstrap floor
+taken from `date -u` before the first production release, after establishing that no
+production-valid manifest predates T; every production manifest's generated_at must be >= T
+(inclusive; `publish.py plan` enforces it). Roll it forward when a release needs to.
 """
 
 from __future__ import annotations
@@ -135,7 +137,7 @@ def check(sh_text: str, ps1_text: str, allow_dev: bool = False, require_verifier
     if require_floor:
         for name, pins in (("install.sh", sh), ("install.ps1", ps)):
             if not pins["min_generated_at"]:
-                out.append(f"{name} pins no manifest floor (`pins.py set --min-generated-at` the generated_at of the first manifest with expires_at first)")
+                out.append(f"{name} pins no manifest floor (`pins.py set --min-generated-at T` with an explicit UTC bootstrap floor from `date -u`)")
     if sh["trust_set"] != ps["trust_set"]:
         out.append("install.sh and install.ps1 pin different trust sets")
     if sh["min_generated_at"] != ps["min_generated_at"]:
@@ -182,6 +184,9 @@ def self_test() -> int:
     if problems:
         print("self-test: the real installers fail:", *problems, sep="\n  ")
         return 1
+    # The cases below start from the real installers with the floor cleared, so they hold
+    # whether or not the committed tree has its bootstrap floor pinned.
+    sh_text, ps_text = apply(sh_text, ps_text, {"min_generated_at": ""})
     ok = "k1:" + "a" * 64
     other = "k2:" + "b" * 64
     cases = []

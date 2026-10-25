@@ -47,7 +47,7 @@ function Inst([string]$Name, [string]$KeyFrom, [string[]]$More, [string]$MinGen 
     $env:YADORILINK_INSTALL_PUBKEY_HEX = Pub $KeyFrom
     $env:YADORILINK_INSTALL_KEY_ID = (Get-Content (Join-Path $Srv "$KeyFrom\key_id") -Raw).Trim()
     $env:YADORILINK_INSTALL_BASE_URL = "$Base/$Name"
-    $env:YADORILINK_INSTALL_MIN_GENERATED_AT = $MinGen
+    $env:YADORILINK_INSTALL_MIN_GENERATED_AT = $(if ($MinGen) { $MinGen } else { '2000-01-01T00:00:00Z' })
     $env:YADORILINK_INSTALL_ARCH = 'AMD64'
     $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Installer, '-Prefix', $Prefix, '-Yes', '-NoModifyPath') + $More
     $script:Out = (& powershell.exe @a 2>&1 | ForEach-Object { "$_" }) -join "`n"

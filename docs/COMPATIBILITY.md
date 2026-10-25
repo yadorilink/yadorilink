@@ -48,7 +48,7 @@ rejected with a message asking to restart or finish updating.
 
 This section states exactly what happens while some of your devices run a newer or
 older release than others. It applies to the pre-1.0 line, including
-v0.1.0-beta.6, and complements the policy above and [CUTOVER.md](CUTOVER.md) (the generation
+v0.1.0-beta.7, and complements the policy above and [CUTOVER.md](CUTOVER.md) (the generation
 ledger). The rule is simple: **there is no mixed-version operation.** Devices on different
 protocol generations do not sync with each other. They refuse each other
 cleanly, and nothing is lost while they wait for the update.
@@ -121,11 +121,11 @@ older one (table above). Going back to an older release therefore means
 installing it on every device and recreating local state when the schema
 differs; the release notes say when.
 
-### Minimum supported version for v0.1.0-beta.6
+### Minimum supported version for v0.1.0-beta.7
 
-v0.1.0-beta.6 is on the same protocol generation as v0.1.0-beta.5, the first
+v0.1.0-beta.7 is on the same protocol generation as v0.1.0-beta.5, the first
 public release (`PROTOCOL_VERSION` 4, `RPC_VERSION` 2). The local state schema changed:
 `SCHEMA_VERSION` is 133 (it was 132 in beta.5). Nothing is migrated, so
-beta.6 refuses a beta.5 state database and the other way round; update every
+beta.7 refuses a beta.5 state database and the other way round; update every
 device and set up again as described in the beta.5 release notes. No build
 before beta.5 was public, so no older peer is supported and none is promised.

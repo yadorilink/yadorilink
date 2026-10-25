@@ -197,7 +197,7 @@ jobs:
   # permission is already scoped to this one run by GitHub, not a
   # long-lived credential this workflow manages.
   docker-artifacts:
-    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || (startsWith(github.ref, 'refs/tags/v') && github.ref != 'refs/tags/v0.1.0-beta.6'))
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || (startsWith(github.ref, 'refs/tags/v') && github.ref != 'refs/tags/v0.1.0-beta.7'))
     needs: verify-gate
     runs-on: ubuntu-latest
     permissions:
@@ -461,7 +461,7 @@ jobs:
           packages=(-p yadorilink-cli -p yadorilink-daemon)
           if [ "$TARGET" = "windows-x86_64" ]; then packages+=(-p yadorilink-client-ffi); fi
           cargo build --release --locked "${packages[@]}" \
-            --features yadorilink-daemon/enforce-release-trust-root
+            --features enforce-release-trust-root
 
       # The Windows shell extension and CfAPI host are their own workspace.
       - name: Build the Windows shell extension
@@ -483,7 +483,7 @@ jobs:
           set -euo pipefail
           cargo build --release --locked --target aarch64-apple-darwin \
             -p yadorilink-cli -p yadorilink-daemon -p yadorilink-client-ffi \
-            --features yadorilink-daemon/enforce-release-trust-root
+            --features enforce-release-trust-root
           .github/release/generate-swift-binding.sh --out "$RUNNER_TEMP/swift-binding"
 
       # The iOS app links the static libraries (device and simulator) and compiles the Swift
@@ -540,16 +540,22 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
           PUBLIC_SHA: ${{ github.sha }}
           REPOSITORY: ${{ github.repository }}
+          YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
         run: |
           set -euo pipefail
+          key_args=()
           if [ "$TAGGED" = "true" ]; then
             channel=beta
             release_tag="$REF_NAME"
+            # A release bundle is refused unless its daemon embeds this key (the build above must
+            # have compiled it in); an unset variable is refused too.
+            key_args=(--release-key-hex "$YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX")
           else
             channel=dev
             release_tag=nightly
           fi
           python3 .github/release/build-engine-bundle.py build \
+            ${key_args[@]+"${key_args[@]}"} \
             --channel "$channel" \
             --target "$TARGET" \
             --root "bin=$BIN_DIR" \

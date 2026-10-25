@@ -59,7 +59,7 @@ $ErrorActionPreference = 'Stop'
 #             (a replay floor for a first install; empty = none).
 # >>> PINS >>>
 $script:TrustSet = @('yadorilink-release-2026-10:cdaf6fbf36a6fa5c8c894fc5012a80bb6c6a73407c9285ac8623d572e9894bd8')
-$script:MinManifestGeneratedAt = ''
+$script:MinManifestGeneratedAt = '2026-10-25T03:57:34Z'
 # <<< PINS <<<
 $script:ManifestBase = 'https://yadori.link/dl'
 

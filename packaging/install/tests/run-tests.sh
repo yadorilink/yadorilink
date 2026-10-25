@@ -66,7 +66,7 @@ inst() {
         YADORILINK_INSTALL_PUBKEY_HEX="$(pub "$keyfrom")" \
         YADORILINK_INSTALL_KEY_ID="$(cat "$SRV/$keyfrom/key_id")" \
         YADORILINK_INSTALL_BASE_URL="${BASEURL_OVERRIDE:-$BASE/$name}" \
-        ${MINGEN:+YADORILINK_INSTALL_MIN_GENERATED_AT="$MINGEN"} \
+        YADORILINK_INSTALL_MIN_GENERATED_AT="${MINGEN:-2000-01-01T00:00:00Z}" \
         ${NOW:+YADORILINK_INSTALL_NOW="$NOW"} \
         YADORILINK_INSTALL_OS="${TOS:-Linux}" YADORILINK_INSTALL_ARCH="${TARCH:-x86_64}" \
         ${TRUSTSET:+YADORILINK_INSTALL_TRUST_SET="$TRUSTSET"} \
@@ -135,7 +135,7 @@ VBASE=$BASE/redir/verifier; inst s1 s1; unset VBASE
 # --- prefix with shell metacharacters stays literal in the profile
 newhome 25; H25=$H
 sh -c 'cd "$1" && mkdir -p "dollar\$tools"' sh "$H"
-env HOME="$H" SHELL=/bin/sh YADORILINK_INSTALL_TEST=1 YADORILINK_INSTALL_PUBKEY_HEX="$(pub s1)" YADORILINK_INSTALL_KEY_ID="$(cat "$SRV/s1/key_id")" \
+env HOME="$H" SHELL=/bin/sh YADORILINK_INSTALL_TEST=1 YADORILINK_INSTALL_MIN_GENERATED_AT=2000-01-01T00:00:00Z YADORILINK_INSTALL_PUBKEY_HEX="$(pub s1)" YADORILINK_INSTALL_KEY_ID="$(cat "$SRV/s1/key_id")" \
     YADORILINK_INSTALL_BASE_URL="$BASE/s1" YADORILINK_INSTALL_OS=Linux YADORILINK_INSTALL_ARCH=x86_64 YADORILINK_INSTALL_VERIFIER_BASE="$BASE/verifier" \
     YADORILINK_INSTALL_VERIFIER_SHA256="$VSHA" sh "$INSTALL" --prefix "$H/it's \$(touch pwned)" --yes > "$T/out" 2>&1; RC=$?
 if [ $RC = 0 ] && [ ! -e pwned ] && (cd "$H" && HOME="$H" sh -c '. ./.profile; command -v yadorilink >/dev/null' && [ ! -e "$H/pwned" ]); then ok "prefix metacharacters stay literal in the profile"; else bad "prefix quoting" "$T/out"; fi
@@ -174,7 +174,7 @@ newhome 23
 TRUSTSET="yadorilink-test-key:$(pub s7other) next-key:$(pub s7)"; inst s7 s7; unset TRUSTSET
 { [ $RC != 0 ] && has "does NOT verify" && nothing_installed; } && ok "trust set: key id bound to its own key" || bad "trust set key binding" "$T/out"
 newhome 8
-env HOME="$H" YADORILINK_INSTALL_TEST=1 YADORILINK_INSTALL_PUBKEY_HEX="$(pub s7)" YADORILINK_INSTALL_KEY_ID=some-other-id \
+env HOME="$H" YADORILINK_INSTALL_TEST=1 YADORILINK_INSTALL_MIN_GENERATED_AT=2000-01-01T00:00:00Z YADORILINK_INSTALL_PUBKEY_HEX="$(pub s7)" YADORILINK_INSTALL_KEY_ID=some-other-id \
     YADORILINK_INSTALL_BASE_URL="$BASE/s7" YADORILINK_INSTALL_OS=Linux YADORILINK_INSTALL_ARCH=x86_64 sh "$INSTALL" --prefix "$H/prefix" --yes > "$T/out" 2>&1; RC=$?
 { [ $RC != 0 ] && has "not one of the pinned release keys" && nothing_installed; } && ok "wrong key id rejected" || bad "wrong key id" "$T/out"
 
@@ -247,7 +247,7 @@ chmod 755 "$H/prefix"
 
 # --- no network, and no release published yet
 newhome 17
-env HOME="$H" YADORILINK_INSTALL_TEST=1 YADORILINK_INSTALL_PUBKEY_HEX="$(pub s1)" YADORILINK_INSTALL_BASE_URL="http://127.0.0.1:1" \
+env HOME="$H" YADORILINK_INSTALL_TEST=1 YADORILINK_INSTALL_MIN_GENERATED_AT=2000-01-01T00:00:00Z YADORILINK_INSTALL_PUBKEY_HEX="$(pub s1)" YADORILINK_INSTALL_BASE_URL="http://127.0.0.1:1" \
     YADORILINK_INSTALL_OS=Linux YADORILINK_INSTALL_ARCH=x86_64 sh "$INSTALL" --prefix "$H/prefix" --yes > "$T/out" 2>&1; RC=$?
 { [ $RC != 0 ] && has "could not reach" && nothing_installed; } && ok "no network fails cleanly" || bad "no network" "$T/out"
 newhome 18; mkdir -p "$SRV/empty"
@@ -279,14 +279,14 @@ inst s1 s1 --uninstall
 { [ $RC != 0 ] && has "another yadorilink install is running" && [ -d "$H/prefix/share/yadorilink" ]; } && ok "uninstall respects the install lock" || bad "uninstall lock" "$T/out"
 # --- bash profile choice keeps an existing .profile
 newhome 28; printf 'echo hi\n' > "$H/.profile"
-env HOME="$H" SHELL=/bin/bash YADORILINK_INSTALL_TEST=1 YADORILINK_INSTALL_PUBKEY_HEX="$(pub s1)" YADORILINK_INSTALL_KEY_ID="$(cat "$SRV/s1/key_id")" \
+env HOME="$H" SHELL=/bin/bash YADORILINK_INSTALL_TEST=1 YADORILINK_INSTALL_MIN_GENERATED_AT=2000-01-01T00:00:00Z YADORILINK_INSTALL_PUBKEY_HEX="$(pub s1)" YADORILINK_INSTALL_KEY_ID="$(cat "$SRV/s1/key_id")" \
     YADORILINK_INSTALL_BASE_URL="$BASE/s1" YADORILINK_INSTALL_OS=Linux YADORILINK_INSTALL_ARCH=x86_64 YADORILINK_INSTALL_VERIFIER_BASE="$BASE/verifier" \
     YADORILINK_INSTALL_VERIFIER_SHA256="$VSHA" sh "$INSTALL" --prefix "$H/prefix" --yes > "$T/out" 2>&1; RC=$?
 { [ $RC = 0 ] && [ ! -e "$H/.bash_profile" ] && grep -q 'yadorilink (' "$H/.profile"; } && ok "bash users keep their existing login profile" || bad "bash profile" "$T/out"
 
 # --- profile path with sed metacharacters is recorded and removed correctly
 newhome 29; mkdir -p "$H/a&b|c"
-env HOME="$H/a&b|c" SHELL=/bin/sh YADORILINK_INSTALL_TEST=1 YADORILINK_INSTALL_PUBKEY_HEX="$(pub s1)" YADORILINK_INSTALL_KEY_ID="$(cat "$SRV/s1/key_id")" \
+env HOME="$H/a&b|c" SHELL=/bin/sh YADORILINK_INSTALL_TEST=1 YADORILINK_INSTALL_MIN_GENERATED_AT=2000-01-01T00:00:00Z YADORILINK_INSTALL_PUBKEY_HEX="$(pub s1)" YADORILINK_INSTALL_KEY_ID="$(cat "$SRV/s1/key_id")" \
     YADORILINK_INSTALL_BASE_URL="$BASE/s1" YADORILINK_INSTALL_OS=Linux YADORILINK_INSTALL_ARCH=x86_64 YADORILINK_INSTALL_VERIFIER_BASE="$BASE/verifier" \
     YADORILINK_INSTALL_VERIFIER_SHA256="$VSHA" sh "$INSTALL" --prefix "$H/prefix" --yes > "$T/out" 2>&1
 env HOME="$H/a&b|c" sh "$INSTALL" --prefix "$H/prefix" --yes --uninstall >> "$T/out" 2>&1; RC=$?
@@ -300,7 +300,7 @@ inst s1 s1; inst n1 n1 --channel nightly
 # --- two prefixes sharing one profile each keep their own PATH block
 newhome 31
 inst s1 s1 --prefix "$H/prefix"; 
-env HOME="$H" SHELL=/bin/sh YADORILINK_INSTALL_TEST=1 YADORILINK_INSTALL_PUBKEY_HEX="$(pub s1)" YADORILINK_INSTALL_KEY_ID="$(cat "$SRV/s1/key_id")" \
+env HOME="$H" SHELL=/bin/sh YADORILINK_INSTALL_TEST=1 YADORILINK_INSTALL_MIN_GENERATED_AT=2000-01-01T00:00:00Z YADORILINK_INSTALL_PUBKEY_HEX="$(pub s1)" YADORILINK_INSTALL_KEY_ID="$(cat "$SRV/s1/key_id")" \
     YADORILINK_INSTALL_BASE_URL="$BASE/s1" YADORILINK_INSTALL_OS=Linux YADORILINK_INSTALL_ARCH=x86_64 YADORILINK_INSTALL_VERIFIER_BASE="$BASE/verifier" \
     YADORILINK_INSTALL_VERIFIER_SHA256="$VSHA" sh "$INSTALL" --prefix "$H/second prefix" --yes > "$T/out" 2>&1
 env HOME="$H" sh "$INSTALL" --prefix "$H/second prefix" --yes --uninstall >> "$T/out" 2>&1; RC=$?

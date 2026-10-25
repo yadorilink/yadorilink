@@ -11,7 +11,7 @@ prerelease suffix (e.g. `v0.1.0-beta.1`).
 
 ## [Unreleased]
 
-## [v0.1.0-beta.6] - 2026-10-25
+## [v0.1.0-beta.7] - 2026-10-25
 
 ### Added
 - The macOS engine binaries are signed and notarized.

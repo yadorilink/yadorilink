@@ -49,7 +49,7 @@ function Inst([string]$Name, [string]$KeyFrom, [string]$Prefix, [string[]]$More,
     $env:YADORILINK_INSTALL_PUBKEY_HEX = Pub $KeyFrom
     $env:YADORILINK_INSTALL_KEY_ID = (Get-Content (Join-Path $Srv "$KeyFrom\key_id") -Raw).Trim()
     $env:YADORILINK_INSTALL_BASE_URL = $(if ($script:BaseOverride) { $script:BaseOverride } else { "$Base/$Name" })
-    $env:YADORILINK_INSTALL_MIN_GENERATED_AT = $(if ($script:MinGen) { $script:MinGen } else { $null })
+    $env:YADORILINK_INSTALL_MIN_GENERATED_AT = $(if ($script:MinGen) { $script:MinGen } else { '2000-01-01T00:00:00Z' })
     $env:YADORILINK_INSTALL_NOW = $(if ($script:Now) { $script:Now } else { $null })
     $env:YADORILINK_INSTALL_ARCH = $Arch
     $args_ = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Installer, '-Prefix', $Prefix, '-Yes') + $More

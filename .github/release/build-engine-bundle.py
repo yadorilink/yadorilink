@@ -307,6 +307,11 @@ def source_notice(repository: str, release_tag: str, public_commit_sha: str, con
     return "\n".join(lines).encode()
 
 
+# The public development manifest key; a release never pins it. (The daemon's release gate keeps
+# its text in every build, so its presence in a daemon proves nothing; the release key's is what counts.)
+DEV_MANIFEST_KEY = "00e033f866c263139ff4afd165e75bae3cfca67eb32399dddd6e33a3251af1e3"
+
+
 def build_identity(args):
     """(kind, config, config_digest) of a build, known before any binary is built."""
     config = dict(item.split("=", 1) for item in args.build_config)
@@ -366,6 +371,15 @@ def build(args) -> int:
     for name in layout["programs"]:
         if not embeds(files[name], expected_id):
             raise SystemExit(f"error: {name} does not embed the release identity {expected_id}")
+    if kind == "release" and layout.get("trust_root", True):
+        # The compiled-in trust root is the one thing a release must get right: `cargo --features
+        # pkg/feature` was found to be silently ignored for a selected package, which built a daemon
+        # without the release key. So the bundle is refused unless the daemon really embeds it.
+        key = (args.release_key_hex or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", key) or key == DEV_MANIFEST_KEY:
+            raise SystemExit("error: a release build needs --release-key-hex, the 64-hex release manifest public key (not the development key)")
+        if key.encode() not in files[daemon]:
+            raise SystemExit(f"error: {daemon} does not embed the release manifest key {key} (was it built with the enforce-release-trust-root feature and the release key variables?)")
     files["SOURCE.txt"] = source_notice(args.repository, args.release_tag, args.public_commit_sha, config, config_digest, kind)
 
     sums = "".join(f"{sha256(files[n])}  {n}\n" for n in sorted(files)).encode()
@@ -700,7 +714,9 @@ def self_test() -> int:
                     (roots[root] / rel_dir / f"{name}{suffix}").write_bytes(f"{name}{suffix}".encode())
                 (roots[root] / rel_dir / "ignored.txt").write_bytes(b"not part of the layout")
 
-        def run_build(target: str, out: Path, channel: str = "beta", features: str | None = None, embed: bool = True, expect: str | None = None, **extra):
+        TEST_KEY = "11" * 32
+
+        def run_build(target: str, out: Path, channel: str = "beta", features: str | None = None, embed: bool = True, expect: str | None = None, with_key: bool = True, **extra):
             if features is None:
                 features = "" if channel == "dev" else "yadorilink-daemon/enforce-release-trust-root"
             ident = ["--channel", channel, "--target", target, "--build-config", f"features={features}", "--public-commit-sha", sha]
@@ -708,13 +724,15 @@ def self_test() -> int:
             for name in LAYOUTS[target]["programs"]:
                 for layout_name, root, rel, _ in LAYOUTS[target]["files"]:
                     if layout_name == name:
-                        (roots[root] / rel).write_bytes(f"{target}:{name}:{rid if embed else 'none'}".encode())
+                        (roots[root] / rel).write_bytes(f"{target}:{name}:{rid if embed else 'none'}:{TEST_KEY if with_key else ''}".encode())
             argv = [
                 "build", *ident, "--expect-release-id", expect or rid, "--repository", "o/r", "--release-tag", "v1.0.0",
                 "--license", str(lic), "--third-party-licenses", str(tpl), "--api-version-source", str(api), "--out-dir", str(out),
             ]
             for key, path in roots.items():
                 argv += ["--root", f"{key}={path}"]
+            if channel != "dev" and "release_key_hex" not in extra:
+                argv += ["--release-key-hex", TEST_KEY]
             for k, v in extra.items():
                 argv += [f"--{k.replace('_', '-')}", v]
             return build(parse(argv))
@@ -943,6 +961,10 @@ def self_test() -> int:
             ("a release bundle without the release trust root", {"channel": "beta", "features": ""}),
             ("programs that do not embed the release identity", {"embed": False}),
             ("programs built for another release identity", {"expect": "a" * 40 + ":" + "0" * 64}),
+            ("a daemon that lacks the release manifest key", {"with_key": False}),
+            ("a daemon that lacks the key it is told to carry", {"release_key_hex": "22" * 32}),
+            ("a release build given the development key", {"release_key_hex": DEV_MANIFEST_KEY}),
+            ("a release build given no key", {"release_key_hex": ""}),
         ]:
             try:
                 run_build("macos-aarch64", tmp / "bad-kind", **kwargs)
@@ -1066,6 +1088,7 @@ def parse(argv):
     sub.add_parser("release-id", parents=[ident], help="print the release_id the binaries must embed")
     b = sub.add_parser("build", parents=[ident])
     b.add_argument("--expect-release-id", required=True, metavar="ID", help="the release_id the binaries were built to embed (from release-id); the build refuses a mismatch or a program that lacks it")
+    b.add_argument("--release-key-hex", default="", metavar="HEX", help="release manifest public key the daemon must embed (required for a release build of a layout with a trust root)")
     b.add_argument("--root", action="append", default=[], metavar="KEY=DIR", help="source root named by the layout")
     b.add_argument("--license", default=str(ROOT / "LICENSE"))
     b.add_argument("--third-party-licenses", required=True, metavar="FILE", help="notice for the crates in this bundle (generate-third-party-licenses.sh)")
