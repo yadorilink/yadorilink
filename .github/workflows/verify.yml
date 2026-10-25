@@ -168,6 +168,13 @@ jobs:
               --skip rotation_under_the_lock_keeps_the_grant_alive
               --skip rotation_child
               --skip a_process_stays_authenticated_across_the_five_minute_access_token_lifetime
+          - lane: embedded shape
+            timeout: 45
+            # Own invocation: in the workspace run Cargo unifies the daemon's `process-model`
+            # feature on, and the tests that pin the embedded engine's shape step aside.
+            run: >-
+              env YADORILINK_EXPECT_EMBEDDED_SHAPE=1
+              cargo test --no-fail-fast -p yadorilink-embedded-host -p yadorilink-mobile-ffi
           - lane: daemon lib
             timeout: 45
             run: cargo test --no-fail-fast -p yadorilink-daemon --lib -- --test-threads=1
@@ -399,6 +406,13 @@ jobs:
           --skip rotation_under_the_lock_keeps_the_grant_alive
           --skip rotation_child
           --skip a_process_stays_authenticated_across_the_five_minute_access_token_lifetime
+      - name: Embedded shape tests
+        if: matrix.lane == 'workspace' && always()
+        # Own invocation: in the workspace run Cargo unifies the daemon's `process-model` feature
+        # on, and the tests that pin the embedded engine's shape step aside.
+        env:
+          YADORILINK_EXPECT_EMBEDDED_SHAPE: '1'
+        run: .github/checks/run-logged.sh cargo test --no-fail-fast -p yadorilink-embedded-host -p yadorilink-mobile-ffi
       - name: CLI tests (single-threaded)
         if: matrix.lane == 'workspace' && always()
         run: .github/checks/run-logged.sh cargo test --no-fail-fast -p yadorilink-cli --tests -- --test-threads=1
@@ -471,6 +485,13 @@ jobs:
           --skip rotation_under_the_lock_keeps_the_grant_alive
           --skip rotation_child
           --skip a_process_stays_authenticated_across_the_five_minute_access_token_lifetime
+      - name: Embedded shape tests
+        if: matrix.lane == 'workspace' && always()
+        # Own invocation: in the workspace run Cargo unifies the daemon's `process-model` feature
+        # on, and the tests that pin the embedded engine's shape step aside.
+        env:
+          YADORILINK_EXPECT_EMBEDDED_SHAPE: '1'
+        run: .github/checks/run-logged.sh cargo test --no-fail-fast -p yadorilink-embedded-host -p yadorilink-mobile-ffi
       - name: Sync substrate tests (single-threaded)
         if: matrix.lane == 'workspace' && always()
         # Own step, one test at a time, as on Linux: the relay tests bind real

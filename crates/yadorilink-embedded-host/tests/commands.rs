@@ -86,7 +86,7 @@ fn a_link_that_the_engine_refuses_fails_with_its_message_and_changes_nothing() {
 #[test]
 fn an_ordinary_folder_is_not_linked_without_a_change_source() {
     let _serial = serialized();
-    if ordinary_folder_links_supported() {
+    if support::desktop_shaped_skip() {
         return; // this build has a watcher
     }
     let (host, _area) = running_host();

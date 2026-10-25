@@ -123,9 +123,26 @@ fn a_second_engine_over_the_same_database_is_a_typed_start_failure() {
     first.stop().unwrap();
 }
 
+/// For a test that only holds in the embedded shape: true when this build is desktop-shaped
+/// (a `--workspace` build unifies the daemon's `process-model` feature on) and the test should
+/// return. CI's dedicated embedded-shape run sets `YADORILINK_EXPECT_EMBEDDED_SHAPE`, and there
+/// a desktop-shaped build is a failure, not a skip.
+fn desktop_shaped_skip() -> bool {
+    if !ordinary_folder_links_supported() {
+        return false;
+    }
+    assert!(
+        std::env::var_os("YADORILINK_EXPECT_EMBEDDED_SHAPE").is_none(),
+        "this run was to pin the embedded shape, but the daemon's process model is on"
+    );
+    true
+}
+
 #[test]
 fn linking_an_ordinary_folder_is_refused_as_no_change_source() {
-    assert!(!ordinary_folder_links_supported());
+    if desktop_shaped_skip() {
+        return;
+    }
     let area = area();
     let host = MobileHost::new(area.config.clone());
     host.start().unwrap();
@@ -236,18 +253,21 @@ fn refusals_of_every_family_arrive_typed() {
     host.start().unwrap();
     let folder = tempfile::tempdir().unwrap();
 
-    // An ordinary folder in a share command: no change source.
-    let create = CreateShareRequest {
-        group_name: "Photos".into(),
-        folder: ShareFolder::Ordinary {
-            local_path: folder.path().display().to_string(),
-            create_if_missing: false,
-        },
-        on_demand: false,
-        acknowledge_risks: true,
-    };
-    let refused = host.create_share(create, &fresh(), Some(30_000)).expect_err("refused");
-    assert!(matches!(refused, CallFailure::NoChangeSource { .. }), "{refused:?}");
+    // An ordinary folder in a share command: no change source (only where the build has none;
+    // a `--workspace` build is desktop-shaped, see the test above).
+    if !desktop_shaped_skip() {
+        let create = CreateShareRequest {
+            group_name: "Photos".into(),
+            folder: ShareFolder::Ordinary {
+                local_path: folder.path().display().to_string(),
+                create_if_missing: false,
+            },
+            on_demand: false,
+            acknowledge_risks: true,
+        };
+        let refused = host.create_share(create, &fresh(), Some(30_000)).expect_err("refused");
+        assert!(matches!(refused, CallFailure::NoChangeSource { .. }), "{refused:?}");
+    }
 
     // A link the engine does not have, with a group expectation: the typed mismatch is only for
     // a link that exists, so an unknown link is the plain failure.
@@ -309,13 +329,22 @@ fn a_sign_in_starts_and_cancels_and_its_id_dies_with_the_engine() {
     host.cancel_sign_in(id, &fresh(), Some(30_000)).unwrap();
     host.cancel_sign_in(id, &fresh(), Some(30_000)).unwrap();
     // The sign-in ends as cancelled, or as failed when the coordination service was refused
-    // before the cancel; it never ends as signed in.
-    let step = host.poll_sign_in(id, 0, &fresh(), Some(30_000)).unwrap();
-    assert!(
-        matches!(step.event, SignInEvent::Cancelled | SignInEvent::Failed { .. }),
-        "{:?}",
-        step.event
-    );
+    // before the cancel; it never ends as signed in. Steps the flow emitted before the cancel
+    // (`Enrolling`) come first, so follow the numbering to the last one.
+    let mut after = 0;
+    let mut last = None;
+    for _ in 0..16 {
+        let step = host.poll_sign_in(id, after, &fresh(), Some(30_000)).unwrap();
+        assert!(!matches!(step.event, SignInEvent::SignedIn { .. }), "{:?}", step.event);
+        if matches!(step.event, SignInEvent::Cancelled | SignInEvent::Failed { .. }) {
+            last = Some(step.event);
+            break;
+        }
+        assert!(step.seq > after, "the numbering did not advance: {:?}", step.event);
+        after = step.seq;
+    }
+    let last = last.expect("no terminal step within 16 steps");
+    assert!(matches!(last, SignInEvent::Cancelled | SignInEvent::Failed { .. }));
 
     // Without the id (a begin whose answer was lost): the engine's current sign-in.
     // (The flow may already have failed on the unreachable service, then it is finished.)

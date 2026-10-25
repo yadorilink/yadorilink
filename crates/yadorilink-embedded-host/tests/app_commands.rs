@@ -233,6 +233,9 @@ fn preserved_items_are_empty_on_a_fresh_engine_and_an_unknown_one_is_refused_typ
 #[test]
 fn a_share_into_an_ordinary_folder_is_refused_before_anything_happens() {
     let _serial = serialized();
+    if support::desktop_shaped_skip() {
+        return;
+    }
     let (host, _area) = running_host();
     let folder = tempfile::tempdir().unwrap();
     let path = folder.path().join("made-by-the-command");

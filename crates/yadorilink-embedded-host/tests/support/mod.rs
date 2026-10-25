@@ -9,6 +9,21 @@ use yadorilink_embedded_host::{
     WitnessPlacement,
 };
 
+/// For a test that only holds in the embedded shape: true when this build is desktop-shaped
+/// (a `--workspace` build unifies the daemon's `process-model` feature on) and the test should
+/// return. CI's dedicated embedded-shape run sets `YADORILINK_EXPECT_EMBEDDED_SHAPE`, and there
+/// a desktop-shaped build is a failure, not a skip.
+pub fn desktop_shaped_skip() -> bool {
+    if !yadorilink_embedded_host::ordinary_folder_links_supported() {
+        return false;
+    }
+    assert!(
+        std::env::var_os("YADORILINK_EXPECT_EMBEDDED_SHAPE").is_none(),
+        "this run was to pin the embedded shape, but the daemon's process model is on"
+    );
+    true
+}
+
 static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A data area of its own under the process's state directory.

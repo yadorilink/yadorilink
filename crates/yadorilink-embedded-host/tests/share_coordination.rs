@@ -221,7 +221,9 @@ fn an_expired_or_used_invite_is_refused_typed_and_links_nothing() {
 
 #[test]
 fn a_blank_name_is_refused_and_nothing_is_activated() {
-    if !HAS_PROVIDER {
+    // The plain-folder refusal below only exists in the embedded shape; a workspace build unifies
+    // the daemon's `process-model` feature on (see `embedded_defaults.rs`).
+    if !HAS_PROVIDER || support::desktop_shaped_skip() {
         return;
     }
     let _serial = serialized();

@@ -634,8 +634,16 @@ mod persistent_dir_tests {
         // A `..` that climbs back into the state directory is resolved, not trusted.
         std::fs::create_dir_all(root.path().join("elsewhere")).unwrap();
         assert!(refused(&root.path().join("elsewhere/../state/w"), &areas).contains("data area"));
-        // A `..` below a missing component cannot be named: refused, not guessed.
+        // A `..` below a missing component cannot be named without asking the filesystem: on
+        // Unix it is refused, not guessed. Windows collapses `..` lexically before the lookup
+        // (the path has no other meaning there), so it names `root\x` and is judged as such.
+        #[cfg(unix)]
         assert!(refused(&root.path().join("missing/../x"), &areas).contains("resolved"));
+        #[cfg(windows)]
+        {
+            assert!(refused(&root.path().join("missing/../state/w"), &areas).contains("data area"));
+            check_persistent_dir(&root.path().join("missing/../x"), &areas).unwrap();
+        }
 
         // Outside every area, existing or not, it is accepted; a sibling that shares a name
         // prefix with a data area is not inside it.

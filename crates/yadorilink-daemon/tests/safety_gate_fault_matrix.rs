@@ -381,9 +381,16 @@ fn ns_discard_case() -> Scenario {
                     "the committed removal lost the bytes or forgot the leftover's name".into()
                 })
             }
-            Phase::AfterRetry => ok_when(!path.exists() && l3.0.borrow().is_empty(), || {
-                "the recovered removal left the object or its record".into()
-            }),
+            // Windows documents no durability for an unlink, so it keeps the record of the
+            // name it just removed (the next recovery finds the name absent and drops it):
+            // what must hold there is that no recorded name is still an object.
+            Phase::AfterRetry => ok_when(
+                !path.exists()
+                    && l3.0.borrow().iter().all(|p| !p.exists())
+                    // Windows keeps exactly the record of the name it just unlinked.
+                    && l3.0.borrow().len() == usize::from(cfg!(windows)),
+                || "the recovered removal left the object or its record".into(),
+            ),
         }
     };
     Scenario {

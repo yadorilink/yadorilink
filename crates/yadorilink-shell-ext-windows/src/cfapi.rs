@@ -54,14 +54,14 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Storage::CloudFilters::{
     CfConnectSyncRoot, CfCreatePlaceholders, CfDisconnectSyncRoot, CfExecute,
-    CfGetSyncRootInfoByPath, CfRegisterSyncRoot, CfReportProviderProgress, CfUnregisterSyncRoot, CF_CALLBACK_INFO,
-    CF_CALLBACK_PARAMETERS, CF_CALLBACK_REGISTRATION, CF_CALLBACK_TYPE_CANCEL_FETCH_DATA,
-    CF_CALLBACK_TYPE_FETCH_DATA, CF_CALLBACK_TYPE_NONE, CF_CONNECT_FLAG_NONE, CF_CREATE_FLAG_NONE,
-    CF_HARDLINK_POLICY_NONE, CF_HYDRATION_POLICY, CF_HYDRATION_POLICY_FULL,
-    CF_HYDRATION_POLICY_MODIFIER_NONE, CF_INSYNC_POLICY_TRACK_ALL, CF_OPERATION_INFO,
-    CF_OPERATION_PARAMETERS, CF_OPERATION_PARAMETERS_0, CF_OPERATION_PARAMETERS_0_6,
-    CF_OPERATION_TRANSFER_DATA_FLAG_NONE, CF_OPERATION_TYPE_TRANSFER_DATA,
-    CF_PLACEHOLDER_CREATE_FLAG_DISABLE_ON_DEMAND_POPULATION,
+    CfGetSyncRootInfoByPath, CfRegisterSyncRoot, CfReportProviderProgress, CfUnregisterSyncRoot,
+    CF_CALLBACK_INFO, CF_CALLBACK_PARAMETERS, CF_CALLBACK_REGISTRATION,
+    CF_CALLBACK_TYPE_CANCEL_FETCH_DATA, CF_CALLBACK_TYPE_FETCH_DATA, CF_CALLBACK_TYPE_NONE,
+    CF_CONNECT_FLAG_NONE, CF_CREATE_FLAG_NONE, CF_HARDLINK_POLICY_NONE, CF_HYDRATION_POLICY,
+    CF_HYDRATION_POLICY_FULL, CF_HYDRATION_POLICY_MODIFIER_NONE, CF_INSYNC_POLICY_TRACK_ALL,
+    CF_OPERATION_INFO, CF_OPERATION_PARAMETERS, CF_OPERATION_PARAMETERS_0,
+    CF_OPERATION_PARAMETERS_0_6, CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
+    CF_OPERATION_TYPE_TRANSFER_DATA, CF_PLACEHOLDER_CREATE_FLAG_DISABLE_ON_DEMAND_POPULATION,
     CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC, CF_PLACEHOLDER_CREATE_INFO,
     CF_PLACEHOLDER_MANAGEMENT_POLICY_DEFAULT, CF_POPULATION_POLICY,
     CF_POPULATION_POLICY_ALWAYS_FULL, CF_POPULATION_POLICY_MODIFIER_NONE,
@@ -72,8 +72,8 @@ use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO,
 };
 use yadorilink_fs_platform::durable_dir::{move_durably, NameLedger, Replace};
-use yadorilink_windows_provider_policy::fetch_report::{FetchFailure, RangeProgress};
 use yadorilink_fs_platform::reserved_namespace::{artefact_component_name, ArtefactKind};
+use yadorilink_windows_provider_policy::fetch_report::{FetchFailure, RangeProgress};
 
 use crate::windowed_fetch;
 
@@ -1298,8 +1298,8 @@ static TRANSFERS: Mutex<Vec<(std::time::Instant, i64, i64, bool)>> = Mutex::new(
 #[cfg(test)]
 mod tests {
     use super::{decode_generation_identity, fetch_failure_status, fetch_window, served_layout};
-    use yadorilink_windows_provider_policy::fetch_report::FetchFailure;
     use crate::provider_client::FetchTarget;
+    use yadorilink_windows_provider_policy::fetch_report::FetchFailure;
 
     fn answer(
         version: [u8; 32],

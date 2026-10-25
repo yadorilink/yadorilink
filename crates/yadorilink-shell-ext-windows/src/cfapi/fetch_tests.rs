@@ -665,12 +665,8 @@ fn a_refused_fetch_fails_the_read_with_the_reason() {
     println!(
         "low disk: {disk:?}\nunobtainable: {offline:?}\nnot ready: {other:?}\nversion: {moved:?}"
     );
-    let codes = [
-        disk.raw_os_error(),
-        offline.raw_os_error(),
-        other.raw_os_error(),
-        moved.raw_os_error(),
-    ];
+    let codes =
+        [disk.raw_os_error(), offline.raw_os_error(), other.raw_os_error(), moved.raw_os_error()];
     for (i, a) in codes.iter().enumerate() {
         for b in &codes[i + 1..] {
             assert_ne!(a, b, "{codes:?}");
