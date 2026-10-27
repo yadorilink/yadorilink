@@ -30,6 +30,49 @@
       "description": "Every version ever served per install_source; append only.",
       "additionalProperties": { "type": "array", "items": { "type": "string" } }
     },
-    "withdrawn_versions": { "type": "array", "items": { "type": "string" }, "description": "Yanked versions; append only; carried into the manifest body." }
+    "published_at": {
+      "type": "object",
+      "description": "UTC time each version was first published on this channel, per install_source; append only. Never decreases along history. Not part of a reviewed ledger file: the publisher writes it into the archived ledger snapshot from the manifest's generated_at (its own clock); a ledger file that carries it is refused.",
+      "propertyNames": { "enum": ["script", "app_bundle", "microsoft_store"] },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" }
+      }
+    },
+    "full_rollout_at": {
+      "type": "object",
+      "description": "UTC time each version first reached a 100% rollout on this channel, per install_source; append only. Not part of a reviewed ledger file: the publisher stamps it from the manifest's generated_at into the archived snapshot. The promoting channel's soak period (SOAK_DAYS) is measured from it, read from the source channel's served snapshot.",
+      "propertyNames": { "enum": ["script", "app_bundle", "microsoft_store"] },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" }
+      }
+    },
+    "rollout_history": {
+      "type": "object",
+      "description": "Per install_source and version: the highest rollout it was ever served at and whether it was ever withdrawn (kill-switched, or taken to 0% after being served); append only. The promoting channel requires 100 and never withdrawn.",
+      "propertyNames": { "enum": ["script", "app_bundle", "microsoft_store"] },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "object",
+          "required": ["max_rollout_percentage", "kill_switched"],
+          "additionalProperties": false,
+          "properties": {
+            "max_rollout_percentage": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "kill_switched": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "withdrawn_versions": { "type": "array", "items": { "type": "string" }, "description": "Yanked versions; append only; carried into the manifest body." },
+    "app_build_tombstones": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["version", "sparkle_build"],
+        "properties": { "version": { "type": "string" }, "sparkle_build": { "type": "integer", "minimum": 1 } }
+      },
+      "description": "Withdrawn (kill-switched, 0% or yanked) app_bundle releases; append only. A tombstoned Sparkle build number may never be reused by another version. Read by the Apple release preflight."
+    }
   }
 }

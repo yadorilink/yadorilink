@@ -12,8 +12,10 @@
 //! its own runtime and drops that runtime after [`Engine::stop`]: that is what guarantees
 //! nothing the engine started outlives it. `yadorilink-embedded-host` does exactly that.
 //!
-//! One engine runs per data area per process. Exclusion across processes is the storage
-//! lease's job, not this module's.
+//! One engine runs per data area per process. Exclusion across processes is the OS-level
+//! `DataResourceLocks` the engine takes before it opens the data and holds until the host
+//! releases it (the block store is therefore opened with `open_process_locked_with`, which
+//! is what that lock licenses; `open_exclusive` is for a host holding only a writer lease).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,6 +31,7 @@ pub use crate::credential_store::CredentialConfig;
 use crate::daemon_state::DaemonState;
 pub use crate::engine_tuning::EngineTuning;
 pub use crate::install_witness::WitnessPlacement;
+pub use crate::instance_nonce::{InstanceNonceKeychain, Nonce as InstanceNonce};
 use crate::shell_context::ShellContext;
 pub use yadorilink_fapi_client::store::Backend as CredentialBackend;
 pub use yadorilink_transport::KeyMirror;
@@ -303,6 +306,8 @@ pub enum CommandErrorKind {
     Refused(ApplicationErrorCode),
     /// A preserved item's own refusal.
     Preserved(PreservedRefusal),
+    /// A re-adoption of a marked folder was refused.
+    Readopt(ReadoptRefusal),
     /// Any other failure.
     Failed,
 }
@@ -322,6 +327,14 @@ impl CommandError {
 
     fn preserved(refusal: PreservedRefusal, message: String) -> Self {
         Self { kind: CommandErrorKind::Preserved(refusal), message, operation_id: String::new() }
+    }
+
+    fn readopt(refusal: ReadoptRefusal, message: impl Into<String>) -> Self {
+        Self {
+            kind: CommandErrorKind::Readopt(refusal),
+            message: message.into(),
+            operation_id: String::new(),
+        }
     }
 
     fn no_change_source() -> Self {
@@ -583,6 +596,7 @@ impl Engine {
         install_machine_id(config.machine_id.as_deref())?;
         let crate::engine_startup::OpenedData { block_store, replica_coordinator } =
             crate::engine_startup::open_data(
+                &locks,
                 &dir,
                 &config.block_store_root,
                 &config.sync_db_path,
@@ -1022,8 +1036,9 @@ mod claim_tests {
 mod app_commands;
 pub use app_commands::{
     CreateShare, DoctorCheck, DoctorStatus, HandoffInfo, JoinGroup, JoinShare, PauseFor, PauseLink,
-    PreservedItem, PreservedKind, PreservedRef, PreservedRefusal, ProviderFolder, ResumeLink,
-    ShareFolder, ShareOutcome, SpaceManagement, UnlinkFolder, UnlinkOutcome,
+    PreservedItem, PreservedKind, PreservedRef, PreservedRefusal, ProviderFolder,
+    ReadoptMarkedFolder, ReadoptOutcome, ReadoptRefusal, ResumeLink, ShareFolder, ShareOutcome,
+    SpaceManagement, UnlinkFolder, UnlinkOutcome,
 };
 
 #[cfg(test)]

@@ -290,7 +290,9 @@ async fn submit_report_with_consent_disabled_makes_no_network_request() {
     )
     .await;
     assert!(
-        matches!(resp.payload, Some(RespPayload::Error(_))),
+        matches!(&resp.payload, Some(RespPayload::Refused(r))
+            if r.next_step
+                == yadorilink_ipc_proto::daemonctl::NextStep::EnableReportSubmission as i32),
         "submission must be refused while usage_submission_enabled is false"
     );
     assert!(

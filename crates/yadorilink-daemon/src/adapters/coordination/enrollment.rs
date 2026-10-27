@@ -258,10 +258,15 @@ impl EnrollmentCoordination for HttpEnrollmentCoordination {
         role: Option<&'a str>,
         ttl_secs: Option<u64>,
         requires_approval: bool,
-    ) -> BoxFuture<'a, Result<crate::application::model::MintedInvite, String>> {
+    ) -> BoxFuture<
+        'a,
+        Result<crate::application::model::MintedInvite, crate::application::model::MintInviteError>,
+    > {
         Box::pin(async move {
             let Some(config) = self.state.coordination_client_config() else {
-                return Err(NOT_CONFIGURED_DETAIL.to_string());
+                return Err(crate::application::model::MintInviteError::Rejected(
+                    NOT_CONFIGURED_DETAIL.to_string(),
+                ));
             };
             coordination_client::mint_invite(
                 &config.addr,
@@ -284,6 +289,9 @@ fn prepare_result(outcome: EnrollmentPrepareOutcome) -> EnrollmentPrepareResult 
         }
         EnrollmentPrepareOutcome::DefinitelyRejected(detail) => {
             EnrollmentPrepareResult::DefinitelyRejected { detail }
+        }
+        EnrollmentPrepareOutcome::TermsConsentRequired(detail) => {
+            EnrollmentPrepareResult::TermsConsentRequired { detail }
         }
         EnrollmentPrepareOutcome::InviteRefused { reason, detail } => {
             EnrollmentPrepareResult::InviteRefused { reason, detail }

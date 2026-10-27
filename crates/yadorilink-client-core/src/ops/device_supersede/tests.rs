@@ -17,6 +17,26 @@ fn key() -> (tempfile::TempDir, yadorilink_transport::DeviceSigningKeyPair) {
     (dir, key)
 }
 
+fn id_token_of(sub: &str) -> String {
+    use base64::Engine;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::json!({ "sub": sub }).to_string());
+    format!("e30.{payload}.sig")
+}
+
+#[test]
+fn a_sign_in_is_another_account_only_when_both_accounts_are_known_and_differ() {
+    let dir = tempfile::tempdir().unwrap();
+    // Nothing recorded yet: nothing to compare.
+    assert!(!is_other_account(dir.path(), Some(&id_token_of("acct-1"))));
+    record_account_id(dir.path(), Some(&id_token_of("acct-1")));
+    assert!(!is_other_account(dir.path(), Some(&id_token_of("acct-1"))));
+    assert!(is_other_account(dir.path(), Some(&id_token_of("acct-2"))));
+    // A sign-in that names no account is not a different one.
+    assert!(!is_other_account(dir.path(), None));
+    assert!(!is_other_account(dir.path(), Some("not-a-token")));
+}
+
 async fn call(server: &MockServer) -> Result<SupersedeResponse, SupersedeError> {
     let (_dir, key) = key();
     let result = send(

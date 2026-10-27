@@ -495,6 +495,45 @@ fn duplicate_device_ids_are_rejected_before_snapshot_application() {
     assert_eq!(*generation.lock().unwrap(), Some(1));
 }
 
+/// `self.accountDeletionState` is read when present; a missing `self`, field or unknown value is
+/// "not said" (`None`), which the caller must not treat as clearing the state. A malformed `self`
+/// never refuses the netmap.
+#[test]
+fn the_netmaps_own_account_deletion_state_is_additive_and_lenient() {
+    use super::ws_netmap::WsNetmapMessage;
+    use crate::daemon_state::AccountDeletionState as S;
+
+    let parse = |own: Option<serde_json::Value>| {
+        let mut push = netmap_push(Some("1"), serde_json::json!([]));
+        if let Some(own) = own {
+            push["self"] = own;
+        }
+        let message: WsNetmapMessage = serde_json::from_value(push).unwrap();
+        message.account_deletion_state()
+    };
+    assert_eq!(parse(None), None);
+    assert_eq!(parse(Some(serde_json::json!({}))), None);
+    assert_eq!(parse(Some(serde_json::json!({"accountDeletionState": "none"}))), Some(S::None));
+    assert_eq!(
+        parse(Some(serde_json::json!({"accountDeletionState": "pending"}))),
+        Some(S::Pending)
+    );
+    assert_eq!(parse(Some(serde_json::json!({"accountDeletionState": "urgent"}))), Some(S::Urgent));
+    assert_eq!(parse(Some(serde_json::json!({"accountDeletionState": "later"}))), None);
+    assert_eq!(parse(Some(serde_json::json!("garbage"))), None);
+}
+
+#[tokio::test]
+async fn account_deletion_state_is_replaced_only_by_an_explicit_state() {
+    use crate::daemon_state::AccountDeletionState as S;
+    let state = test_state();
+    assert_eq!(state.account_deletion(), S::None);
+    state.set_account_deletion(S::Urgent);
+    assert_eq!(state.account_deletion(), S::Urgent);
+    state.set_account_deletion(S::None);
+    assert_eq!(state.account_deletion(), S::None);
+}
+
 #[test]
 fn stale_or_replayed_netmap_generation_is_rejected_across_attempts() {
     use super::ws_netmap::{AdmittedNetmapMessage, NetmapAdmissionError, WsNetmapMessage};

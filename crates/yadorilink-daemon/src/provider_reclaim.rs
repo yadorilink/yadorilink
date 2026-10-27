@@ -43,9 +43,11 @@ pub(crate) enum Retained {
     Busy,
     /// The item is no longer a live regular file at the version the request was about.
     VersionMoved,
-    /// No block was freed: nothing of this version is cached locally, every cached block is still
-    /// referenced by other content of this device, or the lease no longer backed the reclaim.
+    /// No block was freed: every cached block is still referenced by other content of this
+    /// device, or the lease no longer backed the reclaim.
     NothingFreed,
+    /// Nothing of this version is cached on this device: the item is already not downloaded.
+    NotDownloaded,
     /// A process holds the file open; the OS copy and the blocks stay.
     HostBusy,
     /// The OS copy is the only complete local copy and no custody lease covers the version, so
@@ -68,6 +70,7 @@ impl Retained {
             Self::Busy => "busy",
             Self::VersionMoved => "version_moved",
             Self::NothingFreed => "nothing_freed",
+            Self::NotDownloaded => "not_downloaded",
             Self::HostBusy => "host_busy",
             Self::CustodyRequired => "custody_required",
             Self::NotConfirmed => "not_confirmed",
@@ -87,7 +90,10 @@ impl Retained {
             | Self::HostRefused
             | Self::CustodyNotAcquired
             | Self::CustodyRequired => true,
-            Self::CustodyUnsupported | Self::FullReplica | Self::NothingFreed => false,
+            Self::CustodyUnsupported
+            | Self::FullReplica
+            | Self::NothingFreed
+            | Self::NotDownloaded => false,
         }
     }
 }

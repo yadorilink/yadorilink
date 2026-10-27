@@ -52,12 +52,12 @@ pub(crate) use preserved::PreservedPort;
 #[allow(unused_imports)]
 pub(crate) use replica_role::{
     CustodyLeaseHandoffPort, HandoffReadinessPort, LinkRuntimePort, OnDemandCapabilityPort,
-    ReplicaRoleRepository, RoleLossCoordination, RoleLossJournal,
+    ReplicaRoleRepository, RoleLossCoordination, RoleLossJournal, StorageModeWriteError,
 };
 #[allow(unused_imports)]
 pub(crate) use reporting::{
     ConsentCommand, LastErrorReport, RedactionCategoryCount as ReportingRedactionCategoryCount,
-    ReportingCommandPort, SubmitReportOutcome,
+    ReportingCommandPort, SubmitReportError, SubmitReportOutcome,
 };
 #[allow(unused_imports)]
 pub(crate) use runtime_control::{

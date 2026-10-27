@@ -440,11 +440,18 @@ impl CoordinationAuth {
     ///   settles nothing either, and is reported the same way.
     pub async fn confirm_registration_status(&self) -> RegistrationStatus {
         let current = self.current();
-        let refreshed = current.manager.force_refresh().await;
-        match &refreshed {
-            Ok(_) => current.refresh_succeeded(),
-            Err(e) => current.refresh_failed(e),
-        }
+        // Under the refresh gate, like every other refresh: the outcome is recorded in the order
+        // the refreshes ran, so a refusal that happened first cannot be recorded after the
+        // success that followed it and then be replayed.
+        let refreshed = {
+            let _gate = current.refresh_gate.lock().await;
+            let refreshed = current.manager.force_refresh().await;
+            match &refreshed {
+                Ok(_) => current.refresh_succeeded(),
+                Err(e) => current.refresh_failed(e),
+            }
+            refreshed
+        };
         match refreshed {
             Ok(_) => RegistrationStatus::Alive,
             Err(Error::Response { parsed: Some(oauth), .. }) if oauth.error == "invalid_client" => {

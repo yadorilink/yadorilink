@@ -8,7 +8,9 @@ Usage: pins.py show
        pins.py --self-test
 
 install.sh and install.ps1 each carry one block between `>>> PINS >>>` and `<<< PINS <<<`.
-Release CI (installer-sync) writes it with `set`; nothing edits it by hand. The block holds
+Release CI (installer-sync) writes it with `set`; nothing edits it by hand. `set` also writes
+.github/channels/installer-pins.json (the trust set's key ids, which channel-publish requires for
+production) and `check` fails when that file differs. The block holds
 exactly what a client must trust without fetching it: the manifest signing keys (current key
 first, next key during a rotation), the verifier program's hash per platform, where the
 verifier is released, and the oldest manifest time a first install accepts.
@@ -27,12 +29,15 @@ production-valid manifest predates T; every production manifest's generated_at m
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SH, PS1 = HERE / "install.sh", HERE / "install.ps1"
+# The key ids the served installers pin, read by channel-publish (production); `set` writes it.
+KEY_IDS = HERE.parents[1] / ".github" / "channels" / "installer-pins.json"
 DEV_KEY = "00e033f866c263139ff4afd165e75bae3cfca67eb32399dddd6e33a3251af1e3"
 TARGETS = ("macos-aarch64", "linux-x86_64")
 KEY_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -145,6 +150,10 @@ def check(sh_text: str, ps1_text: str, allow_dev: bool = False, require_verifier
     return out
 
 
+def render_key_ids(pins: dict) -> str:
+    return json.dumps([e.partition(":")[0] for e in pins["trust_set"]]) + "\n"
+
+
 def render_sh(pins: dict) -> str:
     return "\n".join([
         f'TRUST_SET="{" ".join(pins["trust_set"])}"',
@@ -206,6 +215,7 @@ def self_test() -> int:
     assert check(floored_sh, floored_ps, require_floor=True) == [], check(floored_sh, floored_ps, require_floor=True)
     assert check(floored_sh, floored_ps.replace("MinManifestGeneratedAt = '2026-10-19T00:00:00Z'", "MinManifestGeneratedAt = ''"), require_floor=True)
     assert apply(new_sh, new_ps, {})[0] == new_sh
+    assert render_key_ids(parse_sh(new_sh)) == '["k1", "k2"]\n'
     assert parse_sh(new_sh)["trust_set"] == [ok, other] and parse_ps1(new_ps)["trust_set"] == [ok, other]
     assert new_sh.replace(render_sh(parse_sh(new_sh)), "") != new_sh
     # only the block changes
@@ -259,6 +269,15 @@ def main(argv: list[str]) -> int:
         problems = check(sh_text, ps_text, allow_dev="--allow-dev-key" in rest,
                          require_verifier="--require-verifier" in rest,
                          require_floor="--require-floor" in rest)
+        try:
+            want = render_key_ids(parse_sh(sh_text))
+            have = KEY_IDS.read_text(encoding="utf-8") if KEY_IDS.is_file() else None
+            # The channel ledger directory is not part of the public tree, where the release
+            # workflow runs this check; there the file is not expected.
+            if KEY_IDS.parent.is_dir() and have != want:
+                problems.append(f"{KEY_IDS.relative_to(HERE.parents[1])} must be {want.strip()} (run `pins.py set`)")
+        except PinError:
+            pass  # check() already reported the malformed block
         for p in problems:
             print(f"error: {p}", file=sys.stderr)
         print("pins: ok" if not problems else "pins: FAILED")
@@ -292,6 +311,8 @@ def main(argv: list[str]) -> int:
         return 1
     SH.write_text(new_sh, encoding="utf-8")
     PS1.write_text(new_ps, encoding="utf-8")
+    KEY_IDS.parent.mkdir(parents=True, exist_ok=True)
+    KEY_IDS.write_text(render_key_ids(parse_sh(new_sh)), encoding="utf-8")
     return 0
 
 

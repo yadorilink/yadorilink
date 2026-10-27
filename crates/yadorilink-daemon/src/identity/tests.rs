@@ -371,7 +371,7 @@ fn no_daemon_of_either_owner_starts_while_a_hand_off_is_half_applied() {
         for refused in [cli().gate_start(config.path()), app().gate_start(config.path())] {
             let refused = refused.unwrap_err();
             assert!(matches!(refused.0, Refusal::HandoffUnfinished { .. }), "{refused}");
-            assert!(refused.to_string().contains("release-to-app"), "{refused}");
+            assert!(refused.to_string().contains("roll it back"), "{refused}");
         }
         assert_eq!(std::fs::read(config.path().join(ownership::FILE_NAME)).unwrap(), before);
     }

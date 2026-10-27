@@ -436,6 +436,23 @@ fn a_hard_link_to_an_existing_credential_file_is_the_same_entry() {
     file_backend(&hard).claim_entry().expect("free again");
 }
 
+#[cfg(windows)]
+#[test]
+fn a_hard_linked_credential_file_is_refused_until_the_link_is_gone() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let original = dir.path().join("original.json");
+    std::fs::write(&original, "{}").unwrap();
+    let hard = dir.path().join("hard.json");
+    std::fs::hard_link(&original, &hard).unwrap();
+
+    for name in [&original, &hard] {
+        let err = file_backend(name).claim_entry().expect_err("a hard-linked credential");
+        assert!(matches!(err, StoreError::CredentialFileIsHardLinked(_)), "{err:?}");
+    }
+    std::fs::remove_file(&hard).unwrap();
+    file_backend(&original).claim_entry().expect("a single link is claimable");
+}
+
 #[cfg(unix)]
 #[test]
 fn a_credential_path_that_is_a_symlink_is_refused() {

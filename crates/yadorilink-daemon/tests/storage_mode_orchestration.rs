@@ -474,6 +474,8 @@ async fn demotion_refused_when_a_target_is_confirmed_but_this_device_has_no_conf
     // device-b -- the (Some(target), None) arm under test.
     let a = new_daemon("device-a");
     let b = new_daemon("device-b");
+    // Past the on-demand availability refusal, so the request reaches the lease arm under test.
+    b.state.set_test_on_demand_allowed(true);
     let content = b"the file device-a confirms holding";
     let hash = a.state.block_store.put(content).unwrap();
     a.state

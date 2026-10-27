@@ -11,6 +11,20 @@ prerelease suffix (e.g. `v0.1.0-beta.1`).
 
 ## [Unreleased]
 
+## [v0.1.0-beta.8] - 2026-10-28
+
+### Fixed
+- The `install.sh` one-liner reads the manifest key id correctly when the manifest carries a trust chain.
+- The one-liner stops with a clear message when the desktop app or another installation already owns the data.
+- A copied data area is detected and no longer shared by two devices by mistake.
+- A missing nonce file beside the keychain item is repaired instead of refusing to start.
+- A folder marked for start-over is adopted back into its group.
+- Windows: a credential file that is a hard link is refused.
+
+### Changed
+- Account deletion that is scheduled shows up as an item that needs attention.
+- Daemon refusals name the next step to take instead of a CLI command.
+
 ## [v0.1.0-beta.7] - 2026-10-25
 
 ### Added

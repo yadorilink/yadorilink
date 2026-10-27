@@ -253,7 +253,7 @@ struct FakeCoordination {
     prepare: Mutex<std::collections::VecDeque<EnrollmentPrepareResult>>,
     activate: Mutex<std::collections::VecDeque<EnrollmentActivationResult>>,
     cancel: Mutex<std::collections::VecDeque<EnrollmentCancellationResult>>,
-    mint: Mutex<std::collections::VecDeque<Result<MintedInvite, String>>>,
+    mint: Mutex<std::collections::VecDeque<Result<MintedInvite, MintInviteError>>>,
     /// One entry per mint call -- the approval flag is the whole point of
     /// the option, so a test must be able to prove it survived the trip
     /// through this port rather than merely that a mint happened.
@@ -389,7 +389,7 @@ impl EnrollmentCoordination for FakeCoordination {
         role: Option<&'a str>,
         ttl_secs: Option<u64>,
         requires_approval: bool,
-    ) -> super::super::ports::BoxFuture<'a, Result<MintedInvite, String>> {
+    ) -> super::super::ports::BoxFuture<'a, Result<MintedInvite, MintInviteError>> {
         Box::pin(async move {
             self.calls.lock().unwrap().push(EnrollmentCall::MintInvite);
             self.mint_args.lock().unwrap().push(MintInviteArgs {
@@ -1161,6 +1161,26 @@ async fn accept_invite_rejected_prepare_never_touches_the_link_port() {
         .await;
 
     assert!(matches!(result, Err(EnrollmentError::PreparationRejected { .. })));
+    assert!(links.calls.lock().unwrap().is_empty());
+}
+
+/// The Terms consent refusal reaches the caller typed, with the link port untouched.
+#[tokio::test]
+async fn accept_invite_terms_consent_refusal_is_typed() {
+    let coordination = Arc::new(FakeCoordination::configured());
+    coordination
+        .prepare
+        .lock()
+        .unwrap()
+        .push_back(EnrollmentPrepareResult::TermsConsentRequired { detail: "terms".to_string() });
+    let links = Arc::new(FakeLinkPort::default());
+
+    let result =
+        service(Arc::new(FakeEnrollmentRepository::default()), coordination, links.clone())
+            .accept_invite_and_link(accept_invite_command())
+            .await;
+
+    assert!(matches!(result, Err(EnrollmentError::TermsConsentRequired { .. })), "{result:?}");
     assert!(links.calls.lock().unwrap().is_empty());
 }
 

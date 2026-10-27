@@ -528,6 +528,7 @@ impl EnrollmentRecoveryService {
                         // the NEXT sweep's `Prepared` branch below.
                     }
                     EnrollmentPrepareResult::DefinitelyRejected { .. }
+                    | EnrollmentPrepareResult::TermsConsentRequired { .. }
                     | EnrollmentPrepareResult::InviteRefused { .. } => {
                         let _ = self.repository.delete_operation(&operation.operation_id);
                     }

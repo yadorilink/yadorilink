@@ -64,6 +64,11 @@ pub enum Restored {
     DifferentInstall,
     /// The side copy exists but cannot be read, so nothing can be compared.
     Unverifiable,
+    /// The keychain instance nonce differs from the one beside the data
+    /// ([`crate::instance_nonce`]).
+    KeychainNonceMismatch,
+    /// The keychain instance nonce is missing beside the data, or the data's beside the keychain's.
+    KeychainNonceMissing,
 }
 
 impl Restored {
@@ -72,6 +77,8 @@ impl Restored {
             Self::OlderGeneration => "older_generation",
             Self::DifferentInstall => "different_install",
             Self::Unverifiable => "unverifiable",
+            Self::KeychainNonceMismatch => "keychain_nonce_mismatch",
+            Self::KeychainNonceMissing => "keychain_nonce_missing",
         }
     }
 }

@@ -94,6 +94,9 @@ pub struct EngineTuning {
     /// backup restores and the system does not purge (`Persistent`), or opt into `BesideDatabase`. The default is
     /// `Unset`, which an embedded engine refuses to start with.
     pub witness: crate::install_witness::WitnessPlacement,
+    /// The host's keychain holding the instance nonce that detects a copied or restored data area
+    /// ([`crate::instance_nonce`]). `None` (the default): no such check.
+    pub instance_nonce: Option<std::sync::Arc<dyn crate::instance_nonce::InstanceNonceKeychain>>,
     /// Group-commit bounds of the block store (a measurement seam).
     pub group_commit: yadorilink_local_storage::GroupCommitLimits,
     /// The user's home directory, which linking is warned about; `None` where the host has none.
@@ -164,6 +167,7 @@ impl EngineTuning {
             group_commit: group_commit(&lookup),
             home_dir: text("HOME").or_else(|| text("USERPROFILE")).map(std::path::PathBuf::from),
             witness: crate::install_witness::WitnessPlacement::default(),
+            instance_nonce: None,
             update_manifest_url: text(vars::UPDATE_MANIFEST_URL),
             install_source: text(vars::INSTALL_SOURCE),
             // Only `1` or `true` turn it on; anything else, unset included, leaves it off.

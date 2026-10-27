@@ -695,6 +695,7 @@ async fn complete_one_obligation(
         });
         match closed {
             Ok(true) => {
+                note_obligation_completed(state, group_id);
                 // Wake the hazard recheck: a copy this attempt just made durable
                 // could be exactly the sibling change that clears some held
                 // path's hazard.
@@ -807,7 +808,7 @@ async fn complete_zero_work_obligation(
         // sibling to react to -- whatever originally wrote this content
         // already woke retirement/hazard at that time, through its own
         // (exact-outcome) completion.
-        Ok(true) => {}
+        Ok(true) => note_obligation_completed(state, group_id),
         Ok(false) => tracing::debug!(
             group_id,
             path,
@@ -862,19 +863,28 @@ impl yadorilink_peer_session::convergence_driver::ConvergenceDriver for LocalCon
     }
 }
 
-/// Shows the folder as waiting for disk space while an attempt is refused for lack of it, and
-/// clears that as soon as an attempt gets through with nothing left to retry. Only a link
-/// that is not terminal is touched, so this never hides a lost ownership.
-fn track_disk_space_wait(
+/// The local folder of `group_id`'s live link. A link that is not live (terminal, lost
+/// ownership) has none, so the disk-space wait is never touched for it.
+fn live_link_path(state: &Arc<DaemonState>, group_id: &str) -> Option<String> {
+    match state.replica_coordinator.link_gate_for_group(group_id) {
+        Ok(yadorilink_replica_domain::session_state::LinkGate::Live { local_path, .. }) => {
+            Some(local_path)
+        }
+        _ => None,
+    }
+}
+
+/// Shows the folder as waiting for disk space while an attempt is refused for lack of it. The
+/// wait ends on the real transitions, not on the next unrelated sync: an attempt that was not
+/// refused and settled something (the refused write got through, or was superseded), and a path's
+/// obligation completing ([`note_obligation_completed`]). Every clear is confirmed on the
+/// volume, so one write at the edge never flaps the status.
+pub(super) fn track_disk_space_wait(
     state: &Arc<DaemonState>,
     group_id: &str,
     attempt: &crate::local_convergence::types::ProjectionAttempt,
 ) {
-    let Ok(yadorilink_replica_domain::session_state::LinkGate::Live { local_path, .. }) =
-        state.replica_coordinator.link_gate_for_group(group_id)
-    else {
-        return;
-    };
+    let Some(local_path) = live_link_path(state, group_id) else { return };
     if let Some(wait) = &attempt.disk_pressure {
         state.mark_link_waiting_for_disk_space(
             &local_path,
@@ -884,8 +894,18 @@ fn track_disk_space_wait(
                 wait.required_free_bytes,
             ),
         );
-    } else if attempt.retry.is_empty() && !attempt.settled.is_empty() {
-        // Settling something is not proof the space is back: confirm on the volume.
+    } else if !attempt.settled.is_empty() {
+        // Settling something is not proof the space is back: confirm on the volume. Paths still
+        // in `retry` are retried for their own reasons; had they been refused for space, the
+        // attempt would carry `disk_pressure`.
+        state.clear_link_degraded_if_space_recovered(&local_path);
+    }
+}
+
+/// A path's obligation closed: whatever was waiting for space to place it is over. Confirmed on
+/// the volume like every other clear.
+pub(super) fn note_obligation_completed(state: &Arc<DaemonState>, group_id: &str) {
+    if let Some(local_path) = live_link_path(state, group_id) {
         state.clear_link_degraded_if_space_recovered(&local_path);
     }
 }

@@ -174,16 +174,20 @@ async fn a_run_trace_partitions_the_run_wall_time_by_the_last_file_to_reach_each
         mark(Stage::Closed);
     })
     .await;
-    run_trace_end(trace);
+    // Record into this test's own distributions: other tests' settle runs
+    // (which do not take the lock) feed the process-global ones while armed.
+    let step: [Dist; STAGES + 1] = std::array::from_fn(|_| Dist::new());
+    let spread: [Dist; STAGES] = std::array::from_fn(|_| Dist::new());
+    record_run(&trace.expect("armed"), &step, &spread);
     set_enabled(false);
 
-    let lock = S_STEP[Stage::Locked as usize].total();
-    let close = S_STEP[Stage::Closed as usize].total();
-    let tail = S_STEP[STAGES].total();
+    let lock = step[Stage::Locked as usize].total();
+    let close = step[Stage::Closed as usize].total();
+    let tail = step[STAGES].total();
     assert!(lock >= 30_000_000, "the late file's lock sets the lock step: {lock}");
     assert!((10_000_000..30_000_000).contains(&close), "close step: {close}");
-    assert_eq!(S_STEP[STAGES].count(), 1);
+    assert_eq!(step[STAGES].count(), 1);
     assert!(tail < 5_000_000, "nothing after the last stage: {tail}");
-    assert!(S_SPREAD[Stage::Locked as usize].total() >= 30_000_000, "first and last differ");
+    assert!(spread[Stage::Locked as usize].total() >= 30_000_000, "first and last differ");
     reset();
 }

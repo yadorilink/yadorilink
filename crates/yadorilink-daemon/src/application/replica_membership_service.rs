@@ -80,6 +80,10 @@ pub(crate) enum ReplicaMembershipError {
     TicketUnavailable { group_id: String },
     #[error("coordination commit was rejected: {detail}")]
     CoordinationRejected { detail: String },
+    /// The account has not accepted the current Terms (`403 terms_consent_required`). Nothing was
+    /// committed; signing in again clears it.
+    #[error("the Terms must be accepted to continue: {detail}")]
+    TermsConsentRequired { detail: String },
     #[error("coordination result is ambiguous: {detail}")]
     CoordinationAmbiguous { detail: String },
     #[error("durability latch persistence failed for {group_ids:?}: {detail}")]
@@ -368,6 +372,9 @@ impl ReplicaMembershipService {
             (_, MembershipCommitOutcome::DefinitelyRejected(detail)) => {
                 Err(ReplicaMembershipError::CoordinationRejected { detail })
             }
+            (_, MembershipCommitOutcome::TermsConsentRequired(detail)) => {
+                Err(ReplicaMembershipError::TermsConsentRequired { detail })
+            }
             (operation_id, MembershipCommitOutcome::Ambiguous(detail)) => {
                 Err(ReplicaMembershipError::RecoveryPending { operation_id, detail })
             }
@@ -398,6 +405,9 @@ impl ReplicaMembershipService {
             (_, MembershipCommitOutcome::Committed(_)) => {}
             (_, MembershipCommitOutcome::DefinitelyRejected(detail)) => {
                 return Err(ReplicaMembershipError::CoordinationRejected { detail });
+            }
+            (_, MembershipCommitOutcome::TermsConsentRequired(detail)) => {
+                return Err(ReplicaMembershipError::TermsConsentRequired { detail });
             }
             (operation_id, MembershipCommitOutcome::Ambiguous(detail)) => {
                 return Err(ReplicaMembershipError::RecoveryPending { operation_id, detail });
@@ -570,6 +580,11 @@ impl ReplicaMembershipService {
                 tracing::warn!(detail, "lease-bound membership commit was definitely rejected");
                 Ok(None)
             }
+            MembershipCommitOutcome::TermsConsentRequired(detail) => {
+                // Nothing was committed, and `--force` would meet the same refusal: report it.
+                self.release_tickets(target_device_id, &tickets).await;
+                Err(ReplicaMembershipError::TermsConsentRequired { detail })
+            }
             MembershipCommitOutcome::Ambiguous(detail) => {
                 // The coordination plane MAY already have committed this
                 // removal (Worker-side deletion could already be done) —
@@ -711,7 +726,9 @@ impl ReplicaMembershipService {
                     self.repository.settle_operation(&operation_id);
                 }
             }
-            MembershipCommitOutcome::DefinitelyRejected(_) => {
+            // Nothing was committed either way: the row is terminal.
+            MembershipCommitOutcome::DefinitelyRejected(_)
+            | MembershipCommitOutcome::TermsConsentRequired(_) => {
                 self.repository.settle_operation(&operation_id);
             }
             MembershipCommitOutcome::Ambiguous(detail) => {
@@ -964,6 +981,15 @@ impl ReplicaMembershipService {
                             );
                             self.repository.discard_operation(&marker.operation_id);
                         }
+                        MembershipCommitOutcome::TermsConsentRequired(detail) => {
+                            // Not a verdict on the removal: the row stays until the account signs
+                            // in again and a later sweep resends it.
+                            tracing::debug!(
+                                operation_id = %marker.operation_id,
+                                detail,
+                                "resent unknown-scope removal needs the Terms accepted; will retry"
+                            );
+                        }
                         MembershipCommitOutcome::Ambiguous(detail) => {
                             tracing::debug!(
                                 operation_id = %marker.operation_id,
@@ -1116,6 +1142,15 @@ impl ReplicaMembershipService {
                             );
                             self.release_journaled_tickets(&row).await;
                             self.repository.settle_operation(&row.operation_id);
+                        }
+                        MembershipCommitOutcome::TermsConsentRequired(detail) => {
+                            // Not a verdict on the operation: the row stays until the account
+                            // signs in again and a later sweep resends it.
+                            tracing::debug!(
+                                operation_id = %row.operation_id,
+                                detail,
+                                "resent membership operation needs the Terms accepted; will retry"
+                            );
                         }
                         MembershipCommitOutcome::Ambiguous(detail) => {
                             tracing::debug!(

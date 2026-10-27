@@ -28,8 +28,13 @@ pub struct TerminalEnv {
     pub stdin_tty: bool,
     pub stdout_tty: bool,
     pub stderr_tty: bool,
-    /// Running over SSH (`SSH_CONNECTION` / `SSH_TTY` set).
+    /// Running over SSH: `SSH_CONNECTION` / `SSH_TTY` set, or, where a session lost them (tmux
+    /// attached over SSH, `sudo`), the tmux session's or the login record's remote host.
     pub ssh: bool,
+    /// `CI` is set: nobody is at the terminal even if it is a pty.
+    pub ci: bool,
+    /// `--json` was given: the output is for a program, which a sign-in must not wait inside.
+    pub json: bool,
     /// A local display for a browser plausibly exists (always true off Linux).
     pub display: bool,
 }
@@ -44,15 +49,62 @@ impl TerminalEnv {
             stdin_tty: std::io::stdin().is_terminal(),
             stdout_tty: std::io::stdout().is_terminal(),
             stderr_tty: std::io::stderr().is_terminal(),
-            ssh: set("SSH_CONNECTION") || set("SSH_TTY"),
+            ssh: set("SSH_CONNECTION") || set("SSH_TTY") || remote_session_without_ssh_variables(),
+            ci: set("CI"),
+            json: std::env::args_os().any(|arg| arg == "--json"),
             display: !cfg!(target_os = "linux") || set("DISPLAY") || set("WAYLAND_DISPLAY"),
         }
     }
 }
 
+/// Whether the host of the login record (`who am i`) is a remote one: the record names the
+/// controlling terminal's login, and a local display (`:0`) or no host is not remote.
+#[cfg(any(unix, test))]
+fn login_record_is_remote(who_output: &str) -> bool {
+    who_output
+        .split_whitespace()
+        .last()
+        .and_then(|last| last.strip_prefix('(')?.strip_suffix(')'))
+        .is_some_and(|host| !host.is_empty() && !host.starts_with(':'))
+}
+
+/// Whether tmux's session environment (refreshed at every attach) still names an SSH
+/// connection, which a pane started before the attach does not.
+#[cfg(any(unix, test))]
+fn tmux_session_is_remote(show_environment: &str) -> bool {
+    show_environment
+        .trim()
+        .strip_prefix("SSH_CONNECTION=")
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+/// The SSH sessions that carry no `SSH_*` variable: a tmux attached over SSH, and `sudo`, which
+/// strips them.
+#[cfg(unix)]
+fn remote_session_without_ssh_variables() -> bool {
+    let run = |program: &str, args: &[&str]| {
+        std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    (std::env::var_os("TMUX").is_some()
+        && run("tmux", &["show-environment", "SSH_CONNECTION"])
+            .is_some_and(|out| tmux_session_is_remote(&out)))
+        || run("who", &["am", "i"]).is_some_and(|out| login_record_is_remote(&out))
+}
+
+#[cfg(not(unix))]
+fn remote_session_without_ssh_variables() -> bool {
+    false
+}
+
 /// Whether the failed command starts the sign-in by itself, and which flow it uses.
 /// Everything the person must see or answer is on a terminal (stdin, stdout and stderr: a piped
-/// `--json` run never starts one), the command is not itself a sign-in command (no recursion), and
+/// `--json` run never starts one, and neither does `--json` on a terminal or `CI`), the command is not itself a sign-in command (no recursion), and
 /// the failure is one signing in settles. The device flow is used where no local browser is
 /// plausible (SSH, no display), since the loopback redirect could never arrive there.
 #[must_use]
@@ -61,7 +113,7 @@ pub fn auto_sign_in_plan(
     is_sign_in_command: bool,
     env: TerminalEnv,
 ) -> Option<bool> {
-    let interactive = env.stdin_tty && env.stdout_tty && env.stderr_tty;
+    let interactive = env.stdin_tty && env.stdout_tty && env.stderr_tty && !env.ci && !env.json;
     (interactive && !is_sign_in_command && error.is_sign_in_required())
         .then_some(env.ssh || !env.display)
 }
@@ -150,6 +202,8 @@ mod sign_in_offer_tests {
         stdout_tty: true,
         stderr_tty: true,
         ssh: false,
+        ci: false,
+        json: false,
         display: true,
     };
 
@@ -161,6 +215,8 @@ mod sign_in_offer_tests {
             TerminalEnv { stdin_tty: false, ..TERMINAL },
             TerminalEnv { stdout_tty: false, ..TERMINAL },
             TerminalEnv { stderr_tty: false, ..TERMINAL },
+            TerminalEnv { ci: true, ..TERMINAL },
+            TerminalEnv { json: true, ..TERMINAL },
         ] {
             assert_eq!(auto_sign_in_plan(&consent(), false, env), None, "{env:?}");
         }
@@ -178,6 +234,18 @@ mod sign_in_offer_tests {
             auto_sign_in_plan(&consent(), false, TerminalEnv { display: false, ..TERMINAL }),
             Some(true)
         );
+    }
+
+    #[test]
+    fn ssh_is_recognised_without_its_variables() {
+        assert!(login_record_is_remote("juntaki  ttys003  Oct 26 10:00 (192.168.1.5)"));
+        assert!(login_record_is_remote("user pts/1 2026-10-26 10:00 (laptop.example)"));
+        assert!(!login_record_is_remote("juntaki  ttys003  Oct 26 10:00"));
+        assert!(!login_record_is_remote("user pts/1 2026-10-26 10:00 (:0)"));
+        assert!(!login_record_is_remote(""));
+        assert!(tmux_session_is_remote("SSH_CONNECTION=10.0.0.2 5000 10.0.0.1 22\n"));
+        assert!(!tmux_session_is_remote("-SSH_CONNECTION\n"));
+        assert!(!tmux_session_is_remote("unknown variable: SSH_CONNECTION"));
     }
 
     #[test]

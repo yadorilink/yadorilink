@@ -12,7 +12,7 @@ use yadorilink_ipc_proto::daemonctl::{
 use yadorilink_local_storage::link_preflight::{self, LinkPreflightReport};
 
 use crate::daemon::control;
-use crate::error::CoreError;
+use crate::error::{CoreError, Hint};
 use crate::ops::paths;
 use crate::ops::shares::resolve_group_name;
 
@@ -182,7 +182,7 @@ fn classify_unlink_refusal(error: CoreError) -> CoreError {
             message,
             group_ids,
             ..
-        } => CoreError::DurabilityBlocked { message, group_ids },
+        } => CoreError::DurabilityBlocked { message, group_ids }.hinted(Hint::ForceUnlink),
         other => other,
     }
 }
@@ -212,8 +212,10 @@ mod tests {
     #[test]
     fn only_the_not_protected_refusal_becomes_durability_blocked() {
         match classify_unlink_refusal(refusal(ApplicationErrorCode::NotProtected)) {
-            CoreError::DurabilityBlocked { message, group_ids } => {
-                assert!(message.contains("--force"));
+            CoreError::Hinted { error, hint: Hint::ForceUnlink } => {
+                let CoreError::DurabilityBlocked { group_ids, .. } = *error else {
+                    panic!("expected a durability refusal inside the hint");
+                };
                 assert_eq!(group_ids, vec!["group-1".to_string()]);
             }
             other => panic!("expected a durability refusal, got {other:?}"),

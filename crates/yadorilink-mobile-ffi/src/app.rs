@@ -52,6 +52,8 @@ pub enum RefusalCode {
     /// The folder now belongs to a different group than the caller expected.
     GroupMismatch,
     AccessDenied,
+    /// The account has not accepted the current Terms: signing in again shows them.
+    TermsConsentRequired,
 }
 
 impl From<yadorilink_ipc_proto::daemonctl::ApplicationErrorCode> for RefusalCode {
@@ -85,6 +87,7 @@ impl From<yadorilink_ipc_proto::daemonctl::ApplicationErrorCode> for RefusalCode
             C::InviteAlreadyUsed => Self::InviteAlreadyUsed,
             C::GroupMismatch => Self::GroupMismatch,
             C::AccessDenied => Self::AccessDenied,
+            C::TermsConsentRequired => Self::TermsConsentRequired,
         }
     }
 }
@@ -111,6 +114,30 @@ impl From<host::PreservedRefusal> for PreservedRefusal {
             host::PreservedRefusal::NotAWriter => Self::NotAWriter,
             host::PreservedRefusal::RecordUnavailable => Self::RecordUnavailable,
             host::PreservedRefusal::ContentUnavailable => Self::ContentUnavailable,
+        }
+    }
+}
+
+/// Why a re-adoption of a marked folder was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ReadoptRefusal {
+    /// This engine has no folder of the group.
+    GroupUnknown,
+    /// The folder of the group is not marked as needing action: it already syncs.
+    NotMarked,
+    /// The folder of the group is an ordinary folder; only a provider folder is re-adopted.
+    NotAProviderFolder,
+    /// The engine still runs as the retired device: restart it (`suspend`, `resume`) first.
+    RestartRequired,
+}
+
+impl From<host::ReadoptRefusal> for ReadoptRefusal {
+    fn from(reason: host::ReadoptRefusal) -> Self {
+        match reason {
+            host::ReadoptRefusal::GroupUnknown => Self::GroupUnknown,
+            host::ReadoptRefusal::NotMarked => Self::NotMarked,
+            host::ReadoptRefusal::NotAProviderFolder => Self::NotAProviderFolder,
+            host::ReadoptRefusal::RestartRequired => Self::RestartRequired,
         }
     }
 }
@@ -230,6 +257,19 @@ pub struct CreateShareRequest {
     pub acknowledge_risks: bool,
 }
 
+/// A folder group of this account that can be joined on this device. Identity only.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct JoinableGroup {
+    pub group_id: String,
+    pub name: String,
+}
+
+impl From<dto::GroupSummary> for JoinableGroup {
+    fn from(group: dto::GroupSummary) -> Self {
+        Self { group_id: group.group_id, name: group.name }
+    }
+}
+
 /// Join a share of this account.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct JoinGroupRequest {
@@ -311,6 +351,23 @@ pub struct PauseLinkRequest {
 pub struct ResumeLinkRequest {
     pub link_key: String,
     pub expected_group_id: Option<String>,
+}
+
+/// Re-adopt the provider folder of a group that a start over marked as needing action.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ReadoptRequest {
+    pub group_id: String,
+}
+
+/// What a re-adoption did.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ReadoptOutcome {
+    pub group_id: String,
+    pub link_key: String,
+    pub provider_root_id: Option<String>,
+    /// The folder is now a full replica (a replacement the service calls unconfirmed waits for
+    /// this group).
+    pub promoted_to_eager: bool,
 }
 
 /// Unlink a folder after the custody checks; `force` skips a refusal and risks data loss.
@@ -1007,6 +1064,24 @@ impl MobileHost {
         }
     }
 
+    /// The folder groups of this account that can be joined on this device. Read-only; join
+    /// one with `join_group`.
+    ///
+    /// # Errors
+    /// `Account` with `NotSignedIn`; the other [`CallFailure`] cases.
+    pub fn list_joinable_groups(
+        &self,
+        cancel: &CancelHandle,
+        deadline_ms: Option<u64>,
+    ) -> Result<Vec<JoinableGroup>, CallFailure> {
+        match self.account(host::AccountCommand::ListJoinableGroups, cancel, deadline_ms)? {
+            host::CommandOutput::JoinableGroups(groups) => {
+                Ok(groups.into_iter().map(Into::into).collect())
+            }
+            other => Err(unexpected("list_joinable_groups", &other)),
+        }
+    }
+
     /// Joins a share by invite.
     ///
     /// # Errors
@@ -1062,6 +1137,33 @@ impl MobileHost {
             expected_group_id: request.expected_group_id,
         });
         self.done("resume_link", command, cancel, deadline_ms)
+    }
+
+    /// Re-adopts the folder a start over marked as needing action into its group: it syncs
+    /// again, keeping its files; on-demand while a replacement waits for confirmation, it is
+    /// made a full replica. Call after the engine restarted following the start over.
+    ///
+    /// # Errors
+    /// `ReadoptRefused` (`GroupUnknown`, `NotMarked`, `NotAProviderFolder`, `RestartRequired`),
+    /// or `Refused` with the codes a join has (the group is gone or not accessible).
+    pub fn readopt_marked_folder(
+        &self,
+        request: ReadoptRequest,
+        cancel: &CancelHandle,
+        deadline_ms: Option<u64>,
+    ) -> Result<ReadoptOutcome, CallFailure> {
+        let command = host::Command::ReadoptMarkedFolder(host::ReadoptMarkedFolder {
+            group_id: request.group_id,
+        });
+        match self.run(command, cancel, deadline_ms)? {
+            host::CommandOutput::Readopted(outcome) => Ok(ReadoptOutcome {
+                group_id: outcome.group_id,
+                link_key: outcome.link_key,
+                provider_root_id: outcome.provider_root_id,
+                promoted_to_eager: outcome.promoted_to_eager,
+            }),
+            other => Err(unexpected("readopt_marked_folder", &other)),
+        }
     }
 
     /// Unlinks a folder after the custody checks.

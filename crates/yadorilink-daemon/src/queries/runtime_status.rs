@@ -87,12 +87,18 @@ pub(crate) struct RuntimeStatusView {
     /// Why the coordination service refuses this device although its credential is intact
     /// (the Terms are not accepted, or the session cannot be renewed); `None` when it does not.
     pub(crate) coordination_block: Option<yadorilink_fapi_client::CoordinationBlock>,
+    /// Where this device's own account stands in its deletion lifecycle.
+    pub(crate) account_deletion: crate::daemon_state::AccountDeletionState,
 }
 
 /// Reads the coordination block of the credential this daemon authenticates with; `None` until
 /// the daemon has one.
 pub(crate) type CoordinationBlockSource =
     Arc<dyn Fn() -> Option<yadorilink_fapi_client::CoordinationBlock> + Send + Sync>;
+
+/// Reads the deletion state of this device's own account as the latest netmap reported it.
+pub(crate) type AccountDeletionSource =
+    Arc<dyn Fn() -> crate::daemon_state::AccountDeletionState + Send + Sync>;
 
 pub(crate) struct RuntimeStatusQueryService {
     link_status: Arc<LinkStatusQueryService>,
@@ -107,6 +113,7 @@ pub(crate) struct RuntimeStatusQueryService {
     rate_limiters: Arc<RateLimiters>,
     replica: Arc<crate::replica_coordinator::ReplicaCoordinator>,
     coordination_block: CoordinationBlockSource,
+    account_deletion: AccountDeletionSource,
 }
 
 impl RuntimeStatusQueryService {
@@ -123,6 +130,7 @@ impl RuntimeStatusQueryService {
         rate_limiters: Arc<RateLimiters>,
         replica: Arc<crate::replica_coordinator::ReplicaCoordinator>,
         coordination_block: CoordinationBlockSource,
+        account_deletion: AccountDeletionSource,
     ) -> Self {
         Self {
             link_status,
@@ -137,6 +145,7 @@ impl RuntimeStatusQueryService {
             rate_limiters,
             replica,
             coordination_block,
+            account_deletion,
         }
     }
 
@@ -218,6 +227,7 @@ impl RuntimeStatusQueryService {
             database_restored: self.replica.database_restored().map(|r| r.category()),
             author_unavailable: self.replica.author_unavailable(),
             coordination_block: (self.coordination_block)(),
+            account_deletion: (self.account_deletion)(),
         })
     }
 

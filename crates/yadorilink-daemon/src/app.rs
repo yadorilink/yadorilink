@@ -103,7 +103,10 @@ fn gate_ownership(
     if let Err(refusal) = identity.gate_start(config_dir) {
         let message = refusal.to_string();
         tracing::error!("{message}");
-        if let Err(e) = yadorilink_local_storage::startup_refusal::record(config_dir, &message) {
+        if let Err(e) = yadorilink_local_storage::startup_refusal::record(
+            config_dir,
+            &yadorilink_local_storage::startup_refusal::StartupRefusal::plain(message),
+        ) {
             tracing::warn!(error = %e, "could not record the startup refusal");
         }
         return Err(refusal.into());
@@ -502,7 +505,13 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<RunEnd> {
     let shell_ipc_socket_path = config.shell_ipc_socket_path;
 
     let crate::engine_startup::OpenedData { block_store, replica_coordinator } =
-        crate::engine_startup::open_data(&dir, &block_store_root, &sync_db_path, &tuning)?;
+        crate::engine_startup::open_data(
+            &data_resource_locks,
+            &dir,
+            &block_store_root,
+            &sync_db_path,
+            &tuning,
+        )?;
     data_resource_locks.lock_created_sync_db(&sync_db_path)?;
     crate::engine_startup::settle_data(&replica_coordinator, &sync_db_path)?;
 
@@ -917,7 +926,14 @@ pub fn record_placement_refusal(
     let dir = dir.map(std::path::Path::to_path_buf).or_else(|| state_dir::resolve(env).ok());
     for place in [dir, state_dir::default_dir(env).ok()].into_iter().flatten() {
         let recorded = yadorilink_fs_platform::durable_dir::create_dir_all_durably(&place)
-            .and_then(|()| yadorilink_local_storage::startup_refusal::record(&place, &message));
+            .and_then(|()| {
+                yadorilink_local_storage::startup_refusal::record(
+                    &place,
+                    &yadorilink_local_storage::startup_refusal::StartupRefusal::plain(
+                        message.clone(),
+                    ),
+                )
+            });
         if let Err(error) = recorded {
             tracing::warn!(error = %error, "could not record the startup refusal");
         }
@@ -1326,7 +1342,7 @@ mod ownership_gate_tests {
         let app = identity("/Applications/Y.app/Contents/Helpers/yadorilink-daemon", "app_bundle");
         let error = gate_ownership(&app, dir.path()).unwrap_err();
         assert!(error.downcast_ref::<OwnershipRefused>().is_some(), "{error}");
-        let reason = yadorilink_local_storage::startup_refusal::read(dir.path()).unwrap();
+        let reason = yadorilink_local_storage::startup_refusal::read(dir.path()).unwrap().message();
         assert!(reason.contains("managed by"), "{reason}");
 
         // The owner itself is still welcome.
@@ -1820,7 +1836,7 @@ mod startup_config_validation_tests {
         let dir = appdata.join("yadorilink");
         let err = refuse_unusable_state_dir(&env, &dir).unwrap_err();
         assert!(err.to_string().contains("AppData"), "{err}");
-        let recorded = yadorilink_local_storage::startup_refusal::read(&dir).unwrap();
+        let recorded = yadorilink_local_storage::startup_refusal::read(&dir).unwrap().message();
         assert!(recorded.contains("AppData"), "{recorded}");
         let unpackaged = yadorilink_fs_platform::state_dir::Env { packaged: false, ..env };
         refuse_unusable_state_dir(&unpackaged, &dir).unwrap();
@@ -1896,7 +1912,8 @@ mod startup_config_validation_tests {
             run(DaemonConfig::from_env().unwrap()),
         )
         .await;
-        let refusal = yadorilink_local_storage::startup_refusal::read(config_dir.path());
+        let refusal =
+            yadorilink_local_storage::startup_refusal::read(config_dir.path()).map(|r| r.message());
 
         std::env::remove_var("YADORILINK_CONFIG_DIR");
         std::env::remove_var("YADORILINK_BLOCK_STORE");

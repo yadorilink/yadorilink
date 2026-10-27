@@ -12,7 +12,9 @@ use yadorilink_ipc_proto::daemonctl::{
 use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_local_storage::release_descriptor::{self, DescriptorProblem, ReleaseDescriptor};
 
-use crate::error::{CoreError, EngineMismatchDetail, EngineMismatchDirection, EngineMismatchKind};
+use crate::error::{
+    CoreError, EngineMismatchDetail, EngineMismatchDirection, EngineMismatchKind, Hint,
+};
 
 /// Sends one request and returns the daemon's response. A plain
 /// `RespPayload::Error` answer is returned as [`CoreError::DaemonRejected`]
@@ -280,6 +282,13 @@ async fn round_trip(
     }
     match &resp.payload {
         Some(RespPayload::Error(msg)) => return Err(CoreError::DaemonRejected(msg.clone())),
+        Some(RespPayload::Refused(refused)) => {
+            let rejected = CoreError::DaemonRejected(refused.message.clone());
+            return Err(match Hint::from_wire(refused.next_step) {
+                Some(hint) => rejected.hinted(hint),
+                None => rejected,
+            });
+        }
         Some(RespPayload::CommandError(error)) => {
             return Err(CoreError::from_command_error(error.clone()));
         }

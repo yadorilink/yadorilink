@@ -75,6 +75,19 @@ struct VerifiedManifest {
     manifest: Option<manifest::UpdateManifest>,
 }
 
+/// The last accepted envelope, kept beside the replay floor so a restarted daemon can answer
+/// [`UpdateManager::verified_entry`] before its first check. It is never trusted as stored: it
+/// is re-verified on load and must be the envelope the replay floor accepted.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedVerified {
+    channel: String,
+    at_unix: i64,
+    envelope: String,
+}
+
+const PERSISTED_VERIFIED_FILE: &str = "update_verified_manifest.json";
+
 /// Why the daemon cannot say whether an item is covered. Distinct from a refusal: nothing is
 /// known to be wrong, so an app shows "cannot confirm", never "update required".
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,7 +272,8 @@ pub struct UpdateManager {
     pub policy: UpdatePolicyStore,
     trust: TrustStore,
     replay: ReplayStore,
-    /// The newest manifest this process verified, for [`UpdateManager::verified_entry`], which
+    verified_path: std::path::PathBuf,
+    /// The newest manifest this process verified (or restored from disk, re-verified), for [`UpdateManager::verified_entry`], which
     /// answers from it without touching the network or the replay floor.
     verified: std::sync::Mutex<Option<VerifiedManifest>>,
     http: reqwest::Client,
@@ -334,6 +348,7 @@ impl UpdateManager {
             policy: UpdatePolicyStore::new(config_dir.as_ref()),
             trust: TrustStore::new(config_dir.as_ref()),
             replay: ReplayStore::new(config_dir.as_ref()),
+            verified_path: config_dir.as_ref().join(PERSISTED_VERIFIED_FILE),
             verified: std::sync::Mutex::new(None),
             http,
             manifest_url,
@@ -452,20 +467,14 @@ impl UpdateManager {
             .await
             .map_err(|e| UpdateError::Fetch(e.to_string()))?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-            self.remember_verified(&policy.channel, None);
+            self.remember_no_manifest(&policy.channel)?;
             return Ok(None);
         }
         let response =
             response.error_for_status().map_err(|e| UpdateError::Fetch(e.to_string()))?;
         let body = response.text().await.map_err(|e| UpdateError::Fetch(e.to_string()))?;
         let envelope = manifest::parse_envelope(&body)?;
-        #[cfg(test)]
-        let genesis: &[manifest::TrustedKey] = match &self.trusted_keys_override {
-            Some(keys) => keys,
-            None => manifest::TRUSTED_KEYS,
-        };
-        #[cfg(not(test))]
-        let genesis: &[manifest::TrustedKey] = manifest::TRUSTED_KEYS;
+        let genesis = self.genesis_keys();
         // The persisted chain (plus any verified extension the server offers)
         // decides which keys are trusted; a revoked key stays revoked even if
         // a later response omits the chain.
@@ -484,9 +493,24 @@ impl UpdateManager {
         Ok(Some(manifest))
     }
 
-    fn remember_verified(&self, channel: &str, manifest: Option<manifest::UpdateManifest>) {
-        *self.verified.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(VerifiedManifest { channel: channel.into(), at_unix: self.now(), manifest });
+    fn genesis_keys(&self) -> &[manifest::TrustedKey] {
+        #[cfg(test)]
+        if let Some(keys) = &self.trusted_keys_override {
+            return keys;
+        }
+        manifest::TRUSTED_KEYS
+    }
+
+    /// The channel has no manifest now. The fact is made durable in the replay floor (which
+    /// `restore_verified` consults) before it is acted on; no file removal is relied on, so an
+    /// older cached manifest cannot come back after a restart. If it cannot be stored, the check
+    /// fails.
+    fn remember_no_manifest(&self, channel: &str) -> Result<(), ReplayError> {
+        let mut cache = self.verified.lock().unwrap_or_else(|e| e.into_inner());
+        self.replay.mark_no_manifest(channel)?;
+        *cache =
+            Some(VerifiedManifest { channel: channel.into(), at_unix: self.now(), manifest: None });
+        Ok(())
     }
 
     /// Moves the replay floor and records the manifest under one lock, so concurrent checks
@@ -499,12 +523,62 @@ impl UpdateManager {
     ) -> Result<(), ReplayError> {
         let mut cache = self.verified.lock().unwrap_or_else(|e| e.into_inner());
         self.replay.accept(channel, &manifest.generated_at, body)?;
+        let at_unix = self.now();
         *cache = Some(VerifiedManifest {
             channel: channel.into(),
-            at_unix: self.now(),
+            at_unix,
             manifest: Some(manifest.clone()),
         });
+        // Only a convenience for the next start: the replay floor above is what must not be lost.
+        if let Err(e) = self.persist_verified(channel, at_unix, body) {
+            tracing::warn!(error = %e, "could not persist the verified update manifest");
+        }
         Ok(())
+    }
+
+    fn persist_verified(&self, channel: &str, at_unix: i64, body: &str) -> std::io::Result<()> {
+        use std::io::Write;
+
+        use yadorilink_fs_platform::durable_dir::{
+            create_dir_all_durably, publish_durably, Replace,
+        };
+
+        if let Some(parent) = self.verified_path.parent() {
+            create_dir_all_durably(parent)?;
+        }
+        let record = PersistedVerified { channel: channel.into(), at_unix, envelope: body.into() };
+        let json = serde_json::to_string(&record).map_err(std::io::Error::other)?;
+        let tmp = self.verified_path.with_file_name(format!(".{PERSISTED_VERIFIED_FILE}.tmp"));
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(json.as_bytes())?;
+        yadorilink_fs_platform::flush::sync_file(&f)?;
+        drop(f);
+        publish_durably(&tmp, &self.verified_path, Replace::Yes)
+    }
+
+    /// The persisted envelope for `channel`, when it still verifies under the trust chain and is
+    /// exactly what the replay floor accepted. Anything else (absent, damaged, another channel,
+    /// superseded) is "nothing", and the answer stays `NotChecked` until a check completes.
+    fn restore_verified(&self, channel: &str) -> Option<VerifiedManifest> {
+        let record: PersistedVerified =
+            serde_json::from_str(&std::fs::read_to_string(&self.verified_path).ok()?).ok()?;
+        if record.channel != channel {
+            return None;
+        }
+        let floor = self.replay.accepted(channel)?;
+        if floor.no_manifest
+            || floor.envelope_sha256 != super::replay::envelope_sha256(&record.envelope)
+        {
+            return None;
+        }
+        let envelope = manifest::parse_envelope(&record.envelope).ok()?;
+        let state = self.trust.sync(self.genesis_keys(), &envelope.trust_chain).ok()?;
+        let doc = manifest::verify_envelope(&envelope, &state).ok()?;
+        Some(VerifiedManifest {
+            channel: channel.into(),
+            at_unix: record.at_unix,
+            manifest: Some(doc),
+        })
     }
 
     /// Whether `item` is covered by the `app_bundle` entry of the manifest this daemon last
@@ -517,7 +591,15 @@ impl UpdateManager {
         phase: manifest::AppcastPhase,
     ) -> VerifiedEntryAnswer {
         let policy = self.policy.load_or_default();
-        let cached = self.verified.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let cached = {
+            let mut cache = self.verified.lock().unwrap_or_else(|e| e.into_inner());
+            if cache.as_ref().is_none_or(|c| c.channel != policy.channel) {
+                if let Some(restored) = self.restore_verified(&policy.channel) {
+                    *cache = Some(restored);
+                }
+            }
+            cache.clone()
+        };
         let Some(cached) = cached.filter(|c| c.channel == policy.channel) else {
             return VerifiedEntryAnswer::cannot_confirm(CannotConfirm::NotChecked);
         };

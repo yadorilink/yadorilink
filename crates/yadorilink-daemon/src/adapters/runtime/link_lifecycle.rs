@@ -230,9 +230,10 @@ impl LinkWatcherPort for DaemonLinkWatcherAdapter {
         Box::pin(async move {
             if on_demand {
                 if !self.state.root_allows_on_demand(group_id) {
-                    return Err(DaemonError::Config(
-                        crate::provider_gate::ON_DEMAND_REFUSAL.to_string(),
-                    ));
+                    return Err(DaemonError::Advised {
+                        message: crate::provider_gate::ON_DEMAND_REFUSAL.to_string(),
+                        step: crate::error::NextStep::CreateProviderFolder,
+                    });
                 }
                 self.state
                     .replica_coordinator

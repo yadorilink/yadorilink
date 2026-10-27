@@ -42,7 +42,8 @@
 #
 # Exit status: 0 ok or already current, 1 other failure, 2 usage, 3 network,
 # 4 signature, hash, replay or withdrawal refusal, 5 unsupported platform,
-# 6 downgrade refused, 7 prefix not writable.
+# 6 downgrade refused, 7 prefix not writable, 19 managed elsewhere (the app or a
+# package manager owns this machine's YadoriLink data; nothing is installed).
 #
 # Needs: curl, unzip, awk, and sha256sum or shasum. The Ed25519 signature is
 # checked by a small pinned verifier program the script downloads and hash-checks
@@ -278,6 +279,28 @@ envelope_field() {
     BEGIN { RS = "\001" }
     { s = $0 }
     END {
+        # The optional top-level trust_chain array (key-rotation records) carries its own
+        # nested key_id fields. The installer pins the trust set itself and ignores the
+        # chain, so cut the array out before looking for a top-level field.
+        tc = index(s, "\"trust_chain\"")
+        if (want != "trust_chain" && tc > 0) {
+            m = length(s); k = tc + 13
+            while (k <= m && substr(s, k, 1) ~ /[ \t\r\n]/) k++
+            if (substr(s, k, 1) != ":") exit 5
+            k++
+            while (k <= m && substr(s, k, 1) ~ /[ \t\r\n]/) k++
+            if (substr(s, k, 1) != "[") exit 5
+            depth = 0; instr = 0; e2 = 0
+            for (; k <= m; k++) {
+                ch = substr(s, k, 1)
+                if (instr) { if (ch == "\\") k++; else if (ch == "\"") instr = 0; continue }
+                if (ch == "\"") instr = 1
+                else if (ch == "[") depth++
+                else if (ch == "]") { depth--; if (depth == 0) { e2 = k; break } }
+            }
+            if (e2 == 0) exit 5
+            s = substr(s, 1, tc - 1) substr(s, e2 + 1)
+        }
         pat = "\"" want "\""
         first = index(s, pat)
         if (first == 0) exit 3
@@ -412,6 +435,29 @@ id_field() {
     [ -n "$vals" ] || return 1
     [ "$(printf '%s\n' "$vals" | wc -l | tr -d ' ')" = 1 ] || return 1
     printf '%s' "$vals"
+}
+
+# ---- ownership --------------------------------------------------------------
+
+# state_dir: the data area the daemon uses (crates/yadorilink-fs-platform/src/state_dir.rs).
+state_dir() {
+    if [ -n "${YADORILINK_CONFIG_DIR:-}" ]; then printf '%s' "$YADORILINK_CONFIG_DIR"
+    elif [ "$PLATFORM" = macos ]; then printf '%s' "$HOME/Library/Application Support/yadorilink"
+    else printf '%s' "${XDG_DATA_HOME:-$HOME/.local/share}/yadorilink"; fi
+}
+
+# check_not_managed_elsewhere: one data area has one owner, and only the owner's updater
+# changes its programs (see the desktop and CLI coexistence design). The ownership record
+# decides: no record means nothing is owned yet; a record naming the app, another installation
+# or an unreadable one stops the install before anything is fetched or written.
+check_not_managed_elsewhere() {
+    rec=$(state_dir)/install-owner.json
+    [ -e "$rec" ] || return 0
+    unreadable="the ownership record $rec cannot be read, so who manages YadoriLink here is unknown. Nothing was installed. Fix or remove that file only if you know no other YadoriLink install uses this data."
+    rec_owner=$(id_field "$rec" owner) || refuse 19 "$unreadable"
+    rec_source=$(id_field "$rec" install_source) || refuse 19 "$unreadable"
+    [ "$rec_owner" != gui ] || refuse 19 "YadoriLink is managed by the app ($rec_source); the yadorilink command is already available from the app. Nothing was installed."
+    [ "$rec_source" = script ] || refuse 19 "this machine's YadoriLink data belongs to another installation ($rec_source), which has its own updater. Nothing was installed."
 }
 
 # ---- platform ---------------------------------------------------------------
@@ -680,6 +726,7 @@ take_live() { LIVE_VERSION=$M_VERSION; LIVE_KILL=$M_KILL; LIVE_MIN=$M_MIN; LIVE_
 
 do_install() {
     detect_target
+    check_not_managed_elsewhere
     have curl || die "curl is required"
     have unzip || have bsdtar || die "unzip is required"
 

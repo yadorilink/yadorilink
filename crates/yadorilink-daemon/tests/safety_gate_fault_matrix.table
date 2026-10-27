@@ -50,6 +50,8 @@ delegate | 2.8 |  | crates/yadorilink-daemon/tests/unreadable_file_attention.rs:
 # ---- 2.9 restored or copied database, start over, replaced device ----
 case | witness.side_unreadable | 2.9 | Restored::Unverifiable | An unreadable installation witness refuses the open (unverifiable) and is not rewritten; start over records a fresh witness
 case | witness.other_install | 2.9 | Restored::DifferentInstall | A database of another installation is refused (different_install); the side copy is untouched; start over recovers
+delegate | 2.9 | Restored::KeychainNonceMissing | crates/yadorilink-daemon/src/instance_nonce.rs::a_wiped_keychain_beside_existing_data_is_detected
+delegate | 2.9 | Restored::KeychainNonceMismatch | crates/yadorilink-daemon/src/instance_nonce.rs::a_data_area_copied_to_another_keychain_is_detected
 case | witness.older_generation | 2.9 | Restored::OlderGeneration | A database older than the newest recorded state is refused (older_generation); start over recovers
 case | witness.database_predates_witness | 2.9 | Restored::DifferentInstall | A database without a witness beside an installation that has one is refused; start over recovers
 case | replacement.record_unreadable | 2.9 |  | An unreadable replacement record counts as waiting (never confirmed) and is not dropped; rewriting it with the acknowledgement releases it

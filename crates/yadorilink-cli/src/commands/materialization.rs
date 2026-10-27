@@ -212,6 +212,7 @@ mod evict_report_tests {
             "host_busy",
             "version_moved",
             "nothing_freed",
+            "not_downloaded",
             "not_confirmed",
             "host_refused",
         ] {

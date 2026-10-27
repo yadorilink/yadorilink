@@ -174,13 +174,12 @@ fn refusal(result: Result<CommandOutput, CallError>) -> ApplicationErrorCode {
     }
 }
 
-const HAS_PROVIDER: bool = cfg!(any(target_vendor = "apple", windows));
-
 #[test]
+#[cfg_attr(
+    not(any(target_vendor = "apple", windows)),
+    ignore = "needs a provider adapter, which only Apple and Windows have"
+)]
 fn joining_by_invite_into_a_provider_folder_redeems_the_invite_and_links_it() {
-    if !HAS_PROVIDER {
-        return;
-    }
     let _serial = serialized();
     let fake = Fake::start();
     let (host, _area) = host_against(&fake);
@@ -200,10 +199,11 @@ fn joining_by_invite_into_a_provider_folder_redeems_the_invite_and_links_it() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_vendor = "apple", windows)),
+    ignore = "needs a provider adapter, which only Apple and Windows have"
+)]
 fn an_expired_or_used_invite_is_refused_typed_and_links_nothing() {
-    if !HAS_PROVIDER {
-        return;
-    }
     let _serial = serialized();
     let fake = Fake::start();
     let (host, _area) = host_against(&fake);
@@ -220,10 +220,14 @@ fn an_expired_or_used_invite_is_refused_typed_and_links_nothing() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_vendor = "apple", windows)),
+    ignore = "needs a provider adapter, which only Apple and Windows have"
+)]
 fn a_blank_name_is_refused_and_nothing_is_activated() {
     // The plain-folder refusal below only exists in the embedded shape; a workspace build unifies
     // the daemon's `process-model` feature on (see `embedded_defaults.rs`).
-    if !HAS_PROVIDER || support::desktop_shaped_skip() {
+    if support::desktop_shaped_skip() {
         return;
     }
     let _serial = serialized();
@@ -248,10 +252,11 @@ fn a_blank_name_is_refused_and_nothing_is_activated() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_vendor = "apple", windows)),
+    ignore = "needs a provider adapter, which only Apple and Windows have"
+)]
 fn a_token_reused_for_another_name_is_refused_and_the_first_folder_stays() {
-    if !HAS_PROVIDER {
-        return;
-    }
     let _serial = serialized();
     let fake = Fake::start();
     let (host, _area) = host_against(&fake);
@@ -263,10 +268,11 @@ fn a_token_reused_for_another_name_is_refused_and_the_first_folder_stays() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_vendor = "apple", windows)),
+    ignore = "needs a provider adapter, which only Apple and Windows have"
+)]
 fn creating_a_provider_share_prepares_activates_and_a_retry_changes_nothing() {
-    if !HAS_PROVIDER {
-        return;
-    }
     let _serial = serialized();
     let fake = Fake::start();
     let (host, _area) = host_against(&fake);

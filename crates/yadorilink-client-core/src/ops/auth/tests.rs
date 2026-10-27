@@ -343,11 +343,18 @@ async fn reauthenticating_with_nothing_enrolled_reports_not_logged_in_and_enrols
 
 /// An Authorization Server that serves the device-code step-up.
 async fn step_up_server() -> wiremock::MockServer {
+    step_up_server_claiming(None).await
+}
+
+/// As [`step_up_server`], reporting `claimed_issuer` as its issuer when given (its endpoints
+/// stay at its own address).
+async fn step_up_server_claiming(claimed_issuer: Option<&str>) -> wiremock::MockServer {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
-    let issuer = server.uri();
+    let own = server.uri();
+    let issuer = claimed_issuer.map_or_else(|| own.clone(), str::to_owned);
     Mock::given(method("GET"))
         .and(path("/.well-known/openid-configuration"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -445,13 +452,18 @@ async fn reauthenticating_talks_to_the_authorization_server_not_the_coordination
 /// arguments (the process's own credential variables are not set).
 #[tokio::test]
 async fn reauthenticating_in_a_directory_uses_the_hosts_settings() {
-    let server = step_up_server().await;
-    let issuer = server.uri();
+    // The stored issuer names a host nothing listens on; the settings name the live
+    // Authorization Server, which reports that issuer. Only dialing the settings' address
+    // reaches it.
+    let stored_issuer = "https://issuer.example.test".to_owned();
+    let server = step_up_server_claiming(Some(&stored_issuer)).await;
+    let override_addr = server.uri();
+    assert_ne!(override_addr, stored_issuer);
     let dir = tempfile::tempdir().expect("temp dir");
     let settings = credential_store::CredentialSettings {
         backend: yadorilink_fapi_client::store::Backend::File(dir.path().join("credentials.json")),
         key_mirror: yadorilink_transport::KeyMirror::Disabled,
-        auth_server_addr: Some(issuer.clone()),
+        auth_server_addr: Some(override_addr),
         coordination_addr: None,
         host_name: None,
     };
@@ -462,7 +474,7 @@ async fn reauthenticating_in_a_directory_uses_the_hosts_settings() {
         .save(
             &lock,
             &yadorilink_fapi_client::store::Credentials::new(
-                issuer.clone(),
+                stored_issuer,
                 "ylk-AAAAAAAAAAAAAAAAAAAAAA",
                 key_jwk,
                 "rt-original",

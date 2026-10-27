@@ -243,7 +243,8 @@ fn a_role_change_accepts_viewer_and_editor_and_refuses_owner() {
     assert!(validate_changeable_role("editor").is_ok());
 
     let refused = validate_changeable_role("owner").unwrap_err();
-    assert!(matches!(refused, CoreError::InvalidInput(_)), "{refused:?}");
+    assert!(matches!(refused, CoreError::InvalidArgument(_)), "{refused:?}");
+    assert!(!refused.to_string().contains("--"), "{refused}");
     let refused = refused.to_string();
     assert!(refused.contains("owner"), "{refused}");
     assert!(refused.contains("viewer or editor"), "{refused}");
@@ -491,11 +492,8 @@ fn storage_mode_words_map_to_the_on_demand_flag_and_back() {
         assert_eq!(parse_storage_mode(word).unwrap(), on_demand, "{word}");
     }
     let refused = parse_storage_mode("bogus").unwrap_err();
-    assert!(matches!(refused, CoreError::InvalidInput(_)));
-    assert_eq!(
-        refused.to_string(),
-        "invalid --storage-mode \"bogus\" (expected eager or on-demand)"
-    );
+    assert!(matches!(refused, CoreError::InvalidArgument(_)));
+    assert_eq!(refused.to_string(), "invalid storage mode \"bogus\" (expected eager or on-demand)");
 }
 
 #[test]

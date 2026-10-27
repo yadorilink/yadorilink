@@ -11,7 +11,7 @@ pub(crate) mod replica_role;
 #[allow(unused_imports)]
 pub(crate) use enrollment::{
     EnrollmentActivationResult, EnrollmentCancellationResult, EnrollmentPrepareResult,
-    InviteRefusal, LinkRefusal, MintedInvite,
+    InviteRefusal, LinkRefusal, MintInviteError, MintedInvite,
 };
 #[allow(unused_imports)]
 pub(crate) use membership::{

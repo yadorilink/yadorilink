@@ -18,9 +18,13 @@
 //!   maps to one lock file for the file's lifetime, also after a save renames a new file over
 //!   it. On a case-insensitive volume case aliases of the lock file are one inode, so they
 //!   contend too. A credential path that is itself a symlink is refused: a save would replace
-//!   the symlink with a regular file and leave its target as another credential. On Unix, when the credential file exists it is also locked itself (opened read-only,
-//!   so nothing is written), which catches a hard link to it. Windows cannot: a `LockFileEx`
-//!   lock is mandatory there and would make the engine's own reads of the file fail.
+//!   the symlink with a regular file and leave its target as another credential. On Unix, when
+//!   the credential file exists it is also locked itself (opened read-only, so nothing is
+//!   written), which catches a hard link to it. Windows cannot lock it: a `LockFileEx` lock is
+//!   mandatory there and would make the engine's own reads of the file fail. There an existing
+//!   credential file with more than one link is refused instead
+//!   ([`StoreError::CredentialFileIsHardLinked`]), because the file's other names cannot be
+//!   found to lock their sidecars.
 //!
 //! The locks are held for the life of the [`EntryClaim`]. A save replaces the credential file
 //! by renaming a new one over it, so a lock on the file's inode only proves what it proved at
@@ -160,6 +164,17 @@ fn claim_file(path: &Path) -> StoreResult<FileEntryLock> {
     lock(&sidecar, &lock_path)?;
     locks.push(sidecar);
     // After the lock file is held, so a credential created in the meantime is seen.
+    #[cfg(windows)]
+    match File::open(&file) {
+        Ok(opened) => {
+            let links = winapi_util::file::information(&opened).map_err(|_| unresolvable())?;
+            if links.number_of_links() > 1 {
+                return Err(StoreError::CredentialFileIsHardLinked(path.to_path_buf()));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(unresolvable()),
+    }
     #[cfg(unix)]
     match File::open(&file) {
         Ok(opened) => {

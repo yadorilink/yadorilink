@@ -193,7 +193,10 @@ pub(crate) trait EnrollmentCoordination: Send + Sync {
         role: Option<&'a str>,
         ttl_secs: Option<u64>,
         requires_approval: bool,
-    ) -> BoxFuture<'a, Result<crate::application::model::MintedInvite, String>>;
+    ) -> BoxFuture<
+        'a,
+        Result<crate::application::model::MintedInvite, crate::application::model::MintInviteError>,
+    >;
 }
 
 /// A local link/marker/watcher commit request -- what the current `LinkFn`

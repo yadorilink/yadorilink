@@ -398,6 +398,11 @@ pub(crate) fn run_trace_end(trace: Option<std::sync::Arc<RunTrace>>) {
     if !enabled() {
         return;
     }
+    record_run(&trace, &S_STEP, &S_SPREAD);
+}
+
+/// Adds one finished run to the given stage distributions.
+fn record_run(trace: &RunTrace, step: &[Dist; STAGES + 1], spread: &[Dist; STAGES]) {
     let ended = nanos(trace.begun.elapsed());
     let mut frontier = 0u64;
     for index in 0..STAGES {
@@ -406,12 +411,12 @@ pub(crate) fn run_trace_end(trace: Option<std::sync::Arc<RunTrace>>) {
         if first == u64::MAX {
             continue;
         }
-        S_SPREAD[index].record(last.saturating_sub(first));
+        spread[index].record(last.saturating_sub(first));
         let reached = last.max(frontier);
-        S_STEP[index].record(reached - frontier);
+        step[index].record(reached - frontier);
         frontier = reached;
     }
-    S_STEP[STAGES].record(ended.saturating_sub(frontier));
+    step[STAGES].record(ended.saturating_sub(frontier));
 }
 
 fn emit_stages(occasion: &str) {

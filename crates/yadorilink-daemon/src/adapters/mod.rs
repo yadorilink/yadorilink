@@ -202,6 +202,10 @@ pub(crate) fn build_query_services(state: Arc<DaemonState>) -> Arc<QueryServices
             let state = state.clone();
             Arc::new(move || state.coordination_client_config().and_then(|c| c.auth.block()))
         },
+        {
+            let state = state.clone();
+            Arc::new(move || state.account_deletion())
+        },
     ));
     let linked_path = Arc::new(crate::queries::linked_path::LinkedPathResolver::new(
         state.replica_coordinator.clone(),

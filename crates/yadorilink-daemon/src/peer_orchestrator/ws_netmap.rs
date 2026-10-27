@@ -41,6 +41,29 @@ pub(super) struct WsNetmapMessage {
     /// does not send it reads as none waiting.
     #[serde(default, rename = "pendingApprovals")]
     pending_approvals: Vec<WsPendingApprovals>,
+    /// This device's own account, additive: absent from an older plane, and read leniently so
+    /// that a shape this build does not know reads as nothing pending rather than refusing the
+    /// whole netmap.
+    #[serde(default, rename = "self")]
+    self_account: Option<serde_json::Value>,
+}
+
+impl WsNetmapMessage {
+    /// The deletion state of this device's own account, only when the netmap states one that this
+    /// build knows. `None` means "not said" (no `self`, no field, or a value from a newer plane):
+    /// that must leave the last state alone, so a partial or unreadable push never hides a
+    /// pending-deletion warning. Only an explicit `none` clears it.
+    pub(super) fn account_deletion_state(
+        &self,
+    ) -> Option<crate::daemon_state::AccountDeletionState> {
+        use crate::daemon_state::AccountDeletionState as S;
+        match self.self_account.as_ref()?.get("accountDeletionState")?.as_str()? {
+            "none" => Some(S::None),
+            "pending" => Some(S::Pending),
+            "urgent" => Some(S::Urgent),
+            _ => None,
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -675,6 +698,10 @@ impl NetmapSessionState<'_> {
         self.state.set_pending_approvals(
             update.pending_approvals.iter().map(|p| (p.group_id.clone(), p.count)),
         );
+
+        if let Some(state) = update.account_deletion_state() {
+            self.state.set_account_deletion(state);
+        }
 
         self.apply_membership_diff(&update.peers, generation);
 

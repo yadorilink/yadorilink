@@ -640,6 +640,35 @@ async fn definitely_rejected_ticket_bound_commit_releases_tickets_and_falls_thro
     assert_eq!(outcome.forced_group_ids, vec!["group-1".to_string()]);
 }
 
+/// A Terms refusal is not an unavailable ticket: it is reported as such rather than falling
+/// through to `--force`, which would meet the same refusal.
+#[tokio::test]
+async fn terms_refused_ticket_bound_commit_releases_tickets_and_reports_the_terms() {
+    let repository = Arc::new(FakeRepository::default());
+    let coordination = Arc::new(FakeCoordination::configured());
+    coordination.eager_groups.lock().unwrap().push_back(Ok(vec!["group-1".to_string()]));
+    coordination
+        .dispatch
+        .lock()
+        .unwrap()
+        .push_back(MembershipCommitOutcome::TermsConsentRequired("403".to_string()));
+    let tickets = Arc::new(FakeTickets::default());
+    tickets.grants.lock().unwrap().push_back(grant("device-c", "lease-0"));
+    let readiness = Arc::new(FakeReadiness::default());
+
+    let error = service(repository, coordination, tickets.clone(), readiness)
+        .revoke_device(RevokeDeviceCommand {
+            group_id: "group-1".to_string(),
+            device_id: "device-b".to_string(),
+            force: true,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ReplicaMembershipError::TermsConsentRequired { .. }), "{error:?}");
+    assert_eq!(tickets.released.lock().unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn ambiguous_ticket_bound_commit_never_releases_tickets_or_falls_through() {
     let repository = Arc::new(FakeRepository::default());

@@ -56,6 +56,14 @@ pub enum CoreError {
     #[error("the Terms must be accepted to continue; sign in again to review and accept them")]
     TermsConsentRequired { terms_version: Option<String> },
 
+    /// A sign-in on this installation was made with a different account than the one this
+    /// installation belongs to. Nothing was changed; sign in with the original account.
+    #[error(
+        "that sign-in is for a different account than the one this computer belongs to; sign in \
+         with the original account"
+    )]
+    AccountMismatch,
+
     /// The coordination plane answered 403: the session is valid but not
     /// allowed to do this.
     #[error("{0}")]
@@ -142,6 +150,11 @@ pub enum CoreError {
     #[error("{0}")]
     Io(String),
 
+    /// An argument value this layer refuses before any request. The text names the argument
+    /// without a flag; a front end that spells it as an option does so from the argument.
+    #[error("{0}")]
+    InvalidArgument(InvalidArgument),
+
     #[error("{0}")]
     Other(String),
 
@@ -154,6 +167,41 @@ pub enum CoreError {
     /// [`CoreError::into_unhinted`].
     #[error("{error}")]
     Hinted { error: Box<CoreError>, hint: Hint },
+}
+
+/// An argument value refused before any request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvalidArgument {
+    /// Not a storage mode (`eager` or `on-demand`).
+    StorageMode(String),
+    /// Not a role a role change may move a member to.
+    Role(String),
+}
+
+impl InvalidArgument {
+    /// The argument's name as a desktop field.
+    #[must_use]
+    pub fn field(&self) -> &'static str {
+        match self {
+            InvalidArgument::StorageMode(_) => "storage_mode",
+            InvalidArgument::Role(_) => "role",
+        }
+    }
+}
+
+impl std::fmt::Display for InvalidArgument {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InvalidArgument::StorageMode(value) => {
+                write!(f, "invalid storage mode {value:?} (expected eager or on-demand)")
+            }
+            InvalidArgument::Role(value) => write!(
+                f,
+                "invalid role {value:?} (expected viewer or editor); owner is not available \
+                 here yet"
+            ),
+        }
+    }
 }
 
 /// What a person can do next about a failure, as an action rather than a command line. Hosts
@@ -175,6 +223,46 @@ pub enum Hint {
     CreateOrAcceptShare,
     /// No joinable folder group of that name: list what the account can join.
     ListJoinableShares,
+    /// An unlink was refused to protect the group's data: it can be done anyway, accepting the
+    /// risk of losing the only complete copy.
+    ForceUnlink,
+    /// A folder is still being set up: check its sync status.
+    CheckLinkStatus,
+    /// What is linked is uncertain: check the linked folders and the daemon log.
+    CheckLinkList,
+    /// A provider-folder item downloads when opened; keeping it on this device downloads it now.
+    KeepItemOnDevice,
+    /// A provider-folder item's local state is held by the operating system: see it there and
+    /// see the folder's download progress.
+    ShowProviderLocalState,
+    /// Only a provider folder can be on-demand: create one.
+    CreateProviderFolder,
+    /// Submitting a report needs its type enabled in the reporting consent settings.
+    EnableReportSubmission,
+    /// A hand-off of the data area to the app was interrupted: finish it or roll it back.
+    FinishOrRollBackHandoff,
+    /// A storage-mode change was refused for now: try it again.
+    RetryStorageModeChange,
+    /// Another command-line install owns the data area: use that install and its own updater.
+    UseOwningInstall,
+}
+
+impl Hint {
+    /// The step a daemon refusal carries on the wire; an unset or unknown value is none.
+    #[must_use]
+    pub fn from_wire(next_step: i32) -> Option<Self> {
+        use yadorilink_ipc_proto::daemonctl::NextStep;
+        match NextStep::try_from(next_step).ok()? {
+            NextStep::Unspecified => None,
+            NextStep::CheckLinkStatus => Some(Hint::CheckLinkStatus),
+            NextStep::CheckLinkList => Some(Hint::CheckLinkList),
+            NextStep::KeepItemOnDevice => Some(Hint::KeepItemOnDevice),
+            NextStep::ShowProviderLocalState => Some(Hint::ShowProviderLocalState),
+            NextStep::CreateProviderFolder => Some(Hint::CreateProviderFolder),
+            NextStep::EnableReportSubmission => Some(Hint::EnableReportSubmission),
+            NextStep::RetryStorageModeChange => Some(Hint::RetryStorageModeChange),
+        }
+    }
 }
 
 impl CoreError {
@@ -268,6 +356,11 @@ impl CoreError {
     /// this build does not know reads as `Unspecified` rather than failing.
     #[must_use]
     pub fn from_command_error(error: ApplicationCommandError) -> Self {
+        // The Terms refusal is a sign-in, not a command failure: the same error the direct
+        // coordination calls produce, so every front end words it once.
+        if error.code == ApplicationErrorCode::TermsConsentRequired as i32 {
+            return CoreError::TermsConsentRequired { terms_version: None };
+        }
         CoreError::DaemonCommand {
             code: ApplicationErrorCode::try_from(error.code)
                 .unwrap_or(ApplicationErrorCode::Unspecified),
@@ -565,7 +658,7 @@ impl DesktopError {
             CoreError::LimitExceeded { kind: LimitKind::Quota, .. } => {
                 denied(message, PermissionDeniedReason::QuotaExceeded)
             }
-            CoreError::AuthFailed(_) | CoreError::SignInRequired => {
+            CoreError::AuthFailed(_) | CoreError::SignInRequired | CoreError::AccountMismatch => {
                 denied(message, PermissionDeniedReason::SessionRejected)
             }
             CoreError::TermsConsentRequired { .. } => {
@@ -600,6 +693,9 @@ impl DesktopError {
                 },
             },
             CoreError::InvalidInput(_) => DesktopError::InvalidInput { message, field: None },
+            CoreError::InvalidArgument(argument) => {
+                DesktopError::InvalidInput { message, field: Some(argument.field().to_owned()) }
+            }
             CoreError::DaemonCommand { code, group_ids, operation_id, .. } => {
                 from_command(code, message, group_ids, operation_id, can_force)
             }
@@ -698,6 +794,7 @@ fn from_command(
         Code::InviteAlreadyUsed => {
             DesktopError::Refused { message, reason: RefusalReason::InviteAlreadyUsed }
         }
+        Code::TermsConsentRequired => denied(message, PermissionDeniedReason::TermsConsentRequired),
         Code::TargetNotFound => DesktopError::InvalidInput { message, field: None },
         // Refused with nothing changed.
         Code::UnrecordedLocalChanges => {

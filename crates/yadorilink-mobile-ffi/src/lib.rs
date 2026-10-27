@@ -63,7 +63,7 @@ pub struct EngineConfig {
     /// root (a start whose directory is inside one of them, symlinks resolved, fails) that no backup of it
     /// restores and the system does not purge (on iOS a separate directory in the app group's
     /// Application Support, excluded from backup; never Caches, which the system may purge). A
-    /// start without one fails (`StartFailed`) rather than keeping the witness beside the
+    /// start without one fails (`WitnessPlacementRequired`) rather than keeping the witness beside the
     /// database, where a restore would bring it back too. If the witness later goes missing while
     /// the database records one, the engine refuses to open the author identity
     /// (`database_restored:unverifiable`) instead of recording it again. Keep this directory and
@@ -77,9 +77,58 @@ pub struct EngineConfig {
     pub machine_id: Option<String>,
 }
 
+/// The engine's instance nonce in the credential keychain group, under the account
+/// `instance-nonce.<scope>`: detects a copied or restored data area (the item does not travel
+/// with a backup or a copy).
+#[cfg(any(target_vendor = "apple", test))]
+#[derive(Debug)]
+pub(crate) struct KeychainInstanceNonce<B> {
+    keychain: yadorilink_os_keychain::Keychain<B>,
+    account: String,
+}
+
+#[cfg(any(target_vendor = "apple", test))]
+impl<B> KeychainInstanceNonce<B> {
+    pub(crate) fn new(keychain: yadorilink_os_keychain::Keychain<B>, scope: &str) -> Self {
+        Self { keychain, account: format!("instance-nonce.{scope}") }
+    }
+}
+
+#[cfg(any(target_vendor = "apple", test))]
+impl<B: yadorilink_os_keychain::Backend + std::fmt::Debug + Send + Sync> host::InstanceNonceKeychain
+    for KeychainInstanceNonce<B>
+{
+    fn read(&self) -> std::io::Result<Option<host::InstanceNonce>> {
+        let other = |message: String| std::io::Error::other(message);
+        match self.keychain.read(&self.account).map_err(|e| other(e.to_string()))? {
+            None => Ok(None),
+            Some(bytes) => bytes
+                .try_into()
+                .map(Some)
+                .map_err(|_| other("the stored instance nonce has the wrong length".into())),
+        }
+    }
+
+    fn write(&self, nonce: &host::InstanceNonce) -> std::io::Result<()> {
+        self.keychain.write(&self.account, nonce).map_err(|e| std::io::Error::other(e.to_string()))
+    }
+}
+
 impl From<EngineConfig> for host::EngineConfig {
     fn from(config: EngineConfig) -> Self {
         let config_dir = std::path::PathBuf::from(config.config_dir);
+        // The instance nonce lives in the same keychain access group as the credentials, under
+        // the engine's scope. Only the system keychain exists on Apple targets.
+        #[cfg(target_vendor = "apple")]
+        let instance_nonce: Option<std::sync::Arc<dyn host::InstanceNonceKeychain>> =
+            config.credential_keyring_scope.as_deref().map(|scope| {
+                std::sync::Arc::new(KeychainInstanceNonce::new(
+                    yadorilink_os_keychain::Keychain::system(),
+                    scope,
+                )) as _
+            });
+        #[cfg(not(target_vendor = "apple"))]
+        let instance_nonce: Option<std::sync::Arc<dyn host::InstanceNonceKeychain>> = None;
         let (backend, key_mirror) = match config.credential_keyring_scope {
             // Not validated here: an unusable scope is refused when the engine starts.
             Some(scope) => (
@@ -111,6 +160,7 @@ impl From<EngineConfig> for host::EngineConfig {
                     .map_or(host::WitnessPlacement::Unset, |dir| {
                         host::WitnessPlacement::Persistent(dir.into())
                     }),
+                instance_nonce,
                 ..host::EngineTuning::default()
             },
         }
@@ -155,6 +205,14 @@ pub enum HostFailure {
     /// use the same credential entry. Stop the other engine first.
     #[error("an engine over {running} already runs in this process and {requested} would share its credential store")]
     SharedCredentialStore { running: String, requested: String },
+    /// The engine's configuration names no witness directory, and the engine needs one that
+    /// outlives the process. Set `EngineConfig::witness_dir`.
+    #[error("{}", host::StartError::WitnessPlacementRequired)]
+    WitnessPlacementRequired,
+    /// The configured witness directory cannot be used (relative, or inside the state
+    /// directory); `reason` says why.
+    #[error("the installation witness directory is unusable: {reason}")]
+    WitnessDirUnusable { reason: String },
     /// The engine did not start for another reason; the message says what to do.
     #[error("{message}")]
     StartFailed { message: String },
@@ -186,11 +244,15 @@ impl From<host::HostError> for HostFailure {
                     requested: requested.display().to_string(),
                 }
             }
-            HostError::Start(
-                other @ (StartError::Other(_)
-                | StartError::WitnessPlacementRequired
-                | StartError::WitnessDirUnusable(_)),
-            ) => Self::StartFailed { message: other.to_string() },
+            HostError::Start(StartError::WitnessPlacementRequired) => {
+                Self::WitnessPlacementRequired
+            }
+            HostError::Start(StartError::WitnessDirUnusable(reason)) => {
+                Self::WitnessDirUnusable { reason }
+            }
+            HostError::Start(other @ StartError::Other(_)) => {
+                Self::StartFailed { message: other.to_string() }
+            }
             HostError::Runtime(error) => Self::Runtime { message: error.to_string() },
             HostError::Draining => Self::Draining,
             HostError::Closed => Self::Closed,
@@ -229,6 +291,9 @@ pub enum CallFailure {
     /// A preserved item's own refusal.
     #[error("{message}")]
     PreservedRefused { reason: PreservedRefusal, message: String },
+    /// A re-adoption of a marked folder was refused; nothing was changed.
+    #[error("{message}")]
+    ReadoptRefused { reason: ReadoptRefusal, message: String },
     /// An account command failed.
     #[error("{}", .error.message)]
     Account { error: AccountError },
@@ -259,6 +324,9 @@ impl From<host::CallError> for CallFailure {
                     },
                     CommandErrorKind::Preserved(reason) => {
                         Self::PreservedRefused { reason: reason.into(), message }
+                    }
+                    CommandErrorKind::Readopt(reason) => {
+                        Self::ReadoptRefused { reason: reason.into(), message }
                     }
                     CommandErrorKind::Failed => Self::Failed { message },
                 }

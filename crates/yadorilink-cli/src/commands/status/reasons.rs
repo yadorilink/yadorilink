@@ -45,6 +45,8 @@ fn cause(item: AttentionItem) -> &'static str {
         I::ReplacementSignInRequired => "The confirmation of the device replacement was refused because you are signed out. Sign in again so it can go through; your files are kept.",
         I::TermsConsentRequired => "The service is refusing requests until you accept the updated Terms. Your files, folders and this device are kept and nothing is unlinked; sync of what is already set up keeps its local state. Sign in again to review and accept the Terms in your browser.",
         I::SignInRequired => "Signing in again is required (the Terms may have changed): the service refused to renew this computer's session. Your files, folders and this device are kept. Sign in again to continue.",
+        I::AccountDeletionPending => "This account is scheduled for deletion. Your files on this computer are kept; the account can still be restored from its settings before the grace period ends.",
+        I::AccountDeletionUrgent => "This account is about to be deleted: removing it would leave a shared folder without a safe copy, and the deletion goes ahead soon regardless. Review the account's settings now to restore it, or make another device a full copy.",
         I::Unrecognized => "Needs attention.",
     }
 }
@@ -103,6 +105,8 @@ fn next_step(item: AttentionItem) -> &'static str {
         | I::ProviderFilesFailing
         | I::EditsKeptBeside
         | I::RetryableFailure
+        | I::AccountDeletionPending
+        | I::AccountDeletionUrgent
         | I::Unrecognized => "yadorilink status --details",
     }
 }

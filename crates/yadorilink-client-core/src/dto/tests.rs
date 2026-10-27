@@ -1903,3 +1903,23 @@ fn an_appcast_item_check_maps_outcome_reason_and_entry() {
         assert_eq!(check.reason, Some(reason));
     }
 }
+
+#[test]
+fn dimensions_json_names_the_typed_degraded_cause_per_folder() {
+    use yadorilink_ipc_proto::daemonctl::DegradedCause as Wire;
+    let status = StatusResponse {
+        links: vec![
+            LinkStatus {
+                degraded: true,
+                degraded_reason: "Waiting for disk space".into(),
+                degraded_cause: Wire::WaitingForDiskSpace as i32,
+                ..link("/tmp/a", "g1")
+            },
+            link("/tmp/b", "g2"),
+        ],
+        ..Default::default()
+    };
+    let json = status_dimensions_json(&status);
+    assert_eq!(json["folders"][0]["degraded_cause"], "waiting_for_disk_space");
+    assert!(json["folders"][1]["degraded_cause"].is_null());
+}

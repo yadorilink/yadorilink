@@ -5979,6 +5979,8 @@ fn scan_existing_files_records_a_symlink_with_correct_target_text() {
 /// target text, not trust the stat.
 #[cfg(unix)]
 #[test]
+// apple-cfg: ios-explicit the simulator sandbox cannot spawn host tools
+#[cfg_attr(target_os = "ios", ignore = "the simulator sandbox has no /usr/bin/touch to spawn")]
 fn rescan_notices_a_same_length_retarget_that_keeps_the_symlink_mtime() {
     let (proc, state, _store_dir, root_dir) = processor();
     let root = canonical_root(&root_dir);

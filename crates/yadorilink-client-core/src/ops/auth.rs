@@ -306,7 +306,17 @@ pub async fn reauthenticate_in(
         client.exchange_authorization_code(&code, &redirect_uri, &pkce).await?
     };
 
+    // A step-up proves the person is still the account this installation belongs to: another
+    // account's tokens must not replace its session.
+    if crate::ops::device_supersede::is_other_account(dir, tokens.id_token()) {
+        return Err(CoreError::AccountMismatch);
+    }
     manager.adopt(&tokens).await?;
+    // Keeps the record of installations that predate it, or whose record was lost; a sign-in
+    // that names no account leaves it as it is.
+    if tokens.id_token().and_then(crate::ops::device_supersede::subject_of_id_token).is_some() {
+        crate::ops::device_supersede::record_account_id(dir, tokens.id_token());
+    }
     sink(LoginEvent::SignedIn { client_id: manager.client_id().to_owned() });
     Ok(())
 }

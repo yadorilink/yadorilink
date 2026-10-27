@@ -152,6 +152,9 @@ pub enum AccountCommand {
     /// The origins the sign-in pages are served from, per purpose (see
     /// `ops::auth::trusted_sign_in_origins_in`).
     SignInOrigins,
+    /// The folder groups this account owns and may join on this device (identity only: id and
+    /// name). Read-only.
+    ListJoinableGroups,
     /// Asks for account deletion; nothing is deleted until it is confirmed. Refused as
     /// `DurabilityBlocked` until `acknowledge_impact` when the impact is not empty.
     RequestDeletion {
@@ -179,6 +182,7 @@ impl AccountCommand {
                 | Self::PollSignIn(_)
                 | Self::SignInOrigins
                 | Self::DeletionImpact
+                | Self::ListJoinableGroups
                 | Self::DeletionStatus
         )
     }
@@ -436,6 +440,19 @@ impl AccountCommands {
                 CommandOutput::DeletionImpact(yadorilink_client_core::dto::account_deletion_impact(
                     &ops::account::deletion_impact_with(&auth).await?,
                 ))
+            }
+            AccountCommand::ListJoinableGroups => {
+                let auth = require_auth_in(dir, settings).await?;
+                CommandOutput::JoinableGroups(
+                    ops::shares::list_joinable_groups_with(&auth)
+                        .await?
+                        .into_iter()
+                        .map(|g| yadorilink_client_core::dto::GroupSummary {
+                            group_id: g.group_id,
+                            name: g.name,
+                        })
+                        .collect(),
+                )
             }
             AccountCommand::RequestDeletion { acknowledge_impact } => {
                 let auth = require_auth_in(dir, settings).await?;

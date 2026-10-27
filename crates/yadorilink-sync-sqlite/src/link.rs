@@ -154,6 +154,14 @@ impl LinkRepository {
         }
     }
 
+    /// Whether the write re-linked a provider row that already declares its root (a folder
+    /// marked as needing the person, linked to its group again): the root, its OS folder and
+    /// everything under it stay, so no second root is declared.
+    pub(crate) fn keeps_declared_root(write: &LinkRowWrite) -> bool {
+        matches!(write, LinkRowWrite::Updated(prior)
+            if matches!(prior.location, LinkLocation::Provider { .. }))
+    }
+
     /// Undoes one [`Self::insert_link_row`] write: deletes a row it inserted,
     /// or puts back the columns a re-link (and its setup) may have changed
     /// on a row that already existed -- never the row's `root_token`, which a
@@ -259,7 +267,9 @@ impl LinkRepository {
     ) -> Result<LinkRowWrite, SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
             let write = Self::insert_link_row(tx, local_path, group_id)?;
-            crate::provider::declare_link_root_in_tx(tx, group_id, provider)?;
+            if !Self::keeps_declared_root(&write) {
+                crate::provider::declare_link_root_in_tx(tx, group_id, provider)?;
+            }
             crate::rewind_plan::record_local_history_floor_for_a_first_link(tx, group_id)?;
             Ok(write)
         })

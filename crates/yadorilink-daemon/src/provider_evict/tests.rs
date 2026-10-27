@@ -140,6 +140,25 @@ async fn an_item_already_without_its_os_copy_still_frees_the_blocks() {
     assert!(!fx.cached(&blocks[0]));
 }
 
+/// An item that is already not downloaded has nothing to free: the answer says so, not that
+/// other files still reference its data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_item_that_is_already_not_downloaded_says_so() {
+    let fx = Fx::new();
+    let blocks = fx.commit("a.bin", 1, &[&data_of(1, 4096)]);
+    fx.held_item("a.bin");
+    let first = evictor(&fx, fx.reclaim()).evict(GROUP, "a.bin").await.unwrap();
+    assert_eq!(first.retained, None);
+    assert!(!fx.cached(&blocks[0]));
+    fx.host.answers.lock().unwrap().push_back(HostAnswer::NotMaterialized);
+
+    let again = evictor(&fx, fx.reclaim()).evict(GROUP, "a.bin").await.unwrap();
+
+    assert!(!again.dehydrated);
+    assert_eq!(again.reclaimed.blocks, 0);
+    assert_eq!(again.retained, Some(Retained::NotDownloaded));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_host_means_no_lease_and_an_error() {
     let fx = Fx::new();

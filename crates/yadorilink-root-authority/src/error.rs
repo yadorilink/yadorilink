@@ -60,7 +60,7 @@ pub enum RootAuthorityError {
     #[error(
         "folder group {group_id} is linked to {} folders on this device ({}); sync is stopped \
          for this folder group until exactly one remains. Decide which folder is this group's \
-         sync root and run `yadorilink unlink` on the other(s) — unlinking removes a folder from \
+         sync root and unlink the other(s) — unlinking removes a folder from \
          sync and does not delete any files from it. Any file that exists only in a folder you \
          unlink will be copied into the folder you keep if another device still has it; if no \
          other device has it, copy it into the folder you keep yourself, or a later scan will \

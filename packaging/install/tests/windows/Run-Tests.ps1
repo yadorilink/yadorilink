@@ -163,6 +163,21 @@ try {
 
 
     # exit codes: 2 usage, 3 network, 4 signature/hash/withdrawal, 5 platform, 6 downgrade, 7 prefix
+    # ownership: the app, another installation or an unreadable record stops the install (exit 19)
+    $cfg = Join-Path $T 'cfg'; New-Item -ItemType Directory -Force -Path $cfg | Out-Null
+    $env:YADORILINK_CONFIG_DIR = $cfg
+    foreach ($case in @(@('gui', 'microsoft_store'), @('gui', 'app_bundle'), @('cli', 'winget'))) {
+        Set-Content -LiteralPath (Join-Path $cfg 'install-owner.json') -Value (@{ owner = $case[0]; install_source = $case[1]; install_root = 'x'; release_id = ''; written_at = 1 } | ConvertTo-Json)
+        $p = NewPrefix 44; Inst 's1' 's1' $p @('-NoModifyPath')
+        if ($Rc -eq 19 -and (Has 'Nothing was installed') -and (NothingInstalled $p)) { Ok "exit 19: owner $($case -join '/')" } else { Bad "exit 19 owner $($case -join '/')" $Out }
+    }
+    Set-Content -LiteralPath (Join-Path $cfg 'install-owner.json') -Value 'not json'
+    $p = NewPrefix 45; Inst 's1' 's1' $p @('-NoModifyPath')
+    if ($Rc -eq 19 -and (Has 'cannot be read') -and (NothingInstalled $p)) { Ok 'exit 19: unreadable ownership record' } else { Bad 'exit 19 unreadable' $Out }
+    Set-Content -LiteralPath (Join-Path $cfg 'install-owner.json') -Value (@{ owner = 'cli'; install_source = 'script'; install_root = 'x'; release_id = ''; written_at = 1 } | ConvertTo-Json)
+    $p = NewPrefix 46; Inst 's1' 's1' $p @('-NoModifyPath')
+    if ($Rc -eq 0) { Ok 'script-owned data installs' } else { Bad 'script owner installs' $Out }
+    Remove-Item Env:YADORILINK_CONFIG_DIR -ErrorAction SilentlyContinue
     $p = NewPrefix 40; Inst 's1' 's1' $p @('-Bogus'); if ($Rc -eq 2 -and (Has 'unknown option')) { Ok 'exit 2: unknown option' } else { Bad 'exit 2' $Out }
     $p = NewPrefix 40; Inst 's1' 's1' $p @('-NoModifyPath', '-Channel', 'stable'); if ($Rc -eq 2) { Ok 'exit 2: unknown channel' } else { Bad 'exit 2 channel' $Out }
     $script:BaseOverride = 'http://127.0.0.1:1'; $p = NewPrefix 41; Inst 's1' 's1' $p @('-NoModifyPath'); $script:BaseOverride = $null

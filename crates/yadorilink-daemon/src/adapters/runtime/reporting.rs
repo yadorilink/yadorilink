@@ -12,7 +12,7 @@ use yadorilink_reporting::submission::SubmissionClient;
 
 use crate::application::ports::{
     BoxFuture, ConsentCommand, LastErrorReport, ReportingCommandPort,
-    ReportingRedactionCategoryCount, SubmitReportOutcome,
+    ReportingRedactionCategoryCount, SubmitReportError, SubmitReportOutcome,
 };
 use crate::reporting::ReportingStorage;
 
@@ -73,10 +73,11 @@ impl ReportingCommandPort for DaemonReportingCommandAdapter {
     fn submit_report<'a>(
         &'a self,
         report_json: &'a str,
-    ) -> BoxFuture<'a, Result<SubmitReportOutcome, String>> {
+    ) -> BoxFuture<'a, Result<SubmitReportOutcome, SubmitReportError>> {
         Box::pin(async move {
-            let envelope = ReportEnvelope::from_json(report_json).map_err(|e| e.to_string())?;
-            envelope.validate().map_err(|e| e.to_string())?;
+            let envelope = ReportEnvelope::from_json(report_json)
+                .map_err(|e| SubmitReportError::Failed(e.to_string()))?;
+            envelope.validate().map_err(|e| SubmitReportError::Failed(e.to_string()))?;
 
             let consent = self.reporting.consent_or_default();
             let allowed = match envelope.report_type {
@@ -84,14 +85,12 @@ impl ReportingCommandPort for DaemonReportingCommandAdapter {
                 ReportType::Error => consent.error_submission_enabled,
             };
             if !allowed {
-                return Err(
-                    "submission is not enabled for this report type — run `yadorilink report consent enable-usage` or `enable-error` first, or use --export instead"
-                        .to_string(),
-                );
+                return Err(SubmitReportError::NotEnabled);
             }
 
             let report_id = uuid::Uuid::new_v4().to_string();
-            let client = SubmissionClient::with_default_config().map_err(|e| e.to_string())?;
+            let client = SubmissionClient::with_default_config()
+                .map_err(|e| SubmitReportError::Failed(e.to_string()))?;
             match client.submit(&report_id, &envelope, consent.endpoint_override.as_deref()).await {
                 Ok(receipt) => Ok(SubmitReportOutcome {
                     receipt_id: receipt.receipt_id,
@@ -99,14 +98,17 @@ impl ReportingCommandPort for DaemonReportingCommandAdapter {
                     queued_for_retry: false,
                 }),
                 Err(e) if consent.queue_retry_enabled && e.is_retryable() => {
-                    self.reporting.queue().enqueue(envelope).map_err(|e| e.to_string())?;
+                    self.reporting
+                        .queue()
+                        .enqueue(envelope)
+                        .map_err(|e| SubmitReportError::Failed(e.to_string()))?;
                     Ok(SubmitReportOutcome {
                         receipt_id: String::new(),
                         submitted_at: String::new(),
                         queued_for_retry: true,
                     })
                 }
-                Err(e) => Err(e.to_string()),
+                Err(e) => Err(SubmitReportError::Failed(e.to_string())),
             }
         })
     }

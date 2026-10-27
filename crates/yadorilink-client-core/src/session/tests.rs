@@ -436,3 +436,37 @@ fn a_stopped_gate_never_polls_the_flow() {
     assert!(gated.as_mut().poll(&mut cx).is_pending());
     assert!(!written.load(Ordering::SeqCst), "a stopped gate polled the flow");
 }
+
+// ---- a panicking flow still ends the session -------------------------------------------
+
+fn panicking_session() -> LoginSession {
+    LoginSession::with_flow(
+        options(None),
+        no_precheck(),
+        Box::new(|_sink| Box::pin(async { panic!("flow bug") })),
+    )
+}
+
+#[tokio::test]
+async fn a_panicking_flow_ends_the_session_with_a_failure() {
+    let session = panicking_session();
+    session.begin().unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(5), next(&session))
+        .await
+        .expect("the session must end, not hang");
+    assert!(matches!(event, Some(LoginEvent::Failed { error: DesktopError::Internal { .. } })));
+    assert_eq!(next(&session).await, None);
+}
+
+#[tokio::test]
+async fn cancel_after_a_panicked_flow_keeps_the_failure_and_ends() {
+    let session = panicking_session();
+    session.begin().unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    session.cancel();
+    let event = tokio::time::timeout(Duration::from_secs(5), next(&session))
+        .await
+        .expect("the session must end, not hang");
+    assert!(matches!(event, Some(LoginEvent::Failed { .. })));
+    assert_eq!(next(&session).await, None);
+}

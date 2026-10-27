@@ -1,6 +1,6 @@
 use super::*;
 
-const ALL: [AttentionItem; 38] = [
+const ALL: [AttentionItem; 40] = [
     AttentionItem::FolderStopped,
     AttentionItem::WaitingForDiskSpace,
     AttentionItem::LinkedTwice,
@@ -38,6 +38,8 @@ const ALL: [AttentionItem; 38] = [
     AttentionItem::ReplacementWaiting,
     AttentionItem::TermsConsentRequired,
     AttentionItem::SignInRequired,
+    AttentionItem::AccountDeletionPending,
+    AttentionItem::AccountDeletionUrgent,
     AttentionItem::Unrecognized,
 ];
 
@@ -84,6 +86,8 @@ fn ordinal(item: AttentionItem) -> usize {
         I::FileWatchLimit => 34,
         I::TermsConsentRequired => 36,
         I::SignInRequired => 37,
+        I::AccountDeletionPending => 38,
+        I::AccountDeletionUrgent => 39,
         I::Unrecognized => 35,
     }
 }
@@ -92,7 +96,7 @@ fn ordinal(item: AttentionItem) -> usize {
 fn all_lists_every_item() {
     let mut seen: Vec<usize> = ALL.iter().map(|i| ordinal(*i)).collect();
     seen.sort_unstable();
-    assert_eq!(seen, (0..38).collect::<Vec<_>>());
+    assert_eq!(seen, (0..40).collect::<Vec<_>>());
 }
 
 #[test]
@@ -110,6 +114,8 @@ fn every_rollup_code_the_daemon_emits_is_recognized() {
         "degraded:g",
         "terms_consent_required",
         "sign_in_required",
+        "account_deletion_pending",
+        "account_deletion_urgent",
         "waiting_for_disk_space:g",
         "file_watch_limit:g",
         "ambiguous:g",
@@ -416,5 +422,28 @@ fn the_consent_and_sign_in_items_offer_the_sign_in_and_are_permanent() {
         assert_eq!(item.key(), code);
         assert_eq!(item.kind(), AttentionKind::Permanent);
         assert_eq!(item.primary_action(), ProductAction::SignIn);
+    }
+}
+
+#[test]
+fn account_deletion_items_are_general_permanent_and_urgent_ranks_higher() {
+    for (code, item, severity) in [
+        (
+            "account_deletion_pending",
+            AttentionItem::AccountDeletionPending,
+            AttentionSeverity::Warning,
+        ),
+        (
+            "account_deletion_urgent",
+            AttentionItem::AccountDeletionUrgent,
+            AttentionSeverity::Critical,
+        ),
+    ] {
+        let attention = Attention::from_reason(code);
+        assert_eq!((attention.item, attention.scope), (item, AttentionScope::General));
+        assert_eq!(item.key(), code);
+        assert_eq!(item.kind(), AttentionKind::Permanent);
+        assert_eq!(item.severity(), severity);
+        assert_eq!(item.primary_action(), ProductAction::ViewDetails);
     }
 }

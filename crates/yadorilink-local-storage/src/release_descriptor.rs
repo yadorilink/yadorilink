@@ -443,8 +443,8 @@ impl PairMismatch {
         };
         format!(
             "this YadoriLink program ({}) and the running daemon ({}) do not come from the same \
-             release: {what}. Nothing was changed. {fix}; only read-only commands such as \
-             `yadorilink doctor` work until then.",
+             release: {what}. Nothing was changed. {fix}; only read-only requests work \
+             until then.",
             caller.version, daemon.version
         )
     }

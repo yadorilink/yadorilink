@@ -126,6 +126,9 @@ struct Inner {
     /// `(device_id, group_id) -> requests waiting on that device's account`, reported in the
     /// device's own netmap as `pendingApprovals` (absent while none).
     pending_approvals: HashMap<(String, String), u32>,
+    /// `device_id -> its account's deletion state`, reported in the device's own netmap as
+    /// `self.accountDeletionState` (the field is absent while unset, like an older plane).
+    account_deletion: HashMap<String, String>,
     /// Per `(group_id, device_id)` issuance counter for
     /// `serve_authorization_checkpoint` -- `AuthorizationCheckpoint::
     /// checkpoint_seq` must strictly increase per issuing device, matching
@@ -650,6 +653,19 @@ impl FakeCoordination {
         self.push();
     }
 
+    /// Reports `state` (`pending` / `urgent` / `none`) as `device_id`'s own account deletion
+    /// state; `None` stops sending the `self` field at all.
+    pub fn set_account_deletion_state(&self, device_id: &str, state: Option<&str>) {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            match state {
+                Some(state) => inner.account_deletion.insert(device_id.to_string(), state.into()),
+                None => inner.account_deletion.remove(device_id),
+            };
+        }
+        self.push();
+    }
+
     /// Republishes `device_id`'s advertised endpoint -- mirroring
     /// what a real coordination plane would push over the netmap
     /// subscription if a device's network conditions changed (e.g. a new
@@ -865,6 +881,9 @@ fn netmap_frame_for(inner: &mut Inner, subscriber_id: &str) -> String {
         .filter(|((device_id, _), _)| device_id == subscriber_id)
         .map(|((_, group_id), count)| serde_json::json!({ "groupId": group_id, "count": count }))
         .collect();
+    if let Some(state) = inner.account_deletion.get(subscriber_id) {
+        frame["self"] = serde_json::json!({ "accountDeletionState": state });
+    }
     if !pending.is_empty() {
         frame["pendingApprovals"] = serde_json::Value::Array(pending);
     }

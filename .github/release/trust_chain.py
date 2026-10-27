@@ -72,7 +72,7 @@ def apply(state: State, rec: object) -> None:
         raise TrustChainError(f"record {n}: body is not JSON: {e}") from None
     if not isinstance(body, dict) or not {"schema_version", "serial"} <= set(body) or set(body) - RECORD_FIELDS:
         raise TrustChainError(f"record {n}: unexpected fields")
-    if body["schema_version"] != SCHEMA_VERSION:
+    if type(body["schema_version"]) is not int or body["schema_version"] != SCHEMA_VERSION:
         raise TrustChainError(f"record {n}: unsupported schema version")
     if body["serial"] != n:
         raise TrustChainError(f"record {n}: serial {body['serial']!r} is out of sequence")

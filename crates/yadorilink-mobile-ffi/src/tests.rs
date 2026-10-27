@@ -417,17 +417,20 @@ fn the_hosts_witness_directory_is_the_engines_and_none_is_refused_at_start() {
     let unset: yadorilink_embedded_host::EngineConfig = without.clone().into();
     assert_eq!(unset.tuning.witness, yadorilink_embedded_host::WitnessPlacement::Unset);
     let host = MobileHost::new(without);
-    assert!(host.start().is_err(), "an engine with no witness directory must not start");
+    assert!(
+        matches!(host.start(), Err(HostFailure::WitnessPlacementRequired)),
+        "an engine with no witness directory must not start"
+    );
 
     // An empty string names nothing: it is none, not the working directory.
     let empty = EngineConfig { witness_dir: Some(String::new()), ..area.config.clone() };
     let converted: yadorilink_embedded_host::EngineConfig = empty.clone().into();
     assert_eq!(converted.tuning.witness, yadorilink_embedded_host::WitnessPlacement::Unset);
-    assert!(matches!(MobileHost::new(empty).start(), Err(HostFailure::StartFailed { .. })));
+    assert!(matches!(MobileHost::new(empty).start(), Err(HostFailure::WitnessPlacementRequired)));
 }
 
 /// A relative directory, or one inside the state directory, is refused at start as a typed
-/// `StartFailed` that names the witness directory.
+/// `WitnessDirUnusable` that names the witness directory.
 #[test]
 fn an_unusable_witness_directory_is_a_typed_start_failure() {
     let area = area();
@@ -435,13 +438,38 @@ fn an_unusable_witness_directory_is_a_typed_start_failure() {
     for dir in ["relative-witness".to_owned(), state.join("witness").display().to_string()] {
         let config = EngineConfig { witness_dir: Some(dir.clone()), ..area.config.clone() };
         match MobileHost::new(config).start() {
-            Err(HostFailure::StartFailed { message }) => {
-                assert!(message.contains("witness directory"), "{dir}: {message}");
+            Err(error @ HostFailure::WitnessDirUnusable { .. }) => {
+                assert!(error.to_string().contains("witness directory"), "{dir}: {error}");
             }
-            other => panic!("{dir}: expected StartFailed, got {other:?}"),
+            other => panic!("{dir}: expected WitnessDirUnusable, got {other:?}"),
         }
     }
     assert!(!std::path::Path::new("relative-witness").exists());
+}
+
+/// Listing the joinable folder groups needs an account: a signed-out engine says so, typed.
+#[test]
+fn listing_joinable_groups_needs_a_sign_in() {
+    let area = area();
+    let host = MobileHost::new(area.config.clone());
+    host.start().unwrap();
+    let refused = host.list_joinable_groups(&fresh(), Some(30_000)).expect_err("signed out");
+    assert!(
+        matches!(&refused, CallFailure::Account { error } if error.kind == AccountErrorKind::NotSignedIn),
+        "{refused:?}"
+    );
+    host.stop().unwrap();
+}
+
+/// The joinable group record carries the facade's summary unchanged.
+#[test]
+fn a_joinable_group_is_the_facades_summary() {
+    let group: JoinableGroup = yadorilink_embedded_host::dto::GroupSummary {
+        group_id: "g1".into(),
+        name: "Photos".into(),
+    }
+    .into();
+    assert_eq!(group, JoinableGroup { group_id: "g1".into(), name: "Photos".into() });
 }
 
 /// A step-up of a signed-out engine is refused at its begin, as the step-up's own typed error
@@ -579,4 +607,57 @@ fn the_restart_required_refusal_has_its_own_account_error_kind() {
         refused(yadorilink_embedded_host::RefusalReason::DatabaseNotRestored),
         AccountErrorKind::Refused
     );
+}
+
+/// The keychain adapter of the instance nonce keeps one item per scope and reads absence as none.
+#[test]
+fn the_keychain_instance_nonce_round_trips_per_scope() {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use yadorilink_embedded_host::InstanceNonceKeychain;
+    use yadorilink_os_keychain::{Attr, Backend, Keychain, Status};
+
+    #[derive(Debug, Clone, Default)]
+    struct Memory(Arc<Mutex<HashMap<String, Vec<u8>>>>);
+    fn account(attrs: &[Attr]) -> String {
+        attrs
+            .iter()
+            .find_map(|a| if let Attr::Account(v) = a { Some(v.clone()) } else { None })
+            .unwrap()
+    }
+    fn data(attrs: &[Attr]) -> Vec<u8> {
+        attrs
+            .iter()
+            .find_map(|a| if let Attr::ValueData(v) = a { Some(v.clone()) } else { None })
+            .unwrap()
+    }
+    impl Backend for Memory {
+        fn add(&self, attributes: &[Attr]) -> Result<(), Status> {
+            self.0.lock().unwrap().insert(account(attributes), data(attributes));
+            Ok(())
+        }
+        fn update(&self, query: &[Attr], changes: &[Attr]) -> Result<(), Status> {
+            match self.0.lock().unwrap().get_mut(&account(query)) {
+                Some(slot) => {
+                    *slot = data(changes);
+                    Ok(())
+                }
+                None => Err(Status::NotFound),
+            }
+        }
+        fn copy_data(&self, query: &[Attr]) -> Result<Vec<u8>, Status> {
+            self.0.lock().unwrap().get(&account(query)).cloned().ok_or(Status::NotFound)
+        }
+        fn delete(&self, _: &[Attr]) -> Result<(), Status> {
+            Ok(())
+        }
+    }
+
+    let memory = Memory::default();
+    let a = crate::KeychainInstanceNonce::new(Keychain::new(memory.clone()), "a");
+    let b = crate::KeychainInstanceNonce::new(Keychain::new(memory), "b");
+    assert_eq!(a.read().unwrap(), None);
+    a.write(&[7; 16]).unwrap();
+    assert_eq!(a.read().unwrap(), Some([7; 16]));
+    assert_eq!(b.read().unwrap(), None);
 }

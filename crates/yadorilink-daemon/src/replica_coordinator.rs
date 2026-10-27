@@ -537,6 +537,7 @@ impl ReplicaCoordinator {
         let opened = crate::author_identity::ReplicaAuthor::open(
             &self.database,
             &self.tuning.witness,
+            self.tuning.instance_nonce.as_deref(),
             device_id,
             signing_key,
         );

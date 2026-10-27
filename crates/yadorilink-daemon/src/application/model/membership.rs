@@ -53,6 +53,9 @@ pub enum RoleLossCommitOutcome {
     Conflict(String),
     /// The Worker may already have committed the request.
     Ambiguous(String),
+    /// `403 terms_consent_required`: the account has not accepted the current Terms. Nothing was
+    /// committed; signing in again clears it.
+    TermsConsentRequired(String),
 }
 
 /// A membership operation's terminal outcome, as recorded durably by the
@@ -151,6 +154,8 @@ pub(crate) enum MembershipCommitOutcome {
     /// `crate::application::ReplicaMembershipError::OperationConflict`'s own
     /// doc comment.
     Conflict(String),
+    /// `403 terms_consent_required`: nothing was committed; signing in again clears it.
+    TermsConsentRequired(String),
 }
 
 /// Structured payload of a `Committed` outcome. `handoff` is only ever

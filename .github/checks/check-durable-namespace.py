@@ -74,6 +74,9 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     # Generation files: the removal of generations older than the previous one, of a retired
     # record, and of a generation published below the newest; a lost removal leaves an old
     # generation no reader prefers.
+    # The instance nonce publish: the temp file is removed when the durable publish fails; a lost
+    # removal leaves an unreferenced `.tmp` that no reader opens.
+    C + "yadorilink-daemon/src/instance_nonce.rs": {"fs::remove_file": 1},
     C + "yadorilink-fs-platform/src/generation.rs": {"fs::remove_file": 3},
     C + "yadorilink-fs-platform/src/durable_dir/raw.rs": {"MoveFileExW": 1, "fs::rename": 1},
     C + "yadorilink-fs-platform/src/durable_dir/probe.rs": {"fs::remove_dir_all": 1},

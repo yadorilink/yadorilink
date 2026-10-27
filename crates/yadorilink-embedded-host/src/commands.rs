@@ -26,8 +26,9 @@ pub use yadorilink_client_core::DesktopError;
 pub use yadorilink_daemon::embedded_host::{
     ordinary_folder_links_supported, CommandError, CommandErrorKind, CreateShare, DoctorCheck,
     DoctorStatus, HandoffInfo, JoinGroup, JoinShare, LinkFolder, LinkedFolder, PauseFor, PauseLink,
-    PreservedItem, PreservedKind, PreservedRef, PreservedRefusal, ProviderFolder, RestoreVersion,
-    ResumeLink, ShareFolder, ShareOutcome, SpaceManagement, UnlinkFolder, UnlinkOutcome,
+    PreservedItem, PreservedKind, PreservedRef, PreservedRefusal, ProviderFolder,
+    ReadoptMarkedFolder, ReadoptOutcome, ReadoptRefusal, RestoreVersion, ResumeLink, ShareFolder,
+    ShareOutcome, SpaceManagement, UnlinkFolder, UnlinkOutcome,
 };
 
 use crate::account::{
@@ -51,6 +52,8 @@ pub enum Command {
     JoinShare(JoinShare),
     PauseLink(PauseLink),
     ResumeLink(ResumeLink),
+    /// Re-adopts the provider folder a start over marked as needing the person into its group.
+    ReadoptMarkedFolder(ReadoptMarkedFolder),
     /// Unlinks a folder after the custody checks (and hand-off) the desktop's unlink runs.
     Unlink(UnlinkFolder),
     /// The engine's status: overall state, attention items, folders, peers, transfers, storage.
@@ -86,6 +89,7 @@ impl Command {
             | Self::JoinShare(_)
             | Self::PauseLink(_)
             | Self::ResumeLink(_)
+            | Self::ReadoptMarkedFolder(_)
             | Self::Unlink(_)
             | Self::RestorePreserved(_)
             | Self::DiscardPreserved(_)
@@ -105,6 +109,7 @@ pub enum CommandOutput {
     Done,
     Shared(ShareOutcome),
     Unlinked(UnlinkOutcome),
+    Readopted(ReadoptOutcome),
     Status(Box<yadorilink_client_core::dto::StatusSnapshot>),
     Doctor(Vec<DoctorCheck>),
     Preserved(Vec<PreservedItem>),
@@ -121,6 +126,8 @@ pub enum CommandOutput {
     StartOver(yadorilink_client_core::dto::StartOverProgress),
     /// Whether an acknowledgement was recorded (`false`: no replacement was waiting).
     PossibleLossAcknowledged(bool),
+    /// The folder groups the account may join: `(group_id, name)` summaries.
+    JoinableGroups(Vec<yadorilink_client_core::dto::GroupSummary>),
     DeletionImpact(AccountDeletionImpact),
     DeletionRequested(AccountDeletionRequest),
     DeletionStatus(AccountDeletionStatus),
@@ -416,6 +423,9 @@ async fn run_command(
         Command::ResumeLink(resume) => {
             commands.resume_link(resume).await.map(|()| CommandOutput::Done)?
         }
+        Command::ReadoptMarkedFolder(readopt) => {
+            commands.readopt_marked_folder(readopt).await.map(CommandOutput::Readopted)?
+        }
         Command::Unlink(unlink) => commands.unlink(unlink).await.map(CommandOutput::Unlinked)?,
         Command::Status => status(commands, accounts)?,
         Command::Doctor => CommandOutput::Doctor(commands.doctor()),
@@ -472,6 +482,7 @@ mod tests {
             Command::Account(AccountCommand::Status),
             Command::Account(AccountCommand::PollSignIn(PollSignIn { id, after: 0 })),
             Command::Account(AccountCommand::DeletionImpact),
+            Command::Account(AccountCommand::ListJoinableGroups),
             Command::Account(AccountCommand::DeletionStatus),
         ];
         let changes = [
@@ -520,6 +531,7 @@ mod tests {
                 expected_group_id: None,
             }),
             Command::ResumeLink(ResumeLink { link_key: String::new(), expected_group_id: None }),
+            Command::ReadoptMarkedFolder(ReadoptMarkedFolder { group_id: String::new() }),
             Command::Unlink(UnlinkFolder {
                 link_key: String::new(),
                 force: false,

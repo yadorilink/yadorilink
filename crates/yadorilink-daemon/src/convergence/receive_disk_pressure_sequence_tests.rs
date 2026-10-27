@@ -331,3 +331,47 @@ async fn receive_resumes_on_its_own_backoff_once_space_returns() {
     }
     assert!(f.state.degraded_link_info(&f.root.to_string_lossy()).is_none());
 }
+
+fn mark_waiting(f: &Fixture) {
+    f.state.mark_link_waiting_for_disk_space(
+        &f.root.to_string_lossy(),
+        crate::link_registry::waiting_for_disk_space_reason("v", MIB, 1 << 30),
+    );
+    assert!(f.state.degraded_link_info(&f.root.to_string_lossy()).is_some());
+}
+
+/// A pass that was not refused for space and settled a file ends the wait even when another
+/// path of the same pass is still retried for its own reasons.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unrefused_settling_attempt_ends_the_wait_even_with_other_paths_retrying() {
+    use crate::local_convergence::types::{ProjectionAttempt, SettlementEvidence};
+    let f = fixture(false).await;
+    mark_waiting(&f);
+    let mut attempt = ProjectionAttempt::default();
+    attempt.settled.insert("done.bin".into(), SettlementEvidence::IgnoreExcluded);
+    attempt.retry.insert("other.bin".into());
+    super::engine_impl::track_disk_space_wait(&f.state, GROUP, &attempt);
+    assert!(f.state.degraded_link_info(&f.root.to_string_lossy()).is_none());
+}
+
+/// A refused pass keeps the wait, and settling nothing does not end it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attempt_that_settled_nothing_leaves_the_wait() {
+    let f = fixture(false).await;
+    mark_waiting(&f);
+    super::engine_impl::track_disk_space_wait(
+        &f.state,
+        GROUP,
+        &crate::local_convergence::types::ProjectionAttempt::default(),
+    );
+    assert!(f.state.degraded_link_info(&f.root.to_string_lossy()).is_some());
+}
+
+/// An obligation closing ends the wait without waiting for an unrelated sync or the re-check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_completed_obligation_ends_the_wait() {
+    let f = fixture(false).await;
+    mark_waiting(&f);
+    super::engine_impl::note_obligation_completed(&f.state, GROUP);
+    assert!(f.state.degraded_link_info(&f.root.to_string_lossy()).is_none());
+}

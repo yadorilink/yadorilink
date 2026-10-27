@@ -156,6 +156,12 @@ pub enum AttentionItem {
     /// The coordination service refuses to renew this installation's session (`invalid_grant`;
     /// the Terms may have changed). Local state is kept; signing in again is the remedy.
     SignInRequired,
+    /// This account is scheduled for deletion and in its ordinary grace window. Informational for
+    /// a device of the account: nothing local changes, and the account's owner can still cancel.
+    AccountDeletionPending,
+    /// As above, and the departing-account durability guard has blocked finalization: the
+    /// bounded escape hatch is running, so the account will be removed soon unless cancelled.
+    AccountDeletionUrgent,
     /// A code this build does not know.
     Unrecognized,
 }
@@ -216,6 +222,8 @@ impl AttentionItem {
             Self::NotJoined => "not_joined",
             Self::TermsConsentRequired => "terms_consent_required",
             Self::SignInRequired => "sign_in_required",
+            Self::AccountDeletionPending => "account_deletion_pending",
+            Self::AccountDeletionUrgent => "account_deletion_urgent",
             Self::UnreadableFiles => "unreadable_files",
             Self::Unrecognized => "unrecognized",
         }
@@ -256,6 +264,8 @@ impl AttentionItem {
             | Self::ReplacementSignInRequired
             | Self::TermsConsentRequired
             | Self::SignInRequired
+            | Self::AccountDeletionPending
+            | Self::AccountDeletionUrgent
             | Self::EditsKeptBeside
             | Self::ProviderOrphan
             | Self::DiskFull
@@ -276,6 +286,7 @@ impl AttentionItem {
             | Self::NoSafeCopy
             | Self::DatabaseRestored
             | Self::AuthorUnavailable
+            | Self::AccountDeletionUrgent
             | Self::DiskFull => AttentionSeverity::Critical,
             _ if self.kind() == AttentionKind::Waiting => AttentionSeverity::Info,
             _ => AttentionSeverity::Warning,
@@ -318,6 +329,8 @@ impl AttentionItem {
             | Self::ReplacementSignInRequired
             | Self::EditsKeptBeside
             | Self::PeerUnavailable
+            | Self::AccountDeletionPending
+            | Self::AccountDeletionUrgent
             | Self::Unrecognized => ProductAction::ViewDetails,
             Self::DatabaseRestored => ProductAction::StartOverAsNewDevice,
         }
@@ -413,6 +426,12 @@ impl Attention {
                 (AttentionItem::TermsConsentRequired, AttentionScope::General)
             }
             "sign_in_required" => (AttentionItem::SignInRequired, AttentionScope::General),
+            "account_deletion_pending" => {
+                (AttentionItem::AccountDeletionPending, AttentionScope::General)
+            }
+            "account_deletion_urgent" => {
+                (AttentionItem::AccountDeletionUrgent, AttentionScope::General)
+            }
             "replacement_unconfirmed_sign_in_required" => {
                 (AttentionItem::ReplacementSignInRequired, AttentionScope::General)
             }

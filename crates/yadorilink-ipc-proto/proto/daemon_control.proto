@@ -2339,6 +2339,37 @@ enum ApplicationErrorCode {
   // protection, a Windows ACL, file permissions). Nothing was linked; allow
   // access or choose another folder, then try again.
   APPLICATION_ERROR_CODE_ACCESS_DENIED = 26;
+  // The coordination service refused because this account has not accepted the
+  // current Terms (403 terms_consent_required). Nothing was committed; signing in
+  // again shows the consent screen, and the installation is kept.
+  APPLICATION_ERROR_CODE_TERMS_CONSENT_REQUIRED = 27;
+}
+
+// What a person can do next about a refusal, as an action rather than a command line. The
+// daemon's refusal texts are host-neutral and never name a command or a flag; each front end
+// (command line, app) words the step for its own surface.
+enum NextStep {
+  NEXT_STEP_UNSPECIFIED = 0;
+  // Look at the folder's sync status.
+  NEXT_STEP_CHECK_LINK_STATUS = 1;
+  // Look at the list of linked folders to verify what is linked.
+  NEXT_STEP_CHECK_LINK_LIST = 2;
+  // Keep the item on this device to download it now.
+  NEXT_STEP_KEEP_ITEM_ON_DEVICE = 3;
+  // See the item's local state and the folder's download progress.
+  NEXT_STEP_SHOW_PROVIDER_LOCAL_STATE = 4;
+  // Create a provider folder, the only kind of folder that can be on-demand.
+  NEXT_STEP_CREATE_PROVIDER_FOLDER = 5;
+  // Turn on submission for the report's type in the reporting consent settings.
+  NEXT_STEP_ENABLE_REPORT_SUBMISSION = 6;
+  // Try the storage-mode change again.
+  NEXT_STEP_RETRY_STORAGE_MODE_CHANGE = 7;
+}
+
+// A refusal in plain text with the next step it carries.
+message RefusedWithNextStep {
+  string message = 1;
+  NextStep next_step = 2;
 }
 
 message ApplicationCommandError {
@@ -3167,6 +3198,9 @@ message DaemonControlResponse {
     UpdateVersionCheckResponse update_version_check = 99;
     ListSentTransfersResponse list_sent_transfers = 100;
     UpdateVerifiedEntryResponse update_verified_entry = 101;
+    // A plain-text refusal that also says what the person can do next, as a typed step the
+    // front end words for itself (`error` carries no such step).
+    RefusedWithNextStep refused = 102;
   }
   // Field numbers 25-27 were the directional-mode responses (set_mode,
   // override, revert); 40-43 were the directional folder-operation responses

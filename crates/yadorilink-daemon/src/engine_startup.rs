@@ -60,7 +60,13 @@ pub(crate) struct OpenedData {
 
 /// Opens the block store and the replica database, refusing a lost database and recording
 /// the refusal for `status` when either cannot be used.
+///
+/// `_locks` is the proof the block store's recovery needs: it truncates and removes bytes a
+/// live writer may have staged, so it runs only while this process holds the data area's
+/// `DataResourceLocks` (the daemon and the embedded engine both take them first). Requiring
+/// the value keeps a host from opening the store without that exclusion.
 pub(crate) fn open_data(
+    _locks: &yadorilink_local_storage::resource_lock::DataResourceLocks,
     dir: &Path,
     block_store_root: &Path,
     sync_db_path: &Path,
@@ -106,10 +112,10 @@ pub(crate) fn open_data(
                     "sync-state",
                     e.to_string(),
                 );
-                let message = data_refusal_message(&e, sync_db_path, block_store_root);
-                tracing::error!("{message}");
+                let refusal = data_refusal(&e, sync_db_path, block_store_root);
+                tracing::error!("{}", refusal.message());
                 if let Err(write_error) =
-                    yadorilink_local_storage::startup_refusal::record(dir, &message)
+                    yadorilink_local_storage::startup_refusal::record(dir, &refusal)
                 {
                     tracing::warn!(error = %write_error, "could not record the startup refusal");
                 }
@@ -422,11 +428,12 @@ pub(crate) fn spawn_coordination_tasks(
 /// reset (there is no migration before release); a newer database is answered
 /// by running the newer build, and any other failure (permissions, a full disk)
 /// is only reported, because the data is not known to be unusable.
-pub(crate) fn data_refusal_message(
+pub(crate) fn data_refusal(
     error: &anyhow::Error,
     sync_db_path: &std::path::Path,
     block_store_root: &std::path::Path,
-) -> String {
+) -> yadorilink_local_storage::startup_refusal::StartupRefusal {
+    use yadorilink_local_storage::startup_refusal::{StartOver, StartupRefusal};
     use yadorilink_sqlite_runtime::{DatabaseError, LostDatabaseError};
     let head = format!("The background service cannot open the data on disk: {error}");
     let unusable =
@@ -439,23 +446,23 @@ pub(crate) fn data_refusal_message(
                 )
             );
     if unusable {
-        format!(
-            "{head}\nThere is no migration before release. To start over: run `yadorilink daemon \
-             stop`, delete the index database {} (and its -wal and -shm files), its marker file {} and the \
-             block store {}, then run `yadorilink daemon start` and link your folders again. If this \
-             device is signed in, remove this device from your account's device list first and \
-             register it again afterwards.",
-            sync_db_path.display(),
-            yadorilink_sqlite_runtime::creation_marker_path(sync_db_path).display(),
-            block_store_root.display()
-        )
+        StartupRefusal {
+            reason: head,
+            start_over: Some(StartOver {
+                sync_db: sync_db_path.to_path_buf(),
+                marker: yadorilink_sqlite_runtime::creation_marker_path(sync_db_path),
+                block_store: block_store_root.to_path_buf(),
+            }),
+        }
     } else if matches!(
         error.downcast_ref::<DatabaseError>(),
         Some(DatabaseError::UnsupportedSchemaDowngrade { .. })
     ) {
-        format!("{head}\nIt was written by a newer build: run that build or a newer one.")
+        StartupRefusal::plain(format!(
+            "{head}\nIt was written by a newer build: run that build or a newer one."
+        ))
     } else {
-        head
+        StartupRefusal::plain(head)
     }
 }
 
@@ -505,8 +512,8 @@ pub(crate) fn load_device_config(
             | crate::device_config::DeviceConfigError::StaleConfigVersion { .. }),
         ) => Err(anyhow::anyhow!(
             "refusing to start: {e}. Nothing on disk has been modified, and this device is \
-                 still registered: do not delete device.json and do not run `yadorilink device \
-                 register` again, which would register a second identity for this one device."
+                 still registered: do not delete device.json and do not register this device \
+                 again, which would register a second identity for this one device."
         )),
         Err(e @ crate::device_config::DeviceConfigError::Read { .. }) => Err(anyhow::anyhow!(
             "refusing to start: {e}. device.json exists but could not be read, so this \
@@ -516,7 +523,7 @@ pub(crate) fn load_device_config(
         )),
         Err(e @ crate::device_config::DeviceConfigError::Corrupt { .. }) => Err(anyhow::anyhow!(
             "refusing to start: {e}. Restore device.json from a backup if one exists. \
-                 Running `yadorilink device register` again registers a new identity for this \
+                 Registering this device again registers a new identity for this \
                  device rather than recovering the old one, and changes already made under the \
                  previous device id stay attributed to it."
         )),
@@ -616,18 +623,17 @@ pub(crate) async fn checkpoint_data(state: &Arc<DaemonState>) {
 
 #[cfg(test)]
 mod tests {
-    use super::data_refusal_message;
+    use super::data_refusal;
 
     /// Only data this build cannot use is answered with the destructive reset: a
     /// failure that says nothing about the data (a permission error) is only reported.
     #[test]
     fn a_failure_that_says_nothing_about_the_data_does_not_advise_deleting_it() {
         let io = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-        let message = data_refusal_message(
-            &io,
-            std::path::Path::new("/d/db"),
-            std::path::Path::new("/d/blocks"),
-        );
+        let refusal =
+            data_refusal(&io, std::path::Path::new("/d/db"), std::path::Path::new("/d/blocks"));
+        assert!(refusal.start_over.is_none());
+        let message = refusal.message();
         assert!(
             !message.contains("delete") && !message.contains("remove this device"),
             "{message}"
@@ -638,11 +644,9 @@ mod tests {
                 supported_version: 1,
             },
         );
-        let message = data_refusal_message(
-            &newer,
-            std::path::Path::new("/d/db"),
-            std::path::Path::new("/d/blocks"),
-        );
+        let refusal =
+            data_refusal(&newer, std::path::Path::new("/d/db"), std::path::Path::new("/d/blocks"));
+        let message = refusal.message();
         assert!(message.contains("newer build") && !message.contains("delete"), "{message}");
     }
 }

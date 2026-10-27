@@ -60,6 +60,8 @@ pub struct RuntimeTelemetry {
     /// Files each link's scans could not read and that need the person. Written by the
     /// capture scans, read by status; rebuilt by the first scan after a restart.
     unreadable_files: std::sync::Arc<yadorilink_local_capture::unreadable::UnreadableFileLedger>,
+    /// Delta admission outcomes and bytes/messages served to peers, for `/metrics`.
+    replication: std::sync::Arc<crate::native_replication_driver::ReplicationCounters>,
 }
 
 impl RuntimeTelemetry {
@@ -71,7 +73,14 @@ impl RuntimeTelemetry {
             transfer_progress: crate::transfer_progress::TransferProgressTracker::new(),
             recent_errors: crate::recent_errors::RecentErrorLog::new(),
             unreadable_files: std::sync::Arc::default(),
+            replication: std::sync::Arc::default(),
         }
+    }
+
+    pub fn replication_counters(
+        &self,
+    ) -> std::sync::Arc<crate::native_replication_driver::ReplicationCounters> {
+        self.replication.clone()
     }
 
     /// Records whether essential task `name` is currently running.

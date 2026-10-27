@@ -304,14 +304,6 @@ fn desktop_device_name() -> String {
     "My Device".to_owned()
 }
 
-/// The real sign-in flow: the client layer's enrolment and login, with each
-/// step passed on as a product event.
-///
-/// Nothing is awaited after the login's credential write: the write and the
-/// flow's completion happen in one poll, and the session's gate makes a cancel
-/// wait for a poll in flight and forbid the next, so a flow that has written is
-/// reported as signed in and a cancelled one writes nothing. The daemon is
-/// therefore asked about linked folders before the login starts.
 /// A sign-in over the state directory `dir`: the same flow as
 /// [`ClientCore::new_login_session`], with the credential store and every record it writes in
 /// that directory.
@@ -378,6 +370,14 @@ pub fn new_reauthentication_session_in(
     ))
 }
 
+/// The real sign-in flow: the client layer's enrolment and login, with each
+/// step passed on as a product event.
+///
+/// Nothing is awaited after the login's credential write: the write and the
+/// flow's completion happen in one poll, and the session's gate makes a cancel
+/// wait for a poll in flight and forbid the next, so a flow that has written is
+/// reported as signed in and a cancelled one writes nothing. The daemon is
+/// therefore asked about linked folders before the login starts.
 async fn sign_in(device: bool, sink: LoginEventSink) -> Result<AccountStatus, DesktopError> {
     let has_linked_folders = linked_folders().await;
     ops::auth::login(device, |event| {

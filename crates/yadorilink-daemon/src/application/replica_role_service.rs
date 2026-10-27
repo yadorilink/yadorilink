@@ -7,7 +7,7 @@ use crate::sync_error::SyncError;
 
 use super::ports::{
     CustodyLeaseHandoffPort, HandoffReadinessPort, LinkRuntimePort, OnDemandCapabilityPort,
-    ReplicaRoleRepository, RoleLossCoordination, RoleLossJournal,
+    ReplicaRoleRepository, RoleLossCoordination, RoleLossJournal, StorageModeWriteError,
 };
 
 /// Past this many compensation attempts for the same role-loss operation,
@@ -16,10 +16,54 @@ use super::ports::{
 /// many attempts it has accrued.
 const ROLE_LOSS_COMPENSATION_ESCALATION_ATTEMPTS: i64 = 5;
 
+/// Why a storage-mode change was refused.
+#[derive(Debug)]
+pub(crate) enum StorageModeError {
+    /// On-demand was asked for a root that is not a ready provider root.
+    OnDemandUnavailable,
+    Failed(String),
+    /// Refused for now; the front end words the step that retries it.
+    Advised {
+        message: String,
+        step: crate::error::NextStep,
+    },
+    /// The account has not accepted the current Terms (`403 terms_consent_required`). Nothing was
+    /// committed; signing in again clears it.
+    TermsConsentRequired,
+}
+
+impl From<String> for StorageModeError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl StorageModeError {
+    fn retry(message: impl Into<String>) -> Self {
+        Self::Advised {
+            message: message.into(),
+            step: crate::error::NextStep::RetryStorageModeChange,
+        }
+    }
+}
+
+impl std::fmt::Display for StorageModeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OnDemandUnavailable => f.write_str(crate::provider_gate::ON_DEMAND_REFUSAL),
+            Self::Failed(message) | Self::Advised { message, .. } => f.write_str(message),
+            Self::TermsConsentRequired => f.write_str(TERMS_CONSENT_REQUIRED_MESSAGE),
+        }
+    }
+}
+
+/// The text of a refusal because the Terms were not accepted; the typed code carries the meaning.
+const TERMS_CONSENT_REQUIRED_MESSAGE: &str =
+    "the Terms must be accepted to continue; sign in again to review and accept them";
+
 pub(crate) fn demotion_handoff_lease_failure_message() -> String {
     "refusing to drop complete-copy status: confirmed a ready replica but could not obtain the \
-     required handoff lease (peer unreachable, not caught up, or coordination unavailable); \
-     re-run set-storage-mode to retry"
+     required handoff lease (peer unreachable, not caught up, or coordination unavailable)"
         .to_string()
 }
 
@@ -29,6 +73,9 @@ pub(crate) fn demotion_handoff_lease_failure_message() -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UnlinkError {
     NotProtected(String),
+    /// The account has not accepted the current Terms (`403 terms_consent_required`). Nothing was
+    /// changed; signing in again clears it.
+    TermsConsentRequired,
     /// The link at the path belongs to a different group than the caller expected. Nothing
     /// was changed.
     GroupMismatch(String),
@@ -41,6 +88,7 @@ impl std::fmt::Display for UnlinkError {
             UnlinkError::NotProtected(message)
             | UnlinkError::GroupMismatch(message)
             | UnlinkError::Other(message) => f.write_str(message),
+            UnlinkError::TermsConsentRequired => f.write_str(TERMS_CONSENT_REQUIRED_MESSAGE),
         }
     }
 }
@@ -59,7 +107,7 @@ pub(crate) fn unlink_handoff_lease_failure_message(local_path: &str) -> String {
     format!(
         "refusing to unlink {local_path}: confirmed a ready replica but could not obtain the \
          required handoff lease (peer unreachable, not caught up, or coordination unavailable). \
-         Re-run unlink to retry, or use --force to unlink anyway (data-loss risk)."
+         Re-run unlink to retry."
     )
 }
 
@@ -187,6 +235,20 @@ impl ReplicaRoleService {
         Ok(Some(AmbiguityRecovery { group_id, survivors }))
     }
 
+    /// Changes the group's storage mode. An on-demand request on a root that cannot hold
+    /// dataless items is the typed [`StorageModeError::OnDemandUnavailable`], so the front end
+    /// words the next step for itself.
+    pub(crate) async fn set_storage_mode(
+        &self,
+        group_id: &str,
+        on_demand: bool,
+    ) -> Result<Option<(HandoffCommitResult, [u8; 32])>, StorageModeError> {
+        if on_demand && !self.on_demand_capability.allows_on_demand(group_id) {
+            return Err(StorageModeError::OnDemandUnavailable);
+        }
+        self.set_storage_mode_checked(group_id, on_demand).await
+    }
+
     /// Orchestrates `yadorilink share set-storage-mode`: the SOLE place that
     /// commits BOTH the coordination-plane record of this device's storage mode
     /// for `group_id` AND the local materialization-policy flip between eager
@@ -271,18 +333,15 @@ impl ReplicaRoleService {
                   the lease-acquired arm, and splitting it would move the commit and its rollback \
                   into different scopes"
     )]
-    pub(crate) async fn set_storage_mode(
+    async fn set_storage_mode_checked(
         &self,
         group_id: &str,
         on_demand: bool,
-    ) -> Result<Option<(HandoffCommitResult, [u8; 32])>, String> {
+    ) -> Result<Option<(HandoffCommitResult, [u8; 32])>, StorageModeError> {
         let Some(local_path) = self.local_path_for_group(group_id).map_err(|e| e.to_string())?
         else {
-            return Err(format!("no link registered for folder group {group_id}"));
+            return Err(format!("no link registered for folder group {group_id}").into());
         };
-        if on_demand && !self.on_demand_capability.allows_on_demand(group_id) {
-            return Err(crate::provider_gate::ON_DEMAND_REFUSAL.to_string());
-        }
         if on_demand && self.readiness.is_local_full_replica(group_id) {
             let Some(proof) = self.readiness.full_replica_handoff_proof(group_id).await else {
                 // Deliberately no consultation of cached background custody
@@ -293,7 +352,8 @@ impl ReplicaRoleService {
                 return Err(
                     "refusing to drop complete-copy status: no other complete copy is confirmed to \
                  hold every file in this group yet"
-                        .to_string(),
+                        .to_string()
+                        .into(),
                 );
             };
             let digest_at_check = proof.root_digest();
@@ -320,6 +380,7 @@ impl ReplicaRoleService {
             // compensate (failure) the journal row it names.
             let mut role_loss_operation_id: Option<String> = None;
             let mut lease_acquisition_failed = false;
+            let mut terms_consent_required = false;
             let coordination_result = match (
                 &ready_peer_device_id,
                 self.coordination.is_configured(),
@@ -390,6 +451,18 @@ impl ReplicaRoleService {
                                                  set-storage-mode readiness gate treats this the same \
                                                  as an unconfirmed peer"
                                             );
+                                            Err(())
+                                        }
+                                        RoleLossCommitOutcome::TermsConsentRequired(e) => {
+                                            // Nothing was committed: the journal row is terminal.
+                                            self.role_loss.discard_operation(&operation_id);
+                                            tracing::warn!(
+                                                error = %e,
+                                                group_id,
+                                                "coordination plane refused the role-loss commit \
+                                                 until the Terms are accepted"
+                                            );
+                                            terms_consent_required = true;
                                             Err(())
                                         }
                                         RoleLossCommitOutcome::Ambiguous(e) => {
@@ -469,15 +542,17 @@ impl ReplicaRoleService {
                 _ => Ok(None),
             };
             let Ok(handoff_result) = coordination_result else {
-                if lease_acquisition_failed {
-                    return Err(demotion_handoff_lease_failure_message());
+                if terms_consent_required {
+                    return Err(StorageModeError::TermsConsentRequired);
                 }
-                return Err(
+                if lease_acquisition_failed {
+                    return Err(StorageModeError::retry(demotion_handoff_lease_failure_message()));
+                }
+                return Err(StorageModeError::retry(
                     "refusing to drop complete-copy status: the coordination plane could not \
                  confirm the target device is still an active eager complete copy for this \
-                 group; re-run set-storage-mode to re-confirm"
-                        .to_string(),
-                );
+                 group",
+                ));
             };
             // Atomic: re-enumerate the root set and, only if its digest still
             // equals the one the peer confirmed against, flip the policy --
@@ -516,25 +591,23 @@ impl ReplicaRoleService {
                 return Ok(handoff_result);
             };
             let Some(operation_id) = role_loss_operation_id else {
-                return Err(format!(
-                    "refusing to drop complete-copy status: {local_failure_reason}; re-run \
-                 set-storage-mode to re-confirm"
-                ));
+                return Err(StorageModeError::retry(format!(
+                    "refusing to drop complete-copy status: {local_failure_reason}"
+                )));
             };
             return Err(match self.compensate_role_loss_operation(&operation_id).await {
-                Ok(()) => format!(
+                Ok(()) => StorageModeError::retry(format!(
                 "demotion was committed on the coordination plane but the matching local change \
                  failed ({local_failure_reason}); the operation was SAFELY ROLLED BACK -- this \
-                 device's complete-copy status was restored on the coordination plane. Re-run \
-                 set-storage-mode to try again."
-            ),
-                Err(compensation_err) => format!(
+                 device's complete-copy status was restored on the coordination plane"
+            )),
+                Err(compensation_err) => StorageModeError::Failed(format!(
                 "demotion was committed on the coordination plane but the matching local change \
                  failed ({local_failure_reason}); the automatic rollback could not complete \
                  ({compensation_err}) and will be retried automatically until it succeeds -- \
                  this device may briefly appear demoted on the coordination plane even though \
                  it is still storing this group eagerly locally."
-            ),
+            )),
             });
         }
         // Reached for a PROMOTION (`on_demand = false`), and for a redundant
@@ -561,10 +634,18 @@ impl ReplicaRoleService {
                 return Err(
                 "not connected to the coordination plane; cannot change storage mode (ensure the \
                  daemon is logged in; restart it if you logged in after it started)"
-                    .to_string(),
+                    .to_string()
+                    .into(),
             );
             };
-            self.coordination.set_storage_mode(group_id, &self.device_id, "eager").await?;
+            self.coordination.set_storage_mode(group_id, &self.device_id, "eager").await.map_err(
+                |e| match e {
+                    StorageModeWriteError::TermsConsentRequired(_) => {
+                        StorageModeError::TermsConsentRequired
+                    }
+                    StorageModeWriteError::Failed(m) => m.into(),
+                },
+            )?;
         }
         let policy =
             if on_demand { MaterializationPolicy::OnDemand } else { MaterializationPolicy::Eager };
@@ -654,6 +735,7 @@ impl ReplicaRoleService {
         // device id); the atomic method below re-enumerates and removes the
         // link in one transaction only if that digest still holds.
         let mut lease_acquisition_failed = false;
+        let mut terms_consent_required = false;
         if let Some(proof) = self.readiness.full_replica_handoff_proof(&link.group_id).await {
             let digest_at_check = proof.root_digest();
             let ready_peer_device_id = proof.into_peer_device_id();
@@ -786,6 +868,19 @@ impl ReplicaRoleService {
                                                  unlink readiness gate treats this the same as an \
                                                  unconfirmed peer"
                                             );
+                                            Err(())
+                                        }
+                                        RoleLossCommitOutcome::TermsConsentRequired(e) => {
+                                            // Nothing was committed: the journal row is terminal.
+                                            self.role_loss.discard_operation(&operation_id);
+                                            tracing::warn!(
+                                                error = %e,
+                                                group_id = %link.group_id,
+                                                local_path,
+                                                "coordination plane refused the role-loss commit \
+                                                 until the Terms are accepted"
+                                            );
+                                            terms_consent_required = true;
                                             Err(())
                                         }
                                         RoleLossCommitOutcome::Ambiguous(e) => {
@@ -942,6 +1037,9 @@ impl ReplicaRoleService {
                 .map_err(|e| e.to_string())?;
             return Ok(UnlinkCommit::RemoveNormally);
         }
+        if terms_consent_required {
+            return Err(UnlinkError::TermsConsentRequired);
+        }
         if lease_acquisition_failed {
             return Err(UnlinkError::NotProtected(unlink_handoff_lease_failure_message(
                 local_path,
@@ -950,8 +1048,7 @@ impl ReplicaRoleService {
         Err(UnlinkError::NotProtected(format!(
             "refusing to unlink {local_path}: no other complete copy is confirmed ready to durably \
              hold every file in this group yet, so unlinking it may permanently lose the only \
-             complete copy of this folder's data. Wait for another complete copy to finish syncing, \
-             or re-run with --force to unlink anyway (data-loss risk)."
+             complete copy of this folder's data. Wait for another complete copy to finish syncing."
         )))
     }
 

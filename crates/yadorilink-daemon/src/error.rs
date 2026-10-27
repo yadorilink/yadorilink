@@ -1,3 +1,24 @@
+/// What a person can do next about a refusal, as an action rather than a command line. The
+/// daemon's refusal texts never name a command or a flag; the front end words the step for its
+/// own surface (the wire form is `NextStep`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NextStep {
+    /// Look at the folder's sync status.
+    CheckLinkStatus,
+    /// Look at the list of linked folders to verify what is linked.
+    CheckLinkList,
+    /// Keep a provider-folder item on this device to download it now.
+    KeepItemOnDevice,
+    /// See a provider-folder item's local state and the folder's download progress.
+    ShowProviderLocalState,
+    /// Create a provider folder, the only kind of folder that can be on-demand.
+    CreateProviderFolder,
+    /// Turn on submission for the report's type in the reporting consent settings.
+    EnableReportSubmission,
+    /// Try the storage-mode change again.
+    RetryStorageModeChange,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
     #[error("io error: {0}")]
@@ -27,6 +48,11 @@ pub enum DaemonError {
     /// malformed access token header,...).
     #[error("{0}")]
     Config(String),
+
+    /// A refusal whose own text is host-neutral, plus what the person can do next as a typed
+    /// step the front end words for itself.
+    #[error("{message}")]
+    Advised { message: String, step: NextStep },
 
     /// A link was refused because of the folder's place on this device
     /// (nested in or around another link, or overlapping the recovery

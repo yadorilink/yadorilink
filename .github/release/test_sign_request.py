@@ -81,6 +81,10 @@ class SignRequest(unittest.TestCase):
         with self.assertRaisesRegex(SR.SignError, pattern):
             self.sign(req, **kw)
 
+    def test_schema_version_true_or_float_is_refused(self):
+        for bad in (True, 1.0):
+            self.refused("schema version", request(schema_version=bad))
+
     def test_the_good_request_becomes_the_bundle_the_publisher_expects(self):
         bundle = json.loads(self.sign())
         self.assertEqual(set(bundle), {"schema_version", "channel", "body_sha256", "envelope_text",

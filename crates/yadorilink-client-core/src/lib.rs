@@ -34,7 +34,7 @@ pub mod ops;
 pub mod session;
 pub mod wording;
 
-pub use error::{CoreError, DesktopError, Hint};
+pub use error::{CoreError, DesktopError, Hint, InvalidArgument};
 pub use facade::{
     account_status_in, new_login_session_in, new_reauthentication_session_in, ClientCore,
     DEFAULT_STATUS_INTERVAL,

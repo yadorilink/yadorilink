@@ -10,6 +10,7 @@ import re
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -22,8 +23,17 @@ spec.loader.exec_module(gum)
 
 FLOOR = "0.3.0"
 AT = "2026-10-19T00:00:00Z"
+FRESH = "2026-10-18T12:00:00Z"  # inside the stamp lag before AT
+FULL = {"max_rollout_percentage": 100, "kill_switched": False}
 CHAIN = "[]\n"
 H = "a" * 64
+
+
+def build_for(version):
+    """A Sparkle build that rises with the version (0.4.2 -> 42), as real releases must."""
+    core = version.split("-")[0].split(".")
+    pre = int(version.rsplit(".", 1)[1]) if "-" in version else 0
+    return 1000 * int(core[0]) + 10 * int(core[1]) + int(core[2]) + pre
 
 
 def record(version, lane="beta", gen=(4, 2), sources=("script", "app_bundle", "microsoft_store")):
@@ -45,7 +55,8 @@ def record(version, lane="beta", gen=(4, 2), sources=("script", "app_bundle", "m
         }
     if "app_bundle" in sources:
         rec["app_bundle"] = {"macos-aarch64": {
-            "file": f"YadoriLink-{version}.dmg", "sha256": "e" * 64, "size": 99, "sparkle_build": "42",
+            "file": f"YadoriLink-{version}.dmg", "sha256": "e" * 64, "size": 99,
+            "sparkle_build": str(build_for(version)),
             "notarization_evidence_sha256": "f" * 64, "engine_release_id": rid}}
     if "microsoft_store" in sources:
         rec["microsoft_store"] = {"windows-x86_64": {
@@ -62,6 +73,8 @@ def ledger(versions=None, minimum="0.3.0", channel="beta", **extra):
                     for s, v in versions.items()},
         "reason": "test",
         "history": {s: [v] for s, v in versions.items()},
+        "rollout_history": {s: {v: {"max_rollout_percentage": 100, "kill_switched": False}}
+                            for s, v in versions.items()},
     }
     led.update(extra)
     return led
@@ -71,8 +84,27 @@ def records(*versions, **kw):
     return {v: record(v, **kw) for v in versions}
 
 
+def settle_rollouts(led, prev=None):
+    """Make `led`'s rollout_history truthful for the history and entries the test built by hand:
+    keep recorded values, take a version's record from `prev`, else assume it was served at 100%."""
+    roll = led.setdefault("rollout_history", {})
+    for src, versions in led.get("history", {}).items():
+        per = roll.setdefault(src, {})
+        for v in versions:
+            old = ((prev or {}).get("rollout_history") or {}).get(src, {}).get(v)
+            per.setdefault(v, dict(old) if old else {"max_rollout_percentage": 100, "kill_switched": False})
+        e = led.get("entries", {}).get(src)
+        if e and e["version"] in per:
+            r = per[e["version"]]
+            r["max_rollout_percentage"] = max(r["max_rollout_percentage"], e["rollout_percentage"])
+            r["kill_switched"] = r["kill_switched"] or e["kill_switch"] is True
+
+
 def run(led, recs, **kw):
     kw.setdefault("floor", FLOOR)
+    if isinstance(led, dict) and "rollout_history" in led and isinstance(led.get("history"), dict) \
+            and isinstance(led.get("entries"), dict):
+        settle_rollouts(led, kw.get("previous_ledger"))
     return cl.assemble(led, recs, CHAIN, AT, **kw)
 
 
@@ -268,6 +300,7 @@ class Transitions(unittest.TestCase):
     def test_forward_promotion_is_fine(self):
         led = ledger({"script": "0.4.3", "app_bundle": "0.4.3"})
         led["history"] = {s: [("0.4.2"), "0.4.3"] for s in ("script", "app_bundle")}
+        led["rollout_history"] = {s: {"0.4.2": dict(FULL), "0.4.3": dict(FULL)} for s in ("script", "app_bundle")}
         self.assertEqual(problems_of(led, records("0.4.2", "0.4.3"), previous_ledger=self.prev()), [])
 
     def test_removing_a_served_install_source_is_refused(self):
@@ -292,6 +325,7 @@ class Transitions(unittest.TestCase):
     def yank_fixture(self, **over):
         prev = ledger({"script": "0.4.2"})
         prev["history"]["script"] = ["0.4.1", "0.4.2"]
+        prev["rollout_history"]["script"]["0.4.1"] = dict(FULL)
         led = ledger({"script": "0.4.1"}, reason="yank 0.4.2", withdrawn_versions=["0.4.2"])
         led["history"]["script"] = ["0.4.1", "0.4.2"]
         led.update(over)
@@ -445,14 +479,18 @@ class AppcastGate(unittest.TestCase):
     def test_kill_switched_entry_generates_no_item(self):
         led = ledger()
         led["entries"]["app_bundle"]["kill_switch"] = True
+        led["app_build_tombstones"] = [{"version": led["entries"]["app_bundle"]["version"], "sparkle_build": 42}]
         plan = run(led, records("0.4.2"))
         self.assertEqual(plan["appcast"]["items"], [])
 
     def test_zero_rollout_offers_nothing_and_partial_rollout_is_carried(self):
         led = ledger()
         led["entries"]["app_bundle"]["rollout_percentage"] = 0
+        led["app_build_tombstones"] = [{"version": "0.4.2", "sparkle_build": 42}]
+        led["rollout_history"]["app_bundle"]["0.4.2"]["kill_switched"] = True
         self.assertEqual(run(led, records("0.4.2"))["appcast"]["items"], [])
         led["entries"]["app_bundle"]["rollout_percentage"] = 25
+        del led["app_build_tombstones"]
         self.assertEqual(run(led, records("0.4.2"))["appcast"]["items"][0]["rollout_percentage"], 25)
         ap = copy.deepcopy(self.plan["appcast"])
         ap["items"][0]["rollout_percentage"] = 50
@@ -464,6 +502,69 @@ class AppcastGate(unittest.TestCase):
     def test_no_app_bundle_entry_means_no_appcast_items(self):
         plan = run(ledger({"script": "0.4.2"}), records("0.4.2"))
         self.assertEqual(plan["appcast"]["items"], [])
+
+
+class AppBuildTombstones(unittest.TestCase):
+    TOMB = {"version": "0.4.2", "sparkle_build": 42}
+
+    def test_a_kill_switched_app_bundle_must_be_tombstoned(self):
+        led = ledger()
+        led["entries"]["app_bundle"]["kill_switch"] = True
+        has(self, problems_of(led, records("0.4.2")), "app_build_tombstones must list")
+        led["app_build_tombstones"] = [self.TOMB]
+        self.assertEqual(problems_of(led, records("0.4.2")), [])
+
+    def test_a_yanked_app_bundle_that_was_served_must_be_tombstoned(self):
+        prev = ledger({"app_bundle": "0.4.2"})
+        prev["history"]["app_bundle"] = ["0.4.1", "0.4.2"]
+        prev["rollout_history"]["app_bundle"]["0.4.1"] = dict(FULL)
+        led = ledger({"app_bundle": "0.4.1"}, reason="yank 0.4.2", withdrawn_versions=["0.4.2"])
+        led["history"]["app_bundle"] = ["0.4.1", "0.4.2"]
+        recs = records("0.4.1", "0.4.2")
+        recs["0.4.1"]["app_bundle"]["macos-aarch64"]["sparkle_build"] = "41"
+        has(self, problems_of(led, recs, previous_ledger=prev), "app_build_tombstones must list")
+        led["app_build_tombstones"] = [self.TOMB]
+        self.assertEqual(problems_of(led, recs, previous_ledger=prev), [])
+
+    def test_a_tombstoned_build_cannot_be_reused_by_another_version(self):
+        led = ledger({"app_bundle": "0.4.3"})
+        led["history"]["app_bundle"] = ["0.4.2", "0.4.3"]
+        led["app_build_tombstones"] = [self.TOMB]
+        recs = records("0.4.2", "0.4.3")
+        recs["0.4.3"]["app_bundle"]["macos-aarch64"]["sparkle_build"] = "42"
+        has(self, problems_of(led, recs), "reuses sparkle_build 42")
+
+    def test_a_build_that_does_not_rise_with_the_version_is_refused(self):
+        led = ledger({"app_bundle": "0.4.3"})
+        led["history"]["app_bundle"] = ["0.4.2", "0.4.3"]
+        recs = records("0.4.2", "0.4.3")
+        self.assertEqual(problems_of(led, recs), [])
+        recs["0.4.3"]["app_bundle"]["macos-aarch64"]["sparkle_build"] = "42"
+        has(self, problems_of(led, recs), "sparkle_build must increase with version")
+        recs["0.4.3"]["app_bundle"]["macos-aarch64"]["sparkle_build"] = "41"
+        has(self, problems_of(led, recs), "0.4.3 has 41 but 0.4.2 has 42")
+
+    def test_a_tombstoned_version_cannot_change_its_build(self):
+        led = ledger()
+        led["app_build_tombstones"] = [{"version": "0.4.2", "sparkle_build": 41}]
+        has(self, problems_of(led, records("0.4.2")), "tombstoned as 41")
+
+    def test_shape(self):
+        for bad in ([{"version": "0.4.2"}], [{"version": "x", "sparkle_build": 1}],
+                    [{"version": "0.4.2", "sparkle_build": 0}], [{"version": "0.4.2", "sparkle_build": True}],
+                    "no", [self.TOMB, {"version": "0.4.3", "sparkle_build": 42}]):
+            led = ledger()
+            led["app_build_tombstones"] = bad
+            self.assertTrue(problems_of(led, records("0.4.2")), bad)
+
+    def test_append_only(self):
+        prev = ledger()
+        prev["app_build_tombstones"] = [self.TOMB]
+        has(self, problems_of(ledger(), records("0.4.2"), previous_ledger=prev), "app_build_tombstones may only grow")
+        cur = ledger()
+        cur["app_build_tombstones"] = [self.TOMB, {"version": "0.4.1", "sparkle_build": 41}]
+        self.assertFalse([m for m in problems_of(cur, records("0.4.2"), previous_ledger=prev)
+                          if "may only grow" in m])
 
 
 class RecordImmutability(unittest.TestCase):
@@ -486,6 +587,244 @@ class RecordImmutability(unittest.TestCase):
         has(self, cl.check_records_immutable(base, {"0.4.1.json": b"b"}), "edited")
         has(self, cl.check_records_immutable(base, {}), "deleted")
         self.assertEqual(cl.check_records_immutable(base, {"0.4.1.json": b"a", "0.4.2.json": b"c"}), [])
+
+
+class AdditiveStore(unittest.TestCase):
+    """A merged record may gain exactly one new microsoft_store target (Windows) and nothing else."""
+
+    @staticmethod
+    def enc(rec):
+        return (json.dumps(rec, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+    def setUp(self):
+        self.rec = record("0.4.1", sources=("script",))
+        self.base = {"0.4.1.json": self.enc(self.rec)}
+        self.store = record("0.4.1")["microsoft_store"]["windows-x86_64"]
+
+    def head(self, mutate):
+        r = copy.deepcopy(self.rec)
+        mutate(r)
+        return {"0.4.1.json": self.enc(r)}
+
+    def refused(self, mutate, needle="immutable"):
+        has(self, cl.check_records_immutable(self.base, self.head(mutate)), needle)
+
+    def test_one_new_store_target_is_accepted(self):
+        out = cl.check_records_immutable(self.base, self.head(lambda r: r.update(microsoft_store={"windows-x86_64": self.store})))
+        self.assertEqual(out, [])
+
+    def test_store_next_to_an_existing_dmg_is_accepted(self):
+        rec = record("0.4.1", sources=("script", "app_bundle"))
+        base = {"0.4.1.json": self.enc(rec)}
+        rec["microsoft_store"] = {"windows-x86_64": self.store}
+        self.assertEqual(cl.check_records_immutable(base, {"0.4.1.json": self.enc(rec)}), [])
+
+    def test_dmg_and_store_in_one_edit_are_refused(self):
+        dmg = record("0.4.1")["app_bundle"]
+        self.refused(lambda r: r.update(microsoft_store={"windows-x86_64": self.store}, app_bundle=dmg))
+
+    def test_two_store_targets_are_refused(self):
+        self.refused(lambda r: r.update(microsoft_store={"windows-x86_64": self.store, "windows-aarch64": dict(self.store)}))
+
+    def test_non_windows_store_target_is_refused(self):
+        self.refused(lambda r: r.update(microsoft_store={"linux-x86_64": self.store}))
+
+    def test_macos_target_in_the_store_section_is_refused(self):
+        self.refused(lambda r: r.update(microsoft_store={"macos-aarch64": self.store}))
+
+    def test_windows_target_in_the_dmg_section_is_refused(self):
+        self.refused(lambda r: r.update(app_bundle={"windows-x86_64": record("0.4.1")["app_bundle"]["macos-aarch64"]}))
+
+    def test_existing_store_target_replaced_or_removed_is_refused(self):
+        rec = record("0.4.1")
+        base = {"0.4.1.json": self.enc(rec)}
+        changed = copy.deepcopy(rec)
+        changed["microsoft_store"]["windows-x86_64"]["submission_id"] = "other"
+        has(self, cl.check_records_immutable(base, {"0.4.1.json": self.enc(changed)}), "immutable")
+        both = copy.deepcopy(changed)   # an existing target changed while one is added: still refused
+        both["microsoft_store"]["windows-aarch64"] = dict(self.store)
+        has(self, cl.check_records_immutable(base, {"0.4.1.json": self.enc(both)}), "immutable")
+        gone = copy.deepcopy(rec)
+        gone["microsoft_store"] = {"windows-aarch64": dict(self.store)}
+        has(self, cl.check_records_immutable(base, {"0.4.1.json": self.enc(gone)}), "immutable")
+
+    def test_other_field_edited_alongside_is_refused(self):
+        def m(r):
+            r["microsoft_store"] = {"windows-x86_64": self.store}
+            r["tag"] = "v9.9.9"
+        self.refused(m)
+
+    def test_script_edited_alongside_is_refused(self):
+        def m(r):
+            r["microsoft_store"] = {"windows-x86_64": self.store}
+            r["script"]["linux-x86_64"]["sha256"] = "9" * 64
+        self.refused(m)
+
+    def test_malformed_store_entry_is_refused(self):
+        for bad in ({**self.store, "upload_sha256": "zz"}, {**self.store, "x": "y"}, {k: v for k, v in self.store.items() if k != "submission_id"}):
+            self.refused(lambda r, bad=bad: r.update(microsoft_store={"windows-x86_64": bad}))
+
+    def test_empty_store_section_is_refused(self):
+        self.refused(lambda r: r.update(microsoft_store={}))
+
+    def test_non_canonical_bytes_are_refused(self):
+        r = copy.deepcopy(self.rec)
+        r["microsoft_store"] = {"windows-x86_64": self.store}
+        has(self, cl.check_records_immutable(self.base, {"0.4.1.json": json.dumps(r).encode()}), "immutable")
+
+    def test_null_sections_count_as_absent(self):
+        dmg = record("0.4.1")["app_bundle"]
+        self.assertEqual(cl.check_records_immutable(self.base, self.head(
+            lambda r: r.update(app_bundle=None, microsoft_store={"windows-x86_64": self.store}))), [])
+        self.assertEqual(cl.check_records_immutable(self.base, self.head(
+            lambda r: r.update(microsoft_store=None, app_bundle=dmg))), [])
+        self.refused(lambda r: r.update(app_bundle=None, microsoft_store=None))
+
+    def test_record_version_must_match_its_file_name(self):
+        r = copy.deepcopy(self.rec)
+        r["version"] = "0.4.2"
+        base = {"0.4.2.json": self.enc(r)}
+        r["microsoft_store"] = {"windows-x86_64": self.store}
+        has(self, cl.check_records_immutable({"0.4.1.json": base["0.4.2.json"]}, {"0.4.1.json": self.enc(r)}), "immutable")
+
+    def test_ledger_serving_the_added_store_entry_assembles(self):
+        rec = copy.deepcopy(self.rec)
+        rec["microsoft_store"] = {"windows-x86_64": self.store}
+        led = ledger({"script": "0.4.1", "microsoft_store": "0.4.1"})
+        body = json.loads(run(led, {"0.4.1": rec})["manifest_body"])
+        self.assertIn(("microsoft_store", "windows"), {(r["install_source"], r["platform"]) for r in body["releases"]})
+
+
+class AdditiveDmg(unittest.TestCase):
+    """A merged record may gain exactly one new app_bundle target and nothing else."""
+
+    @staticmethod
+    def enc(rec):
+        return (json.dumps(rec, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+    def setUp(self):
+        self.rec = record("0.4.1", sources=("script",))
+        self.base = {"0.4.1.json": self.enc(self.rec)}
+        self.dmg = record("0.4.1")["app_bundle"]["macos-aarch64"]
+
+    def head(self, mutate):
+        r = copy.deepcopy(self.rec)
+        mutate(r)
+        return {"0.4.1.json": self.enc(r)}
+
+    def refused(self, mutate):
+        has(self, cl.check_records_immutable(self.base, self.head(mutate)), "immutable")
+
+    def test_one_new_target_is_accepted(self):
+        out = cl.check_records_immutable(self.base, self.head(lambda r: r.update(app_bundle={"macos-aarch64": self.dmg})))
+        self.assertEqual(out, [])
+
+    def test_second_target_next_to_an_existing_one_is_accepted(self):
+        rec = record("0.4.1")
+        base = {"0.4.1.json": self.enc(rec)}
+        rec["app_bundle"]["macos-x86_64"] = dict(self.dmg)
+        self.assertEqual(cl.check_records_immutable(base, {"0.4.1.json": self.enc(rec)}), [])
+
+    def test_other_field_edited_alongside_is_refused(self):
+        def m(r):
+            r["app_bundle"] = {"macos-aarch64": self.dmg}
+            r["tag"] = "v9.9.9"
+        self.refused(m)
+
+    def test_script_edited_alongside_is_refused(self):
+        def m(r):
+            r["app_bundle"] = {"macos-aarch64": self.dmg}
+            r["script"]["linux-x86_64"]["sha256"] = "9" * 64
+        self.refused(m)
+
+    def test_field_removed_is_refused(self):
+        self.refused(lambda r: r.pop("tag"))
+
+    def test_edit_without_app_bundle_is_refused(self):
+        self.refused(lambda r: r.update(state_schema="2"))
+
+    def test_existing_target_replaced_is_refused(self):
+        rec = record("0.4.1")
+        base = {"0.4.1.json": self.enc(rec)}
+        rec["app_bundle"]["macos-aarch64"]["sha256"] = "9" * 64
+        has(self, cl.check_records_immutable(base, {"0.4.1.json": self.enc(rec)}), "immutable")
+
+    def test_existing_target_removed_is_refused(self):
+        rec = record("0.4.1")
+        base = {"0.4.1.json": self.enc(rec)}
+        del rec["app_bundle"]["macos-aarch64"]
+        rec["app_bundle"]["macos-x86_64"] = dict(self.dmg)
+        has(self, cl.check_records_immutable(base, {"0.4.1.json": self.enc(rec)}), "immutable")
+
+    def test_two_new_targets_are_refused(self):
+        self.refused(lambda r: r.update(app_bundle={"macos-aarch64": self.dmg, "macos-x86_64": dict(self.dmg)}))
+
+    def test_non_macos_target_is_refused(self):
+        self.refused(lambda r: r.update(app_bundle={"linux-x86_64": self.dmg}))
+
+    def test_foreign_engine_release_id_is_refused(self):
+        self.refused(lambda r: r.update(app_bundle={"macos-aarch64": {**self.dmg, "engine_release_id": "other"}}))
+
+    def test_extra_entry_field_is_refused(self):
+        self.refused(lambda r: r.update(app_bundle={"macos-aarch64": {**self.dmg, "x": "y"}}))
+
+    def test_malformed_entry_is_refused(self):
+        self.refused(lambda r: r.update(app_bundle={"macos-aarch64": {**self.dmg, "sha256": "zz"}}))
+
+    def test_non_canonical_bytes_are_refused(self):
+        r = copy.deepcopy(self.rec)
+        r["app_bundle"] = {"macos-aarch64": self.dmg}
+        has(self, cl.check_records_immutable(self.base, {"0.4.1.json": json.dumps(r).encode()}), "immutable")
+
+    def test_duplicate_keys_and_garbage_are_refused(self):
+        dup = self.enc(self.rec).replace(b'  "tag"', b'  "tag": "v0.4.1",\n  "tag"', 1)
+        self.assertEqual(json.loads(dup), self.rec)
+        has(self, cl.check_records_immutable(self.base, {"0.4.1.json": dup}), "immutable")
+        has(self, cl.check_records_immutable(self.base, {"0.4.1.json": b"\xff"}), "immutable")
+
+    def test_scalar_type_change_in_other_field_is_refused(self):
+        for v in (True, 1.0):
+            self.refused(lambda r, v=v: r.update(schema_version=v, app_bundle={"macos-aarch64": self.dmg}))
+
+    def test_non_canonical_merged_base_is_refused(self):
+        base = {"0.4.1.json": json.dumps(self.rec, indent=4, sort_keys=True).encode() + b"\n"}
+        r = copy.deepcopy(self.rec)
+        r["app_bundle"] = {"macos-aarch64": self.dmg}
+        has(self, cl.check_records_immutable(base, {"0.4.1.json": self.enc(r)}), "immutable")
+
+    def test_empty_app_bundle_in_base_is_refused(self):
+        r = copy.deepcopy(self.rec)
+        r["app_bundle"] = {}
+        base = {"0.4.1.json": self.enc(r)}
+        r["app_bundle"] = {"macos-aarch64": self.dmg}
+        has(self, cl.check_records_immutable(base, {"0.4.1.json": self.enc(r)}), "immutable")
+
+    def test_unusable_sparkle_build_is_refused(self):
+        for b in ("abc", "0", "01", str(2**64)):
+            self.refused(lambda r, b=b: r.update(app_bundle={"macos-aarch64": {**self.dmg, "sparkle_build": b}}))
+
+    def test_file_name_not_ending_in_dmg_is_refused(self):
+        for f in ("manifest.json", "x.dmg.sha256", "yadorilink-0.4.1-linux-x86_64.zip"):
+            self.refused(lambda r, f=f: r.update(app_bundle={"macos-aarch64": {**self.dmg, "file": f}}))
+
+    def test_second_arch_reusing_a_file_name_with_other_bytes_is_refused(self):
+        rec = record("0.4.1")
+        base = {"0.4.1.json": self.enc(rec)}
+        rec["app_bundle"]["macos-x86_64"] = {**self.dmg, "sha256": "9" * 64}
+        has(self, cl.check_records_immutable(base, {"0.4.1.json": self.enc(rec)}), "immutable")
+
+    def test_deleting_the_record_is_still_refused(self):
+        has(self, cl.check_records_immutable(self.base, {}), "deleted")
+
+    def test_ledger_serving_the_added_dmg_assembles(self):
+        recs = {"0.4.1": self.rec}
+        led = ledger({"script": "0.4.1"})
+        self.assertEqual(run(led, recs)["appcast"]["items"], [])
+        self.rec["app_bundle"] = {"macos-aarch64": self.dmg}
+        led2 = ledger({"script": "0.4.1", "app_bundle": "0.4.1"})
+        led2["history"]["script"] = ["0.4.1"]
+        out = run(led2, recs, previous_ledger=led)
+        self.assertEqual(len(out["appcast"]["items"]), 1)
 
 
 class Cli(unittest.TestCase):
@@ -561,6 +900,23 @@ class SchemasMatchValidator(unittest.TestCase):
             t = s["properties"][source]["additionalProperties"]
             self.assertEqual(set(t["properties"]) - cl.OPTIONAL_TARGET_FIELDS, fields)
             self.assertEqual(set(t["required"]), fields)
+
+
+class SchemaVersionIsAnInteger(unittest.TestCase):
+    """`True == 1` and `1.0 == 1` in Python, so an equality check alone accepts them."""
+
+    def test_record_and_ledger_refuse_true_and_float_versions(self):
+        for bad in (True, 1.0):
+            rec = record("0.4.2")
+            rec["schema_version"] = bad
+            has(self, cl.validate_record(rec, "0.4.2"), "schema_version")
+            led = ledger()
+            led["schema_version"] = bad
+            has(self, cl.validate_ledger(led, {}, floor="0.3.0"), "schema_version")
+
+    def test_manifest_validator_refuses_true_and_float_versions(self):
+        for bad in (True, 2.0):
+            has(self, gum.validate_manifest({"schema_version": bad}, False), "schema_version")
 
 
 class StrictIdentifiers(unittest.TestCase):
@@ -697,7 +1053,7 @@ class Channels(unittest.TestCase):
         for mod in mods:
             self.assertEqual(tuple(mod.CHANNELS), rc.CHANNELS, mod.__name__)
 
-    def assemble_cli(self, tree, channel):
+    def assemble_cli(self, tree, channel, *extra):
         from unittest import mock
         chain = Path(tree) / "chain.json"
         chain.write_text(CHAIN, encoding="utf-8")
@@ -705,7 +1061,7 @@ class Channels(unittest.TestCase):
                 mock.patch("sys.stderr"), mock.patch("sys.stdout"):
             return gum.main(["assemble", "--ledger", str(Path(tree) / f"{channel}.json"),
                              "--records-dir", str(Path(tree) / "releases"), "--trust-chain", str(chain),
-                             "--generated-at", AT, "--out-body", str(Path(tree) / "out.json")])
+                             "--generated-at", AT, "--out-body", str(Path(tree) / "out.json"), *extra])
 
     def ledger_tree(self, with_beta=True):
         tree = Path(tempfile.mkdtemp())
@@ -717,11 +1073,13 @@ class Channels(unittest.TestCase):
             (tree / "beta.json").write_text(json.dumps(self.beta("0.4.2")), encoding="utf-8")
         return tree
 
-    def test_assemble_cli_reads_the_promotion_source_itself(self):
-        """The CI dry run passes no --promotion-source-ledger: assemble must find the sibling beta
-        ledger for stable (as the publisher does), and still refuse when it is absent."""
-        self.assertEqual(self.assemble_cli(self.ledger_tree(), "stable"), 0)
-        self.assertEqual(self.assemble_cli(self.ledger_tree(with_beta=False), "stable"), 5)
+    def test_assemble_cli_needs_the_served_promotion_source_for_stable(self):
+        """The repository beta file carries no stamps and cannot show a soak: the CLI no longer
+        picks it up; the stamped snapshot beta serves is passed explicitly (the publisher reads it
+        from storage)."""
+        tree = self.ledger_tree()
+        self.assertEqual(self.assemble_cli(tree, "stable"), 5)
+        self.assertEqual(self.assemble_cli(tree, "stable", "--promotion-source-ledger", str(tree / "beta.json")), 0)
 
     def test_workflows_and_cli_list_the_shared_channels(self):
         """Every channel list in a workflow or the CLI is the shared one, or the shared one without
@@ -767,9 +1125,13 @@ class Channels(unittest.TestCase):
         led = ledger(channel="stable", versions={"script": version})
         return led
 
-    def beta(self, *versions, withdrawn=()):
+    def beta(self, *versions, withdrawn=(), published="2026-10-01T00:00:00Z"):
         led = ledger(channel="beta", versions={"script": versions[-1]})
         led["history"] = {"script": list(versions)}
+        led["published_at"] = {"script": {v: published for v in versions}}
+        led["full_rollout_at"] = {"script": {v: published for v in versions}}
+        led["rollout_history"] = {"script": {v: {"max_rollout_percentage": 100, "kill_switched": False}
+                                             for v in versions}}
         if withdrawn:
             led["withdrawn_versions"] = list(withdrawn)
         return led
@@ -798,12 +1160,51 @@ class Channels(unittest.TestCase):
         has(self, problems_of(self.stable("0.4.2-beta.1"), records("0.4.2-beta.1", sources=("script",)),
                               promotion_source=self.beta("0.4.2-beta.1")), "pre-release")
 
-    def test_stable_refuses_a_version_beta_has_switched_off_or_not_fully_rolled_out(self):
-        for field, value in (("kill_switch", True), ("rollout_percentage", 0), ("rollout_percentage", 50)):
-            src = self.beta("0.4.2")
-            src["entries"]["script"][field] = value
-            has(self, problems_of(self.stable(), records("0.4.2", sources=("script",)), promotion_source=src),
-                "not fully offered on beta")
+    def test_stable_refuses_a_version_beta_never_fully_rolled_out_or_ever_switched_off(self):
+        recs = records("0.4.2", "0.4.3", sources=("script",))
+        for current, record in (("0.4.2", {"max_rollout_percentage": 50, "kill_switched": False}),
+                                ("0.4.2", {"max_rollout_percentage": 0, "kill_switched": False}),
+                                ("0.4.2", {"max_rollout_percentage": 100, "kill_switched": True}),
+                                # beta has moved on: 0.4.2 is no longer the current entry
+                                ("0.4.3", {"max_rollout_percentage": 0, "kill_switched": False}),
+                                ("0.4.3", {"max_rollout_percentage": 100, "kill_switched": True})):
+            src = self.beta("0.4.2", "0.4.3") if current == "0.4.3" else self.beta("0.4.2")
+            src["rollout_history"]["script"]["0.4.2"] = record
+            if record["max_rollout_percentage"] != 100:
+                del src["full_rollout_at"]["script"]["0.4.2"]
+            if current == "0.4.2":
+                src["entries"]["script"].update(rollout_percentage=record["max_rollout_percentage"],
+                                                kill_switch=record["kill_switched"])
+            has(self, problems_of(self.stable(), recs, promotion_source=src), "not cleanly fully offered on beta")
+
+    def test_stable_refuses_a_version_with_no_recorded_rollout(self):
+        src = self.beta("0.4.2")
+        del src["rollout_history"], src["full_rollout_at"]
+        has(self, problems_of(self.stable(), records("0.4.2", sources=("script",)), promotion_source=src),
+            "no recorded rollout_history")
+
+    def test_rollout_history_is_validated_and_append_only(self):
+        led = ledger({"script": "0.4.2"})
+
+        def shape_problems(l):
+            return cl.validate_ledger(l, records("0.4.2"), floor=FLOOR)
+        good = {"max_rollout_percentage": 100, "kill_switched": False}
+        for bad in ({"max_rollout_percentage": 101, "kill_switched": False}, {"max_rollout_percentage": 5},
+                    {"max_rollout_percentage": 100, "kill_switched": "no"}):
+            led["rollout_history"] = {"script": {"0.4.2": bad}}
+            has(self, shape_problems(led), "rollout_history[script][0.4.2] must be exactly")
+        led["rollout_history"] = {"script": {"0.9.9": good}}
+        has(self, shape_problems(led), "not in history")
+        led["rollout_history"] = {"script": {"0.4.2": {"max_rollout_percentage": 50, "kill_switched": False}}}
+        has(self, shape_problems(led), "below the current rollout_percentage")
+        # transitions, called directly (run() settles hand-built records)
+        prev = ledger({"script": "0.4.2"}, rollout_history={"script": {"0.4.2": {
+            "max_rollout_percentage": 100, "kill_switched": True}}})
+        cur = ledger({"script": "0.4.2"})
+        found = cl.validate_transition(prev, cur, records("0.4.2"), floor=FLOOR, generated_at=AT)
+        has(self, found, "must keep its record")
+        cur["rollout_history"] = {"script": {}}
+        has(self, cl.validate_transition(prev, cur, records("0.4.2"), floor=FLOOR, generated_at=AT), "must record the rollout of 0.4.2")
 
     def test_stable_accepts_a_version_beta_has_moved_past(self):
         src = self.beta("0.4.2", "0.4.3")
@@ -822,6 +1223,146 @@ class Channels(unittest.TestCase):
         src["entries"] = "x"
         has(self, problems_of(self.stable(), recs, promotion_source=src), "beta ledger")
 
+    def test_stable_refuses_a_version_younger_than_the_soak_period(self):
+        recs = records("0.4.2", sources=("script",))
+        fresh = cl.TIME_FORMAT
+        for age, ok in ((cl.SOAK_DAYS * 86400 - 1, False), (cl.SOAK_DAYS * 86400, True)):
+            at = (datetime.strptime(AT, fresh) - timedelta(seconds=age)).strftime(fresh)
+            probs = problems_of(self.stable(), recs, promotion_source=self.beta("0.4.2", published=at))
+            if ok:
+                self.assertEqual(probs, [])
+            else:
+                has(self, probs, "days before")
+
+    def test_stable_refuses_a_version_with_no_recorded_publish_time(self):
+        src = self.beta("0.4.2")
+        del src["full_rollout_at"]
+        has(self, problems_of(self.stable(), records("0.4.2", sources=("script",)), promotion_source=src),
+            "no recorded full_rollout_at")
+
+    def test_soak_uses_the_time_recorded_for_the_version_not_the_current_one(self):
+        src = self.beta("0.4.2", "0.4.3")
+        src["full_rollout_at"]["script"]["0.4.3"] = "2026-10-18T00:00:00Z"
+        self.assertEqual(problems_of(self.stable("0.4.2"), records("0.4.2", "0.4.3", sources=("script",)),
+                                     promotion_source=src), [])
+
+    def test_a_typed_stamp_is_refused(self):
+        """#1383: the stamps come from the publisher's clock; a ledger file may not carry them."""
+        recs = records("0.4.2", sources=("script",))
+        for name in ("published_at", "full_rollout_at"):
+            led = ledger({"script": "0.4.2"})
+            led[name] = {"script": {"0.4.2": FRESH}}
+            has(self, problems_of(led, recs), f"{name} is stamped by the publisher")
+
+    def test_the_publisher_stamps_new_versions_with_its_own_clock(self):
+        recs = records("0.4.2", "0.4.3", sources=("script",))
+        prev = cl.stamp_ledger(ledger({"script": "0.4.2"}), None, "2026-10-01T00:00:00Z")
+        self.assertEqual(prev["published_at"], {"script": {"0.4.2": "2026-10-01T00:00:00Z"}})
+        led = ledger({"script": "0.4.3"})
+        led["history"]["script"] = ["0.4.2", "0.4.3"]
+        led["rollout_history"]["script"]["0.4.2"] = dict(FULL)
+        out = run(led, recs, previous_ledger=prev)
+        stamped = json.loads(out["ledger_text"])
+        # the recorded time is carried, the new version gets generated_at (AT), nothing is typed
+        self.assertEqual(stamped["published_at"], {"script": {"0.4.2": "2026-10-01T00:00:00Z", "0.4.3": AT}})
+        self.assertEqual(stamped["full_rollout_at"], {"script": {"0.4.2": "2026-10-01T00:00:00Z", "0.4.3": AT}})
+        self.assertEqual(out["ledger_text"], run(led, recs, previous_ledger=prev)["ledger_text"])  # pure
+        self.assertNotIn("published_at", led)  # the reviewed ledger is not changed
+
+    def test_a_ramping_version_gets_full_rollout_only_when_it_reaches_100(self):
+        recs = records("0.4.2", sources=("script",))
+        led = ledger({"script": "0.4.2"})
+        led["entries"]["script"]["rollout_percentage"] = 50
+        led["rollout_history"]["script"]["0.4.2"]["max_rollout_percentage"] = 50
+        first = json.loads(run(led, recs)["ledger_text"])
+        self.assertEqual(first["published_at"], {"script": {"0.4.2": AT}})
+        self.assertNotIn("full_rollout_at", first)
+        led2 = ledger({"script": "0.4.2"})
+        later = "2026-10-20T00:00:00Z"
+        second = json.loads(cl.assemble(led2, recs, CHAIN, later, floor=FLOOR, previous_ledger=first)["ledger_text"])
+        self.assertEqual(second["published_at"], {"script": {"0.4.2": AT}})
+        self.assertEqual(second["full_rollout_at"], {"script": {"0.4.2": later}})
+        # and a later publish keeps it
+        third = json.loads(cl.assemble(led2, recs, CHAIN, "2026-10-21T00:00:00Z", floor=FLOOR,
+                                       previous_ledger=second)["ledger_text"])
+        self.assertEqual(third["full_rollout_at"], {"script": {"0.4.2": later}})
+
+    def test_recorded_stamps_are_validated_and_append_only(self):
+        """The published snapshot is read back by the promotion and the next publish: its stamps
+        are still validated, and a recorded time is never changed."""
+        recs = records("0.4.2", "0.4.3", sources=("script",))
+        snap = cl.stamp_ledger(ledger({"script": "0.4.3"}, ), None, AT)
+        snap["history"]["script"] = ["0.4.2", "0.4.3"]
+        snap["rollout_history"]["script"]["0.4.2"] = dict(FULL)
+        snap["published_at"] = {"script": {"0.4.2": "yesterday"}}
+        has(self, cl.validate_ledger(snap, recs, floor=FLOOR), "must be YYYY-MM-DDTHH:MM:SSZ")
+        snap["published_at"] = {"script": {"0.9.9": "2026-10-01T00:00:00Z"}}
+        has(self, cl.validate_ledger(snap, recs, floor=FLOOR), "not in history")
+        snap["published_at"] = {"script": {"0.4.2": "2026-10-18T11:00:00Z", "0.4.3": "2026-10-18T10:00:00Z"}}
+        has(self, cl.validate_ledger(snap, recs, floor=FLOOR), "may not go backwards")
+        # a later publish never rewrites a recorded time: the stamps are carried from the served ledger
+        prev = cl.stamp_ledger(ledger({"script": "0.4.2"}), None, "2026-10-01T00:00:00Z")
+        edited = json.loads(json.dumps(prev))
+        edited["published_at"]["script"]["0.4.2"] = "2026-10-02T00:00:00Z"
+        has(self, cl.validate_transition(prev, edited, recs, floor=FLOOR, generated_at=AT), "keep every recorded time")
+
+    def test_a_stamp_the_publisher_clock_would_not_allow_is_refused(self):
+        """The bounds stay: nothing in the archived ledger lies after generated_at, and a
+        recorded time is within MAX_STAMP_LAG of it when first recorded."""
+        recs = records("0.4.2", sources=("script",))
+        led = cl.stamp_ledger(ledger({"script": "0.4.2"}), None, "2026-10-19T01:00:00Z")
+        has(self, cl._future_published_problems(led, AT), "is after generated_at")
+        prev = ledger({"script": "0.4.2"})
+        old = cl.stamp_ledger(ledger({"script": "0.4.3"}), prev, "2026-10-01T00:00:00Z")
+        has(self, cl.validate_transition(prev, old, recs, floor=FLOOR, generated_at=AT), "more than 1 day before")
+
+    def test_full_rollout_is_recorded_only_for_a_version_that_reached_100(self):
+        recs = records("0.4.2", sources=("script",))
+        led = ledger({"script": "0.4.2"})
+        led["rollout_history"]["script"]["0.4.2"]["max_rollout_percentage"] = 50
+        led["entries"]["script"]["rollout_percentage"] = 50
+        led["full_rollout_at"] = {"script": {"0.4.2": FRESH}}
+        has(self, problems_of(led, recs), "does not show at 100%")
+        led["rollout_history"]["script"]["0.4.2"]["max_rollout_percentage"] = 100
+        led["published_at"] = {"script": {"0.4.2": "2026-10-18T13:00:00Z"}}
+        has(self, problems_of(led, recs), "before its published_at")
+
+    def test_soak_runs_from_reaching_100_not_from_first_publish(self):
+        """Published long ago but only fully rolled out yesterday is not soaked."""
+        src = self.beta("0.4.2", published="2026-09-01T00:00:00Z")
+        src["full_rollout_at"]["script"]["0.4.2"] = "2026-10-18T00:00:00Z"
+        has(self, problems_of(self.stable(), records("0.4.2", sources=("script",)), promotion_source=src),
+            "reached 100%")
+        src["full_rollout_at"]["script"]["0.4.2"] = "2026-10-12T00:00:00Z"
+        self.assertEqual(problems_of(self.stable(), records("0.4.2", sources=("script",)),
+                                     promotion_source=src), [])
+
+    def test_a_version_dropped_to_zero_is_withdrawn_and_not_promotable(self):
+        """0% after being served is a withdrawal, by the same predicate the build
+        tombstones use."""
+        recs = records("0.4.2", "0.4.3", sources=("script",))
+        self.assertTrue(cl.is_withdrawn_entry({"rollout_percentage": 0, "kill_switch": False}))
+        self.assertTrue(cl.is_withdrawn_entry({"rollout_percentage": 100, "kill_switch": True}))
+        self.assertFalse(cl.is_withdrawn_entry({"rollout_percentage": 1, "kill_switch": False}))
+        led = ledger({"script": "0.4.2"})
+        led["entries"]["script"]["rollout_percentage"] = 0
+        has(self, problems_of(led, recs), "kill_switched must be true")
+        led["rollout_history"]["script"]["0.4.2"]["kill_switched"] = True
+        self.assertEqual(problems_of(led, recs), [])
+        # a version only ever dark at 0% has not been served and may still ramp
+        dark = ledger({"script": "0.4.2"})
+        dark["entries"]["script"]["rollout_percentage"] = 0
+        dark["rollout_history"]["script"]["0.4.2"]["max_rollout_percentage"] = 0
+        self.assertEqual(problems_of(dark, recs), [])
+        # the recorded withdrawal is never forgotten, so the version stays unpromotable
+        src = self.beta("0.4.2", "0.4.3")
+        src["rollout_history"]["script"]["0.4.2"]["kill_switched"] = True
+        has(self, problems_of(self.stable("0.4.2"), recs, promotion_source=src), "not cleanly fully offered")
+        back = ledger({"script": "0.4.2"})
+        prev = ledger({"script": "0.4.2"}, rollout_history={"script": {"0.4.2": {
+            "max_rollout_percentage": 100, "kill_switched": True}}})
+        has(self, problems_of(back, recs, previous_ledger=prev), "must keep its record")
+
     def test_beta_and_nightly_ignore_promotion(self):
         self.assertEqual(problems_of(ledger(), records("0.4.2")), [])
         self.assertEqual(problems_of(ledger(channel="nightly"), records("0.4.2", lane="dev")), [])
@@ -829,3 +1370,29 @@ class Channels(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LandingChannelCheck(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location("check_landing_channels", HERE / "check-landing-channels.py")
+        self.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.mod)
+
+    def landing(self, names):
+        root = Path(tempfile.mkdtemp())
+        (root / "src").mkdir()
+        listed = ", ".join(f'"{n}"' for n in names)
+        (root / "src" / "dl.mjs").write_text(f"const CHANNELS = new Set([{listed}]);\n", encoding="utf-8")
+        return str(root)
+
+    def test_equal_lists_pass_and_differing_lists_fail(self):
+        self.assertEqual(self.mod.main([self.landing(cl.CHANNELS)]), 0)
+        self.assertEqual(self.mod.main([self.landing(cl.CHANNELS[:-1])]), 1)
+        self.assertEqual(self.mod.main([self.landing([*cl.CHANNELS, "extra"])]), 1)
+
+    def test_absent_landing_is_skipped_and_unparsable_fails(self):
+        self.assertEqual(self.mod.main([]), 0)
+        self.assertEqual(self.mod.main(["/nonexistent-landing-path"]), 0)
+        root = Path(self.landing(cl.CHANNELS))
+        (root / "src" / "dl.mjs").write_text("nothing\n", encoding="utf-8")
+        self.assertEqual(self.mod.main([str(root)]), 2)

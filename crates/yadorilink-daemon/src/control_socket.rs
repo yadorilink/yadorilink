@@ -14,6 +14,10 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
+
+use crate::application::ports::SubmitReportError;
+use crate::application::replica_role_service::StorageModeError;
+use crate::error::NextStep;
 use yadorilink_ipc_proto::daemonctl::rewind_execute_response::Outcome as RewindExecuteOutcome;
 use yadorilink_ipc_proto::daemonctl::{
     accept_invite_command_response, create_and_link_command_response,
@@ -35,13 +39,13 @@ use yadorilink_ipc_proto::daemonctl::{
     MaterializationStatusResponse, MembershipHandoffResult, MintInviteCommandResponse,
     MintedInviteInfo, NasAdminFailureKind, ObtainHandoffTicketResponse, OpenNasAdminResponse,
     PauseResponse, PendingEnrollmentKind, PinItemResponse, PreviewSpaceReclaimResponse, QueueItem,
-    ReadoptVolumeResponse, ReceiveTransferResponse, ReleaseHandoffTicketResponse,
-    RemoveDeviceCommandResponse, RemovePendingEnrollmentResponse, ReplicaMembershipCommandOutcome,
-    ReportingConsentState, ReportingStatusResponse, RequestHandoffLeaseResponse,
-    RestoreTrashOperationFailure, RestoreTrashOperationResponse, RestoreTrashResponse,
-    RestoreVersionResponse, ResumeResponse, RetentionPolicy, RetentionState as WireRetentionState,
-    RetryTransferResponse, RevokeDeviceCommandResponse, RevokeEdgeCommandResponse,
-    RewindActionCounts as WireRewindActionCounts, RewindExecuteResponse,
+    ReadoptVolumeResponse, ReceiveTransferResponse, RefusedWithNextStep,
+    ReleaseHandoffTicketResponse, RemoveDeviceCommandResponse, RemovePendingEnrollmentResponse,
+    ReplicaMembershipCommandOutcome, ReportingConsentState, ReportingStatusResponse,
+    RequestHandoffLeaseResponse, RestoreTrashOperationFailure, RestoreTrashOperationResponse,
+    RestoreTrashResponse, RestoreVersionResponse, ResumeResponse, RetentionPolicy,
+    RetentionState as WireRetentionState, RetryTransferResponse, RevokeDeviceCommandResponse,
+    RevokeEdgeCommandResponse, RewindActionCounts as WireRewindActionCounts, RewindExecuteResponse,
     RewindPathEntry as WireRewindPathEntry, RewindPlanStale, RewindPreviewResponse, RewindRefused,
     RewindRenameCandidate as WireRewindRenameCandidate, RewindRun as WireRewindRun,
     RewindRunStarted, RewindStatusResponse, SendFileResponse, SentTransferEntry,
@@ -308,14 +312,11 @@ pub mod windows_transport {
 }
 
 #[cfg(windows)]
-const PROVIDER_LOCAL_STATE_HINT: &str =
-    "this item is in a provider folder: the OS holds its local \
-     state. `attrib` shows the offline attribute for an item that is not downloaded; \
-     `yadorilink status` shows a folder's download progress";
+const PROVIDER_LOCAL_STATE: &str =
+    "this item is in a provider folder: the OS holds its local state";
 #[cfg(not(windows))]
-const PROVIDER_LOCAL_STATE_HINT: &str = "this item is in a File Provider folder: the OS holds its \
-     local state. `ls -lO <path>` shows `dataless` for an item that is not downloaded; \
-     `yadorilink status` shows a folder's download progress";
+const PROVIDER_LOCAL_STATE: &str =
+    "this item is in a File Provider folder: the OS holds its local state";
 
 /// A request's `expected_group_id`: empty means the caller named no group to check.
 fn expected_group(wire: &str) -> Option<&str> {
@@ -373,9 +374,39 @@ fn space_settings_to_proto(
     yadorilink_ipc_proto::daemonctl::SpaceManagementSettings { enabled: config.enabled }
 }
 
-const PROVIDER_DOWNLOAD_HINT: &str = "this item is in a provider folder: the operating system \
-     downloads it when it is opened. To download it now and keep it on this device, use \
-     `yadorilink pin <path>` (Always keep on this device)";
+const PROVIDER_DOWNLOAD: &str =
+    "this item is in a provider folder: the operating system downloads it when it is opened";
+
+/// A refusal in plain text that carries the next step a front end words for itself.
+fn refused(message: &str, step: NextStep) -> RespPayload {
+    RespPayload::Refused(RefusedWithNextStep {
+        message: message.to_owned(),
+        next_step: wire_step(step) as i32,
+    })
+}
+
+/// The typed refusal of a command the coordination service refused until the Terms are accepted.
+fn terms_consent_response(error: impl std::fmt::Display) -> RespPayload {
+    RespPayload::CommandError(ApplicationCommandError {
+        code: ApplicationErrorCode::TermsConsentRequired as i32,
+        message: error.to_string(),
+        group_ids: Vec::new(),
+        operation_id: String::new(),
+    })
+}
+
+fn wire_step(step: NextStep) -> yadorilink_ipc_proto::daemonctl::NextStep {
+    use yadorilink_ipc_proto::daemonctl::NextStep as Wire;
+    match step {
+        NextStep::CheckLinkStatus => Wire::CheckLinkStatus,
+        NextStep::CheckLinkList => Wire::CheckLinkList,
+        NextStep::KeepItemOnDevice => Wire::KeepItemOnDevice,
+        NextStep::ShowProviderLocalState => Wire::ShowProviderLocalState,
+        NextStep::CreateProviderFolder => Wire::CreateProviderFolder,
+        NextStep::EnableReportSubmission => Wire::EnableReportSubmission,
+        NextStep::RetryStorageModeChange => Wire::RetryStorageModeChange,
+    }
+}
 
 #[allow(
     clippy::too_many_lines,
@@ -474,6 +505,9 @@ async fn handle_request(
                         operation_id: String::new(),
                     })
                 }
+                Err(crate::application::UnlinkError::TermsConsentRequired) => {
+                    terms_consent_response(crate::application::UnlinkError::TermsConsentRequired)
+                }
                 Err(crate::application::UnlinkError::GroupMismatch(message)) => {
                     group_mismatch_response(message)
                 }
@@ -484,6 +518,9 @@ async fn handle_request(
         Some(ReqPayload::ReadoptVolume(r)) => {
             match context.application.pause_resume.readopt_volume(&r.local_path).await {
                 Ok(()) => RespPayload::ReadoptVolume(ReadoptVolumeResponse {}),
+                Err(e @ crate::sync_error::SyncError::FolderNotStarted { .. }) => {
+                    refused(&e.to_string(), NextStep::CheckLinkStatus)
+                }
                 Err(e) => RespPayload::Error(e.to_string()),
             }
         }
@@ -923,7 +960,7 @@ async fn handle_request(
                 }
             }
             None if context.queries.linked_path.resolve_provider(&r.absolute_path).is_some() => {
-                RespPayload::Error(PROVIDER_DOWNLOAD_HINT.into())
+                refused(PROVIDER_DOWNLOAD, NextStep::KeepItemOnDevice)
             }
             None => RespPayload::Error("path is not under any linked folder".into()),
         },
@@ -1033,7 +1070,7 @@ async fn handle_request(
                             Err(e) => RespPayload::Error(e.to_string()),
                         }
                     }
-                    None => RespPayload::Error(PROVIDER_LOCAL_STATE_HINT.into()),
+                    None => refused(PROVIDER_LOCAL_STATE, NextStep::ShowProviderLocalState),
                 }
             } else {
                 match context.queries.linked_path.resolve(&r.absolute_path) {
@@ -1162,7 +1199,10 @@ async fn handle_request(
                 .await
             {
                 Ok(resp) => RespPayload::SubmitReport(resp),
-                Err(e) => RespPayload::Error(e),
+                Err(e @ SubmitReportError::NotEnabled) => {
+                    refused(&e.to_string(), NextStep::EnableReportSubmission)
+                }
+                Err(e @ SubmitReportError::Failed(_)) => RespPayload::Error(e.to_string()),
             }
         }
         Some(ReqPayload::UpdateConsent(r)) => {
@@ -1359,7 +1399,12 @@ async fn handle_request(
                         lease_id: hr.lease_id.unwrap_or_default(),
                     }),
                 }),
-                Err(e) => RespPayload::Error(e),
+                Err(StorageModeError::OnDemandUnavailable) => {
+                    refused(crate::provider_gate::ON_DEMAND_REFUSAL, NextStep::CreateProviderFolder)
+                }
+                Err(StorageModeError::Advised { message, step }) => refused(&message, step),
+                Err(e @ StorageModeError::TermsConsentRequired) => terms_consent_response(e),
+                Err(e @ StorageModeError::Failed(_)) => RespPayload::Error(e.to_string()),
             }
         }
 
@@ -1623,10 +1668,18 @@ async fn handle_request(
                         // describe the invite that exists.
                         requires_approval: invite.requires_approval,
                     }),
-                    Err(detail) => {
+                    Err(error) => {
+                        let code = match error {
+                            crate::application::model::MintInviteError::TermsConsentRequired(_) => {
+                                ApplicationErrorCode::TermsConsentRequired
+                            }
+                            crate::application::model::MintInviteError::Rejected(_) => {
+                                ApplicationErrorCode::CoordinationRejected
+                            }
+                        };
                         mint_invite_command_response::Result::Error(ApplicationCommandError {
-                            code: ApplicationErrorCode::CoordinationRejected as i32,
-                            message: detail,
+                            code: code as i32,
+                            message: error.to_string(),
                             group_ids: Vec::new(),
                             operation_id: String::new(),
                         })
@@ -1742,6 +1795,9 @@ fn membership_error_to_proto(
         Error::CoordinationRejected { .. } => {
             (ApplicationErrorCode::CoordinationRejected, Vec::new(), String::new())
         }
+        Error::TermsConsentRequired { .. } => {
+            (ApplicationErrorCode::TermsConsentRequired, Vec::new(), String::new())
+        }
         Error::CoordinationAmbiguous { .. } => {
             (ApplicationErrorCode::CoordinationAmbiguous, Vec::new(), String::new())
         }
@@ -1831,7 +1887,10 @@ fn link_failure_payload(error: &crate::error::DaemonError) -> RespPayload {
             group_ids: Vec::new(),
             operation_id: String::new(),
         }),
-        None => RespPayload::Error(error.to_string()),
+        None => match error {
+            crate::error::DaemonError::Advised { message, step } => refused(message, *step),
+            _ => RespPayload::Error(error.to_string()),
+        },
     }
 }
 

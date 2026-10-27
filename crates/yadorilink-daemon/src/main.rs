@@ -15,39 +15,56 @@
 // `yadorilink-daemon` takes no settings as arguments -- every real
 // setting comes from `DaemonConfig::from_env()`, matching this binary's own
 // doc comment above. `--restart-on-replace` (a restarting supervisor's
-// declaration, see `exe_replaced`) is read in `async_main`. `--version`/`-V` is the one argument handled here
-// (not via `clap`, to keep this genuinely thin): a daemon binary that
+// declaration, see `exe_replaced`) is read in `async_main`. `--help`/`--version` and unknown arguments are handled here
+// (`launch_args`, not via `clap`, to keep this genuinely thin): a daemon binary that
 // silently ignores `--version` and starts the full sync daemon instead is
 // a real footgun for a package build/test step (this repo's own
 // `juntaki/homebrew-yadorilink` Formula test, `lintian`, a Docker
 // healthcheck) that expects the ordinary `binary --version` convention to
 // just print a version and exit, not bind sockets and open a database.
-fn print_version_and_exit_if_requested() {
-    if std::env::args().skip(1).any(|arg| arg == "--version" || arg == "-V") {
-        // The embedded build identity is printed so a release can check that the binary it ships
-        // carries the identity it publishes (`check-engine-artifact.py`).
-        let release = yadorilink_local_storage::release_descriptor::embedded_build()
-            .map(|b| format!(" (release {})", b.release_id))
-            .unwrap_or_default();
-        // Written and flushed explicitly: `process::exit` does not run destructors, and a
-        // closed or missing stdout must not turn the exit into a panic.
-        use std::io::Write as _;
-        let mut out = std::io::stdout().lock();
-        let _ = writeln!(
-            out,
-            "{} {} (host api {}){release}",
-            env!("CARGO_PKG_NAME"),
-            env!("CARGO_PKG_VERSION"),
-            yadorilink_ipc_proto::PROVIDER_HOST_API_VERSION
-        );
-        let _ = out.flush();
-        std::process::exit(0);
+fn handle_launch_args_or_exit() {
+    use std::io::Write as _;
+    use yadorilink_daemon::launch_args::{classify, usage, LaunchAction};
+    match classify(std::env::args().skip(1)) {
+        LaunchAction::Run => {}
+        LaunchAction::Help => {
+            let mut out = std::io::stdout().lock();
+            let _ = write!(out, "{}", usage());
+            let _ = out.flush();
+            std::process::exit(0);
+        }
+        LaunchAction::Version => {
+            // The embedded build identity is printed so a release can check that the binary it
+            // ships carries the identity it publishes (`check-engine-artifact.py`).
+            let release = yadorilink_local_storage::release_descriptor::embedded_build()
+                .map(|b| format!(" (release {})", b.release_id))
+                .unwrap_or_default();
+            // Written and flushed explicitly: `process::exit` does not run destructors, and a
+            // closed or missing stdout must not turn the exit into a panic.
+            let mut out = std::io::stdout().lock();
+            let _ = writeln!(
+                out,
+                "{} {} (host api {}){release}",
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+                yadorilink_ipc_proto::PROVIDER_HOST_API_VERSION
+            );
+            let _ = out.flush();
+            std::process::exit(0);
+        }
+        LaunchAction::Refuse(arg) => {
+            let mut err = std::io::stderr().lock();
+            let _ =
+                writeln!(err, "yadorilink-daemon: unrecognized argument '{arg}'\n\n{}", usage());
+            let _ = err.flush();
+            std::process::exit(2);
+        }
     }
 }
 
 fn main() -> anyhow::Result<()> {
     console::attach_parent();
-    print_version_and_exit_if_requested();
+    handle_launch_args_or_exit();
     // Before the runtime spawns its threads: glibc arenas are created per
     // contending thread and an existing arena is never merged away.
     let arena_cap = yadorilink_daemon::malloc_arenas::cap_arenas(

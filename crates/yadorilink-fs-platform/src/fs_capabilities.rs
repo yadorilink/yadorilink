@@ -506,11 +506,36 @@ pub fn probe_artefact_name(
 ) -> Result<String, crate::reserved_namespace::ArtefactNameError> {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let counter = PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let id = format!("{}-{}-{}-{}", std::process::id(), nanos, counter, label);
+    let id = format!("{}-{}-{}-{}", process_instance(), nanos, counter, label);
     crate::reserved_namespace::artefact_component_name(
         crate::reserved_namespace::ArtefactKind::Probe,
         &id,
     )
+}
+
+/// Identifies this process instance, not just its pid: a restarted process may reuse the pid
+/// (Docker runs the daemon as pid 1), and its predecessor's stranded probes must not look its own.
+/// The pid plus the instant of first use, which no later instance of the pid shares.
+fn process_instance() -> &'static str {
+    static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        format!("{}x{nanos:x}", std::process::id())
+    })
+}
+
+/// A probe artefact name made by another process. A probe of this process may be running in the
+/// swept root right now (the durable-namespace verdict probe runs lazily, from any thread), and
+/// removing its scratch directory mid-run makes the volume appear to answer wrongly, a verdict
+/// kept for the whole process. A process's own artefacts are removed by their creators; only a
+/// killed process's are stranded, and those carry its instance ([`process_instance`]).
+fn is_foreign_probe_artefact(name: &str) -> bool {
+    let Some((crate::reserved_namespace::ArtefactKind::Probe, id)) =
+        crate::reserved_namespace::parse_artefact_component(name)
+    else {
+        return false;
+    };
+    id.split('-').next() != Some(process_instance())
 }
 
 /// What [`sweep_probe_artefacts`] did under one root.
@@ -559,12 +584,7 @@ pub fn sweep_probe_artefacts(root: &Path) -> ProbeSweep {
                     continue;
                 }
             };
-            let is_probe = entry.file_name().to_str().is_some_and(|name| {
-                matches!(
-                    crate::reserved_namespace::parse_artefact_component(name),
-                    Some((crate::reserved_namespace::ArtefactKind::Probe, _))
-                )
-            });
+            let is_probe = entry.file_name().to_str().is_some_and(is_foreign_probe_artefact);
             if is_probe {
                 let removal = if file_type.is_dir() {
                     std::fs::remove_dir_all(&path)

@@ -201,12 +201,17 @@ mod unix_socket_tests {
             }),
         )
         .await;
-        let Some(RespPayload::Error(msg)) = resp.payload else {
+        let Some(RespPayload::Refused(refused)) = resp.payload else {
             panic!("expected the on-demand link to be refused, got {:?}", resp.payload)
         };
         assert!(
-            msg.contains("on-demand storage is not available for a regular folder"),
-            "got {msg:?}"
+            refused.message.contains("on-demand storage is not available for a regular folder"),
+            "got {:?}",
+            refused.message
+        );
+        assert_eq!(
+            refused.next_step,
+            yadorilink_ipc_proto::daemonctl::NextStep::CreateProviderFolder as i32
         );
 
         let resp = send(&socket_path, ReqPayload::ListLinks(ListLinksRequest {})).await;

@@ -717,6 +717,34 @@ fn reclaimable_bytes_belong_to_entries_on_the_block_store_volume() {
     assert_eq!(none[0].reclaimable_bytes, 0);
 }
 
+/// An account scheduled for deletion is a reason (never healthy meanwhile), `urgent` under its own
+/// key, nothing when none is pending, and both keys are the ones the product view reads back.
+#[test]
+fn a_pending_account_deletion_adds_its_key_and_is_never_healthy() {
+    use crate::daemon_state::AccountDeletionState;
+    let (mut state, mut reasons) = overall_status(&StatusResponse::default());
+    apply_account_deletion(AccountDeletionState::None, &mut state, &mut reasons);
+    assert_eq!((state, reasons.clone()), (OverallState::Healthy, vec![]));
+
+    apply_account_deletion(AccountDeletionState::Pending, &mut state, &mut reasons);
+    assert_eq!(
+        (state, reasons.clone()),
+        (OverallState::Attention, vec!["account_deletion_pending".to_owned()])
+    );
+
+    let mut reasons = vec![];
+    let mut state = OverallState::Degraded;
+    apply_account_deletion(AccountDeletionState::Urgent, &mut state, &mut reasons);
+    assert_eq!(
+        (state, reasons),
+        (OverallState::Degraded, vec!["account_deletion_urgent".to_owned()])
+    );
+    for key in ["account_deletion_pending", "account_deletion_urgent"] {
+        let item = yadorilink_product_view::Attention::from_reason(key).item;
+        assert_eq!(item.key(), key, "the daemon's key and the product view's key agree");
+    }
+}
+
 /// The coordination block is a first-class reason (never healthy meanwhile), keyed exactly as the
 /// product view reads it back, and nothing at all when there is no block.
 #[test]

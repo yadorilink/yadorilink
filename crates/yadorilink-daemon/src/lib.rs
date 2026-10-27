@@ -57,6 +57,9 @@ pub mod hydration;
 pub mod hydration_single_flight;
 pub mod identity;
 pub mod install_witness;
+pub mod instance_nonce;
+#[cfg(feature = "process-model")]
+pub mod launch_args;
 pub mod link_registry;
 pub mod link_runtime;
 pub mod local_convergence;

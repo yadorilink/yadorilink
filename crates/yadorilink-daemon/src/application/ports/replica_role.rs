@@ -15,6 +15,14 @@ use super::common::BoxFuture;
 use crate::application::model::{RoleLossCommitOutcome, RoleLossCompensationOutcome};
 use crate::handoff_proof::StrongHandoffProof;
 
+/// Why the coordination plane's storage-mode write (a promotion) did not land.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorageModeWriteError {
+    /// The account has not accepted the current Terms.
+    TermsConsentRequired(String),
+    Failed(String),
+}
+
 /// The durable link-table reads/writes `ReplicaRoleService` needs.
 /// Deliberately narrow: only the specific atomic transitions the
 /// storage-mode/unlink sagas actually perform.
@@ -167,7 +175,7 @@ pub(crate) trait RoleLossCoordination: Send + Sync {
         group_id: &'a str,
         device_id: &'a str,
         mode: &'a str,
-    ) -> BoxFuture<'a, Result<(), String>>;
+    ) -> BoxFuture<'a, Result<(), StorageModeWriteError>>;
 
     /// Reverts a committed role loss on the coordination plane, restoring
     /// the source device's `eager` storage mode. Carries only identities,

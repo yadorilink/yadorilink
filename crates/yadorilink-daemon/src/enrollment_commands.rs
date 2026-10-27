@@ -242,6 +242,9 @@ pub(crate) fn enrollment_error_code(error: &EnrollmentError) -> (ApplicationErro
         Error::PreparationRejected { .. } => {
             (ApplicationErrorCode::PreparationRejected, String::new())
         }
+        Error::TermsConsentRequired { .. } => {
+            (ApplicationErrorCode::TermsConsentRequired, String::new())
+        }
         Error::PreparationAmbiguous { operation_id, .. } => {
             (ApplicationErrorCode::CoordinationAmbiguous, operation_id.clone())
         }
@@ -321,6 +324,11 @@ mod tests {
             (
                 EnrollmentError::PreparationRejected { detail: detail() },
                 Code::PreparationRejected,
+                "",
+            ),
+            (
+                EnrollmentError::TermsConsentRequired { detail: detail() },
+                Code::TermsConsentRequired,
                 "",
             ),
             (

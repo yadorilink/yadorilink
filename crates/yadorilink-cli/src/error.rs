@@ -3,7 +3,7 @@
 //! something did.
 
 use yadorilink_client_core::error::StartOverRefusal;
-use yadorilink_client_core::{CoreError, Hint};
+use yadorilink_client_core::{CoreError, Hint, InvalidArgument};
 use yadorilink_ipc_proto::daemonctl::ApplicationErrorCode;
 
 #[derive(Debug, thiserror::Error)]
@@ -160,6 +160,9 @@ impl CliError {
         match self {
             CliError::Other(message) => CliError::Other(format!("{message}{advice}")),
             CliError::AuthFailed(message) => CliError::AuthFailed(format!("{message}{advice}")),
+            CliError::ManagedElsewhere(message) => {
+                CliError::ManagedElsewhere(format!("{message}{advice}"))
+            }
             other => other,
         }
     }
@@ -183,6 +186,7 @@ impl CliError {
         matches!(self, CliError::DaemonNotRunning)
             .then(|| yadorilink_local_storage::startup_refusal::read(config_dir))
             .flatten()
+            .map(|refusal| startup_refusal_text(&refusal))
     }
 
     pub fn exit_code(&self) -> i32 {
@@ -243,6 +247,26 @@ impl CliError {
     }
 }
 
+/// A recorded startup refusal as this front end words it: the reset steps name the commands.
+fn startup_refusal_text(
+    refusal: &yadorilink_local_storage::startup_refusal::StartupRefusal,
+) -> String {
+    let Some(reset) = &refusal.start_over else {
+        return refusal.message();
+    };
+    format!(
+        "{}\nThere is no migration before release. To start over: run `yadorilink daemon \
+         stop`, delete the index database {} (and its -wal and -shm files), its marker file {} \
+         and the block store {}, then run `yadorilink daemon start` and link your folders again. \
+         If this device is signed in, remove this device from your account's device list first \
+         and register it again afterwards.",
+        refusal.reason,
+        reset.sync_db.display(),
+        reset.marker.display(),
+        reset.block_store.display()
+    )
+}
+
 /// The command line that carries out a client-layer [`Hint`], as a suffix to its message.
 fn cli_hint_text(hint: Hint) -> &'static str {
     match hint {
@@ -260,6 +284,38 @@ fn cli_hint_text(hint: Hint) -> &'static str {
         }
         Hint::ListJoinableShares => {
             " (run `yadorilink share joinable` to see what this account can join)"
+        }
+        Hint::ForceUnlink => " Use --force to unlink anyway (data-loss risk).",
+        Hint::CheckLinkStatus => ", then check `yadorilink status`",
+        Hint::CheckLinkList => {
+            " -- check `yadorilink link list` and the daemon log before retrying"
+        }
+        Hint::KeepItemOnDevice => {
+            ". To download it now and keep it on this device, use `yadorilink pin <path>` \
+             (Always keep on this device)"
+        }
+        Hint::CreateProviderFolder => {
+            " (create one with `yadorilink provider-folder create <name> --on-demand`)"
+        }
+        Hint::EnableReportSubmission => {
+            " -- run `yadorilink report consent enable-usage` or `enable-error` first, or use \
+             --export instead"
+        }
+        Hint::FinishOrRollBackHandoff => {
+            " Run `yadorilink daemon release-to-app` with the same app to finish it, or \
+             `yadorilink daemon release-to-app --rollback` to return to the previous setup."
+        }
+        Hint::RetryStorageModeChange => "; re-run set-storage-mode to try again",
+        Hint::UseOwningInstall => " Use that install's own `yadorilink`.",
+        #[cfg(windows)]
+        Hint::ShowProviderLocalState => {
+            ". `attrib` shows the offline attribute for an item that is not downloaded; \
+             `yadorilink status` shows a folder's download progress"
+        }
+        #[cfg(not(windows))]
+        Hint::ShowProviderLocalState => {
+            ". `ls -lO <path>` shows `dataless` for an item that is not downloaded; \
+             `yadorilink status` shows a folder's download progress"
         }
     }
 }
@@ -297,7 +353,9 @@ impl From<CoreError> for CliError {
             CoreError::NotLoggedIn => CliError::NotLoggedIn,
             CoreError::CredentialStore(store) => CliError::CredentialStore(store),
             CoreError::AuthFailed(message) => CliError::AuthFailed(message),
-            CoreError::DeviceSuperseded => CliError::AuthFailed(e.to_string()),
+            CoreError::DeviceSuperseded | CoreError::AccountMismatch => {
+                CliError::AuthFailed(e.to_string())
+            }
             CoreError::TermsConsentRequired { .. } => {
                 CliError::SignInRequired("the Terms must be accepted to continue".to_owned())
             }
@@ -315,7 +373,9 @@ impl From<CoreError> for CliError {
                 "CLI/daemon protocol version mismatch (CLI {client}, daemon {daemon}); run \
                  matching YadoriLink CLI and daemon binaries"
             )),
-            CoreError::EngineMismatch { message, .. } => CliError::Other(message),
+            CoreError::EngineMismatch { message, .. } => CliError::Other(format!(
+                "{message} Read-only commands such as `yadorilink doctor` still work."
+            )),
             CoreError::DaemonCommand {
                 code: ApplicationErrorCode::ActivationAmbiguous,
                 message,
@@ -355,6 +415,15 @@ impl From<CoreError> for CliError {
             ),
             CoreError::StartOverRefused(refusal) => CliError::Other(refusal.to_string()),
             CoreError::Hinted { error, hint } => CliError::from(*error).with_hint(hint),
+            CoreError::InvalidArgument(argument) => CliError::Other(match argument {
+                InvalidArgument::StorageMode(value) => {
+                    format!("invalid --storage-mode {value:?} (expected eager or on-demand)")
+                }
+                InvalidArgument::Role(value) => format!(
+                    "invalid --role {value:?} (expected viewer or editor); owner is not \
+                     available via this command yet"
+                ),
+            }),
             e @ CoreError::ReauthenticationRequired => CliError::Other(e.to_string()),
             CoreError::Forbidden(message)
             | CoreError::DaemonRejected(message)
@@ -402,10 +471,25 @@ mod refusal_detail_tests {
     fn a_not_running_daemon_that_refused_its_data_says_why() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(CliError::DaemonNotRunning.daemon_refusal_detail_in(dir.path()), None);
-        yadorilink_local_storage::startup_refusal::record(dir.path(), "reset steps").unwrap();
-        assert_eq!(
-            CliError::DaemonNotRunning.daemon_refusal_detail_in(dir.path()).as_deref(),
-            Some("reset steps")
+        yadorilink_local_storage::startup_refusal::record(
+            dir.path(),
+            &yadorilink_local_storage::startup_refusal::StartupRefusal {
+                reason: "cannot open".into(),
+                start_over: Some(yadorilink_local_storage::startup_refusal::StartOver {
+                    sync_db: "/d/db".into(),
+                    marker: "/d/marker".into(),
+                    block_store: "/d/blocks".into(),
+                }),
+            },
+        )
+        .unwrap();
+        let detail = CliError::DaemonNotRunning.daemon_refusal_detail_in(dir.path()).unwrap();
+        assert!(
+            detail.starts_with("cannot open")
+                && detail.contains("`yadorilink daemon stop`")
+                && detail.contains("`yadorilink daemon start`")
+                && detail.contains("/d/db"),
+            "{detail}"
         );
         assert_eq!(CliError::Other("x".into()).daemon_refusal_detail_in(dir.path()), None);
     }

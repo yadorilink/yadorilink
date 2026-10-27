@@ -350,7 +350,7 @@ impl EnrollmentCoordination for FakeCoordination {
         _requires_approval: bool,
     ) -> crate::application::ports::BoxFuture<
         'a,
-        Result<crate::application::model::MintedInvite, String>,
+        Result<crate::application::model::MintedInvite, crate::application::model::MintInviteError>,
     > {
         Box::pin(async move { unimplemented!("recovery never mints an invite") })
     }

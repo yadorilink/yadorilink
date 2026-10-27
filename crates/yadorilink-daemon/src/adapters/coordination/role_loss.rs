@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::application::model::{RoleLossCommitOutcome, RoleLossCompensationOutcome};
-use crate::application::ports::{BoxFuture, RoleLossCoordination};
+use crate::application::ports::{BoxFuture, RoleLossCoordination, StorageModeWriteError};
 use crate::daemon_state::DaemonState;
 
 const NOT_CONFIGURED_DETAIL: &str = "local device identity is unavailable";
@@ -57,10 +57,10 @@ impl RoleLossCoordination for HttpRoleLossCoordination {
         group_id: &'a str,
         device_id: &'a str,
         mode: &'a str,
-    ) -> BoxFuture<'a, Result<(), String>> {
+    ) -> BoxFuture<'a, Result<(), StorageModeWriteError>> {
         Box::pin(async move {
             let Some(config) = self.state.coordination_client_config().cloned() else {
-                return Err(NOT_CONFIGURED_DETAIL.to_string());
+                return Err(StorageModeWriteError::Failed(NOT_CONFIGURED_DETAIL.to_string()));
             };
             crate::coordination_client::set_storage_mode(
                 &config.addr,
@@ -70,6 +70,14 @@ impl RoleLossCoordination for HttpRoleLossCoordination {
                 mode,
             )
             .await
+            .map_err(|e| match e {
+                crate::coordination_client::StorageModeWriteError::TermsConsentRequired(d) => {
+                    StorageModeWriteError::TermsConsentRequired(d)
+                }
+                crate::coordination_client::StorageModeWriteError::Failed(d) => {
+                    StorageModeWriteError::Failed(d)
+                }
+            })
         })
     }
 

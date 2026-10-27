@@ -6,7 +6,10 @@
 //! Metric families: `yadorilink_transfer_bytes_total` (counter),
 //! `yadorilink_active_transfers` (gauge), `yadorilink_active_peers` (gauge),
 //! `yadorilink_sync_errors_total{category}` (counter),
-//! `yadorilink_block_fetch_seconds` (histogram). Every label/value here is a
+//! `yadorilink_block_fetch_seconds` (histogram),
+//! `yadorilink_replication_deltas_total{outcome}` (counter: admitted, duplicate, held,
+//! rejected), `yadorilink_replication_served_bytes_total` and
+//! `yadorilink_replication_served_messages_total` (counters). Every label/value here is a
 //! count or a bounded-cardinality category string — the test
 //! (`tests::privacy_safe_metrics_never_contain_content_paths_keys_tokens_or_ips`)
 //! asserts none of them ever carries content, a file name, an absolute
@@ -38,6 +41,23 @@ impl DaemonMetrics {
         out += &format!("yadorilink_active_transfers {active_transfers}\n");
         out += "# TYPE yadorilink_active_peers gauge\n";
         out += &format!("yadorilink_active_peers {active_peers}\n");
+
+        let counts = self.state.telemetry.replication_counters().snapshot();
+        out += "# TYPE yadorilink_replication_deltas_total counter\n";
+        for (outcome, count) in [
+            ("admitted", counts.deltas_admitted),
+            ("duplicate", counts.deltas_duplicate),
+            ("held", counts.deltas_held),
+            ("rejected", counts.deltas_rejected),
+        ] {
+            out +=
+                &format!("yadorilink_replication_deltas_total{{outcome=\"{outcome}\"}} {count}\n");
+        }
+        out += "# TYPE yadorilink_replication_served_bytes_total counter\n";
+        out += &format!("yadorilink_replication_served_bytes_total {}\n", counts.served_bytes);
+        out += "# TYPE yadorilink_replication_served_messages_total counter\n";
+        out +=
+            &format!("yadorilink_replication_served_messages_total {}\n", counts.served_messages);
 
         out += "# TYPE yadorilink_sync_errors_total counter\n";
         let mut category_counts = self.state.telemetry.recent_error_category_counts();

@@ -410,7 +410,7 @@ the provider channel) and encodes the channel's messages with the shell IPC
 schema (yadorilink-ipc-proto); it never links the daemon or the desktop client
 layer, so the iOS library carries exactly the embedded engine.
 """
-workspace_dependencies = ["yadorilink-embedded-host", "yadorilink-ipc-proto"]
+workspace_dependencies = ["yadorilink-embedded-host", "yadorilink-ipc-proto", "yadorilink-os-keychain"]
 
 [crate."yadorilink-cli"]
 reason = """

@@ -362,6 +362,27 @@ pub(crate) fn apply_coordination_block(
     }
 }
 
+/// This device's own account is scheduled for deletion: the person may want to cancel it. Status
+/// is never healthy meanwhile. The reason is appended after the others; `urgent` (the
+/// departing-account durability guard is blocking finalization) is its own key so it can rank
+/// higher.
+pub(crate) fn apply_account_deletion(
+    state: crate::daemon_state::AccountDeletionState,
+    overall_state: &mut OverallState,
+    attention_reasons: &mut Vec<String>,
+) {
+    use crate::daemon_state::AccountDeletionState;
+    let reason = match state {
+        AccountDeletionState::None => return,
+        AccountDeletionState::Pending => "account_deletion_pending",
+        AccountDeletionState::Urgent => "account_deletion_urgent",
+    };
+    attention_reasons.push(reason.to_owned());
+    if *overall_state == OverallState::Healthy {
+        *overall_state = OverallState::Attention;
+    }
+}
+
 /// The device that was replaced may have held the only complete replica of a group, and the new
 /// device's state is not confirmed yet: status is never healthy meanwhile. The reason is appended
 /// after the others.
@@ -453,6 +474,7 @@ pub(crate) fn build_status(
     let database_restored = view.database_restored;
     let author_unavailable = view.author_unavailable;
     let coordination_block = view.coordination_block.clone();
+    let account_deletion = view.account_deletion;
     let mut response = encode_runtime_status(view);
     response.provider_roots = context.provider_status.snapshot();
     (response.provider_removals, response.orphan_domains) = context.provider_status.extras();
@@ -486,6 +508,7 @@ pub(crate) fn build_status(
         &mut overall_state,
         &mut attention_reasons,
     );
+    apply_account_deletion(account_deletion, &mut overall_state, &mut attention_reasons);
     apply_replacement_unconfirmed(
         replacement_unconfirmed_pending(state_dir),
         &mut overall_state,

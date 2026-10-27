@@ -30,6 +30,10 @@ pub(crate) enum EnrollmentPrepareResult {
     DefinitelyRejected {
         detail: String,
     },
+    /// The account has not accepted the current Terms; the remote prepare was NOT committed.
+    TermsConsentRequired {
+        detail: String,
+    },
     /// The invite cannot be redeemed; the remote prepare was NOT committed.
     InviteRefused {
         reason: InviteRefusal,
@@ -94,4 +98,21 @@ pub(crate) struct MintedInvite {
     /// coordination plane rather than assumed from what was requested, so
     /// a caller describes the invite that actually exists.
     pub(crate) requires_approval: bool,
+}
+
+/// Why an invite could not be minted. Nothing was minted in either case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MintInviteError {
+    /// `403 terms_consent_required`: the account has not accepted the current Terms.
+    TermsConsentRequired(String),
+    /// Any other refusal or failure, with its detail.
+    Rejected(String),
+}
+
+impl std::fmt::Display for MintInviteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TermsConsentRequired(detail) | Self::Rejected(detail) => f.write_str(detail),
+        }
+    }
 }

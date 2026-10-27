@@ -17,7 +17,7 @@ use yadorilink_ipc_proto::daemonctl::{
 };
 use yadorilink_reporting::consent::ConsentState;
 
-use crate::application::ports::ReportingCommandPort;
+use crate::application::ports::{ReportingCommandPort, SubmitReportError};
 use crate::application::{ConsentCommand, LastErrorReport};
 
 pub(crate) fn generate_usage_report(
@@ -59,7 +59,7 @@ pub(crate) fn flush_queue(port: &dyn ReportingCommandPort) -> Result<FlushQueueR
 pub(crate) async fn submit_report(
     port: &dyn ReportingCommandPort,
     report_json: &str,
-) -> Result<SubmitReportResponse, String> {
+) -> Result<SubmitReportResponse, SubmitReportError> {
     port.submit_report(report_json).await.map(|outcome| SubmitReportResponse {
         receipt_id: outcome.receipt_id,
         submitted_at: outcome.submitted_at,

@@ -232,8 +232,9 @@ impl SegmentBlockStore {
     }
 
     /// Opens the store (running recovery) only while `lease` still proves this process is the
-    /// data area's one writer. A host with no daemon in front must open through this, not
-    /// [`Self::open_process_locked`]. A stale or expired lease is refused before anything on
+    /// data area's one writer. A host that holds no OS-level data-area exclusion
+    /// (`DataResourceLocks`) must open through this, not [`Self::open_process_locked`]; the
+    /// embedded engine takes those locks before it opens the store, so it uses the latter. A stale or expired lease is refused before anything on
     /// disk is touched. `limits` are the group-commit bounds the engine's settings choose
     /// ([`GroupCommitLimits::default`] unless it tunes them).
     pub fn open_exclusive(

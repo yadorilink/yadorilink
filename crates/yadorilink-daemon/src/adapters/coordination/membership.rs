@@ -12,7 +12,7 @@ use crate::application::model::{
     MembershipOperationLookup, MembershipRemoteCommand,
 };
 use crate::application::ports::{BoxFuture, MembershipCoordination};
-use crate::coordination_client::{RoleLossCommitOutcome, SendAuthorized};
+use crate::coordination_client::{is_terms_consent_refusal, RoleLossCommitOutcome, SendAuthorized};
 use crate::daemon_state::{CoordinationClientConfig, DaemonState};
 
 const NOT_CONFIGURED_DETAIL: &str = "local device identity is unavailable";
@@ -31,9 +31,15 @@ impl HttpMembershipCoordination {
     }
 }
 
-fn classify_status(status: reqwest::StatusCode, detail: String) -> MembershipCommitOutcome {
+fn classify_status(
+    status: reqwest::StatusCode,
+    body: &str,
+    detail: String,
+) -> MembershipCommitOutcome {
     if status == reqwest::StatusCode::CONFLICT {
         MembershipCommitOutcome::Conflict(detail)
+    } else if is_terms_consent_refusal(status, body) {
+        MembershipCommitOutcome::TermsConsentRequired(detail)
     } else if status.is_client_error() {
         MembershipCommitOutcome::DefinitelyRejected(detail)
     } else {
@@ -69,7 +75,7 @@ async fn classify_plain_remove_device(
     }
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
-    classify_status(status, format!("remove device returned HTTP {status}: {text}"))
+    classify_status(status, &text, format!("remove device returned HTTP {status}: {text}"))
 }
 
 async fn classify_plain_revoke(
@@ -102,7 +108,7 @@ async fn classify_plain_revoke(
     }
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
-    classify_status(status, format!("revoke device returned HTTP {status}: {text}"))
+    classify_status(status, &text, format!("revoke device returned HTTP {status}: {text}"))
 }
 
 async fn commit_multi_group_removal(
@@ -153,7 +159,11 @@ async fn commit_multi_group_removal(
     }
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
-    classify_status(status, format!("lease-bound device removal returned HTTP {status}: {text}"))
+    classify_status(
+        status,
+        &text,
+        format!("lease-bound device removal returned HTTP {status}: {text}"),
+    )
 }
 
 impl MembershipCoordination for HttpMembershipCoordination {
@@ -237,6 +247,9 @@ impl MembershipCoordination for HttpMembershipCoordination {
                         }
                         RoleLossCommitOutcome::Ambiguous(detail) => {
                             MembershipCommitOutcome::Ambiguous(detail)
+                        }
+                        RoleLossCommitOutcome::TermsConsentRequired(detail) => {
+                            MembershipCommitOutcome::TermsConsentRequired(detail)
                         }
                     }
                 }

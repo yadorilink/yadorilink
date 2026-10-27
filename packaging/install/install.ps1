@@ -41,7 +41,8 @@
 #      upgrade. Any failure before this step leaves an existing install alone.
 # Exit status: 0 ok or already current, 1 other failure, 2 usage, 3 network,
 # 4 signature, hash, replay or withdrawal refusal, 5 unsupported platform,
-# 6 downgrade refused, 7 prefix not writable.
+# 6 downgrade refused, 7 prefix not writable, 19 managed elsewhere (the app or a
+# package manager owns this machine's YadoriLink data; nothing is installed).
 # It never asks for elevation, never runs anything from the bundle before the
 # checks pass (then only `yadorilink.exe --version`), and never starts the daemon.
 
@@ -189,6 +190,23 @@ function Refuse([int]$Code, [string]$Message) {
     $e = New-Object System.Exception ('yadorilink-install: error: ' + $Message)
     $e.Data['ExitCode'] = $Code
     throw $e
+}
+
+# One data area has one owner and only the owner's updater changes its programs
+# (see the desktop and CLI coexistence design). The ownership record decides: no record means
+# nothing is owned yet; the app, another installation or an unreadable record stops the install.
+function Assert-NotManagedElsewhere {
+    $dir = $env:YADORILINK_CONFIG_DIR
+    if (-not $dir) { $dir = Join-Path $env:USERPROFILE '.yadorilink' }
+    $rec = Join-Path $dir 'install-owner.json'
+    if (-not (Test-Path -LiteralPath $rec)) { return }
+    $record = $null
+    try { $record = Get-Content -LiteralPath $rec -Raw | ConvertFrom-Json } catch { }
+    if (-not $record -or -not $record.owner -or -not $record.install_source) {
+        Refuse 19 "the ownership record $rec cannot be read, so who manages YadoriLink here is unknown. Nothing was installed. Fix or remove that file only if you know no other YadoriLink install uses this data."
+    }
+    if ($record.owner -eq 'gui') { Refuse 19 "YadoriLink is managed by the app ($($record.install_source)); the yadorilink command is already available from the app. Nothing was installed." }
+    if ($record.install_source -ne 'script') { Refuse 19 "this machine's YadoriLink data belongs to another installation ($($record.install_source)), which has its own updater. Nothing was installed." }
 }
 
 function Show-Usage {
@@ -568,6 +586,7 @@ function Invoke-Install($Opt) {
     $arch = if ($script:TestArch) { $script:TestArch } elseif ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
     if ($arch -ne 'AMD64') { Refuse 5 "unsupported CPU '$arch'. YadoriLink engine bundles exist for macOS (Apple silicon), Linux (x86_64) and Windows (x86_64). Nothing was installed." }
     $target = 'windows-x86_64'
+    Assert-NotManagedElsewhere
 
     $prefix = $Opt.Prefix
     if (-not $prefix) { $prefix = Join-Path $env:LOCALAPPDATA 'YadoriLink' }

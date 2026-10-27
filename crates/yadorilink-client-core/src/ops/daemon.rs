@@ -54,7 +54,7 @@ pub fn default_launch() -> DaemonLaunch {
 pub fn startup_refusal() -> Option<String> {
     // Reading a refusal from a directory this process may not use would show another store's.
     let dir = crate::coordination::device_config::config_dir().ok()?;
-    yadorilink_local_storage::startup_refusal::read(&dir)
+    yadorilink_local_storage::startup_refusal::read(&dir).map(|refusal| refusal.message())
 }
 
 /// Launches the daemon if nothing answers the control socket (see
@@ -148,12 +148,19 @@ fn launch_owner(launch: &DaemonLaunch, cli_exe: &std::path::Path) -> Owner {
 /// record cannot be read. A data area with no record is launched over: the daemon records itself.
 fn gate_launch(config_dir: &std::path::Path, owner: Owner) -> Result<(), CoreError> {
     if let Some(refusal) = yadorilink_local_storage::handoff::start_refusal(config_dir) {
-        return Err(CoreError::ManagedElsewhere(refusal.message(config_dir)));
+        // The only refusal a hand-off journal gives is an unfinished hand-off.
+        return Err(CoreError::ManagedElsewhere(refusal.message(config_dir))
+            .hinted(Hint::FinishOrRollBackHandoff));
     }
     match ownership::start_verdict(&ownership::read(config_dir), owner) {
         StartVerdict::Proceed | StartVerdict::NoRecord => Ok(()),
         StartVerdict::Refuse(refusal) => {
-            Err(CoreError::ManagedElsewhere(refusal.message(config_dir)))
+            let error = CoreError::ManagedElsewhere(refusal.message(config_dir));
+            let command_line_owner = matches!(
+                &refusal,
+                ownership::Refusal::ManagedElsewhere { recorded } if recorded.owner == Owner::Cli
+            );
+            Err(if command_line_owner { error.hinted(Hint::UseOwningInstall) } else { error })
         }
     }
 }
@@ -497,6 +504,21 @@ mod tests {
         gate_launch(dir.path(), Owner::Gui).unwrap();
         let refused = gate_launch(dir.path(), Owner::Cli).unwrap_err();
         assert!(matches!(&refused, CoreError::ManagedElsewhere(m) if m.contains("YadoriLink app")));
+        // A command-line install owns it: the refusal carries the typed step, not a command.
+        ownership::write(
+            dir.path(),
+            &ownership::OwnershipRecord {
+                owner: Owner::Cli,
+                install_source: "script".into(),
+                install_root: "/opt/y".into(),
+                release_id: String::new(),
+                written_at: 1,
+            },
+        )
+        .unwrap();
+        let refused = gate_launch(dir.path(), Owner::Gui).unwrap_err();
+        assert_eq!(refused.hint(), Some(Hint::UseOwningInstall));
+        assert!(!refused.to_string().contains("`yadorilink`"), "{refused}");
         std::fs::write(dir.path().join(ownership::FILE_NAME), b"{").unwrap();
         for owner in [Owner::Cli, Owner::Gui] {
             assert!(matches!(gate_launch(dir.path(), owner), Err(CoreError::ManagedElsewhere(_))));
@@ -532,8 +554,9 @@ mod tests {
             journal::write(dir.path(), &j).unwrap();
             let result = gate_launch(dir.path(), Owner::Cli);
             assert_eq!(result.is_ok(), allowed, "{phase:?}");
-            if let Err(CoreError::ManagedElsewhere(message)) = result {
-                assert!(message.contains("release-to-app"), "{message}");
+            if let Err(error) = result {
+                assert_eq!(error.hint(), Some(Hint::FinishOrRollBackHandoff), "{phase:?}");
+                assert!(matches!(error.into_unhinted(), CoreError::ManagedElsewhere(_)));
             }
         }
     }
@@ -990,6 +1013,8 @@ mod tests {
 
     /// The restart of a running daemon launches the new one with the ports' launch.
     #[cfg(unix)]
+    // apple-cfg: ios-explicit launching a daemon process is desktop-only; an iOS app embeds the engine
+    #[cfg_attr(target_os = "ios", ignore = "an iOS app does not launch a daemon process")]
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // a test-only env lock, always taken after the socket lock
     async fn start_over_restarts_a_running_daemon_with_its_own_launch() {

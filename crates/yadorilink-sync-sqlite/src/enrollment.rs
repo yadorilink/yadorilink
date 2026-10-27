@@ -442,7 +442,9 @@ impl EnrollmentRepository {
             // A provider link declares its root in THIS transaction: the link, the root, the
             // install marker (derived) and the enrollment marker commit together or not at all.
             if let Some(spec) = provider {
-                crate::provider::declare_link_root_in_tx(tx, group_id, spec)?;
+                if !crate::link::LinkRepository::keeps_declared_root(&write) {
+                    crate::provider::declare_link_root_in_tx(tx, group_id, spec)?;
+                }
             }
             tx.execute(
                 "INSERT OR REPLACE INTO pending_enrollments \

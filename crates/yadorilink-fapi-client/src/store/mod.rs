@@ -363,6 +363,13 @@ pub enum StoreError {
     )]
     CredentialFileIsSymlink(PathBuf),
 
+    #[error(
+        "the credential file {0} has more than one hard link; name a credential file with a \
+         single link, because two engines naming different links would rotate one refresh \
+         token under separate locks"
+    )]
+    CredentialFileIsHardLinked(PathBuf),
+
     #[error("the credential entry {0} is already in use by another engine")]
     EntryInUse(PathBuf),
 

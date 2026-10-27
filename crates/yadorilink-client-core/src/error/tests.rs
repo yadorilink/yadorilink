@@ -29,6 +29,15 @@ fn a_command_error_keeps_its_code_groups_and_operation() {
 }
 
 #[test]
+fn the_daemons_terms_refusal_is_the_terms_consent_error_not_a_command_failure() {
+    let error = CoreError::from_command_error(command_error(
+        ApplicationErrorCode::TermsConsentRequired as i32,
+        "",
+    ));
+    assert!(matches!(error, CoreError::TermsConsentRequired { terms_version: None }), "{error:?}");
+}
+
+#[test]
 fn an_unknown_command_error_code_reads_as_unspecified_and_an_empty_operation_as_none() {
     let error = CoreError::from_command_error(command_error(9_999, ""));
     assert!(error.is_command_error(ApplicationErrorCode::Unspecified));
@@ -134,6 +143,12 @@ fn refusals_by_the_coordination_plane_are_permission_denied_with_their_reason() 
         (CoreError::SignInRequired, PermissionDeniedReason::SessionRejected),
         (
             CoreError::TermsConsentRequired { terms_version: Some("v1".into()) },
+            PermissionDeniedReason::TermsConsentRequired,
+        ),
+        (CoreError::AccountMismatch, PermissionDeniedReason::SessionRejected),
+        // The daemon's typed refusal is the same sign-in error as the direct coordination calls.
+        (
+            command(ApplicationErrorCode::TermsConsentRequired),
             PermissionDeniedReason::TermsConsentRequired,
         ),
         (CoreError::DeviceSuperseded, PermissionDeniedReason::DeviceSuperseded),
@@ -458,4 +473,23 @@ fn only_a_refused_refresh_is_sign_in_required() {
         parsed: serde_json::from_str(&revoked).ok(),
     };
     assert!(matches!(CoreError::from(client), CoreError::AuthFailed(_)));
+}
+
+#[test]
+fn a_daemon_next_step_becomes_a_hint_and_unset_is_none() {
+    use yadorilink_ipc_proto::daemonctl::NextStep;
+    assert_eq!(Hint::from_wire(NextStep::CheckLinkStatus as i32), Some(Hint::CheckLinkStatus));
+    assert_eq!(Hint::from_wire(NextStep::KeepItemOnDevice as i32), Some(Hint::KeepItemOnDevice));
+    assert_eq!(Hint::from_wire(NextStep::Unspecified as i32), None);
+    assert_eq!(Hint::from_wire(999), None);
+}
+
+#[test]
+fn an_invalid_argument_names_no_flag_and_reaches_a_gui_as_its_field() {
+    let error = CoreError::InvalidArgument(InvalidArgument::Role("owner".into()));
+    assert!(!error.to_string().contains("--"), "{error}");
+    match desktop(error) {
+        DesktopError::InvalidInput { field, .. } => assert_eq!(field.as_deref(), Some("role")),
+        other => panic!("expected invalid input, got {other:?}"),
+    }
 }

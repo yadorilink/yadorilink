@@ -6,7 +6,7 @@ use yadorilink_replica_domain::session_state::{EnrollmentOperation, EnrollmentOp
 
 use super::model::{
     EnrollmentActivationResult, EnrollmentCancellationResult, EnrollmentPrepareResult,
-    InviteRefusal, LinkRefusal, MintedInvite,
+    InviteRefusal, LinkRefusal, MintInviteError, MintedInvite,
 };
 use super::ports::{
     EnrollmentCoordination, EnrollmentLinkPort, EnrollmentLinkRequest, EnrollmentRepository,
@@ -173,6 +173,9 @@ pub(crate) enum EnrollmentError {
     RecoveryJournalUnavailable { operation_id: String, detail: String },
     #[error("enrollment preparation was rejected: {detail}")]
     PreparationRejected { detail: String },
+    /// The account has not accepted the current Terms; nothing was committed.
+    #[error("{detail}")]
+    TermsConsentRequired { detail: String },
     /// The invite cannot be redeemed (expired, or already used or cancelled).
     #[error("{detail}")]
     InviteRefused { reason: InviteRefusal, detail: String },
@@ -359,6 +362,10 @@ impl EnrollmentService {
             .await
         {
             EnrollmentPrepareResult::Prepared { group_id } => group_id,
+            EnrollmentPrepareResult::TermsConsentRequired { detail } => {
+                self.repository.delete_operation(&operation_id)?;
+                return Err(EnrollmentError::TermsConsentRequired { detail });
+            }
             EnrollmentPrepareResult::DefinitelyRejected { detail }
             | EnrollmentPrepareResult::InviteRefused { detail, .. } => {
                 self.repository.delete_operation(&operation_id)?;
@@ -530,6 +537,10 @@ impl EnrollmentService {
             .await
         {
             EnrollmentPrepareResult::Prepared { .. } => {}
+            EnrollmentPrepareResult::TermsConsentRequired { detail } => {
+                self.repository.delete_operation(&operation_id)?;
+                return Err(EnrollmentError::TermsConsentRequired { detail });
+            }
             EnrollmentPrepareResult::DefinitelyRejected { detail }
             | EnrollmentPrepareResult::InviteRefused { detail, .. } => {
                 self.repository.delete_operation(&operation_id)?;
@@ -728,6 +739,9 @@ impl EnrollmentService {
             EnrollmentPrepareResult::DefinitelyRejected { detail } => {
                 return Err(EnrollmentError::PreparationRejected { detail });
             }
+            EnrollmentPrepareResult::TermsConsentRequired { detail } => {
+                return Err(EnrollmentError::TermsConsentRequired { detail });
+            }
             EnrollmentPrepareResult::InviteRefused { reason, detail } => {
                 return Err(EnrollmentError::InviteRefused { reason, detail });
             }
@@ -893,11 +907,11 @@ impl EnrollmentService {
         role: Option<&str>,
         ttl_secs: Option<u64>,
         requires_approval: bool,
-    ) -> Result<MintedInvite, String> {
+    ) -> Result<MintedInvite, MintInviteError> {
         if !self.coordination.is_configured() {
-            return Err(
-                "coordination-plane address/access token not configured on this device".to_string()
-            );
+            return Err(MintInviteError::Rejected(
+                "coordination-plane address/access token not configured on this device".to_string(),
+            ));
         }
         self.coordination.mint_invite(group_id, role, ttl_secs, requires_approval).await
     }
@@ -919,6 +933,11 @@ impl EnrollmentService {
         else {
             return Ok(None);
         };
+        // A folder marked as needing the person is not a finished request: joining its group
+        // again is the re-adoption, which keeps the folder and its root.
+        if link.orphaned {
+            return Ok(None);
+        }
         if self.repository.creation_digest(&locator)?.as_deref() != Some(digest) {
             return Err(EnrollmentError::PreparationRejected {
                 detail: "this request token was already used for a different request".to_string(),

@@ -673,7 +673,10 @@ impl crate::application::ports::EnrollmentCoordination for AlreadyMemberCoordina
         _role: Option<&'a str>,
         _ttl_secs: Option<u64>,
         _requires_approval: bool,
-    ) -> BoxFuture<'a, Result<crate::application::model::MintedInvite, String>> {
+    ) -> BoxFuture<
+        'a,
+        Result<crate::application::model::MintedInvite, crate::application::model::MintInviteError>,
+    > {
         unreachable!("invites are not part of these tests")
     }
 }

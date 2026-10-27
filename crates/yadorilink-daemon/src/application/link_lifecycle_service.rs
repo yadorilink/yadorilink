@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use super::ports::{LinkCommand, LinkOutcome, LinkRepositoryPort, LinkWatcherPort};
-use crate::error::DaemonError;
+use crate::error::{DaemonError, NextStep};
 
 /// The single entry point for creating a link -- both the plain
 /// `yadorilink link` command (the control socket's own `Link` handler)
@@ -263,11 +263,13 @@ impl LinkLifecycleService {
             // linked" now could claim a link that is about to disappear.
             // Refuse without touching anything instead; a retry once it has
             // settled gets a definite answer.
-            return Err(DaemonError::Config(format!(
-                "{} is still being linked to folder group {}; wait for that to finish, then \
-                 check `yadorilink status`",
-                command.local_path, command.group_id
-            )));
+            return Err(DaemonError::Advised {
+                message: format!(
+                    "{} is still being linked to folder group {}; wait for that to finish",
+                    command.local_path, command.group_id
+                ),
+                step: NextStep::CheckLinkStatus,
+            });
         }
 
         // Nested links, and one folder linked to two groups, are an unsupported
@@ -384,12 +386,14 @@ impl LinkLifecycleService {
                          after its post-commit setup failed -- this local link may still be \
                          committed even though link setup is being reported as failed"
                     );
-                    DaemonError::Config(format!(
-                        "link setup failed ({e}), and rolling back the partially-committed local \
-                         state also failed -- this device's local link state may now be \
-                         inconsistent with what was reported; check the daemon log and run \
-                         `yadorilink link list` to verify before retrying"
-                    ))
+                    DaemonError::Advised {
+                        message: format!(
+                            "link setup failed ({e}), and rolling back the partially-committed \
+                             local state also failed -- this device's local link state may now \
+                             be inconsistent with what was reported"
+                        ),
+                        step: NextStep::CheckLinkList,
+                    }
                 }
             });
         }
@@ -423,12 +427,12 @@ impl LinkLifecycleService {
                 // interpretation. The in-memory watcher IS stopped here
                 // regardless.
                 self.watcher.stop(&command.local_path).await;
-                return Err(DaemonError::Config(
-                    "local setup completed but the enrollment operation could not advance to \
-                     ActivationPending; remote activation was not attempted -- check `yadorilink \
-                     link list` and the daemon log before retrying"
+                return Err(DaemonError::Advised {
+                    message: "local setup completed but the enrollment operation could not \
+                              advance to ActivationPending; remote activation was not attempted"
                         .to_string(),
-                ));
+                    step: NextStep::CheckLinkList,
+                });
             }
         }
 

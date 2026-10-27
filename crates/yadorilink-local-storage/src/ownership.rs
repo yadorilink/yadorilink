@@ -270,8 +270,8 @@ impl Refusal {
                         record_path.display()
                     ),
                     Owner::Cli => format!(
-                        "{first} Use that install's own `yadorilink` and its own updater. (The \
-                         owner is recorded in {}.)",
+                        "{first} Use that install and its own updater. (The owner is recorded \
+                         in {}.)",
                         record_path.display()
                     ),
                 }
@@ -293,9 +293,8 @@ impl Refusal {
             Refusal::DescriptorUnusable { problem } => problem.message(),
             Refusal::HandoffUnfinished { reason } => format!(
                 "an earlier hand-off of YadoriLink's data to the app was interrupted ({reason}), \
-                 so who owns the data is not settled; nothing was started. Run `yadorilink \
-                 daemon release-to-app` with the same app to finish it, or `yadorilink daemon \
-                 release-to-app --rollback` to return to the previous setup."
+                 so who owns the data is not settled; nothing was started. Finish it with the same \
+                 app, or roll it back to return to the previous setup."
             ),
             Refusal::OwnerRecordUnwritable { reason } => format!(
                 "this daemon could not record itself as the owner of YadoriLink's data on this \

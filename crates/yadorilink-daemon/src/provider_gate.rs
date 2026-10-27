@@ -41,11 +41,12 @@ pub(crate) fn root_allows_on_demand(coordinator: &ReplicaCoordinator, group_id: 
 /// The refusal for an on-demand request on a root that cannot hold dataless items. Only a ready
 /// provider root (macOS File Provider, Windows Cloud Files) can be on-demand; a regular folder
 /// never is, on any platform, so "not available in this build" would send the user looking for
-/// an upgrade that does not exist. The same words are used by every refusal site and matched by
-/// scripts, so it is one constant.
+/// an upgrade that does not exist. Every refusal site uses this one text and carries
+/// [`crate::error::NextStep::CreateProviderFolder`]; a front end words that step itself (the
+/// command line prints the command that creates one).
 pub(crate) const ON_DEMAND_REFUSAL: &str = "on-demand storage is not available for a regular \
-     folder, only for a provider folder (`yadorilink provider-folder create <name> --on-demand`, \
-     macOS and Windows) that is ready; link this folder in eager (full-copy) mode instead";
+     folder, only for a provider folder (macOS and Windows) that is ready; link this folder in \
+     eager (full-copy) mode instead";
 
 #[cfg(test)]
 mod tests;

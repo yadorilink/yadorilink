@@ -237,8 +237,13 @@ impl ProviderEvictor {
                 });
             }
         };
+        let cached_before = self.reclaim.has_cached_blocks(group_id, path);
         let reclaimed = self.reclaim.reclaim(prepared).await?;
-        let retained = (reclaimed.blocks == 0).then_some(Retained::NothingFreed);
+        let retained = (reclaimed.blocks == 0).then_some(if cached_before {
+            Retained::NothingFreed
+        } else {
+            Retained::NotDownloaded
+        });
         Ok(ProviderEvictOutcome { dehydrated, reclaimed, retained })
     }
 

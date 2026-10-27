@@ -759,3 +759,51 @@ fn an_unmeasurable_granularity_is_not_kept_for_the_volume() {
     drop(gone);
     assert_eq!(measure_birth_time_granularity(&path), None);
 }
+
+/// The startup sweep of a sync root must not remove a probe of this process that runs in
+/// that root at the same time (the durable-namespace probe's scratch directory): half-removed,
+/// the volume seems to accept a second no-replace publish, and that wrong verdict is kept for
+/// the process, so every later durable namespace change is refused.
+#[test]
+fn the_sweep_leaves_this_processs_own_probe_artefacts() {
+    let root = tempfile::tempdir().unwrap();
+    let own = root.path().join(probe_artefact_name("dir-durability").unwrap());
+    std::fs::create_dir(&own).unwrap();
+    std::fs::write(own.join("f"), b"probe").unwrap();
+    let stranded = root.path().join(
+        crate::reserved_namespace::artefact_component_name(
+            crate::reserved_namespace::ArtefactKind::Probe,
+            &format!("{}-1-1-dir-durability", std::process::id().wrapping_add(1)),
+        )
+        .unwrap(),
+    );
+    std::fs::create_dir(&stranded).unwrap();
+
+    let sweep = sweep_probe_artefacts(root.path());
+
+    assert_eq!(sweep.removed, vec![stranded.clone()]);
+    assert!(own.join("f").exists(), "a live probe of this process was swept");
+    assert!(!stranded.exists());
+}
+
+/// A restarted process may get the same pid (Docker pid 1); its predecessor's stranded
+/// probes carry that pid but another instance, and are swept.
+#[test]
+fn the_sweep_removes_a_probe_of_an_earlier_process_that_had_the_same_pid() {
+    let root = tempfile::tempdir().unwrap();
+    let stranded = root.path().join(
+        crate::reserved_namespace::artefact_component_name(
+            crate::reserved_namespace::ArtefactKind::Probe,
+            &format!("{}x1-1-1-dir-durability", std::process::id()),
+        )
+        .unwrap(),
+    );
+    std::fs::create_dir(&stranded).unwrap();
+    let own = root.path().join(probe_artefact_name("dir-durability").unwrap());
+    std::fs::create_dir(&own).unwrap();
+
+    let sweep = sweep_probe_artefacts(root.path());
+
+    assert_eq!(sweep.removed, vec![stranded]);
+    assert!(own.exists());
+}

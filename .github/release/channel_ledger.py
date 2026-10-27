@@ -20,10 +20,12 @@ Rules enforced:
   - entries of different versions must belong to the same protocol generation;
   - a record's build lane matches the channel (nightly bytes never enter beta);
   - an app bundle's engine release id equals its record's release id;
-  - merged release records are never edited;
+  - merged release records are never edited, except one new `app_bundle` (macOS) or
+    `microsoft_store` (Windows) target added (additive; see `_additive_target`);
   - a promoting channel (`stable`, see channels.json) serves only release versions (no
-    pre-release suffix) that are in its source channel's history, not withdrawn there and, if
-    the source still serves them, fully rolled out and not kill-switched (promotion_problems);
+    pre-release suffix) that are in its source channel's history, not withdrawn there, recorded in
+    the source's append-only `rollout_history` as served at 100% and never kill-switched, and that have been
+    at 100% there for SOAK_DAYS by the source's recorded `full_rollout_at` (promotion_problems);
   - an appcast item exists only for the app_bundle entry the manifest serves (none while it is
     kill-switched or at 0% rollout; partial rollout is carried on the item).
 """
@@ -68,6 +70,16 @@ TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 MAX_FUTURE_SKEW = timedelta(minutes=5)
 
 
+# How long a version must have been live on the source channel before a promoting channel (stable)
+# may serve it (design O7). The one place the soak length is defined.
+SOAK_DAYS = 7
+# A time newly recorded in a ledger (a version's first publish, the moment it reached 100%) may
+# precede the manifest that publishes it only by this much. The publisher now stamps these itself
+# from `generated_at` (stamp_ledger), so this is a defence in depth on the transition rules that
+# also holds for any snapshot not written by stamp_ledger.
+MAX_STAMP_LAG = timedelta(days=1)
+
+
 def future_dated_problem(generated_at: str, now: datetime) -> str | None:
     """Why `generated_at` is too far ahead of `now` (an aware or naive UTC time), or None."""
     stamped = datetime.strptime(generated_at, TIME_FORMAT)
@@ -98,7 +110,7 @@ YANK_RE = re.compile(r"^yank (\S+)")
 
 LEDGER_FIELDS = {
     "schema_version", "channel", "minimum_supported_version", "entries", "reason",
-    "history", "withdrawn_versions",
+    "history", "published_at", "full_rollout_at", "rollout_history", "withdrawn_versions", "app_build_tombstones",
 }
 ENTRY_FIELDS = {"version", "rollout_percentage", "kill_switch"}
 RECORD_FIELDS = {
@@ -175,7 +187,7 @@ def validate_record(rec, expected_version: str | None = None) -> list[str]:
     unknown = set(rec) - RECORD_FIELDS
     if unknown:
         p.append(f"record has unknown fields {sorted(unknown)}")
-    if rec.get("schema_version") != RECORD_SCHEMA_VERSION:
+    if not _is_int(rec.get("schema_version")) or rec["schema_version"] != RECORD_SCHEMA_VERSION:
         p.append(f"record schema_version must be {RECORD_SCHEMA_VERSION}")
     ver = rec.get("version")
     try:
@@ -214,9 +226,22 @@ def validate_record(rec, expected_version: str | None = None) -> list[str]:
             elif source in SOURCE_PLATFORM and m.group(1) != SOURCE_PLATFORM[source]:
                 p.append(f"{where}: {source} targets must be {SOURCE_PLATFORM[source]}")
             p.extend(_validate_target(source, where, t))
-            if source == "app_bundle" and isinstance(t, dict) \
-                    and t.get("engine_release_id") != rec.get("release_id"):
-                p.append(f"{where}.engine_release_id must equal the record's release_id")
+            if source == "app_bundle" and isinstance(t, dict):
+                if t.get("engine_release_id") != rec.get("release_id"):
+                    p.append(f"{where}.engine_release_id must equal the record's release_id")
+                build = t.get("sparkle_build")
+                if isinstance(build, str) and (not re.fullmatch(r"[1-9][0-9]*", build) or int(build) >= 2**64):
+                    p.append(f"{where}.sparkle_build must be a positive integer below 2**64 "
+                             "without leading zeros")
+                if isinstance(t.get("file"), str) and not t["file"].endswith(".dmg"):
+                    p.append(f"{where}.file must end in .dmg (it may not collide with manifests or sidecars)")
+        # One file name is one object under /dl/<version>/: targets sharing a name share its bytes.
+        seen: dict = {}
+        for tname, t in sec.items():
+            if source == "app_bundle" and isinstance(t, dict) and isinstance(t.get("file"), str):
+                if seen.setdefault(t["file"], (t.get("sha256"), t.get("size"))) != (t.get("sha256"), t.get("size")):
+                    p.append(f"record.app_bundle[{tname}]: file {t['file']!r} is already used by another "
+                             "target with different bytes")
     if sections == 0:
         p.append("record must carry at least one of script, app_bundle, microsoft_store")
     for aux in ("verifier", "installers"):
@@ -280,7 +305,7 @@ def validate_ledger(ledger, records: dict[str, dict], *, floor: str,
     unknown = set(ledger) - LEDGER_FIELDS
     if unknown:
         p.append(f"ledger has unknown fields {sorted(unknown)}")
-    if ledger.get("schema_version") != LEDGER_SCHEMA_VERSION:
+    if not _is_int(ledger.get("schema_version")) or ledger["schema_version"] != LEDGER_SCHEMA_VERSION:
         p.append(f"ledger schema_version must be {LEDGER_SCHEMA_VERSION}")
     channel = ledger.get("channel")
     if channel not in CHANNELS:
@@ -309,6 +334,10 @@ def validate_ledger(ledger, records: dict[str, dict], *, floor: str,
             and all(isinstance(v, list) and all(isinstance(x, str) for x in v) for v in history.values())):
         p.append("history must map install_source to a list of version strings")
         history = {}
+    p += _time_map_problems(ledger, "published_at", history)
+    p += _time_map_problems(ledger, "full_rollout_at", history)
+    p += _stamp_order_problems(ledger, history)
+    p += _rollout_history_problems(ledger.get("rollout_history"), history, entries)
     withdrawn = ledger.get("withdrawn_versions", [])
     if not (isinstance(withdrawn, list) and all(isinstance(x, str) for x in withdrawn)):
         p.append("withdrawn_versions must be a list of version strings")
@@ -320,6 +349,9 @@ def validate_ledger(ledger, records: dict[str, dict], *, floor: str,
             p.append(f"withdrawn_versions entry {w!r} is not strict semver")
     if len(set(withdrawn)) != len(withdrawn):
         p.append("withdrawn_versions contains duplicates")
+
+    p += _tombstone_problems(ledger, entries, withdrawn, history, records)
+    p += _monotonic_build_problems(records)
 
     generations = {}
     for source, e in entries.items():
@@ -385,17 +417,118 @@ def validate_ledger(ledger, records: dict[str, dict], *, floor: str,
     return p
 
 
+def _time_map_problems(ledger: dict, name: str, history) -> list[str]:
+    """`published_at` / `full_rollout_at` map install_source -> version -> a UTC time: when the
+    version was first published on this channel / first served at 100%. Optional (older ledgers
+    lack them); when present every key must be a version in history and every time well formed."""
+    stamped = ledger.get(name)
+    if stamped is None:
+        return []
+    if not isinstance(stamped, dict) or set(stamped) - set(SOURCES):
+        return [f"{name} must map install_source to an object of version -> time"]
+    p = []
+    for source, times in stamped.items():
+        if not isinstance(times, dict):
+            p.append(f"{name}[{source}] must map version to time")
+            continue
+        for ver, at in times.items():
+            if ver not in (history.get(source) or []):
+                p.append(f"{name}[{source}] has {ver!r}, which is not in history[{source}]")
+            if not (isinstance(at, str) and GENERATED_AT_RE.fullmatch(at)):
+                p.append(f"{name}[{source}][{ver}] must be YYYY-MM-DDTHH:MM:SSZ")
+    return p
+
+
+def _stamp_order_problems(ledger: dict, history) -> list[str]:
+    """Publish times never go backwards along the history (a version cannot have been published
+    before the one that preceded it), and a version reaches 100% no earlier than it was published
+    and only if its rollout_history says it did."""
+    p = []
+    published, full = ledger.get("published_at"), ledger.get("full_rollout_at")
+    rollouts = ledger.get("rollout_history")
+    for source in SOURCES:
+        times = published.get(source) if isinstance(published, dict) else None
+        if isinstance(times, dict):
+            last = None
+            for ver in history.get(source) or []:
+                at = times.get(ver)
+                if not (isinstance(at, str) and GENERATED_AT_RE.fullmatch(at)):
+                    continue
+                if last is not None and at < last[1]:
+                    p.append(f"published_at[{source}][{ver}] {at} is before {last[0]}'s {last[1]}; "
+                             "publish times may not go backwards along the history")
+                last = (ver, at)
+        fulls = full.get(source) if isinstance(full, dict) else None
+        for ver, at in (fulls.items() if isinstance(fulls, dict) else ()):
+            if not (isinstance(at, str) and GENERATED_AT_RE.fullmatch(at)):
+                continue
+            pub = times.get(ver) if isinstance(times, dict) else None
+            if isinstance(pub, str) and GENERATED_AT_RE.fullmatch(pub) and at < pub:
+                p.append(f"full_rollout_at[{source}][{ver}] {at} is before its published_at {pub}")
+            rec = ((rollouts or {}).get(source) or {}).get(ver) if isinstance(rollouts, dict) else None
+            if not (isinstance(rec, dict) and rec.get("max_rollout_percentage") == 100):
+                p.append(f"full_rollout_at[{source}] has {ver!r}, which rollout_history does not "
+                         "show at 100%")
+    return p
+
+
+def is_withdrawn_entry(e: dict) -> bool:
+    """One predicate for "this entry offers nothing": kill-switched or at 0%. Both the app build
+    tombstones and the rollout_history withdrawal record use it, so they cannot disagree."""
+    return e.get("kill_switch") is True or e.get("rollout_percentage") == 0
+
+
+def _rollout_history_problems(rollouts, history, entries) -> list[str]:
+    """`rollout_history` maps install_source -> version -> {max_rollout_percentage, kill_switched}:
+    the highest rollout the version was ever served at and whether it was ever withdrawn
+    (kill-switched, or taken to 0% after having been served; `kill_switched` is that flag).
+    Optional (a ledger that never recorded it cannot be promoted from); when present every key must
+    be a version in history, and a recorded version that is the current entry must agree with it."""
+    if rollouts is None:
+        return []
+    if not isinstance(rollouts, dict) or set(rollouts) - set(SOURCES):
+        return ["rollout_history must map install_source to an object of version -> record"]
+    p = []
+    for source, per_version in rollouts.items():
+        if not isinstance(per_version, dict):
+            p.append(f"rollout_history[{source}] must map version to a record")
+            continue
+        for ver, r in per_version.items():
+            where = f"rollout_history[{source}][{ver}]"
+            if ver not in (history.get(source) or []):
+                p.append(f"rollout_history[{source}] has {ver!r}, which is not in history[{source}]")
+            if not (isinstance(r, dict) and set(r) == {"max_rollout_percentage", "kill_switched"}
+                    and _is_int(r["max_rollout_percentage"]) and 0 <= r["max_rollout_percentage"] <= 100
+                    and isinstance(r["kill_switched"], bool)):
+                p.append(f"{where} must be exactly {{max_rollout_percentage: 0..100, kill_switched: bool}}")
+                continue
+            e = entries.get(source)
+            if isinstance(e, dict) and e.get("version") == ver and _is_int(e.get("rollout_percentage")):
+                if r["max_rollout_percentage"] < e["rollout_percentage"]:
+                    p.append(f"{where}.max_rollout_percentage is below the current rollout_percentage")
+                # A version taken off (kill-switched, or dropped to 0% after being served) is
+                # recorded as withdrawn for good; a version that has only ever been dark at 0%
+                # has not been served yet and may still ramp.
+                if is_withdrawn_entry(e) and (e.get("kill_switch") is True or r["max_rollout_percentage"] > 0) \
+                        and not r["kill_switched"]:
+                    p.append(f"{where}.kill_switched must be true while the entry is withdrawn "
+                             "(kill-switched, or at 0% after having been served)")
+    return p
+
+
 def promotion_problems(ledger: dict, source_ledger: dict | None, records: dict[str, dict], *,
-                       floor: str) -> list[str]:
+                       floor: str, now: str | None = None) -> list[str]:
     """A promoting channel serves only what its source channel has served. Checked, for every
     entry of the promoting ledger and the same install_source in the source ledger (itself
     validated first, so a malformed source fails closed):
       - the version is in the source's history and not in its withdrawn_versions;
-      - if the source currently serves that version, it is not kill-switched and its rollout is
-        100 (a version still ramping or switched off on the source is not promoted).
-    Not checked: how long the version has been live (history has no publish times) and whether
-    the source ledger gained the version in the same change as this one (the ledger alone cannot
-    tell; the reviewer of the change must)."""
+      - the source's `rollout_history` shows the version was served at 100% and never
+        kill-switched (a version that was only ever ramping, or was switched off, is not promoted,
+        even once a newer version has replaced it).
+      - soak: the source ledger's recorded `full_rollout_at` (when the version first reached 100%)
+        for the version is at least SOAK_DAYS before `now` (the manifest's generated_at); a version with no recorded time is refused.
+    Not checked: whether the source ledger gained the version in the same change as this one
+    (the ledger alone cannot tell; the reviewer of the change must)."""
     channel = ledger.get("channel")
     source_channel = release_channels.PROMOTES_FROM.get(channel)
     if source_channel is None:
@@ -407,6 +540,7 @@ def promotion_problems(ledger: dict, source_ledger: dict | None, records: dict[s
         return [f"the {source_channel} ledger this promotion reads is invalid: {x}" for x in found]
     p = []
     history = source_ledger["history"]
+    full = source_ledger.get("full_rollout_at") or {}
     withdrawn = source_ledger.get("withdrawn_versions", [])
     for source, e in (ledger.get("entries") or {}).items():
         ver = e.get("version") if isinstance(e, dict) else None
@@ -415,16 +549,142 @@ def promotion_problems(ledger: dict, source_ledger: dict | None, records: dict[s
         elif ver in withdrawn:
             p.append(f"entries[{source}].version {ver} is withdrawn on {source_channel}")
         else:
-            now = source_ledger["entries"].get(source)
-            if now and now["version"] == ver and (now["kill_switch"] or now["rollout_percentage"] != 100):
-                p.append(f"entries[{source}].version {ver} is not fully offered on {source_channel} "
-                         "(kill-switched or rollout below 100)")
+            p += _rollout_problems(source, ver, source_channel,
+                                   ((source_ledger.get("rollout_history") or {}).get(source) or {}).get(ver))
+            p += _soak_problems(source, ver, source_channel, (full.get(source) or {}).get(ver), now)
     return p
 
 
-def validate_transition(prev, cur, records: dict[str, dict], *, floor: str,
+def _rollout_problems(source: str, ver: str, source_channel: str, rec: dict | None) -> list[str]:
+    where = f"entries[{source}].version {ver}"
+    if rec is None:
+        return [f"{where} has no recorded rollout_history on {source_channel}; that it was fully "
+                "rolled out cannot be shown"]
+    if rec["max_rollout_percentage"] != 100 or rec["kill_switched"]:
+        return [f"{where} was not cleanly fully offered on {source_channel} (max rollout "
+                f"{rec['max_rollout_percentage']}%, kill-switched: {rec['kill_switched']})"]
+    return []
+
+
+def _soak_problems(source: str, ver: str, source_channel: str, at: str | None, now: str | None) -> list[str]:
+    where = f"entries[{source}].version {ver}"
+    if now is None or not GENERATED_AT_RE.fullmatch(now or ""):
+        return [f"{where}: the soak period cannot be checked without a valid generated_at"]
+    if at is None:
+        return [f"{where} has no recorded full_rollout_at on {source_channel}; the {SOAK_DAYS}-day "
+                "soak cannot be shown"]
+    age = datetime.strptime(now, TIME_FORMAT) - datetime.strptime(at, TIME_FORMAT)
+    if age < timedelta(days=SOAK_DAYS):
+        return [f"{where} reached 100% on {source_channel} at {at}, less than {SOAK_DAYS} days "
+                f"before {now}"]
+    return []
+
+
+def _build(target) -> int | None:
+    """A record's sparkle_build as an integer (records may carry it as a decimal string)."""
+    try:
+        return int(target["sparkle_build"])
+    except (TypeError, KeyError, ValueError):
+        return None
+
+
+def _tombstone_problems(ledger: dict, entries: dict, withdrawn: list, history: dict, records: dict) -> list[str]:
+    """`app_build_tombstones` is the append-only list of {version, sparkle_build} for app bundles
+    that were withdrawn (kill-switched, 0% or listed in withdrawn_versions). Sparkle compares
+    builds, so a withdrawn build number must never be reused by a different release: installed
+    users would never be offered the replacement. A tombstone pins a build to its version."""
+    p: list[str] = []
+    raw = ledger.get("app_build_tombstones", [])
+    if not isinstance(raw, list):
+        return ["app_build_tombstones must be a list of {version, sparkle_build}"]
+    pinned: dict[int, str] = {}
+    versions: dict[str, int] = {}
+    for i, t in enumerate(raw):
+        where = f"app_build_tombstones[{i}]"
+        if not (isinstance(t, dict) and set(t) == {"version", "sparkle_build"}):
+            p.append(f"{where} must have exactly ['sparkle_build', 'version']")
+            continue
+        v, b = t["version"], t["sparkle_build"]
+        try:
+            semver_key(v)
+        except (ValueError, TypeError):
+            p.append(f"{where}.version {v!r} is not strict semver")
+            continue
+        if not _is_int(b) or not 0 < b < 2**64:
+            p.append(f"{where}.sparkle_build must be a positive integer below 2**64")
+            continue
+        if b in pinned and pinned[b] != v:
+            p.append(f"{where}: build {b} is already tombstoned for {pinned[b]}")
+        if v in versions and versions[v] != b:
+            p.append(f"{where}: {v} is already tombstoned with build {versions[v]}")
+        pinned[b], versions[v] = v, b
+    # Every withdrawn app bundle that was ever served is tombstoned.
+    served = set(history.get("app_bundle", []))
+    need: set[str] = set(w for w in withdrawn if w in served and (records.get(w) or {}).get("app_bundle"))
+    e = entries.get("app_bundle")
+    if isinstance(e, dict) and isinstance(e.get("version"), str) \
+            and is_withdrawn_entry(e):
+        need.add(e["version"])
+    for v in sorted(need):
+        for tname, t in sorted(((records.get(v) or {}).get("app_bundle") or {}).items()):
+            b = _build(t)
+            if versions.get(v) != b:
+                p.append(f"app_build_tombstones must list {{version: {v}, sparkle_build: {b}}}: "
+                         f"{v} is withdrawn on this channel (target {tname})")
+    # No other release may carry a tombstoned build, nor a tombstoned version another build.
+    for v, rec in sorted(records.items()):
+        for tname, t in sorted(((rec or {}).get("app_bundle") or {}).items()):
+            b = _build(t)
+            if b in pinned and pinned[b] != v:
+                p.append(f"record {v} ({tname}) reuses sparkle_build {b}, tombstoned for {pinned[b]}")
+            if v in versions and b != versions[v]:
+                p.append(f"record {v} ({tname}) has sparkle_build {b}, tombstoned as {versions[v]}")
+    return p
+
+
+def _monotonic_build_problems(records: dict) -> list[str]:
+    """Sparkle offers an update only when its build is higher than the installed one, so for each
+    target the sparkle_build must rise strictly with the semver order of the releases."""
+    p: list[str] = []
+    seen: dict[str, list[tuple]] = {}
+    for v, rec in records.items():
+        try:
+            key = semver_key(v)
+        except (ValueError, TypeError):
+            continue
+        for tname, t in ((rec or {}).get("app_bundle") or {}).items():
+            b = _build(t)
+            if b is not None:
+                seen.setdefault(tname, []).append((key, v, b))
+    for tname, rows in sorted(seen.items()):
+        rows.sort()
+        for (_, v0, b0), (_, v1, b1) in zip(rows, rows[1:]):
+            if b1 <= b0:
+                p.append(f"sparkle_build must increase with version ({tname}): {v1} has {b1} "
+                         f"but {v0} has {b0}")
+    return p
+
+
+def _stale_stamp_problems(name: str, prev_t: dict, cur_t: dict, generated_at: str) -> list[str]:
+    """A time recorded for the first time must be recent: within MAX_STAMP_LAG before the
+    manifest that publishes it (the upper bound is _future_published_problems)."""
+    if not GENERATED_AT_RE.fullmatch(generated_at or ""):
+        return []  # assemble reports the malformed generated_at itself
+    floor_at = (datetime.strptime(generated_at, TIME_FORMAT) - MAX_STAMP_LAG).strftime(TIME_FORMAT)
+    return [f"{name}[{source}][{v}] {at} is more than {MAX_STAMP_LAG.days} day before the manifest's "
+            f"generated_at {generated_at}; a new time is stamped when the change is made"
+            for source, times in cur_t.items() if isinstance(times, dict)
+            for v, at in times.items()
+            if isinstance(at, str) and GENERATED_AT_RE.fullmatch(at)
+            and v not in ((prev_t.get(source) or {}) if isinstance(prev_t.get(source), dict) else {})
+            and at < floor_at]
+
+
+def validate_transition(prev, cur, records: dict[str, dict], *, floor: str, generated_at: str,
                         served_appcast_version: str | None = None) -> list[str]:
-    """Rules that compare a ledger with the ledger it replaces and with what is live."""
+    """Rules that compare a ledger with the ledger it replaces and with what is live.
+    `generated_at` is the publisher's clock for the manifest being built: a time newly recorded in
+    the ledger may not be older than MAX_STAMP_LAG before it."""
     p: list[str] = []
     if prev is None:
         prev_entries, prev_hist, prev_withdrawn = {}, {}, []
@@ -435,13 +695,51 @@ def validate_transition(prev, cur, records: dict[str, dict], *, floor: str,
     minimum = cur.get("minimum_supported_version")
     withdrawn = cur.get("withdrawn_versions", [])
     history = cur.get("history", {})
+    prev_tomb = [] if prev is None else prev.get("app_build_tombstones", [])
+    if cur.get("app_build_tombstones", [])[:len(prev_tomb)] != prev_tomb:
+        p.append("app_build_tombstones may only grow (append only)")
     missing_w = set(prev_withdrawn) - set(withdrawn)
     if missing_w:
         p.append(f"withdrawn_versions may only grow; dropped {sorted(missing_w)}")
     for source, ph in prev_hist.items():
         if history.get(source, [])[:len(ph)] != ph:
             p.append(f"history[{source}] must keep the previous history as a prefix (append only)")
+    cur_pub = cur.get("published_at") or {}
+    cur_full = cur.get("full_rollout_at") or {}
+    for name in ("published_at", "full_rollout_at"):
+        prev_t = (prev or {}).get(name) or {}
+        cur_t = cur.get(name) or {}
+        for source, times in prev_t.items():
+            if not isinstance(times, dict) or not isinstance(cur_t.get(source), dict) \
+                    or any(cur_t[source].get(v) != t for v, t in times.items()):
+                p.append(f"{name}[{source}] must keep every recorded time unchanged (append only)")
+        p += _stale_stamp_problems(name, prev_t, cur_t, generated_at)
+    prev_roll = (prev or {}).get("rollout_history") or {}
+    cur_roll = cur.get("rollout_history") or {}
+    for source, per_version in prev_roll.items():
+        now_rec = cur_roll.get(source)
+        for v, r in per_version.items():
+            n = now_rec.get(v) if isinstance(now_rec, dict) else None
+            if not isinstance(n, dict) or n.get("max_rollout_percentage", -1) < r.get("max_rollout_percentage", 0) \
+                    or (r.get("kill_switched") and not n.get("kill_switched")):
+                p.append(f"rollout_history[{source}][{v}] must keep its record (max rollout never "
+                         "lowered, kill-switch never forgotten; append only)")
     if prev is not None:
+        # Every version now served has its rollout recorded, so the history is complete from here.
+        for source, e in cur.get("entries", {}).items():
+            if isinstance(e, dict) and not isinstance((cur_roll.get(source) or {}).get(e.get("version")), dict):
+                p.append(f"rollout_history[{source}] must record the rollout of {e.get('version')}")
+        for source in history:
+            for v in history[source][len(prev_hist.get(source, [])):]:
+                if not isinstance(cur_pub.get(source), dict) or v not in cur_pub[source]:
+                    p.append(f"published_at[{source}] must record when {v} was published")
+        for source, per_version in cur_roll.items():
+            for v, r in (per_version.items() if isinstance(per_version, dict) else ()):
+                before = (prev_roll.get(source) or {}).get(v) if isinstance(prev_roll.get(source), dict) else None
+                was_full = isinstance(before, dict) and before.get("max_rollout_percentage") == 100
+                if isinstance(r, dict) and r.get("max_rollout_percentage") == 100 and not was_full \
+                        and not isinstance((cur_full.get(source) or {}).get(v), str):
+                    p.append(f"full_rollout_at[{source}] must record when {v} first reached 100%")
         # Only the version being served now may be added; otherwise a fabricated history entry
         # could later serve as a yank target.
         for source in history:
@@ -511,15 +809,74 @@ def validate_transition(prev, cur, records: dict[str, dict], *, floor: str,
     return p
 
 
+def _canonical(obj) -> bytes:
+    return (json.dumps(obj, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+# The sources whose target is produced after the engine release, with the platform its targets must name.
+ADDITIVE_SOURCES = {"app_bundle": "macos", "microsoft_store": "windows"}
+
+
+def _additive_target(name: str, base_bytes: bytes, head_bytes: bytes) -> list[str]:
+    """The one edit a merged record accepts: head is base plus exactly one new target in
+    `app_bundle` (the DMG, a macOS target) or in `microsoft_store` (the Store submission, a
+    windows target); the engine bytes are unchanged. Returns the reasons it is not that edit
+    (empty when it is). Fail closed: unparsable, duplicate-key or non-canonical input is refused."""
+    try:
+        base = load_json(base_bytes.decode("utf-8"), name)
+        head = load_json(head_bytes.decode("utf-8"), name)
+    except (LedgerError, UnicodeDecodeError):
+        return ["the base or the edited record is not valid JSON"]
+    if not isinstance(base, dict) or not isinstance(head, dict):
+        return ["the record is not an object"]
+    for label, obj, raw in (("merged", base, base_bytes), ("edited", head, head_bytes)):
+        if raw != _canonical(obj):
+            return [f"the {label} record is not in canonical form (indent 2, sorted keys)"]
+    added = []
+    for source, platform in ADDITIVE_SOURCES.items():
+        # validate_record treats a null section as absent; so does this check.
+        base_sec = {} if base.get(source) is None else base[source]
+        head_sec = {} if head.get(source) is None else head[source]
+        if not isinstance(base_sec, dict) or not isinstance(head_sec, dict) \
+                or (base.get(source) is not None and not base_sec) \
+                or (head.get(source) is not None and not head_sec):
+            return [f"{source} must be a non-empty object"]
+        if not set(base_sec) <= set(head_sec):
+            return [f"a {source} target was removed"]
+        if any(_canonical(head_sec[t]) != _canonical(v) for t, v in base_sec.items()):
+            return [f"an existing {source} target was changed"]
+        for target in set(head_sec) - set(base_sec):
+            if not target.startswith(platform + "-"):
+                return [f"{source} target {target!r} is not a {platform} target"]
+            added.append((source, target))
+    if len(added) != 1:
+        return ["exactly one new app_bundle or microsoft_store target may be added"]
+    # Compared as canonical text, not with ==, so that true / 1 / 1.0 are different values.
+    rest = lambda rec: _canonical({k: v for k, v in rec.items() if k not in ADDITIVE_SOURCES})
+    if rest(head) != rest(base):
+        return ["fields other than the added target's section were changed"]
+    # The record's version must be the one its file name carries (validate_record checks it against the
+    # version it is given, and the unchanged-fields compare above makes head's version equal base's).
+    stem = name[:-len(".json")] if name.endswith(".json") else name
+    found = validate_record(head, expected_version=stem)
+    if found:
+        return found
+    return []
+
+
 def check_records_immutable(base: dict[str, bytes], head: dict[str, bytes]) -> list[str]:
     """`base`/`head` map record file name -> bytes. A record present in base may not change or
-    disappear."""
+    disappear, except for the additive exception (`_additive_target`): the DMG and the Store
+    submission are produced after the engine release and must not need a new engine tag."""
     p = []
     for name, data in sorted(base.items()):
         if name not in head:
             p.append(f"release record {name} was deleted")
         elif head[name] != data:
-            p.append(f"release record {name} was edited; merged records are immutable")
+            why = _additive_target(name, data, head[name])
+            if why:
+                p.append(f"release record {name} was edited; merged records are immutable "
+                         f"(only one new app_bundle or microsoft_store target may be added: {'; '.join(why)})")
     return p
 
 
@@ -647,13 +1004,71 @@ def sha256_hex(data: str | bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+STAMP_FIELDS = ("published_at", "full_rollout_at")
+
+
+def strip_stamps(ledger: dict) -> dict:
+    """The ledger without the publisher's stamps: what a reviewed ledger file contains."""
+    return {k: v for k, v in ledger.items() if k not in STAMP_FIELDS}
+
+
+def typed_stamp_problems(ledger: dict) -> list[str]:
+    """The stamps belong to the publisher: a ledger file under review may not carry them (a typed
+    time could be anything; the publisher's `generated_at` is the only clock the soak trusts)."""
+    return [f"{name} is stamped by the publisher from its own clock; remove it from the ledger file"
+            for name in STAMP_FIELDS if name in ledger]
+
+
+def stamp_ledger(ledger: dict, previous: dict | None, generated_at: str) -> dict:
+    """The ledger as archived: the reviewed `ledger` plus the stamps. Recorded stamps of
+    `previous` (the ledger served now) are carried unchanged; a version new to a source's history
+    gets `published_at`, and one that first reaches 100% in `rollout_history` gets
+    `full_rollout_at`, both = `generated_at`, the publisher's clock. Pure: same inputs, same bytes."""
+    out = json.loads(json.dumps(strip_stamps(ledger)))
+    prev = previous or {}
+    for name in STAMP_FIELDS:
+        carried = prev.get(name)
+        out[name] = {s: dict(t) for s, t in carried.items() if isinstance(t, dict)} \
+            if isinstance(carried, dict) else {}
+    prev_hist = prev.get("history") or {}
+    prev_roll = prev.get("rollout_history") or {}
+    for source, versions in (ledger.get("history") or {}).items():
+        for v in versions:
+            if previous is None or v not in (prev_hist.get(source) or []):
+                out["published_at"].setdefault(source, {}).setdefault(v, generated_at)
+    for source, per_version in (ledger.get("rollout_history") or {}).items():
+        for v, r in per_version.items():
+            before = (prev_roll.get(source) or {}).get(v) if isinstance(prev_roll.get(source), dict) else None
+            was_full = isinstance(before, dict) and before.get("max_rollout_percentage") == 100
+            if isinstance(r, dict) and r.get("max_rollout_percentage") == 100 and not was_full \
+                    and v in ((ledger.get("history") or {}).get(source) or []):
+                out["full_rollout_at"].setdefault(source, {}).setdefault(v, generated_at)
+    return {k: v for k, v in out.items() if v != {} or k not in STAMP_FIELDS}
+
+
+def render_ledger(ledger: dict) -> str:
+    return json.dumps(ledger, indent=2, sort_keys=True) + "\n"
+
+
+def _future_published_problems(ledger: dict, generated_at: str) -> list[str]:
+    """A recorded publish time may not lie after the manifest stamp (plus the clock skew), or a
+    version could look older than it is."""
+    now = datetime.strptime(generated_at, TIME_FORMAT)
+    return [f"{name}[{s}][{v}] {at} is after generated_at {generated_at}"
+            for name in ("published_at", "full_rollout_at")
+            for s, times in (ledger.get(name) or {}).items()
+            for v, at in times.items()
+            if datetime.strptime(at, TIME_FORMAT) > now + MAX_FUTURE_SKEW]
+
+
 def assemble(ledger: dict, records: dict[str, dict], trust_chain_text: str, generated_at: str, *,
              floor: str, previous_ledger: dict | None = None,
              served_appcast_version: str | None = None,
              ledger_stem: str | None = None, promotion_source: dict | None = None) -> dict:
     """Pure: build the unsigned manifest body and appcast body data, or raise LedgerError.
 
-    Returns {manifest_body, manifest_body_sha256, appcast, trust_chain_sha256}. The trust chain
+    Returns {manifest_body, manifest_body_sha256, appcast, ledger_text, trust_chain_sha256}; `ledger_text`
+    is the reviewed ledger plus the publisher's stamps (stamp_ledger), the snapshot to archive. The trust chain
     rides on the signed envelope rather than the body, so only its digest is reported (it must be
     a JSON array)."""
     problems: list[str] = []
@@ -666,12 +1081,19 @@ def assemble(ledger: dict, records: dict[str, dict], trust_chain_text: str, gene
         problems += [f"records/{ver}: {x}" for x in validate_record(rec, ver)]
     if problems:
         raise LedgerError(problems)
+    problems += typed_stamp_problems(ledger)
     problems += validate_ledger(ledger, records, floor=floor, file_stem=ledger_stem)
     if problems:
         raise LedgerError(problems)
-    problems += validate_transition(previous_ledger, ledger, records, floor=floor,
+    reviewed = ledger
+    ledger = stamp_ledger(reviewed, previous_ledger, generated_at)
+    problems += validate_ledger(ledger, records, floor=floor, file_stem=ledger_stem)
+    if problems:
+        raise LedgerError(problems)
+    problems += validate_transition(previous_ledger, ledger, records, floor=floor, generated_at=generated_at,
                                     served_appcast_version=served_appcast_version)
-    problems += promotion_problems(ledger, promotion_source, records, floor=floor)
+    problems += _future_published_problems(ledger, generated_at)
+    problems += promotion_problems(ledger, promotion_source, records, floor=floor, now=generated_at)
     releases = build_entries(ledger, records)
     problems += check_unique_and_urls(releases)
     manifest = {
@@ -693,6 +1115,7 @@ def assemble(ledger: dict, records: dict[str, dict], trust_chain_text: str, gene
         "manifest_body": body,
         "manifest_body_sha256": sha256_hex(body),
         "appcast": appcast,
+        "ledger_text": render_ledger(ledger),
         "trust_chain_sha256": sha256_hex(trust_chain_text),
     }
 

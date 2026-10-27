@@ -946,7 +946,8 @@ impl super::LocalConvergenceExecutor {
         holder: &str,
     ) -> Result<bool, PeerSessionError> {
         use yadorilink_local_storage::{
-            disk_matches_expected_object, DiskContentComparison, ExpectedObject,
+            disk_matches_expected_object, file_content_comparison, DiskContentComparison,
+            ExpectedObject,
         };
         if self.is_locally_ignored(group_id, holder) {
             return Ok(false);
@@ -965,30 +966,46 @@ impl super::LocalConvergenceExecutor {
         let full = self.sync_root(group_id)?.join(holder);
         let snapshot = row.snapshot;
         let matched = tokio::task::spawn_blocking(move || {
-            let expected = match snapshot.record_kind {
-                yadorilink_replica_domain::file::RecordKind::File => {
-                    ExpectedObject::File { blocks: &snapshot.blocks }
+            use yadorilink_replica_domain::file::RecordKind;
+            match snapshot.record_kind {
+                RecordKind::File => {
+                    // One handle for the comparison and the flush: if the path is replaced
+                    // in between, the bytes that were compared are the bytes flushed, never a
+                    // different object judged durable on the strength of the first read.
+                    if !std::fs::symlink_metadata(&full).is_ok_and(|m| m.is_file()) {
+                        return false;
+                    }
+                    let Ok(mut file) = yadorilink_fs_platform::flush::open_for_flush(&full) else {
+                        return false;
+                    };
+                    if !matches!(
+                        file_content_comparison(&mut file, &snapshot.blocks),
+                        Ok(DiskContentComparison::Matched)
+                    ) {
+                        return false;
+                    }
+                    // The caller is about to give up the only other copy: the file's data
+                    // must survive a crash.
+                    if yadorilink_fs_platform::flush::sync_file(&file).is_err() {
+                        return false;
+                    }
                 }
-                yadorilink_replica_domain::file::RecordKind::Symlink => {
-                    ExpectedObject::Symlink { target: snapshot.symlink_target.as_deref() }
+                RecordKind::Symlink => {
+                    let expected =
+                        ExpectedObject::Symlink { target: snapshot.symlink_target.as_deref() };
+                    if !matches!(
+                        disk_matches_expected_object(&full, expected),
+                        Ok(DiskContentComparison::Matched)
+                    ) {
+                        return false;
+                    }
                 }
-                yadorilink_replica_domain::file::RecordKind::Directory => return false,
-            };
-            if !matches!(
-                disk_matches_expected_object(&full, expected),
-                Ok(DiskContentComparison::Matched)
-            ) {
-                return false;
+                RecordKind::Directory => return false,
             }
-            // The caller is about to give up the only other copy: what was just read
-            // must also survive a crash, in the file and in its directory entry.
-            if snapshot.record_kind == yadorilink_replica_domain::file::RecordKind::File
-                && !yadorilink_fs_platform::flush::open_for_flush(&full)
-                    .and_then(|file| yadorilink_fs_platform::flush::sync_file(&file))
-                    .is_ok()
-            {
-                return false;
-            }
+            // The directory entry is flushed where the platform has a directory flush. On
+            // Windows `sync_parent_dir` is a no-op: the entry's durability there is the
+            // write-through move of `durable_dir`, which `destructive_step_durable` requires
+            // of the caller, not something this function proves.
             yadorilink_local_storage::sync_parent_dir(&full).is_ok()
         })
         .await

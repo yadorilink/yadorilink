@@ -303,6 +303,8 @@ async fn run_login(
     flow: BoxFuture<Result<AccountStatus, DesktopError>>,
     overall_timeout: Option<Duration>,
 ) {
+    // However this task ends (a panic in the flow included), the session gets its terminal event.
+    let mut guard = TerminalGuard { shared: shared.clone(), armed: true };
     let deadline = async {
         match overall_timeout {
             Some(limit) => tokio::time::sleep(limit).await,
@@ -323,7 +325,29 @@ async fn run_login(
             },
         },
     };
+    guard.armed = false;
     shared.push(terminal);
+}
+
+/// Queues `Failed(Internal)` when dropped while armed: the run task unwound or was dropped
+/// before it queued its own terminal event. Nothing is pushed when a terminal event is already
+/// queued.
+struct TerminalGuard {
+    shared: Arc<LoginShared>,
+    armed: bool,
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.shared.push(LoginEvent::Failed {
+                error: DesktopError::Internal {
+                    message: "the sign-in stopped unexpectedly".into(),
+                    category: "sign_in_aborted".into(),
+                },
+            });
+        }
+    }
 }
 
 /// Polls status with this, and reports what it returns.

@@ -945,3 +945,75 @@ async fn an_older_generation_finishing_late_cannot_replace_the_newer_cached_one(
     assert!(mgr.accept_and_remember("beta", &old, "older-body").is_err());
     assert_eq!(code(&mgr.verified_entry(&item(), Downloaded)), "withdrawn");
 }
+
+/// A fresh process on the same config dir, as after a daemon restart.
+fn restarted(dir: &Path, now: i64) -> UpdateManager {
+    let mut mgr = manager(dir);
+    mgr.set_trusted_keys_for_test(manifest::test_support::trusted_keys_hex(
+        &manifest::test_support::test_trusted_keys(),
+    ));
+    mgr.set_now_for_test(now);
+    mgr
+}
+
+#[tokio::test]
+async fn a_restarted_daemon_answers_from_the_persisted_verified_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = doc_with_build(&manager(dir.path()));
+    let _ = verified_manager(Some(&doc), dir.path(), unix_at(NOW)).await;
+
+    let mgr = restarted(dir.path(), unix_at(NOW) + 60);
+    let answer = mgr.verified_entry(&item(), Downloaded);
+    assert!(answer.verdict.is_ok(), "{:?}", answer.verdict);
+    assert_eq!(answer.entry.expect("entry").entry.version, "9.9.9");
+
+    // The age is the original verification's: it does not restart with the daemon.
+    let mgr = restarted(dir.path(), unix_at(NOW) + VERIFIED_MAX_AGE_SECS + 1);
+    assert_eq!(code(&mgr.verified_entry(&item(), Downloaded)), "stale");
+}
+
+#[tokio::test]
+async fn a_persisted_manifest_that_no_longer_verifies_or_matches_the_floor_is_not_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = doc_with_build(&manager(dir.path()));
+    let _ = verified_manager(Some(&doc), dir.path(), unix_at(NOW)).await;
+    let file = dir.path().join(PERSISTED_VERIFIED_FILE);
+    let good = std::fs::read_to_string(&file).unwrap();
+
+    // Different signed bytes than the replay floor accepted.
+    let mut record: serde_json::Value = serde_json::from_str(&good).unwrap();
+    record["envelope"] = format!("{} ", record["envelope"].as_str().unwrap()).into();
+    std::fs::write(&file, record.to_string()).unwrap();
+    let mgr = restarted(dir.path(), unix_at(NOW));
+    assert_eq!(code(&mgr.verified_entry(&item(), Downloaded)), "not_checked");
+
+    // Damaged file.
+    std::fs::write(&file, "not json").unwrap();
+    let mgr = restarted(dir.path(), unix_at(NOW));
+    assert_eq!(code(&mgr.verified_entry(&item(), Downloaded)), "not_checked");
+
+    // Verified by the production root only: the throwaway test key is not trusted.
+    std::fs::write(&file, good).unwrap();
+    let mut mgr = restarted(dir.path(), unix_at(NOW));
+    mgr.set_trusted_keys_for_test(vec![]);
+    assert_eq!(code(&mgr.verified_entry(&item(), Downloaded)), "not_checked");
+}
+
+#[tokio::test]
+async fn a_channel_without_a_manifest_forgets_the_persisted_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = doc_with_build(&manager(dir.path()));
+    let _ = verified_manager(Some(&doc), dir.path(), unix_at(NOW)).await;
+    let file = dir.path().join(PERSISTED_VERIFIED_FILE);
+    let stale = std::fs::read_to_string(&file).unwrap();
+    let _ = verified_manager(None, dir.path(), unix_at(NOW)).await;
+    // Failure injection: the removal of the cache file failed, so the old file is still there.
+    std::fs::write(&file, &stale).unwrap();
+    let mgr = restarted(dir.path(), unix_at(NOW));
+    assert_eq!(code(&mgr.verified_entry(&item(), Downloaded)), "not_checked");
+
+    // The same signed manifest served again is usable again after a restart.
+    let _ = verified_manager(Some(&doc), dir.path(), unix_at(NOW)).await;
+    let mgr = restarted(dir.path(), unix_at(NOW));
+    assert!(mgr.verified_entry(&item(), Downloaded).verdict.is_ok());
+}

@@ -13,6 +13,7 @@ fn view(group_id: &str) -> LinkStatusView {
         local_path: format!("/data/{group_id}"),
         provider: None,
         group_id: group_id.to_owned(),
+        orphaned: false,
         paused: false,
         paused_until_unix: 0,
         conflict_count: 0,

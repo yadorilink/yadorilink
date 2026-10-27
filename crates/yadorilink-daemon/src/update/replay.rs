@@ -40,6 +40,10 @@ pub enum ReplayError {
 pub struct AcceptedGeneration {
     pub generated_at: String,
     pub envelope_sha256: String,
+    /// The channel's feed had no manifest (404) after this generation was accepted. The floor
+    /// itself stays; a cached copy of the envelope must not be used while this is set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_manifest: bool,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -142,6 +146,19 @@ impl ReplayStore {
         self.load().ok()?.channels.get(channel).cloned()
     }
 
+    /// Records durably that `channel`'s feed has no manifest now, so a cached envelope for the
+    /// accepted generation is never used again (until that generation is accepted anew). The
+    /// floor itself is kept. A channel with no accepted generation has nothing to mark.
+    pub fn mark_no_manifest(&self, channel: &str) -> Result<(), ReplayError> {
+        let _serialized = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut file = self.load_or_quarantine()?;
+        match file.channels.get_mut(channel) {
+            Some(kept) if !kept.no_manifest => kept.no_manifest = true,
+            _ => return Ok(()),
+        }
+        self.save(&file).map_err(|e| ReplayError::Storage(e.to_string()))
+    }
+
     /// Decides whether an already signature-verified manifest may be acted on, and records it.
     /// The new value is durably stored before `Ok` is returned: a manifest is never acted on
     /// under a floor that a restart could forget.
@@ -165,11 +182,14 @@ impl ReplayStore {
                 });
             }
             if offered_at == kept_at {
-                return if kept.envelope_sha256 == offered_hash {
-                    Ok(())
-                } else {
-                    Err(ReplayError::DifferentAtEqual(generated_at.to_string()))
-                };
+                if kept.envelope_sha256 != offered_hash {
+                    return Err(ReplayError::DifferentAtEqual(generated_at.to_string()));
+                }
+                if !kept.no_manifest {
+                    return Ok(());
+                }
+                // The same signed bytes served again after a 404: usable once more, falling
+                // through to store the cleared marker.
             }
         }
         file.channels.insert(
@@ -177,6 +197,7 @@ impl ReplayStore {
             AcceptedGeneration {
                 generated_at: generated_at.to_string(),
                 envelope_sha256: offered_hash,
+                no_manifest: false,
             },
         );
         self.save(&file).map_err(|e| ReplayError::Storage(e.to_string()))

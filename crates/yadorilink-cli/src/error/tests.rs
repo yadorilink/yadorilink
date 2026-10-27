@@ -125,9 +125,8 @@ fn a_missing_file_is_not_reported_as_a_missing_daemon() {
 /// `ops::start_over` tests): a drift of a site's text or hint breaks the test next to the site.
 #[test]
 fn every_hinted_site_prints_the_text_it_always_printed() {
-    use yadorilink_client_core::Hint;
-    let cases: Vec<(CoreError, &str, i32)> =
-        vec![
+    use yadorilink_client_core::{Hint, InvalidArgument};
+    let cases: Vec<(CoreError, &str, i32)> = vec![
         (
             CoreError::Other("the daemon did not answer after it was started".into())
                 .hinted(Hint::StartDaemon),
@@ -176,8 +175,10 @@ fn every_hinted_site_prints_the_text_it_always_printed() {
             10,
         ),
         (
-            CoreError::InvalidInput("no folder group named \"g\" is visible to this account".into())
-                .hinted(Hint::CreateOrAcceptShare),
+            CoreError::InvalidInput(
+                "no folder group named \"g\" is visible to this account".into(),
+            )
+            .hinted(Hint::CreateOrAcceptShare),
             "no folder group named \"g\" is visible to this account (run `yadorilink share \
              create` to make one, or `yadorilink share accept` to join one you were invited to)",
             1,
@@ -194,6 +195,45 @@ fn every_hinted_site_prints_the_text_it_always_printed() {
             "a start over as a new device is under way on this computer; finish it \
              (`yadorilink device start-over`) before registering",
             1,
+        ),
+        (
+            CoreError::InvalidArgument(InvalidArgument::StorageMode("bogus".into())),
+            "invalid --storage-mode \"bogus\" (expected eager or on-demand)",
+            1,
+        ),
+        (
+            CoreError::DurabilityBlocked {
+                message: "refusing to unlink /f".into(),
+                group_ids: vec![],
+            }
+            .hinted(Hint::ForceUnlink),
+            "refusing to unlink /f Use --force to unlink anyway (data-loss risk).",
+            1,
+        ),
+        (
+            CoreError::DaemonRejected(
+                "x is still being linked to g; wait for that to finish".into(),
+            )
+            .hinted(Hint::CheckLinkStatus),
+            "x is still being linked to g; wait for that to finish, then check `yadorilink status`",
+            1,
+        ),
+        (
+            CoreError::DaemonRejected("link setup failed".into()).hinted(Hint::CheckLinkList),
+            "link setup failed -- check `yadorilink link list` and the daemon log before retrying",
+            1,
+        ),
+        (
+            CoreError::DaemonRejected("refusing to drop complete-copy status".into())
+                .hinted(Hint::RetryStorageModeChange),
+            "refusing to drop complete-copy status; re-run set-storage-mode to try again",
+            1,
+        ),
+        (
+            CoreError::ManagedElsewhere("managed by a command-line install".into())
+                .hinted(Hint::UseOwningInstall),
+            "managed by a command-line install Use that install's own `yadorilink`.",
+            EXIT_MANAGED_ELSEWHERE,
         ),
         (
             CoreError::AuthFailed("this installation is already enrolled".into())

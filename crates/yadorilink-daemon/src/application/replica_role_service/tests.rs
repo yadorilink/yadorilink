@@ -13,6 +13,7 @@ use yadorilink_replica_domain::session_state::{
 use super::*;
 use crate::application::model::RoleLossCompensationOutcome;
 use crate::application::ports::BoxFuture;
+use crate::application::ports::StorageModeWriteError;
 use crate::handoff_proof::StrongHandoffProof;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -303,7 +304,7 @@ struct FakeCoordination {
     configured: AtomicBool,
     commit_result: Mutex<VecDeque<RoleLossCommitOutcome>>,
     set_storage_mode_calls: Mutex<u32>,
-    set_storage_mode_result: Mutex<VecDeque<Result<(), String>>>,
+    set_storage_mode_result: Mutex<VecDeque<Result<(), StorageModeWriteError>>>,
     compensate_calls: Mutex<Vec<String>>,
     compensate_result: Mutex<VecDeque<Result<RoleLossCompensationOutcome, String>>>,
 }
@@ -340,7 +341,7 @@ impl RoleLossCoordination for FakeCoordination {
         _group_id: &'a str,
         _device_id: &'a str,
         _mode: &'a str,
-    ) -> BoxFuture<'a, Result<(), String>> {
+    ) -> BoxFuture<'a, Result<(), StorageModeWriteError>> {
         Box::pin(async move {
             *self.set_storage_mode_calls.lock().unwrap() += 1;
             self.set_storage_mode_result.lock().unwrap().pop_front().unwrap_or(Ok(()))
@@ -539,10 +540,7 @@ async fn on_demand_is_refused_while_the_on_demand_capability_is_not_connected() 
         .await
         .expect_err("on-demand must be refused while the pipeline is not connected");
 
-    assert!(
-        error.contains("on-demand storage is not available for a regular folder"),
-        "got {error}"
-    );
+    assert!(matches!(error, StorageModeError::OnDemandUnavailable), "got {error}");
     assert_eq!(*coordination.set_storage_mode_calls.lock().unwrap(), 0);
     assert!(repository
         .calls
@@ -669,7 +667,73 @@ async fn demotion_lease_unavailable_refuses_with_the_lease_failure_message() {
         .set_storage_mode("group-1", true)
         .await;
 
-    assert_eq!(result.unwrap_err(), demotion_handoff_lease_failure_message());
+    assert_eq!(result.unwrap_err().to_string(), demotion_handoff_lease_failure_message());
+}
+
+/// A role-loss commit refused for the Terms is the typed Terms refusal, not a generic
+/// "could not confirm the peer": nothing was committed, so the journal row is discarded and the
+/// local mode is untouched.
+#[tokio::test]
+async fn a_demotion_refused_for_the_terms_is_a_typed_terms_refusal() {
+    let repository = Arc::new(
+        FakeRepository::default().with_link(link("group-1", MaterializationPolicy::Eager)),
+    );
+    let role_loss = Arc::new(FakeRoleLoss::default());
+    let readiness = Arc::new(FakeReadiness::default());
+    readiness.full_replica.store(true, Ordering::SeqCst);
+    readiness
+        .digest_and_peer
+        .lock()
+        .unwrap()
+        .push_back(Some(([1u8; 32], Some("device-b".to_string()))));
+    readiness.lease.lock().unwrap().push_back(Some("lease-1".to_string()));
+    let coordination = Arc::new(FakeCoordination::configured());
+    coordination
+        .commit_result
+        .lock()
+        .unwrap()
+        .push_back(RoleLossCommitOutcome::TermsConsentRequired("403".into()));
+    let runtime = Arc::new(FakeRuntime::default());
+
+    let result = service(repository.clone(), role_loss.clone(), readiness, coordination, runtime)
+        .set_storage_mode("group-1", true)
+        .await;
+
+    assert!(matches!(result, Err(StorageModeError::TermsConsentRequired)), "{result:?}");
+    assert!(role_loss.calls.lock().unwrap().contains(&Call::DiscardOperation("op-1".to_string())));
+    assert!(repository.calls.lock().unwrap().is_empty(), "no local change");
+}
+
+#[tokio::test]
+async fn an_unlink_refused_for_the_terms_is_a_typed_terms_refusal() {
+    let repository = Arc::new(
+        FakeRepository::default().with_link(link("group-1", MaterializationPolicy::Eager)),
+    );
+    let readiness = Arc::new(FakeReadiness::default());
+    readiness
+        .digest_and_peer
+        .lock()
+        .unwrap()
+        .push_back(Some(([1u8; 32], Some("device-b".to_string()))));
+    readiness.lease.lock().unwrap().push_back(Some("lease-1".to_string()));
+    let coordination = Arc::new(FakeCoordination::configured());
+    coordination
+        .commit_result
+        .lock()
+        .unwrap()
+        .push_back(RoleLossCommitOutcome::TermsConsentRequired("403".into()));
+
+    let result = service(
+        repository,
+        Arc::new(FakeRoleLoss::default()),
+        readiness,
+        coordination,
+        Arc::new(FakeRuntime::default()),
+    )
+    .ensure_unlink_keeps_a_full_replica("/home/alice/Photos", false, "group-1")
+    .await;
+
+    assert_eq!(result.unwrap_err(), UnlinkError::TermsConsentRequired);
 }
 
 #[tokio::test]
@@ -1075,7 +1139,7 @@ async fn demotion_is_refused_and_recoverable_when_a_custody_lease_cannot_move() 
     .set_storage_mode("group-1", true)
     .await;
 
-    assert_eq!(result.unwrap_err(), "1 custody lease(s) could not move");
+    assert_eq!(result.unwrap_err().to_string(), "1 custody lease(s) could not move");
     assert!(role_loss.calls.lock().unwrap().is_empty(), "no journal row");
     assert!(repository.calls.lock().unwrap().is_empty(), "no local change");
     assert_eq!(custody.open_guards.load(Ordering::SeqCst), 0, "nothing stays closed");
@@ -1327,4 +1391,30 @@ async fn custody_hand_off_refuses_a_link_of_another_group() {
 
     assert!(matches!(result, Err(UnlinkError::GroupMismatch(_))));
     assert!(custody.hand_offs.lock().unwrap().is_empty(), "no lease was handed off");
+}
+
+#[tokio::test]
+async fn promotion_terms_refusal_is_the_typed_error_and_changes_nothing_locally() {
+    let repository = Arc::new(
+        FakeRepository::default().with_link(link("group-1", MaterializationPolicy::OnDemand)),
+    );
+    let coordination = Arc::new(FakeCoordination::configured());
+    coordination
+        .set_storage_mode_result
+        .lock()
+        .unwrap()
+        .push_back(Err(StorageModeWriteError::TermsConsentRequired("403".into())));
+
+    let result = service(
+        repository.clone(),
+        Arc::new(FakeRoleLoss::default()),
+        Arc::new(FakeReadiness::default()),
+        coordination,
+        Arc::new(FakeRuntime::default()),
+    )
+    .set_storage_mode("group-1", false)
+    .await;
+
+    assert!(matches!(result, Err(StorageModeError::TermsConsentRequired)), "{result:?}");
+    assert!(repository.calls.lock().unwrap().is_empty(), "no local change");
 }

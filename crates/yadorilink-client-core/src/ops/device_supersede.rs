@@ -112,6 +112,16 @@ pub(crate) fn record_account_id(dir: &Path, id_token: Option<&str>) {
     }
 }
 
+/// Whether a sign-in's id token names a different account than the one recorded for this
+/// installation. Only a recorded account and a named one can differ: with either missing there is
+/// nothing to compare, and the caller goes on.
+pub(crate) fn is_other_account(dir: &Path, id_token: Option<&str>) -> bool {
+    match (recorded_account_id(dir), id_token.and_then(subject_of_id_token)) {
+        (Some(recorded), Some(signed_in)) => recorded != signed_in,
+        _ => false,
+    }
+}
+
 fn recorded_account_id(dir: &Path) -> Option<String> {
     let text = std::fs::read_to_string(dir.join(ACCOUNT_ID_FILE)).ok()?;
     let id = text.trim();

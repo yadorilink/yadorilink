@@ -140,6 +140,23 @@ fn key_of(_file: &fs::File) -> Option<ObjectKey> {
     None
 }
 
+/// Opens `path` so that the flush primitive can run on it. A file is opened through
+/// `open_for_flush` (Windows' `FlushFileBuffers` needs write access). Windows has no
+/// directory flush at all, so a directory there is refused outright, never flushed in name
+/// only; the batch that defers its flushes is Unix-only today, and this keeps that explicit.
+fn open_for_received_flush(path: &Path, is_dir: bool) -> std::io::Result<fs::File> {
+    if is_dir {
+        #[cfg(windows)]
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Windows has no directory flush; a received batch is not flushed there",
+        ));
+        #[cfg(not(windows))]
+        return fs::File::open(path);
+    }
+    flush::open_for_flush(path)
+}
+
 fn flush_one(
     path: &Path,
     plain: bool,
@@ -147,7 +164,7 @@ fn flush_one(
     expected: Option<ObjectKey>,
 ) -> std::io::Result<()> {
     injected_failure(path)?;
-    let file = fs::File::open(path)?;
+    let file = open_for_received_flush(path, is_dir)?;
     // A path that now names another object (the user moved the received file and
     // put something else there) must not be flushed in its place.
     if expected.is_some() && key_of(&file) != expected {
@@ -234,7 +251,7 @@ pub fn flush_received_objects(
                 continue;
             }
             let result = injected_failure(files.first().unwrap_or(dir)).and_then(|()| {
-                let handle = fs::File::open(dir)?;
+                let handle = open_for_received_flush(dir, true)?;
                 crate::io_diag::time(crate::io_diag::Op::FileFsync, 0, || {
                     flush::sync_directory(&handle)
                 })

@@ -111,7 +111,7 @@ def parse_request(text: str) -> dict:
         raise SignError(f"the request is not JSON: {ex}") from None
     if not isinstance(req, dict) or set(req) != REQUEST_FIELDS:
         raise SignError("the request has missing or unknown fields")
-    if req["schema_version"] != REQUEST_SCHEMA_VERSION:
+    if type(req["schema_version"]) is not int or req["schema_version"] != REQUEST_SCHEMA_VERSION:
         raise SignError("unsupported request schema version")
     if req["channel"] not in CHANNELS:
         raise SignError(f"channel must be one of {list(CHANNELS)}")

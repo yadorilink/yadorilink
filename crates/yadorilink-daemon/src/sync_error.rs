@@ -112,7 +112,7 @@ pub enum SyncError {
     #[error(
         "folder group {group_id} is linked to {} folders on this device ({}); sync is stopped \
          for this folder group until exactly one remains. Decide which folder is this group's \
-         sync root and run `yadorilink unlink` on the other(s) — unlinking removes a folder from \
+         sync root and unlink the other(s) — unlinking removes a folder from \
          sync and does not delete any files from it. Any file that exists only in a folder you \
          unlink will be copied into the folder you keep if another device still has it; if no \
          other device has it, copy it into the folder you keep yourself, or a later scan will \
@@ -121,6 +121,12 @@ pub enum SyncError {
         local_paths.join(", ")
     )]
     AmbiguousLink { group_id: String, local_paths: Vec<String> },
+
+    /// The folder's disk was confirmed but the folder is still not running (refused for another
+    /// reason: another group's marker, a lock held). The front end words the next step (its
+    /// sync status), see [`crate::error::NextStep::CheckLinkStatus`].
+    #[error("the disk at {local_path} is confirmed, but the folder did not start")]
+    FolderNotStarted { local_path: String },
 
     /// A value read back from the local database has an impossible shape
     /// (e.g. a fixed-width hash blob that is not its declared length) — a sign
@@ -341,6 +347,7 @@ impl SyncError {
             SyncError::GroupMismatch(_) => "conflict",
             SyncError::InvalidInput(_) => "invalid_input",
             SyncError::AmbiguousLink { .. } => "config",
+            SyncError::FolderNotStarted { .. } => "config",
             SyncError::OwnershipLost(_) => "config",
             SyncError::CorruptState(_) => "storage",
             SyncError::HydrationFailed(_) => "peer_unreachable",

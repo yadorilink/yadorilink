@@ -212,6 +212,7 @@ fn the_commands_that_need_an_account_say_not_signed_in() {
         AccountCommand::SignOut,
         AccountCommand::RegisterDevice { name: "phone".into() },
         AccountCommand::DeletionImpact,
+        AccountCommand::ListJoinableGroups,
         AccountCommand::DeletionStatus,
         AccountCommand::RequestDeletion { acknowledge_impact: false },
         AccountCommand::ConfirmDeletion { confirmation_token: "token".into() },

@@ -35,7 +35,7 @@ use crate::coordination::http_client::{
     delete_no_content, get_json, post_json, post_json_no_content, require_auth,
 };
 use crate::daemon::control;
-use crate::error::{CoreError, Hint};
+use crate::error::{CoreError, Hint, InvalidArgument};
 
 /// Maps a storage-mode word to the daemon's `on_demand` flag: `eager`
 /// (store everything) links a fully-hydrated folder; `on-demand` (store only
@@ -44,9 +44,7 @@ pub fn parse_storage_mode(mode: &str) -> Result<bool, CoreError> {
     match mode.to_ascii_lowercase().as_str() {
         "eager" | "everything" => Ok(false),
         "on-demand" | "ondemand" | "needed" => Ok(true),
-        other => Err(CoreError::InvalidInput(format!(
-            "invalid --storage-mode {other:?} (expected eager or on-demand)"
-        ))),
+        other => Err(CoreError::InvalidArgument(InvalidArgument::StorageMode(other.to_owned()))),
     }
 }
 
@@ -613,10 +611,7 @@ pub fn validate_changeable_role(role: &str) -> Result<(), CoreError> {
     if CHANGEABLE_ROLES.contains(&role) {
         return Ok(());
     }
-    Err(CoreError::InvalidInput(format!(
-        "invalid --role {role:?} (expected {}); owner is not available via this command yet",
-        CHANGEABLE_ROLES.join(" or ")
-    )))
+    Err(CoreError::InvalidArgument(InvalidArgument::Role(role.to_owned())))
 }
 
 /// Moves an already-granted device to a different role in an
@@ -1065,7 +1060,14 @@ struct ListJoinableResponse {
 /// only: name/id, never file names or content.
 pub async fn list_joinable_groups() -> Result<Vec<GroupSummary>, CoreError> {
     let auth = require_auth().await?;
-    let resp: ListJoinableResponse = get_json("/shares/joinable", &auth).await?;
+    list_joinable_groups_with(&auth).await
+}
+
+/// [`list_joinable_groups`] against a given coordination session.
+pub async fn list_joinable_groups_with(
+    auth: &CoordinationAccess,
+) -> Result<Vec<GroupSummary>, CoreError> {
+    let resp: ListJoinableResponse = get_json("/shares/joinable", auth).await?;
     Ok(resp
         .groups
         .into_iter()

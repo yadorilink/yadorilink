@@ -248,6 +248,9 @@ pub enum EnrollmentPrepareOutcome {
     },
     /// 4xx (other than 409). The remote prepare was NOT committed.
     DefinitelyRejected(String),
+    /// `403 terms_consent_required`: the account has not accepted the current Terms. The remote
+    /// prepare was NOT committed; signing in again clears it.
+    TermsConsentRequired(String),
     /// The coordination plane named why the invite cannot be redeemed (its
     /// `code` field). The remote prepare was NOT committed.
     InviteRefused {
@@ -317,6 +320,22 @@ impl From<CoordinationCallError> for DeviceListingError {
     }
 }
 
+/// Why the coordination plane's storage-mode write (a promotion) did not land.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorageModeWriteError {
+    /// `403 terms_consent_required`: the account has not accepted the current Terms.
+    TermsConsentRequired(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for StorageModeWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TermsConsentRequired(detail) | Self::Failed(detail) => f.write_str(detail),
+        }
+    }
+}
+
 impl std::fmt::Display for DeviceListingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -341,7 +360,7 @@ pub use imp::{
 // return types are genuinely part of this module's own public surface, so
 // `mint_invite` can only ever be re-exported at `pub(crate)`, not widened
 // to `pub` alongside its siblings.
-pub(crate) use imp::mint_invite;
+pub(crate) use imp::{is_terms_consent_refusal, mint_invite};
 
 /// Why a remote-evidence lookup could not be answered -- see
 /// `RemoteEvidence`'s own doc comment for the
@@ -546,13 +565,24 @@ mod imp {
         MembershipRemoteRequestGroup, MembershipRemoteResult, MembershipRemoteStatus,
         RemoteEvidenceErrorCategory, RemoteQueryError, RoleLossCommitOutcome,
         RoleLossCommitRequest, RoleLossCompensationOutcome, RoleLossOperationRecord,
-        SendAuthorizationGrant, SendAuthorized, SubstrateReachability,
+        SendAuthorizationGrant, SendAuthorized, StorageModeWriteError, SubstrateReachability,
     };
 
     /// `skip_serializing_if` predicate for an optional boolean request
     /// field whose `false` means exactly what omitting it means.
     fn is_false(value: &bool) -> bool {
         !*value
+    }
+
+    /// Whether a response is the Terms consent refusal: `403` with `{"error":
+    /// "terms_consent_required"}`. A different 403 is an ordinary rejection.
+    pub(crate) fn is_terms_consent_refusal(status: reqwest::StatusCode, body_text: &str) -> bool {
+        status == reqwest::StatusCode::FORBIDDEN
+            && serde_json::from_str::<serde_json::Value>(body_text)
+                .ok()
+                .and_then(|value| value.get("error")?.as_str().map(str::to_owned))
+                .as_deref()
+                == Some("terms_consent_required")
     }
 
     /// The machine-readable `code` of a coordination error body, when it has one.
@@ -805,10 +835,13 @@ mod imp {
             return EnrollmentPrepareOutcome::Conflict(response.text().await.unwrap_or_default());
         }
         if status.is_client_error() {
-            return EnrollmentPrepareOutcome::DefinitelyRejected(format!(
-                "create prepare returned HTTP {status}: {}",
-                response.text().await.unwrap_or_default()
-            ));
+            let body_text = response.text().await.unwrap_or_default();
+            let detail = format!("create prepare returned HTTP {status}: {body_text}");
+            return if is_terms_consent_refusal(status, &body_text) {
+                EnrollmentPrepareOutcome::TermsConsentRequired(detail)
+            } else {
+                EnrollmentPrepareOutcome::DefinitelyRejected(detail)
+            };
         }
         if !status.is_success() {
             return EnrollmentPrepareOutcome::Ambiguous(format!(
@@ -863,12 +896,12 @@ mod imp {
         if status.is_success() {
             return EnrollmentPrepareOutcome::Prepared { group_id: group_id.to_string() };
         }
-        let detail = format!(
-            "join prepare returned HTTP {status}: {}",
-            response.text().await.unwrap_or_default()
-        );
+        let body_text = response.text().await.unwrap_or_default();
+        let detail = format!("join prepare returned HTTP {status}: {body_text}");
         if status == reqwest::StatusCode::CONFLICT {
             EnrollmentPrepareOutcome::Conflict(detail)
+        } else if is_terms_consent_refusal(status, &body_text) {
+            EnrollmentPrepareOutcome::TermsConsentRequired(detail)
         } else if status.is_client_error() {
             EnrollmentPrepareOutcome::DefinitelyRejected(detail)
         } else {
@@ -995,6 +1028,9 @@ mod imp {
             let detail = coord_error_message(&body_text).unwrap_or_else(|| {
                 format!("invite accept prepare returned HTTP {status}: {body_text}")
             });
+            if is_terms_consent_refusal(status, &body_text) {
+                return EnrollmentPrepareOutcome::TermsConsentRequired(detail);
+            }
             return match coord_error_code(&body_text).as_deref() {
                 Some("invite_expired") => EnrollmentPrepareOutcome::InviteRefused {
                     reason: crate::application::model::InviteRefusal::Expired,
@@ -1085,7 +1121,8 @@ mod imp {
         role: Option<&str>,
         ttl_secs: Option<u64>,
         requires_approval: bool,
-    ) -> Result<super::MintedInvite, String> {
+    ) -> Result<super::MintedInvite, crate::application::model::MintInviteError> {
+        use crate::application::model::MintInviteError;
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct Body<'a> {
@@ -1122,18 +1159,20 @@ mod imp {
             .json(&Body { minting_device_id, role, ttl_secs, requires_approval })
             .send_authorized(auth)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| MintInviteError::Rejected(e.to_string()))?;
         let status = response.status();
         if !status.is_success() {
-            return Err(format!(
-                "invite mint returned HTTP {status}: {}",
-                response.text().await.unwrap_or_default()
-            ));
+            let text = response.text().await.unwrap_or_default();
+            let detail = format!("invite mint returned HTTP {status}: {text}");
+            return Err(if is_terms_consent_refusal(status, &text) {
+                MintInviteError::TermsConsentRequired(detail)
+            } else {
+                MintInviteError::Rejected(detail)
+            });
         }
-        let body = response
-            .json::<Response>()
-            .await
-            .map_err(|e| format!("invite mint response was unparseable: {e}"))?;
+        let body = response.json::<Response>().await.map_err(|e| {
+            MintInviteError::Rejected(format!("invite mint response was unparseable: {e}"))
+        })?;
         Ok(super::MintedInvite {
             code: body.code,
             invite_id: body.invite_id,
@@ -1599,6 +1638,8 @@ mod imp {
                 format!("coordination plane refused the handoff commit ({status}): {text}");
             return if status == reqwest::StatusCode::CONFLICT {
                 RoleLossCommitOutcome::Conflict(detail)
+            } else if is_terms_consent_refusal(status, &text) {
+                RoleLossCommitOutcome::TermsConsentRequired(detail)
             } else if status.is_client_error() {
                 RoleLossCommitOutcome::DefinitelyRejected(detail)
             } else {
@@ -2313,7 +2354,7 @@ mod imp {
         group_id: &str,
         device_id: &str,
         storage_mode: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), StorageModeWriteError> {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct Body<'a> {
@@ -2322,18 +2363,24 @@ mod imp {
         }
         let url = format!("{addr}/shares/groups/{group_id}/storage-mode");
         let body = Body { device_id, storage_mode };
-        let resp = reqwest::Client::new()
-            .post(&url)
-            .json(&body)
-            .send_authorized(auth)
-            .await
-            .map_err(|e| format!("could not reach the coordination plane: {e}"))?;
+        let resp =
+            reqwest::Client::new().post(&url).json(&body).send_authorized(auth).await.map_err(
+                |e| {
+                    StorageModeWriteError::Failed(format!(
+                        "could not reach the coordination plane: {e}"
+                    ))
+                },
+            )?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "coordination plane refused the storage-mode change ({status}): {text}"
-            ));
+            let detail =
+                format!("coordination plane refused the storage-mode change ({status}): {text}");
+            return Err(if is_terms_consent_refusal(status, &text) {
+                StorageModeWriteError::TermsConsentRequired(detail)
+            } else {
+                StorageModeWriteError::Failed(detail)
+            });
         }
         Ok(())
     }
@@ -2477,11 +2524,13 @@ mod imp {
         use super::{
             activate_invite_accept, checkpoint_request_body, coord_error_message, fetch_edge_state,
             find_account_device, list_account_device_keys, prepare_create, prepare_invite_accept,
-            request_authorization_checkpoint, resolve_edge, SubstrateReachability,
+            prepare_join, request_authorization_checkpoint, resolve_edge, SubstrateReachability,
         };
+        use super::{commit_handoff_role_loss, mint_invite};
         use crate::checkpoint_source::CheckpointPurpose;
         use crate::coordination_client::{ActivateOutcome, EnrollmentPrepareOutcome};
         use crate::coordination_client::{CoordinationCallError, DeviceListingError};
+        use crate::coordination_client::{RoleLossCommitOutcome, RoleLossCommitRequest};
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2702,6 +2751,135 @@ mod imp {
             assert_eq!(requests.len(), 1);
             let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
             assert_eq!(body["purpose"], "seal");
+        }
+
+        /// A `403 terms_consent_required` is its own outcome on every prepare call, not a generic
+        /// rejection; any other 403 stays a rejection.
+        #[tokio::test]
+        async fn prepare_calls_name_the_terms_consent_refusal() {
+            let consent =
+                serde_json::json!({"error": "terms_consent_required", "terms_version": "v1"});
+            for (route, other_403) in [
+                ("/shares/groups/prepare", false),
+                ("/shares/groups/g1/join/prepare", false),
+                ("/shares/invites/accept/prepare", false),
+                ("/shares/groups/prepare", true),
+                ("/shares/groups/g1/join/prepare", true),
+                ("/shares/invites/accept/prepare", true),
+            ] {
+                let server = MockServer::start().await;
+                let body = if other_403 {
+                    serde_json::json!({"error": "not allowed"})
+                } else {
+                    consent.clone()
+                };
+                Mock::given(method("POST"))
+                    .and(path(route))
+                    .respond_with(ResponseTemplate::new(403).set_body_json(body))
+                    .mount(&server)
+                    .await;
+                let outcome = match route {
+                    "/shares/groups/prepare" => {
+                        prepare_create(&server.uri(), &test_auth(), "op", "n", "d", "eager").await
+                    }
+                    "/shares/groups/g1/join/prepare" => {
+                        prepare_join(&server.uri(), &test_auth(), "op", "g1", "d", "eager").await
+                    }
+                    _ => {
+                        prepare_invite_accept(&server.uri(), &test_auth(), "op", "c", "d", "eager")
+                            .await
+                    }
+                };
+                assert_eq!(
+                    matches!(outcome, EnrollmentPrepareOutcome::TermsConsentRequired(_)),
+                    !other_403,
+                    "{route} other_403={other_403}: {outcome:?}"
+                );
+                if other_403 {
+                    assert!(matches!(outcome, EnrollmentPrepareOutcome::DefinitelyRejected(_)));
+                }
+            }
+        }
+
+        /// A `403 terms_consent_required` on the promotion write is typed; any other 403 is not.
+        #[tokio::test]
+        async fn storage_mode_write_names_the_terms_consent_refusal() {
+            for other_403 in [false, true] {
+                let body = if other_403 {
+                    serde_json::json!({"error": "not allowed"})
+                } else {
+                    serde_json::json!({"error": "terms_consent_required", "terms_version": "v1"})
+                };
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .respond_with(ResponseTemplate::new(403).set_body_json(body))
+                    .mount(&server)
+                    .await;
+                let result =
+                    super::set_storage_mode(&server.uri(), &test_auth(), "g1", "d", "eager").await;
+                assert_eq!(
+                    matches!(
+                        result,
+                        Err(
+                            crate::coordination_client::StorageModeWriteError::TermsConsentRequired(
+                                _
+                            )
+                        )
+                    ),
+                    !other_403,
+                    "{result:?}"
+                );
+            }
+        }
+
+        /// A `403 terms_consent_required` is its own outcome on invite mint and on the role-loss
+        /// commit; any other 403 stays a generic rejection.
+        #[tokio::test]
+        async fn mint_and_role_loss_commit_name_the_terms_consent_refusal() {
+            for other_403 in [false, true] {
+                let body = if other_403 {
+                    serde_json::json!({"error": "not allowed"})
+                } else {
+                    serde_json::json!({"error": "terms_consent_required", "terms_version": "v1"})
+                };
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .respond_with(ResponseTemplate::new(403).set_body_json(body))
+                    .mount(&server)
+                    .await;
+                let minted =
+                    mint_invite(&server.uri(), &test_auth(), "g1", "d", None, None, false).await;
+                let commit = commit_handoff_role_loss(
+                    &server.uri(),
+                    &test_auth(),
+                    RoleLossCommitRequest {
+                        group_id: "g1",
+                        source_device_id: "d",
+                        target_device_id: "t",
+                        lease_id: None,
+                        action: "demote",
+                        operation_id: "op",
+                    },
+                )
+                .await;
+                use crate::application::model::MintInviteError;
+                if other_403 {
+                    assert!(matches!(minted, Err(MintInviteError::Rejected(_))), "{minted:?}");
+                    assert!(
+                        matches!(commit, RoleLossCommitOutcome::DefinitelyRejected(_)),
+                        "{commit:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(minted, Err(MintInviteError::TermsConsentRequired(_))),
+                        "{minted:?}"
+                    );
+                    assert!(
+                        matches!(commit, RoleLossCommitOutcome::TermsConsentRequired(_)),
+                        "{commit:?}"
+                    );
+                }
+            }
         }
 
         #[test]

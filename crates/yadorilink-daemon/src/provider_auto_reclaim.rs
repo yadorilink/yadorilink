@@ -85,7 +85,9 @@ impl Verdict {
             Retained::CustodyUnsupported | Retained::FullReplica => Self::UnsupportedRoot,
             Retained::CustodyNotAcquired | Retained::CustodyRequired => Self::CustodyUnavailable,
             Retained::Busy | Retained::HostBusy => Self::Busy,
-            Retained::VersionMoved | Retained::NotConfirmed => Self::Changed,
+            Retained::VersionMoved | Retained::NotConfirmed | Retained::NotDownloaded => {
+                Self::Changed
+            }
             Retained::HostRefused | Retained::NothingFreed => Self::SafetyBlocked,
         }
     }

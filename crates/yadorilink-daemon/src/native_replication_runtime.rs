@@ -722,6 +722,7 @@ pub fn env_for_peer(state: &Arc<DaemonState>, device: &str) -> ReplicationEnv {
     };
     ReplicationEnv {
         db,
+        counters: state.telemetry.replication_counters(),
         local_device_id: state.device_id.clone(),
         shares_group: Arc::new(shares_group),
         key_for: Arc::new(key_for),

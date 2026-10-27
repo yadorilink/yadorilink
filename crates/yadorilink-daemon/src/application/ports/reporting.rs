@@ -40,6 +40,23 @@ pub(crate) struct SubmitReportOutcome {
     pub(crate) queued_for_retry: bool,
 }
 
+/// Why a report was not submitted.
+#[derive(Debug)]
+pub(crate) enum SubmitReportError {
+    /// Submission is not enabled for this report's type in the consent settings.
+    NotEnabled,
+    Failed(String),
+}
+
+impl std::fmt::Display for SubmitReportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotEnabled => f.write_str("submission is not enabled for this report type"),
+            Self::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
 pub(crate) trait ReportingCommandPort: Send + Sync {
     /// Never fails: builds a usage envelope straight from in-memory
     /// counters, no I/O beyond what's already been loaded.
@@ -58,7 +75,7 @@ pub(crate) trait ReportingCommandPort: Send + Sync {
     fn submit_report<'a>(
         &'a self,
         report_json: &'a str,
-    ) -> super::common::BoxFuture<'a, Result<SubmitReportOutcome, String>>;
+    ) -> super::common::BoxFuture<'a, Result<SubmitReportOutcome, SubmitReportError>>;
 
     fn update_consent(&self, command: ConsentCommand) -> Result<ConsentState, String>;
 }

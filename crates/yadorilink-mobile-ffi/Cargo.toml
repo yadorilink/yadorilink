@@ -32,6 +32,7 @@ bindgen = ["uniffi/cli"]
 [dependencies]
 yadorilink-embedded-host = { path = "../yadorilink-embedded-host" }
 yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
+yadorilink-os-keychain = { path = "../yadorilink-os-keychain" }
 prost = "0.14.4"
 uniffi.workspace = true
 tokio.workspace = true

@@ -247,8 +247,26 @@ impl Drop for BackstopPass {
 /// See `DaemonState::provider_content_probe`.
 pub(crate) type ProviderContentProbe = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
+/// Where this device's own account stands in its deletion lifecycle, as the netmap's
+/// `self.accountDeletionState` reports it. A value this build does not know reads as `None`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum AccountDeletionState {
+    /// No deletion pending (also: the plane did not say).
+    #[default]
+    None,
+    /// Deletion confirmed and in its ordinary grace window.
+    Pending,
+    /// The departing-account durability guard is blocking finalization and its bounded escape
+    /// hatch is running.
+    Urgent,
+}
+
 pub struct DaemonState {
     pub device_id: String,
+    /// The deletion-lifecycle state of this device's own account, as the latest netmap reported
+    /// it. Display only: replaced whole by each netmap, `None` until the first, and never read
+    /// for authorization.
+    account_deletion: std::sync::RwLock<AccountDeletionState>,
     /// Links whose disk-reconcile backstop pass is still running, by local
     /// path. A later sweep leaves such a link alone instead of stacking a
     /// second whole-folder pass on the first.
@@ -679,6 +697,16 @@ impl crate::link_runtime::dependencies::LinkRuntimeHostPort for DaemonState {
 }
 
 impl DaemonState {
+    /// Replaces the deletion state of this device's own account.
+    pub(crate) fn set_account_deletion(&self, state: AccountDeletionState) {
+        *self.account_deletion.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = state;
+    }
+
+    /// The deletion state of this device's own account, as last reported.
+    pub(crate) fn account_deletion(&self) -> AccountDeletionState {
+        *self.account_deletion.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Replaces the per-group count of requests waiting on this account's approval.
     pub(crate) fn set_pending_approvals(&self, counts: impl IntoIterator<Item = (String, u32)>) {
         *self.pending_approvals.write().unwrap_or_else(|poisoned| poisoned.into_inner()) =
@@ -1032,6 +1060,7 @@ impl DaemonState {
             device_id,
             backstop_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             pending_approvals: std::sync::RwLock::default(),
+            account_deletion: std::sync::RwLock::default(),
             custody_hold_wake: replica_coordinator.custody_hold_wake(),
             replica_coordinator,
             block_store,

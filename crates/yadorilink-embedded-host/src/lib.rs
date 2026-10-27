@@ -36,8 +36,9 @@ pub use commands::{
     ordinary_folder_links_supported, CallError, CallOptions, CancelHandle, Command, CommandError,
     CommandErrorKind, CommandOutput, CreateShare, DesktopError, DoctorCheck, DoctorStatus,
     HandoffInfo, JoinGroup, JoinShare, LinkFolder, LinkedFolder, PauseFor, PauseLink,
-    PreservedItem, PreservedKind, PreservedRef, PreservedRefusal, ProviderFolder, RestoreVersion,
-    ResumeLink, ShareFolder, ShareOutcome, SpaceManagement, UnlinkFolder, UnlinkOutcome,
+    PreservedItem, PreservedKind, PreservedRef, PreservedRefusal, ProviderFolder,
+    ReadoptMarkedFolder, ReadoptOutcome, ReadoptRefusal, RestoreVersion, ResumeLink, ShareFolder,
+    ShareOutcome, SpaceManagement, UnlinkFolder, UnlinkOutcome,
 };
 
 /// The one parser for invite links and codes, and the reason a permission refusal carries.
@@ -53,8 +54,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc;
 pub use yadorilink_daemon::embedded_host::{
-    CredentialBackend, CredentialConfig, EngineConfig, EngineTuning, KeyMirror, ReleaseProbe,
-    StartError, WitnessPlacement,
+    CredentialBackend, CredentialConfig, EngineConfig, EngineTuning, InstanceNonce,
+    InstanceNonceKeychain, KeyMirror, ReleaseProbe, StartError, WitnessPlacement,
 };
 use yadorilink_daemon::embedded_host::{Engine, Held};
 pub use yadorilink_ipc_proto::shellipc::ShellIpcMessage;

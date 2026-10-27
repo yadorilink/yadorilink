@@ -230,6 +230,15 @@ impl FetchAccount {
         }
     }
 
+    /// The fetch succeeded: the content is verified, so its progress is complete and the bytes
+    /// reported are the whole content (the snapshot stays one short of it until then).
+    fn finish_ok(&mut self) -> (u64, u64) {
+        if let Some(progress) = &self.progress {
+            progress.finish();
+        }
+        self.finish()
+    }
+
     /// Bytes verified so far and milliseconds since the request started; the fetch has ended.
     fn finish(&mut self) -> (u64, u64) {
         self.finished = true;
@@ -302,7 +311,7 @@ fn start(
             let (bytes, elapsed_ms) = account.finish();
             tracing::warn!(?failure, bytes, elapsed_ms, "a provider fetch failed");
         } else {
-            let (bytes, elapsed_ms) = account.finish();
+            let (bytes, elapsed_ms) = account.finish_ok();
             tracing::info!(bytes, elapsed_ms, ranged = request.ranged, "a provider fetch finished");
         }
         #[cfg(test)]

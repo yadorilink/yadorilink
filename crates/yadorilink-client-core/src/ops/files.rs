@@ -170,6 +170,9 @@ pub fn evict_refusal(code: &str) -> Option<EvictRefusal> {
         "nothing_freed" => {
             ("the data is still referenced by other files on this device", false, "")
         }
+        "not_downloaded" => {
+            ("the file is not downloaded on this device, so there is nothing to free", false, "")
+        }
         "not_confirmed" => {
             ("the download has not been confirmed yet, or the file is being updated", true, again)
         }

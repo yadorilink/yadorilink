@@ -242,6 +242,7 @@ impl LinkStatusReadPort for DaemonLinkStatusReader {
                 provider,
                 local_path: link.key().to_string(),
                 group_id: link.group_id.clone(),
+                orphaned: link.orphaned,
                 paused: link.paused,
                 paused_until_unix: state
                     .replica_coordinator

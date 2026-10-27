@@ -95,12 +95,19 @@ def self_test() -> int:
     assert validate({**good, "source": source}, require_source=True) == []
     for key, bad_value in [
         ("repository", "no-slash"),
+        ("repository", "../repo"),
+        ("repository", "owner/.."),
+        ("repository", "./repo"),
+        ("repository", "owner/."),
+        ("repository", "owner/repo/extra"),
         ("release_tag", "../x"),
         ("asset_name", "engine.tar.gz"),
         ("asset_name", "../engine.zip"),
     ]:
         assert validate({**good, "source": {**source, key: bad_value}}), key
     assert validate({**good, "source": {"repository": "owner/repo"}})
+    for ok_repo in ("a/b", "my-org/.github", "o.w/r..e", "_o/_r", "o/..x"):
+        assert validate({**good, "source": {**source, "repository": ok_repo}}) == [], ok_repo
     assert validate({**good, "source": {**source, "extra": 1}})
     assert validate({k: v for k, v in good.items() if k != "bundle_sha256"})
     slices = {"aarch64-apple-ios": "e" * 64, "aarch64-apple-ios-sim": "f" * 64}

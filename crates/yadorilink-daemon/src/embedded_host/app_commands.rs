@@ -107,6 +107,40 @@ pub struct ShareOutcome {
     pub already_linked: bool,
 }
 
+/// Re-adopt the provider folder of `group_id` that a start over marked as needing the person: it
+/// is joined to its group again as this device, keeping its OS folder, its root and every file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadoptMarkedFolder {
+    pub group_id: String,
+}
+
+/// What a re-adoption did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadoptOutcome {
+    pub group_id: String,
+    /// The folder's link key: its locator.
+    pub link_key: String,
+    pub provider_root_id: Option<String>,
+    /// The folder was on-demand while a replacement the service called unconfirmed waits for
+    /// this group, and is now a full replica (eager): the replacement is confirmed only for a
+    /// group held that way and complete on this device.
+    pub promoted_to_eager: bool,
+}
+
+/// Why a re-adoption was refused; nothing was changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadoptRefusal {
+    /// This engine has no folder of the group.
+    GroupUnknown,
+    /// The folder of the group is not marked as needing the person (it already syncs).
+    NotMarked,
+    /// The folder of the group is an ordinary folder: only a provider folder is re-adopted.
+    NotAProviderFolder,
+    /// The engine still runs as the identity a start over retired (its status still reports
+    /// `database_restored`): restart it first.
+    RestartRequired,
+}
+
 /// Pause sync of one linked folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PauseLink {
@@ -192,6 +226,8 @@ pub struct DoctorCheck {
     /// What was found, and the fix when there is one.
     pub detail: String,
 }
+
+const LOCATOR_PREFIX: &str = "provider://";
 
 fn failed(message: impl Into<String>) -> CommandError {
     CommandError::failed(message)
@@ -297,6 +333,109 @@ impl EngineCommands {
         Ok(())
     }
 
+    /// Re-adopts the folder a start over marked as needing the person into its group.
+    ///
+    /// The marked provider folder is joined to its group again as this device (the same
+    /// prepare, link, activate saga a join runs, over the existing folder: no second provider
+    /// folder, root or OS domain is created) and syncs again. When a replacement the service
+    /// called unconfirmed waits for the group and the folder is on-demand, it is promoted to a
+    /// full replica, the only way the replacement can be confirmed. Never deletes or rewrites a
+    /// file. If the promotion fails after the folder was re-adopted, the error says so and
+    /// calling again finishes the promotion.
+    ///
+    /// # Errors
+    /// [`super::CommandErrorKind::Readopt`] for the refusals of [`ReadoptRefusal`];
+    /// [`super::CommandErrorKind::Refused`] when the service does not take the device into the
+    /// group (the group is gone or not accessible to this account), with the code a join has.
+    pub async fn readopt_marked_folder(
+        &self,
+        command: ReadoptMarkedFolder,
+    ) -> Result<ReadoptOutcome, CommandError> {
+        let group_id = command.group_id;
+        // The engine that has not restarted since a start over still is the retired identity.
+        let restored =
+            self.status()?.attention_reasons.iter().any(|r| r.starts_with("database_restored"));
+        if restored {
+            return Err(CommandError::readopt(
+                ReadoptRefusal::RestartRequired,
+                "the engine still runs as the retired device; restart it, then re-adopt the folder",
+            ));
+        }
+        let links =
+            self.context.queries.link_status.list_links().map_err(|e| failed(e.to_string()))?;
+        let Some(link) = links.into_iter().find(|link| link.group_id == group_id) else {
+            return Err(CommandError::readopt(
+                ReadoptRefusal::GroupUnknown,
+                format!("this device has no folder of group {group_id}"),
+            ));
+        };
+        let Some((root_id, display_name)) = link.provider.clone() else {
+            return Err(CommandError::readopt(
+                ReadoptRefusal::NotAProviderFolder,
+                format!("the folder of group {group_id} is an ordinary folder"),
+            ));
+        };
+        let on_demand = link.materialization_policy != "eager";
+        let promote = on_demand && self.replacement_waits_for(&group_id);
+        if !link.orphaned {
+            // Re-adopted before, its promotion failed: only that is left to do.
+            if !promote {
+                return Err(CommandError::readopt(
+                    ReadoptRefusal::NotMarked,
+                    format!("the folder of group {group_id} is not marked as needing action"),
+                ));
+            }
+        } else {
+            let token = link.local_path.strip_prefix(LOCATOR_PREFIX).unwrap_or_default().to_owned();
+            enrollment_commands::join_and_link(
+                &self.context.application,
+                Join {
+                    group_id: group_id.clone(),
+                    group_name: display_name.clone(),
+                    local_path: String::new(),
+                    on_demand,
+                    acknowledge_risks: true,
+                    provider_display_name: display_name,
+                    request_token: token,
+                },
+            )
+            .await
+            .map_err(|e| enrollment_failure(&e))?;
+        }
+        if promote {
+            self.promote_to_eager(&group_id).await?;
+        }
+        Ok(ReadoptOutcome {
+            group_id,
+            link_key: link.local_path,
+            provider_root_id: Some(root_id),
+            promoted_to_eager: promote,
+        })
+    }
+
+    /// Whether the replacement the service called unconfirmed names `group_id`.
+    fn replacement_waits_for(&self, group_id: &str) -> bool {
+        yadorilink_local_storage::replacement_unconfirmed::read(&self.config_dir)
+            .ok()
+            .flatten()
+            .is_some_and(|record| record.unconfirmed_group_ids.iter().any(|g| g == group_id))
+    }
+
+    async fn promote_to_eager(&self, group_id: &str) -> Result<(), CommandError> {
+        use crate::application::replica_role_service::StorageModeError;
+        match self.context.application.replica_role.set_storage_mode(group_id, false).await {
+            Ok(_) => Ok(()),
+            Err(StorageModeError::TermsConsentRequired) => Err(CommandError::refused(
+                ApplicationErrorCode::TermsConsentRequired,
+                StorageModeError::TermsConsentRequired.to_string(),
+                String::new(),
+            )),
+            Err(e) => Err(failed(format!(
+                "the folder is re-adopted, but promoting it to a full replica failed ({e}); call again"
+            ))),
+        }
+    }
+
     /// Pauses a linked folder.
     ///
     /// # Errors
@@ -349,6 +488,11 @@ impl EngineCommands {
             Err(UnlinkError::NotProtected(message)) => Err(CommandError::refused(
                 ApplicationErrorCode::NotProtected,
                 message,
+                String::new(),
+            )),
+            Err(error @ UnlinkError::TermsConsentRequired) => Err(CommandError::refused(
+                ApplicationErrorCode::TermsConsentRequired,
+                error.to_string(),
                 String::new(),
             )),
             Err(UnlinkError::GroupMismatch(path)) => Err(group_mismatch(&path)),

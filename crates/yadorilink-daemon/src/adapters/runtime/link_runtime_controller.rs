@@ -912,10 +912,7 @@ impl LinkRuntimeController {
         // The disk is confirmed, but the folder may still be refused for another
         // reason (another group's marker, a lock held): do not claim success.
         if state.links.runtime(local_path).is_none() {
-            return Err(SyncError::InvalidInput(format!(
-                "the disk at {local_path} is confirmed, but the folder did not start; \
-                 see `yadorilink status`"
-            )));
+            return Err(SyncError::FolderNotStarted { local_path: local_path.to_owned() });
         }
         Ok(())
     }

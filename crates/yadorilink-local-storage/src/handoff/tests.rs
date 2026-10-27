@@ -924,7 +924,7 @@ async fn a_half_applied_switch_blocks_a_start_of_either_owner_until_it_is_settle
             seen_block = true;
             let refusal = start_refusal(&env.config).expect("a start must be blocked");
             assert!(matches!(refusal, ownership::Refusal::HandoffUnfinished { .. }));
-            assert!(refusal.message(&env.config).contains("release-to-app"));
+            assert!(refusal.message(&env.config).contains("hand-off"));
         }
     }
     assert!(seen_block);

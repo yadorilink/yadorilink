@@ -110,6 +110,8 @@ pub(crate) struct LinkStatusView {
     /// `(root_id, display_name)` of a provider-backed folder.
     pub(crate) provider: Option<(String, String)>,
     pub(crate) group_id: String,
+    /// The link is marked as needing the person (no longer joined to its group); its files stay.
+    pub(crate) orphaned: bool,
     pub(crate) paused: bool,
     /// Unix time a timed pause ends; 0 when not paused or paused until resumed.
     pub(crate) paused_until_unix: i64,

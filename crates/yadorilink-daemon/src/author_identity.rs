@@ -82,10 +82,14 @@ pub fn open_author_identity(
     conn: &Connection,
     db_path: &Path,
     placement: &crate::install_witness::WitnessPlacement,
+    nonce: Option<&dyn crate::instance_nonce::InstanceNonceKeychain>,
     device_id: &str,
     signing_key: ed25519_dalek::SigningKey,
 ) -> Result<Arc<LocalAuthorKey>, AuthorIdentityError> {
     let witness = placement.store(db_path).map_err(AuthorIdentityError::Witness)?;
+    if let Some(keychain) = nonce {
+        check_instance_nonce(conn, db_path, device_id, keychain)?;
+    }
     open_author_identity_on(
         conn,
         db_path,
@@ -120,6 +124,23 @@ pub(crate) fn open_author_identity_on(
             author_incarnation::rotate_incarnation(conn, IncarnationMintReason::OwnAuthorAhead)?;
     }
     Ok(Arc::new(publish(db_path, &record, signing_key)?))
+}
+
+/// Compares the keychain instance nonce with the one beside the database
+/// ([`crate::instance_nonce`]) before anything is minted or rotated.
+fn check_instance_nonce(
+    conn: &Connection,
+    db_path: &Path,
+    device_id: &str,
+    keychain: &dyn crate::instance_nonce::InstanceNonceKeychain,
+) -> Result<(), AuthorIdentityError> {
+    use crate::instance_nonce::NonceError;
+    let no_identity_here = author_incarnation::incarnation_record(conn)?
+        .is_none_or(|record| record.author.device.as_str() != device_id);
+    crate::instance_nonce::check(db_path, keychain, no_identity_here).map_err(|error| match error {
+        NonceError::Restored(reason) => AuthorIdentityError::DatabaseRestored(reason),
+        NonceError::Io(error) => AuthorIdentityError::Witness(error),
+    })
 }
 
 /// Compares the database's installation witness with the side copy
@@ -247,6 +268,7 @@ impl ReplicaAuthor {
     pub fn open(
         database: &yadorilink_sqlite_runtime::SyncDatabase,
         placement: &crate::install_witness::WitnessPlacement,
+        nonce: Option<&dyn crate::instance_nonce::InstanceNonceKeychain>,
         device_id: &str,
         signing_key: ed25519_dalek::SigningKey,
     ) -> Result<Self, AuthorIdentityError> {
@@ -254,9 +276,14 @@ impl ReplicaAuthor {
             .write::<_, IdentityStep>(|conn| {
                 let db_path = main_database_path(conn)?;
                 let handle = match &db_path {
-                    Some(path) => {
-                        open_author_identity(conn, path, placement, device_id, signing_key.clone())?
-                    }
+                    Some(path) => open_author_identity(
+                        conn,
+                        path,
+                        placement,
+                        nonce,
+                        device_id,
+                        signing_key.clone(),
+                    )?,
                     None => Arc::new(LocalAuthorKey::new(
                         in_memory_record(conn, device_id)?.author,
                         signing_key.clone(),
@@ -803,8 +830,9 @@ mod tests {
             } else {
                 WitnessPlacement::At(dir.clone())
             };
-            let open =
-                || open_author_identity(&replica.conn(), &replica.db, &placement, DEVICE, key());
+            let open = || {
+                open_author_identity(&replica.conn(), &replica.db, &placement, None, DEVICE, key())
+            };
             open().expect("a fresh install opens");
             open().expect("a normal restart opens");
             for entry in std::fs::read_dir(&dir).unwrap() {

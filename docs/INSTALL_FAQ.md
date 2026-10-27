@@ -1,5 +1,7 @@
 # Install, update and uninstall: FAQ
 
+日本語版: [INSTALL_FAQ.ja.md](INSTALL_FAQ.ja.md)
+
 Answers for installing, updating and uninstalling the YadoriLink engine (the
 `yadorilink` command line and `yadorilink-daemon`). See also the
 [README](../README.md#installing) and the [Linux README](../packaging/linux/README.md).

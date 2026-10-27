@@ -3,11 +3,17 @@
 This is the current policy for the pre-1.0 line. It can change before 1.0, and
 any change will be announced in the release notes.
 
-## Versions must match exactly
+## Versions should match
 
-All of a user's devices should run the same release. YadoriLink does not
-negotiate between protocol generations and does not promise that a release
+Policy: all of a user's devices should run the same release. YadoriLink does
+not negotiate between protocol generations and does not promise that a release
 works with the one before it. Update every device together.
+
+What the software enforces is narrower than that policy. Peers compare only
+the wire constants `PROTOCOL_VERSION` (lane hello) and `RPC_VERSION` (service
+RPC), not the release number. Two releases that carry the same pair connect and
+sync, whether or not the release numbers are equal. Peers with a different pair
+are refused (see "Rolling upgrade contract").
 
 ## A protocol change is an announced product event
 
@@ -18,16 +24,17 @@ is told that an update is required.
 
 ## What you see during a version mismatch
 
-A device on a different version is reported as reachable but incompatible, with
-an "update required" message. It is never shown as offline, because it is online
+A device whose `PROTOCOL_VERSION` or `RPC_VERSION` differs is reported as
+reachable but incompatible, with an "update required" message. It is never shown as offline, because it is online
 and the fix is to update, not to wait. Sync with it pauses until the versions
 match again. Nothing is deleted or reclaimed because of the pause.
 
 ## Safety-critical operations fail closed
 
 Storage custody, handoff, space reclaim, and demote, unlink, remove or revoke
-of a device only count a peer whose version and capabilities are known and
-match. A peer whose version is unknown or different is excluded, and the
+of a device only count a peer whose protocol generation (`PROTOCOL_VERSION`,
+`RPC_VERSION`) and capabilities are known and match. A peer whose generation is
+unknown or different is excluded, and the
 operation waits or is refused instead of proceeding. An unsupported capability
 never reads as "false" or as success.
 
@@ -48,10 +55,14 @@ rejected with a message asking to restart or finish updating.
 
 This section states exactly what happens while some of your devices run a newer or
 older release than others. It applies to the pre-1.0 line, including
-v0.1.0-beta.7, and complements the policy above and [CUTOVER.md](CUTOVER.md) (the generation
-ledger). The rule is simple: **there is no mixed-version operation.** Devices on different
-protocol generations do not sync with each other. They refuse each other
-cleanly, and nothing is lost while they wait for the update.
+v0.1.0-beta.8, and complements the policy above and [CUTOVER.md](CUTOVER.md) (the generation
+ledger). The enforced rule is about protocol generations, not release numbers:
+**devices on different protocol generations do not sync with each other.** They
+refuse each other cleanly, and nothing is lost while they wait for the update.
+Devices on the same generation (the same `PROTOCOL_VERSION` and `RPC_VERSION`)
+are not refused by the peer handshake even when their release numbers differ;
+the release number is not compared. Running different releases of one
+generation is still outside the policy above and is not promised to work.
 
 Every statement below names the code that enforces it and the test that pins
 it.
@@ -121,11 +132,17 @@ older one (table above). Going back to an older release therefore means
 installing it on every device and recreating local state when the schema
 differs; the release notes say when.
 
-### Minimum supported version for v0.1.0-beta.7
+### Releases of the current generation
 
-v0.1.0-beta.7 is on the same protocol generation as v0.1.0-beta.5, the first
-public release (`PROTOCOL_VERSION` 4, `RPC_VERSION` 2). The local state schema changed:
-`SCHEMA_VERSION` is 133 (it was 132 in beta.5). Nothing is migrated, so
-beta.7 refuses a beta.5 state database and the other way round; update every
-device and set up again as described in the beta.5 release notes. No build
-before beta.5 was public, so no older peer is supported and none is promised.
+v0.1.0-beta.5, the first public release, v0.1.0-beta.6, v0.1.0-beta.7 and v0.1.0-beta.8 all
+carry the same protocol generation (`PROTOCOL_VERSION` 4, `RPC_VERSION` 2). Their
+peers pass the lane hello and service RPC checks and can talk to each other; no
+code compares the release number. No build before beta.5 was public, so no
+older peer is supported and none is promised.
+
+The local state schema is separate and is per device, not part of the peer
+handshake. `SCHEMA_VERSION` is 132 in beta.5 and 133 in beta.6, beta.7 and beta.8.
+Nothing is migrated, so a build refuses a state database of the other schema
+(beta.5 and beta.6, beta.7 or beta.8 refuse each other's database). A device that
+moves between beta.5 and a later beta must recreate its local state as described
+in the release notes; after that it can sync with peers on the other release.

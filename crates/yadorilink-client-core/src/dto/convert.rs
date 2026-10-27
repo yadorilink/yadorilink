@@ -385,6 +385,8 @@ fn attention_category(item: view::AttentionItem) -> AttentionCategory {
         | I::ReplacementSignInRequired
         | I::TermsConsentRequired
         | I::SignInRequired
+        | I::AccountDeletionPending
+        | I::AccountDeletionUrgent
         | I::NotJoined
         | I::FileWatchLimit
         | I::UnreadableFiles
@@ -610,6 +612,9 @@ pub fn status_dimensions_json(response: &StatusResponse) -> serde_json::Value {
                 "placeholder_count": link.placeholder_count,
                 "availability": availability(&view::AvailabilitySummary::from_link(link)),
                 "protection": protection(&view::ProtectionSummary::from_link(link)),
+                // Why the folder is degraded, as the attention code the rollup reports for it
+                // (`waiting_for_disk_space`, `file_watch_limit`, ...); null when it is not.
+                "degraded_cause": view::DegradedCause::of(link).map(|c| c.item().key()),
             })
         })
         .collect();

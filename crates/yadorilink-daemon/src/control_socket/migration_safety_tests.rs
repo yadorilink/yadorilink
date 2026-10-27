@@ -209,7 +209,8 @@ async fn unlink_of_the_only_complete_copy_is_refused_as_not_protected() {
     match response.payload {
         Some(RespPayload::CommandError(e)) => {
             assert_eq!(e.code(), ApplicationErrorCode::NotProtected, "{e:?}");
-            assert!(e.message.contains("--force"), "{}", e.message);
+            // The text is host-neutral: the front end words the force option itself.
+            assert!(!e.message.contains("--force"), "{}", e.message);
         }
         other => panic!("expected a typed refusal, got {other:?}"),
     }

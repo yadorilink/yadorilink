@@ -153,7 +153,7 @@ impl LinkRuntimeFactory {
             );
         }
         // Capability-probe artefacts a killed process left. The root lock is held, so no
-        // probe of another process runs here, and nothing is probing yet in this one.
+        // probe of another process runs here; a probe of this process is left alone by the sweep.
         let probe_sweep =
             yadorilink_fs_platform::fs_capabilities::sweep_probe_artefacts(Path::new(&local_path));
         if !probe_sweep.removed.is_empty() {

@@ -44,11 +44,89 @@ pub type TruncationNote = dyn Fn(&FolderGroupId, Option<RetainedSummary>) + Send
 type GroupsToSync = dyn Fn() -> Vec<FolderGroupId> + Send + Sync;
 pub type ActivitySignal = dyn Fn() + Send + Sync;
 
+/// Monotonic counters of this daemon's replication work, for the `/metrics` endpoint: how many
+/// delta entries received from peers were admitted, were already known, were held for a missing
+/// predecessor or were refused, and how much this side sent in answer to peers (replies,
+/// pushed delta batches, recovery chunks). They only ever grow, so an acceptance run reads them
+/// before and after an idle window and expects no change.
+#[derive(Debug, Default)]
+pub struct ReplicationCounters {
+    deltas_admitted: std::sync::atomic::AtomicU64,
+    deltas_duplicate: std::sync::atomic::AtomicU64,
+    deltas_held: std::sync::atomic::AtomicU64,
+    deltas_rejected: std::sync::atomic::AtomicU64,
+    served_bytes: std::sync::atomic::AtomicU64,
+    served_messages: std::sync::atomic::AtomicU64,
+}
+
+/// A point-in-time read of [`ReplicationCounters`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicationCounts {
+    pub deltas_admitted: u64,
+    pub deltas_duplicate: u64,
+    pub deltas_held: u64,
+    pub deltas_rejected: u64,
+    pub served_bytes: u64,
+    pub served_messages: u64,
+}
+
+impl ReplicationCounters {
+    fn note_ingest(&self, report: &IngestReport) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.deltas_admitted.fetch_add(report.admitted as u64, Relaxed);
+        self.deltas_duplicate.fetch_add(report.duplicates as u64, Relaxed);
+        self.deltas_held.fetch_add(report.held as u64, Relaxed);
+        self.deltas_rejected.fetch_add(report.rejected.len() as u64, Relaxed);
+    }
+
+    fn note_served(&self, bytes: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.served_bytes.fetch_add(bytes as u64, Relaxed);
+        self.served_messages.fetch_add(1, Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_ingest_for_tests(
+        &self,
+        admitted: usize,
+        duplicates: usize,
+        held: usize,
+        rejected: usize,
+    ) {
+        self.note_ingest(&IngestReport {
+            group: String::new(),
+            admitted,
+            duplicates,
+            held,
+            rejected: vec![String::new(); rejected],
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_served_for_tests(&self, bytes: usize) {
+        self.note_served(bytes);
+    }
+
+    pub fn snapshot(&self) -> ReplicationCounts {
+        use std::sync::atomic::Ordering::Relaxed;
+        ReplicationCounts {
+            deltas_admitted: self.deltas_admitted.load(Relaxed),
+            deltas_duplicate: self.deltas_duplicate.load(Relaxed),
+            deltas_held: self.deltas_held.load(Relaxed),
+            deltas_rejected: self.deltas_rejected.load(Relaxed),
+            served_bytes: self.served_bytes.load(Relaxed),
+            served_messages: self.served_messages.load(Relaxed),
+        }
+    }
+}
+
 /// What a peer connection needs from the daemon, as plain closures so the
 /// driver depends on no daemon state type.
 #[derive(Clone)]
 pub struct ReplicationEnv {
     pub db: Arc<SyncDatabase>,
+    /// The daemon's replication counters.
+    pub counters: Arc<ReplicationCounters>,
     /// This device's id, naming whose join timeline a milestone belongs to.
     pub local_device_id: String,
     /// Whether `group` is hosted here and shared with this peer.
@@ -322,6 +400,7 @@ async fn serve_stream(
         Err(_) => return,
     };
     if let Some(report) = &answer.ingested {
+        env.counters.note_ingest(report);
         log_ingest(report);
         if report.admitted > 0 {
             yadorilink_fs_platform::join_timeline::mark(
@@ -366,7 +445,9 @@ async fn serve_stream(
                 reason: protocol5::RefusalReason::Overloaded,
             });
             if let Ok(refusal) = refusal {
-                send_and_finish(&mut writer, &refusal).await;
+                if send_and_finish(&mut writer, &refusal).await {
+                    env.counters.note_served(refusal.len());
+                }
             }
             return;
         }
@@ -377,7 +458,9 @@ async fn serve_stream(
         return;
     }
     if let Some(reply) = answer.reply {
-        send_and_finish(&mut writer, &reply).await;
+        if send_and_finish(&mut writer, &reply).await {
+            env.counters.note_served(reply.len());
+        }
     }
     for push in answer.pushes {
         // Access is asked again before every batch: a peer that loses the
@@ -387,7 +470,7 @@ async fn serve_stream(
                 return;
             }
         }
-        if !push_message(&connection, &push).await {
+        if !push_message(&env.counters, &connection, &push).await {
             return;
         }
     }
@@ -409,7 +492,7 @@ async fn serve_recovery(
             // come, instead of leaving the peer to wait out its ask cooldown.
             if let Ok(refusal) = protocol5::encode_message(&Message::Refused { request_id, reason })
             {
-                push_message(connection, &refusal).await;
+                push_message(&env.counters, connection, &refusal).await;
             }
             return;
         }
@@ -433,7 +516,7 @@ async fn serve_recovery(
         }) else {
             return;
         };
-        if !push_message(connection, &message).await {
+        if !push_message(&env.counters, connection, &message).await {
             return;
         }
     }
@@ -509,13 +592,21 @@ async fn ask_recovery(
 }
 
 /// Sends `bytes` as one message on a stream of its own.
-async fn push_message(connection: &NativeReplicationConnection, bytes: &[u8]) -> bool {
+async fn push_message(
+    counters: &ReplicationCounters,
+    connection: &NativeReplicationConnection,
+    bytes: &[u8],
+) -> bool {
     let Ok(Ok((mut writer, _reader))) =
         tokio::time::timeout(STREAM_STEP, connection.open_stream()).await
     else {
         return false;
     };
-    send_and_finish(&mut writer, bytes).await
+    let sent = send_and_finish(&mut writer, bytes).await;
+    if sent {
+        counters.note_served(bytes.len());
+    }
+    sent
 }
 
 fn log_ingest(report: &IngestReport) {
@@ -722,7 +813,7 @@ pub async fn push_published(
     let Ok(Ok(entries)) = entries else { return };
     let Ok(batches) = session::delta_batches(group, entries) else { return };
     for batch in batches {
-        push_message(connection, &batch).await;
+        push_message(&env.counters, connection, &batch).await;
     }
 }
 

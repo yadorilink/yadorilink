@@ -1788,6 +1788,24 @@ fn assembly_progress_is_monotonic_bounded_and_complete_only_when_finished() {
     assert_eq!(empty.snapshot(), None);
 }
 
+#[test]
+fn a_finished_fetch_logs_the_whole_content_not_one_byte_short() {
+    let progress = std::sync::Arc::new(AssemblyProgress::default());
+    progress.begin(1000);
+    progress.plan_fetch(1000);
+    progress.advance(3000);
+    let account = |progress: &std::sync::Arc<AssemblyProgress>| super::FetchAccount {
+        started: std::time::Instant::now(),
+        progress: Some(progress.clone()),
+        ranged: false,
+        finished: false,
+    };
+    // Before the content is verified the count stays short of the total.
+    assert_eq!(account(&progress).finish().0, 999);
+    // A successful fetch reports every byte.
+    assert_eq!(account(&progress).finish_ok().0, 1000);
+}
+
 impl Fx {
     fn link_key(&self) -> String {
         self.state

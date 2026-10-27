@@ -902,17 +902,20 @@ async fn main() {
     let result = run(cli.command).await;
     if let Err(e) = result {
         eprintln!("error: {e}");
-        if let Some(device) = commands::auth::auto_sign_in_plan(
-            &e,
-            is_sign_in_command,
-            commands::auth::TerminalEnv::detect(),
-        ) {
+        // The terminal is only inspected (it may run `who`/`tmux`) for a failure a sign-in settles.
+        if let Some(device) = (e.is_sign_in_required() && !is_sign_in_command)
+            .then(commands::auth::TerminalEnv::detect)
+            .and_then(|env| commands::auth::auto_sign_in_plan(&e, is_sign_in_command, env))
+        {
             // The person is at a terminal: start the normal sign-in now, everything on stderr.
             // The command itself did not run, so it is not retried; the exit code stays the
             // failure's, whatever the sign-in does.
             eprintln!("Starting the sign-in. The browser shows the Terms to review and accept.");
             match commands::auth::login_on_stderr(device).await {
-                Ok(()) => eprintln!("Signed in. Run the command again."),
+                Ok(()) => eprintln!(
+                    "Signed in. Run the command again; a running daemon can take up to two \
+                     minutes to notice."
+                ),
                 Err(login_error) => eprintln!("error: {login_error}"),
             }
         }

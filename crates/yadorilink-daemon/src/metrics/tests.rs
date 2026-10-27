@@ -26,6 +26,33 @@ async fn renders_every_documented_metric_family() {
     assert!(rendered.contains("yadorilink_active_peers"));
     assert!(rendered.contains("yadorilink_sync_errors_total"));
     assert!(rendered.contains("yadorilink_block_fetch_seconds"));
+    for outcome in ["admitted", "duplicate", "held", "rejected"] {
+        assert!(
+            rendered.contains(&format!(
+                "yadorilink_replication_deltas_total{{outcome=\"{outcome}\"}} 0"
+            )),
+            "{outcome}: {rendered}"
+        );
+    }
+    assert!(rendered.contains("yadorilink_replication_served_bytes_total 0"));
+    assert!(rendered.contains("yadorilink_replication_served_messages_total 0"));
+}
+
+#[tokio::test]
+async fn replication_counters_are_rendered_per_outcome() {
+    let state = test_state();
+    let counters = state.telemetry.replication_counters();
+    counters.record_ingest_for_tests(3, 2, 1, 4);
+    counters.record_served_for_tests(100);
+    counters.record_served_for_tests(50);
+
+    let rendered = DaemonMetrics::new(state).render_openmetrics();
+    assert!(rendered.contains("yadorilink_replication_deltas_total{outcome=\"admitted\"} 3"));
+    assert!(rendered.contains("yadorilink_replication_deltas_total{outcome=\"duplicate\"} 2"));
+    assert!(rendered.contains("yadorilink_replication_deltas_total{outcome=\"held\"} 1"));
+    assert!(rendered.contains("yadorilink_replication_deltas_total{outcome=\"rejected\"} 4"));
+    assert!(rendered.contains("yadorilink_replication_served_bytes_total 150"));
+    assert!(rendered.contains("yadorilink_replication_served_messages_total 2"));
 }
 
 #[tokio::test]

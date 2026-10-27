@@ -197,7 +197,7 @@ def validate_manifest(manifest: dict, check_urls: bool, floor: str | None = None
     The live channel manifest must carry a valid expires_at; with `snapshot` (a per-version
     manifest, published once and kept, never expired) it is accepted with or without one."""
     problems: list[str] = []
-    if manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
+    if not channel_ledger._is_int(manifest.get("schema_version")) or manifest["schema_version"] != MANIFEST_SCHEMA_VERSION:
         problems.append(
             f"schema_version must be {MANIFEST_SCHEMA_VERSION}, got {manifest.get('schema_version')!r}"
         )
@@ -235,7 +235,7 @@ def validate_manifest(manifest: dict, check_urls: bool, floor: str | None = None
         if ch not in CHANNELS:
             problems.append(f"{where}.channel {ch!r} is not one of {CHANNELS}")
         roll = e.get("rollout_percentage", 0)
-        if not isinstance(roll, int) or not (0 <= roll <= 100):
+        if not channel_ledger._is_int(roll) or not (0 <= roll <= 100):
             problems.append(f"{where}.rollout_percentage {roll!r} must be an int in 0..100")
         size = e.get("artifact_size")
         if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
@@ -398,13 +398,11 @@ def cmd_assemble(args: argparse.Namespace) -> int:
             previous = channel_ledger.load_json(
                 Path(args.previous_ledger).read_text(encoding="utf-8"), args.previous_ledger)
         source = None
-        source_path = args.promotion_source_ledger
-        if not source_path and (source_channel := release_channels.PROMOTES_FROM.get(ledger_path.stem)):
-            # A channel that promotes always reads its source from the sibling ledger, as the
-            # publisher does (plan.load_inputs): no caller can forget the argument.
-            source_path = str(ledger_path.with_name(f"{source_channel}.json"))
-        if source_path and (args.promotion_source_ledger or Path(source_path).is_file()):
-            source = channel_ledger.load_json(Path(source_path).read_text(encoding="utf-8"), source_path)
+        if args.promotion_source_ledger:
+            # The stamped snapshot the source channel serves (the publisher reads it from storage);
+            # the repository file carries no stamps, so it cannot show a soak.
+            source = channel_ledger.load_json(
+                Path(args.promotion_source_ledger).read_text(encoding="utf-8"), args.promotion_source_ledger)
         records = channel_ledger.load_records(Path(args.records_dir))
         chain_text = Path(args.trust_chain).read_text(encoding="utf-8")
         plan = channel_ledger.assemble(
@@ -558,8 +556,8 @@ def main(argv: list[str]) -> int:
                    help="the ledger this one replaces (e.g. from the base branch); enables the "
                         "promotion, yank and live-minimum rules")
     a.add_argument("--promotion-source-ledger", default=None,
-                   help="the ledger of the channel this one promotes from (default: the sibling <source>.json "
-                        "of a channel that promotes; a missing one is refused by the ledger rules)")
+                   help="the stamped ledger snapshot the channel this one promotes from serves now (a "
+                        "channel that promotes is refused without it; the repository file carries no stamps)")
     a.add_argument("--served-appcast-version", default=None,
                    help="app_bundle version currently in the served appcast")
     a.add_argument("--trust-chain", default=str(Path(__file__).with_name("trust-chain.json")))

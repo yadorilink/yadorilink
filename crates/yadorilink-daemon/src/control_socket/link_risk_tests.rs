@@ -533,3 +533,32 @@ fn an_os_denied_root_is_an_access_denied_link_refusal() {
         None
     );
 }
+
+/// A refusal that carries a next step reaches a client as the typed step with a text that
+/// names no command or flag.
+#[test]
+fn an_advised_link_failure_carries_its_step_and_no_command() {
+    use crate::error::{DaemonError, NextStep};
+    let error = DaemonError::Advised {
+        message: "x is still being linked to group g; wait for that to finish".into(),
+        step: NextStep::CheckLinkStatus,
+    };
+    match super::link_failure_payload(&error) {
+        RespPayload::Refused(refused) => {
+            assert_eq!(
+                refused.next_step(),
+                yadorilink_ipc_proto::daemonctl::NextStep::CheckLinkStatus
+            );
+            assert!(!refused.message.contains("yadorilink"), "{}", refused.message);
+        }
+        other => panic!("expected a refusal with a next step, got {other:?}"),
+    }
+}
+
+/// No provider refusal text names a command or flag; the front end words the step.
+#[test]
+fn provider_refusal_texts_name_no_command() {
+    for text in [super::PROVIDER_LOCAL_STATE, super::PROVIDER_DOWNLOAD] {
+        assert!(!text.contains('`') && !text.contains("yadorilink"), "{text}");
+    }
+}

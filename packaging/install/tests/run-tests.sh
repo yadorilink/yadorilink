@@ -173,6 +173,18 @@ TRUSTSET=$TS; inst s7 s7; unset TRUSTSET
 newhome 23
 TRUSTSET="yadorilink-test-key:$(pub s7other) next-key:$(pub s7)"; inst s7 s7; unset TRUSTSET
 { [ $RC != 0 ] && has "does NOT verify" && nothing_installed; } && ok "trust set: key id bound to its own key" || bad "trust set key binding" "$T/out"
+# a rotation announcement (top-level trust_chain with nested key_id fields) must not break the key_id read
+newhome 24; fx s24
+python3 - "$SRV/s24" <<'PY'
+import json, pathlib, sys
+for p in pathlib.Path(sys.argv[1]).glob("*/manifest.json"):
+    if p.parent.name == "files": continue
+    e = json.load(open(p))
+    e["trust_chain"] = [{"key_id": e["key_id"], "record_json": '{"add":[{"key_id":"spare [x]","public_key_hex":"00"}]}', "signature_base64": "AA=="}]
+    json.dump(e, open(p, "w"))
+PY
+inst s24 s24
+{ [ $RC = 0 ] && version_is 0.2.0; } && ok "envelope with trust_chain installs" || bad "envelope with trust_chain" "$T/out"
 newhome 8
 env HOME="$H" YADORILINK_INSTALL_TEST=1 YADORILINK_INSTALL_MIN_GENERATED_AT=2000-01-01T00:00:00Z YADORILINK_INSTALL_PUBKEY_HEX="$(pub s7)" YADORILINK_INSTALL_KEY_ID=some-other-id \
     YADORILINK_INSTALL_BASE_URL="$BASE/s7" YADORILINK_INSTALL_OS=Linux YADORILINK_INSTALL_ARCH=x86_64 sh "$INSTALL" --prefix "$H/prefix" --yes > "$T/out" 2>&1; RC=$?
@@ -496,6 +508,24 @@ ls -l "$H/prefix/bin" | sed 's/.* yadorilink/yadorilink/' > "$T/links.after"
 { [ $RC != 0 ] && has "could not write the install receipt" && ! has "Installed YadoriLink" && version_is 0.2.0 \
     && cmp -s "$SH/install-receipt" "$T/receipt.before" && cmp -s "$T/links.before" "$T/links.after" \
     && [ "$(ls "$SH/versions" | wc -l | tr -d ' ')" = 1 ]; } && ok "receipt write failure fails closed and restores links, receipt and versions" || bad "receipt failure rollback" "$T/out"
+
+# --- ownership: the app, another installation or an unreadable record stops the install (exit 19)
+newhome 72; fx o1 --version 0.2.0
+owner_record() { mkdir -p "$H/cfg"; printf '{\n  "owner": "%s",\n  "install_source": "%s",\n  "install_root": "/x",\n  "release_id": "",\n  "written_at": 1\n}\n' "$1" "$2" > "$H/cfg/install-owner.json"; }
+for pair in gui:app_bundle gui:microsoft_store cli:apt cli:homebrew cli:standalone; do
+    newhome 73; owner_record "${pair%%:*}" "${pair#*:}"
+    YADORILINK_INSTALL_FAIL_RECEIPT=0 YADORILINK_CONFIG_DIR=$H/cfg inst o1 o1
+    { [ $RC = 19 ] && has "Nothing was installed" && nothing_installed; } && ok "owner ${pair} refused with 19" || bad "owner $pair" "$T/out"
+done
+newhome 74; mkdir -p "$H/cfg"; echo 'not json' > "$H/cfg/install-owner.json"
+YADORILINK_INSTALL_FAIL_RECEIPT=0 YADORILINK_CONFIG_DIR=$H/cfg inst o1 o1
+{ [ $RC = 19 ] && has "cannot be read" && nothing_installed; } && ok "unreadable ownership record refused with 19" || bad "unreadable record" "$T/out"
+newhome 75; owner_record cli script
+YADORILINK_INSTALL_FAIL_RECEIPT=0 YADORILINK_CONFIG_DIR=$H/cfg inst o1 o1
+{ [ $RC = 0 ] && version_is 0.2.0; } && ok "script-owned data installs" || bad "script owner" "$T/out"
+newhome 76
+YADORILINK_INSTALL_FAIL_RECEIPT=0 YADORILINK_CONFIG_DIR=$H/cfg inst o1 o1
+{ [ $RC = 0 ] && version_is 0.2.0; } && ok "no ownership record installs" || bad "no record" "$T/out"
 
 # --- cross-check: the fixture signer (RFC 8032 reference) agrees with OpenSSL 3
 if [ -n "$OPENSSL3" ]; then
