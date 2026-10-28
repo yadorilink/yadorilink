@@ -265,7 +265,10 @@ async fn keep_both(
         )?;
         permit.verify()?;
         copy_in_place(state, group_id, root, copy_abs)?;
-        bump_fence(state, group_id, copy_path)?;
+        // Only the name the copy moves to loses its proof. The copy's own path keeps
+        // the proof of the version it held: capture needs it to vouch for the delete of
+        // that version, and without it a copy another device authored is never removed
+        // there, so the two devices differ for good.
         bump_fence(state, group_id, &target)?;
         match durable_dir::move_durably(copy_abs, &target_abs, Replace::No) {
             Ok(()) => {

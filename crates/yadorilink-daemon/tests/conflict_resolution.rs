@@ -364,22 +364,20 @@ fn fence(device: &TestDevice, group_id: &str, path: &str) -> i64 {
     device.state.replica_coordinator.dag_snapshot_mutation_fence(group_id, path).unwrap()
 }
 
-/// Keep both retires any proof of what was at the copy's path before the copy is moved: the
-/// path's mutation fence moves on. Keep this leaves the copy alone, so its fence stays.
+/// Keep both retires any proof of what was at the name the copy moves to: that path's mutation
+/// fence moves on. The copy's own path keeps its proof, which is what lets capture vouch for the
+/// version it removes from there (see `conflict_resolution::keep_both`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn resolving_invalidates_the_proof_of_the_copy_path() {
-    for (group_id, resolution) in [("conflict-fence-keep-both", ConflictResolution::KeepBoth)] {
-        let (a, socket) = device_with_conflict(group_id).await;
-        let before = fence(&a, group_id, COPY);
+async fn keep_both_retires_the_proof_of_the_name_the_copy_moves_to() {
+    let group_id = "conflict-fence-keep-both";
+    let (a, socket) = device_with_conflict(group_id).await;
+    let target = "plan (other version).txt";
+    let before = fence(&a, group_id, target);
 
-        let outcome = resolve(&socket, &a, COPY, resolution).await;
+    let outcome = resolve(&socket, &a, COPY, ConflictResolution::KeepBoth).await;
 
-        assert!(matches!(outcome, Outcome::KeptPath(_)), "{outcome:?}");
-        assert!(
-            fence(&a, group_id, COPY) > before,
-            "the copy's mutation fence did not move on ({resolution:?})"
-        );
-    }
+    assert!(matches!(outcome, Outcome::KeptPath(_)), "{outcome:?}");
+    assert!(fence(&a, group_id, target) > before, "the target's mutation fence did not move on");
 }
 
 /// Keep this over a name that is a folder now is refused.

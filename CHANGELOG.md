@@ -14,6 +14,7 @@ prerelease suffix (e.g. `v0.1.0-beta.1`).
 ## [v0.1.0-beta.8] - 2026-10-28
 
 ### Fixed
+- Keeping both files when resolving a conflict no longer leaves two devices out of sync.
 - The `install.sh` one-liner reads the manifest key id correctly when the manifest carries a trust chain.
 - The one-liner stops with a clear message when the desktop app or another installation already owns the data.
 - A copied data area is detected and no longer shared by two devices by mistake.
