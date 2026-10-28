@@ -70,6 +70,7 @@ jobs:
           name: verifier-build-${{ matrix.target }}
           path: verifier-out
           if-no-files-found: error
+          retention-days: 14
 
   # Attestation half: the only job with id-token/attestations. It downloads just
   # this run's verifier-build artifact, re-verifies it by hash (nothing from it

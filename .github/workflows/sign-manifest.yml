@@ -90,6 +90,7 @@ jobs:
           name: manifest-signer
           path: signer/yadorilink-sign-manifest
           if-no-files-found: error
+          retention-days: 14
 
   sign:
     needs: build-signer
@@ -163,6 +164,7 @@ jobs:
           name: signed-bundle
           path: bundle/bundle.json
           if-no-files-found: error
+          retention-days: 14
 
   attest:
     needs: sign

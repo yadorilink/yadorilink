@@ -187,6 +187,7 @@ jobs:
           name: yadorilink-linux-artifacts
           path: release/linux
           if-no-files-found: error
+          retention-days: 14
 
   # Multi-arch (amd64+arm64) yadorilink-daemon image, published to GHCR --
   # see packaging/docker/Dockerfile's header for what it contains and why.
@@ -297,6 +298,7 @@ jobs:
           name: yadorilink-windows-build-health
           path: release/windows
           if-no-files-found: error
+          retention-days: 7
 
   macos-build-health:
     runs-on: macos-latest
@@ -352,6 +354,7 @@ jobs:
           name: yadorilink-macos-build-health
           path: release/macos
           if-no-files-found: error
+          retention-days: 7
 
   # Per-channel engine bundle (zip), built from this tree with the real release
   # trust root. This job is deliberately unprivileged: no environment, no
@@ -609,6 +612,7 @@ jobs:
           name: engine-build-${{ matrix.target }}
           path: engine-bundle
           if-no-files-found: error
+          retention-days: 7
 
   # Attestation half: the only job with id-token/attestations. It downloads
   # just this run's engine-build artifact, re-verifies it by hash (nothing from
@@ -787,6 +791,7 @@ jobs:
           name: engine-signed-macos-aarch64
           path: engine-signed
           if-no-files-found: error
+          retention-days: 14
 
   # Attestation half for the signed macOS bundle: like engine-attest, the only kind of job with
   # id-token/attestations, no environment, no secrets, nothing runs. It has GitHub sign a
@@ -977,6 +982,7 @@ jobs:
           name: engine-bundle-${{ matrix.target }}
           path: engine-bundle
           if-no-files-found: error
+          retention-days: 14
 
   nightly-release:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
