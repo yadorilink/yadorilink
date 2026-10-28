@@ -130,3 +130,14 @@ pub async fn query_link_status(state: Arc<DaemonState>, group_id: &str) -> LinkS
         .find(|l| l.group_id == group_id)
         .unwrap_or_else(|| panic!("control socket did not report group {group_id}"))
 }
+
+/// The text of a refused command: a plain `Error`, or the typed `Refused` a retryable refusal
+/// answers with (it carries the same message plus the next step a front end words itself).
+#[allow(dead_code)]
+pub fn refusal_message(payload: &Option<RespPayload>) -> Option<String> {
+    match payload {
+        Some(RespPayload::Error(message)) => Some(message.clone()),
+        Some(RespPayload::Refused(refused)) => Some(refused.message.clone()),
+        _ => None,
+    }
+}

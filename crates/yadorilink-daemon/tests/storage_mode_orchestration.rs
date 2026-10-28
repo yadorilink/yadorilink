@@ -376,7 +376,7 @@ async fn demotion_refused_by_the_worker_leaves_local_policy_untouched() {
     )
     .await;
     assert!(
-        matches!(resp.payload, Some(RespPayload::Error(_))),
+        support::control_socket_client::refusal_message(&resp.payload).is_some(),
         "a refused role-loss commit must fail the demotion, got {:?}",
         resp.payload
     );
@@ -429,7 +429,7 @@ async fn demotion_refused_when_the_target_cannot_grant_a_lease() {
     )
     .await;
     assert!(
-        matches!(resp.payload, Some(RespPayload::Error(_))),
+        support::control_socket_client::refusal_message(&resp.payload).is_some(),
         "a non-empty-root-set demotion with no obtainable lease must be refused, got {:?}",
         resp.payload
     );
@@ -516,7 +516,7 @@ async fn demotion_refused_when_a_target_is_confirmed_but_this_device_has_no_conf
     )
     .await;
     assert!(
-        matches!(resp.payload, Some(RespPayload::Error(_))),
+        support::control_socket_client::refusal_message(&resp.payload).is_some(),
         "a demotion with a confirmed target but no coordination config must fail closed \
          (non-empty root set mandates a lease that cannot be obtained here), got {:?}",
         resp.payload
@@ -687,7 +687,7 @@ async fn promotion_without_coordination_config_fails_closed_and_leaves_local_unt
     )
     .await;
     assert!(
-        matches!(resp.payload, Some(RespPayload::Error(_))),
+        support::control_socket_client::refusal_message(&resp.payload).is_some(),
         "a promotion with no coordination-plane config must fail closed, got {:?}",
         resp.payload
     );
@@ -732,7 +732,7 @@ async fn promotion_refused_by_the_worker_leaves_local_policy_untouched() {
     )
     .await;
     assert!(
-        matches!(resp.payload, Some(RespPayload::Error(_))),
+        support::control_socket_client::refusal_message(&resp.payload).is_some(),
         "a refused Worker storage-mode write must fail the promotion, got {:?}",
         resp.payload
     );

@@ -349,7 +349,7 @@ async fn demote_fails_closed_when_the_prepared_journal_write_fails() {
     )
     .await;
     assert!(
-        matches!(resp.payload, Some(RespPayload::Error(_))),
+        support::control_socket_client::refusal_message(&resp.payload).is_some(),
         "a demotion whose durable journal write fails must be refused, got {:?}",
         resp.payload
     );
@@ -403,7 +403,7 @@ async fn ambiguous_demote_keeps_prepared_journal() {
     )
     .await;
 
-    assert!(matches!(resp.payload, Some(RespPayload::Error(_))));
+    assert!(support::control_socket_client::refusal_message(&resp.payload).is_some());
     assert_eq!(policy_of(&b.state, GROUP), MaterializationPolicy::Eager);
     let rows = all_role_loss_operations(&b.state);
     assert_eq!(rows.len(), 1, "an ambiguous commit must retain its recovery journal");
@@ -442,7 +442,7 @@ async fn definite_4xx_discards_prepared_journal() {
     )
     .await;
 
-    assert!(matches!(resp.payload, Some(RespPayload::Error(_))));
+    assert!(support::control_socket_client::refusal_message(&resp.payload).is_some());
     assert!(all_role_loss_operations(&b.state).is_empty());
     assert_eq!(request_count(&server, "POST", "/storage-mode").await, 0);
 }
@@ -514,8 +514,7 @@ async fn demote_local_failure_after_worker_commit_is_compensated_and_rolled_back
     .await;
     racer.await.unwrap();
 
-    let RespPayload::Error(err_message) = resp.payload.expect("response must carry a payload")
-    else {
+    let Some(err_message) = support::control_socket_client::refusal_message(&resp.payload) else {
         panic!("a post-Worker-commit local failure must not report success");
     };
     assert!(

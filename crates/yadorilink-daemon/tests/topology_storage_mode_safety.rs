@@ -555,7 +555,7 @@ async fn version_change_during_lease_issuance_refuses_the_demotion() {
     // specific "could not obtain a lease" refusal from any other error
     // path that might also happen to mention "lease".
     let payload_debug = format!("{:?}", resp.payload);
-    let RespPayload::Error(error_message) = resp.payload.expect("a response payload") else {
+    let Some(error_message) = support::control_socket_client::refusal_message(&resp.payload) else {
         panic!(
             "a version change mid-lease-issuance must refuse the demotion, got a non-error \
              response: {payload_debug}"
