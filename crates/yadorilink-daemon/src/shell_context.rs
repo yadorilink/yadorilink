@@ -64,6 +64,33 @@ pub struct ShellContext {
     pub(crate) auto_reclaim: Arc<crate::provider_auto_reclaim::AutoReclaim>,
     /// The author identity, block store and authoring lease the provider write path uses.
     pub(crate) writer: Arc<crate::provider_writer::ProviderWriter>,
+    /// Which other device holds a version no connected peer could supply (weak: the state
+    /// outlives every request).
+    pub(crate) holders: HolderLookup,
+}
+
+/// Names the device behind an unobtainable item, from the daemon's own state.
+#[derive(Clone)]
+pub(crate) struct HolderLookup {
+    state: std::sync::Weak<crate::daemon_state::DaemonState>,
+}
+
+impl HolderLookup {
+    /// The device that authored `path`'s current version, when it is another device and no
+    /// session with it is up (so "offline" is what the person can act on). `None` whenever
+    /// the engine cannot say.
+    pub(crate) fn offline_holder(&self, group_id: &str, path: &str) -> Option<String> {
+        let state = self.state.upgrade()?;
+        let origin = state
+            .replica_coordinator
+            .get_origin_device_id(group_id, path)
+            .ok()
+            .flatten()
+            .filter(|origin| !origin.is_empty() && *origin != state.device_id)?;
+        let connected =
+            state.peers.sessions_for_group(group_id).iter().any(|(peer, _)| *peer == origin);
+        (!connected).then_some(origin)
+    }
 }
 
 /// The machine facts the Eager driver reads, from the daemon's own state.
@@ -135,6 +162,25 @@ impl ShellContext {
             crate::provider_eager::EagerConfig::default(),
         ));
         let membership: Arc<crate::provider_evidence::ProviderMembership> = Arc::default();
+        let writer = Arc::new(crate::provider_writer::ProviderWriter::new(state.clone()));
+        {
+            // Weak: the state would otherwise own the writer that owns the state.
+            let lease_writer = Arc::downgrade(&writer);
+            let lease_host = provider_host.clone();
+            let lease_state = Arc::downgrade(state);
+            state.set_provider_lease_lookup(Arc::new(move |group_id| {
+                let (writer, state) = (lease_writer.upgrade()?, lease_state.upgrade()?);
+                let handoff = lease_host.handoff_root()?;
+                let root = state
+                    .replica_coordinator
+                    .provider_repository()
+                    .list_declared_roots()
+                    .ok()?
+                    .into_iter()
+                    .find(|r| r.group_id == group_id && r.error_description.is_none())?;
+                writer.lease(&root.root_id, group_id, &handoff.domain_dir(&root.root_id)).ok()
+            }));
+        }
         {
             let (coordinator, eager, membership, host) = (
                 state.replica_coordinator.clone(),
@@ -249,10 +295,11 @@ impl ShellContext {
                 reclaim,
             )),
             handoff: crate::provider_handoff::HandoffSlot::empty(),
-            writer: Arc::new(crate::provider_writer::ProviderWriter::new(state.clone())),
+            writer,
             eager,
             auto_reclaim,
             requested_opens: state.requested_opens.clone(),
+            holders: HolderLookup { state: Arc::downgrade(state) },
             prefetch: Arc::new(crate::provider_prefetch::PrefetchScheduler::new(
                 crate::provider_prefetch::PrefetchConfig::default(),
             )),

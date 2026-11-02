@@ -493,49 +493,80 @@ fn mtime_already_matches_disk_is_trivially_true_for_a_negative_sentinel() {
     assert!(mtime_already_matches_disk(&path, -1).unwrap());
 }
 
-/// Changing the requested mode actually changes the on-disk permission
-/// bits, and is idempotent (calling it again with the same value
-/// doesn't error or otherwise misbehave). `None` is a deliberate no-op
-/// — never fabricates a mode for a version that carries none.
+/// Setting the execute flag adds `x` (the owner always, group and other where they have `r`) and
+/// clearing it removes every `x`; no other permission bit changes. Applying it again is a no-op.
 #[cfg(unix)]
 #[test]
-fn apply_unix_mode_sets_and_clears_permission_bits() {
+fn apply_exec_sets_and_clears_only_the_execute_bits() {
     use std::os::unix::fs::PermissionsExt;
+    let mode_of = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("script.sh");
     fs::write(&path, b"#!/bin/sh\necho hi\n").unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
 
-    apply_unix_mode(&path, Some(0o744)).unwrap();
-    let mode_after_set = fs::metadata(&path).unwrap().permissions().mode();
-    assert_eq!(mode_after_set & 0o777, 0o744, "owner-exec bit must be set");
-
-    // Idempotent: setting it again when already set is a harmless no-op.
-    apply_unix_mode(&path, Some(0o744)).unwrap();
-    assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o744);
-
-    apply_unix_mode(&path, Some(0o644)).unwrap();
-    let mode_after_clear = fs::metadata(&path).unwrap().permissions().mode();
-    assert_eq!(mode_after_clear & 0o777, 0o644, "owner-exec bit must be cleared");
-
-    // `None` is a no-op — the mode from the last real apply survives.
-    apply_unix_mode(&path, None).unwrap();
-    assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
+    for (before, exec, after) in [
+        (0o644, true, 0o755),
+        (0o641, true, 0o751),
+        (0o611, true, 0o711),
+        (0o640, true, 0o750),
+        (0o600, true, 0o700),
+        (0o664, true, 0o775),
+        (0o200, true, 0o300),
+        (0o000, true, 0o100),
+        (0o755, false, 0o644),
+        (0o700, false, 0o600),
+        (0o751, false, 0o640),
+        (0o644, false, 0o644),
+        (0o611, false, 0o611),
+        (0o755, true, 0o755),
+    ] {
+        fs::set_permissions(&path, fs::Permissions::from_mode(before)).unwrap();
+        apply_exec(&path, exec).unwrap();
+        assert_eq!(mode_of(&path), after, "{before:o} exec={exec}");
+        assert!(exec_already_matches_disk(&path, exec).unwrap());
+        assert!(!exec_already_matches_disk(&path, !exec).unwrap());
+    }
 }
 
-/// `apply_unix_mode` must never error on a plain file — this
-/// runs unconditionally (not `#[cfg(unix)]`-gated) so the non-Unix
-/// no-op arm is at least compiled and exercised on every platform this
-/// crate builds for; on this dev machine it's the `#[cfg(unix)]`-arm's
-/// real permission-changing behavior above that's exercised.
+/// A mode that already is right is not touched: no `set_permissions`, so no ctime movement.
+#[cfg(unix)]
 #[test]
-fn apply_unix_mode_never_errors_on_a_plain_file() {
+fn apply_exec_on_a_file_that_already_matches_changes_nothing() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("script.sh");
+    fs::write(&path, b"x").unwrap();
+    apply_exec(&path, true).unwrap();
+    let ctime = fs::metadata(&path).unwrap().ctime_nsec();
+    let seconds = fs::metadata(&path).unwrap().ctime();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    apply_exec(&path, true).unwrap();
+    assert_eq!(
+        (fs::metadata(&path).unwrap().ctime(), fs::metadata(&path).unwrap().ctime_nsec()),
+        (seconds, ctime)
+    );
+}
+
+/// `mode_with_exec` also drops setuid/setgid when the content changes.
+#[cfg(unix)]
+#[test]
+fn mode_with_exec_clears_setuid_and_setgid_only_when_asked() {
+    assert_eq!(mode_with_exec(0o6755, true, true), 0o755);
+    assert_eq!(mode_with_exec(0o4644, true, false), 0o4755);
+    assert_eq!(mode_with_exec(0o2755, false, true), 0o644);
+}
+
+/// `apply_exec` must never error on a plain file -- this runs unconditionally (not
+/// `#[cfg(unix)]`-gated) so the non-Unix no-op arm is at least compiled and exercised on every
+/// platform this crate builds for.
+#[test]
+fn apply_exec_never_errors_on_a_plain_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("plain.txt");
     fs::write(&path, b"hello").unwrap();
-    apply_unix_mode(&path, Some(0o755)).unwrap();
-    apply_unix_mode(&path, None).unwrap();
+    apply_exec(&path, true).unwrap();
+    apply_exec(&path, false).unwrap();
 }
 
 /// `create_dir_all(parent)` follows symlinks like any other `mkdir`
@@ -580,233 +611,6 @@ fn verify_write_target_within_root_still_creates_genuine_nested_directories() {
         .unwrap();
 
     assert!(sync_root.path().join("a").join("b").join("c").is_dir());
-}
-
-/// `apply_xattrs` must both set every attribute in the supplied list
-/// AND remove any `user.*` attribute already on disk that the list no
-/// longer carries -- the same "set exactly what's replicated, nothing
-/// left over from a prior version" contract `apply_unix_mode` gives
-/// for permission bits.
-#[cfg(target_os = "linux")]
-#[test]
-fn apply_xattrs_sets_new_attributes_and_removes_stale_ones() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("file.bin");
-    fs::write(&path, b"content").unwrap();
-
-    apply_xattrs(&path, &[("user.keep".to_string(), b"v1".to_vec())]).unwrap();
-    assert_eq!(
-        crate::read_replicated_xattrs(&fs::File::open(&path).unwrap()),
-        vec![("user.keep".to_string(), b"v1".to_vec())]
-    );
-
-    // A later version drops "user.keep" and adds "user.new" -- the
-    // stale attribute must not survive the second call.
-    apply_xattrs(&path, &[("user.new".to_string(), b"v2".to_vec())]).unwrap();
-    assert_eq!(
-        crate::read_replicated_xattrs(&fs::File::open(&path).unwrap()),
-        vec![("user.new".to_string(), b"v2".to_vec())]
-    );
-}
-
-/// An empty attribute list is a real, meaningful target state (this
-/// version genuinely carries no extended attributes) -- confirms it
-/// clears whatever was already on disk rather than being silently
-/// treated as "nothing to do."
-#[cfg(target_os = "linux")]
-#[test]
-fn apply_xattrs_with_an_empty_list_clears_existing_attributes() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("file.bin");
-    fs::write(&path, b"content").unwrap();
-
-    apply_xattrs(&path, &[("user.gone".to_string(), b"v".to_vec())]).unwrap();
-    apply_xattrs(&path, &[]).unwrap();
-
-    assert_eq!(crate::read_replicated_xattrs(&fs::File::open(&path).unwrap()), Vec::new());
-}
-
-/// Regression: `apply_xattrs`'s removal side and its set side both
-/// restrict themselves to `user.*`, rather than handing every incoming
-/// name straight to `fsetxattr` -- defense-in-depth for the same
-/// allow-list `FileMeta::decode` rejects a violation of at the wire-decode
-/// boundary (a second, independent layer, in case some future caller
-/// ever builds an `xattrs` list some other way). Confirmed genuinely
-/// RED by temporarily hardcoding this to `true` for every name: it no
-/// longer distinguished the allow-listed namespace from any other.
-#[cfg(target_os = "linux")]
-#[test]
-fn is_replicated_xattr_name_only_accepts_the_user_namespace() {
-    assert!(is_replicated_xattr_name("user.foo"));
-    assert!(!is_replicated_xattr_name("security.selinux"));
-    assert!(!is_replicated_xattr_name("trusted.overlay"));
-    assert!(!is_replicated_xattr_name("system.posix_acl_access"));
-    assert!(!is_replicated_xattr_name("com.apple.quarantine"));
-}
-
-/// The `ExactObject` proof gate's positive case: an attribute set
-/// genuinely applied end to end verifies as an exact match.
-#[cfg(target_os = "linux")]
-#[test]
-fn verify_replicated_xattrs_exact_confirms_a_genuine_match() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("file.bin");
-    fs::write(&path, b"content").unwrap();
-    let desired = vec![("user.a".to_string(), b"1".to_vec())];
-
-    apply_xattrs(&path, &desired).unwrap();
-
-    assert!(verify_replicated_xattrs_exact(&path, &desired).unwrap());
-}
-
-/// Regression: a desired attribute that never actually landed on disk (standing in
-/// for `apply_xattrs`'s own `fsetxattr` silently failing, which it
-/// never surfaces as an `Err`) must never verify as an exact match.
-/// Confirmed genuinely RED by temporarily hardcoding this function's
-/// comparison to `true`: the mismatch below went undetected.
-#[cfg(target_os = "linux")]
-#[test]
-fn verify_replicated_xattrs_exact_detects_an_attribute_that_never_landed() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("file.bin");
-    fs::write(&path, b"content").unwrap();
-    let desired = vec![("user.missing".to_string(), b"1".to_vec())];
-
-    // No `apply_xattrs` call at all -- disk carries none of what is
-    // desired, exactly what a silently-swallowed `fsetxattr` failure
-    // would also leave behind.
-
-    assert!(!verify_replicated_xattrs_exact(&path, &desired).unwrap());
-}
-
-/// The mirror case: a stale attribute still on disk that the desired
-/// version no longer carries (standing in for `apply_xattrs`'s
-/// `fremovexattr` silently failing) must also never verify as exact.
-#[cfg(target_os = "linux")]
-#[test]
-fn verify_replicated_xattrs_exact_detects_a_stale_attribute_that_should_be_gone() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("file.bin");
-    fs::write(&path, b"content").unwrap();
-
-    apply_xattrs(&path, &[("user.stale".to_string(), b"v".to_vec())]).unwrap();
-    // The version this file is meant to now exactly hold desires no
-    // attributes at all -- as if `apply_xattrs(&path, &[])`'s own
-    // `fremovexattr` call for "user.stale" had silently failed.
-
-    assert!(!verify_replicated_xattrs_exact(&path, &[]).unwrap());
-}
-
-/// A same-name attribute whose VALUE differs must also fail exactness
-/// -- name-only comparison would wrongly accept this.
-#[cfg(target_os = "linux")]
-#[test]
-fn verify_replicated_xattrs_exact_detects_a_value_mismatch() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("file.bin");
-    fs::write(&path, b"content").unwrap();
-
-    apply_xattrs(&path, &[("user.a".to_string(), b"old".to_vec())]).unwrap();
-
-    assert!(
-        !verify_replicated_xattrs_exact(&path, &[("user.a".to_string(), b"new".to_vec())]).unwrap()
-    );
-}
-
-/// The proof gate fails closed where the best-effort reader does not:
-/// a file whose attribute listing succeeds but whose attribute read is
-/// refused. The best-effort reader drops the attribute it could not
-/// read, so a version that carries no attributes would compare equal to
-/// a file that really does carry one; the strict comparison must be an
-/// `Err` instead, never a match.
-///
-/// Listing a file's attribute names needs no permission on the file,
-/// but reading a `user.` attribute's value needs read permission, so a
-/// write-only descriptor on a mode 0o200 file reaches exactly that state
-/// deterministically. The path-based `verify_replicated_xattrs_exact`
-/// opens read-only and so cannot be driven there; the comparison it
-/// delegates to is tested directly. A process that ignores file
-/// permissions (root) cannot be refused the read, so the test has
-/// nothing to check there and returns early.
-#[cfg(target_os = "linux")]
-#[test]
-fn the_exact_xattr_comparison_fails_closed_where_the_best_effort_reader_sees_no_attributes() {
-    use std::os::unix::fs::PermissionsExt as _;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("file.bin");
-    fs::write(&path, b"content").unwrap();
-    apply_xattrs(&path, &[("user.present".to_string(), b"v".to_vec())]).unwrap();
-    assert!(verify_replicated_xattrs_exact(&path, &[("user.present".to_string(), b"v".to_vec())])
-        .unwrap());
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o200)).unwrap();
-    if fs::File::open(&path).is_ok() {
-        // Permissions are not enforced for this process: nothing to test.
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        return;
-    }
-    let write_only = fs::OpenOptions::new().write(true).open(&path).unwrap();
-
-    let best_effort = crate::chunker::read_replicated_xattrs(&write_only);
-    let strict = replicated_xattrs_exactly_match(&write_only, &[]);
-
-    drop(write_only);
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(
-        best_effort.is_empty(),
-        "precondition: the best-effort reader drops the attribute it cannot read: {best_effort:?}"
-    );
-    assert!(
-        strict.is_err(),
-        "an attribute set that could not be read must not compare as a match: {strict:?}"
-    );
-}
-
-// The non-Linux `verify_replicated_xattrs_exact` arm (always
-// `Ok(true)`, unconditionally treating xattrs as retained-only on a
-// backend with no replicated-xattr support -- see its own doc
-// comment for the target-projection-contract reasoning) is `#[cfg(not(
-// target_os = "linux"))]`, so it never compiles on the Linux machines
-// this workspace is actually developed/tested on and has no dedicated
-// test here; it is now a single unconditional return with no branch
-// left to exercise.
-
-/// A replicated mode that takes the owner's read (or write) permission
-/// away must not stop the replicated attributes from landing: the
-/// attributes are applied while the file still has the mode it was
-/// written with, and the mode last. Applying the mode first made
-/// `apply_xattrs` fail with EACCES on a `0o200` file.
-#[cfg(target_os = "linux")]
-#[test]
-fn apply_file_metadata_sets_attributes_even_when_the_mode_revokes_read() {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("file.bin");
-    fs::write(&path, b"content").unwrap();
-    let xattrs = vec![("user.keep".to_string(), b"v1".to_vec())];
-
-    apply_file_metadata(&path, Some(0o200), &xattrs).unwrap();
-
-    assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o200);
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-    assert_eq!(crate::read_replicated_xattrs(&fs::File::open(&path).unwrap()), xattrs);
-}
-
-/// `xattrs_already_match_disk` only chooses between a snapshot and a
-/// mutating attempt, so a file whose mode denies its owner read access is
-/// "not known to match" -- never a hard error that stops the caller.
-#[cfg(target_os = "linux")]
-#[test]
-fn xattrs_already_match_disk_reports_an_unreadable_file_as_not_matching() {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("file.bin");
-    fs::write(&path, b"content").unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o200)).unwrap();
-
-    let result = xattrs_already_match_disk(&path, &[]);
-
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-    assert!(matches!(result, Ok(false)), "got {result:?}");
 }
 
 /// A ledger that remembers every name it was asked to hold.
@@ -1510,9 +1314,13 @@ fn a_deferred_publish_keeps_the_temp_record_for_the_batch() {
     let store = crate::SegmentBlockStore::new(store_dir.path()).unwrap();
     let hash = store.put(b"hello").unwrap();
     let blocks = vec![BlockInfo { hash: hex::decode(hash).unwrap(), offset: 0, size: 5 }];
-    for (durability, held) in [(Durability::Full, 0), (Durability::DeferredToBatch, 1)] {
+    for (durability, held) in [
+        (Durability::Full, 0),
+        (Durability::DeferredToBatch, 1),
+        (Durability::FileFlushedNamesDeferred, 1),
+    ] {
         let ledger = HeldLedger::default();
-        let out = dir.path().join(format!("f{held}"));
+        let out = dir.path().join(format!("f{durability:?}"));
         let tmp = reconstruct_file_to_temp_observed_durable(
             &store,
             &out,
@@ -1577,6 +1385,7 @@ fn the_batch_flush_refuses_another_object_at_the_path() {
     let outcomes = flush_received_objects(
         std::slice::from_ref(&path),
         &[key],
+        &[None],
         ReceivedFlushMode::FullFsyncEach,
         1,
     );
@@ -1587,8 +1396,276 @@ fn the_batch_flush_refuses_another_object_at_the_path() {
     let outcomes = flush_received_objects(
         std::slice::from_ref(&path),
         &[key],
+        &[None],
         ReceivedFlushMode::FullFsyncEach,
         1,
     );
     assert!(matches!(outcomes[0], ReceivedFlushOutcome::Failed(_)), "{outcomes:?}");
+
+    // A file whose data its writer already flushed is still checked to be the object received.
+    let stamp = crate::flushed_stamp(&path);
+    let outcomes = flush_received_objects(
+        std::slice::from_ref(&path),
+        &[key],
+        &[stamp],
+        ReceivedFlushMode::FullFsyncEach,
+        1,
+    );
+    assert!(matches!(outcomes[0], ReceivedFlushOutcome::Failed(_)), "{outcomes:?}");
+}
+
+/// A file its writer flushed and that nobody has touched since is not flushed again by the batch (only
+/// its directory is); one written to since is, so the new bytes are covered too.
+#[cfg(unix)]
+#[test]
+fn the_batch_flush_skips_a_file_still_as_its_writer_left_it_and_flushes_one_that_changed() {
+    use crate::{
+        completed_flushes_under, flush_received_objects, flushed_stamp, object_key,
+        ReceivedFlushMode, ReceivedFlushOutcome,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let untouched = root.join("untouched");
+    let edited = root.join("edited");
+    std::fs::write(&untouched, b"received").unwrap();
+    std::fs::write(&edited, b"received").unwrap();
+    let stamps = [flushed_stamp(&untouched), flushed_stamp(&edited)];
+    let keys = [object_key(&untouched), object_key(&edited)];
+    // An editor appends to the second file after the writer flushed it.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let mut file = std::fs::OpenOptions::new().append(true).open(&edited).unwrap();
+    std::io::Write::write_all(&mut file, b" and the user's bytes").unwrap();
+    drop(file);
+
+    let outcomes = flush_received_objects(
+        &[untouched.clone(), edited.clone()],
+        &keys,
+        &stamps,
+        ReceivedFlushMode::FullFsyncEach,
+        1,
+    );
+
+    assert_eq!(outcomes, vec![ReceivedFlushOutcome::Flushed; 2]);
+    let flushed = completed_flushes_under(&root);
+    assert!(
+        !flushed.contains(&untouched),
+        "an untouched, already flushed file is not flushed again"
+    );
+    assert!(flushed.contains(&edited), "a file written to since its flush is flushed");
+    assert!(flushed.contains(&root), "the directory is flushed");
+}
+
+/// The data of a file whose content is not durable elsewhere is flushed before the rename can publish
+/// it: `FileFlushedNamesDeferred` issues a file fsync inside the write, while `DeferredToBatch` leaves
+/// it to the batch. Counted per thread, so tests flushing beside this one cannot satisfy or disturb it.
+#[cfg(unix)]
+#[test]
+fn file_flushed_names_deferred_flushes_the_data_inside_the_write() {
+    use crate::io_diag;
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = crate::SegmentBlockStore::new(store_dir.path()).unwrap();
+    let hash = store.put(b"hello").unwrap();
+    let blocks = vec![BlockInfo { hash: hex::decode(hash).unwrap(), offset: 0, size: 5 }];
+    io_diag::set_enabled(true);
+    for (durability, fsyncs) in
+        [(Durability::DeferredToBatch, 0), (Durability::FileFlushedNamesDeferred, 1)]
+    {
+        let before = io_diag::thread_file_fsyncs();
+        let ledger = HeldLedger::default();
+        let out = dir.path().join(format!("flush-{durability:?}"));
+        let tmp = reconstruct_file_to_temp_observed_durable(
+            &store,
+            &out,
+            &blocks,
+            0,
+            &ledger,
+            &|_| {},
+            durability,
+        )
+        .unwrap();
+        assert_eq!(io_diag::thread_file_fsyncs() - before, fsyncs, "{durability:?}");
+        persist_reconstructed_file_durable(&tmp, &out, &ledger, durability).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"hello");
+    }
+    io_diag::set_enabled(false);
+}
+
+fn block_of(offset: u64, data: &[u8]) -> BlockInfo {
+    let hashed = crate::LocallyHashedBlock::from_bytes(data.to_vec());
+    BlockInfo {
+        hash: hex::decode(hashed.hash()).unwrap(),
+        offset,
+        size: u32::try_from(data.len()).unwrap(),
+    }
+}
+
+/// A staged file is filled in any order, flushed and read back; what a block-by-block write puts
+/// at the offsets is exactly the file.
+#[test]
+fn a_staged_file_filled_out_of_order_finishes_and_holds_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("big");
+    let (a, b, c) = (vec![1u8; 700], vec![2u8; 300], vec![3u8; 500]);
+    let blocks = vec![block_of(0, &a), block_of(700, &b), block_of(1000, &c)];
+    let ledger = std::sync::Arc::new(HeldLedger::default());
+    let staged = StagedFile::create(&out, 1500, ledger.clone()).unwrap();
+    // Later blocks first, one block at several places is not needed here.
+    staged.write_at(1000, &c).unwrap();
+    staged.write_at(0, &a).unwrap();
+    staged.write_at(700, &b).unwrap();
+    staged.finish(&blocks, 1_000_000_000).unwrap();
+
+    let (tmp, _ledger) = staged.keep();
+    assert_eq!(std::fs::read(&tmp).unwrap(), [a, b, c].concat());
+    assert!(!out.exists(), "the target is untouched");
+    drop(staged);
+    assert!(tmp.exists(), "a kept file is not removed by the drop");
+}
+
+/// A block that was not written, or written wrongly, is caught by the read-back before the file can
+/// be renamed in.
+#[test]
+fn a_staged_file_with_a_missing_or_wrong_block_does_not_finish() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("big");
+    let (a, b) = (vec![1u8; 100], vec![2u8; 100]);
+    let blocks = vec![block_of(0, &a), block_of(100, &b)];
+    let staged = StagedFile::create(&out, 200, std::sync::Arc::new(HeldLedger::default())).unwrap();
+    staged.write_at(0, &a).unwrap();
+    assert!(staged.finish(&blocks, 0).is_err(), "the second block was never written");
+    staged.write_at(100, &[9u8; 100]).unwrap();
+    assert!(staged.finish(&blocks, 0).is_err(), "the second block holds other bytes");
+    staged.write_at(100, &b).unwrap();
+    staged.finish(&blocks, 0).unwrap();
+}
+
+/// Dropped without being kept (a cancelled or failed attempt), the staged file and its ledger record
+/// are gone; nothing is left beside the target.
+#[test]
+fn a_staged_file_dropped_without_keep_is_removed_with_its_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("big");
+    let ledger = std::sync::Arc::new(HeldLedger::default());
+    let staged = StagedFile::create(&out, 10, ledger.clone()).unwrap();
+    let tmp = staged.tmp_path().to_path_buf();
+    assert!(tmp.exists());
+    drop(staged);
+    assert!(!tmp.exists());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    // Unix releases the record with the file; Windows keeps it until a restart finds the path
+    // absent (an unlink has no documented durability there).
+    assert_record_after_an_unlink(&ledger);
+}
+
+#[cfg(unix)]
+mod staged_file_name_tests {
+    use super::*;
+
+    fn staged_in(dir: &std::path::Path, size: u64) -> StagedFile {
+        StagedFile::create(&dir.join("target.bin"), size, std::sync::Arc::new(NoTempLedger))
+            .unwrap()
+    }
+
+    fn one_block(data: &[u8]) -> BlockInfo {
+        let hashed = LocallyHashedBlock::from_bytes(data.to_vec());
+        BlockInfo {
+            hash: hex::decode(hashed.hash().as_bytes()).unwrap(),
+            offset: 0,
+            size: data.len() as u32,
+        }
+    }
+
+    #[test]
+    fn finish_refuses_a_name_that_no_longer_leads_to_the_verified_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = staged_in(dir.path(), 4);
+        staged.write_at(0, b"data").unwrap();
+        // Another file takes the temp's name after the bytes were written.
+        let other = dir.path().join("other");
+        std::fs::write(&other, b"evil").unwrap();
+        std::fs::rename(&other, staged.tmp_path()).unwrap();
+
+        assert!(staged.finish(&[one_block(b"data")], 0).is_err());
+    }
+
+    #[test]
+    fn dropping_a_staged_file_leaves_a_replacement_at_its_name_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = staged_in(dir.path(), 4);
+        let name = staged.tmp_path().to_path_buf();
+        let other = dir.path().join("other");
+        std::fs::write(&other, b"theirs").unwrap();
+        std::fs::rename(&other, &name).unwrap();
+
+        drop(staged);
+
+        assert_eq!(std::fs::read(&name).unwrap(), b"theirs");
+    }
+
+    #[derive(Default)]
+    struct CountingLedger(std::sync::Mutex<Vec<PathBuf>>);
+
+    impl TempFileLedger for CountingLedger {
+        fn record(&self, _tmp_path: &Path) -> Result<(), StorageError> {
+            Ok(())
+        }
+        fn release(&self, tmp_path: &Path) {
+            self.0.lock().unwrap().push(tmp_path.to_path_buf());
+        }
+        fn strand(&self, _dir_path: &Path) -> Result<(), StorageError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_replacement_at_the_name_is_released_from_the_ledger_so_recovery_never_takes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = std::sync::Arc::new(CountingLedger::default());
+        let staged = StagedFile::create(&dir.path().join("target.bin"), 4, ledger.clone()).unwrap();
+        let name = staged.tmp_path().to_path_buf();
+        let other = dir.path().join("other");
+        std::fs::write(&other, b"theirs").unwrap();
+        std::fs::rename(&other, &name).unwrap();
+
+        drop(staged);
+
+        assert_eq!(ledger.0.lock().unwrap().as_slice(), [name]);
+    }
+
+    #[test]
+    fn a_second_hard_link_means_the_temp_is_not_still_at_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = staged_in(dir.path(), 4);
+        assert!(staged.is_still_at_its_path());
+        std::fs::hard_link(staged.tmp_path(), dir.path().join("alias")).unwrap();
+        assert!(!staged.is_still_at_its_path());
+    }
+}
+
+/// A deferred publish that fails leaves its temp to the caller (which may have recorded the temp's
+/// flushed name as a witness that the name was renamed, and withdraws it before removing the
+/// temp); a full publish still removes the temp itself.
+#[cfg(unix)]
+#[test]
+fn a_failed_deferred_publish_keeps_its_temp_and_a_failed_full_publish_removes_it() {
+    for (durability, temp_stays) in [
+        (Durability::DeferredToBatch, true),
+        (Durability::FileFlushedNamesDeferred, true),
+        (Durability::Full, false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("occupied");
+        // A non-empty directory at the name: renaming a file over it fails.
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("child"), b"x").unwrap();
+        let tmp = dir.path().join(".yadorilink-tmp.0123456789abcdef");
+        std::fs::write(&tmp, b"received").unwrap();
+
+        let result = persist_reconstructed_file_durable(&tmp, &target, &NoTempLedger, durability);
+
+        assert!(result.is_err(), "{durability:?}: the publish should fail");
+        assert_eq!(tmp.exists(), temp_stays, "{durability:?}");
+        assert!(target.join("child").exists(), "{durability:?}: the occupant is untouched");
+    }
 }

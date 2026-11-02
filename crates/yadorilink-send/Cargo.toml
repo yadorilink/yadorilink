@@ -62,6 +62,7 @@ uuid = { version = "1", features = ["v4"] }
 # workspace-established dependency (`yadorilink-local-storage`'s own
 # `link_preflight.rs` uses it for the identical purpose), not a new one.
 walkdir = "2"
+serde_json = "1"
 tokio.workspace = true
 
 [dev-dependencies]

@@ -7,6 +7,7 @@
 
 use yadorilink_client_core::ops::auth as ops;
 use yadorilink_client_core::wording::{login_event_lines, sign_out_line};
+use yadorilink_fapi_client::PairingCode;
 
 use crate::error::CliError;
 
@@ -20,6 +21,50 @@ pub async fn login(device: bool) -> Result<(), CliError> {
     })
     .await?;
     Ok(())
+}
+
+/// Add this computer with a pairing code from the account's web page: no browser. `code` is the
+/// argument as given: the code itself, or `-` to read it from standard input.
+pub async fn login_with_code(code: &str) -> Result<(), CliError> {
+    use std::io::IsTerminal;
+    let code = if code.trim() == "-" {
+        if std::io::stdin().is_terminal() {
+            eprint!("Pairing code (from your account's Devices page): ");
+        }
+        read_pairing_code(&mut std::io::stdin().lock())?
+    } else {
+        parse_pairing_code(code)?
+    };
+    ops::login_with_pairing_code(code, |event| {
+        for line in login_event_lines(&event) {
+            println!("{line}");
+        }
+    })
+    .await?;
+    Ok(())
+}
+
+/// The first line of `input` as a pairing code. Reads a bounded amount: a pipe that is not a
+/// code is refused, not buffered.
+fn read_pairing_code(input: &mut impl std::io::BufRead) -> Result<PairingCode, CliError> {
+    use std::io::{BufRead, Read};
+    let mut line = String::new();
+    input
+        .by_ref()
+        .take(256)
+        .read_line(&mut line)
+        .map_err(|e| CliError::Other(format!("could not read the pairing code: {e}")))?;
+    parse_pairing_code(&line)
+}
+
+/// A typed or pasted pairing code (or the link its QR carries). Nothing of a refused input is
+/// echoed back.
+fn parse_pairing_code(input: &str) -> Result<PairingCode, CliError> {
+    PairingCode::from_scanned(input).map_err(|e| {
+        CliError::AuthFailed(format!(
+            "{e}; make a code on your account's web page (Devices > Add device)"
+        ))
+    })
 }
 
 /// What the process runs on, as far as the automatic sign-in decision cares.
@@ -178,6 +223,33 @@ const FORGOT_LOCAL_CREDENTIALS: &str = "Local credentials removed. This computer
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_code_is_read_from_the_first_line_of_standard_input() {
+        for input in ["bcdf-ghjk-lmnp\n", "BCDFGHJKLMNP", "  BCDF GHJK LMNP  \r\nignored\n"] {
+            let code = read_pairing_code(&mut input.as_bytes()).expect(input);
+            assert_eq!(code.formatted(), "BCDF-GHJK-LMNP");
+        }
+    }
+
+    #[test]
+    fn input_that_is_not_a_code_is_refused_without_echoing_it() {
+        for input in ["", "\n", "hello\n", "BCDF-GHJK-LMN\n", &"B".repeat(10_000)] {
+            let error = read_pairing_code(&mut input.as_bytes()).expect_err(input);
+            let text = error.to_string();
+            assert!(text.contains("not a pairing code"), "{text}");
+            assert!(!text.contains("hello") && !text.contains("BCDF-GHJK-LMN"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_scanned_link_is_accepted_as_the_code() {
+        let code = parse_pairing_code(
+            "https://auth.example.test/account/devices/pair?code=BCDF-GHJK-LMNP",
+        )
+        .expect("a link");
+        assert_eq!(code.formatted(), "BCDF-GHJK-LMNP");
+    }
 
     #[test]
     fn the_forget_local_credentials_line_is_pinned_verbatim() {

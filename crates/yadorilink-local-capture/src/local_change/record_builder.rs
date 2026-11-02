@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::LocalCaptureError;
+use crate::ingest::Ingest;
 use crate::scan_block_staging::ScanBlockStaging;
 use yadorilink_fs_platform::fs_identity::{
     disk_race_fingerprint_of_handle, metadata_mtime_matches,
@@ -25,11 +26,10 @@ use super::disk_observation::{
 };
 use super::{LocalChangeOutcome, LocalChangeProcessor, Predecessor};
 
-/// [`build_record_for_created_or_modified`]'s Unix-mode-to-persist output:
-/// the outer `None` means nothing to persist (a symlink, or nothing
-/// changed); the inner `Option<u32>` is `unix_mode_from_metadata`'s own
-/// value (itself `None` on a platform with no Unix permission-bits model).
-pub(super) type PendingUnixModeUpdate = Option<Option<u32>>;
+/// [`build_record_for_created_or_modified`]'s execute-flag-to-persist output:
+/// `None` means nothing to persist (a symlink, or nothing changed); `Some(exec)`
+/// is the flag the file is captured with.
+pub(super) type PendingExecUpdate = Option<bool>;
 
 /// The `FileRecord` a `get_file` read would return for one current-row
 /// read, so a caller that also needs the row's other columns reads them
@@ -85,26 +85,20 @@ pub(super) struct SymlinkClassification {
 /// `FileVersion`.
 pub(super) fn metadata_columns_for(
     classification: &Option<SymlinkClassification>,
-    unix_mode: Option<Option<u32>>,
-    xattrs: Vec<(String, Vec<u8>)>,
+    exec: Option<bool>,
 ) -> LocalFileMetaColumns {
     match classification {
         Some(c) => LocalFileMetaColumns {
             record_kind: RecordKind::Symlink,
             symlink_target: Some(c.target.clone()),
             symlink_out_of_root: c.out_of_root,
-            unix_mode: None,
-            // A symlink is not scanned for xattrs either, for the
-            // identical reason `unix_mode` is `None` here -- matches
-            // `single_pass_capture.rs`'s own symlink branch.
-            xattrs: Vec::new(),
+            exec: false,
         },
         None => LocalFileMetaColumns {
             record_kind: RecordKind::File,
             symlink_target: None,
             symlink_out_of_root: false,
-            unix_mode: unix_mode.flatten(),
-            xattrs,
+            exec: exec.unwrap_or(false),
         },
     }
 }
@@ -203,6 +197,101 @@ pub(super) fn is_source_path_vanished_error(e: &LocalCaptureError, path: &Path) 
 /// The outcome of a capture pass whose path was replaced by another object
 /// between its `lstat` and its open: nothing captured, left for a later
 /// pass, which classifies the path afresh.
+/// What the pre-commit flush of a file-only capture found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Barrier {
+    /// The capture put its blocks into the store; there was nothing to flush.
+    NotNeeded,
+    /// The file and its directory entries up to the folder's root are durable.
+    Flushed,
+    /// The name no longer leads to the file that was read: nothing is captured from this pass.
+    NameMoved,
+    /// The file could not be flushed here (a handle without write access on Windows, a read-only
+    /// mount, an exclusive lock): its blocks have to go into the store instead.
+    CouldNotFlush,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+static FLUSH_FAILURE_HOOKS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::OnceLock::new();
+
+/// Makes the pre-commit flush of `path` fail until [`disarm_flush_failure_hook`], as a file that
+/// cannot be flushed would.
+#[cfg(any(test, feature = "test-support"))]
+pub fn arm_flush_failure_hook(path: PathBuf) {
+    FLUSH_FAILURE_HOOKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn disarm_flush_failure_hook(path: &Path) {
+    if let Some(set) = FLUSH_FAILURE_HOOKS.get() {
+        set.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(path);
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn flush_failure_armed(path: &Path) -> bool {
+    FLUSH_FAILURE_HOOKS.get().is_some_and(|set| {
+        set.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).contains(path)
+    })
+}
+
+/// Makes the bytes of the file just read durable, and its place in the folder.
+///
+/// Flushes through a handle opened for flushing by name (a plain read handle cannot flush on
+/// Windows), then compares that handle's identity with the one that was read: a rename over the
+/// name between the read and the flush leaves the flushed bytes not the ones that were read. The
+/// capture's before/after fingerprint of the read handle would notice too, but its change time can
+/// be equal across a rename on a filesystem with a coarse clock, so the identity is compared
+/// explicitly. Then every directory entry on the way from the file up to the folder's root is
+/// flushed: the file's own, and those of directories the user has just made, or a crash could keep
+/// the record and lose the file it names. Any flush that fails is [`Barrier::CouldNotFlush`],
+/// never a reason to skip the barrier.
+pub(super) fn flush_before_commit(
+    root: &Path,
+    path: &Path,
+    read_metadata: &std::fs::Metadata,
+) -> Barrier {
+    #[cfg(any(test, feature = "test-support"))]
+    if flush_failure_armed(path) {
+        return Barrier::CouldNotFlush;
+    }
+    let Ok(flush_handle) = yadorilink_fs_platform::flush::open_for_flush(path) else {
+        return Barrier::CouldNotFlush;
+    };
+    if yadorilink_fs_platform::flush::sync_data(&flush_handle).is_err() {
+        return Barrier::CouldNotFlush;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let Ok(flushed) = flush_handle.metadata() else { return Barrier::CouldNotFlush };
+        if (flushed.dev(), flushed.ino()) != (read_metadata.dev(), read_metadata.ino()) {
+            return Barrier::NameMoved;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = read_metadata;
+    let mut directory = path.parent();
+    while let Some(dir) = directory {
+        let flushed = yadorilink_fs_platform::flush::open_for_flush(dir)
+            .and_then(|handle| yadorilink_fs_platform::flush::sync_directory(&handle));
+        if flushed.is_err() {
+            return Barrier::CouldNotFlush;
+        }
+        if dir == root {
+            break;
+        }
+        directory = dir.parent();
+    }
+    Barrier::Flushed
+}
+
 fn replaced_while_opening(group_id: &str, rel_path: &str) -> LocalChangeOutcome {
     tracing::info!(
         group_id,
@@ -437,7 +526,7 @@ fn fire_content_read_race_hook(path: &Path) {
 /// version. It is refused before anything is indexed or authored and the path
 /// is left unsettled, so it is picked up again once it shrinks.
 fn refuse_unsyncable(group_id: &str, rel_path: &str, block_count: usize) -> bool {
-    let limit = syncable_block_limit();
+    let limit = syncable_block_limit(group_id, rel_path);
     if block_count <= limit {
         return false;
     }
@@ -453,27 +542,34 @@ fn refuse_unsyncable(group_id: &str, rel_path: &str, block_count: usize) -> bool
 }
 
 /// The most blocks a captured file may have and still be synced.
-fn syncable_block_limit() -> usize {
+fn syncable_block_limit(group_id: &str, rel_path: &str) -> usize {
     #[cfg(test)]
+    if let Some((group, path, limit)) = SYNCABLE_BLOCK_LIMIT_OVERRIDE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
     {
-        let overridden = SYNCABLE_BLOCK_LIMIT_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst);
-        if overridden != usize::MAX {
-            return overridden;
+        if group == group_id && path == rel_path {
+            return *limit;
         }
     }
+    #[cfg(not(test))]
+    let _ = (group_id, rel_path);
     MAX_SYNCABLE_BLOCKS
 }
 
-/// Lowers the syncable block limit for a test, so a file of a few blocks
-/// stands in for one of a hundred thousand. `usize::MAX` restores the real
-/// limit. Process-global: a test that sets it must restore it.
+/// Lowers the syncable block limit of one path for a test, so a file of a few blocks stands in
+/// for one of a hundred thousand. Only that group and path see it: tests in one binary run in
+/// parallel, and a limit that applied to every capture would refuse the large files of the others.
+/// `None` restores the real limit.
 #[cfg(test)]
-static SYNCABLE_BLOCK_LIMIT_OVERRIDE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(usize::MAX);
+static SYNCABLE_BLOCK_LIMIT_OVERRIDE: std::sync::Mutex<Option<(String, String, usize)>> =
+    std::sync::Mutex::new(None);
 
 #[cfg(test)]
-pub(super) fn override_syncable_block_limit(limit: usize) {
-    SYNCABLE_BLOCK_LIMIT_OVERRIDE.store(limit, std::sync::atomic::Ordering::SeqCst);
+pub(super) fn override_syncable_block_limit(path_limit: Option<(&str, &str, usize)>) {
+    *SYNCABLE_BLOCK_LIMIT_OVERRIDE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        path_limit.map(|(group, path, limit)| (group.to_owned(), path.to_owned(), limit));
 }
 
 /// path-string analysis only — never dereferences `raw_target`
@@ -532,9 +628,8 @@ impl LocalChangeProcessor {
     pub(super) fn content_op(
         &self,
         record: &FileRecord,
-        unix_mode: Option<u32>,
+        exec: bool,
         symlink_target: Option<Vec<u8>>,
-        xattrs: Vec<(String, Vec<u8>)>,
     ) -> (Op, FileVersion) {
         // The chunker's real per-block sizes are in scope here, so the version
         // carries each block's exact length; a receiver rebuilds offsets from
@@ -548,10 +643,9 @@ impl LocalChangeProcessor {
             if symlink_target.is_some() { RecordKind::Symlink } else { RecordKind::File };
         let meta = FileMeta {
             mtime_unix_nanos: record.mtime_unix_nanos,
-            unix_mode,
+            exec: exec && record_kind == RecordKind::File,
             symlink_target,
             record_kind,
-            xattrs,
         };
         let version = FileVersion::new(blocks, record.size, meta);
         let version_hash = version.version_hash;
@@ -611,7 +705,7 @@ impl LocalChangeProcessor {
     /// (`scan_existing_files`) never issues a per-file query for them.
     ///
     /// The third element of the returned tuple
-    /// (see [`PendingUnixModeUpdate`]) is the Unix permission bits to
+    /// (see [`PendingExecUpdate`]) is the execute flag to
     /// persist, when this call determined a value needs capturing. Returned
     /// rather than applied directly here, mirroring `SymlinkClassification`:
     /// the caller folds both into the path's `LocalFileMetaColumns` (see
@@ -635,11 +729,8 @@ impl LocalChangeProcessor {
         clippy::excessive_nesting,
         reason = "the nested arms are the fast-path ladder for an \
                   apparently-unchanged file: size and mtime match, then \
-                  unix_mode, then replicated xattrs, each level only \
-                  reachable when every coarser check already matched. \
-                  Flattening it would either re-read metadata per check or \
-                  lose the ordering that makes the expensive xattr open the \
-                  last resort"
+                  the execute flag, each level only reachable when every \
+                  coarser check already matched"
     )]
     pub(super) fn build_record_for_created_or_modified(
         &self,
@@ -654,9 +745,9 @@ impl LocalChangeProcessor {
         // caller that has more than one file to pool blocks across. `None`
         // is a single live watcher event, whose content is chunked and
         // durably committed here exactly as it always was.
-        staging: Option<&mut ScanBlockStaging<'_>>,
+        mut staging: Option<&mut ScanBlockStaging<'_>>,
     ) -> Result<
-        (LocalChangeOutcome, Option<SymlinkClassification>, PendingUnixModeUpdate),
+        (LocalChangeOutcome, Option<SymlinkClassification>, PendingExecUpdate),
         LocalCaptureError,
     > {
         // Zero-field `phase T_*` marker: a timestamp anchor for offline
@@ -803,53 +894,18 @@ impl LocalChangeProcessor {
                         let predecessor = Predecessor::of_row(
                             self.state.canonical_current_row(group_id, &rel_path)?.as_ref(),
                         );
-                        let on_disk_unix_mode = self.captured_unix_mode(&metadata, &predecessor);
-                        let (indexed_unix_mode, indexed_xattrs) =
-                            (predecessor.unix_mode, predecessor.xattrs.clone());
-                        // Same reasoning as the exec bit just above, for
-                        // extended attributes: a `setxattr`-only
-                        // edit touches none of size/mtime/content/unix_mode
-                        // either, so it must be checked here too, or it is
-                        // silently and permanently dropped -- never
-                        // captured, never emitted, and a peer's next sync
-                        // would overwrite this device's real xattr edit
-                        // with the stale indexed value.
-                        let on_disk_xattrs = self.captured_xattrs(path, &predecessor);
-                        if on_disk_unix_mode == indexed_unix_mode
-                            && on_disk_xattrs == indexed_xattrs
-                        {
-                            // size, mtime, exec bit, AND xattrs all
-                            // unchanged — preserve the existing no-op
+                        let on_disk_exec = self.captured_exec(&metadata, &predecessor);
+                        if on_disk_exec == predecessor.exec {
+                            // size, mtime and the execute flag all
+                            // unchanged -- preserve the existing no-op
                             // behavior exactly.
                             return Ok((LocalChangeOutcome::None, None, None));
                         }
-                        // A row that records no mode (a version from a platform with
-                        // no permission bits) says nothing the file's own mode can
-                        // diverge from, and the daemon's write of that version gives
-                        // the file the platform's default one. While a write of
-                        // exactly this content is open, that is the write's own
-                        // echo, not a chmod: the unfinished write (its proof is not
-                        // recorded yet, so `is_untouched_proven_write` cannot say so)
-                        // must not be authored back as a local edit.
-                        if indexed_unix_mode.is_none()
-                            && on_disk_xattrs == indexed_xattrs
-                            && self
-                                .state
-                                .materialization_intent_target(group_id, &rel_path)?
-                                .is_some_and(|target| {
-                                    target
-                                        == yadorilink_local_storage::intent_target_hash(
-                                            &existing.blocks,
-                                        )
-                                })
-                        {
-                            return Ok((LocalChangeOutcome::None, None, None));
-                        }
-                        // A mode or xattr set that differs from the row is a
+                        // An execute flag that differs from the row is a
                         // local edit only if someone made it. The daemon's own
                         // untouched write of an older version still carries
-                        // that version's metadata, and authoring it would put
-                        // the older mode over the newer version.
+                        // that version's flag, and authoring it would put
+                        // the older flag over the newer version.
                         if self.is_untouched_proven_write(
                             Some(existing),
                             group_id,
@@ -863,7 +919,7 @@ impl LocalChangeProcessor {
                         return Ok((
                             LocalChangeOutcome::FileChanged(record),
                             None,
-                            Some(on_disk_unix_mode),
+                            Some(on_disk_exec),
                         ));
                     }
                 }
@@ -911,6 +967,9 @@ impl LocalChangeProcessor {
         // Read before `staging` is moved into the closure below; decides
         // who records this file's group block provenance further down.
         let staged_blocks = staging.is_some();
+        // Whether this file's blocks go into the store or are only hashed (`crate::ingest`). A
+        // file that cannot be flushed falls back to the store below.
+        let mut ingest = self.ingest_policy.ingest_for(group_id, &rel_path, lstat.len());
         // ONE LOOK AT THE FILE. The record built below -- blocks, size,
         // mtime, mode -- must describe a single state of the file, and a
         // file can be written while it is read (a `git clone` streaming a
@@ -930,59 +989,97 @@ impl LocalChangeProcessor {
         // would capture whatever it points at -- possibly a file outside
         // the root -- as this path's content. Such a pass is left for a
         // later one, which classifies the path afresh.
-        let chunk_result = run_capture_pass_off_worker(|| -> Result<_, LocalCaptureError> {
-            let Some(file) = open_classified_regular_file(path, &lstat)? else {
-                return Ok(None);
-            };
-            let before = file.metadata().map_err(source_read_error)?;
-            let fingerprint_before = disk_race_fingerprint_of_handle(&before, &file);
-            // Chunking algorithm is chosen automatically from file size:
-            // files at or above the size threshold use content-defined
-            // chunking (so an internal edit re-transfers only the affected
-            // region), and everything below uses the original fixed-size
-            // chunker. Self-echo suppression below just compares whatever
-            // this device's chunker produced against what's indexed, so it
-            // needs no algorithm-awareness either way.
-            let use_cdc = before.len() >= CDC_SIZE_THRESHOLD;
-            let force_fixed = use_cdc && force_fixed_requested;
-            let blocks = match staging {
-                // A reconciliation scan: hash here, hand every block to the
-                // scan's cross-file pool, and let the scan flush. The
-                // blocks this returns are NOT durable yet — see
-                // `scan_block_staging`'s module doc for who owns making
-                // them so, and for why a per-file commit cannot be the
-                // answer on a folder of small files.
-                Some(staging) => yadorilink_local_storage::hash_open_file_blocks(
-                    &file,
-                    use_cdc && !force_fixed,
-                    |block, prepared| staging.stage(&block.hash, prepared),
-                )?,
-                // A single live watcher event: one file is the whole batch
-                // there, so there is nothing to pool across and the
-                // existing per-file producers stay exactly as they were.
-                None if force_fixed => {
-                    yadorilink_local_storage::chunk_open_file_fixed_with_callback(
-                        self.store.as_ref(),
+        let chunk_result = loop {
+            let attempt = run_capture_pass_off_worker(|| -> Result<_, LocalCaptureError> {
+                let Some(file) = open_classified_regular_file(path, &lstat)? else {
+                    return Ok(None);
+                };
+                let before = file.metadata().map_err(source_read_error)?;
+                let fingerprint_before = disk_race_fingerprint_of_handle(&before, &file);
+                // Chunking algorithm is chosen automatically from file size:
+                // files at or above the size threshold use content-defined
+                // chunking (so an internal edit re-transfers only the affected
+                // region), and everything below uses the original fixed-size
+                // chunker. Self-echo suppression below just compares whatever
+                // this device's chunker produced against what's indexed, so it
+                // needs no algorithm-awareness either way.
+                let use_cdc = before.len() >= CDC_SIZE_THRESHOLD;
+                let force_fixed = use_cdc && force_fixed_requested;
+                let blocks = if ingest == Ingest::FileOnly {
+                    // Hash only: the file is the holder of these bytes (see `crate::ingest`), and is
+                    // flushed below before the record that names them may commit.
+                    yadorilink_local_storage::hash_open_file_blocks(
                         &file,
-                        |_, _: std::sync::Arc<[u8]>| {},
+                        use_cdc && !force_fixed,
+                        |_, _| Ok::<(), LocalCaptureError>(()),
                     )?
+                } else {
+                    match staging.as_deref_mut() {
+                        // A reconciliation scan: hash here, hand every block to the
+                        // scan's cross-file pool, and let the scan flush. The
+                        // blocks this returns are NOT durable yet — see
+                        // `scan_block_staging`'s module doc for who owns making
+                        // them so, and for why a per-file commit cannot be the
+                        // answer on a folder of small files.
+                        Some(staging) => yadorilink_local_storage::hash_open_file_blocks(
+                            &file,
+                            use_cdc && !force_fixed,
+                            |block, prepared| staging.stage(&block.hash, prepared),
+                        )?,
+                        // A single live watcher event: one file is the whole batch
+                        // there, so there is nothing to pool across and the
+                        // existing per-file producers stay exactly as they were.
+                        None if force_fixed => {
+                            yadorilink_local_storage::chunk_open_file_fixed_with_callback(
+                                self.store.as_ref(),
+                                &file,
+                                |_, _: std::sync::Arc<[u8]>| {},
+                            )?
+                        }
+                        None if use_cdc => {
+                            yadorilink_local_storage::chunk_open_file_content_defined_with_callback(
+                                self.store.as_ref(),
+                                &file,
+                                |_, _: std::sync::Arc<[u8]>| {},
+                            )?
+                        }
+                        None => chunk_open_file(self.store.as_ref(), &file)?,
+                    }
+                };
+                #[cfg(any(test, feature = "test-support"))]
+                fire_content_read_race_hook(path);
+                // The barrier of a file-only capture: after the last read and before the record can
+                // commit, the file's bytes are made durable. A store capture's blocks are made
+                // durable by the store instead. The fingerprint comparison below runs after the
+                // flush, so a write or a rename that lands meanwhile abandons the pass.
+                let barrier = if ingest == Ingest::FileOnly {
+                    flush_before_commit(root, path, &before)
+                } else {
+                    Barrier::NotNeeded
+                };
+                let after = file.metadata().map_err(source_read_error)?;
+                let fingerprint_after = disk_race_fingerprint_of_handle(&after, &file);
+                Ok(Some((
+                    blocks,
+                    before,
+                    after,
+                    fingerprint_before == fingerprint_after && barrier != Barrier::NameMoved,
+                    barrier,
+                )))
+            });
+            match attempt {
+                Ok(Some((.., Barrier::CouldNotFlush))) => {
+                    tracing::info!(
+                        group_id,
+                        path = %rel_path,
+                        "the file could not be flushed, so its blocks go into the store instead"
+                    );
+                    ingest = Ingest::Store;
                 }
-                None if use_cdc => {
-                    yadorilink_local_storage::chunk_open_file_content_defined_with_callback(
-                        self.store.as_ref(),
-                        &file,
-                        |_, _: std::sync::Arc<[u8]>| {},
-                    )?
-                }
-                None => chunk_open_file(self.store.as_ref(), &file)?,
-            };
-            #[cfg(any(test, feature = "test-support"))]
-            fire_content_read_race_hook(path);
-            let after = file.metadata().map_err(source_read_error)?;
-            let fingerprint_after = disk_race_fingerprint_of_handle(&after, &file);
-            Ok(Some((blocks, before, after, fingerprint_before == fingerprint_after)))
-        });
-        let (blocks, before, after, unchanged) = match chunk_result {
+                other => break other,
+            }
+        };
+        let (blocks, before, after, unchanged, _) = match chunk_result {
             Ok(Some(read)) => read,
             Ok(None) => return Ok((replaced_while_opening(group_id, &rel_path), None, None)),
             // The lstat above already confirmed `path` existed when this
@@ -1044,7 +1141,7 @@ impl LocalChangeProcessor {
         // -- so `ScanBlockStaging::flush` records it there instead, per
         // batch, immediately after that batch is durable and still well
         // before anything referencing it can commit.
-        if !staged_blocks {
+        if !staged_blocks && ingest == Ingest::Store {
             let block_hashes: Vec<Vec<u8>> =
                 blocks.iter().map(|block| block.hash.clone()).collect();
             self.state.record_group_block_provenance(group_id, &block_hashes)?;
@@ -1100,13 +1197,13 @@ impl LocalChangeProcessor {
         // projecting is treated as that projection's own echo.
         //
         // CONTENT MATCHING THE INTENT IS NOT, BY ITSELF, PROOF THIS IS AN
-        // ECHO -- the same lesson the exec-bit/xattr check just below this
+        // ECHO -- the same lesson the exec-bit check just below this
         // block exists to teach about the plain `existing.blocks == blocks`
         // comparison applies here too, for an identical reason. A real
-        // metadata-only edit (chmod, an xattr change) can land on a path
+        // metadata-only edit (a chmod) can land on a path
         // while materialize's OWN intent for that path's CONTENT is still
         // open (its content write already landed; its own
-        // `apply_unix_mode`/`apply_xattrs` calls, or simply an unrelated
+        // `apply_exec` call, or simply an unrelated
         // human edit racing the still-open intent, haven't run yet) --
         // returning unconditionally here on content alone would silently
         // swallow that edit, exactly the failure class the check below was
@@ -1116,7 +1213,7 @@ impl LocalChangeProcessor {
         // this materialization intends to project" -- content alone is
         // necessary but not sufficient.
         //
-        // So: suppress only when mode AND xattrs ALSO already agree with
+        // So: suppress only when the execute flag ALSO already agrees with
         // what's indexed for this path RIGHT NOW -- fetched fresh here, not
         // from `existing` (a snapshot taken before this function's own
         // chunking read, which is exactly the kind of stale reference this
@@ -1132,18 +1229,13 @@ impl LocalChangeProcessor {
             if intent_target == yadorilink_local_storage::intent_target_hash(&blocks) {
                 if let Ok(metadata) = std::fs::metadata(path) {
                     let indexed_row = self.state.canonical_current_row(group_id, &rel_path)?;
-                    let has_row = indexed_row.is_some();
                     let predecessor = Predecessor::of_row(indexed_row.as_ref());
-                    let on_disk_unix_mode = self.captured_unix_mode(&metadata, &predecessor);
-                    let (indexed_unix_mode, indexed_xattrs) =
-                        (predecessor.unix_mode, predecessor.xattrs.clone());
-                    let on_disk_xattrs = self.captured_xattrs(path, &predecessor);
-                    // A row that records no mode has none for the disk to diverge from
-                    // while the write that owns the intent is still open. (No row at
-                    // all is a different thing: nothing says what the file should be.)
-                    if (on_disk_unix_mode == indexed_unix_mode
-                        || (has_row && indexed_unix_mode.is_none()))
-                        && on_disk_xattrs == indexed_xattrs
+                    // While the write that owns the intent is still open the file
+                    // is the daemon's own; only a real divergence of the flag is an
+                    // edit. No row at all is a different thing: nothing says what
+                    // the file should be.
+                    if indexed_row.is_some()
+                        && self.captured_exec(&metadata, &predecessor) == predecessor.exec
                     {
                         return Ok((LocalChangeOutcome::None, None, None));
                     }
@@ -1174,15 +1266,8 @@ impl LocalChangeProcessor {
                     let predecessor = Predecessor::of_row(
                         self.state.canonical_current_row(group_id, &rel_path)?.as_ref(),
                     );
-                    let on_disk_unix_mode = self.captured_unix_mode(&metadata, &predecessor);
-                    let (indexed_unix_mode, indexed_xattrs) =
-                        (predecessor.unix_mode, predecessor.xattrs.clone());
-                    // Same reasoning as the exec-bit check just above, for
-                    // extended attributes -- see the size+mtime
-                    // fast path's own identical comment for the full
-                    // rationale.
-                    let on_disk_xattrs = self.captured_xattrs(path, &predecessor);
-                    if on_disk_unix_mode != indexed_unix_mode || on_disk_xattrs != indexed_xattrs {
+                    let on_disk_exec = self.captured_exec(&metadata, &predecessor);
+                    if on_disk_exec != predecessor.exec {
                         // Content is genuinely unchanged (so no re-chunk,
                         // no re-versioned block list), but the exec bit is
                         // a real, local, user-initiated divergence — bump
@@ -1192,7 +1277,7 @@ impl LocalChangeProcessor {
                         return Ok((
                             LocalChangeOutcome::FileChanged(existing.clone()),
                             None,
-                            Some(on_disk_unix_mode),
+                            Some(on_disk_exec),
                         ));
                     }
                 }
@@ -1216,7 +1301,7 @@ impl LocalChangeProcessor {
         // discoverable later via a subsequent metadata-only update.
         let predecessor =
             Predecessor::of_row(self.state.canonical_current_row(group_id, &rel_path)?.as_ref());
-        let unix_mode = self.captured_unix_mode(&metadata, &predecessor);
+        let exec = self.captured_exec(&metadata, &predecessor);
 
         let record = FileRecord {
             path: rel_path,
@@ -1225,7 +1310,7 @@ impl LocalChangeProcessor {
             blocks,
             deleted: false,
         };
-        Ok((LocalChangeOutcome::FileChanged(record), None, Some(unix_mode)))
+        Ok((LocalChangeOutcome::FileChanged(record), None, Some(exec)))
     }
 
     /// Builds a symlink leaf record: the target's raw text

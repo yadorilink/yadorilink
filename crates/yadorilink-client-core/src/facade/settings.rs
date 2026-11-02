@@ -7,13 +7,21 @@ use super::ClientCore;
 use crate::dto::{
     self, AccountDeletionImpact, AccountDeletionRequest, AccountDeletionStatus, BandwidthLimits,
     DaemonStartOutcome, DiagnosticsCollectionMode, DiagnosticsExport, GcReport, IncomingTransfer,
-    OutgoingTransfer, ReceivedTransfer, SentTransfer, SpaceManagement, SpaceReclaimPreview,
-    UpdateConfig, UpdateDownloadGuidance, UpdateStatus,
+    OutgoingTransfer, ReceivedTransfer, SendLink, SendLinkPreview, SendLinkStatus, SendLinkTtl,
+    SentTransfer, SpaceManagement, SpaceReclaimPreview, UpdateConfig, UpdateDownloadGuidance,
+    UpdateStatus,
 };
-use crate::error::{CoreError, DaemonUnavailableReason, DesktopError};
+use crate::error::{CoreError, DaemonUnavailableReason, DesktopError, RefusalReason};
 use crate::ops;
 use crate::ops::diagnostics::BundleRequest;
 use crate::ops::transfers::RetryDirection;
+
+fn unknown_link_state() -> DesktopError {
+    DesktopError::Internal {
+        message: "the engine reported a send link state this app does not know".to_owned(),
+        category: "send_link_state_unknown".to_owned(),
+    }
+}
 
 fn limits(up: u64, down: u64) -> BandwidthLimits {
     BandwidthLimits {
@@ -50,6 +58,111 @@ impl ClientCore {
         target_device_id: String,
     ) -> Result<SentTransfer, DesktopError> {
         Ok(dto::sent_transfer(ops::transfers::send_file(source_path, target_device_id).await?))
+    }
+
+    /// Creates a one-use Send link for a recipient on any account. `source_paths` (files and/or
+    /// folders; empty = no preview) lets the recipient preview every name and the total size. The code in the result is
+    /// shown once. Nothing is offered yet: the sender then calls [`Self::send_to_link`].
+    ///
+    /// # Errors
+    /// `NotSignedIn` without a sign-in; `Network` when the service cannot be reached.
+    pub async fn create_send_link(
+        &self,
+        ttl: SendLinkTtl,
+        source_paths: Vec<String>,
+    ) -> Result<SendLink, DesktopError> {
+        Ok(dto::send_link(ops::transfers::create_send_link(ttl.seconds(), source_paths).await?))
+    }
+
+    /// Who sends the link a code names and what it carries, for the recipient to agree to
+    /// receive it. Needs a sign-in and consumes nothing: redeeming is a separate call.
+    ///
+    /// # Errors
+    /// `NotSignedIn` without a sign-in; `Refused` with `SendLinkInvalid` for any link that is
+    /// not open (the service does not say why).
+    pub async fn preview_send_link(&self, code: String) -> Result<SendLinkPreview, DesktopError> {
+        Ok(dto::send_link_preview(ops::transfers::preview_send_link(code).await?))
+    }
+
+    /// Sends files and/or folders (one transfer) under a Send link. Waits (up to ten minutes)
+    /// until the recipient has redeemed the link, so a screen runs it in the background; returns
+    /// once the offer is accepted. A link works for one send.
+    ///
+    /// # Errors
+    /// `Refused` with `SendLinkExpired`, `SendLinkAlreadyUsed` or `SendLinkCancelled` when the
+    /// link cannot be used; `SendPeerUnreachable` when the recipient's device is offline.
+    pub async fn send_to_link(
+        &self,
+        link_id: String,
+        source_paths: Vec<String>,
+    ) -> Result<SentTransfer, DesktopError> {
+        Ok(dto::sent_transfer(
+            ops::transfers::send_files(source_paths, format!("link:{link_id}")).await?,
+        ))
+    }
+
+    /// Redeems a Send link code with one of this account's devices, which the person always
+    /// picks (see `list_devices`). Returns the link id. Redeeming is the one consent: the engine
+    /// receives the sender's offer by itself into `receive_dir` (absolute; `None` = a folder of
+    /// its own choosing) when `receiving_device_id` is this device. The offer shows in the inbox
+    /// (`list_inbox`) with `link_id` set, and its status and `received_bytes` follow the receive.
+    ///
+    /// # Errors
+    /// `NotSignedIn`; `Refused` with `SendLinkInvalid` for any code the service does not accept
+    /// (it does not say whether it expired, was used or cancelled).
+    pub async fn redeem_send_link(
+        &self,
+        code: String,
+        receiving_device_id: String,
+        receive_dir: Option<String>,
+    ) -> Result<String, DesktopError> {
+        if receiving_device_id.is_empty() {
+            return Err(DesktopError::invalid_input(
+                "a receiving device is required",
+                "receiving_device_id",
+            ));
+        }
+        Ok(ops::transfers::redeem_send_link(code, Some(receiving_device_id), receive_dir)
+            .await?
+            .link_id)
+    }
+
+    /// Withdraws a Send link; a grant it already issued but nobody used goes with it.
+    ///
+    /// # Errors
+    /// Daemon and service failures, `SendLinkInvalid` for a link that is not this account's.
+    pub async fn cancel_send_link(&self, link_id: String) -> Result<(), DesktopError> {
+        Ok(ops::transfers::cancel_send_link(link_id).await?)
+    }
+
+    /// The sender's view of one Send link.
+    ///
+    /// # Errors
+    /// Daemon and service failures, `SendLinkInvalid` for a link the service does not know.
+    pub async fn send_link_status(&self, link_id: String) -> Result<SendLinkStatus, DesktopError> {
+        let status = ops::transfers::send_link_status(link_id.clone()).await?;
+        dto::send_link_status(link_id, status).ok_or_else(unknown_link_state)
+    }
+
+    /// The status of each link in `link_ids`, in order. A link the service no longer knows is
+    /// left out; any other failure fails the call. The caller keeps the ids of the links it
+    /// created.
+    ///
+    /// # Errors
+    /// Daemon and service failures.
+    pub async fn list_send_links(
+        &self,
+        link_ids: Vec<String>,
+    ) -> Result<Vec<SendLinkStatus>, DesktopError> {
+        let mut statuses = Vec::with_capacity(link_ids.len());
+        for link_id in link_ids {
+            match self.send_link_status(link_id).await {
+                Ok(status) => statuses.push(status),
+                Err(DesktopError::Refused { reason: RefusalReason::SendLinkInvalid, .. }) => {}
+                Err(other) => return Err(other),
+            }
+        }
+        Ok(statuses)
     }
 
     /// # Errors

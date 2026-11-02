@@ -169,6 +169,9 @@ pub mod writer_gate_stats {
         pub commit_calls: u64,
         pub commit_nanos: u128,
         pub commit_max_nanos: u64,
+        /// Calls that changed at least one row. Under `synchronous = FULL` only these
+        /// reach an fsync: a call that changed nothing writes no log frame.
+        pub changed_calls: u64,
     }
 
     pub fn set_split_enabled(on: bool) {
@@ -192,6 +195,7 @@ pub mod writer_gate_stats {
         location: &'static std::panic::Location<'static>,
         body: Duration,
         commit: Option<Duration>,
+        changed: bool,
     ) {
         let body_nanos = body.as_nanos().min(u64::MAX as u128) as u64;
         BODY_HIST.record(body_nanos);
@@ -203,6 +207,7 @@ pub mod writer_gate_stats {
         let entry = sites.entry((location.file(), location.line())).or_default();
         entry.calls += 1;
         entry.body_nanos += body_nanos as u128;
+        entry.changed_calls += u64::from(changed);
         if let Some(nanos) = commit_nanos {
             entry.commit_calls += 1;
             entry.commit_nanos += nanos as u128;
@@ -327,6 +332,10 @@ pub struct SyncDatabase {
     /// and so also counts every other database's writes. See
     /// [`Self::write_transaction_count`].
     write_transactions: AtomicU64,
+    /// Bumped after every write through this handle that changed at least one row (triggers
+    /// included), never for a write that found nothing to do. A poller that used to wake on a
+    /// timer to look for new work waits on [`Self::subscribe_data_changes`] instead.
+    data_changed: tokio::sync::watch::Sender<u64>,
     /// Whether this database carries the provider tables, so every write TRANSACTION reconciles
     /// provider item liveness before it commits (a connection-level autocommit write only records
     /// the changed paths, atomically with the change; provider reads settle them first; see
@@ -553,6 +562,7 @@ impl SyncDatabase {
             _close_barrier: CloseBarrier(connections),
             writer_gate: Mutex::new(()),
             write_transactions: AtomicU64::new(0),
+            data_changed: tokio::sync::watch::channel(0).0,
             provider_liveness,
         })
     }
@@ -602,6 +612,7 @@ impl SyncDatabase {
             _close_barrier: CloseBarrier(connections),
             writer_gate: Mutex::new(()),
             write_transactions: AtomicU64::new(0),
+            data_changed: tokio::sync::watch::channel(0).0,
             provider_liveness,
         })
     }
@@ -633,6 +644,19 @@ impl SyncDatabase {
     /// keeps writing.
     pub fn write_transaction_count(&self) -> u64 {
         self.write_transactions.load(Ordering::Relaxed)
+    }
+
+    /// A receiver that resolves `changed()` once a write through this handle has changed rows
+    /// since the receiver last looked (`borrow_and_update()`). Take the mark BEFORE reading the
+    /// state to act on, so a write landing during the read wakes the next wait. A write that
+    /// changed nothing (an empty transaction) does not signal, so a poller whose pass opens an
+    /// empty write transaction does not wake itself.
+    pub fn subscribe_data_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.data_changed.subscribe()
+    }
+
+    fn signal_data_changed(&self) {
+        self.data_changed.send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
     /// A read, retried on a transient SQLITE_BUSY/SQLITE_LOCKED (external
@@ -695,12 +719,17 @@ impl SyncDatabase {
         writer_gate_stats::record_call_site(caller);
         self.locked_write(caller, || {
             let mut conn = checkout::<E>(&self.pool)?;
-            if !writer_gate_stats::split_enabled() {
-                return operation(&mut conn);
-            }
+            let changes_before = total_changes(&conn);
             let started = std::time::Instant::now();
             let result = operation(&mut conn);
-            writer_gate_stats::record_split(caller, started.elapsed(), None);
+            let body = started.elapsed();
+            let changed = changes_before.is_none() || total_changes(&conn) != changes_before;
+            if writer_gate_stats::split_enabled() {
+                writer_gate_stats::record_split(caller, body, None, changed);
+            }
+            if changed {
+                self.signal_data_changed();
+            }
             result
         })
     }
@@ -803,19 +832,25 @@ impl SyncDatabase {
             let mut conn = checkout::<E>(&self.pool)?;
             let tx = new_immediate_write_transaction(&mut conn)?;
             let body_started = writer_gate_stats::split_enabled().then(std::time::Instant::now);
+            let changes_before = total_changes(&tx);
             let result = operation(&tx)?;
             // After the COMPLETE semantic mutation, before the commit: liveness reads the
             // final state, never an intermediate one.
             if self.provider_liveness {
                 crate::schema::reconcile_provider_liveness(&tx).map_err(E::from)?;
             }
+            let changed = changes_before.is_none() || total_changes(&tx) != changes_before;
             let commit_started = body_started.map(|body| (body, std::time::Instant::now()));
             tx.commit().map_err(E::from)?;
+            if changed {
+                self.signal_data_changed();
+            }
             if let Some((body_started, commit_started)) = commit_started {
                 writer_gate_stats::record_split(
                     caller,
                     commit_started.duration_since(body_started),
                     Some(commit_started.elapsed()),
+                    changed,
                 );
             }
             Ok(result)
@@ -872,6 +907,14 @@ impl SyncDatabase {
     }
 }
 
+/// Rows this connection has changed so far (triggers included). `None` when it cannot be read,
+/// which callers treat as "changed": a spurious wake costs a look, a missed one a delay.
+fn total_changes(conn: &Connection) -> Option<i64> {
+    conn.prepare_cached("SELECT total_changes()")
+        .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)))
+        .ok()
+}
+
 /// One half of the fix for a real, previously-diagnosed
 /// `SQLITE_LOCKED: database table is locked` failure class.
 /// `rusqlite::Connection::transaction` opens a `DEFERRED` transaction by
@@ -901,3 +944,49 @@ fn new_immediate_write_transaction(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod data_change_tests {
+    use super::*;
+
+    fn database() -> SyncDatabase {
+        SyncDatabase::open_in_memory(|conn| {
+            conn.execute_batch("CREATE TABLE t (x INTEGER);")?;
+            Ok(())
+        })
+        .unwrap()
+    }
+
+    /// A write that changes rows signals subscribers; an empty write transaction and a
+    /// no-row statement do not, so a poller whose pass opens an empty transaction does not wake
+    /// itself.
+    #[test]
+    fn only_a_write_that_changes_rows_signals() {
+        let db = database();
+        let mut rx = db.subscribe_data_changes();
+        rx.borrow_and_update();
+
+        db.write_immediate::<_, DatabaseError>(|_tx| Ok(())).unwrap();
+        db.write::<_, DatabaseError>(|conn| {
+            conn.execute("DELETE FROM t", [])?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(!rx.has_changed().unwrap(), "no row changed");
+
+        db.write_immediate::<_, DatabaseError>(|tx| {
+            tx.execute("INSERT INTO t VALUES (1)", [])?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(rx.has_changed().unwrap(), "an immediate write that inserted a row");
+        rx.borrow_and_update();
+
+        db.write::<_, DatabaseError>(|conn| {
+            conn.execute("INSERT INTO t VALUES (2)", [])?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(rx.has_changed().unwrap(), "an autocommit write that inserted a row");
+    }
+}

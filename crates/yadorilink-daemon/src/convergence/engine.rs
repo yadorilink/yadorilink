@@ -62,6 +62,16 @@ const MAX_JOBS_PER_TICK_PER_GROUP: u32 = 128;
 /// event-driven wake fired by `enqueue_pending`'s caller.
 const FALLBACK_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long a tick that found nothing runnable waits for a write (or for the earliest backed-off
+/// row's deadline, if that is sooner) before looking anyway. Obligations are only ever created or
+/// unblocked by writes to the replica database, and every such write wakes the loop; this is a
+/// safety net. [`FALLBACK_POLL_INTERVAL`] remains for a tick that could not read the table.
+const IDLE_BACKSTOP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The shortest sleep before a backed-off row's deadline: a deadline already past (a row that
+/// became due while the tick ran) is looked at again after this, not in a spin.
+const MIN_DEADLINE_WAIT: Duration = Duration::from_millis(50);
+
 /// How many groups' audits run concurrently. Without this, `run_once`
 /// processing groups one at a time meant one group with many slow, blocked
 /// (sole-source-unreachable) attempts could hold up every other group's
@@ -367,7 +377,11 @@ pub async fn run(engine: Arc<ConvergenceEngine>) {
     // opposed to inferring it from whether `run_once` happened to find any
     // claimable work) and which branch woke it each time.
     let mut tick: u64 = 0;
+    let mut writes = state.replica_coordinator.database().subscribe_data_changes();
     loop {
+        // Marked before the tick reads anything: a write that lands during the tick wakes the
+        // next wait.
+        writes.borrow_and_update();
         let tick_start = std::time::Instant::now();
         let outcome = run_once(&engine).await;
         let run_once_wall_ms = tick_start.elapsed().as_millis() as u64;
@@ -403,7 +417,11 @@ pub async fn run(engine: Arc<ConvergenceEngine>) {
                 let select_ms = select_started.elapsed().as_millis() as u64;
                 tracing::debug!(local_device_id = %state.device_id, tick, select_ms, "engine loop woken by wake_notified");
             }
-            _ = tokio::time::sleep(FALLBACK_POLL_INTERVAL) => {
+            _ = writes.changed(), if outcome.wait_for_write => {
+                let select_ms = select_started.elapsed().as_millis() as u64;
+                tracing::debug!(local_device_id = %state.device_id, tick, select_ms, "engine loop woken by a database write");
+            }
+            _ = tokio::time::sleep(idle_wait(&outcome, now_unix_nanos())) => {
                 let select_ms = select_started.elapsed().as_millis() as u64;
                 tracing::debug!(local_device_id = %state.device_id, tick, select_ms, "engine loop woken by fallback poll");
             }
@@ -419,6 +437,25 @@ pub async fn run(engine: Arc<ConvergenceEngine>) {
 /// throughput tuning question.
 struct RunOnceOutcome {
     immediate_backlog: bool,
+    /// Nothing was runnable and the clock is the only thing that makes a row runnable (see
+    /// `wake_at`), so the next look waits for a write to the replica database or for `wake_at`
+    /// ([`IDLE_BACKSTOP_INTERVAL`] at most) instead of the one-second poll.
+    wait_for_write: bool,
+    /// With `wait_for_write`: when the earliest backed-off row becomes runnable (unix nanos), if
+    /// any. Rows a write unblocks (parked, paused, held, frozen) do not count.
+    wake_at: Option<i64>,
+}
+
+/// How long the loop sleeps when no wake and no write arrives.
+fn idle_wait(outcome: &RunOnceOutcome, now_unix_nanos: i64) -> Duration {
+    if !outcome.wait_for_write {
+        return FALLBACK_POLL_INTERVAL;
+    }
+    match outcome.wake_at {
+        None => IDLE_BACKSTOP_INTERVAL,
+        Some(at) => Duration::from_nanos(at.saturating_sub(now_unix_nanos).max(0) as u64)
+            .clamp(MIN_DEADLINE_WAIT, IDLE_BACKSTOP_INTERVAL),
+    }
 }
 
 /// One scheduler tick: claims every currently-runnable `projection_
@@ -453,7 +490,11 @@ async fn run_once(engine: &ConvergenceEngine) -> RunOnceOutcome {
         Ok(obligations) => obligations,
         Err(e) => {
             tracing::warn!(error = %e, "convergence engine failed to claim runnable obligations");
-            return RunOnceOutcome { immediate_backlog: false };
+            return RunOnceOutcome {
+                immediate_backlog: false,
+                wait_for_write: false,
+                wake_at: None,
+            };
         }
     };
     tracing::debug!(
@@ -466,7 +507,18 @@ async fn run_once(engine: &ConvergenceEngine) -> RunOnceOutcome {
             run_once_ms = run_once_started.elapsed().as_millis() as u64,
             "run_once returning (nothing runnable)"
         );
-        return RunOnceOutcome { immediate_backlog: false };
+        // Nothing runnable. A row can become runnable only through the clock (a backed-off row:
+        // its deadline) or through a write (a parked, paused or held one, a lifted freeze, a
+        // new admission), and every write wakes this loop, so it waits for the earliest of the
+        // two instead of polling. A failed read keeps the poll.
+        return match state.replica_coordinator.sqlite().dag_next_obligation_wake() {
+            Ok(wake_at) => {
+                RunOnceOutcome { immediate_backlog: false, wait_for_write: true, wake_at }
+            }
+            Err(_) => {
+                RunOnceOutcome { immediate_backlog: false, wait_for_write: false, wake_at: None }
+            }
+        };
     }
     // This tick's claim itself hit the global cap -- there may be MORE
     // runnable obligations this call never even fetched, regardless of how
@@ -523,7 +575,11 @@ async fn run_once(engine: &ConvergenceEngine) -> RunOnceOutcome {
         run_once_ms = run_once_started.elapsed().as_millis() as u64,
         "run_once returning (groups processed)"
     );
-    RunOnceOutcome { immediate_backlog: any_group_immediate_backlog || claim_hit_cap }
+    RunOnceOutcome {
+        immediate_backlog: any_group_immediate_backlog || claim_hit_cap,
+        wait_for_write: false,
+        wake_at: None,
+    }
 }
 
 /// Test-only: drives exactly one scheduler tick and reports whether `run`'s

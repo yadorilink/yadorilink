@@ -220,7 +220,11 @@ fn setup_device(name: &str) -> TestDevice {
         on_first_store: Mutex::new(None),
     });
     let (sync_state, index_dir) = support::open_file_backed_replica_coordinator();
-    let state = DaemonState::new(name.to_string(), Arc::new(sync_state), store.clone());
+    let state = yadorilink_daemon::test_support::isolated_daemon_state(
+        name.to_string(),
+        Arc::new(sync_state),
+        store.clone(),
+    );
     support::ensure_device_signing_key(&state);
     // The on-demand capability of this device's (plain) roots, for the legacy lane these tests exercise.
     state.set_test_on_demand_allowed(true);
@@ -598,6 +602,7 @@ async fn a_version_superseded_during_a_fetch_is_never_reported_hydrated() {
                 "device-x",
                 Some(&NativeRowIdentity::of(&head)),
                 None,
+                yadorilink_sync_sqlite::retention::Retention::OwnEdit,
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();

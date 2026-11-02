@@ -87,6 +87,12 @@ crates = [
   "yadorilink-replica-engine",
   "yadorilink-namespace",
   "yadorilink-dcf-oracle",
+  # Pure view derivation over the IPC contract and over values its caller
+  # fetches (its exact allowlist below holds that). It sits here, below the
+  # daemon, because the daemon computes the product status once and sends it
+  # while the client layer and the front ends read it; a lower layer may not
+  # depend on a higher one.
+  "yadorilink-product-view",
 ]
 
 [layer.platform]
@@ -164,13 +170,8 @@ control-socket client for the local daemon, the coordination-plane client, the
 typed operations the front ends drive, and the product-facing view models
 derived from them. Returns typed results; never prints, prompts or exits.
 """
-# yadorilink-product-view sits here rather than with the interfaces because
-# the client layer derives from it; a lower layer may not depend on a higher
-# one. It is pure view derivation over the IPC contract and over values its
-# caller fetches (its exact allowlist below holds that).
 crates = [
   "yadorilink-client-core",
-  "yadorilink-product-view",
   # The embedded host composes the engine (the application layer) with the client layer's
   # sign-in, registration and account operations over the engine's own state directory, so it
   # sits with the client layer: a lower layer may not depend on a higher one.

@@ -72,7 +72,57 @@ fn run_with(
         running,
         local,
         roots: &m.roots,
+        path_copies: &[],
     })
+}
+
+fn duplicates(copies: &[&str]) -> Option<Finding> {
+    let copies: Vec<PathBuf> = copies.iter().map(PathBuf::from).collect();
+    super::duplicates_row(&copies)
+}
+
+#[test]
+fn no_copy_on_the_path_says_nothing_and_one_copy_is_ok() {
+    assert_eq!(duplicates(&[]), None);
+    let row = duplicates(&["/home/u/.local/bin/yadorilink"]).unwrap();
+    assert_eq!(row.severity, Severity::Ok);
+    assert_eq!(row.check, CHECK_DUPLICATES);
+}
+
+#[test]
+fn a_second_copy_on_the_path_is_a_warning_naming_both_and_the_fix() {
+    let row =
+        duplicates(&["/home/u/.cargo/bin/yadorilink", "/opt/homebrew/bin/yadorilink"]).unwrap();
+    assert_eq!(row.severity, Severity::Warn);
+    assert!(
+        row.detail.contains("/home/u/.cargo/bin/yadorilink is the yadorilink that runs"),
+        "{}",
+        row.detail
+    );
+    assert!(
+        row.detail.contains("1 more on the search path: /opt/homebrew/bin/yadorilink"),
+        "{}",
+        row.detail
+    );
+    assert!(row.detail.contains("Fix: remove the copies you do not use"), "{}", row.detail);
+}
+
+#[test]
+fn the_duplicates_row_comes_first_in_the_report_and_is_never_an_error() {
+    let m = machine();
+    let state = record(Owner::Cli, "script", "/home/u/.local/lib/yadorilink/1.0");
+    let copies = [PathBuf::from("/a/yadorilink"), PathBuf::from("/b/yadorilink")];
+    let rows = check(&Facts {
+        config_dir: Path::new("/cfg"),
+        record: &state,
+        lock: &LockProbe::Free,
+        running: None,
+        local: &local("c:d", 1),
+        roots: &m.roots,
+        path_copies: &copies,
+    });
+    assert_eq!(rows[0].check, CHECK_DUPLICATES);
+    assert!(errors(&rows).iter().all(|r| r.check != CHECK_DUPLICATES));
 }
 
 fn errors(rows: &[Finding]) -> Vec<&Finding> {

@@ -100,6 +100,20 @@ pub enum SyncSqliteError {
     )]
     LocalWriteCaptureStale { group_id: String, path: String },
 
+    /// A sync would replace a version that has bytes to keep, and the write came without the
+    /// retention proof for it. Nothing was written.
+    #[error(
+        "{group_id}/{path} would be replaced without a retention proof for its current version"
+    )]
+    RetentionProofMissing { group_id: String, path: String },
+
+    /// The retention proof was made for a row the path has since moved on from. Nothing was written;
+    /// the caller proves the row as it stands now.
+    #[error(
+        "the retention proof for {group_id}/{path} is for a version that is no longer current"
+    )]
+    RetentionProofStale { group_id: String, path: String },
+
     /// A local authoring refused by an authoring rule
     /// ([`yadorilink_replica_domain::author::AuthoringRefusal`]). Nothing was
     /// signed or written. Kept structured so the caller can react to the

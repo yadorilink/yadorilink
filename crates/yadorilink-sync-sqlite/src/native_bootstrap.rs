@@ -624,10 +624,9 @@ mod tests {
             FileMeta {
                 // A multiple of 100 ns, so a file system with coarse timestamps can hold it.
                 mtime_unix_nanos: seed as i64 * 1_000,
-                unix_mode: Some(0o644),
+                exec: false,
                 symlink_target: None,
                 record_kind: RecordKind::File,
-                xattrs: Vec::new(),
             },
         )
     }

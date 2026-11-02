@@ -839,3 +839,58 @@ async fn a_failed_refresh_is_one_request_and_leaves_the_stored_token_to_be_prese
     assert_eq!(manager.access_token().await.expect("second attempt"), "at-1");
     assert_eq!(enrolled.store.load().expect("load").expect("enrolled").refresh_token(), "rt-2");
 }
+
+/// The first refresh is processed by the server but its response never reaches the client (a
+/// connection that stalls past the client's timeout): the server has rotated, the client holds
+/// the retired token. The failed call must leave the store alone, and the next call must present
+/// that same token -- which the server's recovery window answers with a fresh successor -- so
+/// the installation keeps its session instead of ending up with a dead token.
+#[tokio::test]
+async fn a_dropped_refresh_response_is_recovered_by_presenting_the_same_token_again() {
+    let server = MockServer::start().await;
+    serve_discovery(&server, false).await;
+    let presentations = std::sync::atomic::AtomicUsize::new(0);
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("refresh_token=rt-1"))
+        .respond_with(move |_: &Request| {
+            // Server side: the first presentation rotates (and the response is held back past
+            // the client's timeout, i.e. lost); a re-presentation replaces the unconfirmed
+            // successor, as the server's recovery window does.
+            if presentations.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(200)
+                    .set_body_json(token_body("at-lost", "rt-2", 300))
+                    .set_delay(Duration::from_secs(3))
+            } else {
+                ResponseTemplate::new(200).set_body_json(token_body("at-1", "rt-2-recovered", 300))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let enrolled = enrol(&server.uri(), "rt-1").await;
+    let http = reqwest::Client::builder().timeout(Duration::from_millis(300)).build().unwrap();
+    let manager = CredentialManager::restore(http, &server.uri(), enrolled.store.clone())
+        .await
+        .expect("restore from the store");
+
+    let first = manager.access_token().await;
+    assert!(matches!(first, Err(Error::Http(_))), "the lost response is a transport error");
+    assert_eq!(
+        enrolled.store.load().expect("load").expect("enrolled").refresh_token(),
+        "rt-1",
+        "nothing was received, so nothing is written"
+    );
+
+    assert_eq!(manager.access_token().await.expect("second attempt"), "at-1");
+    assert_eq!(
+        enrolled.store.load().expect("load").expect("enrolled").refresh_token(),
+        "rt-2-recovered"
+    );
+    let requests = server.received_requests().await.expect("recorded");
+    assert_eq!(
+        requests.iter().filter(|r| r.url.path() == "/token").count(),
+        2,
+        "one lost response, one re-presentation"
+    );
+}

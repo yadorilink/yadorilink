@@ -2201,8 +2201,7 @@ async fn hydrate_inner(
                 initial_lstat.as_ref(),
                 initial_disk_identity,
                 &current,
-                canonical.snapshot.unix_mode,
-                &canonical.snapshot.xattrs,
+                canonical.snapshot.exec,
                 &root_commit_permit,
             )
         })
@@ -2283,22 +2282,10 @@ async fn hydrate_inner(
             if disk_identity(&out_path)? != initial_disk_identity {
                 return Err(SyncError::HydrationFailed(path.to_string()));
             }
-            // The xattrs are compared with the strict reader: the best-effort
-            // `xattrs_already_match_disk` reads a failed attribute read as "no
-            // attributes", so it could heal a proof over attributes nothing
-            // actually read. An attribute set that cannot be read is not a
-            // match; it falls through to the write path below, as a mismatch
-            // does, which reapplies the metadata and re-verifies it strictly.
-            if yadorilink_local_storage::unix_mode_already_matches_disk(
+            if yadorilink_local_storage::exec_already_matches_disk(
                 &out_path,
-                canonical.snapshot.unix_mode,
-            )? && matches!(
-                yadorilink_local_storage::verify_replicated_xattrs_exact(
-                    &out_path,
-                    &canonical.snapshot.xattrs,
-                ),
-                Ok(true)
-            ) {
+                canonical.snapshot.exec,
+            )? {
                 // Disk really does hold this version. Nothing is written;
                 // this only restores the footing of a claim already true.
                 let healed = heal_hydrated_proof_for_current_version(
@@ -2568,6 +2555,20 @@ async fn hydrate_inner(
             });
             intent.disarm();
             placed?;
+            // The rename reached stable storage (`Durability::Full`): from here a missing name
+            // is the user's doing, which the open intent alone cannot tell from a crash before
+            // the rename. Recorded before anything else happens to the file, and a mark that
+            // cannot be recorded fails the attempt: the intent stays open and the path stays
+            // unsettled, rather than leaving a window in which a delete reads as a crash.
+            state
+                .replica_coordinator
+                .materialization_intent_repository()
+                .mark_write_landed(group_id, path, mutation_generation, &root_commit_permit)
+                .map_err(|e| {
+                    SyncError::CorruptState(format!(
+                        "{path}: could not record the write landed: {e}"
+                    ))
+                })?;
             #[cfg(test)]
             if fail_after_place(&out_path) {
                 return Err(SyncError::HydrationFailed(path.to_string()));
@@ -2585,35 +2586,13 @@ async fn hydrate_inner(
             // index kept the correct bit, but disk never got it applied
             // after `reconstruct_file`.
             //
-            // Both come from the one row read this attempt took under the
-            // path lock, not from a fresh read here. `target_version`
-            // bakes the mode and the xattrs into its hash, so re-reading
-            // them on this side of the block fetch would apply one
-            // incarnation's metadata and then claim the other's version
-            // for it -- and the exactness gate could not catch it,
-            // because it verifies against the same row that supplied the
-            // wrong value. If the row has moved, this write is stale, and
-            // the commit below is where that is decided.
-            //
-            // The attributes are strictly confirmed inside this write, before
-            // the final mode; without that confirmation there is no exact
-            // proof to publish, even though the bytes and mode landed.
-            let applied = yadorilink_local_storage::apply_file_metadata_verified(
-                &out_path,
-                canonical.snapshot.unix_mode,
-                &canonical.snapshot.xattrs,
-            )?;
-            if let Err(refused) = yadorilink_local_storage::XattrEvidence::from(applied)
-                .prove(&out_path, &canonical.snapshot.xattrs)
-            {
-                tracing::warn!(
-                    %path,
-                    ?refused,
-                    "could not confirm the replicated extended attributes this hydration set; \
-                     abandoning the attempt rather than publishing a proof they do not back"
-                );
-                return Err(SyncError::HydrationFailed(path.to_string()));
-            }
+            // The flag comes from the one row read this attempt took under the
+            // path lock, not from a fresh read here. `target_version` bakes it
+            // into its hash, so re-reading it on this side of the block fetch
+            // would apply one incarnation's metadata and then claim the other's
+            // version for it. If the row has moved, this write is stale, and the
+            // commit below is where that is decided.
+            yadorilink_local_storage::apply_file_metadata(&out_path, canonical.snapshot.exec)?;
             // The proof for the write this device just performed, observed
             // once the file is in its final state.
             //
@@ -3067,9 +3046,20 @@ async fn restore_content_inner(
                 version_seq,
             )?
             else {
-                return Err(SyncError::NotFound(format!(
-                    "version {version_seq} of {group_id}/{path}"
-                )));
+                // A version the device recorded as not kept says why, instead of reading as a
+                // version that never existed.
+                let why = state.replica_coordinator.file_index_repository().version_not_kept(
+                    group_id,
+                    path,
+                    version_seq,
+                )?;
+                return Err(SyncError::NotFound(match why {
+                    Some(span) => format!(
+                        "version {version_seq} of {group_id}/{path} was not kept: {}",
+                        span.reason.words()
+                    ),
+                    None => format!("version {version_seq} of {group_id}/{path}"),
+                }));
             };
             version
         }
@@ -3134,9 +3124,8 @@ async fn restore_content_inner(
         version.size,
         now_unix_nanos,
         version.record_kind,
-        version.unix_mode,
+        version.exec,
         version.symlink_target.clone(),
-        version.xattrs.clone(),
     );
     let emitter = state.local_author().ok_or_else(|| {
         SyncError::CorruptState(format!(
@@ -3205,8 +3194,7 @@ async fn restore_content_inner(
                 record_kind: version.record_kind,
                 symlink_target: version.symlink_target.clone(),
                 symlink_out_of_root: false,
-                unix_mode: version.unix_mode,
-                xattrs: version.xattrs.clone(),
+                exec: version.exec,
             },
         },
         &restored_file_version,
@@ -3298,9 +3286,6 @@ async fn restore_content_inner(
         .replica_coordinator
         .dag_bump_mutation_fence(group_id, path, "restore_write")
         .map_err(|e| SyncError::CorruptState(format!("{path}: mutation fence bump failed: {e}")))?;
-    // Set by the regular-file arm below when its replicated xattrs could
-    // not be confirmed; the commit then publishes no exact proof.
-    let mut xattrs_unproven = false;
     // A restored version carries its own `record_kind`/`unix_mode`/
     // `symlink_target` (captured per-row, not just for the `current` row
     // -- see `VersionRecord::record_kind`'s own doc comment); calling
@@ -3373,25 +3358,7 @@ async fn restore_content_inner(
                     &temp_ledger,
                 )
             })?;
-            // Confirmed inside this write, before the final mode. A restore
-            // whose attributes cannot be confirmed still happened -- it is
-            // not failed -- but it publishes no exact proof for them.
-            let applied = yadorilink_local_storage::apply_file_metadata_verified(
-                &out_path,
-                version.unix_mode,
-                &version.xattrs,
-            )?;
-            if let Err(refused) = yadorilink_local_storage::XattrEvidence::from(applied)
-                .prove(&out_path, &version.xattrs)
-            {
-                tracing::warn!(
-                    %path,
-                    ?refused,
-                    "could not confirm the replicated extended attributes this restore set; \
-                     committing it without an exact proof"
-                );
-                xattrs_unproven = true;
-            }
+            yadorilink_local_storage::apply_file_metadata(&out_path, version.exec)?;
         }
         yadorilink_replica_domain::file::RecordKind::Symlink => match &version.symlink_target {
             Some(target) => materialize_restored_symlink(state, group_id, &out_path, target)?,
@@ -3424,7 +3391,6 @@ async fn restore_content_inner(
                     group_id,
                 ),
             )?;
-            yadorilink_local_storage::apply_unix_mode(&out_path, version.unix_mode)?;
         }
     }
     // Marks the journal entry disk-committed, observes what the write
@@ -3434,7 +3400,6 @@ async fn restore_content_inner(
         &operation_id,
         &out_path,
         wrote_under_mutation_generation,
-        !xattrs_unproven,
         &root_commit_permit,
     )? {
         yadorilink_replica_domain::session_state::RestoreCommitOutcome::Committed(_) => {}
@@ -3783,6 +3748,12 @@ async fn resolve_blocks_local_first_reporting(
         }
     }
 
+    // What this attempt has to fetch is known now, also when it is nothing: the requester is told
+    // how much of the content was already here (`AssemblyProgress::resumed_from`).
+    let bytes_total: u64 = missing.iter().map(|b| b.size as u64).sum();
+    if let Some(fetched) = stall.and_then(|stall| stall.fetched.as_ref()) {
+        fetched.plan_fetch(bytes_total);
+    }
     if missing.is_empty() {
         return Ok((Vec::new(), false));
     }
@@ -3791,10 +3762,6 @@ async fn resolve_blocks_local_first_reporting(
     // only (already-present blocks never touch the network, so they're not
     // part of "progress" toward completing this fetch) — torn down
     // automatically (whatever the outcome) once `_progress_guard` drops.
-    let bytes_total: u64 = missing.iter().map(|b| b.size as u64).sum();
-    if let Some(fetched) = stall.and_then(|stall| stall.fetched.as_ref()) {
-        fetched.plan_fetch(bytes_total);
-    }
     let blocks_total = missing.len() as u64;
     let _progress_guard = state.telemetry.begin_transfer(group_id, path, bytes_total, blocks_total);
 

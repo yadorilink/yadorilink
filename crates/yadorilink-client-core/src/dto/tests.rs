@@ -26,6 +26,12 @@ use super::*;
 use crate::ops::account::DeletionStatus;
 use crate::ops::shares::{GroupMemberInfo, PendingApproval, PendingInviteInfo, ShareEdgeInfo};
 
+/// A reply as the daemon sends it: with the product status computed and stored.
+fn computed(mut response: StatusResponse) -> StatusResponse {
+    yadorilink_product_view::wire::fill_product_status(&mut response);
+    response
+}
+
 fn secs(n: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(n)
 }
@@ -255,6 +261,7 @@ fn status_response() -> StatusResponse {
             peer("dev-a", WireReach::Connected, WireRoute::Relay),
             PeerStatus {
                 unreachable_category: WireUnreach::UdpBlocked as i32,
+                last_connected_unix: 500,
                 ..peer("dev-b", WireReach::Unreachable, WireRoute::Unspecified)
             },
         ],
@@ -319,12 +326,14 @@ fn status_snapshot_maps_every_section_of_the_daemon_status() {
                 reachability: PeerReachability::Connected,
                 unreachable_category: None,
                 route: RouteKind::Relay,
+                last_connected: None,
             },
             PeerSummary {
                 device_id: "dev-b".into(),
                 reachability: PeerReachability::Unreachable,
                 unreachable_category: Some(UnreachableCategory::UdpBlocked),
                 route: RouteKind::Unknown,
+                last_connected: Some(secs(500)),
             },
         ]
     );
@@ -508,17 +517,34 @@ fn only_the_highest_version_is_current() {
             size: 2,
             mtime_unix_nanos: 3_000_000_000,
             origin_device_id: "dev-a".into(),
-            unix_mode: Some(0o644),
+            exec: true,
             state: "live".into(),
             kind: 0,
+            ..Default::default()
         },
         FileVersionInfo { version_seq: 5, size: 3, ..Default::default() },
     ]);
     assert_eq!(versions.iter().map(|v| v.is_current).collect::<Vec<_>>(), [false, true, false]);
     assert_eq!(versions[1].modified_at, Some(secs(3)));
     assert_eq!(versions[1].origin_device_id.as_deref(), Some("dev-a"));
-    assert_eq!(versions[1].unix_mode, Some(0o644));
+    assert!(versions[1].exec);
     assert_eq!(versions[0].origin_device_id, None);
+}
+
+#[test]
+fn a_version_says_whether_this_device_still_holds_its_bytes() {
+    use yadorilink_ipc_proto::daemonctl::VersionContent as Wire;
+    let content = |wire: Wire| {
+        file_version(&FileVersionInfo { content: wire as i32, ..Default::default() }, false).content
+    };
+    assert_eq!(content(Wire::NotApplicable), VersionContent::NotApplicable);
+    assert_eq!(content(Wire::Kept), VersionContent::Kept);
+    assert_eq!(content(Wire::NotKept), VersionContent::NotKept);
+    // A daemon that does not send the field (an older one) reads as "not a statement about bytes", never as "kept".
+    assert_eq!(
+        file_version(&FileVersionInfo::default(), false).content,
+        VersionContent::NotApplicable
+    );
 }
 
 #[test]
@@ -961,6 +987,7 @@ fn account_deletion_and_transfers_parse_their_states() {
         offered_at_unix_nanos: 4_000_000_000,
         status: "in_progress".into(),
         failure: String::new(),
+        ..Default::default()
     });
     assert_eq!(inbox.status, IncomingTransferStatus::InProgress);
     assert_eq!(inbox.offered_at, Some(secs(4)));
@@ -1069,12 +1096,28 @@ fn a_pin_outcome_carries_the_download_failure_without_dropping_the_pin() {
     let failed = pin_outcome(&PinItemResponse {
         retention: Some(kept),
         download_error: "no peer has the content".into(),
+        ..Default::default()
     });
     assert_eq!(failed.retention.policy, RetentionPolicy::Pinned);
     assert_eq!(failed.download_error.as_deref(), Some("no peer has the content"));
-    let done =
-        pin_outcome(&PinItemResponse { retention: Some(kept), download_error: String::new() });
+    let done = pin_outcome(&PinItemResponse { retention: Some(kept), ..Default::default() });
     assert_eq!(done.download_error, None, "an empty wire string is no error");
+    assert_eq!(done.history_not_kept_reason, None, "an empty wire string is no reason");
+}
+
+/// A pin that stands while a file beneath it is not yet held in the store carries the reason to the
+/// desktop client, instead of reading as a plain success.
+#[test]
+fn a_pin_outcome_carries_the_history_not_kept_reason() {
+    let kept = WireRetentionState { policy: WireRetention::Pinned as i32, explicit: true };
+    let pending = pin_outcome(&PinItemResponse {
+        retention: Some(kept),
+        history_not_kept_reason: "changing_retry".into(),
+        ..Default::default()
+    });
+    assert_eq!(pending.retention.policy, RetentionPolicy::Pinned);
+    assert_eq!(pending.history_not_kept_reason.as_deref(), Some("changing_retry"));
+    assert_eq!(pending.download_error, None);
 }
 
 #[test]
@@ -1095,7 +1138,7 @@ fn the_two_dimensions_reach_the_folder_and_the_snapshot_and_unset_reads_unknown(
 
     let unset = link("/f/Other", "g2");
     let response = StatusResponse { links: vec![waiting, unset], ..Default::default() };
-    let snapshot = status_snapshot(&response, account(None), secs(1));
+    let snapshot = status_snapshot(&computed(response.clone()), account(None), secs(1));
     assert_eq!(snapshot.folders[1].availability.availability, Availability::Unknown);
     assert_eq!(snapshot.availability.availability, Availability::WaitingForPeer);
     assert_eq!(snapshot.protection.protection, Protection::Unknown);
@@ -1127,7 +1170,7 @@ fn dimensions_json_carries_both_dimensions_per_folder_and_overall() {
         ],
         ..Default::default()
     };
-    let json = status_dimensions_json(&status);
+    let json = status_dimensions_json(&computed(status));
     assert_eq!(json["overall_state"], "healthy");
     assert_eq!(json["availability"]["state"], "waiting_for_peer");
     assert_eq!(json["availability"]["offline_device_ids"][0], "dev-b");
@@ -1385,7 +1428,7 @@ fn the_snapshot_carries_the_product_state_and_next_action() {
     let paused = LinkStatus { paused: true, ..link("/f/Docs", "g1") };
     let conflicted = LinkStatus { conflict_count: 1, ..link("/f/Pics", "g2") };
     let response = StatusResponse { links: vec![paused, conflicted], ..Default::default() };
-    let snapshot = status_snapshot(&response, account(None), secs(1));
+    let snapshot = status_snapshot(&computed(response.clone()), account(None), secs(1));
     assert_eq!(snapshot.product.state, ProductState::NeedsAttention);
     assert_eq!(snapshot.product.next_action, Some(ProductAction::ReviewConflict));
     assert_eq!((snapshot.product.attention_count, snapshot.product.paused_count), (1, 1));
@@ -1393,7 +1436,7 @@ fn the_snapshot_carries_the_product_state_and_next_action() {
     assert_eq!(snapshot.folders[0].product.next_action, Some(ProductAction::Resume));
     assert_eq!(snapshot.folders[1].product.state, ProductState::NeedsAttention);
 
-    let idle = status_snapshot(&StatusResponse::default(), account(None), secs(1));
+    let idle = status_snapshot(&computed(StatusResponse::default()), account(None), secs(1));
     assert_eq!(idle.product.state, ProductState::UpToDate);
     assert_eq!(idle.product.next_action, None);
     assert_eq!(idle.product.bytes_remaining, None);
@@ -1409,7 +1452,7 @@ fn a_waiting_approval_request_is_a_count_and_an_item_with_the_review_action() {
         attention_reasons: vec!["approval_pending:g1".into()],
         ..Default::default()
     };
-    let snapshot = status_snapshot(&response, account(None), secs(1));
+    let snapshot = status_snapshot(&computed(response.clone()), account(None), secs(1));
     assert_eq!(snapshot.folders[0].pending_approvals, 2);
     assert_eq!(snapshot.folders[1].pending_approvals, 0);
     assert_eq!(snapshot.product.next_action, Some(ProductAction::ReviewApproval));
@@ -1601,6 +1644,7 @@ fn identify_converts_every_ownership_state() {
         owner: "gui".into(),
         pid: 42,
         started_at_unix: 1_700_000_000,
+        data_dir: "/data/yl".into(),
         ..Default::default()
     };
     let recorded = daemon_identity(&IdentifyResponse {
@@ -1617,6 +1661,8 @@ fn identify_converts_every_ownership_state() {
     assert_eq!(recorded.owner, DaemonOwner::Gui);
     assert_eq!(recorded.release_id.as_deref(), Some("c:d"));
     assert_eq!(recorded.engine_api_version, 7);
+    assert_eq!(recorded.data_dir.as_deref(), Some("/data/yl"));
+    assert_eq!(daemon_identity(&IdentifyResponse::default()).data_dir, None);
     let DataAreaOwnership::Recorded { record } = recorded.ownership else { panic!("not recorded") };
     assert_eq!((record.owner, record.release_id), (DaemonOwner::Cli, None));
     assert_eq!(record.install_source, "script");
@@ -1765,6 +1811,19 @@ fn a_sent_transfer_carries_its_status_reason_and_retry_offer() {
     });
     assert_eq!(stalled.status, OutgoingTransferStatus::Accepted);
     assert_eq!(stalled.failure, Some(TransferFailure::Stalled));
+    for (code, expected) in [
+        ("local_network_blocked", TransferFailure::LocalNetworkBlocked),
+        ("sender_gone", TransferFailure::SenderGone),
+        ("receiver_canceled", TransferFailure::ReceiverCanceled),
+        ("receiver_stopped", TransferFailure::ReceiverStopped),
+    ] {
+        let entry = outgoing_transfer(&SentTransferEntry {
+            status: "accepted".into(),
+            failure: code.into(),
+            ..Default::default()
+        });
+        assert_eq!(entry.failure, Some(expected), "{code}");
+    }
     let none =
         outgoing_transfer(&SentTransferEntry { status: "accepted".into(), ..Default::default() });
     assert_eq!(none.failure, None);
@@ -1922,4 +1981,165 @@ fn dimensions_json_names_the_typed_degraded_cause_per_folder() {
     let json = status_dimensions_json(&status);
     assert_eq!(json["folders"][0]["degraded_cause"], "waiting_for_disk_space");
     assert!(json["folders"][1]["degraded_cause"].is_null());
+}
+
+#[test]
+fn activity_request_carries_the_filter_and_cursor() {
+    let request = activity_request(
+        50,
+        Some(77),
+        Some(&ActivityFilter {
+            kinds: vec![ActivityKind::Deleted, ActivityKind::Conflict],
+            origin: ActivityOrigin::OtherDevices,
+        }),
+    );
+    assert_eq!(request.limit, 50);
+    assert_eq!(request.before_cursor, 77);
+    assert_eq!(request.kinds, [yadorilink_ipc_proto::daemonctl::ActivityKind::Deleted as i32, 4]);
+    assert_eq!(request.origin(), yadorilink_ipc_proto::daemonctl::ActivityOrigin::OtherDevices);
+    let none = activity_request(10, None, None);
+    assert_eq!((none.before_cursor, none.kinds.len(), none.origin), (0, 0, 0));
+}
+
+#[test]
+fn activity_page_names_devices_and_pages_by_cursor() {
+    use yadorilink_ipc_proto::daemonctl::{ActivityEventInfo, ActivityKind as Wire};
+    let event = |cursor, origin: &str, kind: Wire| ActivityEventInfo {
+        cursor,
+        local_path: "/f/Docs".into(),
+        path: "a.txt".into(),
+        kind: kind as i32,
+        origin_device_id: origin.into(),
+        is_this_device: origin.is_empty(),
+        at_unix_nanos: 1_000_000_000,
+    };
+    let names = std::collections::HashMap::from([("dev-b".to_string(), "Laptop".to_string())]);
+    let events = [event(9, "dev-b", Wire::Updated), event(8, "", Wire::Added)];
+    let full = activity_page(2, &events, &names);
+    assert_eq!(full.next_cursor, Some(8), "a full page may have more");
+    assert_eq!(full.events[0].origin_device_name.as_deref(), Some("Laptop"));
+    assert_eq!(full.events[0].kind, ActivityKind::Updated);
+    assert!(full.events[1].is_this_device);
+    assert_eq!(full.events[1].origin_device_id, None);
+    assert!(full.events[0].at.is_some());
+    let short = activity_page(3, &events, &names);
+    assert_eq!(short.next_cursor, None, "a short page ends the list");
+    // A kind this build does not know is dropped, not shown as something else.
+    assert!(activity_page(5, &[event(1, "", Wire::Unspecified)], &names).events.is_empty());
+}
+
+#[test]
+fn send_link_ttl_choices_are_one_hour_one_day_and_seven_days() {
+    assert_eq!(SendLinkTtl::OneHour.seconds(), 3_600);
+    assert_eq!(SendLinkTtl::OneDay.seconds(), 86_400);
+    assert_eq!(SendLinkTtl::SevenDays.seconds(), 604_800);
+    // The service refuses less than 60 seconds.
+    assert!(SendLinkTtl::OneHour.seconds() >= 60);
+}
+
+#[test]
+fn a_created_send_link_carries_its_code_and_expiry() {
+    let link = send_link(yadorilink_ipc_proto::daemonctl::CreateSendLinkResponse {
+        link_id: "link-1".into(),
+        code: "ABCD".into(),
+        expires_at_unix: 1_800_000_000,
+    });
+    assert_eq!(link.link_id, "link-1");
+    assert_eq!(link.code, "ABCD");
+    assert_eq!(
+        link.expires_at,
+        Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000))
+    );
+}
+
+#[test]
+fn every_send_link_state_maps_and_an_unknown_one_does_not() {
+    use yadorilink_ipc_proto::daemonctl::{SendLinkState as Wire, SendLinkStatusResponse};
+    let status = |state: i32| SendLinkStatusResponse {
+        state,
+        receiver_device_name: String::new(),
+        transfer_id: String::new(),
+    };
+    let cases = [
+        (Wire::Waiting, SendLinkState::Waiting),
+        (Wire::Redeemed, SendLinkState::Redeemed),
+        (Wire::Transferring, SendLinkState::Transferring),
+        (Wire::Done, SendLinkState::Done),
+        (Wire::Cancelled, SendLinkState::Cancelled),
+        (Wire::Expired, SendLinkState::Expired),
+        (Wire::Interrupted, SendLinkState::Interrupted),
+    ];
+    for (wire, state) in cases {
+        let converted = send_link_status("l".into(), status(wire as i32)).unwrap();
+        assert_eq!(converted.state, state);
+        // Unset text is absent, not an empty name.
+        assert_eq!(converted.receiver_device_name, None);
+        assert_eq!(converted.transfer_id, None);
+    }
+    assert_eq!(send_link_status("l".into(), status(Wire::Unspecified as i32)), None);
+    assert_eq!(send_link_status("l".into(), status(999)), None);
+
+    let named = send_link_status(
+        "l".into(),
+        SendLinkStatusResponse {
+            state: Wire::Redeemed as i32,
+            receiver_device_name: "Kai's iPhone".into(),
+            transfer_id: "t-1".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(named.receiver_device_name.as_deref(), Some("Kai's iPhone"));
+    assert_eq!(named.transfer_id.as_deref(), Some("t-1"));
+}
+
+#[test]
+fn a_no_space_failure_is_its_own_transfer_failure() {
+    let sent = yadorilink_ipc_proto::daemonctl::SentTransferEntry {
+        transfer_id: "t".into(),
+        status: "accepted".into(),
+        failure: "no_space".into(),
+        ..Default::default()
+    };
+    assert_eq!(outgoing_transfer(&sent).failure, Some(TransferFailure::NoSpace));
+}
+
+#[test]
+fn a_send_link_preview_totals_what_the_link_carries() {
+    use yadorilink_ipc_proto::daemonctl::{PreviewSendLinkResponse, SendLinkFile};
+    let preview = send_link_preview(PreviewSendLinkResponse {
+        sender_name: "Kai's Mac".into(),
+        files: vec![
+            SendLinkFile { name: "a.txt".into(), size: 10 },
+            SendLinkFile { name: "d/b.txt".into(), size: 32 },
+        ],
+        expires_at_unix: 1_800_000_000,
+    });
+    assert_eq!(preview.sender_name, "Kai's Mac");
+    assert_eq!(preview.total_size, 42);
+    assert_eq!(preview.files[1], IncomingFile { relative_path: "d/b.txt".into(), size: 32 });
+    assert!(preview.expires_at.is_some());
+    // A sender who attached no list shows an empty one, not a made-up file.
+    let none = send_link_preview(PreviewSendLinkResponse::default());
+    assert!(none.files.is_empty() && none.total_size == 0);
+}
+
+#[test]
+fn a_primary_transfer_listing_converts_with_times_direction_and_status() {
+    use crate::ops::primary_transfer::{PrimaryTransfer, TransferDirection};
+    let wire = PrimaryTransfer {
+        transfer_id: "t".into(),
+        group_id: "g".into(),
+        group_name: "photos".into(),
+        direction: TransferDirection::Incoming,
+        status: "pending".into(),
+        to_device_id: "d".into(),
+        created_at: 100,
+        expires_at: 200,
+    };
+    let summary = primary_transfer_summary(&wire);
+    assert_eq!(summary.direction, PrimaryTransferDirection::Incoming);
+    assert_eq!(summary.status, PrimaryTransferStatus::Pending);
+    assert_eq!(summary.expires_at, UNIX_EPOCH + Duration::from_secs(200));
+    let odd = primary_transfer_summary(&PrimaryTransfer { status: "expired".into(), ..wire });
+    assert_eq!(odd.status, PrimaryTransferStatus::Other { raw: "expired".into() });
 }

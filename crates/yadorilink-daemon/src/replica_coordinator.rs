@@ -34,6 +34,40 @@ pub mod local_commit;
 mod local_mutation;
 mod materialization_execution;
 mod materialization_owner;
+/// Whether every path in `now` was checked by the caller and still has the row it had then.
+fn all_checked_unchanged(
+    tx: &rusqlite::Connection,
+    group_id: &str,
+    now: &[String],
+    checked: &ContestChecked,
+) -> Result<bool, yadorilink_sync_sqlite::SyncSqliteError> {
+    for path in now {
+        let Some(row) = checked.get(path) else { return Ok(false) };
+        let current = yadorilink_sync_sqlite::native_contest_candidates::local_row_fingerprint(
+            tx, group_id, path,
+        )?;
+        if current != *row {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The contested paths a caller found settled in the store, each with the row this device's index
+/// held at it when it looked (`None`: no row). A fork is authored only over exactly these: a path
+/// that is not among them, or whose row has changed since (a capture committed another version),
+/// was not checked.
+pub type ContestChecked = std::collections::HashMap<String, Option<String>>;
+
+/// What a fork pass authored, and whether it stood down for a contested path nobody had checked.
+#[derive(Debug, Default)]
+pub struct ForkOutcome {
+    pub forked: yadorilink_sync_sqlite::native_authoring::ForkAuthored,
+    /// A contested path appeared that was not among those the caller found settled: nothing was
+    /// authored and the candidates stay unattempted, so the pass is to be asked for again.
+    pub unchecked: bool,
+}
+
 #[cfg(test)]
 pub(crate) use materialization_owner::plain_file_columns;
 pub(crate) use materialization_owner::{
@@ -149,6 +183,9 @@ pub struct ReplicaCoordinator {
     /// The engine's tuning and measurement settings, given at construction (nothing reads the
     /// process environment for them).
     tuning: Arc<crate::engine_tuning::EngineTuning>,
+    /// Groups whose captures put their blocks into the store for a while (see
+    /// [`crate::ingest_policy::StoreModeRequests`]).
+    store_mode_requests: crate::ingest_policy::StoreModeRequests,
     /// Concurrent receive file assemblies of this engine, sized by the tuning.
     receive_write_gate: Arc<tokio::sync::Semaphore>,
     /// Set while the author identity is refused because the database was
@@ -268,7 +305,7 @@ impl ReplicaCoordinator {
         startup_readiness: Arc<StartupReadinessRegistry>,
         tuning: crate::engine_tuning::EngineTuning,
     ) -> Result<Self, yadorilink_sqlite_runtime::DatabaseError> {
-        let tuning = Arc::new(tuning);
+        let tuning = Arc::new(tuning.coherent());
         let sqlite = Arc::new(yadorilink_sync_sqlite::SqliteSyncStore::new(database.clone()));
         // Closes that outstanding removal tickets hold, back in place before
         // anything can ask for a custody lease.
@@ -321,6 +358,7 @@ impl ReplicaCoordinator {
                 database.clone(),
             ),
             retention_pauses: Arc::default(),
+            store_mode_requests: Default::default(),
             handoff_lease_repository: yadorilink_sync_sqlite::HandoffLeaseRepository::new(
                 database.clone(),
             ),
@@ -370,6 +408,20 @@ impl ReplicaCoordinator {
         )
     }
 
+    /// [`Self::open_in_memory`] with the engine's tuning, for a test that needs a setting on.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn open_in_memory_with(
+        tuning: crate::engine_tuning::EngineTuning,
+    ) -> Result<Self, yadorilink_sqlite_runtime::DatabaseError> {
+        let database = Arc::new(SyncDatabase::open_in_memory(schema_init)?);
+        Self::from_database_with(
+            database,
+            Arc::new(PathLockRegistry::new()),
+            Arc::new(StartupReadinessRegistry::new()),
+            tuning,
+        )
+    }
+
     /// Opens (or creates) a real on-disk database at `path` and builds a
     /// `ReplicaCoordinator` directly against it, with its own fresh
     /// `PathLockRegistry`/`StartupReadinessRegistry` -- the production
@@ -398,7 +450,7 @@ impl ReplicaCoordinator {
 
     /// The tuning of a coordinator opened without one (tests and tools): the defaults, with the
     /// installation witness explicitly beside the database.
-    fn beside_database_tuning() -> crate::engine_tuning::EngineTuning {
+    pub(crate) fn beside_database_tuning() -> crate::engine_tuning::EngineTuning {
         crate::engine_tuning::EngineTuning {
             witness: crate::install_witness::WitnessPlacement::BesideDatabase,
             ..crate::engine_tuning::EngineTuning::default()
@@ -486,6 +538,12 @@ impl ReplicaCoordinator {
     #[must_use]
     pub fn tuning(&self) -> &crate::engine_tuning::EngineTuning {
         &self.tuning
+    }
+
+    /// Groups whose captures put their blocks into the store for a while.
+    #[must_use]
+    pub(crate) fn store_mode_requests(&self) -> &crate::ingest_policy::StoreModeRequests {
+        &self.store_mode_requests
     }
 
     /// Whether the receive path's commits run on the blocking pool while the
@@ -1101,14 +1159,15 @@ impl ReplicaCoordinator {
         emitter: &LocalAuthorKey,
         group_id: &str,
         eligible: &dyn Fn(&yadorilink_replica_domain::author::AuthorId, bool) -> bool,
-    ) -> Result<yadorilink_sync_sqlite::native_authoring::ForkAuthored, SyncError> {
+        checked: Option<&ContestChecked>,
+    ) -> Result<ForkOutcome, SyncError> {
         let group = yadorilink_replica_domain::ids::FolderGroupId(group_id.to_owned());
         // Nothing new is contested since the last pass: no policy read, no write.
         let work = self.database.read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
             yadorilink_sync_sqlite::native_contest_candidates::has_unattempted(conn, group_id)
         })?;
         if !work {
-            return Ok(yadorilink_sync_sqlite::native_authoring::ForkAuthored::default());
+            return Ok(ForkOutcome::default());
         }
         self.local_policy_head(group_id)?;
         self.with_local_author(emitter, |author| {
@@ -1117,9 +1176,21 @@ impl ReplicaCoordinator {
             // heads), and outside one a stop part-way, or a peer reading between them, sees a
             // frontier position whose delta is not stored.
             self.database.write_immediate::<_, yadorilink_sync_sqlite::SyncSqliteError>(|tx| {
+                // Only the paths the caller found settled may be forked: a peer's delta that
+                // arrived since may have added a contested path whose local version nobody has
+                // looked at. The whole pass then stands down and is asked for again.
+                if let Some(checked) = checked {
+                    let now = yadorilink_sync_sqlite::native_contest_candidates::unattempted_paths(
+                        tx, group_id,
+                    )?;
+                    if !all_checked_unchanged(tx, group_id, &now, checked)? {
+                        return Ok(ForkOutcome { forked: Default::default(), unchecked: true });
+                    }
+                }
                 yadorilink_sync_sqlite::native_authoring::author_all_forks(
                     tx, &group, &author, eligible,
                 )
+                .map(|forked| ForkOutcome { forked, unchecked: false })
             })
         })
         .map_err(SyncError::from)

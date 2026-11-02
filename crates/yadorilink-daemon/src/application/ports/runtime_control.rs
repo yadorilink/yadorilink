@@ -143,4 +143,9 @@ pub(crate) trait DaemonLifecyclePort: Send + Sync {
     /// `DaemonState.shutdown_tx`'s own "a send error just means every
     /// receiver is already gone" semantics.
     fn request_shutdown(&self);
+
+    /// Like [`request_shutdown`](Self::request_shutdown), but the process exits for a restart
+    /// (status 75) because the caller has a supervisor that starts it again. The reason is
+    /// recorded before the signal, so whoever observes the shutdown observes it too.
+    fn request_shutdown_to_restart(&self);
 }

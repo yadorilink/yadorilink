@@ -763,7 +763,16 @@ impl Authoring {
         // A placeholder that is not in sync has bytes the daemon has not seen, and size and time
         // cannot rule that out (a same-size save can keep its time): its bytes are always copied,
         // so that the in-sync mark is only ever given for bytes that carry a USN.
-        let content_changed = !item.directory && !in_sync;
+        //
+        // The one exception is a placeholder with no bytes on the disk whose size and time are
+        // what the daemon shows: nothing can have been written to it (a write hydrates first),
+        // and the rename alone cleared the bit. Copying it would read, hydrate and hash a file
+        // nobody opened, so it is a pure namespace operation (the same test the namespace walk
+        // uses to take such a placeholder back in sync).
+        let never_hydrated = stat.placeholder.as_ref().is_some_and(|p| p.dehydrated)
+            && stat.size == item.size
+            && (stat.mtime_unix_nanos - item.mtime_unix_nanos).abs() <= 200;
+        let content_changed = !item.directory && !in_sync && !never_hydrated;
         if !moved && !renamed && !content_changed {
             return;
         }
@@ -1790,6 +1799,32 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert!(requests[0].content.is_some(), "unsent bytes must be copied, not guessed away");
         assert_eq!(local.adopted.borrow().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A rename of a placeholder that was never hydrated (size and time as shown) is a pure
+    /// namespace operation: its bytes are not read, hashed or sent.
+    #[test]
+    fn renaming_a_dehydrated_placeholder_reads_no_bytes() {
+        let (auth, dir) = setup("dehydratedrename");
+        let (local, api) = (FakeLocal::default(), FakeApi::default());
+        let mut shown: ShownItems = [item("old.txt", 3, 0, false, 10)].into();
+        local.file("new.txt", 10, Some((3, false)));
+        let same_time = shown[&vec![3; 16]].mtime_unix_nanos;
+        {
+            let mut entries = local.entries.borrow_mut();
+            let stat = entries.get_mut(&p("new.txt")).unwrap();
+            stat.mtime_unix_nanos = same_time;
+            stat.placeholder.as_mut().unwrap().dehydrated = true;
+        }
+        local.located.borrow_mut().insert(vec![3; 16], p("new.txt"));
+        api.accept(applied(3, 0, "new.txt", false));
+        auth.process(&signals(&[p("old.txt"), p("new.txt")]), &mut shown, &local, &api);
+        let requests = api.requests.borrow();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].name.as_deref(), Some("new.txt"));
+        assert!(requests[0].content.is_none(), "a rename must not send bytes");
+        assert_eq!(*local.copies.borrow(), 0, "a rename must not read the placeholder");
         let _ = std::fs::remove_dir_all(dir);
     }
 

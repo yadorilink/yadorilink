@@ -1,0 +1,48 @@
+# Unattended YadoriLink on a NAS or home server. `docker compose up -d`, then
+# `docker compose exec yadorilink yadorilink login --device` (see README.md).
+#
+# - Set IMAGE_TAG (for example in a .env file next to this file) to the release
+#   you installed; the examples never use an unpinned `latest`.
+# - PUID/PGID: the numeric user and group that own the synced folder on the
+#   NAS (`id` over SSH; Synology and QNAP list them per user). The daemon runs
+#   as that account, so files it writes stay yours. They default to 999:999.
+# - restart: unless-stopped brings the daemon back after a crash, a Docker
+#   restart and a host reboot, but not after you `docker compose stop` it.
+# - The image's HEALTHCHECK (`yadorilink-daemon --healthcheck`) marks the
+#   container unhealthy when the daemon stops answering; `docker ps` shows it.
+# - State (device identity, credentials, database) lives in the named volume;
+#   the synced folder is a bind mount.
+# - No port is published: the dashboard listens on the container's loopback
+#   only, and the app's Manage button reaches the daemon over the device
+#   connection. For browser administration put a TLS-terminating reverse proxy
+#   or authenticated tunnel in front and declare it (commented lines below).
+services:
+  yadorilink:
+    image: ghcr.io/yadorilink/yadorilink:${IMAGE_TAG:?set IMAGE_TAG to the installed release, for example 0.1.0-beta.9}
+    container_name: yadorilink
+    restart: unless-stopped
+    stop_grace_period: 60s
+    read_only: true
+    tmpfs:
+      - /tmp
+    # The entrypoint starts as root only to hand the state volume to PUID:PGID
+    # and drop to that account; nothing else is needed.
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID]
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      PUID: "${PUID:-999}"
+      PGID: "${PGID:-999}"
+      YADORILINK_NAS_ADMIN: "1"
+      # YADORILINK_COORDINATION_ADDR: https://coordination.example.net
+      #
+      # Behind a TLS-terminating reverse proxy / tunnel (see the README):
+      # YADORILINK_HTTP_API_PUBLIC_HOST: nas.example.net
+      # YADORILINK_HTTP_API_TRUST_REVERSE_PROXY: "1"
+    volumes:
+      - yadorilink-data:/var/lib/yadorilink
+      - /srv/yadorilink:/srv/yadorilink
+
+volumes:
+  yadorilink-data:

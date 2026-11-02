@@ -28,11 +28,18 @@ static VERDICTS: Mutex<Vec<(u64, Probed)>> = Mutex::new(Vec::new());
 pub(super) struct Probed {
     pub(super) verdict: Capability,
     pub(super) cause: RefusalCause,
+    /// Whether the verdict may be kept for the process. Only an answer the volume or the
+    /// platform gave is: `Supported`, or a refusal the system itself made (`ENOTSUP`, `EXDEV`,
+    /// a file system that is not NTFS). A refusal inferred from the probe directory's state
+    /// (an occupied name that should be free, a replace that came out wrong) cannot be told
+    /// from something else having touched that directory, and the first probe of a volume
+    /// runs in whichever caller's directory asked first, so it is not kept.
+    pub(super) settled: bool,
 }
 
 impl Probed {
     fn supported() -> Self {
-        Self { verdict: Capability::Supported, cause: RefusalCause::default() }
+        Self { verdict: Capability::Supported, cause: RefusalCause::default(), settled: true }
     }
 }
 
@@ -44,10 +51,13 @@ pub(super) fn guid_path_cause(dir: &Path, error: &io::Error) -> RefusalCause {
 pub(super) fn cached_verdict(dir: &Path) -> Probed {
     match volume_key(dir) {
         Ok(volume) => verdict_cached(volume, || probe_explained(dir)),
-        Err(e) if is_no_guid_path(&e) => {
-            Probed { verdict: Capability::Unsupported, cause: guid_path_cause(dir, &e) }
-        }
+        Err(e) if is_no_guid_path(&e) => Probed {
+            verdict: Capability::Unsupported,
+            cause: guid_path_cause(dir, &e),
+            settled: true,
+        },
         Err(e) => Probed {
+            settled: false,
             verdict: Capability::Unknown,
             cause: RefusalCause::new(format!(
                 "step volume_key: the volume of {dir:?} could not be identified: {}",
@@ -57,7 +67,7 @@ pub(super) fn cached_verdict(dir: &Path) -> Probed {
     }
 }
 
-/// The cached verdict for `volume`, or `probe_now`'s, kept unless it is `Unknown`.
+/// The cached verdict for `volume`, or `probe_now`'s, kept only when it is `settled`.
 fn verdict_cached(volume: u64, probe_now: impl FnOnce() -> Probed) -> Probed {
     let known = VERDICTS
         .lock()
@@ -68,7 +78,7 @@ fn verdict_cached(volume: u64, probe_now: impl FnOnce() -> Probed) -> Probed {
         return known;
     }
     let probed = probe_now();
-    if probed.verdict != Capability::Unknown {
+    if probed.settled && probed.verdict != Capability::Unknown {
         VERDICTS.lock().unwrap_or_else(|p| p.into_inner()).push((volume, probed.clone()));
     }
     probed
@@ -80,6 +90,7 @@ fn verdict_for(volume: u64, probe_now: impl FnOnce() -> Capability) -> Capabilit
     verdict_cached(volume, || Probed {
         verdict: probe_now(),
         cause: RefusalCause::new("test verdict"),
+        settled: true,
     })
     .verdict
 }
@@ -196,6 +207,27 @@ pub(super) fn probe(dir: &Path) -> Capability {
     probe_explained(dir).verdict
 }
 
+/// The name of one probe's work directory: in the reserved artefact namespace, so the scan, the
+/// watcher and local capture never see it or anything below it, even when the probe runs in a
+/// synchronized folder.
+fn work_dir_name() -> Result<String, crate::reserved_namespace::ArtefactNameError> {
+    crate::fs_capabilities::probe_artefact_name(PROBE_LABEL)
+}
+
+/// Where the probe makes its work directory: the system temp directory when it is on `dir`'s
+/// volume, otherwise `dir` itself. The verdict is about the volume, and the first probe of a
+/// volume runs for whichever caller asked first; in that caller's own tree its work directory
+/// could be swept, scanned or removed with the tree while the probe runs, and the volume would
+/// be judged by the damage. The temp directory holds no caller's data, and the work directory
+/// in it is named for this process alone and removed when the probe ends.
+fn scratch_parent(dir: &Path) -> std::path::PathBuf {
+    let temp = std::env::temp_dir();
+    match (volume_key(&temp), volume_key(dir)) {
+        (Ok(a), Ok(b)) if a == b && temp.is_dir() => temp,
+        _ => dir.to_path_buf(),
+    }
+}
+
 /// [`probe`] with the cause of a verdict that is not `Supported`.
 fn probe_explained(dir: &Path) -> Probed {
     // Taken before the probe runs: if the directory vanishes meanwhile, the cause still names
@@ -206,6 +238,7 @@ fn probe_explained(dir: &Path) -> Probed {
     };
     let refuse = |verdict: Capability, what: String| Probed {
         verdict,
+        settled: verdict != Capability::Unknown,
         cause: RefusalCause::new(format!("probe of {dir:?} on {identity}: {what}")),
     };
     #[cfg(windows)]
@@ -229,11 +262,11 @@ fn probe_explained(dir: &Path) -> Probed {
             );
         }
     }
-    let base = match crate::fs_capabilities::probe_artefact_name(PROBE_LABEL) {
+    let base = match work_dir_name() {
         Ok(base) => base,
         Err(e) => return refuse(Capability::Unknown, format!("step artefact_name: {e:?}")),
     };
-    let work = dir.join(base);
+    let work = scratch_parent(dir).join(base);
     if let Err(e) = std::fs::create_dir(&work) {
         return refuse(Capability::Unknown, format!("step create_work_dir: {}", describe_io(&e)));
     }
@@ -244,6 +277,9 @@ fn probe_explained(dir: &Path) -> Probed {
         Fail::Unsupported(what) => {
             Fail::Unsupported(format!("{what}; probe directory held {}", entry_names(&work)))
         }
+        Fail::Unexpected(what) => {
+            Fail::Unexpected(format!("{what}; probe directory held {}", entry_names(&work)))
+        }
         unknown => unknown,
     });
     // Only this probe's own directory, made just above: never a directory found by its name.
@@ -251,6 +287,9 @@ fn probe_explained(dir: &Path) -> Probed {
     match outcome {
         Ok(()) => Probed::supported(),
         Err(Fail::Unsupported(what)) => refuse(Capability::Unsupported, what),
+        Err(Fail::Unexpected(what)) => {
+            Probed { settled: false, ..refuse(Capability::Unsupported, what) }
+        }
         Err(Fail::Unknown(what)) => refuse(Capability::Unknown, what),
     }
 }
@@ -308,13 +347,17 @@ fn busy_step(step: Step) -> Result<(), Fail> {
     Err(fail_at(step, NsError::from_io(error)))
 }
 
-/// How a probe step went wrong, with the step and the error. `Unsupported` is a definite wrong
-/// answer: the shape succeeded where it must be refused, did something other than it must, or
-/// the volume says it cannot do it (`ENOTSUP`/`EINVAL` class). `Unknown` is any other error (a
+/// How a probe step went wrong, with the step and the error. `Unsupported` is the volume or the
+/// platform saying it cannot do the shape (`ENOTSUP`/`EINVAL` class, a move across volumes).
+/// `Unexpected` is a wrong answer inferred from the probe directory's state: the shape
+/// succeeded where it must be refused, a fresh name was occupied, or the entry came out other
+/// than it must. The probe refuses on it, but it cannot rule out that something else touched
+/// the directory, so it is not kept ([`Probed::settled`]). `Unknown` is any other error (a
 /// sharing violation or lock from a reader, an indexer or a scanner, a full disk, an I/O
 /// error): the volume has not answered, so nothing is concluded, and the verdict is not kept.
 enum Fail {
     Unsupported(String),
+    Unexpected(String),
     Unknown(String),
 }
 
@@ -330,9 +373,8 @@ fn fail_at(step: Step, error: NsError) -> Fail {
     match error {
         // The shape did not do what it must: the entry it just made is not there, a fresh
         // name is occupied, a file is a directory.
-        NsError::AlreadyExists | NsError::NotEmpty | NsError::CrossVolume => {
-            Fail::Unsupported(what)
-        }
+        NsError::AlreadyExists | NsError::NotEmpty => Fail::Unexpected(what),
+        NsError::CrossVolume => Fail::Unsupported(what),
         // A missing entry or directory is about the path, not the volume: the directory
         // under probe was removed (a dropped temp dir, a scanner) while the probe ran. It
         // concludes nothing, so it is never kept as "the volume cannot do this".
@@ -359,7 +401,7 @@ fn try_shapes(work: &Path) -> Result<(), Fail> {
         Err(NsError::AlreadyExists) => {}
         Err(other) => return Err(fail_at(Step::SecondPublish, other)),
         Ok(()) => {
-            return Err(Fail::Unsupported(format!(
+            return Err(Fail::Unexpected(format!(
                 "step {:?}: a no-replace publish over an existing file succeeded",
                 Step::SecondPublish
             )))
@@ -376,7 +418,7 @@ fn try_shapes(work: &Path) -> Result<(), Fail> {
     busy_step(Step::ReadBack)?;
     let read = std::fs::read(&file).map_err(|e| fail_at(Step::ReadBack, NsError::from_io(e)))?;
     if read != b"second" {
-        return Err(Fail::Unsupported(format!(
+        return Err(Fail::Unexpected(format!(
             "step {:?}: the replaced file reads back other content",
             Step::ReadBack
         )));
@@ -399,9 +441,7 @@ fn try_shapes(work: &Path) -> Result<(), Fail> {
         DiscardOutcome::Retained { reason: RetainReason::RemovalFailed, .. } => Err(Fail::Unknown(
             format!("step {:?}: the moved-aside probe file could not be removed", Step::Removal),
         )),
-        other => {
-            Err(Fail::Unsupported(format!("step {:?}: discard gave {other:?}", Step::Discard)))
-        }
+        other => Err(Fail::Unexpected(format!("step {:?}: discard gave {other:?}", Step::Discard))),
     }
 }
 
@@ -946,9 +986,64 @@ mod tests {
         let first = verdict_cached(volume, || Probed {
             verdict: Capability::Unsupported,
             cause: cause.clone(),
+            settled: true,
         });
         assert_eq!(first.cause, cause);
         assert_eq!(verdict_cached(volume, || panic!("probed twice")).cause, cause);
+    }
+
+    /// The work directory, and everything the probe puts below it, is excluded from scans,
+    /// watchers and local capture, which test `path_has_reserved_component` on every path.
+    #[test]
+    fn the_work_directory_and_its_contents_are_reserved_namespace() {
+        let name = work_dir_name().unwrap();
+        for relative in [name.clone(), format!("{name}/f"), format!("{name}/d")] {
+            assert!(
+                crate::reserved_namespace::path_has_reserved_component(Path::new(&relative)),
+                "{relative}"
+            );
+        }
+        assert!(crate::reserved_namespace::is_artefact_component(std::ffi::OsStr::new(&name)));
+    }
+
+    /// A volume that holds the system temp directory is probed there, not in the caller's tree.
+    #[test]
+    fn the_probe_runs_in_the_temp_directory_when_it_shares_the_volume() {
+        let caller = tempfile::tempdir().unwrap();
+        let temp = std::env::temp_dir();
+        assert_eq!(scratch_parent(caller.path()), temp);
+        assert_eq!(probe(caller.path()), Capability::Supported);
+        let left: Vec<_> = std::fs::read_dir(caller.path()).unwrap().collect();
+        assert!(left.is_empty(), "the caller's tree was not touched: {left:?}");
+    }
+
+    /// A refusal inferred from the probe directory's state is not kept for the process: the
+    /// first probe of a volume runs in whichever caller's directory asked first, and a
+    /// directory something else touched would otherwise refuse the volume for every caller.
+    #[test]
+    fn a_state_inferred_refusal_is_not_kept_but_a_system_refusal_is() {
+        let unexpected = Fail::Unexpected("step SecondPublish: succeeded".into());
+        let system = Fail::Unsupported("step FirstPublish: EINVAL".into());
+        for (name, fail, kept) in [("unexpected", unexpected, false), ("system", system, true)] {
+            let volume = intern(format!("settled-test-{name}"));
+            let first = verdict_cached(volume, || match fail {
+                Fail::Unexpected(w) => Probed {
+                    verdict: Capability::Unsupported,
+                    cause: RefusalCause::new(w),
+                    settled: false,
+                },
+                Fail::Unsupported(w) => Probed {
+                    verdict: Capability::Unsupported,
+                    cause: RefusalCause::new(w),
+                    settled: true,
+                },
+                Fail::Unknown(_) => unreachable!(),
+            });
+            assert_eq!(first.verdict, Capability::Unsupported, "{name}");
+            let again = verdict_cached(volume, Probed::supported);
+            let expected = if kept { Capability::Unsupported } else { Capability::Supported };
+            assert_eq!(again.verdict, expected, "{name}");
+        }
     }
 
     /// The gate and no-GUID-path refusals have causes of their own.

@@ -58,6 +58,7 @@ mod peer_sessions;
 mod reachability;
 #[cfg(any(test, feature = "test-support"))]
 pub mod reachability_source_for_tests;
+mod relay_guard;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -72,6 +73,7 @@ use yadorilink_sync_substrate::{
 use crate::coordination_client::SubstrateReachability;
 use crate::daemon_state::PeerAuthorityState;
 use crate::peer_registry::{PeerReachability, UnreachableCategory};
+use crate::route::RouteKind;
 use crate::sync_adapter::address_directory::CoordinationAddressDirectory;
 pub use address_report::report_own_address;
 pub(crate) use peer_sessions::keep_peer_sessions;
@@ -153,6 +155,8 @@ pub struct PeerConnectivityRuntime {
     reachability: Mutex<LinkReachability>,
     /// This device, for the measurement-only join timeline.
     local_device_id: String,
+    /// When each peer was last connected, kept across restarts.
+    last_seen: crate::peer_last_seen::PeerLastSeen,
 }
 
 impl PeerConnectivityRuntime {
@@ -165,7 +169,28 @@ impl PeerConnectivityRuntime {
             endpoints: Mutex::new(Vec::new()),
             reachability: Mutex::new(LinkReachability::default()),
             local_device_id,
+            last_seen: crate::peer_last_seen::PeerLastSeen::in_memory(),
         }
+    }
+
+    /// Keeps when each peer was last connected in the daemon's database, across restarts.
+    pub(crate) fn with_last_seen_in(
+        mut self,
+        database: Arc<yadorilink_sqlite_runtime::SyncDatabase>,
+    ) -> Self {
+        self.last_seen = crate::peer_last_seen::PeerLastSeen::open(database);
+        self
+    }
+
+    /// The last time a session with `device_id` was up (now while one is); 0 when never.
+    pub(crate) fn last_connected_unix(&self, device_id: &str) -> i64 {
+        if matches!(self.reachability(device_id), Some(PeerReachability::Connected(_))) {
+            return std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+        }
+        self.last_seen.get(device_id)
     }
 
     /// Measurement only: records `milestone` on every join timeline of this
@@ -197,13 +222,41 @@ impl PeerConnectivityRuntime {
     /// connections to it; `None` when there is no connection, no dial and no
     /// failure to report.
     pub fn reachability(&self, device_id: &str) -> Option<PeerReachability> {
-        self.links().get(device_id)
+        let folded = self.links().get(device_id);
+        self.on_carrying_path(device_id, folded)
+    }
+
+    /// Said for a connected peer: the path of the connection lane opens use, not of whichever of
+    /// its connections happens to have the best path. A peer can hold two connections (the two
+    /// devices dialled at once); one on a direct path next to a current one on a relay would
+    /// otherwise read as direct while transfers ride the relay.
+    fn on_carrying_path(
+        &self,
+        device_id: &str,
+        folded: Option<PeerReachability>,
+    ) -> Option<PeerReachability> {
+        let Some(PeerReachability::Connected(_)) = folded else { return folded };
+        let carrier = {
+            let endpoints = self.endpoints.lock().unwrap_or_else(|p| p.into_inner());
+            endpoints
+                .iter()
+                .filter_map(Weak::upgrade)
+                .find_map(|open| open.cache()?.current_carrier(device_id))
+        };
+        prefer_carrying(folded, carrier)
     }
 
     /// Every peer with something to report, and its reachability. Order is
     /// unspecified.
     pub fn every_peer_reachability(&self) -> Vec<(String, PeerReachability)> {
-        self.links().all()
+        let folded = self.links().all();
+        folded
+            .into_iter()
+            .map(|(device, r)| {
+                let r = self.on_carrying_path(&device, Some(r)).unwrap_or(r);
+                (device, r)
+            })
+            .collect()
     }
 
     /// How many peers are connected right now, directly or through a relay.
@@ -230,6 +283,7 @@ impl PeerConnectivityRuntime {
     }
 
     pub(crate) fn record_link_up(&self, device_id: &str, carrier: Option<Carrier>) -> LinkId {
+        self.last_seen.session_up(device_id);
         self.links().link_up(device_id, carrier)
     }
 
@@ -238,6 +292,7 @@ impl PeerConnectivityRuntime {
     }
 
     pub(crate) fn record_link_closed(&self, device_id: &str, link: LinkId) {
+        self.last_seen.session_down(device_id);
         self.links().link_closed(device_id, link);
     }
 
@@ -337,6 +392,7 @@ impl PeerConnectivityRuntime {
             .unwrap_or_else(|p| p.into_inner())
             .remove(device_id);
         self.links().forget(device_id);
+        self.last_seen.forget(device_id);
         let endpoints: Vec<Arc<OpenConnections>> = {
             let mut endpoints = self.endpoints.lock().unwrap_or_else(|p| p.into_inner());
             endpoints.retain(|endpoint| endpoint.strong_count() > 0);
@@ -459,13 +515,16 @@ impl PeerConnectivityRuntime {
             authority: Arc::downgrade(authority),
             directory: directory.clone(),
             links: Mutex::new(Vec::new()),
+            held: tokio::sync::Notify::new(),
             track_send,
             track_send_connections: node.track_send_connections(),
             native_replication_connections: node.native_replication_connections(),
+            cache: std::sync::OnceLock::new(),
         });
         self.endpoints.lock().unwrap_or_else(|p| p.into_inner()).push(Arc::downgrade(&open));
         let (inbound_tx, inbound) = mpsc::channel(ACCEPTED_QUEUE);
         let links = Arc::new(link_cache::LinkCache::default());
+        let _ = open.cache.set(Arc::downgrade(&links));
         {
             let open = open.clone();
             let links = links.clone();
@@ -612,6 +671,47 @@ fn admits(authority: &PeerAuthorityState, peer: &PeerId) -> bool {
     authority.device_id_for_signing_key(peer.as_bytes()).is_some()
 }
 
+/// A connected peer's route as the path of the connection lane opens use says, when that
+/// connection has a path selected; anything else is left as it was folded.
+fn prefer_carrying(
+    folded: Option<PeerReachability>,
+    carrying: Option<Carrier>,
+) -> Option<PeerReachability> {
+    let Some(PeerReachability::Connected(_)) = folded else { return folded };
+    match carrying {
+        Some(Carrier::Direct) => Some(PeerReachability::Connected(RouteKind::Direct)),
+        Some(Carrier::Relay) => Some(PeerReachability::Connected(RouteKind::Relay)),
+        None => folded,
+    }
+}
+
+#[cfg(test)]
+mod carrying_path_tests {
+    use super::*;
+
+    const DIRECT: Option<PeerReachability> = Some(PeerReachability::Connected(RouteKind::Direct));
+    const RELAY: Option<PeerReachability> = Some(PeerReachability::Connected(RouteKind::Relay));
+
+    #[test]
+    fn a_relay_connection_in_use_beats_a_direct_one_beside_it() {
+        assert_eq!(prefer_carrying(DIRECT, Some(Carrier::Relay)), RELAY);
+        assert_eq!(prefer_carrying(RELAY, Some(Carrier::Direct)), DIRECT);
+    }
+
+    #[test]
+    fn without_a_selected_path_the_folded_answer_stands() {
+        assert_eq!(prefer_carrying(DIRECT, None), DIRECT);
+        assert_eq!(prefer_carrying(RELAY, None), RELAY);
+    }
+
+    #[test]
+    fn only_a_connected_peer_is_changed() {
+        let connecting = Some(PeerReachability::Connecting);
+        assert_eq!(prefer_carrying(connecting, Some(Carrier::Direct)), connecting);
+        assert_eq!(prefer_carrying(None, Some(Carrier::Relay)), None);
+    }
+}
+
 /// The connections one endpoint holds to peers, dialled or accepted, and
 /// where it looks them up -- what a revocation has to reach.
 struct OpenConnections {
@@ -623,6 +723,8 @@ struct OpenConnections {
     /// link cache, or by the substrate for as long as an accepted connection
     /// lives -- so holding them here extends no connection's life.
     links: Mutex<Vec<PeerLink>>,
+    /// Raised each time a connection is added to `links`.
+    held: tokio::sync::Notify,
     /// Who may open a Track Send connection, asked again on revocation so a
     /// device's Track Send connections are closed exactly when a new one
     /// from it would be refused.
@@ -632,9 +734,15 @@ struct OpenConnections {
     /// The native replication connections this endpoint dialled or
     /// accepted, closed when the device is no longer admitted.
     native_replication_connections: yadorilink_sync_substrate::NativeReplicationConnections,
+    /// This endpoint's link cache, set once it exists (it is made after this).
+    cache: std::sync::OnceLock<Weak<link_cache::LinkCache>>,
 }
 
 impl OpenConnections {
+    fn cache(&self) -> Option<Arc<link_cache::LinkCache>> {
+        self.cache.get()?.upgrade()
+    }
+
     fn admits(&self, peer: &PeerId) -> bool {
         self.authority.upgrade().is_some_and(|authority| admits(&authority, peer))
     }
@@ -651,11 +759,50 @@ impl OpenConnections {
             links.retain(PeerLink::is_alive);
             links.push(link.clone());
         }
+        self.held.notify_one();
         if self.admits(&link.peer()) {
             return true;
         }
         link.close();
         false
+    }
+
+    /// Close every sync and native replication connection this endpoint holds, without
+    /// revoking anything: the network came back, and what was connected before it may be
+    /// hanging on paths that no longer work. The keepers redial. Returns how many were closed.
+    fn recycle_all(&self) -> usize {
+        let mut closed = 0;
+        {
+            let mut links = self.links.lock().unwrap_or_else(|p| p.into_inner());
+            for link in links.drain(..) {
+                if link.is_alive() {
+                    link.close();
+                    closed += 1;
+                }
+            }
+        }
+        closed + self.native_replication_connections.close_all(b"network changed")
+    }
+
+    /// Close this endpoint's sync and native replication connections to `peer`, without revoking
+    /// anything: they are not carrying traffic. Returns how many were closed.
+    fn recycle_peer(&self, peer: &PeerId) -> usize {
+        let mut closed = 0;
+        {
+            let mut links = self.links.lock().unwrap_or_else(|p| p.into_inner());
+            links.retain(|link| {
+                if !link.is_alive() {
+                    return false;
+                }
+                if link.peer() != *peer {
+                    return true;
+                }
+                link.close();
+                closed += 1;
+                false
+            });
+        }
+        closed + self.native_replication_connections.close_plain_to(peer, b"unresponsive")
     }
 
     /// Close every held connection to a peer that is no longer admitted,
@@ -744,6 +891,56 @@ impl IrohEndpoint {
     /// This device's address, updated as the substrate learns more of it.
     pub(crate) fn watch_local_address(&self) -> watch::Receiver<PeerAddress> {
         self.node.watch_local_address()
+    }
+
+    /// The live sync connections this endpoint holds.
+    fn live_links(&self) -> Vec<PeerLink> {
+        let links = self.open.links.lock().unwrap_or_else(|p| p.into_inner());
+        links.iter().filter(|link| link.is_alive()).cloned().collect()
+    }
+
+    /// Resolves when a connection is added to the ones this endpoint holds.
+    async fn next_held_link(&self) {
+        self.open.held.notified().await;
+    }
+
+    /// Closes this endpoint's peer connections so the keepers redial; see
+    /// [`OpenConnections::recycle_all`].
+    pub(crate) fn recycle_connections(&self) -> usize {
+        // Dials left to finish alone were started on the network that is gone.
+        self.links.supersede_detached_dials();
+        self.open.recycle_all()
+    }
+
+    /// Closes the sync and native connections to `device_id`, which stopped answering, so the
+    /// keepers dial new ones. Returns how many were closed.
+    pub(crate) fn recycle_peer(&self, device_id: &str) -> usize {
+        match self.peer_id_of(device_id) {
+            Some(peer) => self.open.recycle_peer(&peer),
+            None => 0,
+        }
+    }
+
+    /// The device ids of peers as they open a connection to this device.
+    pub(crate) fn subscribe_inbound_links(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.links.subscribe_inbound()
+    }
+
+    /// A counter that moves each time the network came back after being lost; see
+    /// `SubstrateNode::watch_restored`.
+    pub(crate) fn watch_restored(&self) -> watch::Receiver<u64> {
+        self.node.watch_restored()
+    }
+
+    /// Whether this device's home relay is connected, updated as that changes; see
+    /// `SubstrateNode::watch_home_relay_connected`.
+    pub(crate) fn watch_home_relay_connected(&self) -> watch::Receiver<bool> {
+        self.node.watch_home_relay_connected()
+    }
+
+    /// The network-arrival view redial loops wait on; see `redial_pacing`.
+    pub(crate) fn arrivals(&self) -> crate::redial_pacing::Arrivals {
+        crate::redial_pacing::Arrivals::new(self.node.watch_arrivals())
     }
 
     /// Where this device publishes and resolves substrate endpoint addresses.

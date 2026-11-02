@@ -184,10 +184,14 @@ async fn revoked_device_restored(other_machine: bool) {
         || "the restored device never applied a live netmap".to_string(),
     )
     .await;
-    assert!(
-        revoked.state.authority.authorized_groups_for_peer(&mesh.member.device_id).is_empty(),
-        "once the plane answers, the revoked device authorizes nobody"
-    );
+    // The provenance turns live with the first part of the netmap applied; the rest of it (the
+    // members' removal) follows, so the end state is waited for rather than read at that instant.
+    wait_until_with_context(
+        || revoked.state.authority.authorized_groups_for_peer(&mesh.member.device_id).is_empty(),
+        Duration::from_secs(30),
+        || "once the plane answers, the revoked device authorizes nobody".to_string(),
+    )
+    .await;
     assert_nothing_crosses(&mesh, &revoked, &revoked_id, "plane reachable").await;
 
     // The members are unharmed: they still sync with each other.

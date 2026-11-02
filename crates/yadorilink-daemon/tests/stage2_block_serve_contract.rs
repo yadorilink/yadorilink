@@ -248,8 +248,12 @@ fn new_device(
     store: Arc<dyn BlockStore + Send + Sync>,
     store_dir: tempfile::TempDir,
 ) -> Device {
-    let (sync_state, index_dir) = support::open_file_backed_replica_coordinator();
-    let state = DaemonState::new(device_id.to_string(), Arc::new(sync_state), store);
+    let (sync_state, index_dir) = support::open_store_first_replica_coordinator();
+    let state = yadorilink_daemon::test_support::isolated_daemon_state(
+        device_id.to_string(),
+        Arc::new(sync_state),
+        store,
+    );
     support::ensure_device_signing_key(&state);
     let mut roots = Vec::new();
     for group in groups {
@@ -308,10 +312,9 @@ fn seed_block(device: &Device, group: &str, path: &str, data: Vec<u8>) -> Seeded
         data.len() as u64,
         FileMeta {
             mtime_unix_nanos: 0,
-            unix_mode: None,
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     );
     let record = FileRecord {

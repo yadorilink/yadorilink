@@ -108,6 +108,31 @@ pub fn corrupt_block_payload(
     Ok(())
 }
 
+/// Replaces one block's stored payload with `replacement` (the same length) AND rewrites the
+/// checksum beside it, so that the record is consistent with itself while its bytes are not the
+/// block its header names: what a writer's bug (or someone who can compute the checksum) leaves.
+/// The checksum-only read accepts it; the SHA-256 read does not.
+pub fn replace_block_payload_with_valid_checksum(
+    root: &Path,
+    hash_hex: &str,
+    replacement: &[u8],
+) -> Result<(), StorageError> {
+    use std::io::{Seek, SeekFrom, Write};
+    let (segment_id, payload_offset, length) =
+        locate(root, hash_hex)?.ok_or_else(|| StorageError::NotFound(hash_hex.to_string()))?;
+    if replacement.len() != length as usize {
+        return Err(StorageError::InvalidPath(
+            "the replacement must be as long as the stored payload".into(),
+        ));
+    }
+    let mut file = std::fs::OpenOptions::new().write(true).open(segment_path(root, segment_id))?;
+    file.seek(SeekFrom::Start(payload_offset))?;
+    file.write_all(replacement)?;
+    file.write_all(&crate::segment_store::format::frame_trailer(replacement))?;
+    yadorilink_fs_platform::flush::sync_data(&file)?;
+    Ok(())
+}
+
 /// Flips every bit of one payload byte -- the smallest damage that still
 /// breaks the content hash.
 pub fn flip_one_payload_bit(root: &Path, hash_hex: &str) -> Result<(), StorageError> {

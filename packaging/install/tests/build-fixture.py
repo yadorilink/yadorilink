@@ -27,6 +27,8 @@ import sys
 import zipfile
 from pathlib import Path
 
+HERE = Path(__file__).resolve().parent
+
 # ---- RFC 8032 Ed25519 (reference, signing + public key) -----------------
 P = 2**255 - 19
 L = 2**252 + 27742317777372353535851937790883648493
@@ -138,13 +140,29 @@ def build_zip(args, target, channel, version):
             if b == "yadorilink-daemon.exe":
                 content += b"\0daemon"  # different bytes, same behaviour
         else:
-            body = f'#!/bin/sh\necho "yadorilink fake {version} {b}"\n'
+            # `--check-data-compat` answers with the status the test asks for (YL_FAKE_COMPAT_RC),
+            # as the real daemon does for the data on the machine.
+            body = (
+                '#!/bin/sh\n'
+                'if [ "${1:-}" = --check-data-compat ]; then\n'
+                '  [ -z "${YL_FAKE_COMPAT_RC:-}" ] || { echo "fake compat message" >&2; exit "$YL_FAKE_COMPAT_RC"; }\n'
+                '  exit 0\n'
+                'fi\n'
+                f'echo "yadorilink fake {version} {b}"\n'
+            )
             if args.broken_bin:
                 body = "#!/bin/sh\necho broken >&2\nexit 7\n"
             content = body.encode()
         files[b] = content
     for e in layout["extra"]:
         files[e] = f"placeholder {e}\n".encode()
+    if not args.no_installer:
+        # The installer a script install keeps for `yadorilink self-update`: the real one under test.
+        name = "install.ps1" if target.startswith("windows") else "install.sh"
+        # beside this script (the Windows runner copies both into one directory) or in the
+        # directory above it (the repository layout)
+        source = next(p for p in (HERE / name, HERE.parent / name) if p.is_file())
+        files[name] = source.read_bytes()
     files["LICENSE"] = b"fixture license\n"
     files["THIRD-PARTY-LICENSES"] = b"fixture third-party notice\n"
     files["SOURCE.txt"] = f"commit {SOURCE_SHA}\n".encode()
@@ -189,6 +207,7 @@ def main():
     ap.add_argument("--engine-api-version", type=int, default=7, help="engine_api_version in engine-identity.json (real programs check it)")
     ap.add_argument("--kill-switch", action="store_true")
     ap.add_argument("--broken-bin", action="store_true", help="binaries fail --version")
+    ap.add_argument("--no-installer", action="store_true", help="a bundle from before bundles carried the installer")
     ap.add_argument("--corrupt-sums", action="store_true", help="a bundle file differs from SHA256SUMS")
     ap.add_argument("--extra-file", action="store_true", help="bundle holds a file SHA256SUMS does not list")
     ap.add_argument("--identity-channel")

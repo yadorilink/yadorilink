@@ -29,7 +29,10 @@ use yadorilink_replica_domain::ids::{BlockHash, DeltaHash, DeviceId, FolderGroup
 use yadorilink_sync_sqlite::SyncSqliteError;
 
 use crate::support;
-pub use crate::support::topology::{link_eager, new_node, restart_node, TopologyNode};
+pub use crate::support::topology::{
+    link_eager, new_node, new_node_fast, new_node_fast_in, new_node_fast_with, new_node_with_in,
+    restart_node, TopologyNode,
+};
 
 /// How long a convergence wait may take before the test fails with the
 /// devices' trees in the message.
@@ -40,6 +43,39 @@ pub const CONVERGE: Duration = Duration::from_secs(90);
 /// A device linked to `group` with its folder watched.
 pub fn device(name: &str, group: &str) -> TopologyNode {
     let node = new_node(name);
+    link_eager(&node, group);
+    node
+}
+
+/// [`device`] with the one-second repair sweep the convergence scenarios use.
+pub fn device_fast(name: &str, group: &str) -> TopologyNode {
+    let node = new_node_fast(name);
+    link_eager(&node, group);
+    node
+}
+
+/// [`device_fast`] whose engine has `features`.
+#[allow(dead_code)]
+pub fn device_fast_with(
+    name: &str,
+    group: &str,
+    features: crate::support::NodeFeatures,
+) -> TopologyNode {
+    let node = new_node_fast_with(name, features);
+    link_eager(&node, group);
+    node
+}
+
+/// [`device`] whose folder is made inside `parent` (see [`new_node_fast_in`]).
+pub fn device_in(parent: &std::path::Path, name: &str, group: &str) -> TopologyNode {
+    let node = new_node_with_in(Some(parent), name, Default::default());
+    link_eager(&node, group);
+    node
+}
+
+/// [`device_fast`] whose folder is made inside `parent`.
+pub fn device_fast_in(parent: &std::path::Path, name: &str, group: &str) -> TopologyNode {
+    let node = new_node_fast_in(parent, name);
     link_eager(&node, group);
     node
 }
@@ -747,10 +783,9 @@ pub fn fixture_version(seed: u8) -> FileVersion {
         16,
         FileMeta {
             mtime_unix_nanos: 1,
-            unix_mode: Some(0o644),
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     )
 }

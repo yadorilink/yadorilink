@@ -165,12 +165,10 @@ async fn fresh_daemon_reports_healthy_over_the_real_socket() {
         .expect("status command should succeed against a healthy daemon");
 }
 
-/// "error"/"needs attention" (spec: "a... disconnected
-/// account/device state" needs attention): a peer that cannot be connected
-/// (unreachable) drives `overall_state` to `"attention"` with a
-/// `peer_disconnected:<device_id>` reason, over the real socket.
+/// A peer that cannot be connected is a device that is away: it is listed under `peers` with its
+/// reason and raises no attention reason, so the overall state stays healthy, over the real socket.
 #[tokio::test]
-async fn unreachable_peer_reports_attention_over_the_real_socket() {
+async fn unreachable_peer_is_not_a_reason_for_attention_over_the_real_socket() {
     let _guard = TEST_MUTEX.lock().await;
     let (_dir, state) = start_daemon().await;
 
@@ -181,11 +179,12 @@ async fn unreachable_peer_reports_attention_over_the_real_socket() {
     );
 
     let status = fetch_status().await;
-    assert_eq!(status.overall_state, "attention");
-    assert_eq!(
-        attention_reasons_excluding_startup_update_check_race(&status),
-        vec!["peer_disconnected:device-b".to_string()]
+    assert!(
+        attention_reasons_excluding_startup_update_check_race(&status).is_empty(),
+        "{:?}",
+        status.attention_reasons
     );
+    assert!(status.peers.iter().any(|p| p.device_id == "device-b"));
 }
 
 /// a headroom override pinned above the block

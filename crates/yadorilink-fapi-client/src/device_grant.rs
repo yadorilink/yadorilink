@@ -223,9 +223,11 @@ impl FapiClient {
     }
 }
 
-/// The RFC 8628 section 3.5 polling rules, apart from the network: wait the
-/// interval before every poll, widen it by five seconds on every `slow_down`
-/// and keep it widened, and stop at the authorization's own `expires_in`.
+/// The RFC 8628 section 3.5 polling rules, apart from the network: poll once
+/// at once (the user has just been told to approve, and the server has no
+/// earlier poll to throttle against), then wait the interval between polls,
+/// widen it by five seconds on every `slow_down` and keep it widened, and stop
+/// at the authorization's own `expires_in`.
 async fn poll_until_granted<F, Fut>(
     authorization: &DeviceAuthorization,
     mut poll: F,
@@ -239,7 +241,6 @@ where
     let mut interval = authorization.poll_interval();
 
     loop {
-        tokio::time::sleep(interval).await;
         if tokio::time::Instant::now() >= deadline {
             return Err(Error::DeviceAuthorizationExpired);
         }
@@ -248,6 +249,7 @@ where
             DevicePoll::Pending => {}
             DevicePoll::SlowDown => interval += Duration::from_secs(5),
         }
+        tokio::time::sleep(interval).await;
     }
 }
 

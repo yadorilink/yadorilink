@@ -61,6 +61,7 @@ use crate::client::ensure_trusted_socket;
 use crate::error::{Error, Result};
 use crate::jws::{jti, now_secs};
 use crate::key::Es256Key;
+use crate::pairing::PairingCode;
 
 /// Where an installation opens a transaction.
 pub const BOOTSTRAP_START_PATH: &str = "/bootstrap/start";
@@ -87,6 +88,11 @@ pub struct EnrolmentRequest<'a> {
     /// A display label, shown to the human on the approval page. Not an
     /// identifier, and not trusted as one.
     pub client_name: Option<&'a str>,
+    /// A pairing code from the account's web page. With one, the code stands in
+    /// for the browser approval: the server registers this key for the code's
+    /// account at once, [`PendingEnrolment::approval_uri`] is `None`, and the
+    /// first poll collects the registration. Everything else is unchanged.
+    pub pairing_code: Option<&'a PairingCode>,
 }
 
 /// An open transaction: what the installation holds while a human approves it.
@@ -116,8 +122,9 @@ pub struct PendingEnrolment {
     /// The URL a human must open to approve this enrolment. It carries a
     /// DIFFERENT secret from the handle, so printing it -- which is the whole
     /// point of it -- does not print the value the registration is collected
-    /// with.
-    pub approval_uri: String,
+    /// with. `None` for an enrolment opened with a pairing code, which has no
+    /// approval step.
+    pub approval_uri: Option<String>,
     /// How long the transaction lives. The server's number, not a local guess:
     /// polling past it can only ever return "pending".
     pub expires_in: Duration,
@@ -174,7 +181,8 @@ pub enum EnrolmentPoll {
 #[derive(serde::Deserialize)]
 struct StartResponse {
     bootstrap_handle: String,
-    approval_uri: String,
+    #[serde(default)]
+    approval_uri: Option<String>,
     expires_in: u64,
     poll_interval_seconds: u64,
 }
@@ -215,7 +223,7 @@ pub async fn open_enrolment(
 
     let endpoint = base_url.join(BOOTSTRAP_START_PATH)?;
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         // A JWK *set*, because RFC 7591 registers `jwks`, and with the public
         // half only: the server refuses a key carrying private parameters, and
         // rightly.
@@ -223,15 +231,33 @@ pub async fn open_enrolment(
         "redirect_uris": request.redirect_uris,
         "client_name": request.client_name,
     });
+    if let Some(code) = request.pairing_code {
+        body["pairing_code"] = serde_json::Value::String(code.as_str().to_owned());
+    }
 
     let response = http.post(endpoint).json(&body).send().await?;
     let status = response.status();
+    let retry_after = retry_after(&response);
     let text = response.text().await?;
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(Error::RateLimited { step: "opening a bootstrap transaction", retry_after });
+    }
     if status != reqwest::StatusCode::CREATED {
         return Err(Error::response("opening a bootstrap transaction", status.as_u16(), text));
     }
 
     let started: StartResponse = serde_json::from_str(&text)?;
+    // A paired start has no approval step (a link in the answer is ignored). An ordinary one
+    // is useless without its link.
+    let approval_uri = match (request.pairing_code, started.approval_uri) {
+        (Some(_), _) => None,
+        (None, Some(link)) => Some(link),
+        (None, None) => {
+            return Err(Error::Registration(
+                "the server opened a bootstrap transaction with no approval link".to_owned(),
+            ))
+        }
+    };
     // A transaction with no life left is not an enrolment in progress, it is a
     // loop that will only ever print "still waiting". Better to say so here
     // than after ten minutes of polling.
@@ -243,7 +269,7 @@ pub async fn open_enrolment(
 
     Ok(PendingEnrolment {
         handle: started.bootstrap_handle,
-        approval_uri: started.approval_uri,
+        approval_uri,
         expires_in: Duration::from_secs(started.expires_in),
         // Zero would busy-loop against the server; one second is the floor RFC
         // 8628 uses for the same advisory field, for the same reason.
@@ -252,6 +278,16 @@ pub async fn open_enrolment(
         canonical_issuer,
     })
 }
+
+/// The server's `Retry-After` (delta-seconds form) of a refusal, if it sent one.
+fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    let seconds =
+        response.headers().get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim().parse().ok()?;
+    Some(Duration::from_secs(seconds))
+}
+
+/// The longest a poll waits out one rate-limit answer, whatever the server asked for.
+const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(60);
 
 /// The `issuer` field alone, off this deployment's own discovery document.
 ///
@@ -349,8 +385,12 @@ pub async fn poll_enrolment(
         .send()
         .await?;
     let status = response.status();
+    let retry_after = retry_after(&response);
     let text = response.text().await?;
 
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(Error::RateLimited { step: "polling a bootstrap transaction", retry_after });
+    }
     if status == reqwest::StatusCode::OK {
         return Ok(EnrolmentPoll::Registered(registration_from(&text)?));
     }
@@ -360,6 +400,39 @@ pub async fn poll_enrolment(
         return Ok(EnrolmentPoll::Pending);
     }
     Err(refusal)
+}
+
+/// Polls made at [`FAST_POLL`] spacing first (about the first four seconds).
+const FAST_POLLS: u32 = 16;
+
+/// The spacing of the very first polls. A sign-in is approved within a second or two of the
+/// link being shown, and the wait for the next poll is the one part of that leg nobody can
+/// overlap with other work: at one second it cost 0.5 s on average, a quarter of the whole
+/// leg. A poll is a single small key-bound request on a warm connection, `/bootstrap/poll`
+/// is not under the abuse budget, and a rate-limit answer is still obeyed below.
+const FAST_POLL: Duration = Duration::from_millis(250);
+
+/// Polls made at [`QUICK_POLL`] spacing after the fast ones, before the server's advised
+/// interval takes over.
+const QUICK_POLLS: u32 = 20;
+
+/// The spacing of the polls after the first few seconds: waiting the advised five seconds
+/// made every sign-in take 5 s longer than the approval did. The advertised interval is
+/// advice, not a rate limit (the poll is idempotent and key-bound); a person who has not
+/// approved after the fast and quick polls is polled at the advised interval from then on.
+const QUICK_POLL: Duration = Duration::from_secs(1);
+
+/// How long to wait before poll number `attempt` (1 is the second poll).
+fn poll_wait(attempt: u32, interval: Duration, quick: bool) -> Duration {
+    if !quick {
+        interval
+    } else if attempt <= FAST_POLLS {
+        FAST_POLL.min(interval)
+    } else if attempt <= FAST_POLLS + QUICK_POLLS {
+        QUICK_POLL.min(interval)
+    } else {
+        interval
+    }
 }
 
 /// Poll until the enrolment completes, the transaction expires, or the server
@@ -379,20 +452,45 @@ where
     S: FnMut(Duration) -> F,
     F: std::future::Future<Output = ()>,
 {
-    // The server's own deadline, converted to a number of attempts. A
-    // wall-clock deadline would be the obvious shape and is the wrong one here:
-    // the sleep is injected, so wall-clock time does not advance in a test and
-    // the loop would never end.
+    // The server's own deadline, counted in planned waiting rather than read off a
+    // wall clock. A wall-clock deadline would be the obvious shape and is the wrong
+    // one here: the sleep is injected, so wall-clock time does not advance in a test
+    // and the loop would never end.
     let interval = pending.poll_interval.max(Duration::from_secs(1));
-    let attempts = pending.expires_in.as_secs().div_ceil(interval.as_secs()).max(1);
+    let deadline = pending.expires_in;
+    let mut planned = Duration::ZERO;
+    let mut attempt: u32 = 0;
+    // Cleared by the first rate-limit answer: a server that says slow down is obeyed from then on.
+    let mut quick = true;
 
-    for attempt in 0..attempts {
+    while planned < deadline || attempt == 0 {
         if attempt > 0 {
-            sleep(interval).await;
+            let wait = poll_wait(attempt, interval, quick);
+            // A wait that would reach the deadline ends the loop: the transaction is gone by
+            // the time it is over, and a poll then would be answered with an expired handle
+            // instead of the enrolment's own "not approved in time".
+            if planned + wait >= deadline {
+                break;
+            }
+            planned += wait;
+            sleep(wait).await;
         }
-        match poll_enrolment(http, pending, client_key).await? {
-            EnrolmentPoll::Registered(registration) => return Ok(registration),
-            EnrolmentPoll::Pending => {}
+        attempt += 1;
+        match poll_enrolment(http, pending, client_key).await {
+            Ok(EnrolmentPoll::Registered(registration)) => return Ok(registration),
+            Ok(EnrolmentPoll::Pending) => {}
+            // The abuse budget answered: wait as long as it asks (bounded) and spend the
+            // attempt, so the loop still ends at the transaction's own deadline.
+            Err(Error::RateLimited { retry_after, .. }) => {
+                quick = false;
+                let wait = retry_after.unwrap_or(interval).min(MAX_RATE_LIMIT_WAIT);
+                if planned + wait >= deadline {
+                    break;
+                }
+                planned += wait;
+                sleep(wait).await;
+            }
+            Err(other) => return Err(other),
         }
     }
 

@@ -21,6 +21,8 @@ impl FakeLifecycle {
 impl DaemonLifecyclePort for FakeLifecycle {
     fn request_shutdown(&self) {}
 
+    fn request_shutdown_to_restart(&self) {}
+
     fn request_safe_stop(&self, _deadline: Duration) -> BoxFuture<'_, SafeStopOutcome> {
         self.requests.fetch_add(1, Ordering::SeqCst);
         let mut answers = self.answers.lock().unwrap();
@@ -183,6 +185,8 @@ struct Recording(Arc<FakeLifecycle>, Arc<Mutex<Vec<Duration>>>, tokio::time::Ins
 
 impl DaemonLifecyclePort for Recording {
     fn request_shutdown(&self) {}
+
+    fn request_shutdown_to_restart(&self) {}
     fn request_safe_stop(&self, d: Duration) -> BoxFuture<'_, SafeStopOutcome> {
         self.1.lock().unwrap().push(self.2.elapsed());
         self.0.request_safe_stop(d)

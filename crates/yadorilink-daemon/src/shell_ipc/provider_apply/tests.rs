@@ -38,6 +38,16 @@ fn sha(bytes: &[u8]) -> Vec<u8> {
 
 impl Fx {
     async fn new() -> Self {
+        Self::new_with(true).await
+    }
+
+    /// The embedding app's view: the root is declared and nothing else has happened. The OS has
+    /// registered no domain, no extension has said hello and no host connection is attached.
+    async fn app_only() -> Self {
+        Self::new_with(false).await
+    }
+
+    async fn new_with(os_evidence: bool) -> Self {
         let (state, root) = state_with_root();
         state.set_device_signing_key(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
         // This device is a writer of the group's verified policy.
@@ -49,17 +59,21 @@ impl Fx {
             )]),
         )]));
         let root_id = hex::decode(&root).unwrap();
-        send(&state, domain_state(&root_id, true)).await;
-        send(&state, handshake(&root_id)).await;
+        if os_evidence {
+            send(&state, domain_state(&root_id, true)).await;
+            send(&state, handshake(&root_id)).await;
+        }
         let dir = tempfile::tempdir().unwrap();
         let handoff = HandoffRoot::open_with_lifetime(dir.path(), Duration::from_secs(60)).unwrap();
         let context =
             Arc::new(ShellContext::from_state(state.clone()).with_handoff_root(Some(handoff)));
         let (host, host_rx) = mpsc::unbounded_channel();
-        assert!(context.provider_host.try_attach(host.clone()));
         let (tx, rx) = mpsc::unbounded_channel();
         let handshakes = Arc::new(Handshakes::default());
-        handshakes.note(&root_id);
+        if os_evidence {
+            assert!(context.provider_host.try_attach(host.clone()));
+            handshakes.note(&root_id);
+        }
         Self {
             state,
             root,
@@ -631,6 +645,48 @@ async fn the_wire_item_carries_the_engines_eviction_permission() {
     assert!(permissions(ask_children(&fx, &[], &[], 10).await).iter().all(|(_, ok)| *ok));
 }
 
+/// The wire item reports what the engine holds of it (not what the OS holds): bytes here, bytes
+/// not here, a fetch in progress, and nothing for a row the engine has no state for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_wire_item_carries_the_engines_local_state() {
+    use yadorilink_ipc_proto::shellipc::LocalTransition;
+    let mut fx = Fx::new().await;
+    let names = ["away", "busy", "here"];
+    for (seq, name) in names.into_iter().enumerate() {
+        let mut request = fx.create(seq as u64 + 1, name, None);
+        request.request_id = format!("req-{name}").into_bytes();
+        assert!(fx.ask(request).await.ok);
+    }
+    fx.repo().set_namespace_ready(&fx.root, true).unwrap();
+    for (name, state) in [("away", "remote"), ("busy", "hydrating"), ("here", "present")] {
+        fx.state
+            .replica_coordinator
+            .database()
+            .write_immediate::<_, yadorilink_sync_sqlite::SyncSqliteError>(|tx| {
+                tx.execute(
+                    "UPDATE files SET materialization_state = ?3 \
+                     WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
+                    rusqlite::params!["group-1", name, state],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+    let page = ask_children(&fx, &[], &[], 10).await;
+    assert!(page.ok, "{}", page.error);
+    let states: std::collections::BTreeMap<_, _> =
+        page.items.into_iter().map(|i| (i.name, i.local_state)).collect();
+    let away = states["away"].expect("a row with a state is reported");
+    assert!(!away.local_object_present && !away.current_content_present);
+    assert_eq!(away.transition(), LocalTransition::None);
+    let busy = states["busy"].expect("hydrating is reported");
+    assert!(!busy.current_content_present);
+    assert_eq!(busy.transition(), LocalTransition::Hydrating);
+    let here = states["here"].expect("present is reported");
+    assert!(here.local_object_present && here.current_content_present);
+    assert_eq!(here.transition(), LocalTransition::None);
+}
+
 /// Pinning or unpinning is not just retention state: the OS already holds the item with its old
 /// permission, so the engine republishes it (a new served token) and owes the OS a signal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -830,6 +886,32 @@ async fn changes_and_the_working_set_walk_over_the_connection() {
         panic!("not a changes response")
     };
     assert_eq!(enumerate_failure(expired.failure), EnumerateFailure::AnchorExpired);
+    assert!(!expired.ok && expired.upserts.is_empty() && expired.removed_item_ids.is_empty());
+
+    // An anchor the retention sweep passed is expired too: the OS enumerates in full instead of
+    // being handed a partial list. The newest anchor still answers.
+    fx.repo().prune_change_events(&fx.root, 0, i64::MAX).unwrap();
+    for (since, expect_ok) in [(listing.anchor, false), (changed.next_anchor, true)] {
+        let Payload::EnumerateChangesResponse(answer) = through(
+            &fx,
+            Payload::EnumerateChangesRequest(EnumerateChangesRequest {
+                root_id: fx.root_id.clone(),
+                scope: ChangeScope::WorkingSet as i32,
+                parent_item_id: Vec::new(),
+                since_anchor: since,
+                limit: 0,
+            }),
+        )
+        .await
+        else {
+            panic!("not a changes response")
+        };
+        assert_eq!(answer.ok, expect_ok, "{answer:?}");
+        if !expect_ok {
+            assert_eq!(enumerate_failure(answer.failure), EnumerateFailure::AnchorExpired);
+            assert!(answer.upserts.is_empty() && answer.removed_item_ids.is_empty());
+        }
+    }
 
     // The walk: pages by cursor, every page repeats the first page's anchor.
     let mut names = Vec::new();
@@ -1204,4 +1286,673 @@ async fn a_viewer_demoted_before_the_commit_point_is_refused_there() {
         0,
         "a demoted device authored"
     );
+}
+
+// ---- the embedding app's own path ------------------------------------------------------------
+
+impl Fx {
+    async fn app(&self, request: ProviderApplyChangeRequest) -> ProviderApplyChangeResponse {
+        apply_for_app(&self.context, &request).await
+    }
+
+    fn modify(&self, seq: u64, item: &ProviderAppliedItem) -> ProviderApplyChangeRequest {
+        ProviderApplyChangeRequest {
+            request_id: format!("app-{seq}").into_bytes(),
+            session_id: vec![2; 16],
+            operation_seq: seq,
+            root_id: self.root_id.clone(),
+            kind: ProviderChangeKind::Modify as i32,
+            item_id: item.item_id.clone(),
+            base_version_hash: item.content_version.clone(),
+            base_generation: Some(generation_of(&item.content_version)),
+            parent_generation: Some(item.parent_generation),
+            ..Default::default()
+        }
+    }
+}
+
+/// No socket, no handshake, no attached host, no registered domain: the owner of the engine writes
+/// a file, a folder, a new version, a rename and move, and a delete, every one durable and visible
+/// to the same readers the extension uses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_app_creates_modifies_renames_moves_and_deletes_without_any_os_evidence() {
+    let fx = Fx::app_only().await;
+    assert!(!fx.context.provider_host.host_connected());
+    assert_eq!(
+        declared_root(&fx).readiness(),
+        Readiness::NotReady(
+            yadorilink_replica_domain::session_state::NotReady::DomainNotRegistered
+        ),
+        "the setup must have no OS evidence at all"
+    );
+
+    // A folder, then a file in it.
+    let mut folder = fx.create(1, "Trip", None);
+    folder.entry_kind = WireEntryKind::Directory as i32;
+    folder.session_id = vec![2; 16];
+    let folder = fx.app(folder).await;
+    assert!(folder.ok, "{folder:?}");
+    let folder = folder.item.unwrap();
+    assert_eq!(folder.entry_kind, WireEntryKind::Directory as i32);
+
+    let source = fx.put_ingest("up-1", b"photo bytes");
+    let mut create = fx.create(2, "p.jpg", Some(source));
+    create.session_id = vec![2; 16];
+    create.parent_item_id = Some(folder.item_id.clone());
+    let created = fx.app(create).await;
+    assert!(created.ok, "{created:?}");
+    assert_eq!(created.outcome, ProviderApplyOutcome::Applied as i32);
+    let file = created.item.unwrap();
+    assert_eq!((file.name.as_str(), file.size), ("p.jpg", 11));
+    assert!(!fx.ingest_dir().join("up-1").exists(), "the spent copy is removed once committed");
+    assert_eq!(fx.context.writer.follow_ups(), 2, "committed changes are published to peers");
+
+    // A new version of the same file.
+    let source = fx.put_ingest("up-2", b"retouched");
+    let mut edit = fx.modify(3, &file);
+    edit.content = Some(source);
+    let edited = fx.app(edit).await;
+    assert!(edited.ok, "{edited:?}");
+    let file = edited.item.unwrap();
+    assert_eq!(file.size, 9);
+
+    // Rename and move to the root in one request.
+    let mut rename = fx.modify(4, &file);
+    rename.name = Some("cover.jpg".into());
+    rename.parent_item_id = Some(Vec::new());
+    let renamed = fx.app(rename).await;
+    assert!(renamed.ok, "{renamed:?}");
+    let file = renamed.item.unwrap();
+    assert_eq!(file.name, "cover.jpg");
+    assert!(file.parent_item_id.is_empty(), "moved to the root");
+    let id = <[u8; 16]>::try_from(file.item_id.as_slice()).unwrap();
+    assert_eq!(
+        fx.repo().path_for_item(&fx.root, &id).unwrap().map(|(p, _)| p).as_deref(),
+        Some("cover.jpg")
+    );
+
+    // Delete.
+    let mut delete = fx.modify(5, &file);
+    delete.kind = ProviderChangeKind::Delete as i32;
+    let deleted = fx.app(delete).await;
+    assert!(deleted.ok, "{deleted:?}");
+    assert_eq!(fx.repo().path_for_item(&fx.root, &id).unwrap().map(|(_, live)| live), Some(false));
+}
+
+/// A lost response is answered with the stored outcome: nothing is read again (the staged copy is
+/// gone) and nothing is authored twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_app_retry_after_a_lost_response_returns_the_stored_outcome() {
+    let fx = Fx::app_only().await;
+    let source = fx.put_ingest("up-1", b"once only");
+    let mut first = fx.create(1, "a.txt", Some(source.clone()));
+    first.session_id = vec![2; 16];
+    let first = fx.app(first.clone()).await;
+    assert!(first.ok && !first.replayed, "{first:?}");
+    let count = fx.repo().list_children(&fx.root, "").unwrap().len();
+
+    let mut retry = fx.create(1, "a.txt", Some(source));
+    retry.session_id = vec![2; 16];
+    retry.request_id = b"retry".to_vec();
+    let again = fx.app(retry).await;
+    assert!(again.ok && again.replayed, "{again:?}");
+    assert_eq!(again.item, first.item);
+    assert_eq!(fx.repo().list_children(&fx.root, "").unwrap().len(), count);
+}
+
+/// Conflicts are the engine's decision, never the app's: a stale view of an item authored at the
+/// same time keeps both versions, and a retired item answers KEEP_LOCAL with a name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_app_edit_on_a_stale_view_keeps_both_and_a_retired_item_names_a_copy() {
+    let fx = Fx::app_only().await;
+    let source = fx.put_ingest("up-1", b"v1");
+    let mut create = fx.create(1, "doc.txt", Some(source));
+    create.session_id = vec![2; 16];
+    let doc = fx.app(create).await.item.unwrap();
+
+    // Another edit lands first; the app's edit names the old version.
+    let source = fx.put_ingest("up-2", b"v2 from elsewhere");
+    let mut other = fx.modify(2, &doc);
+    other.content = Some(source);
+    assert!(fx.app(other).await.ok);
+    let source = fx.put_ingest("up-3", b"v2 from the phone");
+    let mut stale = fx.modify(3, &doc);
+    stale.content = Some(source);
+    let stale = fx.app(stale).await;
+    assert!(stale.ok, "{stale:?}");
+    assert_eq!(stale.outcome, ProviderApplyOutcome::Concurrent as i32);
+    assert_eq!(fx.repo().list_children(&fx.root, "").unwrap().len(), 2, "both versions are kept");
+
+    // A request that carries nothing but the version it saw, when that is no longer the current
+    // version, authors nothing: STALE_VIEW, refresh and retry.
+    let before = fx.repo().list_children(&fx.root, "").unwrap().len();
+    let touch = fx.app(fx.modify(10, &doc)).await;
+    assert_eq!(failure(&touch), ProviderApplyFailure::StaleView, "{touch:?}");
+    assert_eq!(fx.repo().list_children(&fx.root, "").unwrap().len(), before);
+
+    // A pure rename or move acts on the item's identity, not on a view: it applies, into a
+    // folder named by its stable id.
+    let mut dir = fx.create(11, "B", None);
+    dir.entry_kind = WireEntryKind::Directory as i32;
+    dir.session_id = vec![2; 16];
+    let dir_b = fx.app(dir).await.item.unwrap();
+    let mut mv = fx.modify(12, &doc);
+    mv.parent_item_id = Some(dir_b.item_id.clone());
+    mv.name = Some("moved.txt".into());
+    let moved = fx.app(mv).await;
+    assert!(moved.ok, "{moved:?}");
+    let moved = moved.item.unwrap();
+    assert_eq!((moved.name.as_str(), &moved.parent_item_id), ("moved.txt", &dir_b.item_id));
+
+    // A retired item: the bytes are kept as a new item under a suggested name.
+    let id = <[u8; 16]>::try_from(doc.item_id.as_slice()).unwrap();
+    assert!(fx.repo().retire_item(&fx.root, &id).unwrap());
+    let source = fx.put_ingest("up-4", b"after retirement");
+    let mut late = fx.modify(5, &doc);
+    late.content = Some(source);
+    let late = fx.app(late).await;
+    assert!(late.ok, "{late:?}");
+    assert_eq!(late.outcome, ProviderApplyOutcome::Concurrent as i32);
+}
+
+/// A reader (or any device that is not a writer of the group) is refused with a typed refusal,
+/// before the staged file is read; the staged file stays for the app to discard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_app_write_by_a_reader_is_refused_not_authorized() {
+    use crate::test_support::sync_stack_fixture::fixture_group_policy_granting;
+    let fx = Fx::app_only().await;
+    let other = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+    fx.state.authority.replace_group_policy_states(std::collections::HashMap::from([(
+        "group-1".to_string(),
+        fixture_group_policy_granting(&[("someone-else", other)]),
+    )]));
+    let source = fx.put_ingest("up-1", b"not allowed");
+    let mut create = fx.create(1, "a.txt", Some(source));
+    create.session_id = vec![2; 16];
+    let response = fx.app(create).await;
+    assert_eq!(failure(&response), ProviderApplyFailure::NotAuthorized, "{response:?}");
+    assert_eq!(fx.repo().list_children(&fx.root, "").unwrap().len(), 0);
+    assert!(fx.ingest_dir().join("up-1").exists());
+}
+
+/// A root that reported an error of its own is not written to, even by the app.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_app_write_to_a_root_with_an_error_is_not_ready() {
+    let fx = Fx::app_only().await;
+    fx.repo().record_provider_error(&fx.root, "domain invalid").unwrap();
+    let mut create = fx.create(1, "a.txt", None);
+    create.session_id = vec![2; 16];
+    assert_eq!(failure(&fx.app(create).await), ProviderApplyFailure::NotReady);
+    assert_eq!(fx.repo().list_children(&fx.root, "").unwrap().len(), 0);
+}
+
+/// A file too big for the volume is refused with LOW_DISK before it is read; the staged copy is
+/// kept, so nothing is lost and the same operation succeeds once there is room.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_app_write_that_cannot_fit_is_refused_low_disk_before_reading() {
+    let fx = Fx::app_only().await;
+    fx.state.enable_disk_headroom_enforcement();
+    let mut source = fx.put_ingest("up-1", b"small but declared huge");
+    // Declared far beyond any volume: the check is on the declared size, before any read.
+    source.size = u64::MAX / 4;
+    let mut create = fx.create(1, "huge.bin", Some(source));
+    create.session_id = vec![2; 16];
+    let response = fx.app(create).await;
+    assert_eq!(failure(&response), ProviderApplyFailure::LowDisk, "{response:?}");
+    assert!(fx.ingest_dir().join("up-1").exists(), "the staged copy is kept");
+    assert_eq!(fx.repo().list_children(&fx.root, "").unwrap().len(), 0);
+}
+
+// ---- restore: an earlier version, a deleted item ---------------------------------------------
+
+impl Fx {
+    /// The retained versions of `path`, newest first (what the history listing reads).
+    fn versions(&self, path: &str) -> Vec<yadorilink_replica_domain::session_state::VersionRecord> {
+        self.state.replica_coordinator.sqlite().dag_list_versions(GROUP_ID, path).unwrap()
+    }
+
+    /// A file `a.txt` with two versions, "first" then "second, longer". Returns the item the last
+    /// write left.
+    async fn file_with_two_versions(&self) -> ProviderAppliedItem {
+        let mut create = self.create(1, "a.txt", Some(self.put_ingest("up-1", b"first")));
+        create.session_id = vec![2; 16];
+        let item = self.app(create).await.item.expect("created");
+        let mut edit = self.modify(2, &item);
+        edit.content = Some(self.put_ingest("up-2", b"second, longer"));
+        self.app(edit).await.item.expect("edited")
+    }
+
+    fn restore_request(
+        &self,
+        mut request: ProviderApplyChangeRequest,
+        path: &str,
+        version_hash: &VersionHash,
+    ) -> ProviderApplyChangeRequest {
+        request.restore_from = Some(yadorilink_ipc_proto::shellipc::ProviderRestoreSource {
+            path: path.into(),
+            version_hash: version_hash.0.to_vec(),
+        });
+        request
+    }
+}
+
+/// An earlier version comes back as one ordinary new write over the live item: the content is the
+/// old one, the item and its place are unchanged, the old version stays in the history, and the
+/// same operation asked again is a replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restore_authors_an_earlier_version_as_a_new_write() {
+    let fx = Fx::app_only().await;
+    let file = fx.file_with_two_versions().await;
+    assert_eq!(file.size, 14);
+    let first = fx
+        .versions("a.txt")
+        .into_iter()
+        .find(|v| v.state == yadorilink_replica_domain::session_state::VersionState::Superseded)
+        .expect("the first version is retained");
+    assert_eq!(first.size, 5);
+
+    let restore = fx.restore_request(fx.modify(3, &file), "a.txt", &first.version_hash);
+    let restored = fx.app(restore.clone()).await;
+    assert!(restored.ok && !restored.replayed, "{restored:?}");
+    let item = restored.item.clone().unwrap();
+    assert_eq!((item.item_id.clone(), item.name.as_str(), item.size), (file.item_id, "a.txt", 5));
+    assert!(item.current);
+    let versions = fx.versions("a.txt");
+    let current = versions
+        .iter()
+        .find(|v| v.state == yadorilink_replica_domain::session_state::VersionState::Current)
+        .unwrap();
+    assert_eq!((current.size, &current.blocks), (5, &first.blocks), "the old bytes are current");
+    assert!(versions.iter().any(|v| v.size == 14), "the version that was replaced stays");
+    assert_eq!(fx.repo().list_children(&fx.root, "").unwrap().len(), 1, "no copy was made");
+
+    let mut again = restore;
+    again.request_id = b"retry".to_vec();
+    let replay = fx.app(again).await;
+    assert!(replay.ok && replay.replayed, "{replay:?}");
+    assert_eq!(replay.item, restored.item);
+}
+
+/// A deleted file comes back with a create under its name and parent; asked twice under another
+/// identity it is the same file (the create adopts what is already there).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deleted_file_is_restored_by_a_create() {
+    let fx = Fx::app_only().await;
+    let file = fx.file_with_two_versions().await;
+    let mut delete = fx.modify(3, &file);
+    delete.kind = ProviderChangeKind::Delete as i32;
+    assert!(fx.app(delete).await.ok);
+    let trashed = fx
+        .state
+        .replica_coordinator
+        .file_index_repository()
+        .list_trashed(GROUP_ID)
+        .unwrap()
+        .into_iter()
+        .find(|t| t.path == "a.txt")
+        .expect("the deleted file is listed");
+    let last = fx.versions("a.txt").into_iter().find(|v| v.version_seq == trashed.version_seq);
+    let last = last.expect("the trashed version is retained");
+    assert_eq!(last.size, 14, "the last content before the delete");
+
+    let restore = fx.restore_request(fx.create(4, "a.txt", None), "a.txt", &last.version_hash);
+    let mut restore = restore;
+    restore.session_id = vec![2; 16];
+    let restored = fx.app(restore).await;
+    assert!(restored.ok, "{restored:?}");
+    let item = restored.item.unwrap();
+    assert_eq!((item.name.as_str(), item.size), ("a.txt", 14));
+    assert!(item.current);
+    assert!(
+        fx.state
+            .replica_coordinator
+            .file_index_repository()
+            .list_trashed(GROUP_ID)
+            .unwrap()
+            .iter()
+            .all(|t| t.path != "a.txt"),
+        "the file is not in the trash any more"
+    );
+}
+
+/// A deleted folder comes back as a folder; the files that were in it are brought back after it,
+/// each under the folder's new item.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deleted_folder_is_restored_before_what_was_in_it() {
+    let fx = Fx::app_only().await;
+    let mut folder = fx.create(1, "Trip", None);
+    folder.entry_kind = WireEntryKind::Directory as i32;
+    folder.session_id = vec![2; 16];
+    let folder = fx.app(folder).await.item.unwrap();
+    let mut file = fx.create(2, "p.jpg", Some(fx.put_ingest("up-1", b"photo")));
+    file.session_id = vec![2; 16];
+    file.parent_item_id = Some(folder.item_id.clone());
+    assert!(fx.app(file).await.ok);
+    // Delete the folder with what is in it.
+    // A folder is deleted on its current token, which a file added below it moved.
+    let folder_id = <[u8; 16]>::try_from(folder.item_id.as_slice()).unwrap();
+    let (shown, _) = fx.repo().lookup_item(&fx.root, &folder_id).unwrap().expect("listed");
+    let mut token = shown.content_version.0.to_vec();
+    token.extend_from_slice(&shown.generation.to_be_bytes());
+    let mut delete = fx.modify(3, &folder);
+    delete.kind = ProviderChangeKind::Delete as i32;
+    delete.recursive = true;
+    delete.base_version_hash = token;
+    delete.base_generation = Some(shown.generation);
+    let deleted = fx.app(delete).await;
+    assert!(deleted.ok, "{deleted:?}");
+    let hash_of = |path: &str| {
+        let trashed = fx
+            .state
+            .replica_coordinator
+            .file_index_repository()
+            .list_trashed(GROUP_ID)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.path == path)
+            .unwrap_or_else(|| panic!("{path} is in the trash"));
+        fx.versions(path).into_iter().find(|v| v.version_seq == trashed.version_seq).unwrap()
+    };
+
+    // The file first: its folder is gone, so it cannot come back yet and nothing is kept.
+    let mut orphan = fx.restore_request(
+        fx.create(4, "p.jpg", None),
+        "Trip/p.jpg",
+        &hash_of("Trip/p.jpg").version_hash,
+    );
+    orphan.session_id = vec![2; 16];
+    orphan.parent_item_id = Some(folder.item_id.clone());
+    let refused = fx.app(orphan).await;
+    assert!(!refused.ok, "{refused:?}");
+
+    let mut dir =
+        fx.restore_request(fx.create(5, "Trip", None), "Trip", &hash_of("Trip").version_hash);
+    dir.session_id = vec![2; 16];
+    dir.entry_kind = WireEntryKind::Directory as i32;
+    let dir = fx.app(dir).await;
+    assert!(dir.ok, "{dir:?}");
+    let dir = dir.item.unwrap();
+    assert_eq!(dir.entry_kind, WireEntryKind::Directory as i32);
+
+    let mut child = fx.restore_request(
+        fx.create(6, "p.jpg", None),
+        "Trip/p.jpg",
+        &hash_of("Trip/p.jpg").version_hash,
+    );
+    child.session_id = vec![2; 16];
+    child.parent_item_id = Some(dir.item_id.clone());
+    let child = fx.app(child).await;
+    assert!(child.ok, "{child:?}");
+    assert_eq!(child.item.unwrap().size, 5);
+}
+
+/// A restore that cannot be done changes nothing and keeps nothing: an unknown version, a taken
+/// name, bytes that no device holds, a request that also carries bytes, a symlink.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_restore_changes_nothing_and_keeps_no_copy() {
+    let fx = Fx::app_only().await;
+    let file = fx.file_with_two_versions().await;
+    let first = fx
+        .versions("a.txt")
+        .into_iter()
+        .find(|v| v.state == yadorilink_replica_domain::session_state::VersionState::Superseded)
+        .unwrap();
+    let children = || fx.repo().list_children(&fx.root, "").unwrap().len();
+
+    // A version this device does not retain.
+    let unknown = fx.restore_request(fx.modify(3, &file), "a.txt", &VersionHash([0xEE; 32]));
+    let refused = fx.app(unknown).await;
+    assert_eq!(failure(&refused), ProviderApplyFailure::VersionUnavailable, "{refused:?}");
+
+    // A modify on a view that is not the current one: stale, nothing authored, no copy.
+    let mut stale = fx.restore_request(fx.modify(30, &file), "a.txt", &first.version_hash);
+    let mut token = vec![0xAB; 32];
+    token.extend_from_slice(&generation_of(&file.content_version).to_be_bytes());
+    stale.base_version_hash = token;
+    let refused = fx.app(stale).await;
+    assert_eq!(failure(&refused), ProviderApplyFailure::StaleView, "{refused:?}");
+    assert_eq!(children(), 1, "a stale restore keeps no copy");
+
+    // A create over a name that is taken by other content: a collision, and no conflict copy.
+    let mut taken = fx.restore_request(fx.create(4, "a.txt", None), "a.txt", &first.version_hash);
+    taken.session_id = vec![2; 16];
+    let refused = fx.app(taken).await;
+    assert_eq!(failure(&refused), ProviderApplyFailure::NameCollision, "{refused:?}");
+    assert_eq!(children(), 1, "a refused restore keeps no conflict copy");
+
+    // Bytes and a version together are not a request.
+    let mut both = fx.restore_request(fx.modify(5, &file), "a.txt", &first.version_hash);
+    both.content = Some(fx.put_ingest("up-3", b"x"));
+    let refused = fx.app(both).await;
+    assert_eq!(failure(&refused), ProviderApplyFailure::IngestRejected, "{refused:?}");
+
+    // A modify must be for the live item at the path of the version.
+    let elsewhere = fx.restore_request(fx.modify(6, &file), "other.txt", &first.version_hash);
+    assert_eq!(failure(&fx.app(elsewhere).await), ProviderApplyFailure::NotFound);
+
+    // The old bytes are gone from this device and no peer is connected.
+    for block in &first.blocks {
+        fx.state.block_store.delete(&hex::encode(&block.hash)).unwrap();
+    }
+    let lost = fx.restore_request(fx.modify(7, &file), "a.txt", &first.version_hash);
+    let refused = fx.app(lost).await;
+    assert_eq!(failure(&refused), ProviderApplyFailure::VersionUnavailable, "{refused:?}");
+    let current = fx
+        .versions("a.txt")
+        .into_iter()
+        .find(|v| v.state == yadorilink_replica_domain::session_state::VersionState::Current)
+        .unwrap();
+    assert_eq!(current.size, 14, "nothing was authored");
+}
+
+/// The File Provider extension never restores: the request is for the embedding app.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_extension_cannot_ask_for_a_restore() {
+    let mut fx = Fx::new().await;
+    let source = fx.put_ingest("copy-1", b"hello");
+    let created = fx.ask(fx.create(1, "a.txt", Some(source))).await;
+    let item = created.item.unwrap();
+    let hash = fx.versions("a.txt")[0].version_hash;
+    let mut request = fx.restore_request(fx.modify(2, &item), "a.txt", &hash);
+    request.session_id = vec![1; 16];
+    let response = fx.ask(request).await;
+    assert_eq!(failure(&response), ProviderApplyFailure::NotFound, "{response:?}");
+}
+
+// ---- conflict copies of a provider folder -----------------------------------------------------
+
+impl Fx {
+    /// The daemon-side applier the resolution commits through, as the provider side installs it.
+    fn install_applier(&self) {
+        let context = self.context.clone();
+        self.state.set_provider_applier(Arc::new(move |request| {
+            let context = context.clone();
+            Box::pin(async move { apply_for_app(&context, &request).await })
+        }));
+    }
+
+    /// `a.txt` holding "mine" and a conflict copy of it holding "theirs". Returns the copy's path.
+    async fn file_with_a_conflict_copy(&self) -> String {
+        let mut create = self.create(1, "a.txt", Some(self.put_ingest("up-1", b"mine")));
+        create.session_id = vec![2; 16];
+        assert!(self.app(create).await.ok);
+        let copy = yadorilink_replica_domain::conflict::conflict_copy_path(
+            "a.txt",
+            1_700_000_000_000_000_000,
+            "dev-b",
+            &[0xab; 32],
+        );
+        let mut create = self.create(2, &copy, Some(self.put_ingest("up-2", b"theirs")));
+        create.session_id = vec![2; 16];
+        assert!(self.app(create).await.ok);
+        copy
+    }
+
+    fn current_size(&self, path: &str) -> Option<u64> {
+        self.versions(path)
+            .into_iter()
+            .find(|v| v.state == yadorilink_replica_domain::session_state::VersionState::Current)
+            .map(|v| v.size)
+    }
+}
+
+/// Keep this writes the copy's content over the original as a new version: the original keeps its
+/// item and its old version, and the copy is left as it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keep_this_restores_the_copy_over_the_original_in_a_provider_folder() {
+    use crate::conflict_resolution::{resolve_conflict, ConflictChoice};
+    let fx = Fx::app_only().await;
+    fx.install_applier();
+    let copy = fx.file_with_a_conflict_copy().await;
+    let before = fx.repo().item_for_path(&fx.root, "a.txt").unwrap().unwrap();
+    assert_eq!(fx.current_size("a.txt"), Some(4));
+
+    let kept =
+        resolve_conflict(&fx.state, GROUP_ID, &copy, ConflictChoice::KeepThis).await.unwrap();
+    assert_eq!(kept, std::path::PathBuf::from("a.txt"));
+    assert_eq!(fx.current_size("a.txt"), Some(6), "the copy's bytes are the original's now");
+    assert!(fx.versions("a.txt").iter().any(|v| v.size == 4), "the replaced version stays");
+    assert_eq!(fx.repo().item_for_path(&fx.root, "a.txt").unwrap(), Some(before));
+    assert!(fx.repo().item_for_path(&fx.root, &copy).unwrap().is_some(), "the copy is untouched");
+    // The OS does not hold the copy's bytes: the new version is left to be announced and fetched
+    // (as a change from a peer is), not published as if the OS had written it.
+    let pending: Vec<_> =
+        fx.repo().pending_items(&fx.root).unwrap().into_iter().map(|p| p.item_id).collect();
+    assert!(pending.contains(&before), "the original awaits its announcement to the OS");
+}
+
+/// Restoring an earlier version of an item itself stays published at once (the app's own write).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restore_of_the_items_own_version_is_still_published_at_once() {
+    let fx = Fx::app_only().await;
+    let file = fx.file_with_two_versions().await;
+    let first = fx
+        .versions("a.txt")
+        .into_iter()
+        .find(|v| v.state == yadorilink_replica_domain::session_state::VersionState::Superseded)
+        .unwrap();
+    let restore = fx.restore_request(fx.modify(3, &file), "a.txt", &first.version_hash);
+    assert!(fx.app(restore).await.ok);
+    let item = fx.repo().item_for_path(&fx.root, "a.txt").unwrap().unwrap();
+    assert!(!fx.repo().pending_items(&fx.root).unwrap().iter().any(|p| p.item_id == item));
+}
+
+/// Keep both renames the copy to the first free "other version" name, the same names a plain
+/// folder gives, and never onto a name that is taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keep_both_renames_the_copy_to_the_first_free_other_version_name() {
+    use crate::conflict_resolution::{resolve_conflict, ConflictChoice};
+    let fx = Fx::app_only().await;
+    fx.install_applier();
+    let copy = fx.file_with_a_conflict_copy().await;
+    let item = fx.repo().item_for_path(&fx.root, &copy).unwrap().unwrap();
+
+    let kept =
+        resolve_conflict(&fx.state, GROUP_ID, &copy, ConflictChoice::KeepBoth).await.unwrap();
+    assert_eq!(kept, std::path::PathBuf::from("a (other version).txt"));
+    assert_eq!(fx.repo().item_for_path(&fx.root, "a (other version).txt").unwrap(), Some(item));
+    assert!(fx.repo().item_for_path(&fx.root, &copy).unwrap().is_none(), "the copy was renamed");
+    assert_eq!(fx.current_size("a.txt"), Some(4), "the original is unchanged");
+
+    // A second copy takes the next name.
+    let second = yadorilink_replica_domain::conflict::conflict_copy_path(
+        "a.txt",
+        1_700_000_100_000_000_000,
+        "dev-c",
+        &[0xcd; 32],
+    );
+    let mut create = fx.create(3, &second, Some(fx.put_ingest("up-3", b"third")));
+    create.session_id = vec![2; 16];
+    assert!(fx.app(create).await.ok);
+    let kept =
+        resolve_conflict(&fx.state, GROUP_ID, &second, ConflictChoice::KeepBoth).await.unwrap();
+    assert_eq!(kept, std::path::PathBuf::from("a (other version 2).txt"));
+}
+
+/// A copy whose original is not a shown item is not offered a resolution at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_copy_without_a_shown_original_is_not_resolvable() {
+    use crate::conflict_resolution::resolvable_in_folder;
+    let fx = Fx::app_only().await;
+    fx.install_applier();
+    let copy = fx.file_with_a_conflict_copy().await;
+    assert!(resolvable_in_folder(&fx.state.replica_coordinator, GROUP_ID, &copy));
+    let original = fx.repo().item_for_path(&fx.root, "a.txt").unwrap().unwrap();
+    fx.repo().retire_item(&fx.root, &original).unwrap();
+    assert!(!resolvable_in_folder(&fx.state.replica_coordinator, GROUP_ID, &copy));
+}
+
+/// Resolutions share one session of the root: many of them never run into the root's bound on
+/// sessions, and each one still commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn many_resolutions_use_one_session_of_the_root() {
+    use crate::conflict_resolution::{resolve_conflict, ConflictChoice};
+    let fx = Fx::app_only().await;
+    fx.install_applier();
+    fx.file_with_a_conflict_copy().await;
+    for n in 0..70u8 {
+        let copy = yadorilink_replica_domain::conflict::conflict_copy_path(
+            "a.txt",
+            1_700_000_200_000_000_000 + i64::from(n),
+            "dev-d",
+            &[n; 32],
+        );
+        let mut create =
+            fx.create(10 + u64::from(n), &copy, Some(fx.put_ingest(&format!("m-{n}"), b"x")));
+        create.session_id = vec![2; 16];
+        assert!(fx.app(create).await.ok);
+        resolve_conflict(&fx.state, GROUP_ID, &copy, ConflictChoice::KeepBoth).await.unwrap();
+    }
+}
+
+/// An original that changes between the moment Keep this reads its view and the commit is not
+/// overwritten: the change is refused as stale, nothing is written, and the copy stays a conflict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keep_this_does_not_overwrite_an_original_that_changed_before_the_commit() {
+    use crate::conflict_resolution::{resolve_conflict, ConflictChoice, ResolveConflictError};
+    let fx = Fx::app_only().await;
+    let copy = fx.file_with_a_conflict_copy().await;
+    let item = fx.repo().item_for_path(&fx.root, "a.txt").unwrap().unwrap();
+    // The applier edits the original first (an edit arriving after the view was read), then
+    // commits the resolution request unchanged.
+    let edit = {
+        let mut edit = fx.create(0, "unused", None);
+        edit.kind = ProviderChangeKind::Modify as i32;
+        edit.session_id = vec![3; 16];
+        edit.operation_seq = 1;
+        edit.item_id = item.to_vec();
+        edit.name = None;
+        edit.content = Some(fx.put_ingest("up-edit", b"edited meanwhile"));
+        let view = fx.versions("a.txt");
+        let current = view.iter().find(|v| v.size == 4).unwrap();
+        let mut base = current.version_hash.0.to_vec();
+        base.extend_from_slice(
+            &fx.repo().live_item_generation(&fx.root, &item).unwrap().unwrap().to_be_bytes(),
+        );
+        edit.base_version_hash = base;
+        edit.base_generation = fx.repo().live_item_generation(&fx.root, &item).unwrap();
+        edit
+    };
+    let context = fx.context.clone();
+    let edited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let edited_in = edited.clone();
+    fx.state.set_provider_applier(Arc::new(move |request| {
+        let (context, edit, edited) = (context.clone(), edit.clone(), edited_in.clone());
+        Box::pin(async move {
+            if !edited.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                assert!(apply_for_app(&context, &edit).await.ok, "the edit lands first");
+            }
+            apply_for_app(&context, &request).await
+        })
+    }));
+
+    let refused =
+        resolve_conflict(&fx.state, GROUP_ID, &copy, ConflictChoice::KeepThis).await.unwrap_err();
+    assert!(matches!(refused, ResolveConflictError::UnrecordedLocalChanges(_)), "{refused:?}");
+    assert_eq!(
+        fx.current_size("a.txt"),
+        Some(16),
+        "the edit stands, the copy did not overwrite it"
+    );
+    assert!(fx.repo().item_for_path(&fx.root, &copy).unwrap().is_some(), "the copy is still there");
 }

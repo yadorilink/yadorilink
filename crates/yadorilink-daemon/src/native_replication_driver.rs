@@ -352,11 +352,19 @@ fn to_sqlite(error: ReplicationError) -> yadorilink_sync_sqlite::SyncSqliteError
 /// peer that stops reading cannot hold a task (or anything the task waits
 /// on) for longer.
 async fn send_and_finish(writer: &mut NativeReplicationWriter, bytes: &[u8]) -> bool {
-    let sent = tokio::time::timeout(STREAM_STEP, async {
+    send_and_finish_within(writer, bytes, STREAM_STEP).await
+}
+
+async fn send_and_finish_within(
+    writer: &mut NativeReplicationWriter,
+    bytes: &[u8],
+    step: Duration,
+) -> bool {
+    let sent = tokio::time::timeout(step, async {
         if writer.write_all(bytes).await.is_err() || writer.finish().is_err() {
             return false;
         }
-        writer.flushed(STREAM_STEP).await;
+        writer.flushed(step).await;
         true
     })
     .await;
@@ -635,29 +643,87 @@ pub enum GroupRound {
     Divergent,
     /// The peer refused (not a member, or no longer holds the history).
     Refused(RefusalReason),
-    /// The exchange did not complete.
+    /// The exchange did not complete for a reason on this side (the database, building the
+    /// request, an answer that was not the one asked for). Says nothing about the connection.
     Failed,
+    /// The peer did not answer in time, or the stream to it failed: the transport is not
+    /// carrying traffic. The only outcome that means the connection should be replaced.
+    NoAnswer,
 }
 
-async fn request(connection: &NativeReplicationConnection, bytes: &[u8]) -> Option<Message> {
-    let (mut writer, mut reader) =
-        tokio::time::timeout(STREAM_STEP, connection.open_stream()).await.ok()?.ok()?;
-    if !send_and_finish(&mut writer, bytes).await {
+impl GroupRound {
+    /// Whether this round says the connection itself is dead.
+    pub fn connection_is_dead(&self) -> bool {
+        matches!(self, GroupRound::NoAnswer)
+    }
+}
+
+/// How long a reconcile request (a summary, a few hundred bytes) may wait for its answer. Shorter
+/// than a stream step because nothing but a connection that is not carrying traffic keeps the
+/// peer from answering one, and a round that waits 30 s for it keeps a dead connection in
+/// service for those 30 s after the network came back.
+pub(crate) const REQUEST_STEP: Duration = Duration::from_secs(10);
+
+async fn request(
+    connection: &NativeReplicationConnection,
+    bytes: &[u8],
+    step: Duration,
+) -> Option<Message> {
+    let opened = tokio::time::timeout(step, connection.open_stream()).await;
+    let (mut writer, mut reader) = match opened {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) => {
+            tracing::debug!(%error, closed = ?connection.close_reason(), "native replication: could not open a stream");
+            return None;
+        }
+        Err(_) => {
+            tracing::debug!(?step, "native replication: opening a stream timed out");
+            return None;
+        }
+    };
+    if !send_and_finish_within(&mut writer, bytes, step).await {
+        tracing::debug!(closed = ?connection.close_reason(), "native replication: could not send the request");
         return None;
     }
-    let reply =
-        tokio::time::timeout(STREAM_STEP, reader.read_to_end(protocol5::MAX_MESSAGE_BYTES)).await;
-    protocol5::decode_message(&reply.ok()?.ok()?).ok()
+    let reply = tokio::time::timeout(step, reader.read_to_end(protocol5::MAX_MESSAGE_BYTES)).await;
+    let reply = match reply {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(error)) => {
+            tracing::debug!(%error, closed = ?connection.close_reason(), "native replication: the reply could not be read");
+            return None;
+        }
+        Err(_) => {
+            tracing::debug!(?step, "native replication: no reply within the step");
+            return None;
+        }
+    };
+    protocol5::decode_message(&reply).ok()
 }
 
-/// One reconcile round for every group in `env.groups`.
+/// One reconcile round for every group in `env.groups`. `step` bounds each group's own summary
+/// exchange, not the sweep: a peer sharing several groups, each answered inside the step, is
+/// a healthy peer however long the sweep takes.
 pub async fn reconcile(
     env: &ReplicationEnv,
     connection: &NativeReplicationConnection,
+    step: Duration,
 ) -> Vec<(FolderGroupId, GroupRound)> {
+    sweep((env.groups)(), |group| {
+        let (env, connection) = (env.clone(), connection.clone());
+        async move { reconcile_group_within(&env, &connection, &group, step).await }
+    })
+    .await
+}
+
+/// Runs `one` for each group in turn and collects the results.
+async fn sweep<F, Fut>(groups: Vec<FolderGroupId>, mut one: F) -> Vec<(FolderGroupId, GroupRound)>
+where
+    F: FnMut(FolderGroupId) -> Fut,
+    Fut: std::future::Future<Output = GroupRound>,
+{
     let mut rounds = Vec::new();
-    for group in (env.groups)() {
-        let round = reconcile_group(env, connection, &group).await;
+    for group in groups {
+        let round = one(group.clone()).await;
         rounds.push((group, round));
     }
     rounds
@@ -667,6 +733,15 @@ pub(crate) async fn reconcile_group(
     env: &ReplicationEnv,
     connection: &NativeReplicationConnection,
     group: &FolderGroupId,
+) -> GroupRound {
+    reconcile_group_within(env, connection, group, REQUEST_STEP).await
+}
+
+async fn reconcile_group_within(
+    env: &ReplicationEnv,
+    connection: &NativeReplicationConnection,
+    group: &FolderGroupId,
+    step: Duration,
 ) -> GroupRound {
     yadorilink_fs_platform::join_timeline::note_reconcile_round(&env.local_device_id, &group.0);
     // A round running means a session to this peer is usable for the group,
@@ -682,8 +757,8 @@ pub(crate) async fn reconcile_group(
         yadorilink_fs_platform::join_timeline::Milestone::FirstReconcileRound,
     );
     let Ok((_, summary_bytes)) = session::summary_request(group) else { return GroupRound::Failed };
-    let Some(response) = request(connection, &summary_bytes).await else {
-        return GroupRound::Failed;
+    let Some(response) = request(connection, &summary_bytes, step).await else {
+        return GroupRound::NoAnswer;
     };
     if let Message::Refused { reason, .. } = response {
         return GroupRound::Refused(reason);
@@ -740,7 +815,10 @@ pub(crate) async fn reconcile_group(
     if matches!(needs_sealed_state, Ok(Ok(true))) {
         request_recovery(env, connection, group).await;
     }
-    let diff_reply = request(connection, &diff_bytes).await;
+    let diff_reply = request(connection, &diff_bytes, REQUEST_STEP).await;
+    if diff_reply.is_none() {
+        return GroupRound::NoAnswer;
+    }
     if diff_reply.is_some() {
         yadorilink_fs_platform::join_timeline::mark(
             &env.local_device_id,

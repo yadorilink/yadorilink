@@ -262,6 +262,15 @@ fn link_and_invite_refusals_carry_their_typed_reason() {
         (ApplicationErrorCode::UnrecordedLocalChanges, RefusalReason::UnrecordedLocalChanges),
         (ApplicationErrorCode::ConflictNotResolvable, RefusalReason::ConflictNotResolvable),
         (ApplicationErrorCode::GroupMismatch, RefusalReason::GroupMismatch),
+        (ApplicationErrorCode::SendLinkExpired, RefusalReason::SendLinkExpired),
+        (ApplicationErrorCode::SendLinkAlreadyUsed, RefusalReason::SendLinkAlreadyUsed),
+        (ApplicationErrorCode::SendLinkCancelled, RefusalReason::SendLinkCancelled),
+        (ApplicationErrorCode::SendLinkInvalid, RefusalReason::SendLinkInvalid),
+        (ApplicationErrorCode::SendPeerUnreachable, RefusalReason::SendPeerUnreachable),
+        (ApplicationErrorCode::SendNoSpace, RefusalReason::SendNoSpace),
+        (ApplicationErrorCode::SendInterrupted, RefusalReason::SendInterrupted),
+        (ApplicationErrorCode::SendLocalNetworkBlocked, RefusalReason::SendLocalNetworkBlocked),
+        (ApplicationErrorCode::SendLinksDisabled, RefusalReason::SendLinksDisabled),
     ];
     for (code, reason) in cases {
         assert_eq!(
@@ -486,10 +495,20 @@ fn a_daemon_next_step_becomes_a_hint_and_unset_is_none() {
 
 #[test]
 fn an_invalid_argument_names_no_flag_and_reaches_a_gui_as_its_field() {
-    let error = CoreError::InvalidArgument(InvalidArgument::Role("owner".into()));
+    let error = CoreError::InvalidArgument(InvalidArgument::Role("admin".into()));
     assert!(!error.to_string().contains("--"), "{error}");
     match desktop(error) {
         DesktopError::InvalidInput { field, .. } => assert_eq!(field.as_deref(), Some("role")),
         other => panic!("expected invalid input, got {other:?}"),
     }
+}
+
+/// A send that needs a sign-in the device does not have is "not signed in", never a refusal
+/// of the link: the daemon answers it with the missing-identity code.
+#[test]
+fn a_send_without_a_sign_in_is_not_signed_in() {
+    assert!(matches!(
+        desktop(command(ApplicationErrorCode::LocalIdentityUnavailable)),
+        DesktopError::NotSignedIn { .. }
+    ));
 }

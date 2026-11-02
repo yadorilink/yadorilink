@@ -72,6 +72,15 @@ fn ensure_plain_directory(dir: &Path) -> Result<(), String> {
     plain_directory_identity(dir).map(|_| ())
 }
 
+/// Why a restore's blocks could not be made local.
+pub(crate) enum EnsureBlocksError {
+    /// The volume cannot take the blocks still to be fetched.
+    LowDisk(String),
+    /// No reachable device holds them.
+    Unavailable,
+    Failed(String),
+}
+
 pub(crate) struct ProviderWriter {
     state: Arc<DaemonState>,
     leases: Mutex<HashMap<String, HeldLease>>,
@@ -91,6 +100,74 @@ impl ProviderWriter {
 
     pub(crate) fn device_id(&self) -> String {
         self.state.device_id.clone()
+    }
+
+    /// The daemon state, for the questions about peers the write path's follow-ups ask.
+    pub(crate) fn state(&self) -> &Arc<DaemonState> {
+        &self.state
+    }
+
+    /// Makes every block of a retained version local: those already held stay as they are, the
+    /// rest are fetched from the connected peers that hold them. The caller holds a write-activity
+    /// guard until the blocks are referenced by a committed head.
+    pub(crate) async fn ensure_blocks(
+        &self,
+        group_id: &str,
+        blocks: &[yadorilink_replica_domain::file::BlockInfo],
+    ) -> Result<(), EnsureBlocksError> {
+        let hashes: Vec<String> = blocks.iter().map(|b| hex::encode(&b.hash)).collect();
+        let present = self
+            .state
+            .block_store
+            .present_blocks(&hashes)
+            .map_err(|e| EnsureBlocksError::Failed(e.to_string()))?;
+        let to_fetch: u64 = blocks
+            .iter()
+            .zip(&present)
+            .filter(|(_, held)| !**held)
+            .map(|(block, _)| u64::from(block.size))
+            .sum();
+        // Held until the fetched blocks are stored.
+        let _space = if to_fetch > 0 {
+            self.reserve_space(to_fetch).map_err(EnsureBlocksError::LowDisk)?
+        } else {
+            None
+        };
+        let missing = crate::hydration::fetch_unindexed_blocks(&self.state, group_id, blocks)
+            .await
+            .map_err(|e| EnsureBlocksError::Failed(e.to_string()))?;
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(EnsureBlocksError::Unavailable)
+        }
+    }
+
+    /// Reserves `bytes` of the free space of the volume holding the block store, held until the
+    /// reservation is dropped: the write about to read a file of that size refuses BEFORE reading
+    /// when the volume cannot take it with its headroom. `Ok(None)` where the engine does not
+    /// enforce headroom or the store has no directory.
+    pub(crate) fn reserve_space(
+        &self,
+        bytes: u64,
+    ) -> Result<Option<crate::local_convergence::HeadroomReservation>, String> {
+        self.reserve_space_on(self.state.block_store.storage_root(), bytes)
+    }
+
+    /// [`Self::reserve_space`] for the volume holding `dir`.
+    pub(crate) fn reserve_space_on(
+        &self,
+        dir: Option<&Path>,
+        bytes: u64,
+    ) -> Result<Option<crate::local_convergence::HeadroomReservation>, String> {
+        let Some(dir) = dir.filter(|_| self.state.disk_headroom_enforcement_enabled()) else {
+            return Ok(None);
+        };
+        let headroom_override =
+            self.state.governance_config.load_or_default().headroom_override_bytes;
+        crate::local_convergence::reserve_volume_headroom(dir, dir, bytes, headroom_override)
+            .map(Some)
+            .map_err(|e| e.to_string())
     }
 
     pub(crate) fn now_ms(&self) -> i64 {

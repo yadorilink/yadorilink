@@ -23,6 +23,7 @@
 //! extension's later silence never reverts a ready root.
 
 use std::sync::Arc;
+use yadorilink_sqlite_runtime::CachedStatements as _;
 
 use rusqlite::OptionalExtension;
 use yadorilink_replica_domain::session_state::{NotReady, ProviderKind, Readiness};
@@ -187,10 +188,11 @@ impl ProviderRepository {
             #[cfg(test)]
             run_after_settle_hook();
             let answer = self.database.read_snapshot::<_, SyncSqliteError>(|conn| {
-                let dirty: bool =
-                    conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_dirty_paths)", [], |r| {
-                        r.get(0)
-                    })?;
+                let dirty: bool = conn.query_row_cached(
+                    "SELECT EXISTS(SELECT 1 FROM provider_dirty_paths)",
+                    [],
+                    |r| r.get(0),
+                )?;
                 if dirty {
                     return Ok(None);
                 }
@@ -209,9 +211,11 @@ impl ProviderRepository {
     /// first, so it never answers from a liveness that lags the rows, however they were written.
     fn settle(&self) -> Result<(), SyncSqliteError> {
         let dirty = self.database.read::<_, SyncSqliteError>(|conn| {
-            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_dirty_paths)", [], |r| {
-                r.get::<_, bool>(0)
-            })?)
+            Ok(conn.query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM provider_dirty_paths)",
+                [],
+                |r| r.get::<_, bool>(0),
+            )?)
         })?;
         if dirty {
             // The write transaction's own reconcile runs before it commits.
@@ -264,7 +268,7 @@ impl ProviderRepository {
         }
         self.require_plain(group_id)?;
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            let has_files: bool = tx.query_row(
+            let has_files: bool = tx.query_row_cached(
                 "SELECT EXISTS(SELECT 1 FROM files WHERE group_id = ?1 AND state = 'current' \
                  AND deleted = 0)",
                 [group_id],
@@ -277,7 +281,7 @@ impl ProviderRepository {
             }
             let root_id = mint_root_id();
             insert_root(tx, &root_id, group_id, kind.as_db_str(), display_name)?;
-            tx.execute(
+            tx.execute_cached(
                 "UPDATE provider_roots SET install_done = 1 WHERE root_id = ?1",
                 [&root_id],
             )?;
@@ -296,7 +300,7 @@ impl ProviderRepository {
     ) -> Result<String, SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
             let root_id = mint_root_id();
-            tx.execute(
+            tx.execute_cached(
                 "INSERT INTO provider_roots (root_id, group_id, kind, display_name) \
                  VALUES (?1, ?2, 'mac_file_provider', ?3)",
                 rusqlite::params![root_id, group_id, display_name],
@@ -315,7 +319,7 @@ impl ProviderRepository {
     ) -> Result<ProviderDeclaration, SyncSqliteError> {
         self.database.read_snapshot::<_, SyncSqliteError>(|conn| {
             let declared: Option<(String, Option<String>)> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT provider_kind, provider_root_id FROM links \
                      WHERE group_id = ?1 AND orphaned = 0 ORDER BY local_path LIMIT 1",
                     [group_id],
@@ -353,7 +357,7 @@ impl ProviderRepository {
     /// (an unavailable snapshot, so the host leaves its domains alone), never a quiet omission.
     pub fn list_declared_roots(&self) -> Result<Vec<ProviderRoot>, SyncSqliteError> {
         self.database.read_snapshot::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT group_id, provider_kind, provider_root_id FROM links \
                  WHERE orphaned = 0 AND provider_kind <> 'none' ORDER BY provider_root_id",
             )?;
@@ -387,7 +391,7 @@ impl ProviderRepository {
     ) -> Result<bool, SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
             let row: Option<(String, i64)> = tx
-                .query_row(
+                .query_row_cached(
                     "SELECT group_id, domain_registered FROM provider_roots WHERE root_id = ?1",
                     [root_id],
                     |r| Ok((r.get(0)?, r.get(1)?)),
@@ -396,7 +400,7 @@ impl ProviderRepository {
             let Some((group_id, was)) = row else { return Ok(false) };
             if registered {
                 if was == 0 {
-                    tx.execute(
+                    tx.execute_cached(
                         "UPDATE provider_roots SET domain_registered = 1, \
                             first_handshake_at = NULL WHERE root_id = ?1",
                         [root_id],
@@ -422,20 +426,20 @@ impl ProviderRepository {
     ) -> Result<bool, SyncSqliteError> {
         let location = (!preserved_location.is_empty()).then_some(preserved_location);
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            let requested: bool = tx.query_row(
+            let requested: bool = tx.query_row_cached(
                 "SELECT EXISTS(SELECT 1 FROM provider_removals \
                  WHERE root_id = ?1 AND state = 'requested')",
                 [root_id],
                 |r| r.get(0),
             )?;
             if requested {
-                let group: String = tx.query_row(
+                let group: String = tx.query_row_cached(
                     "SELECT group_id FROM provider_removals WHERE root_id = ?1",
                     [root_id],
                     |r| r.get(0),
                 )?;
                 delete_provider_state(tx, root_id, &group)?;
-                tx.execute(
+                tx.execute_cached(
                     "UPDATE provider_removals SET state = 'done', preserved_location = ?2 \
                      WHERE root_id = ?1",
                     rusqlite::params![root_id, location],
@@ -443,7 +447,7 @@ impl ProviderRepository {
                 return Ok(true);
             }
             let group: Option<String> = tx
-                .query_row(
+                .query_row_cached(
                     "SELECT group_id FROM provider_roots WHERE root_id = ?1",
                     [root_id],
                     |r| r.get(0),
@@ -460,7 +464,7 @@ impl ProviderRepository {
     pub fn install_done_for_tests(&self, root_id: &str) -> bool {
         self.database
             .read::<_, SyncSqliteError>(|conn| {
-                Ok(conn.query_row(
+                Ok(conn.query_row_cached(
                     "SELECT install_done FROM provider_roots WHERE root_id = ?1",
                     [root_id],
                     |r| r.get::<_, i64>(0),
@@ -473,7 +477,7 @@ impl ProviderRepository {
     pub fn root_display_name(&self, root_id: &str) -> Result<Option<String>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             Ok(conn
-                .query_row(
+                .query_row_cached(
                     "SELECT display_name FROM provider_roots WHERE root_id = ?1",
                     [root_id],
                     |r| r.get(0),
@@ -485,7 +489,7 @@ impl ProviderRepository {
     /// Every removal the daemon knows of, requested or done, oldest first.
     pub fn removals(&self) -> Result<Vec<ProviderRemoval>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT root_id, group_id, display_name, state, requested_at, preserved_location \
                  FROM provider_removals ORDER BY requested_at, root_id",
             )?;
@@ -512,7 +516,7 @@ impl ProviderRepository {
         now_unix_nanos: i64,
     ) -> Result<bool, SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            let changed = tx.execute(
+            let changed = tx.execute_cached(
                 "UPDATE provider_roots SET \
                     first_handshake_at = COALESCE(first_handshake_at, ?2), \
                     error_description = NULL \
@@ -531,7 +535,7 @@ impl ProviderRepository {
     ) -> Result<bool, SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
             let description = if description.is_empty() { "provider error" } else { description };
-            let changed = tx.execute(
+            let changed = tx.execute_cached(
                 "UPDATE provider_roots SET error_description = ?2 WHERE root_id = ?1",
                 rusqlite::params![root_id, description],
             )?;
@@ -546,8 +550,7 @@ impl ProviderRepository {
     /// Returns whether it changed anything.
     pub fn mark_installed_when_in_sync(&self, group_id: &str) -> Result<bool, SyncSqliteError> {
         let pending: bool = self.database.read::<_, SyncSqliteError>(|conn| {
-            Ok(conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM provider_roots WHERE group_id = ?1 AND install_done = 0)",
+            Ok(conn.query_row_cached("SELECT EXISTS(SELECT 1 FROM provider_roots WHERE group_id = ?1 AND install_done = 0)",
                 [group_id],
                 |r| r.get(0),
             )?)
@@ -556,8 +559,7 @@ impl ProviderRepository {
             return Ok(false);
         }
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            Ok(tx.execute(
-                "UPDATE provider_roots SET install_done = 1 WHERE group_id = ?1 AND install_done = 0",
+            Ok(tx.execute_cached("UPDATE provider_roots SET install_done = 1 WHERE group_id = ?1 AND install_done = 0",
                 [group_id],
             )? > 0)
         })
@@ -568,7 +570,7 @@ impl ProviderRepository {
     #[cfg(any(test, feature = "test-support"))]
     pub fn mark_install_done(&self, root_id: &str) -> Result<bool, SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            Ok(tx.execute(
+            Ok(tx.execute_cached(
                 "UPDATE provider_roots SET install_done = 1 WHERE root_id = ?1",
                 [root_id],
             )? > 0)
@@ -579,7 +581,7 @@ impl ProviderRepository {
     /// registration, because the OS caches an empty root listing.
     pub fn set_namespace_ready(&self, root_id: &str, ready: bool) -> Result<bool, SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            let changed = tx.execute(
+            let changed = tx.execute_cached(
                 "UPDATE provider_roots SET namespace_ready = ?2 WHERE root_id = ?1",
                 rusqlite::params![root_id, i64::from(ready)],
             )?;
@@ -613,7 +615,7 @@ impl ProviderRepository {
     ) -> Result<Option<ItemId>, SyncSqliteError> {
         self.read_settled(|conn| {
             let row: Option<Vec<u8>> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT item_id FROM provider_items \
                      WHERE root_id = ?1 AND path = ?2 AND live = 1",
                     rusqlite::params![root_id, path],
@@ -633,7 +635,7 @@ impl ProviderRepository {
     ) -> Result<Option<(String, bool)>, SyncSqliteError> {
         self.read_settled(|conn| {
             Ok(conn
-                .query_row(
+                .query_row_cached(
                     "SELECT path, live FROM provider_items WHERE root_id = ?1 AND item_id = ?2",
                     rusqlite::params![root_id, &item_id[..]],
                     |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)),
@@ -711,7 +713,7 @@ impl ProviderRepository {
         parent_path: &str,
     ) -> Result<Vec<(String, ItemId)>, SyncSqliteError> {
         self.read_settled(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT name, item_id FROM provider_items \
                  WHERE root_id = ?1 AND parent_path = ?2 AND live = 1 ORDER BY name",
             )?;
@@ -876,7 +878,7 @@ impl ProviderRepository {
     ) -> Result<Option<yadorilink_replica_domain::ids::VersionHash>, SyncSqliteError> {
         self.read_settled(|conn| {
             let row: Option<(String, String)> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT group_id, path FROM provider_items \
                      WHERE root_id = ?1 AND item_id = ?2 AND live = 1",
                     rusqlite::params![root_id, &item_id[..]],
@@ -885,6 +887,26 @@ impl ProviderRepository {
                 .optional()?;
             let Some((group_id, path)) = row else { return Ok(None) };
             Ok(current_version(conn, &group_id, &path)?.map(|version| version.version_hash))
+        })
+    }
+
+    /// The generation of the live item now: with [`Self::current_version_hash`] it is the
+    /// version identifier a write names as the view it was made against.
+    pub fn live_item_generation(
+        &self,
+        root_id: &str,
+        item_id: &ItemId,
+    ) -> Result<Option<u64>, SyncSqliteError> {
+        self.read_settled(|conn| {
+            Ok(conn
+                .query_row_cached(
+                    "SELECT generation FROM provider_items \
+                     WHERE root_id = ?1 AND item_id = ?2 AND live = 1",
+                    rusqlite::params![root_id, &item_id[..]],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?
+                .map(|generation| generation as u64))
         })
     }
 
@@ -1012,7 +1034,7 @@ impl ProviderRepository {
     pub fn latest_evidence_seq(&self, root_id: &str) -> Result<Option<u64>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             Ok(conn
-                .query_row(
+                .query_row_cached(
                     "SELECT latest_evidence_seq FROM provider_roots WHERE root_id = ?1",
                     [root_id],
                     |r| r.get::<_, i64>(0),
@@ -1026,7 +1048,7 @@ impl ProviderRepository {
     pub fn group_of_root(&self, root_id: &str) -> Result<Option<String>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             Ok(conn
-                .query_row(
+                .query_row_cached(
                     "SELECT group_id FROM provider_roots WHERE root_id = ?1",
                     [root_id],
                     |r| r.get(0),
@@ -1039,7 +1061,7 @@ impl ProviderRepository {
     pub fn namespace_revision(&self, root_id: &str) -> Result<Option<u64>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             Ok(conn
-                .query_row(
+                .query_row_cached(
                     "SELECT namespace_revision FROM provider_roots WHERE root_id = ?1",
                     [root_id],
                     |r| r.get::<_, i64>(0),
@@ -1058,7 +1080,7 @@ impl ProviderRepository {
         self.read_settled(|conn| {
             type Row = (String, String, Option<Vec<u8>>, Option<Vec<u8>>);
             let row: Option<Row> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT group_id, path, published_version_hash, announce_version_hash \
                      FROM provider_items WHERE root_id = ?1 AND item_id = ?2 AND live = 1",
                     rusqlite::params![root_id, &item_id[..]],
@@ -1076,8 +1098,7 @@ impl ProviderRepository {
     /// since the OS was told). One snapshot, so the answer describes one instant.
     pub fn pending_items(&self, root_id: &str) -> Result<Vec<PendingItem>, SyncSqliteError> {
         self.read_settled(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT item_id, group_id, path, published_version_hash, announce_version_hash \
+            let mut stmt = conn.prepare_cached("SELECT item_id, group_id, path, published_version_hash, announce_version_hash \
                  FROM provider_items WHERE root_id = ?1 AND live = 1 AND published_version_hash IS NOT NULL \
                  ORDER BY path",
             )?;
@@ -1111,7 +1132,7 @@ impl ProviderRepository {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
             yadorilink_sqlite_runtime::reconcile_provider_liveness(tx)?;
             let row: Option<(String, String)> = tx
-                .query_row(
+                .query_row_cached(
                     "SELECT group_id, path FROM provider_items \
                      WHERE root_id = ?1 AND item_id = ?2 AND live = 1",
                     rusqlite::params![root_id, &item_id[..]],
@@ -1123,7 +1144,7 @@ impl ProviderRepository {
                 Some(current) if current.version_hash == version => {}
                 _ => return Ok(false),
             }
-            tx.execute(
+            tx.execute_cached(
                 "UPDATE provider_items SET published_version_hash = ?3, \
                  announce_version_hash = NULL, announce_seq = NULL, pending_since = NULL \
                  WHERE root_id = ?1 AND item_id = ?2",
@@ -1153,7 +1174,7 @@ impl ProviderRepository {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
             yadorilink_sqlite_runtime::reconcile_provider_liveness(tx)?;
             let row: Option<AnnounceRow> = tx
-                .query_row(
+                .query_row_cached(
                     "SELECT group_id, path, published_version_hash, announce_version_hash, \
                      announce_seq FROM provider_items \
                      WHERE root_id = ?1 AND item_id = ?2 AND live = 1",
@@ -1178,7 +1199,7 @@ impl ProviderRepository {
                     return Ok(None);
                 }
                 let seq = append_event(tx, root_id, "upsert", &item_id[..], &parent, None)?;
-                tx.execute(
+                tx.execute_cached(
                     "UPDATE provider_items SET announce_version_hash = NULL, \
                      announce_seq = NULL, pending_since = NULL, generation = generation + 1 \
                      WHERE root_id = ?1 AND item_id = ?2",
@@ -1194,7 +1215,7 @@ impl ProviderRepository {
             let seq = append_event(tx, root_id, "upsert", &item_id[..], &parent, None)?;
             // A new announcement changes what the item shows: its generation advances, the
             // pending episode starts (or continues: `pending_since` is kept).
-            tx.execute(
+            tx.execute_cached(
                 "UPDATE provider_items SET announce_version_hash = ?3, announce_seq = ?4, \
                  generation = generation + 1, \
                  pending_since = COALESCE(pending_since, ?5) \
@@ -1221,7 +1242,7 @@ impl ProviderRepository {
         release_after_ms: i64,
     ) -> Result<bool, SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            let changed = tx.execute(
+            let changed = tx.execute_cached(
                 "UPDATE provider_items SET published_version_hash = announce_version_hash, \
                  announce_version_hash = NULL, announce_seq = NULL, pending_since = NULL, \
                  unconfirmed_since = ?3 \
@@ -1245,7 +1266,7 @@ impl ProviderRepository {
     ) -> Result<Option<i64>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             let since: Option<Option<i64>> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT pending_since FROM provider_items \
                      WHERE root_id = ?1 AND item_id = ?2 AND live = 1 \
                        AND announce_version_hash IS NOT NULL",
@@ -1266,7 +1287,7 @@ impl ProviderRepository {
     ) -> Result<bool, SyncSqliteError> {
         self.read_settled(|conn| {
             let row: Option<(String, String, Option<Vec<u8>>)> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT group_id, path, announce_version_hash FROM provider_items \
                      WHERE root_id = ?1 AND item_id = ?2 AND live = 1",
                     rusqlite::params![root_id, &item_id[..]],
@@ -1289,13 +1310,13 @@ impl ProviderRepository {
         limit: u32,
     ) -> Result<(Unresolved, Vec<(String, u64)>), SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let (count, oldest): (i64, Option<i64>) = conn.query_row(
+            let (count, oldest): (i64, Option<i64>) = conn.query_row_cached(
                 "SELECT COUNT(*), MIN(pending_since) FROM provider_items \
                  WHERE root_id = ?1 AND live = 1 AND pending_since IS NOT NULL",
                 [root_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT path, pending_since FROM provider_items \
                  WHERE root_id = ?1 AND live = 1 AND pending_since IS NOT NULL \
                  ORDER BY pending_since, path LIMIT ?2",
@@ -1324,7 +1345,7 @@ impl ProviderRepository {
         now_ms: i64,
     ) -> Result<Unresolved, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let (count, oldest): (i64, Option<i64>) = conn.query_row(
+            let (count, oldest): (i64, Option<i64>) = conn.query_row_cached(
                 "SELECT COUNT(*), MIN(unconfirmed_since) FROM provider_items \
                  WHERE root_id = ?1 AND live = 1 AND unconfirmed_since IS NOT NULL",
                 [root_id],
@@ -1351,7 +1372,7 @@ impl ProviderRepository {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
             yadorilink_sqlite_runtime::reconcile_provider_liveness(tx)?;
             let row: Option<(String, String, Option<Vec<u8>>)> = tx
-                .query_row(
+                .query_row_cached(
                     "SELECT group_id, path, published_version_hash FROM provider_items \
                      WHERE root_id = ?1 AND item_id = ?2 AND live = 1",
                     rusqlite::params![root_id, &item_id[..]],
@@ -1363,7 +1384,7 @@ impl ProviderRepository {
                 Some(current) if current.version_hash == served => {}
                 _ => return Ok(false),
             }
-            tx.execute(
+            tx.execute_cached(
                 "UPDATE provider_items SET published_version_hash = ?3, exposed = 1 \
                  WHERE root_id = ?1 AND item_id = ?2",
                 rusqlite::params![root_id, &item_id[..], &served.0[..]],
@@ -1437,7 +1458,7 @@ impl ProviderRepository {
     ) -> Result<Option<DownloadFailure>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             let row: Option<(Vec<u8>, i64, i64)> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT version_hash, failures, next_attempt_ms FROM \
                      provider_download_failures WHERE root_id = ?1 AND item_id = ?2",
                     rusqlite::params![root_id, &item_id[..]],
@@ -1470,7 +1491,7 @@ impl ProviderRepository {
     ) -> Result<Option<DownloadFailure>, SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
             let live: Option<(String, String)> = tx
-                .query_row(
+                .query_row_cached(
                     "SELECT group_id, path FROM provider_items \
                      WHERE root_id = ?1 AND item_id = ?2 AND live = 1",
                     rusqlite::params![root_id, &item_id[..]],
@@ -1483,7 +1504,7 @@ impl ProviderRepository {
                 return Ok(None);
             }
             let previous: Option<(Vec<u8>, i64)> = tx
-                .query_row(
+                .query_row_cached(
                     "SELECT version_hash, failures FROM provider_download_failures \
                      WHERE root_id = ?1 AND item_id = ?2",
                     rusqlite::params![root_id, &item_id[..]],
@@ -1495,7 +1516,7 @@ impl ProviderRepository {
                 _ => 1,
             };
             let next = now_ms.saturating_add(delay_ms(failures));
-            tx.execute(
+            tx.execute_cached(
                 "INSERT OR REPLACE INTO provider_download_failures \
                  (root_id, item_id, version_hash, failures, next_attempt_ms) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1516,7 +1537,7 @@ impl ProviderRepository {
     ) -> Result<(), SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
             let failures: i64 = tx
-                .query_row(
+                .query_row_cached(
                     "SELECT failures FROM provider_download_failures \
                      WHERE root_id = ?1 AND item_id = ?2 AND version_hash = ?3",
                     rusqlite::params![root_id, &item_id[..], &version.0[..]],
@@ -1524,7 +1545,7 @@ impl ProviderRepository {
                 )
                 .optional()?
                 .unwrap_or(0);
-            tx.execute(
+            tx.execute_cached(
                 "INSERT OR REPLACE INTO provider_download_failures \
                  (root_id, item_id, version_hash, failures, next_attempt_ms) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1541,7 +1562,7 @@ impl ProviderRepository {
         item_id: &ItemId,
     ) -> Result<(), SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            tx.execute(
+            tx.execute_cached(
                 "DELETE FROM provider_download_failures WHERE root_id = ?1 AND item_id = ?2",
                 rusqlite::params![root_id, &item_id[..]],
             )?;
@@ -1563,7 +1584,7 @@ impl ProviderRepository {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
             yadorilink_sqlite_runtime::reconcile_provider_liveness(tx)?;
             let row: Option<(String, String)> = tx
-                .query_row(
+                .query_row_cached(
                     "SELECT group_id, path FROM provider_items \
                      WHERE root_id = ?1 AND item_id = ?2 AND live = 1",
                     rusqlite::params![root_id, &item_id[..]],
@@ -1578,7 +1599,7 @@ impl ProviderRepository {
             if crate::dag_store::get_file_version(tx, &group_id, &version)?.is_none() {
                 return Ok(false);
             }
-            tx.execute(
+            tx.execute_cached(
                 "UPDATE provider_items SET published_version_hash = ?3 \
                  WHERE root_id = ?1 AND item_id = ?2",
                 rusqlite::params![root_id, &item_id[..], &version.0[..]],
@@ -1593,7 +1614,7 @@ impl ProviderRepository {
     pub fn unannounced_changes(&self, root_id: &str) -> Result<Option<u64>, SyncSqliteError> {
         self.read_settled(|conn| {
             let row: Option<(i64, i64)> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT change_seq, announced_change_seq FROM provider_roots \
                      WHERE root_id = ?1",
                     [root_id],
@@ -1607,7 +1628,7 @@ impl ProviderRepository {
     /// The OS acknowledged a root-level signal sent after `changes` changes had been counted.
     pub fn mark_announced(&self, root_id: &str, changes: u64) -> Result<(), SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            tx.execute(
+            tx.execute_cached(
                 "UPDATE provider_roots SET announced_change_seq = MAX(announced_change_seq, ?2) \
                  WHERE root_id = ?1",
                 rusqlite::params![root_id, changes as i64],
@@ -1626,7 +1647,7 @@ impl ProviderRepository {
     ) -> Result<Option<ServedView>, SyncSqliteError> {
         self.read_settled(|conn| {
             let row: Option<(String, String, Option<Vec<u8>>)> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT group_id, path, published_version_hash FROM provider_items \
                      WHERE root_id = ?1 AND item_id = ?2 AND live = 1",
                     rusqlite::params![root_id, &item_id[..]],
@@ -1667,7 +1688,7 @@ impl ProviderRepository {
     /// survived the delete (a newer one the user never saw) is projected as a NEW item.
     pub fn retire_item(&self, root_id: &str, item_id: &ItemId) -> Result<bool, SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            let changed = tx.execute(
+            let changed = tx.execute_cached(
                 "UPDATE provider_items SET live = 0, published_version_hash = NULL \
                  WHERE root_id = ?1 AND item_id = ?2 \
                  AND live = 1",
@@ -1675,7 +1696,7 @@ impl ProviderRepository {
             )?;
 
             // A retired item's download failures die with it.
-            tx.execute(
+            tx.execute_cached(
                 "DELETE FROM provider_download_failures WHERE root_id = ?1 AND item_id = ?2",
                 rusqlite::params![root_id, &item_id[..]],
             )?;
@@ -1695,7 +1716,7 @@ impl ProviderRepository {
         SyncSqliteError,
     > {
         self.read_settled(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT path, published_version_hash FROM provider_items \
                  WHERE root_id = ?1 AND live = 1 AND published_version_hash IS NOT NULL \
                  AND (path = ?2 OR (path > ?2 || '/' AND path < ?2 || '0'))",
@@ -1715,7 +1736,7 @@ pub(crate) fn mint_item_in_tx(
     path: &str,
 ) -> Result<ItemId, SyncSqliteError> {
     let existing: Option<Vec<u8>> = tx
-        .query_row(
+        .query_row_cached(
             "SELECT item_id FROM provider_items WHERE root_id = ?1 AND path = ?2 AND live = 1",
             rusqlite::params![root_id, path],
             |r| r.get(0),
@@ -1725,14 +1746,16 @@ pub(crate) fn mint_item_in_tx(
         return item_id_from(&existing);
     }
     let group_id: String = tx
-        .query_row("SELECT group_id FROM provider_roots WHERE root_id = ?1", [root_id], |r| {
-            r.get(0)
-        })
+        .query_row_cached(
+            "SELECT group_id FROM provider_roots WHERE root_id = ?1",
+            [root_id],
+            |r| r.get(0),
+        )
         .optional()?
         .ok_or_else(|| SyncSqliteError::NotFound(format!("provider root {root_id}")))?;
     let item_id: ItemId = rand::random();
     let (parent_path, name) = split_parent(path);
-    tx.execute(
+    tx.execute_cached(
         "INSERT INTO provider_items (root_id, item_id, group_id, path, parent_path, name) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         rusqlite::params![root_id, &item_id[..], group_id, path, parent_path, name],
@@ -1753,7 +1776,7 @@ fn insert_root(
     display_name: &str,
 ) -> Result<(), SyncSqliteError> {
     // The declaration lives on the link, in the same transaction as the state row.
-    let linked = tx.execute(
+    let linked = tx.execute_cached(
         "UPDATE links SET provider_kind = ?2, provider_root_id = ?3 WHERE group_id = ?1",
         rusqlite::params![group_id, kind, root_id],
     )?;
@@ -1762,7 +1785,7 @@ fn insert_root(
             "group {group_id} has no link to declare a provider root on"
         )));
     }
-    tx.execute(
+    tx.execute_cached(
         "INSERT INTO provider_roots (root_id, group_id, kind, display_name) \
          VALUES (?1, ?2, ?3, ?4)",
         rusqlite::params![root_id, group_id, kind, display_name],
@@ -1789,7 +1812,7 @@ fn record_removal(
     state: &str,
     preserved_location: Option<&str>,
 ) -> Result<(), SyncSqliteError> {
-    tx.execute(
+    tx.execute_cached(
         "INSERT INTO provider_removals (root_id, group_id, display_name, state, requested_at, \
          preserved_location) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
          ON CONFLICT(root_id) DO UPDATE SET state = excluded.state, \
@@ -1826,15 +1849,15 @@ pub(crate) fn delete_provider_state(
     ] {
         tx.execute(&format!("DELETE FROM {table} WHERE root_id = ?1"), [root_id])?;
     }
-    tx.execute("DELETE FROM provider_roots WHERE root_id = ?1", [root_id])?;
+    tx.execute_cached("DELETE FROM provider_roots WHERE root_id = ?1", [root_id])?;
     // The group-level derived index goes only when no root of the group is left to use it.
-    let remaining: bool = tx.query_row(
+    let remaining: bool = tx.query_row_cached(
         "SELECT EXISTS(SELECT 1 FROM provider_roots WHERE group_id = ?1)",
         [group],
         |r| r.get(0),
     )?;
     if !remaining {
-        tx.execute("DELETE FROM provider_dirs WHERE group_id = ?1", [group])?;
+        tx.execute_cached("DELETE FROM provider_dirs WHERE group_id = ?1", [group])?;
     }
     Ok(())
 }
@@ -1852,7 +1875,7 @@ pub fn declare_link_root_in_tx(
             "a provider root needs a kind and a non-empty display name".into(),
         ));
     }
-    let name_taken: bool = tx.query_row(
+    let name_taken: bool = tx.query_row_cached(
         "SELECT EXISTS(SELECT 1 FROM provider_roots WHERE display_name = ?1 AND group_id <> ?2)",
         rusqlite::params![spec.display_name, group_id],
         |r| r.get(0),
@@ -1863,7 +1886,7 @@ pub fn declare_link_root_in_tx(
             spec.display_name
         )));
     }
-    let removing: bool = tx.query_row(
+    let removing: bool = tx.query_row_cached(
         "SELECT EXISTS(SELECT 1 FROM provider_roots WHERE group_id = ?1)",
         [group_id],
         |r| r.get(0),
@@ -1875,12 +1898,12 @@ pub fn declare_link_root_in_tx(
     }
     let root_id = mint_root_id();
     insert_root(tx, &root_id, group_id, spec.kind.as_db_str(), &spec.display_name)?;
-    tx.execute(
+    tx.execute_cached(
         "UPDATE links SET creation_digest = ?2 WHERE group_id = ?1",
         rusqlite::params![group_id, spec.creation_digest],
     )?;
     if spec.on_demand {
-        tx.execute(
+        tx.execute_cached(
             "UPDATE links SET materialization_policy = ?2 WHERE group_id = ?1",
             rusqlite::params![
                 group_id,
@@ -1890,13 +1913,16 @@ pub fn declare_link_root_in_tx(
         )?;
     }
     let installed: bool = spec.empty_owner
-        || tx.query_row(
+        || tx.query_row_cached(
             "SELECT EXISTS(SELECT 1 FROM native_author_context WHERE group_id = ?1)",
             [group_id],
             |r| r.get(0),
         )?;
     if installed {
-        tx.execute("UPDATE provider_roots SET install_done = 1 WHERE root_id = ?1", [&root_id])?;
+        tx.execute_cached(
+            "UPDATE provider_roots SET install_done = 1 WHERE root_id = ?1",
+            [&root_id],
+        )?;
     }
     Ok(root_id)
 }
@@ -1910,7 +1936,7 @@ fn rebootstrap_in_tx(
     preserved_location: Option<&str>,
 ) -> Result<String, SyncSqliteError> {
     let old: Option<(String, String, String)> = tx
-        .query_row(
+        .query_row_cached(
             "SELECT root_id, kind, display_name FROM provider_roots WHERE group_id = ?1",
             [group_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
@@ -1921,22 +1947,22 @@ fn rebootstrap_in_tx(
             "group {group_id} has no provider root to rebootstrap"
         )));
     };
-    let was_installed: bool = tx.query_row(
+    let was_installed: bool = tx.query_row_cached(
         "SELECT install_done FROM provider_roots WHERE root_id = ?1",
         [&old_root],
         |r| r.get(0),
     )?;
-    tx.execute("DELETE FROM provider_handoffs WHERE root_id = ?1", [&old_root])?;
-    tx.execute("DELETE FROM provider_window_serves WHERE root_id = ?1", [&old_root])?;
-    tx.execute("DELETE FROM provider_download_failures WHERE root_id = ?1", [&old_root])?;
-    tx.execute("DELETE FROM provider_apply_log WHERE root_id = ?1", [&old_root])?;
+    tx.execute_cached("DELETE FROM provider_handoffs WHERE root_id = ?1", [&old_root])?;
+    tx.execute_cached("DELETE FROM provider_window_serves WHERE root_id = ?1", [&old_root])?;
+    tx.execute_cached("DELETE FROM provider_download_failures WHERE root_id = ?1", [&old_root])?;
+    tx.execute_cached("DELETE FROM provider_apply_log WHERE root_id = ?1", [&old_root])?;
     // `provider_pending_ingest` is NOT touched: the journal of an undecided upload outlives its root
     // (an orphan record, never aged out) so teardown can never turn retained bytes into byte loss.
-    tx.execute("DELETE FROM provider_apply_sessions WHERE root_id = ?1", [&old_root])?;
-    tx.execute("DELETE FROM provider_change_events WHERE root_id = ?1", [&old_root])?;
-    tx.execute("DELETE FROM provider_enumerated_parents WHERE root_id = ?1", [&old_root])?;
-    tx.execute("DELETE FROM provider_items WHERE root_id = ?1", [&old_root])?;
-    tx.execute("DELETE FROM provider_roots WHERE root_id = ?1", [&old_root])?;
+    tx.execute_cached("DELETE FROM provider_apply_sessions WHERE root_id = ?1", [&old_root])?;
+    tx.execute_cached("DELETE FROM provider_change_events WHERE root_id = ?1", [&old_root])?;
+    tx.execute_cached("DELETE FROM provider_enumerated_parents WHERE root_id = ?1", [&old_root])?;
+    tx.execute_cached("DELETE FROM provider_items WHERE root_id = ?1", [&old_root])?;
+    tx.execute_cached("DELETE FROM provider_roots WHERE root_id = ?1", [&old_root])?;
     // The old domain's removal is a durable fact: `done` when the host already saw it gone,
     // `requested` when the daemon wants the host to remove it.
     record_removal(tx, &old_root, group_id, &display_name, old_intent, preserved_location)?;
@@ -1946,13 +1972,16 @@ fn rebootstrap_in_tx(
     // namespace is completely built (the install was recorded and no projection obligation is
     // open), so only the provider root is being recreated; otherwise the new root waits for its
     // own install like any other.
-    let open: i64 = tx.query_row(
+    let open: i64 = tx.query_row_cached(
         "SELECT COUNT(*) FROM projection_obligations WHERE group_id = ?1",
         [group_id],
         |r| r.get(0),
     )?;
     if was_installed && open == 0 {
-        tx.execute("UPDATE provider_roots SET install_done = 1 WHERE root_id = ?1", [&root_id])?;
+        tx.execute_cached(
+            "UPDATE provider_roots SET install_done = 1 WHERE root_id = ?1",
+            [&root_id],
+        )?;
     }
     Ok(root_id)
 }
@@ -1994,7 +2023,7 @@ pub(crate) fn rename_tree_in_tx(
     from: &str,
     to: &str,
 ) -> Result<(), SyncSqliteError> {
-    let any: bool = tx.query_row(
+    let any: bool = tx.query_row_cached(
         "SELECT EXISTS(SELECT 1 FROM provider_items WHERE group_id = ?1 AND live = 1 \
          AND (path = ?2 OR (path > ?2 || '/' AND path < ?2 || '0')))",
         rusqlite::params![group_id, from],
@@ -2006,7 +2035,7 @@ pub(crate) fn rename_tree_in_tx(
     // A rename never replaces: an item already live at or under the destination is a collision
     // the caller had to rule out (the write path does, in its own transaction). Retiring it here
     // would silently discard an item the user may not have seen.
-    let occupied: bool = tx.query_row(
+    let occupied: bool = tx.query_row_cached(
         "SELECT EXISTS(SELECT 1 FROM provider_items WHERE group_id = ?1 AND live = 1 \
          AND (path = ?2 OR (path > ?2 || '/' AND path < ?2 || '0')))",
         rusqlite::params![group_id, to],
@@ -2017,7 +2046,7 @@ pub(crate) fn rename_tree_in_tx(
             "the destination {to:?} holds live provider items; a rename never replaces them"
         )));
     }
-    let mut stmt = tx.prepare(
+    let mut stmt = tx.prepare_cached(
         "SELECT root_id, item_id, path FROM provider_items WHERE group_id = ?1 AND live = 1 \
          AND (path = ?2 OR (path > ?2 || '/' AND path < ?2 || '0')) ORDER BY path",
     )?;
@@ -2030,18 +2059,18 @@ pub(crate) fn rename_tree_in_tx(
         let old_parent = split_parent(&path).0.to_owned();
         let new_path = format!("{to}{}", &path[from.len()..]);
         let (parent_path, name) = split_parent(&new_path);
-        tx.execute(
+        tx.execute_cached(
             "UPDATE provider_items SET path = ?3, parent_path = ?4, name = ?5 \
              WHERE root_id = ?1 AND item_id = ?2",
             rusqlite::params![root_id, item_id, new_path, parent_path, name],
         )?;
-        tx.execute(
+        tx.execute_cached(
             "UPDATE provider_roots SET change_seq = change_seq + 1 WHERE root_id = ?1",
             [&root_id],
         )?;
         // Only the renamed item itself changes parent or name; its descendants keep theirs.
         if moved_top {
-            tx.execute(
+            tx.execute_cached(
                 "UPDATE provider_items SET generation = generation + 1 \
                  WHERE root_id = ?1 AND item_id = ?2",
                 rusqlite::params![root_id, item_id],
@@ -2051,7 +2080,7 @@ pub(crate) fn rename_tree_in_tx(
             yadorilink_sqlite_runtime::note_child_set_change(tx, &root_id, &old_parent)?;
             let new_parent = parent_item_id(tx, &root_id, parent_path)?;
             let old_parent = parent_item_id(tx, &root_id, &old_parent)?;
-            let published: bool = tx.query_row(
+            let published: bool = tx.query_row_cached(
                 "SELECT published_version_hash IS NOT NULL FROM provider_items \
                  WHERE root_id = ?1 AND item_id = ?2",
                 rusqlite::params![root_id, item_id],
@@ -2105,7 +2134,7 @@ fn parent_item_id(
         return Ok(Vec::new());
     }
     Ok(tx
-        .query_row(
+        .query_row_cached(
             "SELECT item_id FROM provider_items WHERE root_id = ?1 AND path = ?2 AND live = 1",
             rusqlite::params![root_id, parent_path],
             |r| r.get(0),
@@ -2120,7 +2149,7 @@ pub(crate) fn parent_is_enumerated(
     root_id: &str,
     parent_item_id: &[u8],
 ) -> Result<bool, SyncSqliteError> {
-    Ok(tx.query_row(
+    Ok(tx.query_row_cached(
         "SELECT EXISTS(SELECT 1 FROM provider_enumerated_parents \
          WHERE root_id = ?1 AND parent_item_id = ?2)",
         rusqlite::params![root_id, parent_item_id],
@@ -2140,18 +2169,18 @@ pub(crate) fn append_event(
 ) -> Result<u64, SyncSqliteError> {
     // The event first, then the revision: the revision only ever advances to a sequence that has
     // its event (the schema refuses any other advance).
-    let seq: i64 = tx.query_row(
+    let seq: i64 = tx.query_row_cached(
         "SELECT namespace_revision + 1 FROM provider_roots WHERE root_id = ?1",
         [root_id],
         |r| r.get(0),
     )?;
-    tx.execute(
+    tx.execute_cached(
         "INSERT INTO provider_change_events \
          (root_id, seq, kind, item_id, parent_item_id, old_parent_item_id, at_s) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, CAST(strftime('%s', 'now') AS INTEGER))",
         rusqlite::params![root_id, seq, kind, item_id, parent_item_id, old_parent_item_id],
     )?;
-    tx.execute(
+    tx.execute_cached(
         "UPDATE provider_roots SET namespace_revision = ?2 WHERE root_id = ?1",
         rusqlite::params![root_id, seq],
     )?;
@@ -2183,7 +2212,7 @@ fn record_ledger_in_tx(
 ) -> Result<Option<u64>, SyncSqliteError> {
     yadorilink_sqlite_runtime::reconcile_provider_liveness(tx)?;
     let row: Option<(String, String)> = tx
-        .query_row(
+        .query_row_cached(
             "SELECT group_id, path FROM provider_items \
                  WHERE root_id = ?1 AND item_id = ?2 AND live = 1",
             rusqlite::params![root_id, &item_id[..]],
@@ -2195,19 +2224,19 @@ fn record_ledger_in_tx(
         Some(current) if current.version_hash == version => {}
         _ => return Ok(None),
     }
-    let content_sig: String = tx.query_row(
+    let content_sig: String = tx.query_row_cached(
         "SELECT size || '|' || blocks_json || '|' || record_kind || '|' \
                     || COALESCE(CAST(symlink_target AS TEXT), '') \
              FROM files WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
         rusqlite::params![group_id, path],
         |r| r.get(0),
     )?;
-    tx.execute(
+    tx.execute_cached(
         "UPDATE provider_roots SET latest_evidence_seq = latest_evidence_seq + 1 \
              WHERE root_id = ?1",
         [root_id],
     )?;
-    let seq: i64 = tx.query_row(
+    let seq: i64 = tx.query_row_cached(
         "SELECT latest_evidence_seq FROM provider_roots WHERE root_id = ?1",
         [root_id],
         |r| r.get(0),

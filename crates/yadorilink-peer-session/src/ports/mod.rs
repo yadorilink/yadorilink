@@ -4,12 +4,14 @@
 //! (`SessionTransports`), plus an in-memory implementation of the latter for
 //! tests (`InMemoryPeerChannel`).
 
+mod block_file_source;
 mod block_serve_authorization;
 #[cfg(any(test, feature = "test-support"))]
 mod in_memory_channel;
 mod peer_message_channel;
 mod peer_replica_state;
 
+pub use block_file_source::{BlockFileSourcePort, FileBlockRead};
 pub use block_serve_authorization::{BlockServeAuthorization, BlockServeAuthorizationPort};
 #[cfg(any(test, feature = "test-support"))]
 pub use in_memory_channel::{

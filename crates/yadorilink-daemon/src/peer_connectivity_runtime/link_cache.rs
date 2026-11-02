@@ -49,6 +49,14 @@ struct SlotState {
     retired: Vec<Retired>,
     /// A caller is dialling for this peer.
     dialing: bool,
+    /// Which dial `dialing` speaks of; a dial that was superseded must not clear the flag of
+    /// the one that replaced it.
+    dial_gen: u64,
+    /// The dial whose caller was answered by an accepted link and went away, leaving the dial
+    /// to finish alone (see `link_to`). It still counts as dialling, and a caller that finds no
+    /// live link waits for it (so no second dial starts beside it), until the network changes:
+    /// see [`LinkCache::supersede_detached_dials`].
+    detached: Option<tokio::task::AbortHandle>,
 }
 
 /// How long a replaced standby stays open: the peer may be using it as ITS
@@ -172,21 +180,62 @@ impl Slot {
 }
 
 /// Ends the leader's turn however its future ends, cancellation included.
-struct Leading(Arc<Slot>);
+struct Leading(Arc<Slot>, u64);
 
 impl Drop for Leading {
     fn drop(&mut self) {
-        self.0.state().dialing = false;
+        {
+            let mut state = self.0.state();
+            // A superseded dial leaves the flag to its successor.
+            if state.dial_gen == self.1 {
+                state.dialing = false;
+                state.detached = None;
+            }
+        }
         self.0.notify();
     }
 }
 
-#[derive(Default)]
 pub(super) struct LinkCache {
     slots: Mutex<HashMap<String, Arc<Slot>>>,
+    /// The device id of every authorized peer whose connection to this device was just accepted.
+    /// A peer that opens a new connection has just been reachable from where it is, which says
+    /// something about the connections made to it earlier.
+    inbound: tokio::sync::broadcast::Sender<String>,
+}
+
+impl Default for LinkCache {
+    fn default() -> Self {
+        Self { slots: Mutex::default(), inbound: tokio::sync::broadcast::channel(16).0 }
+    }
 }
 
 impl LinkCache {
+    /// Aborts every dial that was left to finish alone, and returns how many. Called when the
+    /// network came back: such a dial was started on the network that is gone, can take its
+    /// whole handshake deadline (about 33 s) to fail there, and holds the slot's dial turn
+    /// meanwhile, so the next caller would queue behind it. Aborting frees the turn; a
+    /// connection the peer accepted from it meanwhile is dropped, which is the peer's
+    /// connection to lose when the network that carried it is gone.
+    pub(super) fn supersede_detached_dials(&self) -> usize {
+        let slots: Vec<Arc<Slot>> =
+            self.slots.lock().unwrap_or_else(|p| p.into_inner()).values().cloned().collect();
+        let mut aborted = 0;
+        for slot in slots {
+            let detached = slot.state().detached.take();
+            if let Some(dial) = detached {
+                dial.abort();
+                aborted += 1;
+            }
+        }
+        aborted
+    }
+
+    /// A receiver of the device ids of peers that just opened a connection to this device.
+    pub(super) fn subscribe_inbound(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.inbound.subscribe()
+    }
+
     fn slot(&self, device_id: &str) -> Arc<Slot> {
         self.slots
             .lock()
@@ -227,17 +276,33 @@ impl LinkCache {
         let slot = self.slot(device_id);
         {
             let mut state = slot.state();
+            // A connection that closed while it waited in the accept queue is not news of the
+            // peer, and must not make anything else replace a healthy connection.
             if !link.is_alive() {
                 return;
             }
             let link = Arc::new(link.clone());
             if Slot::live_current(&mut state, link.peer()).is_some() {
                 slot.set_standby(&mut state, link);
-                return;
+            } else {
+                state.current = Some(link);
             }
-            state.current = Some(link);
         }
         slot.notify();
+        // No receiver is not an error: nobody is waiting to hear of it.
+        let _ = self.inbound.send(device_id.to_string());
+    }
+
+    /// The path kind the link the next lane open would use is on, when that link has one selected.
+    /// Read, not promoted: a standby only stands in for a current link that is gone.
+    pub(super) fn current_carrier(
+        &self,
+        device_id: &str,
+    ) -> Option<yadorilink_sync_substrate::Carrier> {
+        let slot = self.slots.lock().unwrap_or_else(|p| p.into_inner()).get(device_id).cloned()?;
+        let state = slot.state();
+        let usable = |l: &&Arc<PeerLink>| l.is_alive();
+        state.current.as_ref().filter(usable).or(state.standby.as_ref().filter(usable))?.carrier()
     }
 
     /// Resolves when a live link to `peer` is current for `device_id`
@@ -286,13 +351,19 @@ impl LinkCache {
                 for stale in [state.current.take(), state.standby.take()].into_iter().flatten() {
                     stale.close();
                 }
-                !std::mem::replace(&mut state.dialing, true)
+                if state.dialing {
+                    None
+                } else {
+                    state.dialing = true;
+                    state.dial_gen += 1;
+                    Some(state.dial_gen)
+                }
             };
-            if !leading {
+            let Some(generation) = leading else {
                 // Someone else is dialling; wake on any change and look again.
                 let _ = changes.changed().await;
                 continue;
-            }
+            };
             let (hold, adopt, dial) = parts.take().expect("a leader returns, so it leads once");
             let dialled = dial(peer);
 
@@ -307,7 +378,7 @@ impl LinkCache {
                 // The dial's turn ends when the dial does (finished, failed
                 // or aborted), not when the caller does: a detached dial
                 // still counts, so nobody starts a second one beside it.
-                let turn = Leading(slot.clone());
+                let turn = Leading(slot.clone(), generation);
                 tokio::spawn(async move {
                     let _turn = turn;
                     let outcome = match dialled.await {
@@ -338,7 +409,7 @@ impl LinkCache {
                     Err(_) => Ok(None),
                 },
                 link = slot.next_current(peer) => {
-                    dial_task.detach();
+                    dial_task.detach(&slot, generation);
                     // An accepted link is made current after the endpoint
                     // held it, but the device can be withdrawn after that and
                     // before the revocation sweep reaches the link: the pin
@@ -354,8 +425,14 @@ impl LinkCache {
 struct DialTask(Option<tokio::task::JoinHandle<()>>);
 
 impl DialTask {
-    fn detach(&mut self) {
-        self.0 = None;
+    /// Lets the dial finish on its own, and records that nobody waits for it.
+    fn detach(&mut self, slot: &Slot, generation: u64) {
+        if let Some(task) = self.0.take() {
+            let mut state = slot.state();
+            if state.dial_gen == generation {
+                state.detached = Some(task.abort_handle());
+            }
+        }
     }
 }
 

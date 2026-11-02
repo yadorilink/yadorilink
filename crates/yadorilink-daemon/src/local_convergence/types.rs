@@ -4,7 +4,6 @@
 //! These lived in `yadorilink-peer-session` because the code that used
 //! them did. None of them describe a peer.
 
-use bytes::Bytes;
 use futures_util::stream::FuturesUnordered;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -529,7 +528,11 @@ impl ProjectionAttempt {
 /// that made it durable.
 pub(crate) struct CommittedBatch {
     pub(crate) hashes: Vec<Vec<u8>>,
-    pub(crate) rejected: Vec<Vec<u8>>,
+    /// Blocks of this batch kept in memory for the pass instead of being committed (single-pass
+    /// receive): never provenance-eligible, because nothing durable attests to them. The hold is
+    /// made where the blocks are taken, so a batch nobody receives releases them when dropped.
+    pub(crate) window_hold: crate::local_convergence::window_blocks::WindowBlocksHold,
+    pub(crate) window_held: Vec<Vec<u8>>,
     pub(crate) error: Option<yadorilink_local_storage::StorageError>,
     /// `None` when no `ReconcileCallTimer` was attached to this call --
     /// the commit still happens, it just isn't attributed.
@@ -546,9 +549,13 @@ pub(crate) struct CommittedBatch {
 /// what keeps that correct without reintroducing a per-file barrier.
 pub(crate) struct PendingBlock {
     pub(crate) hash: Vec<u8>,
-    pub(crate) data: Bytes,
+    /// The bytes, shown to be the block `hash` names when they were fetched.
+    pub(crate) block: yadorilink_local_storage::VerifiedBlock,
     pub(crate) path: String,
     pub(crate) version_hex: String,
+    /// The block of a small file of a single-pass receive: kept in memory for the pass if the
+    /// budget allows, instead of being committed to the block store.
+    pub(crate) window_cacheable: bool,
 }
 
 /// Fetched blocks waiting to be made durable, and the commits carrying
@@ -595,6 +602,12 @@ pub(crate) struct ReceiveCommitPool {
     /// only source of provenance-eligible hashes: a hash reaches it after
     /// the write it attests to is durable, never before.
     pub(crate) durable: Vec<Vec<u8>>,
+    /// What this pass keeps in memory instead of in the store (single-pass receive); dropped with
+    /// the pool, so a pass that fails part way lets go of it too.
+    pub(crate) window_hold: Option<crate::local_convergence::window_blocks::WindowBlocksHold>,
+    /// The ready temps of large files this pass registered, discarded at the pass's end unless the
+    /// settle took them.
+    pub(crate) filled_hold: Option<crate::local_convergence::filled_temps::FilledTempsHold>,
     /// First fatal error across every commit in this pass.
     pub(crate) fatal: Option<PeerSessionError>,
     /// A peer returned bytes that did not hash to the key they were asked
@@ -616,6 +629,8 @@ impl ReceiveCommitPool {
             pending_bytes: 0,
             commits: FuturesUnordered::new(),
             durable: Vec::new(),
+            window_hold: None,
+            filled_hold: None,
             fatal: None,
             lost_content: false,
         }
@@ -639,6 +654,8 @@ pub(crate) struct SymlinkMaterialization<'a> {
     pub(crate) windows_opt_in: bool,
     pub(crate) origin_device_id: &'a str,
     pub(crate) authoring: Option<&'a yadorilink_replica_domain::native_plan::NativeRowIdentity>,
+    /// What this write says about the version its row replaces.
+    pub(crate) retention: yadorilink_sync_sqlite::retention::Retention<'a>,
     pub(crate) permit: &'a RootCommitPermit<'a>,
 }
 
@@ -715,6 +732,7 @@ pub(crate) fn materialize_symlink_at(
         windows_opt_in,
         origin_device_id,
         authoring,
+        retention,
         permit,
     } = context;
     let out_path = root.join(&record.path);
@@ -786,6 +804,7 @@ pub(crate) fn materialize_symlink_at(
             &written_version.meta,
         ),
         write_target,
+        retention,
         permit,
     )? {
         Some((mutation_generation, intent_guard)) => {
@@ -837,6 +856,17 @@ pub(crate) fn materialize_symlink_at(
 
     let mutation_generation =
         mutation_generation.expect("write_eligible implies the fence was bumped above");
+
+    // The link was published durably: from here a missing name is the user's, which the open
+    // intent alone cannot tell from a crash before the publish. A mark that cannot be recorded
+    // fails the attempt and leaves the intent open, so the path stays unsettled.
+    state
+        .materialization_intent_repository()
+        .mark_write_landed(group_id, &record.path, mutation_generation, permit)
+        .map_err(crate::sync_error::SyncError::from)?;
+
+    #[cfg(test)]
+    placed_hook::run(&out_path);
 
     // The symlink now genuinely exists on disk under this exact name.
     // Everything this write proved is recorded in ONE durable step: the
@@ -1078,6 +1108,12 @@ pub(crate) fn try_apply_metadata_only_update(
         Some(&yadorilink_replica_domain::session_state::LocalFileMetaColumns::from_version_meta(
             &desired_version.meta,
         )),
+        // The block list is the one already indexed (this is the content-identical fast path),
+        // so the replaced row keeps its bytes and there is nothing to prove; a row that did not
+        // would be refused.
+        yadorilink_sync_sqlite::retention::Retention::Proofs(
+            &yadorilink_sync_sqlite::retention::RetentionProofs::new(),
+        ),
         permit,
     )?;
     // From the version this update applies, not from the row it just
@@ -1090,86 +1126,39 @@ pub(crate) fn try_apply_metadata_only_update(
     // supersession landing between the two applies V2's mode and xattrs
     // while this call settles under V1's `version_hash`, which bakes both
     // in.
-    let unix_mode = desired_version.meta.unix_mode;
-    let xattrs = desired_version.meta.xattrs.clone();
-    // A read-only comparison, before any syscall that could change either:
-    // only when NEITHER would actually change anything is this genuinely a
-    // zero-mutation verification.
-    //
-    // This fast path must not decide snapshot-vs-bump from
-    // unix_mode/xattrs alone, ignoring mtime -- otherwise a same-content,
-    // mtime-ONLY-changed version (an ordinary "touch") could settle as `ExactObject` under the NEW
-    // version's `version_hash` (which bakes in the new mtime) without
-    // ever attempting to stamp the new mtime onto disk at all. mtime
-    // stays retained-only (never a completion-blocking exactness
-    // requirement -- see `SettlementEvidence::ExactObject`'s own doc
-    // comment), but "retained-only" was never meant to mean "never even
-    // attempted on a target that can actually set it" -- that's exactly
-    // the treatment `unix_mode`/`xattrs` already get here (applied when
-    // possible, just not strictly blocking if the target can't). Folded
-    // into the same bump-vs-snapshot decision, not a separate one: an
-    // mtime-only change is still a real mutating syscall attempt and
-    // must bump the fence first like any other, per the same "bump
-    // before the first mutating syscall, no exceptions" invariant
-    // unix_mode/xattrs already follow.
+    let exec = desired_version.meta.exec;
+    // A read-only comparison, before any syscall that could change either the execute flag or
+    // the mtime: only when NEITHER would actually change anything is this genuinely a
+    // zero-mutation verification. An mtime-only change is still a real mutating syscall attempt
+    // and must bump the fence first like any other ("bump before the first mutating syscall, no
+    // exceptions"); mtime stays retained-only, never a completion-blocking exactness requirement.
     let metadata_already_matches_disk =
-        yadorilink_local_storage::unix_mode_already_matches_disk(&out_path, unix_mode)?
-            && yadorilink_local_storage::xattrs_already_match_disk(&out_path, &xattrs)?
+        yadorilink_local_storage::exec_already_matches_disk(&out_path, exec)?
             && yadorilink_local_storage::mtime_already_matches_disk(
                 &out_path,
                 desired_version.meta.mtime_unix_nanos,
             )?;
-    let (mutation_generation, xattr_evidence) = if metadata_already_matches_disk {
-        // Nothing is written: what disk holds must be proved from disk.
-        (state.dag_snapshot_mutation_fence(group_id, &record.path)?, XattrEvidence::ReproveFromDisk)
+    let mutation_generation = if metadata_already_matches_disk {
+        // Nothing is written: a snapshot, never a bump.
+        state.dag_snapshot_mutation_fence(group_id, &record.path)?
     } else {
         let fence = state.dag_bump_mutation_fence(group_id, &record.path, "metadata_repair")?;
         // The mtime stamp opens the file, so it goes before the final mode,
-        // which may deny the owner read access (0o200). Neither the
-        // attributes nor the mode change the mtime afterwards.
+        // which may deny the owner read access (0o200).
         yadorilink_local_storage::stamp_mtime_at_path(
             &out_path,
             desired_version.meta.mtime_unix_nanos,
         )?;
-        let applied =
-            yadorilink_local_storage::apply_file_metadata_verified(&out_path, unix_mode, &xattrs)?;
-        (fence, XattrEvidence::from(applied))
+        yadorilink_local_storage::apply_file_metadata(&out_path, exec)?;
+        fence
     };
-    require_xattr_evidence(&record.path, &out_path, &xattrs, &xattr_evidence)?;
-    Ok(Some(MetadataOnlyUpdate { mutation_generation, xattrs: xattr_evidence }))
+    Ok(Some(MetadataOnlyUpdate { mutation_generation }))
 }
 
-/// A metadata-only update that took effect: the fence it ran under, and the
-/// xattr evidence it already checked, for a caller that builds the
-/// `ExactObject` from it (so a file this update just made unreadable is not
-/// re-read).
+/// A metadata-only update that took effect: the fence it ran under.
 #[derive(Debug)]
 pub(crate) struct MetadataOnlyUpdate {
     pub(crate) mutation_generation: i64,
-    pub(crate) xattrs: XattrEvidence,
-}
-
-/// Shared with every other proof-publishing writer; see its own doc comment.
-pub(crate) use yadorilink_local_storage::XattrEvidence;
-
-/// The xattr half of the `ExactObject` gate, for either source of evidence.
-/// An in-attempt confirmation counts only for the exact path and attribute
-/// set it was taken for; anything else is not evidence for this claim.
-pub(crate) fn require_xattr_evidence(
-    path: &str,
-    out_path: &Path,
-    desired_xattrs: &[(String, Vec<u8>)],
-    evidence: &XattrEvidence,
-) -> Result<(), PeerSessionError> {
-    evidence.prove(out_path, desired_xattrs).map_err(|refused| {
-        tracing::debug!(
-            path,
-            ?refused,
-            "the replicated extended attributes are not proven to match the desired version; \
-             refusing to settle as exact"
-        );
-        PeerSessionError::ReplicatedXattrsNotExact(path.to_string())
-    })
 }
 
 /// The `ExactObject` proof gate against a claimed object kind actually
@@ -1552,9 +1541,10 @@ pub(crate) fn hazard_reason_for_policy(
     // Both probes are real filesystem round trips (deliberately uncached --
     // see `is_case_insensitive_filesystem`'s doc comment), so each is taken
     // once here rather than re-probed per check.
+    let (case_insensitive, normalization_insensitive) = hazard::probed_folding(root);
     let volume = VolumeFolding {
-        case_insensitive: hazard::is_case_insensitive_filesystem(root),
-        normalization_insensitive: hazard::is_normalization_insensitive_filesystem(root),
+        case_insensitive: case_insensitive.unwrap_or(true),
+        normalization_insensitive: normalization_insensitive.unwrap_or(true),
     };
     hazard_reason_for_volume(state, group_id, record, volume)
 }
@@ -1660,6 +1650,7 @@ pub(crate) fn hold_record(
     origin_device_id: &str,
     authoring: Option<&yadorilink_replica_domain::native_plan::NativeRowIdentity>,
     meta: &yadorilink_replica_domain::session_state::LocalFileMetaColumns,
+    retention: yadorilink_sync_sqlite::retention::Retention<'_>,
     permit: &RootCommitPermit,
 ) -> Result<(), PeerSessionError> {
     // Upsert, demote to `Remote`, mark held: see
@@ -1671,6 +1662,7 @@ pub(crate) fn hold_record(
         origin_device_id,
         authoring,
         meta,
+        retention,
         permit,
     )?;
     tracing::info!(
@@ -1828,9 +1820,8 @@ impl MaterializationPayload {
             record.size,
             record.mtime_unix_nanos,
             RecordKind::File,
+            false,
             None,
-            None,
-            Vec::new(),
         );
         Self { record, version }
     }
@@ -1845,5 +1836,45 @@ impl MaterializationPayload {
 
     pub fn path(&self) -> &str {
         &self.record.path
+    }
+}
+
+/// Everything a receive pass keeps beyond its fetch until the pass has settled: the blocks of small
+/// files held in memory, and the completed temps of large files. Dropping it lets go of both.
+#[derive(Default)]
+pub(crate) struct PassHolds {
+    pub(crate) _window: Option<crate::local_convergence::window_blocks::WindowBlocksHold>,
+    pub(crate) _filled: Option<crate::local_convergence::filled_temps::FilledTempsHold>,
+}
+
+/// Test seam: runs right after a symlink or an explicit directory was placed and its landed mark
+/// recorded, before the write's proof is committed. Keyed by the absolute destination path.
+#[cfg(test)]
+pub(crate) mod placed_hook {
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    type Hook = Box<dyn FnOnce() + Send>;
+    static HOOKS: Mutex<Option<HashMap<String, Hook>>> = Mutex::new(None);
+
+    #[cfg(unix)]
+    pub(crate) fn set(path: &Path, hook: Hook) {
+        HOOKS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_or_insert_with(Default::default)
+            .insert(path.display().to_string(), hook);
+    }
+
+    pub(crate) fn run(path: &Path) {
+        let hook = HOOKS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_mut()
+            .and_then(|map| map.remove(&path.display().to_string()));
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 }

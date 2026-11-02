@@ -122,3 +122,19 @@ fn an_embedded_status_names_the_device_from_the_hosts_settings() {
     settings.host_name = Some("   ".to_owned());
     assert_eq!(account_status_in(dir.path(), &settings, None).default_device_name, "My Device");
 }
+
+/// Whoever redeems a link picks the receiving device; nothing is sent to the daemon without one.
+#[tokio::test]
+async fn redeeming_a_send_link_requires_a_receiving_device() {
+    let core = ClientCore::new(CoreConfig {
+        daemon_launch: crate::dto::DaemonLaunch::SpawnBinary { path: None },
+    });
+    let error = core.redeem_send_link("CODE".into(), String::new(), None).await.unwrap_err();
+    assert_eq!(
+        error,
+        DesktopError::InvalidInput {
+            message: "a receiving device is required".into(),
+            field: Some("receiving_device_id".into()),
+        }
+    );
+}

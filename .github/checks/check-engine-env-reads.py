@@ -86,6 +86,13 @@ ALLOWED = {
 # Single functions that may read the environment: entry-point mappings and desktop-only
 # operations living in a library file that also holds engine-reachable code.
 ALLOWED_FUNCTIONS = {
+    "crates/yadorilink-fs-platform/src/durable_dir/probe.rs": {
+        "scratch_parent": (
+            "the volume probe's scratch location: the system temp directory is used only as a "
+            "place on the probed volume, never as configuration, and the probed directory is "
+            "the fallback"
+        ),
+    },
     "crates/yadorilink-fapi-client/src/store/mod.rs": {
         "from_env": "Backend::from_env, the environment mapping of the entry points; an engine is given a Backend",
     },
@@ -120,6 +127,10 @@ ALLOWED_FUNCTIONS = {
         "launch_steps": "desktop daemon service control (Windows SystemRoot)",
         "start_daemon_with": "desktop CLI: the CLI's own path (current_exe) decides the launch owner",
         "daemon_binary_path": "desktop CLI: the daemon binary beside the CLI (current_exe)",
+        "supervised_by_environment": (
+            "desktop CLI in the container image: its entrypoint restarts the daemon, so a restart "
+            "waits for that one (YADORILINK_DAEMON_SUPERVISED); an embedded host has no daemon process"
+        ),
     },
     "crates/yadorilink-client-core/src/ops/handoff.rs": {
         "running_from_cli_install": "desktop install handoff: the running program's own path (current_exe)",

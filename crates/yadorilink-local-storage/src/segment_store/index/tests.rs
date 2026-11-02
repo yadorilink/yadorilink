@@ -204,8 +204,8 @@ fn listing_by_prefix_returns_only_matching_hashes() {
     assert!(index.hashes_with_hex_prefix("cd").unwrap().is_empty());
 }
 
-#[test]
-fn a_store_stamped_with_another_format_version_is_refused() {
+/// Opens an index stamped with `stamp` as its format version.
+fn open_stamped(stamp: &str) -> Result<BlockIndex, StorageError> {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("index.sqlite3");
     {
@@ -214,18 +214,45 @@ fn a_store_stamped_with_another_format_version_is_refused() {
             .db
             .write::<_, DatabaseError>(|conn| {
                 conn.execute(
-                    "UPDATE store_meta SET value = '99' WHERE key = 'format_version'",
-                    [],
+                    "UPDATE store_meta SET value = ?1 WHERE key = 'format_version'",
+                    [stamp],
                 )?;
                 Ok(())
             })
             .unwrap();
     }
-    let Err(err) = BlockIndex::open(&path) else {
+    let result = BlockIndex::open(&path);
+    drop(dir);
+    result
+}
+
+#[test]
+fn a_store_stamped_with_another_format_version_is_refused() {
+    let Err(err) = open_stamped("99") else {
         panic!("a store stamped with a foreign format version must not open");
     };
     assert!(
         matches!(&err, StorageError::Index(message) if message.contains("format version")),
         "unexpected error: {err}"
     );
+}
+
+/// A store of the previous layout (CRC-32 records) is refused, not read, and the refusal says how
+/// to keep what is set aside before the store is deleted and the folder imported again.
+#[test]
+fn a_store_of_the_previous_layout_is_refused_with_the_way_to_save_what_is_set_aside() {
+    let previous = (STORE_FORMAT_VERSION - 1).to_string();
+    let Err(err) = open_stamped(&previous) else {
+        panic!("a store of the previous layout must not open");
+    };
+    let message = err.to_string();
+    for needed in [
+        "pre-release builds do not migrate",
+        "re-import the folder",
+        "yadorilink preserved list",
+        "yadorilink preserved restore <item-id>",
+        "yadorilink preserved discard <item-id> --yes",
+    ] {
+        assert!(message.contains(needed), "the refusal lacks {needed:?}: {message}");
+    }
 }

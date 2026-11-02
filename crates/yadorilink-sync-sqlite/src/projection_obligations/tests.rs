@@ -896,3 +896,46 @@ fn claim_cost_when_backed_off() {
         }
     }
 }
+
+/// The engine sleeps until this: the earliest deadline of a row the clock can make runnable.
+/// Parked, paused, held and frozen rows never are -- a write unblocks them, so they must not keep
+/// the engine polling.
+#[test]
+fn the_next_wake_is_the_earliest_deadline_of_a_row_only_the_clock_can_release() {
+    let conn = conn();
+    assert_eq!(next_obligation_wake(&conn).unwrap(), None);
+
+    insert_pending(&conn, "g", "late", 1, 9_000);
+    insert_pending(&conn, "g", "soon", 2, 5_000);
+    insert_pending(&conn, "h", "other-group", 3, 7_000);
+    assert_eq!(next_obligation_wake(&conn).unwrap(), Some(5_000));
+
+    // Rows a write has to unblock do not count, however early their deadline.
+    insert_pending(&conn, "g", "held", 4, 1_000);
+    conn.execute(
+        "INSERT INTO held_paths (group_id, path, held_at_unix_nanos) VALUES ('g', 'held', 0)",
+        [],
+    )
+    .unwrap();
+    insert_pending(&conn, "g", "paused", 5, 1_100);
+    conn.execute(
+        "INSERT INTO paused_items (group_id, path, paused_at_unix_nanos) VALUES ('g', 'paused', 0)",
+        [],
+    )
+    .unwrap();
+    insert_pending(&conn, "g", "parked", 6, 1_200);
+    conn.execute(
+        "UPDATE projection_obligations SET state = 'ignore_blocked' WHERE path = 'parked'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(next_obligation_wake(&conn).unwrap(), Some(5_000));
+
+    // Only blocked rows left: nothing for the clock to do.
+    conn.execute(
+        "DELETE FROM projection_obligations WHERE path IN ('late', 'soon', 'other-group')",
+        [],
+    )
+    .unwrap();
+    assert_eq!(next_obligation_wake(&conn).unwrap(), None);
+}

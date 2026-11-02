@@ -1,16 +1,15 @@
 #![cfg(test)]
 
-//! `content_identity` ignores the modification time and nothing else.
+//! `content_identity` ignores the modification time and nothing else (the execute flag is part of it).
 
 use super::*;
 
 fn version(block: u8, meta: impl FnOnce(&mut FileMeta)) -> FileVersion {
     let mut m = FileMeta {
         mtime_unix_nanos: 1,
-        unix_mode: Some(0o644),
+        exec: false,
         symlink_target: None,
         record_kind: RecordKind::File,
-        xattrs: Vec::new(),
     };
     meta(&mut m);
     FileVersion::new(vec![VersionBlock { hash: BlockHash(vec![block; 32]), size: 4 }], 4, m)
@@ -28,9 +27,7 @@ fn every_other_replicated_field_changes_the_identity() {
     let base = version(1, |_| {}).content_identity();
     let others = [
         version(2, |_| {}),
-        version(1, |m| m.unix_mode = Some(0o755)),
-        version(1, |m| m.unix_mode = None),
-        version(1, |m| m.xattrs = vec![("user.k".into(), b"v".to_vec())]),
+        version(1, |m| m.exec = true),
         version(1, |m| m.symlink_target = Some(b"t".to_vec())),
         version(1, |m| m.record_kind = RecordKind::Symlink),
     ];
@@ -49,28 +46,4 @@ fn every_other_replicated_field_changes_the_identity() {
 fn the_identity_never_equals_a_version_hash() {
     let v = version(1, |m| m.mtime_unix_nanos = 0);
     assert_ne!(v.content_identity().0, v.version_hash.0);
-}
-
-#[test]
-fn the_mode_bridge_pairs_no_mode_with_a_plain_mode_only() {
-    let bridge = |v: FileVersion| v.mode_bridge();
-    let none = bridge(version(1, |m| m.unix_mode = None)).unwrap();
-    let plain = bridge(version(1, |m| m.unix_mode = Some(0o644))).unwrap();
-    let private = bridge(version(1, |m| m.unix_mode = Some(0o600))).unwrap();
-    assert!(none.modeless && !plain.modeless && !private.modeless);
-    assert_eq!(none.base, plain.base, "equal but for the mode");
-    assert_eq!(none.base, private.base);
-    // Everything else still separates them.
-    assert_ne!(bridge(version(2, |_| {})).unwrap().base, none.base);
-    assert_ne!(
-        bridge(version(1, |m| m.xattrs = vec![("user.k".into(), b"v".to_vec())])).unwrap().base,
-        none.base
-    );
-    // A set exec bit, or any bit beyond read/write, is never bridged.
-    for mode in [0o755, 0o744, 0o645, 0o4644, 0o1644] {
-        assert!(bridge(version(1, |m| m.unix_mode = Some(mode))).is_none(), "{mode:o}");
-    }
-    // Neither is a symlink or a directory.
-    assert!(bridge(version(1, |m| m.record_kind = RecordKind::Symlink)).is_none());
-    assert!(FileVersion::directory(None).mode_bridge().is_none());
 }

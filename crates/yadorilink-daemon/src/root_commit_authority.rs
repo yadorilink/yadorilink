@@ -93,6 +93,16 @@ impl DaemonState {
 }
 
 impl DaemonState {
+    /// The lease a daemon-side author of `group_id` (a rewind) commits under: the linked
+    /// folder's, or for a provider group the provider root's own lease, the one its write path
+    /// admits through. Fails closed when neither exists.
+    #[doc(hidden)]
+    pub fn authoring_root_lease_for(&self, group_id: &str) -> Option<Arc<RootLease>> {
+        use yadorilink_peer_session::peer_session::RootCommitAuthorityProvider;
+        RootCommitAuthorityProvider::root_lease_for(self, group_id)
+            .or_else(|| self.provider_root_lease_for(group_id))
+    }
+
     /// Same lookup as `RootCommitAuthorityProvider::root_lease_for` above,
     /// for this crate's own internal callers (the periodic GC/capacity-
     /// eviction/hydration sweeps in `gc.rs`/`hydration.rs`, and the

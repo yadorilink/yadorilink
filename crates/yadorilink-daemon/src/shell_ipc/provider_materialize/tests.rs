@@ -870,6 +870,56 @@ async fn a_large_burst_runs_at_most_six_assemblies_and_refuses_past_the_in_fligh
     assert!(peak >= 4, "the assemblies did not overlap: {peak}");
 }
 
+/// An unobtainable fetch names the other device that authored the version, when none is connected
+/// to supply it; it names nobody for content this device authored or whose author is unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unobtainable_fetch_names_the_offline_author() {
+    let mut fx = Fx::new().await;
+    let own = fx.state.device_id.clone();
+    let mut items = Vec::new();
+    for (path, origin) in [
+        ("by-nas.bin", Some("nas-1".to_string())),
+        ("by-me.bin", Some(own)),
+        ("by-unknown.bin", None),
+    ] {
+        let ghost = [path.len() as u8; 32];
+        fx.state
+            .replica_coordinator
+            .database()
+            .write_immediate::<_, yadorilink_sync_sqlite::SyncSqliteError>(|tx| {
+                tx.execute(
+                    "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, \
+                     deleted, version_seq, state, origin_device_id) \
+                     VALUES (?1, ?2, 500, 1, ?3, 0, 1, 'current', ?4)",
+                    rusqlite::params![
+                        GROUP,
+                        path,
+                        format!(r#"[{{"hash":{:?},"offset":0,"size":500}}]"#, ghost.to_vec()),
+                        origin
+                    ],
+                )?;
+                let row =
+                    yadorilink_sync_sqlite::read_canonical_current_row(tx, GROUP, path)?.unwrap();
+                let version = yadorilink_replica_domain::session_state::CurrentVersionRecord::from(
+                    row.snapshot,
+                )
+                .to_file_version();
+                yadorilink_sync_sqlite::dag_store::put_file_version(tx, GROUP, &version)?;
+                Ok(())
+            })
+            .unwrap();
+        items.push(fx.repo().mint_item(&fx.root, path).unwrap());
+    }
+    let mut holders = Vec::new();
+    for (n, item) in items.iter().enumerate() {
+        let response = fx.ask(format!("req-holder-{n}").as_bytes(), item).await;
+        assert_eq!(failure(&response), MaterializeFailure::Unobtainable);
+        assert!(response.holder_device_name.is_empty(), "the engine never names a device");
+        holders.push(response.holder_device_id);
+    }
+    assert_eq!(holders, ["nas-1", "", ""]);
+}
+
 /// Content no peer has is a failure of that version (the Eager driver backs off); content that
 /// arrives clears it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1614,6 +1664,10 @@ async fn progress_is_monotonic_ends_at_the_total_and_precedes_the_response() {
     let last = all.last().unwrap();
     assert!(last.done && last.completed == last.total, "{last:?}");
     assert_eq!(all.iter().filter(|m| m.done).count(), 1);
+    // The blocks were all here already: the attempt started from the end, and says so on every
+    // message that knows it.
+    assert_eq!(last.resumed_from, Some(size), "{last:?}");
+    assert!(all.iter().all(|m| m.resumed_from.is_none_or(|from| from == size)), "{all:?}");
     assert!(all.iter().filter(|m| !m.done).all(|m| m.completed < m.total), "{all:?}");
     assert_eq!(response.size, size);
 }
@@ -1786,6 +1840,25 @@ fn assembly_progress_is_monotonic_bounded_and_complete_only_when_finished() {
     let empty = AssemblyProgress::default();
     empty.begin(0);
     assert_eq!(empty.snapshot(), None);
+}
+
+/// What the attempt started from: unknown until it knows what it has to fetch, then the content
+/// minus the bytes to fetch (a restart for a moved version forgets it).
+#[test]
+fn assembly_progress_reports_the_bytes_it_resumed_from() {
+    let progress = AssemblyProgress::default();
+    assert_eq!(progress.resumed_from(), None);
+    progress.begin(1000);
+    assert_eq!(progress.resumed_from(), None, "not known before the fetch is planned");
+    progress.plan_fetch(400);
+    assert_eq!(progress.resumed_from(), Some(600));
+    progress.begin(1000);
+    assert_eq!(progress.resumed_from(), None, "a restarted attempt plans again");
+    progress.plan_fetch(1000);
+    assert_eq!(progress.resumed_from(), Some(0), "a fetch from the start");
+    progress.begin(1000);
+    progress.plan_fetch(0);
+    assert_eq!(progress.resumed_from(), Some(1000), "everything was here");
 }
 
 #[test]

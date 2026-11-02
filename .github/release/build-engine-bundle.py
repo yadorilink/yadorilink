@@ -96,6 +96,7 @@ ZIP_DATE = (2020, 1, 1, 0, 0, 0)
 #   generated  generated Swift binding directory
 #   csharp     generated C# binding directory (generate-csharp-binding.sh --out)
 #   ipc        the ipc-proto crate directory
+#   installer  the installers (packaging/install); defaults to this checkout's, so callers pass nothing
 #   device     iOS device static library directory (aarch64-apple-ios, release)
 #   simulator  iOS simulator static library directory (aarch64-apple-ios-sim, release)
 # `slices` (iOS only): the target triple of each static library slice and its bundle path. The
@@ -108,7 +109,10 @@ LAYOUTS = {
     "linux-x86_64": {
         "daemon": "yadorilink-daemon",
         "programs": ["yadorilink", "yadorilink-daemon"],
-        "files": [(n, r, n, True) for n, r in _BIN],
+        # install.sh: the installer a script install keeps for `yadorilink self-update` to run
+        # (the installer stays the only verifier of what gets installed); inside the bundle it is covered by
+        # SHA256SUMS and so by the signed manifest, which is how it is proven at install time.
+        "files": [(n, r, n, True) for n, r in _BIN] + [("install.sh", "installer", "install.sh", True)],
         "globs": [],
     },
     "windows-x86_64": {
@@ -123,6 +127,7 @@ LAYOUTS = {
             # the C# generated from it.
             ("yadorilink_client_ffi.dll", "bin", "yadorilink_client_ffi.dll", True),
             ("csharp/BINDING-NOTES.md", "csharp", "BINDING-NOTES.md", False),
+            ("install.ps1", "installer", "install.ps1", False),
         ],
         "globs": [("csharp/Generated", "csharp", "Generated", ".cs")],
     },
@@ -132,6 +137,7 @@ LAYOUTS = {
         "files": [
             ("bin/yadorilink", "bin", "yadorilink", True),
             ("bin/yadorilink-daemon", "bin", "yadorilink-daemon", True),
+            ("install.sh", "installer", "install.sh", True),
             ("lib/libyadorilink_client_ffi.a", "bin", "libyadorilink_client_ffi.a", False),
             ("swift/Generated/YadoriLinkCore.swift", "generated", "YadoriLinkCore.swift", False),
             ("swift/Generated/YadoriLinkFFI.swift", "generated", "YadoriLinkFFI.swift", False),
@@ -178,6 +184,7 @@ def safe_path(name: str) -> bool:
 def layout_files(layout: dict, roots: dict[str, Path]) -> dict[str, tuple[bytes, bool]]:
     """Collect the layout's files as {bundle path: (bytes, executable)}."""
     found: dict[str, tuple[bytes, bool]] = {}
+    roots = {"installer": ROOT / "packaging" / "install", **roots}
 
     def take(dest: str, root: str, rel: str, executable: bool):
         if root not in roots:
@@ -689,6 +696,22 @@ def verify_zip(zip_path: Path, expect_zip_sha256: str | None = None, lock: dict 
     return problems
 
 
+def installer_problems(zip_path: Path, installers: Path) -> list[str]:
+    """The installer a bundle carries (the copy a script install keeps and later runs) must be the
+    published, attested one, byte for byte."""
+    problems = []
+    with zipfile.ZipFile(zip_path) as z:
+        for name in ("install.sh", "install.ps1"):
+            if name not in z.namelist():
+                continue
+            published = installers / name
+            if not published.is_file():
+                problems.append(f"the bundle carries {name} but {published} does not exist")
+            elif z.read(name) != published.read_bytes():
+                problems.append(f"the bundle's {name} differs from the published {published}")
+    return problems
+
+
 def self_test() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -701,7 +724,7 @@ def self_test() -> int:
         sha = "a" * 40
 
         # Fake source roots holding every file any layout can ask for.
-        roots = {k: tmp / "roots" / k for k in ("bin", "shell", "generated", "ipc", "csharp", "device", "simulator")}
+        roots = {k: tmp / "roots" / k for k in ("bin", "shell", "generated", "ipc", "csharp", "device", "simulator", "installer")}
         for target, layout in LAYOUTS.items():
             for dest, root, rel, _ in layout["files"]:
                 path = roots[root] / rel
@@ -771,15 +794,15 @@ def self_test() -> int:
             return path
 
         expected_names = {
-            "linux-x86_64": {"yadorilink", "yadorilink-daemon"},
+            "linux-x86_64": {"yadorilink", "yadorilink-daemon", "install.sh"},
             "windows-x86_64": {
-                "yadorilink.exe", "yadorilink-daemon.exe",
+                "install.ps1", "yadorilink.exe", "yadorilink-daemon.exe",
                 "yadorilink_shell_ext.dll", "yadorilink-cfapi-host.exe",
                 "yadorilink_client_ffi.dll", "csharp/BINDING-NOTES.md",
                 "csharp/Generated/A.cs", "csharp/Generated/B.cs",
             },
             "macos-aarch64": {
-                "bin/yadorilink", "bin/yadorilink-daemon", "lib/libyadorilink_client_ffi.a",
+                "install.sh", "bin/yadorilink", "bin/yadorilink-daemon", "lib/libyadorilink_client_ffi.a",
                 "swift/Generated/YadoriLinkCore.swift", "swift/Generated/YadoriLinkFFI.swift",
                 "swift/Generated/include/module.modulemap", "swift/Generated/include/A.h",
                 "swift/Generated/include/B.h", "ipc-proto/proto/shellipc.proto", "ipc-proto/src/framing.rs",
@@ -799,6 +822,18 @@ def self_test() -> int:
             entries = entries_of(z1)
             assert set(entries) == names | set(RESERVED), (target, sorted(entries))
             assert verify_zip(z1) == [] and verify_zip(z1, target=target) == [], verify_zip(z1, target=target)
+            if "install.sh" in names or "install.ps1" in names:
+                # the bundled installer must equal the published one, byte for byte
+                pub_dir = tmp / f"published-{target}"
+                pub_dir.mkdir()
+                for inst in ("install.sh", "install.ps1"):
+                    if inst in names:
+                        (pub_dir / inst).write_bytes(entries[inst])
+                assert installer_problems(z1, pub_dir) == []
+                for inst in ("install.sh", "install.ps1"):
+                    if inst in names:
+                        (pub_dir / inst).write_bytes(entries[inst] + b"# changed\n")
+                assert installer_problems(z1, pub_dir), "a changed published installer was not noticed"
             sums = entries["SHA256SUMS"].decode()
             assert all(f"  {n}\n" in sums for n in names | set(NOTICE_FILES)), "SHA256SUMS misses a file"
             source = entries["SOURCE.txt"].decode()
@@ -1135,6 +1170,7 @@ def parse(argv):
     v.add_argument("--expect-zip-sha256")
     v.add_argument("--lock")
     v.add_argument("--release", action="store_true", help="release or production path: refuse a development bundle")
+    v.add_argument("--installers", help="directory of the published installers: the bundle's install.sh / install.ps1 must be byte-identical to them")
     return p.parse_args(argv)
 
 
@@ -1156,6 +1192,8 @@ def main(argv: list[str]) -> int:
         return resign(args)
     lock = json.loads(Path(args.lock).read_text(encoding="utf-8")) if args.lock else None
     found = verify_zip(Path(args.zip), args.expect_zip_sha256, lock, args.target, args.release)
+    if args.installers and not found:
+        found = installer_problems(Path(args.zip), Path(args.installers))
     for line in found:
         print(f"engine bundle verification failed: {line}", file=sys.stderr)
     return 1 if found else 0

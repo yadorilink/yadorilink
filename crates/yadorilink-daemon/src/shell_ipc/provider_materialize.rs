@@ -328,14 +328,24 @@ fn start(
             return;
         }
         match outcome {
-            Err(failure) => send_plain(&reply, response(&task_id, Err(failure))),
+            Err(failure) => {
+                let holder = if failure.0 == MaterializeFailure::Unobtainable {
+                    holder_of(&context, &request)
+                } else {
+                    None
+                };
+                send_plain(&reply, failure_response(&task_id, failure, holder));
+            }
             Ok((answer, handoff)) => {
                 // The last progress message: the content is verified. Queued before the
                 // response on the same channel, so it cannot arrive after it.
                 if let Some(progress) = &progress {
                     progress.finish();
-                    if let Some((completed, total)) = progress.snapshot() {
-                        send_plain(&reply, progress_message(&task_id, completed, total, true));
+                    if let Some(counts) = progress.snapshot() {
+                        send_plain(
+                            &reply,
+                            progress_message(&task_id, counts, progress.resumed_from(), true),
+                        );
                     }
                 }
                 // Delivered means the framed write completed, not that it was queued.
@@ -428,13 +438,19 @@ struct Answer {
 /// How often a changed progress is sent.
 const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
-fn progress_message(request_id: &[u8], completed: u64, total: u64, done: bool) -> ShellIpcMessage {
+fn progress_message(
+    request_id: &[u8],
+    (completed, total): (u64, u64),
+    resumed_from: Option<u64>,
+    done: bool,
+) -> ShellIpcMessage {
     ShellIpcMessage {
         payload: Some(Payload::MaterializeProgress(MaterializeProgress {
             request_id: request_id.to_vec(),
             completed,
             total,
             done,
+            resumed_from,
         })),
     }
 }
@@ -451,15 +467,15 @@ async fn run_reporting(
     tokio::pin!(work);
     let mut ticker = tokio::time::interval(PROGRESS_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last = None;
+    let mut last = (None, None);
     loop {
         tokio::select! {
             outcome = &mut work => return outcome,
             _ = ticker.tick() => {
-                let now = progress.snapshot();
+                let now = (progress.snapshot(), progress.resumed_from());
                 if now != last {
-                    if let Some((completed, total)) = now {
-                        send_plain(reply, progress_message(&request.request_id, completed, total, false));
+                    if let (Some(counts), resumed) = now {
+                        send_plain(reply, progress_message(&request.request_id, counts, resumed, false));
                     }
                     last = now;
                 }
@@ -695,6 +711,30 @@ fn failure_of(error: SyncError) -> Failure {
     }
 }
 
+/// The other device that authored the item's current version and is not connected now: the one
+/// to bring online when nothing reachable has the bytes. Best effort.
+fn holder_of(context: &ShellContext, request: &MaterializeToTempRequest) -> Option<String> {
+    let root = hex::encode(&request.root_id);
+    let item: ItemId = request.item_id.as_slice().try_into().ok()?;
+    let repo = context.replica_coordinator.provider_repository();
+    let declared = repo.list_declared_roots().ok()?.into_iter().find(|r| r.root_id == root)?;
+    let (path, _) = repo.path_for_item(&root, &item).ok().flatten()?;
+    context.holders.offline_holder(&declared.group_id, &path)
+}
+
+/// A failed answer, naming the holder when the engine knows one.
+fn failure_response(
+    request_id: &[u8],
+    failure: Failure,
+    holder: Option<String>,
+) -> ShellIpcMessage {
+    let mut message = response(request_id, Err(failure));
+    if let Some(Payload::MaterializeToTempResponse(r)) = &mut message.payload {
+        r.holder_device_id = holder.unwrap_or_default();
+    }
+    message
+}
+
 fn response(request_id: &[u8], answer: Result<Answer, Failure>) -> ShellIpcMessage {
     let message = match answer {
         Ok(answer) => MaterializeToTempResponse {
@@ -714,6 +754,8 @@ fn response(request_id: &[u8], answer: Result<Answer, Failure>) -> ShellIpcMessa
             ranged: answer.range.is_some(),
             range_offset: answer.range.map_or(0, |r| r.offset),
             range_length: answer.range.map_or(0, |r| r.len),
+            holder_device_id: String::new(),
+            holder_device_name: String::new(),
         },
         Err((failure, error)) => MaterializeToTempResponse {
             request_id: request_id.to_vec(),
@@ -727,6 +769,8 @@ fn response(request_id: &[u8], answer: Result<Answer, Failure>) -> ShellIpcMessa
             ranged: false,
             range_offset: 0,
             range_length: 0,
+            holder_device_id: String::new(),
+            holder_device_name: String::new(),
         },
     };
     ShellIpcMessage { payload: Some(Payload::MaterializeToTempResponse(message)) }

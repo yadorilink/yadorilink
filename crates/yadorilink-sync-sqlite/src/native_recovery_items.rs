@@ -790,8 +790,7 @@ pub(crate) struct LateEdit<'a> {
 #[derive(Clone, Debug)]
 pub(crate) struct LateEditMeta {
     pub mtime_unix_nanos: i64,
-    pub unix_mode: Option<u32>,
-    pub xattrs: Vec<(String, Vec<u8>)>,
+    pub exec: bool,
 }
 
 /// Why a late edit could not be made ready.
@@ -826,30 +825,21 @@ struct Registration {
 impl LateEdit<'_> {
     /// Names the item: the same edit at the same path is always the same item, so saving it
     /// again after a crash is one item.
-    /// The observed metadata is part of the name: the same bytes under another mode, xattrs or
+    /// The observed metadata is part of the name: the same bytes under another execute flag or
     /// mtime are another edit, and a retry that finds the file unchanged is the same one.
     fn item_id(&self, group: &FolderGroupId) -> String {
         let mut bytes = Vec::new();
-        let mode = self.meta.as_ref().and_then(|m| m.unix_mode);
-        let mode = mode.map_or_else(Vec::new, |m| m.to_be_bytes().to_vec());
+        let exec = vec![u8::from(self.meta.as_ref().is_some_and(|m| m.exec))];
         let mtime =
             self.meta.as_ref().map_or_else(Vec::new, |m| m.mtime_unix_nanos.to_be_bytes().to_vec());
-        let mut xattrs = Vec::new();
-        for (name, value) in self.meta.iter().flat_map(|m| &m.xattrs) {
-            for part in [name.as_bytes(), value.as_slice()] {
-                xattrs.extend_from_slice(&(part.len() as u64).to_be_bytes());
-                xattrs.extend_from_slice(part);
-            }
-        }
         for field in [
             b"late_edit".as_slice(),
             group.as_str().as_bytes(),
             self.path.as_bytes(),
             &[u8::from(self.symlink)],
             &self.sha256,
-            &mode,
+            &exec,
             &mtime,
-            &xattrs,
         ] {
             bytes.extend_from_slice(&(field.len() as u64).to_be_bytes());
             bytes.extend_from_slice(field);
@@ -865,20 +855,18 @@ impl LateEdit<'_> {
         if self.symlink {
             let meta = FileMeta {
                 mtime_unix_nanos,
-                unix_mode: None,
+                exec: false,
                 symlink_target: Some(self.symlink_target.to_vec()),
                 record_kind: RecordKind::Symlink,
-                xattrs: Vec::new(),
             };
             return FileVersion::new(Vec::new(), self.size, meta);
         }
         let observed = self.meta.clone();
         let meta = FileMeta {
             mtime_unix_nanos: observed.as_ref().map_or(mtime_unix_nanos, |m| m.mtime_unix_nanos),
-            unix_mode: observed.as_ref().and_then(|m| m.unix_mode),
+            exec: observed.as_ref().is_some_and(|m| m.exec),
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: observed.map(|m| m.xattrs).unwrap_or_default(),
         };
         FileVersion::new(blocks, self.size, meta)
     }

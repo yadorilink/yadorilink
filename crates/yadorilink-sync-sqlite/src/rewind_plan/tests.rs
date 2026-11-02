@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use super::*;
+use crate::file_index::ErasureReason;
 use yadorilink_replica_domain::file::FileRecord;
 
 /// `yadorilink_sqlite_runtime::init_schema` runs after the replica
@@ -439,9 +440,23 @@ fn stamps_the_local_admission_clock_at_the_write_chokepoint() {
     {
         let tx = c.transaction().unwrap();
         // Branch 1: brand-new path.
-        crate::file_index::upsert_file_in_tx(&tx, "g", &record("f.txt", 1, false), "").unwrap();
+        crate::file_index::upsert_file_in_tx(
+            &tx,
+            "g",
+            &record("f.txt", 1, false),
+            "",
+            crate::retention::Retention::OwnEdit,
+        )
+        .unwrap();
         // Branch 3: version bump over an existing current row.
-        crate::file_index::upsert_file_in_tx(&tx, "g", &record("f.txt", 2, false), "").unwrap();
+        crate::file_index::upsert_file_in_tx(
+            &tx,
+            "g",
+            &record("f.txt", 2, false),
+            "",
+            crate::retention::Retention::OwnEdit,
+        )
+        .unwrap();
         tx.commit().unwrap();
     }
     {
@@ -454,8 +469,14 @@ fn stamps_the_local_admission_clock_at_the_write_chokepoint() {
             [],
         )
         .unwrap();
-        crate::file_index::upsert_file_in_tx(&tx, "g", &record("scaffold.txt", 3, false), "")
-            .unwrap();
+        crate::file_index::upsert_file_in_tx(
+            &tx,
+            "g",
+            &record("scaffold.txt", 3, false),
+            "",
+            crate::retention::Retention::OwnEdit,
+        )
+        .unwrap();
         tx.commit().unwrap();
     }
 
@@ -770,7 +791,7 @@ fn the_ignore_sweep_through_the_repository_makes_earlier_targets_unavailable() {
 
     repo.upsert_file("g", &record, &permit).unwrap();
     let target = admitted_at(&db);
-    assert!(repo.remove_file("g", "kept.txt", &permit).unwrap());
+    assert!(repo.remove_file("g", "kept.txt", ErasureReason::IgnoreSweep, &permit).unwrap());
     std::thread::sleep(std::time::Duration::from_millis(2));
     repo.upsert_file("g", &record, &permit).unwrap();
     assert!(admitted_at(&db) > target, "the re-index is admitted after the target");
@@ -877,7 +898,7 @@ fn the_ignore_sweep_through_the_repository_without_a_reindex_is_unavailable() {
         })
         .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(2));
-    assert!(repo.remove_file("g", "gone.txt", &permit).unwrap());
+    assert!(repo.remove_file("g", "gone.txt", ErasureReason::IgnoreSweep, &permit).unwrap());
 
     let plan = db
         .read::<_, SyncSqliteError>(|conn| compute_rewind_plan(conn, "g", target, &|_| false))

@@ -51,7 +51,7 @@ fn area() -> Area {
         config_dir: path("state"),
         block_store_root: path("blocks"),
         sync_db_path: path("data/sync.sqlite3"),
-        provider_temp_root: None,
+        provider_temp_root: Some(path("provider-temp")),
         credential_keyring_scope: None,
         auth_server_addr: None,
         coordination_addr: None,
@@ -660,4 +660,613 @@ fn the_keychain_instance_nonce_round_trips_per_scope() {
     a.write(&[7; 16]).unwrap();
     assert_eq!(a.read().unwrap(), Some([7; 16]));
     assert_eq!(b.read().unwrap(), None);
+}
+
+/// The Activity list is local: a signed-out engine with no folders answers an empty page.
+#[test]
+fn listing_activity_works_signed_out_and_is_empty_without_folders() {
+    let area = area();
+    let host = MobileHost::new(area.config.clone());
+    host.start().unwrap();
+    let page = host.list_activity(50, None, None, &fresh(), Some(30_000)).expect("local read");
+    assert_eq!(page, ActivityPage { events: vec![], next_cursor: None });
+    host.stop().unwrap();
+}
+
+/// A call on an engine that is not running is a typed failure, and a cancelled one is aborted.
+#[test]
+fn listing_activity_honours_cancel() {
+    let area = area();
+    let host = MobileHost::new(area.config.clone());
+    host.start().unwrap();
+    let cancel = fresh();
+    cancel.cancel();
+    assert!(host.list_activity(50, None, None, &cancel, None).is_err());
+    host.stop().unwrap();
+}
+
+/// The activity records carry the facade's page and filter unchanged.
+#[test]
+fn activity_records_map_the_facades_dtos() {
+    use yadorilink_embedded_host::dto;
+    let filter: dto::ActivityFilter = ActivityFilter {
+        kinds: vec![ActivityKind::Conflict, ActivityKind::Restored],
+        origin: ActivityOrigin::OtherDevices,
+    }
+    .into();
+    assert_eq!(
+        filter,
+        dto::ActivityFilter {
+            kinds: vec![dto::ActivityKind::Conflict, dto::ActivityKind::Restored],
+            origin: dto::ActivityOrigin::OtherDevices,
+        }
+    );
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(5);
+    let page: ActivityPage = dto::ActivityPage {
+        events: vec![dto::ActivityEvent {
+            cursor: 9,
+            local_path: "/r".into(),
+            path: "a.txt".into(),
+            kind: dto::ActivityKind::Updated,
+            origin_device_id: Some("d1".into()),
+            origin_device_name: Some("Mac".into()),
+            is_this_device: false,
+            at: Some(at),
+        }],
+        next_cursor: Some(9),
+    }
+    .into();
+    assert_eq!(
+        page,
+        ActivityPage {
+            events: vec![ActivityEvent {
+                cursor: 9,
+                local_path: "/r".into(),
+                path: "a.txt".into(),
+                kind: ActivityKind::Updated,
+                origin_device_id: Some("d1".into()),
+                origin_device_name: Some("Mac".into()),
+                is_this_device: false,
+                at: Some(at),
+            }],
+            next_cursor: Some(9),
+        }
+    );
+}
+
+/// Send on a signed-out engine: the writes name that nobody is signed in (typed), the lists read
+/// as empty or say the Send service is not up, and nothing is left running.
+#[test]
+fn send_calls_on_a_signed_out_engine_are_typed() {
+    let area = area();
+    let host = MobileHost::new(area.config.clone());
+    host.start().unwrap();
+    let signed_out = |result: Result<(), CallFailure>| match result.expect_err("signed out") {
+        CallFailure::Refused { code, .. } => {
+            assert_eq!(code, RefusalCode::LocalIdentityUnavailable)
+        }
+        other => panic!("{other:?}"),
+    };
+    signed_out(
+        host.create_send_link(SendLinkTtl::OneHour, vec![], &fresh(), Some(30_000)).map(drop),
+    );
+    signed_out(host.preview_send_link("A-B".into(), &fresh(), Some(30_000)).map(drop));
+    signed_out(host.redeem_send_link("A-B".into(), None, &fresh(), Some(30_000)).map(drop));
+    signed_out(host.cancel_send_link("l".into(), &fresh(), Some(30_000)));
+    signed_out(host.send_link_status("l".into(), &fresh(), Some(30_000)).map(drop));
+    assert!(host.list_send_links(&fresh(), Some(30_000)).expect("an empty list").is_empty());
+    // No Send service without a registered, signed-in device.
+    assert!(matches!(host.list_inbox(&fresh(), Some(30_000)), Err(CallFailure::Failed { .. })));
+    host.stop().unwrap();
+}
+
+/// A cancelled read of the Send lists is aborted like any read.
+#[test]
+fn listing_send_links_honours_cancel() {
+    let area = area();
+    let host = MobileHost::new(area.config.clone());
+    host.start().unwrap();
+    let cancel = fresh();
+    cancel.cancel();
+    assert!(matches!(
+        host.list_send_links(&cancel, None),
+        Err(CallFailure::Cancelled { still_running: false })
+    ));
+    host.stop().unwrap();
+}
+
+/// The wire states and failures map onto the exported ones without loss.
+#[test]
+fn send_link_states_and_failures_mirror_the_products() {
+    use yadorilink_embedded_host::dto as d;
+    let states = [
+        (d::SendLinkState::Waiting, SendLinkState::Waiting),
+        (d::SendLinkState::Redeemed, SendLinkState::Redeemed),
+        (d::SendLinkState::Transferring, SendLinkState::Transferring),
+        (d::SendLinkState::Done, SendLinkState::Done),
+        (d::SendLinkState::Cancelled, SendLinkState::Cancelled),
+        (d::SendLinkState::Expired, SendLinkState::Expired),
+        (d::SendLinkState::Interrupted, SendLinkState::Interrupted),
+    ];
+    for (product, exported) in states {
+        assert_eq!(SendLinkState::from(product), exported);
+    }
+    assert_eq!(
+        TransferFailure::from(d::TransferFailure::Interrupted),
+        TransferFailure::Interrupted
+    );
+    assert_eq!(
+        RefusalCode::from(yadorilink_ipc_proto::daemonctl::ApplicationErrorCode::SendLinksDisabled),
+        RefusalCode::SendLinksDisabled
+    );
+}
+
+#[test]
+fn an_incoming_transfer_carries_the_link_redeemed_receive_fields() {
+    use yadorilink_ipc_proto::daemonctl::InboxTransfer;
+    let entry = InboxTransfer {
+        transfer_id: "t".into(),
+        status: "in_progress".into(),
+        total_size: 10,
+        link_id: "link-1".into(),
+        received_bytes: 4,
+        destination_dir: "/recv/link-1".into(),
+        ..Default::default()
+    };
+    let record = crate::send::IncomingTransfer::from(
+        yadorilink_embedded_host::dto::incoming_transfer(&entry),
+    );
+    assert_eq!(record.link_id.as_deref(), Some("link-1"));
+    assert_eq!(record.received_bytes, 4);
+    assert_eq!(record.destination_dir.as_deref(), Some("/recv/link-1"));
+    let plain =
+        crate::send::IncomingTransfer::from(yadorilink_embedded_host::dto::incoming_transfer(
+            &InboxTransfer { transfer_id: "u".into(), ..Default::default() },
+        ));
+    assert_eq!((plain.link_id, plain.received_bytes, plain.destination_dir), (None, 0, None));
+}
+
+// ---- writes ----------------------------------------------------------------------------------
+
+fn running(area: &Area) -> Arc<MobileHost> {
+    let host = MobileHost::new(area.config.clone());
+    host.start().unwrap();
+    host
+}
+
+#[test]
+fn a_file_is_staged_by_move_and_by_clone_and_a_stage_can_be_discarded() {
+    let area = area();
+    let host = running(&area);
+    let work = tempfile::tempdir_in(area._dir.path()).unwrap();
+    let bytes = vec![3u8; 2 << 20];
+    let path = work.path().join("movie.mov");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let moved = host
+        .stage_upload(
+            StageSource::Path { path: path.display().to_string() },
+            StageMode::Move,
+            &fresh(),
+            Some(60_000),
+        )
+        .unwrap();
+    let StageResult::Staged { upload } = moved else { panic!("not staged: {moved:?}") };
+    assert_eq!(upload.how, StagedHow::Moved, "the file was renamed, not copied");
+    assert_eq!((upload.size, upload.sha256.len()), (bytes.len() as u64, 32));
+    assert!(!path.exists());
+    let staged = area._dir.path().join("provider-temp/ingest").join(&upload.ingest_name);
+    assert_eq!(std::fs::read(&staged).unwrap(), bytes);
+
+    // A source that is not there is a typed refusal, not a failed call.
+    let missing = host
+        .stage_upload(
+            StageSource::Path { path: path.display().to_string() },
+            StageMode::Clone,
+            &fresh(),
+            Some(60_000),
+        )
+        .unwrap();
+    assert!(
+        matches!(missing, StageResult::Refused { code: WriteRefusal::IngestUnstable, .. }),
+        "{missing:?}"
+    );
+
+    host.discard_staged_upload(upload.ingest_name.clone(), &fresh(), Some(60_000)).unwrap();
+    assert!(!staged.exists());
+    // Idempotent, and only names the engine issued are accepted.
+    host.discard_staged_upload(upload.ingest_name, &fresh(), Some(60_000)).unwrap();
+    assert!(host.discard_staged_upload("../elsewhere".to_owned(), &fresh(), Some(60_000)).is_err());
+    host.stop().unwrap();
+}
+
+#[test]
+fn a_change_for_an_unknown_root_is_a_typed_refusal_and_delivery_names_what_it_does_not_know() {
+    let area = area();
+    let host = running(&area);
+    let change = WriteChange {
+        request_id: vec![1],
+        session_id: vec![7; 16],
+        operation_seq: 1,
+        root_id: vec![9; 16],
+        kind: WriteKind::Create,
+        item_id: Vec::new(),
+        parent_item_id: None,
+        name: Some("a.txt".into()),
+        entry_kind: WriteEntryKind::File,
+        base_version: Vec::new(),
+        content: None,
+        mtime_unix_nanos: None,
+        exec: None,
+        recursive: false,
+        base_generation: None,
+        parent_generation: None,
+        observed_revision: None,
+        restore_from: None,
+    };
+    let result = host.apply_change(change, &fresh(), Some(60_000)).unwrap();
+    assert!(
+        matches!(result, WriteResult::Refused { code: WriteRefusal::NotReady, .. }),
+        "{result:?}"
+    );
+
+    let report = host
+        .version_delivery(
+            vec![DeliveryItem {
+                root_id: vec![9; 16],
+                item_id: vec![8; 16],
+                content_version: vec![0; 40],
+            }],
+            &fresh(),
+            Some(60_000),
+        )
+        .unwrap();
+    assert_eq!(report.items.len(), 1);
+    assert_eq!(report.items[0].state, DeliveryState::NotFound);
+    assert_eq!(report.undelivered_count, 0, "an unknown item is not counted as only on this phone");
+
+    let too_many = (0..257)
+        .map(|n| DeliveryItem {
+            root_id: vec![9; 16],
+            item_id: vec![n as u8; 16],
+            content_version: vec![0; 40],
+        })
+        .collect();
+    assert!(host.version_delivery(too_many, &fresh(), Some(60_000)).is_err());
+    host.stop().unwrap();
+}
+
+#[test]
+fn the_wire_answers_map_to_the_typed_results() {
+    use yadorilink_ipc_proto::shellipc as wire;
+    let item = wire::ProviderAppliedItem {
+        item_id: vec![1; 16],
+        parent_item_id: Vec::new(),
+        name: "a.txt".into(),
+        entry_kind: wire::EntryKind::File as i32,
+        content_version: vec![2; 40],
+        metadata_version: vec![3; 40],
+        size: 5,
+        mtime_unix_nanos: 6,
+        exec: true,
+        current: true,
+        namespace_revision: 7,
+        parent_generation: 8,
+    };
+    let applied = WriteResult::from(wire::ProviderApplyChangeResponse {
+        ok: true,
+        outcome: wire::ProviderApplyOutcome::Concurrent as i32,
+        item: Some(item),
+        replayed: true,
+        ..Default::default()
+    });
+    let WriteResult::Applied { outcome, item, replayed } = applied else { panic!() };
+    assert_eq!((outcome, replayed), (WriteOutcome::Concurrent, true));
+    assert_eq!(item.unwrap().content_version, vec![2; 40]);
+
+    let refused = WriteResult::from(wire::ProviderApplyChangeResponse {
+        ok: false,
+        failure: wire::ProviderApplyFailure::KeepLocal as i32,
+        error: "keep".into(),
+        suggested_name: "a (phone).txt".into(),
+        ..Default::default()
+    });
+    assert_eq!(
+        refused,
+        WriteResult::Refused {
+            code: WriteRefusal::KeepLocal,
+            message: "keep".into(),
+            suggested_name: Some("a (phone).txt".into()),
+        }
+    );
+    // Every wire failure has a refusal the app can show.
+    for failure in [
+        wire::ProviderApplyFailure::NotAuthorized,
+        wire::ProviderApplyFailure::StaleView,
+        wire::ProviderApplyFailure::NameCollision,
+        wire::ProviderApplyFailure::LowDisk,
+        wire::ProviderApplyFailure::OperationMismatch,
+    ] {
+        let result = WriteResult::from(wire::ProviderApplyChangeResponse {
+            failure: failure as i32,
+            ..Default::default()
+        });
+        assert!(matches!(result, WriteResult::Refused { .. }));
+    }
+    let request = wire::ProviderApplyChangeRequest::from(WriteChange {
+        request_id: vec![1],
+        session_id: vec![2; 16],
+        operation_seq: 3,
+        root_id: vec![4; 16],
+        kind: WriteKind::Modify,
+        item_id: vec![5; 16],
+        parent_item_id: Some(Vec::new()),
+        name: Some("b".into()),
+        entry_kind: WriteEntryKind::Directory,
+        base_version: vec![6; 40],
+        content: Some(WriteContent { ingest_name: "up-1".into(), size: 9, sha256: vec![7; 32] }),
+        mtime_unix_nanos: Some(10),
+        exec: Some(true),
+        recursive: true,
+        base_generation: Some(11),
+        parent_generation: Some(12),
+        observed_revision: Some(13),
+        restore_from: Some(crate::writes::RestoreSource {
+            path: "a/b.txt".into(),
+            version_hash: vec![9; 32],
+        }),
+    });
+    assert_eq!(request.kind, wire::ProviderChangeKind::Modify as i32);
+    assert_eq!(request.entry_kind, wire::EntryKind::Directory as i32);
+    assert_eq!(request.parent_item_id, Some(Vec::new()), "an empty parent is the root");
+    assert_eq!(request.content.unwrap().ingest_name, "up-1");
+    assert_eq!(request.metadata.unwrap().exec, Some(true));
+    assert_eq!(
+        (request.base_generation, request.parent_generation, request.observed_revision),
+        (Some(11), Some(12), Some(13))
+    );
+    let restore = request.restore_from.unwrap();
+    assert_eq!((restore.path.as_str(), restore.version_hash), ("a/b.txt", vec![9; 32]));
+}
+
+/// The destination picker's device record: a full copy is `full_replica`, only an owner or
+/// editor `can_write`, and an unrecognized storage mode never reads as a full replica.
+#[test]
+fn a_group_device_says_whether_it_keeps_a_full_replica() {
+    let member = |storage, role| yadorilink_embedded_host::dto::MemberSummary {
+        device_id: "d1".into(),
+        device_name: "Mac".into(),
+        role,
+        relationship: yadorilink_embedded_host::dto::MemberRelationship::YourOtherDevice,
+        storage,
+        online: true,
+        last_seen: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(42)),
+    };
+    let full: GroupDevice = member(
+        yadorilink_embedded_host::dto::MemberStorage::FullCopy,
+        yadorilink_embedded_host::dto::ShareRole::Editor,
+    )
+    .into();
+    assert!(full.full_replica && full.can_write && full.online && !full.is_this_device);
+    assert_eq!(full.last_seen_unix, Some(42));
+    let phone: GroupDevice = member(
+        yadorilink_embedded_host::dto::MemberStorage::OnDemand,
+        yadorilink_embedded_host::dto::ShareRole::Viewer,
+    )
+    .into();
+    assert!(!phone.full_replica && !phone.can_write);
+}
+
+/// The device list needs an account, like the joinable list.
+#[test]
+fn listing_group_devices_needs_a_sign_in() {
+    let area = area();
+    let host = MobileHost::new(area.config.clone());
+    host.start().unwrap();
+    let refused =
+        host.list_group_devices("g1".into(), &fresh(), Some(30_000)).expect_err("signed out");
+    assert!(
+        matches!(&refused, CallFailure::Account { error } if error.kind == AccountErrorKind::NotSignedIn),
+        "{refused:?}"
+    );
+    host.stop().unwrap();
+}
+
+/// A phone cannot create an On-Demand share: its only member would keep no full copy.
+#[test]
+fn creating_an_on_demand_share_is_refused_typed() {
+    let area = area();
+    let host = MobileHost::new(area.config.clone());
+    host.start().unwrap();
+    let create = CreateShareRequest {
+        group_name: "Photos".into(),
+        folder: ShareFolder::Provider { display_name: "Photos".into(), request_token: "t".into() },
+        on_demand: true,
+        acknowledge_risks: false,
+    };
+    let refused = host.create_share(create, &fresh(), Some(30_000)).expect_err("refused");
+    assert!(matches!(refused, CallFailure::NoFullReplica { .. }), "{refused:?}");
+    host.stop().unwrap();
+}
+
+/// A refused pairing code has its own account error kind, so an app can say "make a new code".
+#[test]
+fn a_refused_pairing_code_has_its_own_account_error_kind() {
+    use crate::app::{AccountError, AccountErrorKind};
+    let error = AccountError::from(yadorilink_embedded_host::DesktopError::Refused {
+        message: "m".into(),
+        reason: yadorilink_embedded_host::RefusalReason::PairingCodeInvalid,
+    });
+    assert_eq!(error.kind, AccountErrorKind::PairingCodeInvalid);
+}
+
+/// Each of the seven hand-over refusals has its own account error kind; other refusals stay
+/// `Refused`.
+#[test]
+fn every_primary_transfer_refusal_has_its_own_account_error_kind() {
+    use crate::app::{AccountError, AccountErrorKind as K};
+    use yadorilink_embedded_host::RefusalReason as R;
+    let kind = |reason| {
+        AccountError::from(yadorilink_embedded_host::DesktopError::Refused {
+            message: "m".into(),
+            reason,
+        })
+        .kind
+    };
+    let all = [
+        (R::PrimaryTransferNotPrimary, K::PrimaryTransferNotPrimary),
+        (R::PrimaryTransferTargetNotMember, K::PrimaryTransferTargetNotMember),
+        (R::PrimaryTransferTargetSameAccount, K::PrimaryTransferTargetSameAccount),
+        (R::PrimaryTransferOfferExpired, K::PrimaryTransferOfferExpired),
+        (R::PrimaryTransferGroupNotActive, K::PrimaryTransferGroupNotActive),
+        (R::PrimaryTransferConflict, K::PrimaryTransferConflict),
+        (R::PrimaryTransferNotFound, K::PrimaryTransferNotFound),
+    ];
+    for (reason, expected) in all {
+        assert_eq!(kind(reason), expected);
+    }
+    assert_eq!(kind(R::StartOverRestartRequired), K::StartOverRestartRequired);
+}
+
+/// The offer record keeps every field and reads times as Unix seconds.
+#[test]
+fn a_primary_transfer_converts_with_its_status_and_times() {
+    use crate::app::{PrimaryTransfer, PrimaryTransferDirection, PrimaryTransferStatus};
+    use yadorilink_embedded_host::dto as d;
+    let at = |s| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s);
+    let summary = |status| d::PrimaryTransferSummary {
+        transfer_id: "t".into(),
+        group_id: "g".into(),
+        group_name: "Photos".into(),
+        direction: d::PrimaryTransferDirection::Incoming,
+        status,
+        to_device_id: "dev".into(),
+        created_at: at(10),
+        expires_at: at(20),
+    };
+    let pending: PrimaryTransfer = summary(d::PrimaryTransferStatus::Pending).into();
+    assert_eq!(pending.direction, PrimaryTransferDirection::Incoming);
+    assert_eq!(pending.status, PrimaryTransferStatus::Pending);
+    assert_eq!((pending.created_at_unix, pending.expires_at_unix), (10, 20));
+    let other: PrimaryTransfer =
+        summary(d::PrimaryTransferStatus::Other { raw: "x".into() }).into();
+    assert_eq!(other.status, PrimaryTransferStatus::Other { raw: "x".into() });
+}
+
+/// All five hand-over calls need a sign-in.
+#[test]
+fn the_primary_transfer_calls_need_a_sign_in() {
+    let area = area();
+    let host = MobileHost::new(area.config.clone());
+    host.start().unwrap();
+    let signed_out = |r: Result<(), CallFailure>| {
+        let refused = r.expect_err("signed out");
+        assert!(
+            matches!(&refused, CallFailure::Account { error } if error.kind == AccountErrorKind::NotSignedIn),
+            "{refused:?}"
+        );
+    };
+    let c = || fresh();
+    signed_out(host.list_primary_transfers(&c(), Some(30_000)).map(drop));
+    signed_out(host.offer_primary_transfer("g".into(), "d".into(), &c(), Some(30_000)).map(drop));
+    signed_out(host.cancel_primary_transfer("g".into(), "t".into(), &c(), Some(30_000)).map(drop));
+    signed_out(host.decline_primary_transfer("g".into(), "t".into(), &c(), Some(30_000)).map(drop));
+    signed_out(host.accept_primary_transfer("g".into(), "t".into(), &c(), Some(30_000)).map(drop));
+    host.stop().unwrap();
+}
+
+/// A restore that no device can supply has its own refusal, so the app can say "connect the
+/// device that has the file".
+#[test]
+fn an_unavailable_version_is_a_typed_write_refusal() {
+    use yadorilink_ipc_proto::shellipc as wire;
+    let result = WriteResult::from(wire::ProviderApplyChangeResponse {
+        ok: false,
+        failure: wire::ProviderApplyFailure::VersionUnavailable as i32,
+        error: "gone".into(),
+        ..Default::default()
+    });
+    assert!(
+        matches!(result, WriteResult::Refused { code: WriteRefusal::VersionUnavailable, .. }),
+        "{result:?}"
+    );
+}
+
+/// The history listings keep every field, add the device names that were readable and leave the
+/// rest `None`.
+#[test]
+fn the_history_listings_convert_with_device_names() {
+    use crate::writes::{
+        DeletedParent, HistoryEntryKind, HistoryVersionState as State, ItemHistory,
+    };
+    use yadorilink_embedded_host as h;
+    let names = std::collections::HashMap::from([("mac".to_owned(), "Mac".to_owned())]);
+    let version = |seq, state, origin: Option<&str>| h::ItemVersion {
+        version_seq: seq,
+        version_hash: vec![seq as u8; 32],
+        size: 10,
+        mtime_unix_nanos: 5,
+        state,
+        origin_device_id: origin.map(str::to_owned),
+        kind: h::HistoryEntryKind::File,
+        restorable: state != h::HistoryVersionState::Current,
+    };
+    let history: ItemHistory = crate::writes::item_history_for_tests(h::HistoryOutcome {
+        listing: h::ItemHistory {
+            path: "a/b.txt".into(),
+            live: true,
+            versions: vec![
+                version(2, h::HistoryVersionState::Current, Some("phone")),
+                version(1, h::HistoryVersionState::Superseded, Some("mac")),
+            ],
+        },
+        device_names: names.clone(),
+    });
+    assert_eq!(history.path, "a/b.txt");
+    assert_eq!(history.versions[0].state, State::Current);
+    assert!(!history.versions[0].restorable && history.versions[1].restorable);
+    assert_eq!(history.versions[0].origin_device_name, None, "an unreadable name is None");
+    assert_eq!(history.versions[1].origin_device_name.as_deref(), Some("Mac"));
+    assert_eq!(history.versions[1].version_hash, vec![1; 32]);
+
+    let deleted = crate::writes::deleted_items_for_tests(h::HistoryOutcome {
+        listing: h::DeletedItems {
+            truncated: true,
+            items: vec![h::DeletedItem {
+                path: "d/x.bin".into(),
+                name: "x.bin".into(),
+                parent: h::DeletedParent::Item(vec![7; 16]),
+                version_seq: 3,
+                version_hash: vec![3; 32],
+                size: 99,
+                deleted_at_unix_nanos: 123,
+                origin_device_id: Some("mac".into()),
+                kind: h::HistoryEntryKind::File,
+                restorable: true,
+                operation: Some("mac:ab".into()),
+            }],
+        },
+        device_names: names,
+    });
+    assert!(deleted.truncated);
+    let item = &deleted.items[0];
+    assert_eq!(item.parent, DeletedParent::Item { item_id: vec![7; 16] });
+    assert_eq!((item.kind, item.size), (HistoryEntryKind::File, 99));
+    assert_eq!(item.origin_device_name.as_deref(), Some("Mac"));
+    assert_eq!(item.operation.as_deref(), Some("mac:ab"));
+}
+
+/// Both listings need a running engine and a known root.
+#[test]
+fn the_history_listings_refuse_an_unknown_root() {
+    let area = area();
+    let host = MobileHost::new(area.config.clone());
+    host.start().unwrap();
+    let refused = host.list_deleted(vec![1; 16], &fresh(), Some(30_000)).expect_err("no such root");
+    assert!(matches!(refused, CallFailure::Failed { .. }), "{refused:?}");
+    let refused = host
+        .list_versions(vec![1; 16], vec![2; 16], &fresh(), Some(30_000))
+        .expect_err("no such root");
+    assert!(matches!(refused, CallFailure::Failed { .. }), "{refused:?}");
+    host.stop().unwrap();
 }

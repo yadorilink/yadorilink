@@ -23,7 +23,7 @@ yadorilink-reporting = { path = "../yadorilink-reporting" }
 tokio = { workspace = true, features = ["signal"] }
 # Local-time rendering of timestamps in `status` (`localtime_r`).
 libc = "0.2"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 thiserror.workspace = true
 # Audit-trail logging for the `--force` durability-gate override on
 # `unlink`/`share revoke`/`device remove` (see `commands::durability_force`).
@@ -35,6 +35,8 @@ tracing-subscriber.workspace = true
 yadorilink-fapi-client.workspace = true
 serde.workspace = true
 serde_json = "1"
+# The kept installer's hash is checked before it runs (commands/kept_installer.rs).
+sha2.workspace = true
 # Renders `share invite`'s one-use URL as a terminal QR code
 # (`commands::share`'s `render_invite_qr`). `default-features = false`
 # drops the `image`/`svg`/`pic` default features entirely -- only the core
@@ -62,6 +64,7 @@ yadorilink-transport = { path = "../yadorilink-transport" }
 # is a composition of the crate's public API (see its `test_support` module),
 # and nothing in the product path enables it.
 yadorilink-fapi-client = { workspace = true, features = ["test-support"] }
+wiremock = "0.6"
 # Test-only: integration tests seed a `ReplicaCoordinator` fixture directly
 # (bypassing the daemon's normal write path), which requires a
 # `RootCommitPermit` -- `RootCommitPermit::for_tests()` is only compiled in
@@ -79,7 +82,6 @@ yadorilink-http-api = { path = "../yadorilink-http-api" }
 yadorilink-sqlite-runtime = { path = "../yadorilink-sqlite-runtime", features = ["test-support"] }
 tempfile = "3"
 hex = "0.4"
-sha2.workspace = true
 ed25519-dalek = "3"
 # The wire-contract harness plays the user agent for two browser legs, and a
 # browser is exactly what the cookie store is: both legs hang a

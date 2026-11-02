@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use yadorilink_fapi_client::{
     complete_enrolment, open_enrolment, AuthorizationRequest, CredentialManager, EnrolmentRequest,
-    Es256Key, FapiClient, Pkce,
+    Es256Key, FapiClient, PairingCode, Pkce,
 };
 
 use crate::coordination::credential_store;
@@ -128,6 +128,75 @@ pub async fn login_in(
         return Err(already_enrolled());
     }
 
+    enrol_and_sign_in(dir, settings, store, Enrol::Browser { device }, &mut sink).await
+}
+
+/// Enrols this installation with a pairing code from the account's web page and signs it in,
+/// with no browser on this machine: the code stands in for the approval, and the sign-in leg
+/// is finished by following the server's redirects ([`FapiClient::authorize_without_browser`]).
+///
+/// Reports `Enrolling` and then `SignedIn`; there is nothing for a person to open or enter.
+/// Nothing is written to the credential store unless the whole sign-in succeeded. A code is
+/// spent by the server when it is accepted, so a failure after that needs a new code.
+///
+/// # Errors
+/// [`CoreError::PairingCodeRefused`] when the server does not accept the code (unknown,
+/// expired, already used: it does not say which), a rate-limit refusal when the server's abuse
+/// budget is exhausted, and the usual sign-in errors. A code is refused up front, without being
+/// sent, when this installation is already signed in.
+pub async fn login_with_pairing_code(
+    code: PairingCode,
+    sink: impl FnMut(LoginEvent),
+) -> Result<(), CoreError> {
+    let dir = credential_store::process_dir()?;
+    login_with_pairing_code_in(
+        &dir,
+        &credential_store::CredentialSettings::from_env(&dir)?,
+        code,
+        sink,
+    )
+    .await
+}
+
+/// [`login_with_pairing_code`] for the state directory `dir`.
+pub async fn login_with_pairing_code_in(
+    dir: &std::path::Path,
+    settings: &credential_store::CredentialSettings,
+    code: PairingCode,
+    mut sink: impl FnMut(LoginEvent),
+) -> Result<(), CoreError> {
+    let store = Arc::new(credential_store::open_in(dir, settings)?);
+    // The code is not spent on an installation that could not use what it yields.
+    if store.load()?.is_some() {
+        return Err(already_enrolled());
+    }
+    enrol_and_sign_in(dir, settings, store, Enrol::Pairing(&code), &mut sink).await
+}
+
+/// How an installation without an identity gets one.
+enum Enrol<'a> {
+    /// A person approves in a browser; `device` signs in with the device grant afterwards.
+    Browser { device: bool },
+    /// The account's pairing code approves; the sign-in finishes without a browser.
+    Pairing(&'a PairingCode),
+}
+
+/// The refusals of an enrolment opened with a pairing code, in the person's terms.
+fn pairing_open_error(error: yadorilink_fapi_client::Error) -> CoreError {
+    if error.is_invalid_grant() {
+        CoreError::PairingCodeRefused
+    } else {
+        error.into()
+    }
+}
+
+async fn enrol_and_sign_in(
+    dir: &std::path::Path,
+    settings: &credential_store::CredentialSettings,
+    store: Arc<yadorilink_fapi_client::CredentialStore>,
+    how: Enrol<'_>,
+    sink: &mut impl FnMut(LoginEvent),
+) -> Result<(), CoreError> {
     let base_url = settings.coordination_addr();
     let http = crate::coordination::http_client::client()?;
 
@@ -140,6 +209,10 @@ pub async fn login_in(
 
     // 2. Enrolment. The key is generated here and only its public half is sent.
     let client_key = Es256Key::generate();
+    let pairing_code = match &how {
+        Enrol::Pairing(code) => Some(*code),
+        Enrol::Browser { .. } => None,
+    };
     let pending = open_enrolment(
         &http,
         &base_url,
@@ -147,15 +220,17 @@ pub async fn login_in(
         &EnrolmentRequest {
             redirect_uris: &redirect_uris,
             client_name: Some(&client_name(settings.host_name.as_deref())),
+            pairing_code,
         },
     )
-    .await?;
+    .await
+    .map_err(|e| if pairing_code.is_some() { pairing_open_error(e) } else { e.into() })?;
 
-    sink(LoginEvent::OpenBrowser {
-        url: pending.approval_uri.clone(),
-        purpose: BrowserPurpose::ApproveDevice,
-    });
-    sink(LoginEvent::WaitingForApproval { expires_in: pending.expires_in });
+    // A paired enrolment has no approval step: the first poll collects the registration.
+    if let Some(approval_uri) = pending.approval_uri.clone() {
+        sink(LoginEvent::OpenBrowser { url: approval_uri, purpose: BrowserPurpose::ApproveDevice });
+        sink(LoginEvent::WaitingForApproval { expires_in: pending.expires_in });
+    }
 
     let registration =
         complete_enrolment(&http, &pending, &client_key, |wait| tokio::time::sleep(wait)).await?;
@@ -177,7 +252,29 @@ pub async fn login_in(
     )
     .await?;
 
-    let tokens = if device {
+    let tokens = if let Enrol::Pairing(_) = how {
+        // The redirect is never dialed: the server's redirects are followed here and the
+        // registered address only names where the code would have been delivered.
+        drop(listener);
+
+        let pkce = Pkce::generate();
+        let state = loopback::random_state();
+        let pushed = client
+            .push_authorization_request(&AuthorizationRequest {
+                redirect_uri: &redirect_uri,
+                scope: LOGIN_SCOPE,
+                state: &state,
+                prompt: Some("consent"),
+                pkce: &pkce,
+            })
+            .await?;
+        let redirected = client
+            .authorize_without_browser(&pushed.request_uri, &redirect_uri)
+            .await
+            .map_err(browser_required_after_pairing)?;
+        let code = loopback::code_from_redirect(&redirected, &state, &client.metadata().issuer)?;
+        client.exchange_authorization_code(&code, &redirect_uri, &pkce).await?
+    } else if matches!(how, Enrol::Browser { device: true }) {
         // The loopback listener registered above is never contacted on this
         // path; drop it now instead of holding the port for no reason.
         drop(listener);
@@ -229,6 +326,18 @@ pub async fn login_in(
 
     sink(LoginEvent::SignedIn { client_id: manager.client_id().to_owned() });
     Ok(())
+}
+
+/// A pairing sign-in that the server sent to a person: the handoff of the code's sign-in ran
+/// out (or the server changed what it does), and nothing was written here.
+fn browser_required_after_pairing(error: yadorilink_fapi_client::Error) -> CoreError {
+    match error {
+        yadorilink_fapi_client::Error::BrowserRequired(detail) => CoreError::AuthFailed(format!(
+            "the code was accepted but the sign-in could not finish without a browser ({detail}); \
+             create a new code on the web page and try again"
+        )),
+        other => other.into(),
+    }
 }
 
 /// Confirms the person's account again as THIS installation, for an action that

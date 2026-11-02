@@ -90,7 +90,10 @@ impl super::LocalConvergenceExecutor {
         let window = crate::receive_diag::window_begin(group_id);
         let path_count = paths.len();
         let fetch_started = crate::receive_diag::clock();
-        let prefetched = self.obtain_missing_content(driver, group_id, &paths, call_timer).await?;
+        // `_pass_holds` keeps what the pass holds (blocks in memory, completed temps) alive until this
+        // attempt has settled.
+        let (prefetched, _pass_holds) =
+            self.obtain_missing_content(driver, group_id, &paths, call_timer).await?;
         if let Some(started) = fetch_started {
             call_timer.add_window_fetch(started.elapsed());
         }
@@ -121,7 +124,6 @@ impl super::LocalConvergenceExecutor {
     /// strictly after the durable write it attests to" true under batching.
     fn absorb_commit_result(
         &self,
-        driver: &Arc<dyn yadorilink_peer_session::convergence_driver::ConvergenceDriver>,
         joined: Result<CommittedBatch, tokio::task::JoinError>,
         pool: &mut ReceiveCommitPool,
         call_timer: Option<&crate::local_convergence::call_timer::ReconcileCallTimer>,
@@ -141,14 +143,18 @@ impl super::LocalConvergenceExecutor {
         if let (Some(timer), Some(elapsed)) = (call_timer, committed.elapsed) {
             timer.add_store_put(elapsed);
         }
-        for rejected in &committed.rejected {
-            tracing::warn!(
-                local_device_id = %self.local_device_id,
-                candidate_peer_id = %driver.peer_device_id(),
-                hash = %hex::encode(rejected),
-                "peer returned bytes that do not hash to the requested block; discarding them"
-            );
-            pool.lost_content = true;
+        // Blocks kept in memory are the pass's whatever happened to the rest of the batch: they are
+        // released with the pass, and are never provenance-eligible.
+        // The pass takes over what the batch holds; a pool without a hold (only a single-pass pass
+        // has blocks of this kind) leaves it to the batch's drop, which releases it.
+        let mut committed = committed;
+        if let Some(hold) = pool.window_hold.as_mut() {
+            hold.absorb(&mut committed.window_hold);
+        }
+        for hash in &committed.window_held {
+            if let Some(batch) = &pool.reconcile_batch {
+                batch.record(hash.clone());
+            }
         }
         if let Some(e) = committed.error {
             if pool.fatal.is_none() {
@@ -190,6 +196,7 @@ impl super::LocalConvergenceExecutor {
         give_up: &mut bool,
         fatal_error: &mut Option<PeerSessionError>,
         call_timer: Option<&crate::local_convergence::call_timer::ReconcileCallTimer>,
+        progress: Option<&crate::transfer_progress::TransferProgressGuard>,
     ) {
         let result = result.map(|fetched| {
             // The session reports the wire wait; attributing it is this
@@ -201,18 +208,22 @@ impl super::LocalConvergenceExecutor {
             fetched.outcome
         });
         match result {
-            Ok(yadorilink_peer_session::convergence_driver::BlockFetch::Fetched { hash, data }) => {
+            Ok(yadorilink_peer_session::convergence_driver::BlockFetch::Fetched(block)) => {
                 if let Some(timer) = call_timer {
                     timer.add_block_fetched();
+                }
+                if let Some(progress) = progress {
+                    progress.record_block_done(block.bytes().len() as u64, driver.peer_device_id());
                 }
                 self.pool_push(
                     driver,
                     pool,
                     PendingBlock {
-                        hash,
-                        data,
+                        hash: block.raw_hash(),
+                        block,
                         path: file_path.to_string(),
                         version_hex: version_hex.to_string(),
+                        window_cacheable: false,
                     },
                     call_timer,
                 )
@@ -493,6 +504,25 @@ impl super::LocalConvergenceExecutor {
         // newer one that superseded it. That version is the caller's, and
         // arrives as `version_hash`.
         let current_version_hash_hex = version_hash.to_hex();
+        // The status model's transfer for this file: the bytes this call has to fetch (a block
+        // that is held, or already in the pool, costs no network), reported as they arrive.
+        // Dropped with this call, whatever its outcome.
+        let _progress = self.transfer_progress.get().and_then(|tracker| {
+            let to_fetch: Vec<u64> = blocks
+                .iter()
+                .zip(&present)
+                .filter(|(block, already_present)| {
+                    !(**already_present
+                        && (provenance_hashes.contains(&block.hash)
+                            || reconcile_batch.is_some_and(|b| b.already_known(&block.hash))))
+                        && !pool.fetched.contains(&block.hash)
+                })
+                .map(|(block, _)| block.size as u64)
+                .collect();
+            (!to_fetch.is_empty()).then(|| {
+                tracker.begin(group_id, file_path, to_fetch.iter().sum(), to_fetch.len() as u64)
+            })
+        });
         let mut all_present = true;
         let concurrency = self.state.tuning().block_fetch_concurrency;
         // Bounded-concurrency block fetch rather than a strictly
@@ -591,6 +621,7 @@ impl super::LocalConvergenceExecutor {
                         &mut give_up,
                         &mut fatal_error,
                         call_timer,
+                        _progress.as_ref(),
                     )
                     .await;
                 }
@@ -612,6 +643,7 @@ impl super::LocalConvergenceExecutor {
                 &mut give_up,
                 &mut fatal_error,
                 call_timer,
+                _progress.as_ref(),
             )
             .await;
         }
@@ -710,13 +742,13 @@ impl super::LocalConvergenceExecutor {
         group_id: &str,
         paths: &std::collections::BTreeSet<String>,
         call_timer: &crate::local_convergence::call_timer::ReconcileCallTimer,
-    ) -> Result<HashMap<String, BlockRequirement>, PeerSessionError> {
+    ) -> Result<(HashMap<String, BlockRequirement>, PassHolds), PeerSessionError> {
         let shape = PrefetchShape::Overlapped {
             fetches_in_flight: self.state.tuning().block_fetch_concurrency,
         };
-        let (requirements, _outcomes) =
+        let (requirements, _outcomes, holds) =
             self.obtain_missing_content_with(driver, group_id, paths, call_timer, shape).await?;
-        Ok(requirements)
+        Ok((requirements, holds))
     }
 
     /// [`Self::obtain_missing_content`] with the fetch stage's shape chosen
@@ -729,7 +761,11 @@ impl super::LocalConvergenceExecutor {
         call_timer: &crate::local_convergence::call_timer::ReconcileCallTimer,
         shape: PrefetchShape,
     ) -> Result<
-        (HashMap<String, BlockRequirement>, std::collections::BTreeMap<String, PathPrefetch>),
+        (
+            HashMap<String, BlockRequirement>,
+            std::collections::BTreeMap<String, PathPrefetch>,
+            PassHolds,
+        ),
         PeerSessionError,
     > {
         // On-demand is a promise about bytes: track every path and version a
@@ -772,6 +808,15 @@ impl super::LocalConvergenceExecutor {
         // conclusion, which is why `ScanBlockStaging` pools across files
         // rather than per file.
         let mut pool = ReceiveCommitPool::new(group_id, Some(Arc::clone(&batch)));
+        pool.window_hold = Some(crate::local_convergence::window_blocks::WindowBlocksHold::new(
+            Arc::clone(&self.window_blocks),
+            group_id,
+        ));
+        pool.filled_hold = Some(crate::local_convergence::filled_temps::FilledTempsHold::new(
+            Arc::clone(&self.filled_temps),
+        ));
+        // Kept temps hold their files' disk reservations: what is too old goes at every pass.
+        self.partial_temps.purge_expired();
         let outcomes = match shape {
             PrefetchShape::Overlapped { fetches_in_flight } => {
                 self.prefetch_overlapped(
@@ -821,7 +866,12 @@ impl super::LocalConvergenceExecutor {
             .collect();
         let requirements =
             wanted.into_iter().map(|p| (p.requirement.path.clone(), p.requirement)).collect();
-        Ok((requirements, outcomes))
+        // The blocks the pass keeps in memory stay held until the caller drops this.
+        Ok((
+            requirements,
+            outcomes,
+            PassHolds { _window: pool.window_hold.take(), _filled: pool.filled_hold.take() },
+        ))
     }
 
     /// The fetch stage: every wanted path's missing blocks, drawn through ONE
@@ -889,6 +939,8 @@ impl super::LocalConvergenceExecutor {
         let allowance = fetches_in_flight.max(1);
         let mut states: Vec<PathFetchState> =
             wanted.iter().map(|_| PathFetchState::default()).collect();
+        // Which paths have to reach the block store, asked of the database once for the pass.
+        let keep_in_store = crate::ingest_policy::KeepInStore::for_group(&self.state, group_id);
         let mut in_flight: FuturesUnordered<Fetch<'_>> = FuturesUnordered::new();
         // Every hash with a joinable request on the wire: who asked, and the
         // paths waiting on its answer.
@@ -900,6 +952,9 @@ impl super::LocalConvergenceExecutor {
             std::collections::VecDeque::new();
         let mut next_path = 0;
         let mut current: Option<(usize, std::collections::VecDeque<_>)> = None;
+        let loop_started =
+            yadorilink_local_storage::io_diag::enabled().then(std::time::Instant::now);
+        let mut loop_bytes = 0u64;
         loop {
             while in_flight.len() < allowance {
                 let own_request = !own_requests.is_empty();
@@ -914,13 +969,23 @@ impl super::LocalConvergenceExecutor {
                     }
                     let index = next_path;
                     next_path += 1;
-                    let blocks =
-                        self.admit_path(group_id, &wanted[index], batch, &mut states[index]);
+                    let blocks = self
+                        .admit_and_prepare(
+                            group_id,
+                            &wanted[index],
+                            batch,
+                            &mut states[index],
+                            &keep_in_store,
+                        )
+                        .await;
                     current = Some((index, blocks.into()));
                     continue;
                 };
                 let state = &mut states[index];
-                if pool.fetched.contains(&block.hash) {
+                // A path writing into its own file needs every block there: a block another path
+                // fetched is in the pool or the store, not in this file.
+                let has_sink = state.sink.is_some();
+                if pool.fetched.contains(&block.hash) && !has_sink && !state.keep_in_store {
                     continue;
                 }
                 // Checked before joining, so a path that already gave up
@@ -934,14 +999,21 @@ impl super::LocalConvergenceExecutor {
                     state.give_up = true;
                     continue;
                 }
-                match waiting.get_mut(&block.hash) {
-                    Some((_, joined)) if !own_request => {
-                        joined.push((index, block));
-                        continue;
-                    }
-                    Some(_) => {}
-                    None => {
-                        waiting.insert(block.hash.clone(), (index, Vec::new()));
+                // A path with a sink neither joins another path's request nor is joined: it asks
+                // for each of its blocks itself and writes the answer into its own file. A path that
+                // must be in the store does not join a request either: the answer would be stored
+                // as its requester stores it, which may be in memory only. It may be joined, since
+                // its own answer goes to the store.
+                if !has_sink {
+                    match waiting.get_mut(&block.hash) {
+                        Some((_, joined)) if !own_request && !state.keep_in_store => {
+                            joined.push((index, block));
+                            continue;
+                        }
+                        Some(_) => {}
+                        None => {
+                            waiting.insert(block.hash.clone(), (index, Vec::new()));
+                        }
                     }
                 }
                 let file_path = wanted[index].requirement.path.as_str();
@@ -959,7 +1031,23 @@ impl super::LocalConvergenceExecutor {
                     (index, block, fetched)
                 }));
             }
+            let wait_started =
+                yadorilink_local_storage::io_diag::enabled().then(std::time::Instant::now);
             let Some((requester, block, fetched)) = in_flight.next().await else { break };
+            if let Some(started) = wait_started {
+                yadorilink_local_storage::io_diag::record(
+                    yadorilink_local_storage::io_diag::Op::FetchWait,
+                    started.elapsed().as_nanos() as u64,
+                    0,
+                );
+            }
+            loop_bytes += fetched_bytes(&fetched);
+            if yadorilink_local_storage::io_diag::recv_discard() {
+                // Measurement switch: the answer was read off the wire; nothing is done with it.
+                continue;
+            }
+            let absorb_started = yadorilink_local_storage::io_diag::enabled()
+                .then(|| (std::time::Instant::now(), in_flight.len() as u64 + 1));
             let joined = match waiting.get(&block.hash) {
                 Some((asked_by, _)) if *asked_by == requester => {
                     waiting.remove(&block.hash).map(|(_, joined)| joined).unwrap_or_default()
@@ -978,8 +1066,67 @@ impl super::LocalConvergenceExecutor {
                     call_timer,
                 )
                 .await;
+            if let Some((started, depth)) = absorb_started {
+                yadorilink_local_storage::io_diag::record(
+                    yadorilink_local_storage::io_diag::Op::FetchAbsorb,
+                    started.elapsed().as_nanos() as u64,
+                    depth,
+                );
+            }
             if !delivered {
                 own_requests.extend(joined);
+            }
+        }
+        record_fetch_loop(loop_started, loop_bytes);
+        // The large files whose blocks all arrived: written, flushed, read back, and registered as
+        // ready temps for the settle. A file that did not complete drops its sink with its state,
+        // which removes the temp.
+        for (index, planned) in wanted.iter().enumerate() {
+            let state = &mut states[index];
+            let complete = !state.give_up
+                && !state.incomplete
+                && !state.timed_out
+                && !state.stale
+                && state.error.is_none();
+            if !complete && !state.stale && !state.sink_failed && state.sink.is_some() {
+                self.keep_partial_temp(group_id, &planned.requirement, state);
+                continue;
+            }
+            if let (true, Some(mut sink)) = (complete, state.sink.take()) {
+                match sink.finalize(self.store.clone(), &planned.requirement.record).await {
+                    Ok(()) => {
+                        let requirement = &planned.requirement;
+                        let (tmp_path, ledger) = sink.staged.keep();
+                        let key = (
+                            group_id.to_owned(),
+                            requirement.path.clone(),
+                            requirement.version_hash.to_hex(),
+                        );
+                        let id = self.filled_temps.next_id();
+                        if let Some(hold) = pool.filled_hold.as_mut() {
+                            hold.push(key.clone(), id);
+                        }
+                        let flushed = yadorilink_local_storage::flushed_stamp(&tmp_path);
+                        let object = sink.staged.object_key();
+                        let ready = crate::local_convergence::filled_temps::ReadyTemp {
+                            id,
+                            flushed,
+                            object,
+                            tmp_path,
+                            ledger,
+                            reservation: Arc::clone(&sink.reservation),
+                            progress: state.progress.take(),
+                        };
+                        if let Some(replaced) = self.filled_temps.insert_ready(key, ready) {
+                            let discard = move || replaced.discard();
+                            tokio::task::spawn_blocking(discard);
+                        }
+                    }
+                    Err(error) => {
+                        log_unobtained(group_id, &planned.requirement.path, &error);
+                        state.error = Some(PeerSessionError::from(error));
+                    }
+                }
             }
         }
         wanted
@@ -987,6 +1134,110 @@ impl super::LocalConvergenceExecutor {
             .zip(states)
             .map(|(planned, state)| state.outcome(group_id, &planned.requirement.path))
             .collect()
+    }
+
+    /// For a large file of a single-pass receive: the checks the settle runs before it creates a temp
+    /// (the write target resolves inside the verified root, no symlinked component), the disk
+    /// headroom, and then the file's temp beside its target. Any refusal or failure leaves the file to
+    /// the ordinary path, which fetches its blocks into the store and reconstructs it.
+    async fn open_large_file_sink(
+        &self,
+        group_id: &str,
+        requirement: &BlockRequirement,
+    ) -> Option<crate::local_convergence::large_file_sink::LargeFileSink> {
+        use crate::local_convergence::large_file_sink::{LargeFileSink, LARGE_FILE_MIN_BYTES};
+        if !self.single_pass() || requirement.record.size <= LARGE_FILE_MIN_BYTES {
+            return None;
+        }
+        let out_path = self.local_file_path(group_id, &requirement.record.path).ok()?;
+        self.verify_write_target(group_id, &out_path).ok()?;
+        // A temp kept from an earlier attempt of this very version goes on; what it claims is
+        // read back and hashed before any of it counts.
+        let key =
+            (group_id.to_owned(), requirement.path.clone(), requirement.version_hash.to_hex());
+        if let Some(parked) = self.partial_temps.take(&key) {
+            // A temp whose name no longer leads to the file being written (removed, replaced) is
+            // dropped, and a fresh one is made.
+            if parked.staged.is_still_at_its_path() {
+                let mut sink = LargeFileSink::resume(parked);
+                if sink.verify_claims(&requirement.record).await {
+                    return Some(sink);
+                }
+            }
+        }
+        let reservation = Arc::new(
+            self.preflight_disk_headroom(group_id, &out_path, requirement.record.size).ok()?,
+        );
+        let size = requirement.record.size;
+        let ledger: Arc<dyn yadorilink_local_storage::TempFileLedger> =
+            Arc::new(self.state.temp_ledger(group_id));
+        let staged = tokio::task::spawn_blocking(move || {
+            yadorilink_local_storage::StagedFile::create(&out_path, size, ledger)
+        })
+        .await
+        .ok()?
+        .ok()?;
+        Some(LargeFileSink::new(staged, reservation))
+    }
+
+    /// The attempt ended before the file was whole (a dropped link, a peer that answered nothing,
+    /// a timeout): what was written stays for the next attempt of this version in this process.
+    fn keep_partial_temp(
+        &self,
+        group_id: &str,
+        requirement: &BlockRequirement,
+        state: &mut PathFetchState,
+    ) {
+        if let Some(parked) = state.sink.take().and_then(|sink| sink.into_parked()) {
+            self.partial_temps.park(
+                (group_id.to_owned(), requirement.path.clone(), requirement.version_hash.to_hex()),
+                parked,
+            );
+        }
+    }
+
+    /// The status model's transfer for a file whose remaining `blocks` are still to be asked for.
+    fn begin_transfer_progress(
+        &self,
+        group_id: &str,
+        planned: &PlannedRequirement,
+        blocks: &[&yadorilink_replica_domain::file::BlockInfo],
+    ) -> Option<crate::transfer_progress::TransferProgressGuard> {
+        let tracker = self.transfer_progress.get()?;
+        (!blocks.is_empty()).then(|| {
+            tracker.begin(
+                group_id,
+                planned.requirement.path.as_str(),
+                blocks.iter().map(|block| block.size as u64).sum(),
+                blocks.len() as u64,
+            )
+        })
+    }
+
+    /// A path's turn: admits it (see [`Self::admit_path`]), and opens the sink its large file is
+    /// written into when it may be (a path that must be in the block store has none).
+    async fn admit_and_prepare<'a>(
+        &self,
+        group_id: &str,
+        planned: &'a PlannedRequirement,
+        batch: &ReconcileProvenanceBatch,
+        state: &mut PathFetchState,
+        keep_in_store: &crate::ingest_policy::KeepInStore,
+    ) -> Vec<&'a yadorilink_replica_domain::file::BlockInfo> {
+        let mut blocks = self.admit_path(group_id, planned, batch, state, keep_in_store);
+        if !blocks.is_empty() && !state.stale && state.error.is_none() && !state.keep_in_store {
+            state.sink = self.open_large_file_sink(group_id, &planned.requirement).await;
+            // A resumed temp already holds (verified) some of the blocks the peer would be asked
+            // for: those are not asked again.
+            if let Some(sink) = state.sink.as_ref() {
+                let before = blocks.len();
+                blocks.retain(|block| !sink.has_written(&block.hash));
+                if blocks.len() != before {
+                    state.progress = self.begin_transfer_progress(group_id, planned, &blocks);
+                }
+            }
+        }
+        blocks
     }
 
     /// A path's turn has come: whether its plan still stands, and which of
@@ -997,6 +1248,7 @@ impl super::LocalConvergenceExecutor {
         planned: &'a PlannedRequirement,
         batch: &ReconcileProvenanceBatch,
         state: &mut PathFetchState,
+        kept_in_store: &crate::ingest_policy::KeepInStore,
     ) -> Vec<&'a yadorilink_replica_domain::file::BlockInfo> {
         let requirement = &planned.requirement;
         // An earlier path's fetch can take long enough for a newer version
@@ -1022,17 +1274,21 @@ impl super::LocalConvergenceExecutor {
                 return Vec::new();
             }
         }
+        state.keep_in_store = kept_in_store.keeps(&requirement.path);
+        let keep_in_store = state.keep_in_store;
         let blocks = &requirement.record.blocks;
         let hashes: Vec<_> = blocks.iter().map(|b| hex::encode(&b.hash)).collect();
-        let held = self.store.present_blocks(&hashes).map_err(PeerSessionError::from).and_then(
-            |present| {
+        // A path that must be in the store asks the store itself: the executor's view also answers
+        // for blocks any pass holds in memory, which are not what it needs.
+        let presence = if keep_in_store { &self.durable_store } else { &self.store };
+        let held =
+            presence.present_blocks(&hashes).map_err(PeerSessionError::from).and_then(|present| {
                 let provenance = self.state.group_has_block_provenance_batch(
                     group_id,
                     &blocks.iter().map(|b| b.hash.clone()).collect::<Vec<_>>(),
                 )?;
                 Ok((present, provenance))
-            },
-        );
+            });
         let (present, provenance) = match held {
             Ok(held) => held,
             Err(error) => {
@@ -1045,15 +1301,37 @@ impl super::LocalConvergenceExecutor {
         // with this group's provenance, recorded or pending behind this
         // attempt's own batch -- the same rule `ensure_blocks_present_core`
         // applies.
-        blocks
+        if crate::receive_diag::enabled() {
+            for (block, present) in blocks.iter().zip(&present) {
+                let held = *present
+                    && (provenance.contains(&block.hash) || batch.already_known(&block.hash));
+                crate::receive_diag::record_block_planned(held, block.size as u64);
+            }
+        }
+        // The batch also knows blocks a small file of this pass keeps in memory only; a path that
+        // must be in the store counts a block as held only when the store holds it with this
+        // group's provenance.
+        let to_fetch: Vec<_> = blocks
             .iter()
             .zip(present)
             .filter(|(block, present)| {
                 !(*present
-                    && (provenance.contains(&block.hash) || batch.already_known(&block.hash)))
+                    && (provenance.contains(&block.hash)
+                        || (!keep_in_store && batch.already_known(&block.hash))))
             })
             .map(|(block, _)| block)
-            .collect()
+            .collect();
+        // The status model's transfer for this file: the bytes it has to ask the peer for,
+        // reported as they arrive and withdrawn when the attempt ends.
+        if let (Some(tracker), false) = (self.transfer_progress.get(), to_fetch.is_empty()) {
+            state.progress = Some(tracker.begin(
+                group_id,
+                requirement.path.as_str(),
+                to_fetch.iter().map(|block| block.size as u64).sum(),
+                to_fetch.len() as u64,
+            ));
+        }
+        to_fetch
     }
 
     /// Applies one answer to the path that asked for it, returning whether
@@ -1095,16 +1373,50 @@ impl super::LocalConvergenceExecutor {
         };
         call_timer.add_block_fetch_wait(fetched.wire_wait);
         match fetched.outcome {
-            BlockFetch::Fetched { hash, data } => {
+            BlockFetch::Fetched(block) => {
                 call_timer.add_block_fetched();
+                crate::receive_diag::record_block_fetched(block.bytes().len() as u64);
+                if let Some(sink) = state.sink.as_mut() {
+                    // Written into the path's own file at its offsets; nothing goes to the pool
+                    // or the store.
+                    let data_len = block.bytes().len() as u64;
+                    return match sink.write_block(&requirement.record, &block).await {
+                        Ok(()) => {
+                            if let Some(progress) = &state.progress {
+                                progress.record_block_done(data_len, driver.peer_device_id());
+                            }
+                            true
+                        }
+                        Err(error) => {
+                            let crate::local_convergence::large_file_sink::SinkError::Io(error) =
+                                error;
+                            tracing::debug!(
+                                file_path = %requirement.path,
+                                %error,
+                                "could not write a block into the file being received; the attempt for this path ends"
+                            );
+                            state.incomplete = true;
+                            state.sink_failed = true;
+                            state.give_up = true;
+                            false
+                        }
+                    };
+                }
+                if let Some(progress) = &state.progress {
+                    progress.record_block_done(block.bytes().len() as u64, driver.peer_device_id());
+                }
                 self.pool_push(
                     driver,
                     pool,
                     PendingBlock {
-                        hash,
-                        data,
+                        hash: block.raw_hash(),
+                        block,
                         path: requirement.path.clone(),
                         version_hex: requirement.version_hash.to_hex(),
+                        window_cacheable: self.single_pass()
+                            && !state.keep_in_store
+                            && requirement.record.size
+                                <= crate::local_convergence::window_blocks::WINDOW_BLOCKS_FILE_MAX_BYTES,
                     },
                     Some(call_timer),
                 )
@@ -1203,11 +1515,28 @@ impl super::LocalConvergenceExecutor {
         if pool.pending.is_empty() {
             return;
         }
+        let wait_started = (pool.commits.len() >= Tuning::MAX_COMMITS_IN_FLIGHT)
+            .then(|| yadorilink_local_storage::io_diag::enabled().then(std::time::Instant::now))
+            .flatten();
         while pool.commits.len() >= Tuning::MAX_COMMITS_IN_FLIGHT {
             match pool.commits.next().await {
-                Some(joined) => self.absorb_commit_result(driver, joined, pool, call_timer),
+                Some(joined) => self.absorb_commit_result(joined, pool, call_timer),
                 None => break,
             }
+        }
+        if let Some(started) = wait_started {
+            yadorilink_local_storage::io_diag::record(
+                yadorilink_local_storage::io_diag::Op::CommitWait,
+                started.elapsed().as_nanos() as u64,
+                0,
+            );
+        }
+        if yadorilink_local_storage::io_diag::enabled() {
+            yadorilink_local_storage::io_diag::record(
+                yadorilink_local_storage::io_diag::Op::CommitDepth,
+                0,
+                pool.commits.len() as u64 + 1,
+            );
         }
         let batch = std::mem::take(&mut pool.pending);
         pool.pending_bytes = 0;
@@ -1227,7 +1556,7 @@ impl super::LocalConvergenceExecutor {
     ) {
         self.pool_commit_pending(driver, pool, call_timer).await;
         while let Some(joined) = pool.commits.next().await {
-            self.absorb_commit_result(driver, joined, pool, call_timer);
+            self.absorb_commit_result(joined, pool, call_timer);
         }
     }
 
@@ -1244,7 +1573,7 @@ impl super::LocalConvergenceExecutor {
         block: PendingBlock,
         call_timer: Option<&crate::local_convergence::call_timer::ReconcileCallTimer>,
     ) {
-        pool.pending_bytes += block.data.len() as u64;
+        pool.pending_bytes += block.block.bytes().len() as u64;
         pool.fetched.insert(block.hash.clone());
         pool.pending.push(block);
         if pool.pending.len() >= Tuning::RECEIVE_COMMIT_BATCH_BLOCKS
@@ -1332,7 +1661,8 @@ impl super::LocalConvergenceExecutor {
         // is what re-drives them, fetching what is missing from the peer.
         let seeds: std::collections::BTreeSet<String> = paths.iter().cloned().collect();
         let call_timer = crate::local_convergence::call_timer::ReconcileCallTimer::new();
-        let prefetched = self.obtain_missing_content(driver, group_id, &seeds, &call_timer).await?;
+        let (prefetched, _pass_holds) =
+            self.obtain_missing_content(driver, group_id, &seeds, &call_timer).await?;
         self.reconcile_group_paths_native(
             group_id,
             seeds,
@@ -1375,7 +1705,12 @@ impl super::LocalConvergenceExecutor {
         call_timer: Option<&crate::local_convergence::call_timer::ReconcileCallTimer>,
     ) -> BlockingHandle<CommittedBatch> {
         let store = self.store.clone();
+        let mut window_hold = crate::local_convergence::window_blocks::WindowBlocksHold::new(
+            Arc::clone(&self.window_blocks),
+            group_id,
+        );
         let blocks = batch.len();
+        let batch_bytes: u64 = batch.iter().map(|block| block.block.bytes().len() as u64).sum();
         let attributed = call_timer.is_some();
         let index_state = self.state.clone();
         let refusal_peer = driver.peer_device_id().to_string();
@@ -1384,48 +1719,57 @@ impl super::LocalConvergenceExecutor {
             let started = std::time::Instant::now();
             let mut prepared = Vec::with_capacity(blocks);
             let mut hashes = Vec::with_capacity(blocks);
-            let mut rejected = Vec::new();
+            let mut window_held = Vec::new();
             let mut refusal_keys: Vec<(String, String)> = Vec::new();
             for block in batch {
-                let hashed =
-                    yadorilink_local_storage::LocallyHashedBlock::from_bytes(block.data.to_vec());
-                if hashed.hash().as_bytes() != hex::encode(&block.hash).as_bytes() {
-                    rejected.push(block.hash);
-                    continue;
-                }
                 let key = (block.path, block.version_hex);
                 if !refusal_keys.contains(&key) {
                     refusal_keys.push(key);
                 }
+                // The bytes were verified against the requested hash when they were fetched and are
+                // not hashed again here. A block of a small file of a single-pass receive stays in
+                // memory for the pass when the budget has room; it is not committed, and so not
+                // provenance-eligible.
+                if block.window_cacheable
+                    && window_hold.try_hold(&hex::encode(&block.hash), block.block.bytes())
+                {
+                    window_held.push(block.hash);
+                    continue;
+                }
                 hashes.push(block.hash);
-                prepared.push(hashed);
+                prepared.push(block.block.into_hashed());
             }
-            let error = store.put_prepared_batch(&prepared).err();
+            let error =
+                if prepared.is_empty() { None } else { store.put_prepared_batch(&prepared).err() };
             let elapsed = started.elapsed();
+            if yadorilink_local_storage::io_diag::enabled() {
+                yadorilink_local_storage::io_diag::record(
+                    yadorilink_local_storage::io_diag::Op::CommitJob,
+                    elapsed.as_nanos() as u64,
+                    batch_bytes,
+                );
+            }
             // Only after a successful commit: a batch that failed proves
             // nothing about what this peer holds.
             if error.is_none() {
-                for (path, version) in &refusal_keys {
-                    let cleared = index_state.clear_block_fetch_refusal(
-                        &refusal_group_id,
-                        path,
-                        version,
-                        &refusal_peer,
+                // One transaction for the batch's files. A failed refusal clear
+                // is logged and tolerated, never fatal to this fetch.
+                if let Err(e) = index_state.clear_block_fetch_refusals(
+                    &refusal_group_id,
+                    &refusal_keys,
+                    &refusal_peer,
+                ) {
+                    tracing::warn!(
+                        files = refusal_keys.len(),
+                        error = %e,
+                        "failed to clear stale block fetch refusals after a successful fetch"
                     );
-                    // Same disposition as before: a failed refusal clear is
-                    // logged and tolerated, never fatal to this fetch.
-                    if let Err(e) = cleared {
-                        tracing::warn!(
-                            file_path = %path,
-                            error = %e,
-                            "failed to clear a stale block fetch refusal after a successful fetch"
-                        );
-                    }
                 }
             }
             CommittedBatch {
                 hashes,
-                rejected,
+                window_hold,
+                window_held,
                 error,
                 elapsed: if attributed { Some(elapsed) } else { None },
             }
@@ -1481,6 +1825,18 @@ struct PathFetchState {
     /// The first error that ended this path's fetching: a local one while
     /// admitting it, or a transport error answering its own request.
     error: Option<PeerSessionError>,
+    /// The path's entry in the status model's active transfers, withdrawn when this state is.
+    progress: Option<crate::transfer_progress::TransferProgressGuard>,
+    /// Where the blocks of a large file go as they arrive (single-pass receive); the file's temp is
+    /// removed with it unless it was completed and registered.
+    sink: Option<crate::local_convergence::large_file_sink::LargeFileSink>,
+    /// A block could not be written into the file: its temp is not kept for a later attempt.
+    sink_failed: bool,
+    /// The path is pinned, or a custody lease names its group (`must_keep_in_store`): every block of
+    /// it must reach the block store, so none of it goes into the file alone or stays in memory, and
+    /// no block counts as held on the strength of having been fetched earlier in the pass (it may
+    /// have been kept in memory only).
+    keep_in_store: bool,
 }
 
 impl PathFetchState {
@@ -1521,4 +1877,33 @@ fn log_timed_out(group_id: &str, path: &str) {
         path,
         "timed out obtaining this path's content from this peer; leaving it for a later pass"
     );
+}
+
+/// How many bytes an answer carried (zero for anything but a block).
+fn fetched_bytes(
+    fetched: &Result<
+        Result<yadorilink_peer_session::convergence_driver::FetchedBlock, PeerSessionError>,
+        tokio::time::error::Elapsed,
+    >,
+) -> u64 {
+    match fetched {
+        Ok(Ok(block)) => match &block.outcome {
+            yadorilink_peer_session::convergence_driver::BlockFetch::Fetched(verified) => {
+                verified.bytes().len() as u64
+            }
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+/// Records one run of the fetch loop, when the io counters are armed.
+fn record_fetch_loop(started: Option<std::time::Instant>, bytes: u64) {
+    if let Some(started) = started {
+        yadorilink_local_storage::io_diag::record(
+            yadorilink_local_storage::io_diag::Op::FetchLoop,
+            started.elapsed().as_nanos() as u64,
+            bytes,
+        );
+    }
 }

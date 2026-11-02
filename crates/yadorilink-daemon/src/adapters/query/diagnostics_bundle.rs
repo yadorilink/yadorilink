@@ -75,7 +75,10 @@ impl RuntimeDiagnosticsPort for DaemonRuntimeDiagnostics {
             tracing::warn!(%error, "diagnostics snapshot could not enumerate links");
             Vec::new()
         });
-        let volumes = self.runtime_status.volumes_free_space(&links);
+        let volumes = self.runtime_status.volumes_free_space(
+            links.iter().map(|l| l.local_path.as_str()),
+            &self.governance.load_or_default(),
+        );
         let disk_state = worst_volume_state(volumes.iter().map(|v| v.state.as_str()));
 
         let governance = self.governance.load_or_default();

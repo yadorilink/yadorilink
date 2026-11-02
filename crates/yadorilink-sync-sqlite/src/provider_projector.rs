@@ -195,6 +195,7 @@ fn write_row(
         &record,
         "",
         Some(&identity),
+        crate::retention::Retention::StoreBacked,
     )?;
     crate::file_index::apply_local_meta_columns_in_tx(
         tx,
@@ -236,7 +237,14 @@ fn tombstone_if_live(
             blocks: Vec::new(),
             deleted: true,
         };
-        crate::file_index::upsert_file_with_authoring_in_tx(tx, group_id, &tombstone, "", None)?;
+        crate::file_index::upsert_file_with_authoring_in_tx(
+            tx,
+            group_id,
+            &tombstone,
+            "",
+            None,
+            crate::retention::Retention::StoreBacked,
+        )?;
     }
     Ok(live)
 }

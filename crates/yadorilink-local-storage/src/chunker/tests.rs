@@ -84,34 +84,6 @@ fn hash_file_blocks_stops_at_the_first_sink_error() {
     assert_eq!(seen, 2, "hashing must stop at the failing block, not run the file out");
 }
 
-#[cfg(target_os = "linux")]
-#[test]
-fn resolve_erange_reprobe_treats_a_positive_size_as_retry() {
-    assert_eq!(resolve_erange_reprobe(42).unwrap(), Some(42));
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn resolve_erange_reprobe_treats_a_zero_size_as_genuinely_empty() {
-    assert_eq!(resolve_erange_reprobe(0).unwrap(), None);
-}
-
-/// `list_xattr_names_strict`/`get_xattr_value_strict` must not treat
-/// ANY re-probe outcome `<= 0` (not just a genuine `0`) as "no
-/// attributes": that would silently fold a real re-probe failure (`-1`,
-/// e.g. an `EIO`/`EACCES` on the second call) into an empty result --
-/// exactly the "could not check" read as "matches" this strict
-/// reader's whole contract exists to rule out. Confirmed genuinely
-/// RED against a version of this function using `if size <= 0 {
-/// return Ok(None) }` in place of the separate `< 0`/`== 0` checks:
-/// this exact case returned `Ok(None)` (treated as empty) instead of
-/// `Err`.
-#[cfg(target_os = "linux")]
-#[test]
-fn resolve_erange_reprobe_treats_a_negative_size_as_a_real_error() {
-    assert!(resolve_erange_reprobe(-1).is_err());
-}
-
 #[test]
 fn chunk_and_reconstruct_roundtrip() {
     let store_dir = tempfile::tempdir().unwrap();
@@ -370,30 +342,39 @@ fn content_defined_callback_matches_plain_form_and_fires_once_per_block_in_order
     }
 }
 
-/// Changing a file's permission bits actually changes what
-/// `unix_mode_from_metadata` reads back.
+/// Setting or clearing the owner's execute bit actually changes what `exec_from_metadata` reads back;
+/// the other permission bits, including the group's and other's `x`, do not.
 #[cfg(unix)]
 #[test]
-fn reads_owner_unix_mode() {
+fn reads_the_execute_flag() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("maybe-script");
     fs::write(&path, b"echo hi").unwrap();
 
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-    assert_eq!(unix_mode_from_metadata(&fs::metadata(&path).unwrap()), Some(0o644));
-
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o744)).unwrap();
-    assert_eq!(unix_mode_from_metadata(&fs::metadata(&path).unwrap()), Some(0o744));
+    for (mode, exec) in [
+        (0o644, false),
+        (0o600, false),
+        (0o666, false),
+        (0o744, true),
+        (0o755, true),
+        (0o700, true),
+        (0o654, false),
+        (0o601, false),
+        (0o111, true),
+    ] {
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(exec_from_metadata(&fs::metadata(&path).unwrap()), exec, "{mode:o}");
+    }
 }
 
 #[test]
-fn owner_exec_reader_accepts_ordinary_metadata() {
+fn exec_reader_accepts_ordinary_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("plain.txt");
     fs::write(&path, b"hello").unwrap();
-    let _ = unix_mode_from_metadata(&fs::metadata(&path).unwrap());
+    let _ = exec_from_metadata(&fs::metadata(&path).unwrap());
 }
 
 /// Crash-safety property 4: a source's `FileRecord`/native state
@@ -426,71 +407,6 @@ fn a_failed_batch_flush_never_returns_a_partial_block_list() {
         "a batch commit failure must surface as an error, never a partial block list a \
          caller could go on to publish a FileRecord from"
     );
-}
-
-/// Round trip: attributes set in reverse-alphabetical order on
-/// disk must come back sorted ascending by name -- the canonical
-/// encoding invariant `FileMeta::xattrs` requires of every capture
-/// path, not just an accident of `listxattr`'s own (unspecified)
-/// ordering.
-#[cfg(target_os = "linux")]
-#[test]
-fn read_replicated_xattrs_captures_user_namespace_attributes_sorted_by_name() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("file.bin");
-    fs::write(&path, b"content").unwrap();
-
-    set_xattr_for_test(&path, "user.zzz", b"last");
-    set_xattr_for_test(&path, "user.aaa", b"first");
-
-    let file = fs::File::open(&path).unwrap();
-    let xattrs = read_replicated_xattrs(&file);
-    assert_eq!(
-        xattrs,
-        vec![
-            ("user.aaa".to_string(), b"first".to_vec()),
-            ("user.zzz".to_string(), b"last".to_vec()),
-        ]
-    );
-}
-
-/// The allow-list is the whole point of `read_replicated_xattrs`
-/// (never every xattr a file happens to carry, see its own doc
-/// comment) -- exercised directly against `read_xattrs_filtered`'s
-/// predicate parameter rather than a real disallowed namespace, since
-/// setting `security.*`/`trusted.*` requires privileges this test
-/// process does not have; the predicate is the exact mechanism
-/// `read_replicated_xattrs`'s own `LINUX_ALLOWED_PREFIX` check
-/// delegates to, so this proves the same logic without needing root.
-#[cfg(target_os = "linux")]
-#[test]
-fn read_xattrs_filtered_excludes_names_the_allow_predicate_rejects() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("file.bin");
-    fs::write(&path, b"content").unwrap();
-
-    set_xattr_for_test(&path, "user.allowed", b"yes");
-    set_xattr_for_test(&path, "user.rejected", b"no");
-
-    let file = fs::File::open(&path).unwrap();
-    let xattrs = read_xattrs_filtered(&file, |name| name == "user.allowed");
-    assert_eq!(xattrs, vec![("user.allowed".to_string(), b"yes".to_vec())]);
-}
-
-#[cfg(target_os = "linux")]
-fn set_xattr_for_test(path: &std::path::Path, name: &str, value: &[u8]) {
-    let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-    let c_name = std::ffi::CString::new(name).unwrap();
-    let ret = unsafe {
-        libc::setxattr(
-            c_path.as_ptr(),
-            c_name.as_ptr(),
-            value.as_ptr() as *const libc::c_void,
-            value.len(),
-            0,
-        )
-    };
-    assert_eq!(ret, 0, "setxattr({name}) failed: {}", std::io::Error::last_os_error());
 }
 
 /// A handle that opens but cannot be read: on Unix a directory opens read-only and every read

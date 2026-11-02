@@ -36,6 +36,7 @@ use crate::maintenance::durability_confirmation::DurabilityConfirmationJob;
 use crate::maintenance::gc_idle::GcIdleJob;
 use crate::maintenance::link_volume::LinkVolumeJob;
 use crate::maintenance::pause_expiry::PauseExpiryJob;
+use crate::maintenance::provider_change_retention::ProviderChangeRetentionJob;
 use crate::maintenance::recovery::RecoveryJob;
 use crate::maintenance::replacement_confirm::ReplacementConfirmJob;
 use crate::maintenance::retention_expiry::RetentionExpiryJob;
@@ -316,6 +317,17 @@ pub(crate) fn start(
             }
         });
     }
+    // The provider change feed (what `enumerateChanges` answers from) is bounded the same way:
+    // once at startup, then hourly.
+    let provider_change_retention =
+        ProviderChangeRetentionJob::new(state.replica_coordinator.clone());
+    provider_change_retention.run_once();
+    supervise::spawn_logged("daemon-state-provider-change-retention", async move {
+        loop {
+            tokio::time::sleep(RETENTION_EXPIRY_SWEEP_INTERVAL).await;
+            provider_change_retention.run_once();
+        }
+    });
     // Fix-saga: startup + periodic reconciliation of any membership-
     // related recovery journal left mid-flight by a crash or an
     // unconfirmable coordination-plane call — role-loss (this device's
@@ -371,6 +383,15 @@ pub(crate) fn start(
                 .await;
                 disk_reconcile_backstop_job.run_once().await;
             }
+        });
+    }
+    // Publishes the native deltas a refused checkpoint flush left pending; idle until a
+    // flush is refused (see `maintenance::publication_retry`).
+    {
+        let state = state.clone();
+        supervise::spawn_logged("daemon-state-publication-retry", async move {
+            crate::maintenance::publication_retry::run(state).await;
+            Ok(())
         });
     }
     // The idle-triggered GC scheduler, modeled on this same `spawn_logged`

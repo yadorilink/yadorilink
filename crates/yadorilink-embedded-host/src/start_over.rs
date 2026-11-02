@@ -409,6 +409,8 @@ mod tests {
                     ports.mark_not_rejoined(folder).await.unwrap();
                 }
                 record.lock().unwrap().push((restored, folders));
+                // A command run through the dispatcher counts itself; this one is run by hand.
+                commands.command_completed();
                 Ok(CommandOutput::Done)
             },
             &options(),

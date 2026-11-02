@@ -322,8 +322,8 @@ async fn a_metadata_only_change_does_not_hide_the_os_copy() {
     assert_eq!(log(&fx), ["acquire", "host_evict"]);
     assert!(outcome.dehydrated);
     // The superseded version still references the same blocks, so they stay (as for any
-    // retained version).
-    assert_eq!(outcome.retained, Some(Retained::NothingFreed));
+    // retained version), and the answer says it is the history that holds them.
+    assert_eq!(outcome.retained, Some(Retained::HeldAsHistory));
     assert!(fx.cached(&blocks[0]));
 }
 

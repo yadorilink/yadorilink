@@ -462,6 +462,38 @@ pub fn probed_case_insensitivity(dir: &Path) -> Option<bool> {
     probe_case_insensitive_filesystem(&canonical).ok()
 }
 
+/// What one scratch directory on `dir`'s volume says about both folding axes: case, then
+/// Unicode normalization. Each is `None` when its own probe could not run (see
+/// [`probed_case_insensitivity`]); a directory that cannot be created leaves both `None`.
+///
+/// One scratch directory serves both probes: the two leaf names cannot collide with each other
+/// or with user content inside a directory this call has just created, and a directory
+/// create plus remove is the costly part of a probe (two directory-lock round trips on the
+/// user's volume, ten thousand times in a bulk receive). Each call is still a fresh, uncached
+/// probe of both axes.
+pub fn probed_folding(dir: &Path) -> (Option<bool>, Option<bool>) {
+    let Some(canonical) =
+        std::fs::create_dir_all(dir).and_then(|_| std::fs::canonicalize(dir)).ok()
+    else {
+        return (None, None);
+    };
+    PROBE_CALL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    NORMALIZATION_PROBE_CALL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    probe_in_owned_dir(&canonical, "fold", |probe_dir| {
+        Ok((
+            case_insensitivity_within(probe_dir).ok(),
+            normalization_insensitivity_within(probe_dir).ok(),
+        ))
+    })
+    .unwrap_or((None, None))
+}
+
+// Scratch directories created by probes on the current thread (a probe runs on its caller).
+#[cfg(test)]
+thread_local! {
+    static SCRATCH_DIRS_CREATED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Bumped once per real probe round trip. Not a uniqueness source — probe
 /// artefact names are minted by `fs_capabilities::probe_artefact_name`, and
 /// ownership is established by `create_dir` failing rather than by the name
@@ -546,6 +578,8 @@ fn probe_in_named_dir<T>(
 ) -> std::io::Result<T> {
     let probe_dir = parent.join(probe_dir_name);
     std::fs::create_dir(&probe_dir)?;
+    #[cfg(test)]
+    SCRATCH_DIRS_CREATED.with(|n| n.set(n.get() + 1));
     let result = probe(&probe_dir);
     // Unconditional, including on the error path: this call created the
     // directory, so it owns it, and a probe that failed halfway still must
@@ -826,6 +860,9 @@ mod probe_artefact_ownership_tests;
 
 #[cfg(test)]
 mod normalization_insensitive_probe_tests;
+
+#[cfg(test)]
+mod probed_folding_tests;
 
 /// Pure, filesystem-independent tests of `case_fold_collision`/
 /// `canonical_fold`'s own folding algorithm -- unlike the case-insensitive

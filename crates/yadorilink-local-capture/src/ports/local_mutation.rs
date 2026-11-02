@@ -537,7 +537,9 @@ pub trait LocalMutationStore: Send + Sync {
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError>;
 
-    fn remove_file(
+    /// Erases the index rows of a path that has become ignored (history included; the file stays
+    /// on disk).
+    fn erase_ignored_path(
         &self,
         group_id: &str,
         path: &str,

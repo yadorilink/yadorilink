@@ -314,6 +314,8 @@ pub(super) struct ReconcilePassTrace {
     group_id: String,
     mode: &'static str,
     started: std::time::Instant,
+    snapshot_ms: u64,
+    walk_ms: u64,
     prepared: usize,
     committed: usize,
 }
@@ -336,6 +338,8 @@ impl ReconcilePassTrace {
             group_id: group_id.to_string(),
             mode,
             started: std::time::Instant::now(),
+            snapshot_ms: 0,
+            walk_ms: 0,
             prepared: 0,
             committed: 0,
         }
@@ -355,6 +359,8 @@ impl Drop for ReconcilePassTrace {
             group_id = %self.group_id,
             mode = self.mode,
             elapsed_ms = self.started.elapsed().as_millis() as u64,
+            snapshot_ms = self.snapshot_ms,
+            walk_ms = self.walk_ms,
             prepared = self.prepared,
             committed = self.committed,
             "RECONCILE_PASS end: reconciliation pass finished"
@@ -381,6 +387,10 @@ struct ReconcileSnapshot {
     materialization_by_path: std::collections::HashMap<String, MaterializationState>,
     placeholder_generation_by_path:
         std::collections::HashMap<String, yadorilink_sync_sqlite::RecordedPlaceholderGeneration>,
+    /// `true` for the add-only probe snapshot, which holds only `kind_by_path`
+    /// (see `load_reconcile_snapshot`): good for judging "does the index have
+    /// this path", not for committing anything.
+    probe: bool,
 }
 
 impl ReconcileSnapshot {
@@ -418,6 +428,10 @@ struct ReconcileWalk {
     /// Root-relative prefixes of the subtrees the walk could not read; no
     /// path under one is tombstoned.
     failed_prefixes: Vec<String>,
+    /// Set only by a walk over a probe snapshot that met a path the index
+    /// does not have: the walk stopped there, and the pass must start over
+    /// on a complete snapshot.
+    needs_complete_snapshot: bool,
 }
 
 /// Max ops in a single reconciliation-emitted change. Matches the initial
@@ -502,7 +516,7 @@ impl LocalChangeProcessor {
     ///
     /// Every input is one observation's worth of the same path:
     /// `record` (its content, from the index or a fresh chunking),
-    /// `classification`/`unix_mode`/`xattrs` (its metadata as just read
+    /// `classification`/`exec` (its metadata as just read
     /// from disk), and `observation` (`Some` only when the fingerprint
     /// bracketing all of the above still matched at the end — see
     /// [`closed_disk_observation_if_unraced`]).
@@ -518,16 +532,15 @@ impl LocalChangeProcessor {
         &self,
         record: FileRecord,
         classification: Option<SymlinkClassification>,
-        unix_mode: Option<u32>,
-        xattrs: Vec<(String, Vec<u8>)>,
+        exec: bool,
         observation: Option<DiskObservation>,
     ) -> PreparedMutation {
         let symlink_target = classification.as_ref().map(|c| c.target.clone());
-        let (op, version) = self.content_op(&record, unix_mode, symlink_target, xattrs.clone());
-        // A symlink carries neither an exec bit nor xattrs, matching what
-        // `content_op` just put in the version's own `FileMeta`.
-        let exec_for_meta = if classification.is_some() { None } else { Some(unix_mode) };
-        let meta = metadata_columns_for(&classification, exec_for_meta, xattrs);
+        let (op, version) = self.content_op(&record, exec, symlink_target);
+        // A symlink carries no exec bit, matching what `content_op` just put in the version's
+        // own `FileMeta`.
+        let exec_for_meta = if classification.is_some() { None } else { Some(exec) };
+        let meta = metadata_columns_for(&classification, exec_for_meta);
         PreparedMutation::Upsert { record, op, version, meta, observation }
     }
 
@@ -1138,7 +1151,9 @@ impl LocalChangeProcessor {
         let mut trace = ReconcilePassTrace::begin(caller, group_id, mode);
         let root = root.path();
 
-        let snapshot = self.load_reconcile_snapshot(group_id, mode)?;
+        let snapshot_started = std::time::Instant::now();
+        let mut snapshot = self.load_reconcile_snapshot(group_id, mode, true)?;
+        trace.snapshot_ms = snapshot_started.elapsed().as_millis() as u64;
 
         // Test-only seam: fires right after the whole-index snapshot
         // (`existing_by_path`) has been read but before any record derived from
@@ -1195,7 +1210,16 @@ impl LocalChangeProcessor {
         }
 
         self.unreadable.begin_pass(group_id);
+        let walk_started = std::time::Instant::now();
         let mut walk = self.walk_and_prepare(group_id, root, ignore_set, mode, &snapshot)?;
+        if snapshot.probe && (walk.needs_complete_snapshot || !walk.prepared.is_empty()) {
+            // The probe found a path to add. Start over on the complete
+            // snapshot, read now and so before the observations made below.
+            self.unreadable.begin_pass(group_id);
+            snapshot = self.load_reconcile_snapshot(group_id, mode, false)?;
+            walk = self.walk_and_prepare(group_id, root, ignore_set, mode, &snapshot)?;
+        }
+        trace.walk_ms = walk_started.elapsed().as_millis() as u64;
         if mode.is_full() && walk.scan_complete {
             self.unreadable.settle_full_pass(group_id, |path| {
                 path_is_within_failed_subtree(path, &walk.failed_prefixes)
@@ -1312,14 +1336,30 @@ impl LocalChangeProcessor {
 
     /// Reads the whole-index snapshot a pass judges disk against. Every
     /// later phase consults this one read; none re-reads the index rows.
+    ///
+    /// `probe` (add-only only) reads just which paths the index has. The other
+    /// three tables -- native's witness of every path, every materialization
+    /// state, every placeholder generation -- are what a commit judges
+    /// against and cost most of a pass on a large folder (on 10 000 files,
+    /// 330-780 ms of a 350-840 ms pass, against 25-45 ms for the walk), but
+    /// a pass that finds nothing to add never reads them. A probe that does
+    /// find something is redone on a complete snapshot (see
+    /// `reconcile_disk_pass`), so a witness is still read before the
+    /// observation it judges.
     fn load_reconcile_snapshot(
         &self,
         group_id: &str,
         mode: ReconcileMode,
+        probe: bool,
     ) -> Result<ReconcileSnapshot, LocalCaptureError> {
         let mut existing_by_path = std::collections::HashMap::new();
         let mut kind_by_path = std::collections::HashMap::new();
-        let native_witness_by_path = self.state.native_capture_witnesses(group_id)?;
+        let probe = probe && mode.is_add_only();
+        let native_witness_by_path = if probe {
+            Default::default()
+        } else {
+            self.state.native_capture_witnesses(group_id)?
+        };
         if mode.is_add_only() {
             // The add-only backstop asks only whether the index has a path: it
             // never re-versions, tombstones or un-ignores a known one, so the
@@ -1334,14 +1374,21 @@ impl LocalChangeProcessor {
                 existing_by_path.insert(record.path.clone(), record);
             }
         }
-        let materialization_by_path = self.state.list_materialization_states(group_id)?;
-        let placeholder_generation_by_path = self.state.list_placeholder_generations(group_id)?;
+        let (materialization_by_path, placeholder_generation_by_path) = if probe {
+            Default::default()
+        } else {
+            (
+                self.state.list_materialization_states(group_id)?,
+                self.state.list_placeholder_generations(group_id)?,
+            )
+        };
         Ok(ReconcileSnapshot {
             existing_by_path,
             kind_by_path,
             native_witness_by_path,
             materialization_by_path,
             placeholder_generation_by_path,
+            probe,
         })
     }
 
@@ -1367,7 +1414,7 @@ impl LocalChangeProcessor {
             if self.state.group_frozen(group_id)? {
                 continue;
             }
-            self.state.remove_file(group_id, path, &self.begin_operation()?.permit())?;
+            self.state.erase_ignored_path(group_id, path, &self.begin_operation()?.permit())?;
         }
         Ok(())
     }
@@ -1455,7 +1502,9 @@ impl LocalChangeProcessor {
     /// it references is still only staged.
     #[allow(
         clippy::excessive_nesting,
-        reason = "the already-current branch's mode/xattr divergence check sits inside the \
+        clippy::too_many_lines,
+        reason = "the walk, its observation bracket and the block-pool drain share one frame; \
+                  the already-current branch's mode/xattr divergence check sits inside the \
                   per-entry walk loop, next to the lstat that opens the observation bracket \
                   its evidence argument depends on; hoisting it out would separate that \
                   argument from the bracket it reasons about"
@@ -1542,6 +1591,7 @@ impl LocalChangeProcessor {
         // conservative whole-scan suppression via `scan_complete`.
         let mut scan_complete = true;
         let mut failed_prefixes: Vec<String> = Vec::new();
+        let mut needs_complete_snapshot = false;
         for entry in walker {
             let entry = match entry {
                 Ok(entry) => entry,
@@ -1638,6 +1688,12 @@ impl LocalChangeProcessor {
             // alone (see below); the snapshot then holds only its kind.
             if mode.is_add_only() && snapshot.kind_by_path.contains_key(&rel_path) {
                 continue;
+            }
+            if snapshot.probe {
+                // A path the index does not have, over a snapshot that cannot
+                // judge it: the caller redoes the pass on a complete one.
+                needs_complete_snapshot = true;
+                break;
             }
             let existing = existing_by_path.get(&rel_path).cloned();
 
@@ -1737,28 +1793,17 @@ impl LocalChangeProcessor {
                         let predecessor = Predecessor::of_row(
                             self.state.canonical_current_row(group_id, &rel_path)?.as_ref(),
                         );
-                        let on_disk_unix_mode = self.captured_unix_mode(metadata, &predecessor);
-                        let indexed_unix_mode = predecessor.unix_mode;
-                        let indexed_xattrs = predecessor.xattrs.clone();
-                        // Same reasoning as the exec-bit check just
-                        // above, for extended attributes: an
-                        // offline `setxattr`-only edit changes neither
-                        // size, mtime, content, nor unix_mode, so it must
-                        // be checked here too or a re-scan can never
-                        // discover it.
-                        let on_disk_xattrs = self.captured_xattrs(path, &predecessor);
-                        // A differing mode or xattr set is a local edit only if
-                        // someone made it: the daemon's own untouched write of
-                        // an older version still carries that version's
-                        // metadata, and authoring it would put it over the
-                        // newer version.
-                        if (on_disk_unix_mode != indexed_unix_mode
-                            || on_disk_xattrs != indexed_xattrs)
+                        let on_disk_exec = self.captured_exec(metadata, &predecessor);
+                        // A differing execute flag is a local edit only if someone made
+                        // it: the daemon's own untouched write of an older version still
+                        // carries that version's flag, and authoring it would put it over
+                        // the newer version.
+                        if on_disk_exec != predecessor.exec
                             && !self
                                 .state
                                 .disk_is_untouched_proven_write(group_id, &rel_path, root, path)?
                         {
-                            // A mode or xattr change is still a change:
+                            // An execute-flag change is still a change:
                             // the version hash covers both, so this emits
                             // a genuinely new `FileVersion` for the path
                             // and native state's answer for it moves. That
@@ -1795,13 +1840,23 @@ impl LocalChangeProcessor {
                             // holds content it does not hold.
                             let observation =
                                 closed_disk_observation_if_unraced(path, fingerprint_before);
+                            // Said out loud: a version authored for an unchanged file
+                            // is the one a user cannot see coming, so the log must be
+                            // able to tell a real chmod from a lagging proof.
+                            tracing::info!(
+                                group_id,
+                                path = %rel_path,
+                                indexed_exec = predecessor.exec,
+                                disk_exec = on_disk_exec,
+                                "scan: authoring a metadata-only version for a file whose \
+                                 content is current and which has no untouched-write proof"
+                            );
                             prepared.push(self.prepare_present_mutation(
                                 existing.clone(),
                                 // Reached only when `file_type.is_file()`,
                                 // so never a symlink.
                                 None,
-                                on_disk_unix_mode,
-                                on_disk_xattrs,
+                                on_disk_exec,
                                 observation,
                             ));
                         }
@@ -1812,17 +1867,16 @@ impl LocalChangeProcessor {
 
             let materialization_state = materialization_by_path.get(&rel_path).copied();
             let placeholder_generation = placeholder_generation_by_path.get(&rel_path).cloned();
-            let (outcome, classification, unix_mode) = match self
-                .build_record_for_created_or_modified(
-                    group_id,
-                    root,
-                    rel_path.clone(),
-                    path,
-                    existing,
-                    materialization_state,
-                    placeholder_generation,
-                    Some(&mut staging),
-                ) {
+            let (outcome, classification, exec) = match self.build_record_for_created_or_modified(
+                group_id,
+                root,
+                rel_path.clone(),
+                path,
+                existing,
+                materialization_state,
+                placeholder_generation,
+                Some(&mut staging),
+            ) {
                 Ok(built) => built,
                 Err(error) => {
                     self.unreadable_file(group_id, &rel_path, error, &mut failed_prefixes)?;
@@ -1842,21 +1896,6 @@ impl LocalChangeProcessor {
                     prepared.push(PreparedMutation::tombstone(record));
                     continue;
                 }
-                // Read inside this path's bracket, before the identity
-                // observation that closes it, so the xattrs the emitted
-                // version carries and the identity that vouches for it
-                // describe one look at the file. A fresh open, not the
-                // handle `build_record_for_created_or_modified` chunked
-                // through above -- a weaker same-bytes guarantee than the
-                // content read itself, but xattrs are best-effort
-                // metadata, never content integrity. Never scanned for a
-                // symlink, matching `unix_mode`'s own `None` there.
-                let xattrs = if classification.is_none() {
-                    let row = self.state.canonical_current_row(group_id, &rel_path)?;
-                    self.captured_xattrs(path, &Predecessor::of_row(row.as_ref()))
-                } else {
-                    Vec::new()
-                };
                 // Closes the bracket this path's `lstat` opened, covering
                 // the content read, the metadata reads and everything
                 // between them.
@@ -1864,8 +1903,7 @@ impl LocalChangeProcessor {
                 prepared.push(self.prepare_present_mutation(
                     record,
                     classification,
-                    unix_mode.flatten(),
-                    xattrs,
+                    exec.unwrap_or(false),
                     observation,
                 ));
             }
@@ -1910,7 +1948,13 @@ impl LocalChangeProcessor {
             );
         }
 
-        Ok(ReconcileWalk { prepared, seen_paths, scan_complete, failed_prefixes })
+        Ok(ReconcileWalk {
+            prepared,
+            seen_paths,
+            scan_complete,
+            failed_prefixes,
+            needs_complete_snapshot,
+        })
     }
 
     /// The walk's step for a directory: prepares its explicit entry when
@@ -1940,12 +1984,11 @@ impl LocalChangeProcessor {
         }
         let Ok(lstat) = std::fs::symlink_metadata(path) else { return Ok(()) };
         let fingerprint_before = Some(disk_race_fingerprint_of_at(&lstat, path));
-        let DirectoryVerdict::Author { unix_mode } =
-            self.directory_verdict(group_id, root, &rel_path, &lstat)?
+        let DirectoryVerdict::Author = self.directory_verdict(group_id, root, &rel_path, &lstat)?
         else {
             return Ok(());
         };
-        let (record, op, version, meta) = directory_entry(&rel_path, unix_mode);
+        let (record, op, version, meta) = directory_entry(&rel_path);
         let observation = closed_disk_observation_if_unraced(path, fingerprint_before);
         prepared.push(PreparedMutation::Upsert { record, op, version, meta, observation });
         Ok(())
@@ -1962,7 +2005,6 @@ impl LocalChangeProcessor {
         group_id: &str,
         root: &Path,
         path: &str,
-        unix_mode: Option<u32>,
         locks: &mut CommitPathLocks,
     ) -> Result<bool, LocalCaptureError> {
         if !locks.try_hold(self.state.path_lock(group_id, path)) {
@@ -1971,7 +2013,7 @@ impl LocalChangeProcessor {
         let Ok(lstat) = std::fs::symlink_metadata(root.join(path)) else { return Ok(false) };
         Ok(matches!(
             self.directory_verdict(group_id, root, path, &lstat)?,
-            DirectoryVerdict::Author { unix_mode: now } if now == unix_mode
+            DirectoryVerdict::Author
         ))
     }
 
@@ -2399,7 +2441,6 @@ impl LocalChangeProcessor {
                             group_id,
                             root,
                             &record.path,
-                            meta.unix_mode,
                             &mut kept_locks,
                         )? {
                             true => {

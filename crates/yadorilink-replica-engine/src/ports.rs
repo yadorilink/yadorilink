@@ -51,12 +51,34 @@ pub trait DurabilityEvidencePort: Send + Sync {
         block: &BlockHash,
     ) -> Result<bool, ReplicaEngineError>;
 
+    /// Called before a version's blocks are checked for custody (a handoff check or a lease): a
+    /// version this device received, or captured without copying it into the store, may be held
+    /// by its folder's file alone, which `verify_block` cannot see. An implementation that has the
+    /// folder reads the exact version from the intact file into the store (each block checked
+    /// against the hash the version lists) so that the checks see it. A file that is not the
+    /// version, or any failure, leaves things as they are and the checks answer "not held". The
+    /// default has no folder to read.
+    fn ensure_version_in_store(
+        &self,
+        _group: &FolderGroupId,
+        _path: &SyncPath,
+        _blocks: &[yadorilink_replica_domain::file::VersionBlock],
+    ) {
+    }
+
     /// Full checksum verification of one block's content -- `Ok(())` only
     /// if the block is present and its bytes re-hash to `block`. Never
     /// merely an existence check (see `PeerReplicaEngine::
     /// holds_version_durably`'s own doc comment on why a corrupt/truncated
     /// block must answer "not held").
     fn verify_block(&self, block: &BlockHash) -> Result<(), ReplicaEngineError>;
+
+    /// Whether every one of `blocks` is in the store now. Cheaper than [`Self::verify_block`]
+    /// (an existence check, no re-hash): it only re-confirms a proof that verified the content a
+    /// moment ago. The default is the full verification.
+    fn blocks_in_store(&self, blocks: &[BlockHash]) -> bool {
+        blocks.iter().all(|block| self.verify_block(block).is_ok())
+    }
 
     /// This device's whole durability-root set for a group, reduced to two
     /// digests and two counts.

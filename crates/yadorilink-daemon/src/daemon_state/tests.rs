@@ -1155,10 +1155,9 @@ async fn local_edit_before_policy_load_must_not_enter_the_dag_with_a_placeholder
         0,
         FileMeta {
             mtime_unix_nanos: 0,
-            unix_mode: None,
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     );
     let record = FileRecord {
@@ -1517,5 +1516,65 @@ mod superseded_devices {
             )]
         );
         assert_eq!(state.authority.superseded_by(OLD).as_deref(), Some(NEW));
+    }
+}
+
+mod construction_intervals {
+    use super::*;
+
+    fn build(intervals: StateIntervals) -> Arc<DaemonState> {
+        construct_with_intervals(intervals, test_state_with_own_config)
+    }
+
+    /// The intervals a construction asks for belong to that daemon alone: two daemons built one
+    /// after the other on the same thread, with different intervals and with none, each keep
+    /// their own, and nothing is left behind for the next construction.
+    #[tokio::test]
+    async fn the_intervals_of_one_construction_reach_that_daemon_and_no_other() {
+        let quick = build(StateIntervals {
+            materialization_repair_sweep: Some(Duration::from_secs(1)),
+            custody_confirmation_sweep: Some(Duration::from_secs(2)),
+        });
+        let slow = build(StateIntervals {
+            materialization_repair_sweep: Some(Duration::from_secs(3600)),
+            custody_confirmation_sweep: None,
+        });
+        let untouched = test_state_with_own_config();
+
+        assert_eq!(quick.materialization_repair_sweep_interval(), Duration::from_secs(1));
+        assert_eq!(quick.durability.custody_confirmation_sweep_interval(), Duration::from_secs(2));
+        assert_eq!(slow.materialization_repair_sweep_interval(), Duration::from_secs(3600));
+        assert_eq!(
+            slow.durability.custody_confirmation_sweep_interval(),
+            crate::durability_service::CUSTODY_CONFIRMATION_SWEEP_INTERVAL
+        );
+        assert_eq!(
+            untouched.materialization_repair_sweep_interval(),
+            MATERIALIZATION_REPAIR_SWEEP_INTERVAL
+        );
+        assert_eq!(
+            untouched.durability.custody_confirmation_sweep_interval(),
+            crate::durability_service::CUSTODY_CONFIRMATION_SWEEP_INTERVAL
+        );
+    }
+
+    /// A construction that panics does not leave its intervals for the next one on the thread.
+    #[test]
+    fn a_panicking_construction_restores_the_previous_intervals() {
+        let panicked = std::panic::catch_unwind(|| {
+            construct_with_intervals(
+                StateIntervals {
+                    materialization_repair_sweep: Some(Duration::from_secs(1)),
+                    custody_confirmation_sweep: Some(Duration::from_secs(1)),
+                },
+                || panic!("construction failed"),
+            )
+        });
+        assert!(panicked.is_err());
+        assert_eq!(
+            default_materialization_repair_sweep_interval(),
+            MATERIALIZATION_REPAIR_SWEEP_INTERVAL
+        );
+        assert_eq!(construction_custody_confirmation_sweep(), None);
     }
 }

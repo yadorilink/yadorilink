@@ -18,10 +18,18 @@ pub async fn run(dry_run: bool) -> Result<(), CliError> {
 
 fn format_gc_report(report: &yadorilink_ipc_proto::daemonctl::GcResponse, dry_run: bool) -> String {
     if dry_run {
-        format!(
+        let mut text = format!(
             "Dry run: would delete {} block(s), reclaiming {} bytes",
             report.blocks_deleted, report.bytes_reclaimed
-        )
+        );
+        if let (Some(versions), Some(bytes)) =
+            (report.kept_history_versions, report.kept_history_bytes)
+        {
+            text.push_str(&format!(
+                "\nKept history: {versions} older version(s) hold {bytes} bytes that no current file uses"
+            ));
+        }
+        text
     } else {
         format!(
             "Deleted {} block(s), reclaimed {} bytes",

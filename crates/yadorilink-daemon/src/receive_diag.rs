@@ -65,6 +65,22 @@ pub fn reset() {
     OPEN_BATCHES.store(0, Ordering::Relaxed);
     OPEN_ITEMS.store(0, Ordering::Relaxed);
     OPEN_ITEMS_HIST.reset();
+    reset_block_dedup();
+    for counter in [
+        &RETAIN_BATCHES,
+        &RETAIN_INGESTS,
+        &RETAIN_BLOCKS,
+        &RETAIN_BYTES,
+        &RETAIN_NANOS,
+        &RETAIN_IN_STORE,
+        &RETAIN_NO_BYTES,
+        &SERVE_READS,
+        &SERVE_FOUND,
+        &SERVE_BYTES,
+        &SERVE_NANOS,
+    ] {
+        counter.store(0, Ordering::Relaxed);
+    }
     reset_windows();
     reset_stages();
 }
@@ -99,6 +115,121 @@ pub(crate) fn record_open_batch(items: usize) {
     OPEN_BATCHES.fetch_add(1, Ordering::Relaxed);
     OPEN_ITEMS.fetch_add(items as u64, Ordering::Relaxed);
     OPEN_ITEMS_HIST.record(items as u64);
+}
+
+// ---------------------------------------------------------------------
+// Keeping the version a sync replaces, and serving blocks from files
+// ---------------------------------------------------------------------
+
+static RETAIN_BATCHES: AtomicU64 = AtomicU64::new(0);
+static RETAIN_INGESTS: AtomicU64 = AtomicU64::new(0);
+static RETAIN_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static RETAIN_BYTES: AtomicU64 = AtomicU64::new(0);
+static RETAIN_NANOS: AtomicU64 = AtomicU64::new(0);
+static RETAIN_IN_STORE: AtomicU64 = AtomicU64::new(0);
+static RETAIN_NO_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// One batch of replaced versions read from their files into the store: `files` of them, the
+/// distinct `blocks` and `bytes` put into the store, and `nanos`: the wall time of its durable
+/// commit and provenance record.
+pub(crate) fn record_retention_ingest(files: usize, blocks: usize, bytes: u64, nanos: u64) {
+    if !enabled() {
+        return;
+    }
+    RETAIN_BATCHES.fetch_add(1, Ordering::Relaxed);
+    RETAIN_INGESTS.fetch_add(files as u64, Ordering::Relaxed);
+    RETAIN_BLOCKS.fetch_add(blocks as u64, Ordering::Relaxed);
+    RETAIN_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    RETAIN_NANOS.fetch_add(nanos, Ordering::Relaxed);
+}
+
+/// A replaced version that needed no ingest: `in_store` when the store already held it, otherwise
+/// the device held no bytes of it.
+pub(crate) fn record_retention_no_ingest(in_store: bool) {
+    if !enabled() {
+        return;
+    }
+    if in_store { &RETAIN_IN_STORE } else { &RETAIN_NO_BYTES }.fetch_add(1, Ordering::Relaxed);
+}
+
+static SERVE_READS: AtomicU64 = AtomicU64::new(0);
+static SERVE_FOUND: AtomicU64 = AtomicU64::new(0);
+static SERVE_BYTES: AtomicU64 = AtomicU64::new(0);
+static SERVE_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// One block asked of the file source when serving a peer (`found`: the file held it).
+pub(crate) fn record_file_serve(found: bool, bytes: u64, nanos: u64) {
+    if !enabled() {
+        return;
+    }
+    SERVE_READS.fetch_add(1, Ordering::Relaxed);
+    if found {
+        SERVE_FOUND.fetch_add(1, Ordering::Relaxed);
+        SERVE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+    SERVE_NANOS.fetch_add(nanos, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------
+// Block reuse
+// ---------------------------------------------------------------------
+
+static DEDUP_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static DEDUP_BYTES: AtomicU64 = AtomicU64::new(0);
+static DEDUP_STORE_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static DEDUP_STORE_BYTES: AtomicU64 = AtomicU64::new(0);
+static DEDUP_FETCHED_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static DEDUP_FETCHED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+fn reset_block_dedup() {
+    for counter in [
+        &DEDUP_BLOCKS,
+        &DEDUP_BYTES,
+        &DEDUP_STORE_BLOCKS,
+        &DEDUP_STORE_BYTES,
+        &DEDUP_FETCHED_BLOCKS,
+        &DEDUP_FETCHED_BYTES,
+    ] {
+        counter.store(0, Ordering::Relaxed);
+    }
+}
+
+/// One block of a file being received, as the receive plans it: `held` when
+/// the block store already has it with this group's provenance (no fetch),
+/// otherwise wanted from the peer. Blocks wanted by several paths of one
+/// window are asked for once, so `wanted - fetched` is the in-window sharing.
+/// Together with the store-held count this says how much of a receive the
+/// block store's reuse saves, which decides whether a receive may keep
+/// writing through it.
+pub(crate) fn record_block_planned(held_in_store: bool, bytes: u64) {
+    if !enabled() {
+        return;
+    }
+    DEDUP_BLOCKS.fetch_add(1, Ordering::Relaxed);
+    DEDUP_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    if held_in_store {
+        DEDUP_STORE_BLOCKS.fetch_add(1, Ordering::Relaxed);
+        DEDUP_STORE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+/// One block that actually arrived from the peer.
+pub(crate) fn record_block_fetched(bytes: u64) {
+    if !enabled() {
+        return;
+    }
+    DEDUP_FETCHED_BLOCKS.fetch_add(1, Ordering::Relaxed);
+    DEDUP_FETCHED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// `(planned blocks, held in the store, fetched from the peer)`.
+#[cfg(test)]
+pub(crate) fn block_source_counts() -> (u64, u64, u64) {
+    (
+        DEDUP_BLOCKS.load(Ordering::Relaxed),
+        DEDUP_STORE_BLOCKS.load(Ordering::Relaxed),
+        DEDUP_FETCHED_BLOCKS.load(Ordering::Relaxed),
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -701,6 +832,7 @@ pub fn emit_report(occasion: &str) {
             commit_calls = site.commit_calls,
             commit_ms = ms(site.commit_nanos),
             commit_max_ms = site.commit_max_nanos / 1_000_000,
+            changed_calls = site.changed_calls,
             "receive_budget sqlite_split"
         );
     }
@@ -716,6 +848,46 @@ pub fn emit_report(occasion: &str) {
             commit_p50_us = us(commit_p50),
             commit_p99_us = us(commit_p99),
             "receive_budget sqlite_split percentiles"
+        );
+    }
+    let ingests = RETAIN_INGESTS.load(Ordering::Relaxed);
+    let (in_store, no_bytes) =
+        (RETAIN_IN_STORE.load(Ordering::Relaxed), RETAIN_NO_BYTES.load(Ordering::Relaxed));
+    if ingests + in_store + no_bytes > 0 {
+        tracing::info!(
+            occasion,
+            ingests,
+            batches = RETAIN_BATCHES.load(Ordering::Relaxed),
+            blocks = RETAIN_BLOCKS.load(Ordering::Relaxed),
+            bytes = RETAIN_BYTES.load(Ordering::Relaxed),
+            ingest_ms = RETAIN_NANOS.load(Ordering::Relaxed) / 1_000_000,
+            already_in_store = in_store,
+            no_local_bytes = no_bytes,
+            "receive_budget retention"
+        );
+    }
+    let serve_reads = SERVE_READS.load(Ordering::Relaxed);
+    if serve_reads > 0 {
+        tracing::info!(
+            occasion,
+            reads = serve_reads,
+            found = SERVE_FOUND.load(Ordering::Relaxed),
+            bytes = SERVE_BYTES.load(Ordering::Relaxed),
+            read_ms = SERVE_NANOS.load(Ordering::Relaxed) / 1_000_000,
+            "receive_budget file_serve"
+        );
+    }
+    let dedup_blocks = DEDUP_BLOCKS.load(Ordering::Relaxed);
+    if dedup_blocks > 0 {
+        tracing::info!(
+            occasion,
+            planned_blocks = dedup_blocks,
+            planned_bytes = DEDUP_BYTES.load(Ordering::Relaxed),
+            held_in_store_blocks = DEDUP_STORE_BLOCKS.load(Ordering::Relaxed),
+            held_in_store_bytes = DEDUP_STORE_BYTES.load(Ordering::Relaxed),
+            fetched_blocks = DEDUP_FETCHED_BLOCKS.load(Ordering::Relaxed),
+            fetched_bytes = DEDUP_FETCHED_BYTES.load(Ordering::Relaxed),
+            "receive_budget block_reuse"
         );
     }
     {

@@ -115,7 +115,31 @@ pub mod daemonctl {
     /// `37`: adds the code `ACCESS_DENIED`; link refuses with it when the system denies the folder.
     /// `38`: adds `update_verified_entry`, which says whether an appcast item is covered by the
     /// verified channel manifest's `app_bundle` entry and returns that entry.
-    pub const CONTROL_PROTOCOL_VERSION: u32 = 38;
+    /// `39`: adds the Send link codes (`SEND_LINK_EXPIRED` to `SEND_INTERRUPTED`) and
+    /// `send_link_status`, `preview_send_link` and `CreateSendLinkRequest.source_path`.
+    /// `40`: `SendFileRequest` and `CreateSendLinkRequest` carry `source_paths` (several files
+    /// and folders in one transfer) in place of the single `source_path`.
+    /// `41`: adds the code `SEND_LINKS_DISABLED` (the service has Send links switched off).
+    /// `42`: a redeemed Send link is received by the engine itself: `RedeemSendLinkRequest`
+    /// takes `destination_dir`, `RedeemSendLinkResponse` reports it, and `InboxTransfer` carries
+    /// `link_id`, `received_bytes` and `destination_dir`.
+    /// `43`: `FileVersionInfo` carries `exec` (field 8) in place of `unix_mode` (field 6, now
+    /// reserved): only the execute flag of a version is replicated.
+    /// `44`: adds `resolve_folder`, which names the folder group of a path to a plain linked folder
+    /// or to a File Provider folder at its place in the file manager (rewind uses it).
+    /// `45`: `FileVersionInfo` carries `content` (field 9): whether this device holds the bytes of
+    /// a superseded or trashed version.
+    /// `46`: `RequestHandoffLeaseResponse` carries `not_requested_reason` (field 4), and
+    /// `PinItemResponse` carries `history_not_kept_reason` (field 3).
+    /// `47`: `ListVersionsResponse` carries `not_kept` (field 2), and `LinkStatus` carries
+    /// `history_skipped_last_day` and `history_skipped_last_30_days` (fields 60 and 61).
+    /// `48`: `GcResponse` carries `kept_history_bytes` and `kept_history_versions` (fields 3
+    /// and 4) under a dry run.
+    /// `49`: `PeerStatus` carries `last_connected_unix` (field 11), and `LinkStatus` carries
+    /// `rebuild_needed` (field 62).
+    /// `50`: `StatusResponse` and `LinkStatus` carry `product` (fields 35 and 63), the product
+    /// status the daemon computes.
+    pub const CONTROL_PROTOCOL_VERSION: u32 = 50;
 }
 
 #[cfg(test)]

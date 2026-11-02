@@ -89,6 +89,29 @@ impl NativeReplicationConnection {
         Ok((NativeReplicationWriter { inner: send }, NativeReplicationReader { inner: recv }))
     }
 
+    /// Whether the peer's application closed the connection (it replaced it, or revoked the
+    /// device), as opposed to a loss to the network (idle timeout, reset, transport error).
+    pub fn closed_by_peer(&self) -> bool {
+        use iroh::endpoint::ConnectionError;
+        matches!(self.connection.close_reason(), Some(ConnectionError::ApplicationClosed(_)))
+    }
+
+    /// Whether this side's application closed the connection.
+    pub fn closed_locally(&self) -> bool {
+        use iroh::endpoint::ConnectionError;
+        matches!(self.connection.close_reason(), Some(ConnectionError::LocallyClosed))
+    }
+
+    /// Whether both handles are the same connection.
+    pub fn is_same_connection(&self, other: &Self) -> bool {
+        self.connection.stable_id() == other.connection.stable_id()
+    }
+
+    /// Why the connection ended, if it has (for diagnostics).
+    pub fn close_reason(&self) -> Option<String> {
+        self.connection.close_reason().map(|reason| reason.to_string())
+    }
+
     /// Close the connection with an application close code and reason.
     /// Idempotent.
     pub fn close(&self, code: u32, reason: &[u8]) {
@@ -125,6 +148,40 @@ impl NativeReplicationConnections {
                 held_peer == peer && weak.upgrade().is_some_and(|c| c.close_reason().is_none())
             })
             .count()
+    }
+
+    /// Close every live native-replication connection to or from `peer` with a plain close (nothing
+    /// was revoked), and return how many were closed.
+    pub fn close_plain_to(&self, peer: &PeerId, reason: &[u8]) -> usize {
+        let mut held = self.held.lock().unwrap_or_else(|p| p.into_inner());
+        let mut closed = 0;
+        held.retain(|(held_peer, weak)| {
+            let Some(connection) = weak.upgrade().filter(|c| c.close_reason().is_none()) else {
+                return false;
+            };
+            if held_peer != peer {
+                return true;
+            }
+            connection.close(0u32.into(), reason);
+            closed += 1;
+            false
+        });
+        closed
+    }
+
+    /// Close every live native-replication connection this node holds, with a plain close (no
+    /// refusal code: nothing was revoked), and return how many were closed. The dialling side
+    /// redials, the accepting side accepts the redial.
+    pub fn close_all(&self, reason: &[u8]) -> usize {
+        let mut held = self.held.lock().unwrap_or_else(|p| p.into_inner());
+        let mut closed = 0;
+        for (_, weak) in held.drain(..) {
+            if let Some(connection) = weak.upgrade().filter(|c| c.close_reason().is_none()) {
+                connection.close(0u32.into(), reason);
+                closed += 1;
+            }
+        }
+        closed
     }
 
     /// Close every live native-replication connection to or from `peer`, and

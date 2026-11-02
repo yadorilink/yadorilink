@@ -295,7 +295,9 @@ impl SegmentBlockStore {
         let root = root.into();
         crate::fs_ops::create_dir_all_durably(&root)?;
         ensure_segments_directory(&root)?;
-        write_format_marker(&root)?;
+        // Before anything is written, created or recovered: a store of another layout is refused
+        // as it stands. (The marker is stamped only once the index has accepted the store.)
+        refuse_a_store_of_another_layout(&root)?;
 
         // The index is the only record of which segment records are
         // committed. Opening a missing one creates an empty index, and
@@ -313,6 +315,7 @@ impl SegmentBlockStore {
             )));
         }
         let index = Arc::new(BlockIndex::open(&index_path)?);
+        write_format_marker(&root)?;
         let recovered = recovery::recover(
             &root,
             &index,
@@ -1017,6 +1020,49 @@ impl SegmentBlockStore {
     }
 }
 
+/// Refuses, before anything is written, created or recovered, a directory that holds a block store
+/// of another layout: a marker that names another format version, or a segment file whose header
+/// declares another layout. Looking only (the files are not opened for writing), so a refused store
+/// is left exactly as it was, and the build that wrote it can still open it.
+///
+/// The segment headers matter because the index may be missing or empty while the segments are
+/// there; recovery would take every such segment for an orphan and delete it. A segment of another
+/// layout is never an orphan to be deleted: it is the previous build's data.
+fn refuse_a_store_of_another_layout(root: &Path) -> Result<(), StorageError> {
+    let expected_line = format!("format_version={}", index::STORE_FORMAT_VERSION);
+    match std::fs::read_to_string(root.join(FORMAT_MARKER_FILE)) {
+        Ok(found) => {
+            let version_line = found.lines().nth(1).unwrap_or_default();
+            if version_line.starts_with("format_version=") && version_line != expected_line {
+                return Err(StorageError::CorruptStore(index::another_layout_refusal(&format!(
+                    "the block store's marker ({version_line})"
+                ))));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(StorageError::Io(e)),
+    }
+    for (segment_id, len) in recovery::enumerate_segment_files(root)? {
+        if len < format::SEGMENT_HEADER_LEN {
+            continue;
+        }
+        let mut header = [0u8; format::SEGMENT_HEADER_LEN as usize];
+        let readable = std::fs::File::open(segment::segment_path(root, segment_id))
+            .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header));
+        if readable.is_err() {
+            continue;
+        }
+        if let Some(layout) = format::declared_segment_layout(&header) {
+            if layout != format::SEGMENT_FORMAT_VERSION {
+                return Err(StorageError::CorruptStore(index::another_layout_refusal(&format!(
+                    "segment {segment_id} (segment layout v{layout})"
+                ))));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Writes the human-readable marker, and refuses a directory that already
 /// holds a different one -- the cheap guard against opening something that
 /// is not one of these stores at all.
@@ -1044,6 +1090,9 @@ fn system_time_to_unix_nanos(when: SystemTime) -> i64 {
         .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod older_store_tests;
 
 #[cfg(test)]
 mod drop_unreadable_tests {

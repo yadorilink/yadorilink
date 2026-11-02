@@ -156,4 +156,14 @@ impl DaemonLifecyclePort for DaemonLifecycleAdapter {
         // `send_replace`: the value must change even when nobody has subscribed yet.
         self.state.shutdown_tx.send_replace(true);
     }
+
+    fn request_shutdown_to_restart(&self) {
+        // Honoured only under a supervisor that starts the daemon again (see `supervised`):
+        // elsewhere the restart status would end the daemon for good, or be answered by a second
+        // starter, so the request is an ordinary stop.
+        if self.state.tuning().supervised {
+            self.state.restart_on_exit.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.state.shutdown_tx.send_replace(true);
+    }
 }

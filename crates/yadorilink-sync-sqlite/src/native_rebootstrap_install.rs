@@ -107,10 +107,8 @@ pub enum Observed {
         size: u64,
         sha256: [u8; 32],
         mtime_unix_nanos: i64,
-        /// `None` where the platform has no permission bits to observe.
-        unix_mode: Option<u32>,
-        /// The replicated extended attributes, `None` where the platform cannot observe them.
-        xattrs: Option<Vec<(String, Vec<u8>)>>,
+        /// The execute flag; `None` where the platform has no permission bits to observe.
+        exec: Option<bool>,
     },
     Symlink {
         target: Vec<u8>,
@@ -134,22 +132,8 @@ pub fn observe_regular_file(mut file: std::fs::File) -> Result<Observed, String>
             Ok(after) => i64::try_from(after.as_nanos()).unwrap_or(i64::MAX),
             Err(before) => -i64::try_from(before.duration().as_nanos()).unwrap_or(i64::MAX),
         };
-    // A failed xattr read must not look like "no attributes": that would let a changed file
-    // pass as unchanged and be removed.
-    #[cfg(target_os = "linux")]
-    let xattrs = Some(
-        yadorilink_local_storage::read_replicated_xattrs_strict(&file)
-            .map_err(|e| format!("reading extended attributes: {e}"))?,
-    );
-    #[cfg(not(target_os = "linux"))]
-    let xattrs = None;
-    Ok(Observed::File {
-        size,
-        sha256: digest,
-        mtime_unix_nanos,
-        unix_mode: yadorilink_local_storage::unix_mode_from_metadata(&meta),
-        xattrs,
-    })
+    let exec = cfg!(unix).then(|| yadorilink_local_storage::exec_from_metadata(&meta));
+    Ok(Observed::File { size, sha256: digest, mtime_unix_nanos, exec })
 }
 
 /// The sync root, reached by the daemon through its root-confined operations.
@@ -823,7 +807,7 @@ fn quarantine(
                 None => QuarantineStatus::AlreadyAbsent,
             },
             Observed::Directory | Observed::Other => QuarantineStatus::LeftInPlace,
-            Observed::File { size, sha256: digest, mtime_unix_nanos, unix_mode, xattrs } => {
+            Observed::File { size, sha256: digest, mtime_unix_nanos, exec } => {
                 // The preserved version this file may be an unchanged copy of: same bytes, and
                 // every metadata field (mtime, and the others where the platform can observe them) the same as that version's.
                 // The fields it cannot observe are inherited from that version, as ordinary
@@ -836,10 +820,8 @@ fn quarantine(
                     // The nanosecond equality ordinary capture applies
                     // (`metadata_mtime_matches`): a touch is a distinct version.
                     let same_mtime = *mtime_unix_nanos == record.meta.mtime_unix_nanos;
-                    let same_mode = unix_mode.is_none() || *unix_mode == record.meta.unix_mode;
-                    let same_xattrs =
-                        xattrs.as_ref().is_none_or(|observed| *observed == record.meta.xattrs);
-                    if same_mtime && same_mode && same_xattrs {
+                    let same_exec = exec.is_none_or(|observed| observed == record.meta.exec);
+                    if same_mtime && same_exec {
                         predecessor = Some(record);
                         break;
                     }
@@ -858,11 +840,8 @@ fn quarantine(
                         .find_map(|v| area.read_record(&v.version).ok());
                     let meta = LateEditMeta {
                         mtime_unix_nanos: *mtime_unix_nanos,
-                        unix_mode: unix_mode
-                            .or_else(|| inherited.as_ref().and_then(|r| r.meta.unix_mode)),
-                        xattrs: xattrs.clone().unwrap_or_else(|| {
-                            inherited.map(|r| r.meta.xattrs).unwrap_or_default()
-                        }),
+                        exec: exec
+                            .unwrap_or_else(|| inherited.as_ref().is_some_and(|r| r.meta.exec)),
                     };
                     preserve_late_edit(path, false, *size, digest, &[], Some(meta))?;
                     removed_status(

@@ -261,13 +261,48 @@ pub async fn materialize_temp(
     version: Option<[u8; 32]>,
     range: Option<(u64, u64)>,
 ) -> Result<RangedOutcome, SyncError> {
+    materialize_temp_reporting(state, group_id, path, staging, version, range, None).await
+}
+
+/// [`materialize_temp`], also reporting what the attempt's progress said it resumed from
+/// (`resumed_from` of the provider channel's progress message): the bytes of the content this
+/// device already held. `None` before the attempt knew what it had to fetch.
+pub async fn materialize_temp_resumed(
+    state: &Arc<DaemonState>,
+    group_id: &str,
+    path: &str,
+    staging: &std::path::Path,
+) -> (Result<RangedOutcome, SyncError>, Option<u64>) {
+    let progress = Arc::new(crate::application::ports::AssemblyProgress::default());
+    let outcome = materialize_temp_reporting(
+        state,
+        group_id,
+        path,
+        staging,
+        None,
+        None,
+        Some(progress.clone()),
+    )
+    .await;
+    (outcome, progress.resumed_from())
+}
+
+async fn materialize_temp_reporting(
+    state: &Arc<DaemonState>,
+    group_id: &str,
+    path: &str,
+    staging: &std::path::Path,
+    version: Option<[u8; 32]>,
+    range: Option<(u64, u64)>,
+    progress: Option<Arc<crate::application::ports::AssemblyProgress>>,
+) -> Result<RangedOutcome, SyncError> {
     let request = TempMaterialization {
         group_id,
         path,
         requested_version: version.map(yadorilink_replica_domain::ids::VersionHash),
         staging_file: staging,
         range: range.map(|(offset, len)| crate::application::ports::ByteRange { offset, len }),
-        progress: None,
+        progress,
     };
     match crate::hydration::materialize_path(
         state,

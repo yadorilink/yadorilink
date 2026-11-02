@@ -86,10 +86,9 @@ impl Side {
                     0,
                     FileMeta {
                         mtime_unix_nanos: *salt,
-                        unix_mode: Some(0o644),
+                        exec: false,
                         symlink_target: None,
                         record_kind: RecordKind::File,
-                        xattrs: Vec::new(),
                     },
                 );
                 PreparedLocalMutation::Upsert {
@@ -105,8 +104,7 @@ impl Side {
                         record_kind: RecordKind::File,
                         symlink_target: None,
                         symlink_out_of_root: false,
-                        unix_mode: Some(0o644),
-                        xattrs: Vec::new(),
+                        exec: false,
                     }),
                     version,
                     native_witness: witness,

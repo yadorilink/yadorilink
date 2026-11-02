@@ -83,7 +83,7 @@ pub() { cat "$SRV/$1/pubkey.hex"; }
 # inst NAME KEYFROM [args]: run install.sh against fixture NAME. Output $T/out, status $RC.
 inst() {
     name=$1; keyfrom=$2; shift 2
-    env HOME="$H" SHELL=/bin/sh YADORILINK_INSTALL_TEST=1 \
+    env HOME="$H" SHELL=/bin/sh YADORILINK_INSTALL_TEST=1 YADORILINK_CONFIG_DIR="$H/cfg" \
         YADORILINK_INSTALL_PUBKEY_HEX="$(pub "$keyfrom")" YADORILINK_INSTALL_KEY_ID="$(cat "$SRV/$keyfrom/key_id")" \
         YADORILINK_INSTALL_BASE_URL="$BASE/$name" YADORILINK_INSTALL_MIN_GENERATED_AT="${MINGEN:-2000-01-01T00:00:00Z}" \
         YADORILINK_INSTALL_OS="$TOS" YADORILINK_INSTALL_ARCH="$TARCH" \
@@ -110,7 +110,9 @@ echo "installer: $INSTALL"
 mkdir -p "$H/Sync" && echo "precious" > "$H/Sync/notes.txt"
 
 # --- 1 install version 1.0.0 with the real programs
-fx rel --version 1.0.0
+# `rel` is a bundle from before bundles carried the installer: self-update then only prints the
+# command (section 3). Section 7 uses bundles that carry it.
+fx rel --version 1.0.0 --no-installer
 inst rel rel
 if [ $RC = 0 ] && has "Manifest signature verified" && has "Installed YadoriLink 1.0.0"; then ok "install.sh installs the real programs"; else bad "install" "$T/out"; fi
 SHARE=$H/prefix/share/yadorilink
@@ -136,7 +138,7 @@ import json, sys
 p = sys.argv[1]; e = json.load(open(p)); e["manifest_json"] = e["manifest_json"].replace('"rollout_percentage": 100', '"rollout_percentage":  99', 1); json.dump(e, open(p, "w"))
 PY
 }
-fx rel --version 2.0.0 --extra-version 1.0.0 --generated-at 2026-10-19T00:00:00Z
+fx rel --version 2.0.0 --extra-version 1.0.0 --no-installer --generated-at 2026-10-19T00:00:00Z
 yl self-update --version 2.0.0
 { [ $RC = 0 ] && has "is allowed by the verified beta channel manifest" && has "install.sh | sh -s -- --channel beta --version 2.0.0 --prefix"; } && ok "self-update --version 2.0.0 is allowed and prints the pinned installer command" || bad "self-update allowed" "$T/out"
 yl self-update
@@ -151,7 +153,7 @@ yl self-update --version 2.0.0
 { [ $RC = 4 ] && ! has "is allowed"; } && ok "self-update refuses a tampered manifest (exit 4)" || bad "self-update tampered (rc=$RC)" "$T/out"
 yl self-update
 { [ $RC != 0 ] && ! has "already up to date"; } && ok "plain self-update does not report up to date on a manifest it cannot verify" || bad "plain self-update, tampered (rc=$RC)" "$T/out"
-fx rel --version 2.0.0 --extra-version 1.0.0 --generated-at 2026-10-22T00:00:00Z
+fx rel --version 2.0.0 --extra-version 1.0.0 --no-installer --generated-at 2026-10-22T00:00:00Z
 # carry out the update with the command self-update prints (local installer, fixture endpoints)
 before=$(snapshot)
 inst rel rel --version 2.0.0
@@ -209,6 +211,104 @@ DAEMON_STARTED=0
 # --- fresh install of an older version (nothing installed after the uninstall); kept data stays untouched
 inst rel rel --version 1.0.0
 { [ $RC = 0 ] && has "Installed YadoriLink 1.0.0" && [ "$(cat "$H/cfg/keep-me.txt")" = "device state" ]; } && ok "fresh install of an older version works and the data directory is intact" || bad "reinstall 1.0.0" "$T/out"
+
+# --- 6 the existing data is checked before anything is replaced (`yadorilink-daemon --check-data-compat`)
+# Ran against the real daemon's own database (stamped by this build, left by the stopped daemon in a
+# clean state) and against ones made unsafe on purpose. The database is the only source.
+DB=$H/cfg/sync-state.sqlite3
+stamp() { python3 -c 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.execute("pragma user_version").fetchone()[0])' "$1"; }
+setstamp() { python3 -c 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute("pragma user_version=%d" % int(sys.argv[2])); c.commit(); c.close()' "$1" "$2"; }
+GOOD=$(stamp "$DB")
+# What a stopped daemon leaves is the common case: its database with a write-ahead log beside it.
+LEFT=""; [ -e "$DB-wal" ] && LEFT="$LEFT -wal"; [ -e "$DB-shm" ] && LEFT="$LEFT -shm"
+inst rel rel --version 2.0.0 --force
+{ [ $RC = 0 ] && has "Installed YadoriLink 2.0.0"; } && ok "data as the stopped daemon left it (files beside the database:${LEFT:- none}): the install proceeds (stamp $GOOD)" || bad "install over the stopped daemon's data" "$T/out"
+inst rel rel --version 1.0.0 --force
+# A database whose log is folded in and which no process holds reads the same.
+python3 -c 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute("pragma wal_checkpoint(TRUNCATE)"); c.close()' "$DB"
+{ [ ! -s "$DB-wal" ]; } && ok "the log is folded into the database (no pending -wal content)" || bad "could not fold the log into the database"
+cp "$DB" "$T/db.clean"
+inst rel rel --version 2.0.0 --force
+{ [ $RC = 0 ] && has "Installed YadoriLink 2.0.0" && cmp -s "$DB" "$T/db.clean"; } && ok "a clean database: the install proceeds and the database file is byte-identical afterwards" || bad "install over a clean database" "$T/out"
+inst rel rel --version 1.0.0 --force
+setstamp "$DB" $((GOOD + 1))
+before=$(snapshot)
+inst rel rel --version 2.0.0 --force
+{ [ $RC = 20 ] && has "downgrading" && has "Nothing was installed" && [ "$(snapshot)" = "$before" ]; } && ok "data written by a newer build: exit 20, installed files untouched" || bad "newer data" "$T/out"
+setstamp "$DB" "$GOOD"
+# A newer stamp that is only in the write-ahead log (the daemon has not checkpointed yet) is seen too.
+python3 - "$DB" $((GOOD + 1)) <<'PY' &
+import sqlite3, sys, time
+c = sqlite3.connect(sys.argv[1], isolation_level=None)
+c.execute("pragma journal_mode=wal")
+c.execute("pragma wal_autocheckpoint=0")
+c.execute("pragma user_version=%d" % int(sys.argv[2]))
+time.sleep(20)
+PY
+HOLDER=$!
+sleep 1
+before=$(snapshot)
+inst rel rel --version 2.0.0 --force
+{ [ $RC = 20 ] && [ "$(snapshot)" = "$before" ]; } && ok "a newer stamp still in the write-ahead log, with another process holding the database: exit 20" || bad "newer stamp in the log" "$T/out"
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+rm -f "$DB-wal" "$DB-shm"
+setstamp "$DB" "$GOOD"
+cp "$DB" "$T/db.good"
+printf 'this is not a database, but it is long enough to look like a header....' > "$DB"
+before=$(snapshot)
+inst rel rel --version 2.0.0 --force
+{ [ $RC = 21 ] && has "start the daemon once and stop it cleanly" && has "Nothing was installed" && [ "$(snapshot)" = "$before" ]; } && ok "data that cannot be read: exit 21 with what to do, installed files untouched" || bad "unreadable data" "$T/out"
+cp "$T/db.good" "$DB"
+inst rel rel --version 2.0.0 --force
+{ [ $RC = 0 ] && has "Installed YadoriLink 2.0.0" && [ "$(stamp "$DB")" = "$GOOD" ]; } && ok "the data is left as it was (same stamp) after a successful install" || bad "data after install" "$T/out"
+rm -rf "$H/cfg" "$H/prefix"
+inst rel rel --version 1.0.0
+{ [ $RC = 0 ] && has "Installed YadoriLink 1.0.0" && [ ! -e "$DB" ]; } && ok "no data at all: the install proceeds and the check creates nothing" || bad "no data" "$T/out"
+
+# --- 7 self-update runs the installer kept from the verified bundle; --rollback; a rewritten copy; an install too far behind
+# The bundles carry install.sh; the install keeps a copy and records the hash it was proven to have.
+# `self-update` checks that hash, then hands those bytes to the shell: the installer is the only
+# verifier. The kept installer is the real one, so its test hooks need YADORILINK_INSTALL_TEST=1.
+rm -rf "$H/prefix" "$H/cfg" "$H/.profile"
+mkdir -p "$H/cfg"
+fx kel --version 1.0.0
+inst kel kel
+KSHA=$(sed -n 's/^installer_sha256=//p' "$SHARE/install-receipt")
+{ [ $RC = 0 ] && [ -x "$SHARE/installer/install.sh" ] && [ -n "$KSHA" ]; } && ok "the installer from the verified bundle is kept and its hash recorded" || bad "kept installer" "$T/out"
+REL=kel yl daemon start
+if [ $RC = 0 ]; then DAEMON_STARTED=1; ok "daemon started on the kel channel"; else bad "daemon start (kel)" "$T/out"; fi
+fx kel --version 2.0.0 --extra-version 1.0.0 --generated-at 2026-10-30T00:00:00Z
+selfenv_on() {
+    export YADORILINK_INSTALL_TEST=1 YADORILINK_INSTALL_PUBKEY_HEX="$(pub kel)" YADORILINK_INSTALL_KEY_ID="$(cat "$SRV/kel/key_id")" \
+        YADORILINK_INSTALL_BASE_URL="$BASE/kel" YADORILINK_INSTALL_MIN_GENERATED_AT=2000-01-01T00:00:00Z \
+        YADORILINK_INSTALL_OS="$TOS" YADORILINK_INSTALL_ARCH="$TARCH" \
+        YADORILINK_INSTALL_VERIFIER_BASE="$BASE/verifier" YADORILINK_INSTALL_VERIFIER_SHA256="$VSHA"
+}
+selfenv_off() {
+    unset YADORILINK_INSTALL_TEST YADORILINK_INSTALL_PUBKEY_HEX YADORILINK_INSTALL_KEY_ID YADORILINK_INSTALL_BASE_URL \
+        YADORILINK_INSTALL_MIN_GENERATED_AT YADORILINK_INSTALL_OS YADORILINK_INSTALL_ARCH YADORILINK_INSTALL_VERIFIER_BASE YADORILINK_INSTALL_VERIFIER_SHA256
+}
+selfenv_on
+REL=kel yl self-update --version 2.0.0
+{ [ $RC = 0 ] && has "running the installer that came with this install" && has "Installed YadoriLink 2.0.0" && grep -q '^version=2.0.0$' "$SHARE/install-receipt" && grep -q '^previous_version=1.0.0$' "$SHARE/install-receipt"; } && ok "self-update runs the kept installer, which verifies and switches to 2.0.0" || bad "self-update through the kept installer (rc=$RC)" "$T/out"
+REL=kel yl self-update --rollback
+{ [ $RC = 0 ] && has "Rolled back to YadoriLink 1.0.0" && grep -q '^version=1.0.0$' "$SHARE/install-receipt"; } && ok "self-update --rollback goes back to 1.0.0 without downloading" || bad "rollback (rc=$RC)" "$T/out"
+# a rewritten kept installer is not run
+cp "$SHARE/installer/install.sh" "$T/kept.good"
+printf '\n# changed\n' >> "$SHARE/installer/install.sh"
+before=$(snapshot)
+REL=kel yl self-update --version 2.0.0
+{ [ $RC != 0 ] && has "does not match what was verified" && has "yadori.link/install.sh" && grep -q '^version=1.0.0$' "$SHARE/install-receipt"; } && ok "a rewritten kept installer is not run: the one-liner is the way out" || bad "rewritten kept installer (rc=$RC)" "$T/out"
+rm -f "$SHARE/installer/install.sh"
+REL=kel yl self-update --version 2.0.0
+{ [ $RC != 0 ] && has "the file is missing" && grep -q '^version=1.0.0$' "$SHARE/install-receipt"; } && ok "a missing kept installer is not replaced by a download" || bad "missing kept installer (rc=$RC)" "$T/out"
+cp "$T/kept.good" "$SHARE/installer/install.sh"; chmod 755 "$SHARE/installer/install.sh"
+# an install whose kept installer pins other keys than the live manifest's signer
+KEEP_ID=$YADORILINK_INSTALL_KEY_ID; YADORILINK_INSTALL_KEY_ID=some-other-id; export YADORILINK_INSTALL_KEY_ID
+REL=kel yl self-update --version 2.0.0
+YADORILINK_INSTALL_KEY_ID=$KEEP_ID; export YADORILINK_INSTALL_KEY_ID
+{ [ $RC = 22 ] && has "too far behind to update itself" && has "yadori.link/install.sh" && grep -q '^version=1.0.0$' "$SHARE/install-receipt"; } && ok "a manifest signed by a key this installer does not pin: exit 22 and the one-liner" || bad "key not pinned (rc=$RC)" "$T/out"
+selfenv_off
 
 echo
 echo "passed: $pass, failed: $failn"

@@ -17,14 +17,22 @@ $T = [System.IO.Path]::GetFullPath((Join-Path $env:TEMP ("yl-install-tests-" + [
 $Srv = Join-Path $T 'srv'
 New-Item -ItemType Directory -Force -Path $Srv | Out-Null
 $script:Pass = 0; $script:Fail = 0
+# install.ps1 reads the machine's data directory (YADORILINK_CONFIG_DIR, else %USERPROFILE%\.yadorilink)
+# to see who owns it. On a host that has the Store app, or any earlier install, that record would
+# stop every install here (exit 19), so the whole run uses a throw-away one. The ownership tests
+# below point it elsewhere for a moment and put it back.
+$script:IsolatedCfg = Join-Path $T 'cfg-isolated'
+New-Item -ItemType Directory -Force -Path $script:IsolatedCfg | Out-Null
+$env:YADORILINK_CONFIG_DIR = $script:IsolatedCfg
 function Ok($m) { $script:Pass++; Write-Host "ok   $m" }
 function Bad($m, $out) { $script:Fail++; Write-Host "FAIL $m"; if ($out) { ($out -split "`n") | ForEach-Object { Write-Host "     | $_" } } }
 
 # --- fake binaries (real PE files)
-foreach ($spec in @(@('0.2.0', 0), @('0.3.0', 0), @('fail', 7), @('ph', 0))) {
+foreach ($spec in @(@('0.2.0', 0), @('0.3.0', 0), @('fail', 7), @('ph', 0), @('compat', 0))) {
     $name = $spec[0]; $code = $spec[1]
     # 'ph' answers `status --json` with whatever YL_FAKE_STATUS holds, like a daemon of any schema.
-    $line = if ($name -eq 'fail') { '' } elseif ($name -eq 'ph') { 'if (a.Length > 0 && a[0] == "status") System.Console.WriteLine(System.Environment.GetEnvironmentVariable("YL_FAKE_STATUS"));' } else { "System.Console.WriteLine(`"yadorilink fake $name`");" }
+    # 'compat' answers `--check-data-compat` with the status YL_FAKE_COMPAT_RC holds (and a message), like the real daemon does for the data on the machine.
+    $line = if ($name -eq 'fail') { '' } elseif ($name -eq 'compat') { 'if (a.Length > 0 && a[0] == "--check-data-compat") { string rc = System.Environment.GetEnvironmentVariable("YL_FAKE_COMPAT_RC"); if (!string.IsNullOrEmpty(rc)) { System.Console.Error.WriteLine("fake compat message"); return int.Parse(rc); } return 0; } System.Console.WriteLine("yadorilink fake compat");' } elseif ($name -eq 'ph') { 'if (a.Length > 0 && a[0] == "status") System.Console.WriteLine(System.Environment.GetEnvironmentVariable("YL_FAKE_STATUS"));' } else { "System.Console.WriteLine(`"yadorilink fake $name`");" }
     Add-Type -TypeDefinition "public static class P { public static int Main(string[] a) { $line return $code; } }" -OutputType ConsoleApplication -OutputAssembly (Join-Path $T "fake-$name.exe")
 }
 
@@ -43,6 +51,7 @@ function Fx([string]$Name, [string[]]$More) {
 }
 function Pub($Name) { (Get-Content (Join-Path $Srv "$Name\pubkey.hex") -Raw).Trim() }
 
+$script:HostExe = 'powershell.exe'
 $script:Out = ''; $script:Rc = 0; $script:BaseOverride = $null; $script:MinGen = $null; $script:Now = $null
 function Inst([string]$Name, [string]$KeyFrom, [string]$Prefix, [string[]]$More, [string]$Arch = 'AMD64', [bool]$TestOn = $true) {
     $env:YADORILINK_INSTALL_TEST = $(if ($TestOn) { '1' } else { $null })
@@ -53,7 +62,7 @@ function Inst([string]$Name, [string]$KeyFrom, [string]$Prefix, [string[]]$More,
     $env:YADORILINK_INSTALL_NOW = $(if ($script:Now) { $script:Now } else { $null })
     $env:YADORILINK_INSTALL_ARCH = $Arch
     $args_ = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Installer, '-Prefix', $Prefix, '-Yes') + $More
-    $script:Out = (& powershell.exe @args_ 2>&1 | ForEach-Object { "$_" }) -join "`n"
+    $script:Out = (& $script:HostExe @args_ 2>&1 | ForEach-Object { "$_" }) -join "`n"
     $script:Rc = $LASTEXITCODE
     foreach ($v in 'YADORILINK_INSTALL_TEST', 'YADORILINK_INSTALL_PUBKEY_HEX', 'YADORILINK_INSTALL_KEY_ID', 'YADORILINK_INSTALL_BASE_URL', 'YADORILINK_INSTALL_ARCH', 'YADORILINK_INSTALL_MIN_GENERATED_AT', 'YADORILINK_INSTALL_NOW') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
@@ -121,6 +130,21 @@ try {
     $p = NewPrefix 9; Inst 'b-broken' 'b-broken' $p @('-NoModifyPath')
     if ($Rc -ne 0 -and (Has 'does not run on this system') -and (NothingInstalled $p)) { Ok 'bad bundle rejected: broken binary' } else { Bad 'broken binary' $Out }
 
+    # The bundle's daemon reads the data on the machine (`--check-data-compat`): 20 = written by a
+    # newer build, 21 = could not be established; both stop before anything is installed.
+    Fx 'c-data' '--exe', (Join-Path $T 'fake-compat.exe')
+    foreach ($case in @(@(20, 'newer build'), @(21, 'unreadable'), @(5, 'unexpected'))) {
+        $env:YL_FAKE_COMPAT_RC = [string]$case[0]
+        $p = NewPrefix 11; Inst 'c-data' 'c-data' $p @('-NoModifyPath')
+        Remove-Item Env:YL_FAKE_COMPAT_RC -ErrorAction SilentlyContinue
+        $want = if ($case[0] -eq 20) { 20 } else { 21 }
+        if ($Rc -eq $want -and (Has 'fake compat message') -and (Has 'Nothing was installed') -and (NothingInstalled $p)) { Ok "data check refuses ($($case[1])): exit $want" } else { Bad "data check refuses ($($case[1]))" $Out }
+    }
+    $env:YL_FAKE_COMPAT_RC = '2'
+    $p = NewPrefix 11; Inst 'c-data' 'c-data' $p @('-NoModifyPath')
+    Remove-Item Env:YL_FAKE_COMPAT_RC -ErrorAction SilentlyContinue
+    if ($Rc -eq 0) { Ok 'a release from before the data check installs' } else { Bad 'status 2 data check' $Out }
+
     # wrong arch
     $p = NewPrefix 10; Inst 's1' 's1' $p @('-NoModifyPath') 'ARM64'
     if ($Rc -ne 0 -and (Has 'unsupported CPU') -and (NothingInstalled $p)) { Ok 'refused ARM64' } else { Bad 'refused ARM64' $Out }
@@ -177,7 +201,7 @@ try {
     Set-Content -LiteralPath (Join-Path $cfg 'install-owner.json') -Value (@{ owner = 'cli'; install_source = 'script'; install_root = 'x'; release_id = ''; written_at = 1 } | ConvertTo-Json)
     $p = NewPrefix 46; Inst 's1' 's1' $p @('-NoModifyPath')
     if ($Rc -eq 0) { Ok 'script-owned data installs' } else { Bad 'script owner installs' $Out }
-    Remove-Item Env:YADORILINK_CONFIG_DIR -ErrorAction SilentlyContinue
+    $env:YADORILINK_CONFIG_DIR = $script:IsolatedCfg
     $p = NewPrefix 40; Inst 's1' 's1' $p @('-Bogus'); if ($Rc -eq 2 -and (Has 'unknown option')) { Ok 'exit 2: unknown option' } else { Bad 'exit 2' $Out }
     $p = NewPrefix 40; Inst 's1' 's1' $p @('-NoModifyPath', '-Channel', 'stable'); if ($Rc -eq 2) { Ok 'exit 2: unknown channel' } else { Bad 'exit 2 channel' $Out }
     $script:BaseOverride = 'http://127.0.0.1:1'; $p = NewPrefix 41; Inst 's1' 's1' $p @('-NoModifyPath'); $script:BaseOverride = $null
@@ -364,6 +388,28 @@ try {
     # a prompt that interpolates "$name?" prints nothing for the name (PowerShell reads "name?" as the variable)
     $bad = @(Select-String -LiteralPath $Installer -Pattern '"[^"]*\$[A-Za-z_]\w*\?[^"]*"' | ForEach-Object { "line $($_.LineNumber): $($_.Line.Trim())" })
     if ($bad.Count -eq 0) { Ok 'no prompt interpolates a name followed by a question mark' } else { Bad 'prompt text interpolates $name?' ($bad -join "`n") }
+
+    # PowerShell 7 (.NET) compiles the embedded verifier against other assemblies than Windows PowerShell does;
+    # the installer must install under both.
+    $pwsh = Get-Command pwsh -ErrorAction SilentlyContinue
+    if ($pwsh) {
+        $p = NewPrefix 22
+        $script:HostExe = $pwsh.Source
+        Inst 's1' 's1' $p @()
+        $script:HostExe = 'powershell.exe'
+        if ($Rc -eq 0 -and (Has 'Manifest signature verified') -and (Test-Path (Join-Path $p 'bin\yadorilink.exe'))) { Ok 'installs under PowerShell 7' } else { Bad 'install under PowerShell 7' $Out }
+    } else { Write-Host 'skip installs under PowerShell 7 (pwsh is not installed here)' }
+
+    # The embedded verifier gives the same answer on known vectors under every host: valid signatures pass,
+    # a flipped bit, another key and another message fail.
+    $vectors = Join-Path $PSScriptRoot 'verifier-vectors.ps1'
+    $want = 'vector1=True;vector2=True;last bit flipped=False;first bit flipped=False;other key=False;other message=False'
+    $got = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $vectors -Installer $Installer 2>&1 | ForEach-Object { "$_" }) -join "`n"
+    if ($got -eq $want) { Ok 'verifier vectors under Windows PowerShell' } else { Bad 'verifier vectors under Windows PowerShell' $got }
+    if ($pwsh) {
+        $got = (& $pwsh.Source -NoProfile -ExecutionPolicy Bypass -File $vectors -Installer $Installer 2>&1 | ForEach-Object { "$_" }) -join "`n"
+        if ($got -eq $want) { Ok 'verifier vectors under PowerShell 7 (same result)' } else { Bad 'verifier vectors under PowerShell 7' $got }
+    }
 
     # embedded verifier agrees with the independent Python signer on a manifest it signed (positive case is every success above)
 } finally {

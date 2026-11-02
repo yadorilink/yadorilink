@@ -128,3 +128,41 @@ fn conditional_batch_clear_only_removes_the_exact_observations_named() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].path, "b.txt");
 }
+
+/// The availability check runs on every status read, once per journaled path; both lookups must be
+/// index searches on the file table's primary key, never a scan of the group's rows.
+#[test]
+fn the_materialized_row_lookups_search_the_primary_key() {
+    let repo = open_test_repo();
+    repo.database
+        .read::<_, SyncSqliteError>(|conn| {
+            for (sql, params) in [(PRESENT_BELOW_SQL, 4), (PRESENT_AT_SQL, 2)] {
+                let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                let args: Vec<&str> = vec!["g", "a", "a/", "a0"][..params].to_vec();
+                let plan: Vec<String> = stmt
+                    .query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(3))?
+                    .collect::<Result<_, _>>()?;
+                let plan = plan.join(" | ");
+                assert!(plan.contains("SEARCH files") && plan.contains("path"), "{plan}");
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// A journal too large to look up within the probe budget withdraws the claim instead of making
+/// the status read pay for it; a small one of rowless new files does not.
+#[test]
+fn a_journal_beyond_the_probe_budget_withdraws_the_claim() {
+    let repo = open_test_repo();
+    let entries: Vec<(String, String, i64)> =
+        (0..10).map(|i| (format!("new/{i}.bin"), "create".to_string(), 1)).collect();
+    repo.record_dirty_paths_batch("g", &entries, &permit()).unwrap();
+    assert!(!repo.has_dirty_path_with_materialized_row("g").unwrap());
+
+    let many: Vec<(String, String, i64)> = (0..DIRTY_LOOKUP_PROBE_BUDGET)
+        .map(|i| (format!("bulk/{i}.bin"), "create".to_string(), 1))
+        .collect();
+    repo.record_dirty_paths_batch("g", &many, &permit()).unwrap();
+    assert!(repo.has_dirty_path_with_materialized_row("g").unwrap());
+}

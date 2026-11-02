@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::content_ports::BlockContentStore;
 use crate::error::StorageError;
 use crate::fs_ops::{durable_namespace_beside, remove_path, rename_path, LedgerNames};
+use crate::LocallyHashedBlock;
 use yadorilink_fs_platform::durable_dir::Replace;
 use yadorilink_replica_domain::file::BlockInfo;
 
@@ -26,6 +27,12 @@ pub enum Durability {
     #[default]
     Full,
     DeferredToBatch,
+    /// For content that is NOT durable elsewhere (a block kept in memory for a single-pass
+    /// receive): the writer flushes the file's data before it can be renamed into place, so a cut
+    /// after the rename cannot leave a torn file that nothing could rebuild; the directory flush
+    /// and the temp name's ledger record are deferred to the batch exactly as for
+    /// `DeferredToBatch`.
+    FileFlushedNamesDeferred,
 }
 
 /// Prefix of every temp name. Kept as the legacy marker so the reserved
@@ -89,8 +96,17 @@ fn create_recorded_tmp<T>(
 /// Creates a new regular file at `path`, never following a symlink at the
 /// name and never reusing an existing object.
 fn create_new_file(path: &Path) -> std::io::Result<fs::File> {
+    create_new_file_with(path, false)
+}
+
+/// [`create_new_file`] that can also be read, for a file that is read back after it is written.
+fn create_new_file_read_write(path: &Path) -> std::io::Result<fs::File> {
+    create_new_file_with(path, true)
+}
+
+fn create_new_file_with(path: &Path, read: bool) -> std::io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
+    options.read(read).write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NOFOLLOW);
     #[cfg(windows)]
@@ -923,7 +939,7 @@ fn reconstruct_file_to_named_temp_with(
         // Closing a file only releases the handle; it does not make its data
         // durable across power loss. Persist the complete temp before the
         // rename can publish it under the user-visible path.
-        if durability == Durability::Full {
+        if durability != Durability::DeferredToBatch {
             crate::io_diag::time(crate::io_diag::Op::FileFsync, 0, || {
                 yadorilink_fs_platform::flush::sync_file(&out)
             })?;
@@ -935,6 +951,250 @@ fn reconstruct_file_to_named_temp_with(
     assemble()?;
     cleanup.1 = true;
     Ok(tmp_path)
+}
+
+/// A temp file beside its target that a large received file is written into while it arrives: each
+/// verified block is written at its offset, in any order, and the file is then flushed and read back
+/// against the record before anything can rename it into place.
+///
+/// The name is recorded in the temp ledger before the file exists, as for every temp. The file is
+/// removed, and its ledger record released, when the last holder drops it without having called
+/// [`StagedFile::keep`]: write jobs on the blocking pool hold a clone, so the discard runs only after
+/// the last of them has finished, never under a write still in flight.
+pub struct StagedFile {
+    tmp_path: PathBuf,
+    file: fs::File,
+    ledger: std::sync::Arc<dyn TempFileLedger>,
+    kept: std::sync::atomic::AtomicBool,
+    /// Data flushes issued before the final one (see [`StagedFile::flush_data`]).
+    data_flushes: AtomicU64,
+}
+
+impl StagedFile {
+    /// Creates the temp beside `out_path` (never reusing a name), sized to `size`.
+    pub fn create(
+        out_path: &Path,
+        size: u64,
+        ledger: std::sync::Arc<dyn TempFileLedger>,
+    ) -> Result<Self, StorageError> {
+        require_parent_directory(out_path)?;
+        let (tmp_path, file) = create_recorded_tmp(
+            out_path,
+            ledger.as_ref(),
+            random_tmp_path,
+            create_new_file_read_write,
+        )?;
+        let staged = Self {
+            tmp_path,
+            file,
+            ledger,
+            kept: std::sync::atomic::AtomicBool::new(false),
+            data_flushes: AtomicU64::new(0),
+        };
+        // On a failure the drop below removes the temp and releases its record.
+        staged.file.set_len(size)?;
+        Ok(staged)
+    }
+
+    pub fn tmp_path(&self) -> &Path {
+        &self.tmp_path
+    }
+
+    /// Writes `data` at `offset`.
+    pub fn write_at(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        write_all_at(&self.file, data, offset)
+    }
+
+    /// Flushes the data written so far, while later blocks are still being written. A large file's
+    /// dirty pages would otherwise all be waiting for one flush at the end; flushing as it fills
+    /// overlaps the disk with the network. A failure here is the file's failure: the caller must
+    /// not treat the final flush's success as covering it.
+    pub fn flush_data(&self) -> std::io::Result<()> {
+        self.data_flushes.fetch_add(1, Ordering::Relaxed);
+        crate::io_diag::time(crate::io_diag::Op::SinkStepFlush, 0, || {
+            crate::io_diag::time(crate::io_diag::Op::FileFsync, 0, || {
+                yadorilink_fs_platform::flush::sync_data(&self.file)
+            })
+        })
+    }
+
+    /// How many data flushes [`StagedFile::flush_data`] has issued.
+    pub fn data_flushes(&self) -> u64 {
+        self.data_flushes.load(Ordering::Relaxed)
+    }
+
+    /// Reads `len` bytes at `offset`.
+    fn read_at(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; len];
+        read_exact_at(&self.file, &mut buf, offset)?;
+        Ok(buf)
+    }
+
+    /// Completes the file: stamps its modification time, flushes its data, and reads every block
+    /// range back, checking it against the record's hash. The written bytes, not the arrived ones,
+    /// are what is verified, before they can be renamed in.
+    pub fn finish(&self, blocks: &[BlockInfo], mtime_unix_nanos: i64) -> Result<(), StorageError> {
+        stamp_mtime(&self.file, mtime_unix_nanos);
+        crate::io_diag::time(crate::io_diag::Op::FileFsync, 0, || {
+            yadorilink_fs_platform::flush::sync_file(&self.file)
+        })?;
+        let expected: u64 = blocks.iter().map(|block| u64::from(block.size)).sum();
+        if self.file.metadata()?.len() != expected {
+            return Err(StorageError::Io(std::io::Error::other(
+                "the staged file's length is not the record's size",
+            )));
+        }
+        for block in blocks {
+            let data = crate::io_diag::time(
+                crate::io_diag::Op::SinkReadbackRead,
+                u64::from(block.size),
+                || self.read_at(block.offset, block.size as usize),
+            )?;
+            let digest_matches = crate::io_diag::time(
+                crate::io_diag::Op::SinkReadbackHash,
+                u64::from(block.size),
+                || {
+                    LocallyHashedBlock::from_bytes(data).hash().as_bytes()
+                        == hex::encode(&block.hash).as_bytes()
+                },
+            );
+            if !digest_matches {
+                return Err(StorageError::Io(std::io::Error::other(
+                    "a block read back from the staged file does not hash to the record",
+                )));
+            }
+        }
+        // What was verified is the object this handle writes: its name must still lead to it, or
+        // the rename would publish whatever else stands at the name.
+        #[cfg(unix)]
+        if !self.is_still_at_its_path() {
+            return Err(StorageError::Io(std::io::Error::other(
+                "the staged file's name no longer leads to the file that was verified",
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether the bytes at `block`'s range hash to the block (the written bytes are read back,
+    /// not trusted). A short or unreadable range is a mismatch.
+    pub fn block_matches(&self, block: &BlockInfo) -> bool {
+        let Ok(data) = self.read_at(block.offset, block.size as usize) else { return false };
+        LocallyHashedBlock::from_bytes(data).hash().as_bytes()
+            == hex::encode(&block.hash).as_bytes()
+    }
+
+    /// Whether the name this temp was created under still leads to the file this handle writes: a
+    /// temp kept for a later attempt may have been removed or replaced meanwhile, and a handle on
+    /// an unlinked file must never be renamed into place by its old path. `false` where the
+    /// platform gives no object identity.
+    pub fn is_still_at_its_path(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let (Ok(handle), Ok(named)) =
+                (self.file.metadata(), fs::symlink_metadata(&self.tmp_path))
+            else {
+                return false;
+            };
+            // One name only: a second hard link would expose the bytes written through this
+            // handle under another name.
+            named.is_file()
+                && (handle.dev(), handle.ino()) == (named.dev(), named.ino())
+                && handle.nlink() == 1
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    /// The identity of the file this handle writes, which is what [`StagedFile::finish`] verified;
+    /// the name is renamed into place only while it still leads to this object.
+    pub fn object_key(&self) -> Option<crate::received_flush::ObjectKey> {
+        crate::received_flush::key_of(&self.file)
+    }
+
+    /// Whether removing the temp's name removes this handle's file (or nothing). A name that now
+    /// leads to another object is somebody else's file and is left alone.
+    fn name_is_ours_to_remove(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            match (self.file.metadata(), fs::symlink_metadata(&self.tmp_path)) {
+                (Ok(handle), Ok(named)) => {
+                    (handle.dev(), handle.ino()) == (named.dev(), named.ino())
+                }
+                _ => true,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
+
+    /// The file is complete and its owner will rename or discard it: the drop no longer removes it.
+    /// Returns its path and the ledger it is recorded in.
+    pub fn keep(&self) -> (PathBuf, std::sync::Arc<dyn TempFileLedger>) {
+        self.kept.store(true, Ordering::SeqCst);
+        (self.tmp_path.clone(), self.ledger.clone())
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        if self.kept.load(Ordering::SeqCst) {
+            return;
+        }
+        if self.name_is_ours_to_remove() {
+            discard_temp_file(&self.tmp_path, self.ledger.as_ref());
+        } else {
+            // The name now leads to another object. It is left alone, and its record is
+            // released so that recovery, which removes whatever stands at a recorded temp name,
+            // never takes it. (Between the check and a removal by name there is the window every
+            // path-based removal has; the name is a 128-bit random one in the reserved namespace.)
+            // Released only once the replacement is durable (as for a removal), so a rolled-back
+            // rename cannot bring our own file back under a name nothing records.
+            release_once_gone_is_durable(&self.tmp_path, self.ledger.as_ref());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn write_all_at(file: &fs::File, data: &[u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(file, data, offset)
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+}
+
+#[cfg(windows)]
+fn write_all_at(file: &fs::File, mut data: &[u8], mut offset: u64) -> std::io::Result<()> {
+    while !data.is_empty() {
+        let n = std::os::windows::fs::FileExt::seek_write(file, data, offset)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        data = &data[n..];
+        offset += n as u64;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &fs::File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        let n = std::os::windows::fs::FileExt::seek_read(file, buf, offset)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        let rest = buf;
+        buf = &mut rest[n..];
+        offset += n as u64;
+    }
+    Ok(())
 }
 
 /// The "publish" half of [`reconstruct_file`]: atomically renames an
@@ -975,10 +1235,28 @@ pub fn persist_reconstructed_file_durable(
 ) -> Result<(), StorageError> {
     #[cfg(not(unix))]
     let _ = durability;
+    // In the deferred modes a failed publish leaves the temp (and its ledger record) to the
+    // caller: it may have recorded the temp's flushed name as a witness that the name was
+    // renamed, and a witness must be withdrawn BEFORE its temp is removed. A caller that cannot
+    // tell the difference removes the temp itself.
+    let keep_temp =
+        matches!(durability, Durability::DeferredToBatch | Durability::FileFlushedNamesDeferred);
+    let discard = |tmp: &Path| {
+        if !keep_temp {
+            discard_temp_file(tmp, ledger);
+        }
+    };
+    // What the person set on the file being replaced (ACL, own attributes, permission bits) moves to the
+    // new file; if it cannot be read, nothing is replaced.
+    #[cfg(unix)]
+    if let Err(error) = crate::replace_keep::carry_over(out_path, tmp_path) {
+        discard(tmp_path);
+        return Err(error.into());
+    }
     let namespace = match durable_namespace_beside(out_path) {
         Ok(namespace) => namespace,
         Err(error) => {
-            discard_temp_file(tmp_path, ledger);
+            discard(tmp_path);
             return Err(error.into());
         }
     };
@@ -986,9 +1264,11 @@ pub fn persist_reconstructed_file_durable(
     #[cfg(not(unix))]
     let _ = durability;
     #[cfg(unix)]
-    if let (Some(ns), Durability::DeferredToBatch) = (&namespace, durability) {
+    if let (Some(ns), Durability::DeferredToBatch | Durability::FileFlushedNamesDeferred) =
+        (&namespace, durability)
+    {
         let published = crate::io_diag::time(crate::io_diag::Op::Rename, 0, || {
-            ns.publish_without_flush(tmp_path, out_path, Replace::Yes, &LedgerNames(ledger))
+            ns.publish_without_flush(tmp_path, out_path, Replace::Yes, &LedgerNames(ledger), true)
         });
         return published.map_err(|error| StorageError::Io(error.into()));
     }
@@ -1016,7 +1296,7 @@ pub fn persist_reconstructed_file_durable(
         Ok(())
     };
     if let Err(e) = publish() {
-        discard_temp_file(tmp_path, ledger);
+        discard(tmp_path);
         return Err(e);
     }
     ledger.release(tmp_path);
@@ -1374,472 +1654,86 @@ pub fn mint_windows_placeholder_generation() -> u64 {
     counter.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Whether [`apply_unix_mode`] would need to perform a real
-/// `set_permissions` syscall for `path` given the desired `unix_mode` -- a
-/// pure, read-only comparison against what disk currently holds, with no
-/// side effects. `true` means calling `apply_unix_mode` right now would be
-/// a genuine no-op; `false` means it would actually change something.
-/// Exists so a caller that must bump a physical-mutation fence before its
-/// first real mutating syscall (never after) can decide whether it needs
-/// to bump at all, before committing to either `apply_unix_mode` or a
-/// fence bump.
+/// Every execute bit of a mode, whichever class holds it.
 #[cfg(unix)]
-pub fn unix_mode_already_matches_disk(
-    path: &Path,
-    unix_mode: Option<u32>,
-) -> Result<bool, StorageError> {
+const EXEC_BITS: u32 = 0o111;
+
+/// Whether a file with this permission word is executable: its owner's `x` bit is set. (Group and
+/// other `x` bits are not what the flag means; clearing the flag clears them with the owner's.)
+#[cfg(unix)]
+pub fn exec_from_mode(mode: u32) -> bool {
+    mode & 0o100 != 0
+}
+
+/// The mode of `current` once the execute flag is `exec`. Execute set: the owner always gets `x` (so the
+/// result is representable even on a `0200` or `0000` file), group and other get it where that class has `r`.
+/// Execute cleared: every `x` goes. No other bit changes, except that a content change drops
+/// setuid/setgid (`clear_special`), as a write to the file would.
+#[cfg(unix)]
+pub fn mode_with_exec(current: u32, exec: bool, clear_special: bool) -> u32 {
+    let mut mode = current;
+    if exec {
+        mode |= 0o100;
+        if mode & 0o040 != 0 {
+            mode |= 0o010;
+        }
+        if mode & 0o004 != 0 {
+            mode |= 0o001;
+        }
+    } else {
+        mode &= !EXEC_BITS;
+    }
+    if clear_special {
+        mode &= !0o6000;
+    }
+    mode
+}
+
+/// Whether [`apply_exec`] would need to perform a real `set_permissions` syscall for `path` given the
+/// desired execute flag -- a pure, read-only comparison against what disk currently holds, with no side
+/// effects. `true` means calling `apply_exec` right now would be a genuine no-op. Exists so a caller that
+/// must bump a physical-mutation fence before its first real mutating syscall (never after) can decide
+/// whether it needs to bump at all. It shares [`mode_with_exec`] with `apply_exec`, so the two cannot
+/// disagree about what "right" means.
+#[cfg(unix)]
+pub fn exec_already_matches_disk(path: &Path, exec: bool) -> Result<bool, StorageError> {
     use std::os::unix::fs::PermissionsExt;
-    const PERMISSION_BITS: u32 = 0o777;
-    let Some(unix_mode) = unix_mode else {
-        return Ok(true);
-    };
+    let mode = fs::metadata(path)?.permissions().mode();
+    Ok(exec_from_mode(mode) == exec)
+}
+
+/// Execute is not applied off Unix, so there is never a mutation to fence.
+#[cfg(not(unix))]
+pub fn exec_already_matches_disk(_path: &Path, _exec: bool) -> Result<bool, StorageError> {
+    Ok(true)
+}
+
+/// Gives a regular file the execute state `exec` (see [`mode_with_exec`]) and leaves every other
+/// permission bit as it is. A no-op when the file already is right (no syscall, so no ctime movement), and
+/// on any non-Unix platform.
+#[cfg(unix)]
+pub fn apply_exec(path: &Path, exec: bool) -> Result<(), StorageError> {
+    use std::os::unix::fs::PermissionsExt;
     let metadata = fs::metadata(path)?;
     let mode = metadata.permissions().mode();
-    Ok((mode & PERMISSION_BITS) == (unix_mode & PERMISSION_BITS))
-}
-
-/// See the `#[cfg(unix)]` `unix_mode_already_matches_disk` above --
-/// `apply_unix_mode` is already a no-op off Unix, so it never needs a
-/// fence bump either.
-///
-/// Target projection contract (see `SettlementEvidence::ExactObject`'s
-/// own doc comment for the full model): `unix_mode` is retained-only on
-/// a non-Unix target, not exact-required. This function's own `Ok(true)`
-/// is that retained-only status expressed as "no mutation needed," which
-/// is also, deliberately, exactly what an exact-required field reports
-/// once it genuinely already matches -- a caller cannot tell "nothing to
-/// verify here" from "verified and it matches" from this return value
-/// alone, and does not need to: either way, this field never blocks
-/// `ExactObject` completion on this platform.
-#[cfg(not(unix))]
-pub fn unix_mode_already_matches_disk(
-    _path: &Path,
-    _unix_mode: Option<u32>,
-) -> Result<bool, StorageError> {
-    Ok(true)
-}
-
-/// Whether [`apply_xattrs`] would need to perform any real
-/// `fsetxattr`/`fremovexattr` syscall for `path` given the desired
-/// `xattrs` -- the xattr counterpart of `unix_mode_already_matches_disk`,
-/// for the same reason. Reuses `chunker::read_replicated_xattrs`, the same
-/// read side `apply_xattrs` itself is the write-side counterpart to, so
-/// the two can never disagree about which names/values are "replicated"
-/// ones.
-#[cfg(target_os = "linux")]
-pub fn xattrs_already_match_disk(
-    path: &Path,
-    xattrs: &[(String, Vec<u8>)],
-) -> Result<bool, StorageError> {
-    // A file whose mode denies its owner read access cannot be compared.
-    // "Not known to match" sends the caller down its mutating path, which is
-    // always safe here; failing hard would stop every later step for a
-    // file that is merely unreadable.
-    let file = match fs::File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
-    let mut current = crate::chunker::read_replicated_xattrs(&file);
-    let mut desired = xattrs.to_vec();
-    current.sort();
-    desired.sort();
-    Ok(current == desired)
-}
-
-/// See the `#[cfg(target_os = "linux")]` `xattrs_already_match_disk` above
-/// -- `apply_xattrs` is already a no-op off Linux, so it never needs a
-/// fence bump either.
-#[cfg(not(target_os = "linux"))]
-pub fn xattrs_already_match_disk(
-    _path: &Path,
-    _xattrs: &[(String, Vec<u8>)],
-) -> Result<bool, StorageError> {
-    Ok(true)
-}
-
-/// The `ExactObject` proof gate: whether `path`'s on-disk replicated
-/// extended attributes exactly equal `desired`, verified strictly. This
-/// is NOT `xattrs_already_match_disk` -- that function exists only to
-/// choose snapshot-vs-bump before any mutation and reuses
-/// `read_replicated_xattrs`'s best-effort reader, which silently folds a
-/// real enumeration/read failure into "no attributes" (fine for deciding
-/// whether a mutating syscall is needed, since falling through to
-/// actually attempt the syscalls is always safe). An `ExactObject`
-/// completion proof has no such fallback available: publishing it means
-/// claiming disk demonstrably holds this exact desired version, and
-/// `FileVersion`'s content-addressed identity bakes replicated xattr
-/// bytes directly into `version_hash` (see `FileVersion::compute_hash`)
-/// -- so a caller that cannot actually confirm the attributes match must
-/// never be allowed to read that failure as a match.
-///
-/// Returns `Ok(true)`/`Ok(false)` for a confirmed match/mismatch, and
-/// `Err` when this backend cannot even attempt the comparison -- a real
-/// I/O failure enumerating or reading an attribute (this Linux arm
-/// only; the non-Linux arm below has no replicated-xattr backend to
-/// fail reading from in the first place, and always settles as
-/// retained-only -- see its own doc comment). Every caller gating
-/// `SettlementEvidence::ExactObject` on this Linux arm's `Err` must
-/// treat it exactly like `Ok(false)`: leave the obligation outstanding
-/// for retry, never propagate it as a hard failure of the write itself
-/// (the content and any other metadata this call's caller already
-/// applied are still genuinely on disk).
-///
-/// `path` is opened with ordinary, symlink-following semantics -- correct
-/// (and required, to still catch a genuine stale attribute) for a
-/// `RecordKind::File` whose `desired` may legitimately be empty, but
-/// wrong for a symlink or directory path, which `FileMeta::xattrs`'s own
-/// doc says is never scanned at all (always an empty `desired`) and
-/// which may not even have a followable target (a dangling symlink is
-/// perfectly valid). Callers must only invoke this for `RecordKind::
-/// File`; skip it entirely for every other kind rather than passing an
-/// empty `desired` and relying on this function to no-op.
-#[cfg(target_os = "linux")]
-pub fn verify_replicated_xattrs_exact(
-    path: &Path,
-    desired: &[(String, Vec<u8>)],
-) -> Result<bool, StorageError> {
-    let file = fs::File::open(path)?;
-    replicated_xattrs_exactly_match(&file, desired)
-}
-
-/// The comparison `verify_replicated_xattrs_exact` makes once it holds
-/// the file open, split out so a test can hand it a descriptor whose
-/// attribute listing succeeds but whose attribute read is refused -- a
-/// state the path-based entry point cannot reach, since it opens the
-/// file read-only and a file its caller cannot read never gets that far.
-#[cfg(target_os = "linux")]
-fn replicated_xattrs_exactly_match(
-    file: &fs::File,
-    desired: &[(String, Vec<u8>)],
-) -> Result<bool, StorageError> {
-    let mut current = crate::chunker::read_replicated_xattrs_strict(file)?;
-    let mut desired = desired.to_vec();
-    current.sort();
-    desired.sort();
-    Ok(current == desired)
-}
-
-/// Off Linux, replicated-xattr support does not exist at all (see
-/// `apply_xattrs`'s own non-Linux stub, which never writes anything).
-///
-/// Design decision (target projection contract, see `SettlementEvidence::
-/// ExactObject`'s own doc comment for the full model): a version's
-/// `xattrs` stay part of its authoritative logical identity
-/// (`VersionHash`) everywhere, but whether they are a REQUIRED-exact
-/// projection field or a RETAINED-only one (present in the logical
-/// version, but this target is never asked to physically reproduce it)
-/// is target-specific. On a backend with no replicated-xattr support at
-/// all, xattrs are always retained-only -- exactly the same "this
-/// target cannot represent it, so completion does not wait on it"
-/// treatment `unix_mode_already_matches_disk`'s own non-Unix arm already
-/// gives `unix_mode`. An earlier version of this function treated a
-/// nonempty desired set as permanently unrepresentable and refused to
-/// ever settle -- correct under the OLD "ExactObject means literal
-/// field-for-field equality" model, but wrong under this one: it left a
-/// path with any replicated attribute permanently un-completable on any
-/// non-Linux target, for a field this target was never expected to
-/// physically reproduce in the first place.
-#[cfg(not(target_os = "linux"))]
-pub fn verify_replicated_xattrs_exact(
-    _path: &Path,
-    _desired: &[(String, Vec<u8>)],
-) -> Result<bool, StorageError> {
-    Ok(true)
-}
-
-/// Sets the replicated permission bits (`REPLICATED_MODE_MASK`,
-/// owner/group/other read-write-execute) on an already-materialized file.
-/// `None` -- the authoring version carries no Unix permission info, i.e. it
-/// was authored on a platform with no Unix mode model -- is a deliberate
-/// no-op: this device does not fabricate a mode for a peer that never had
-/// one, it leaves whatever mode the write already produced (the process's
-/// own umask-derived default). Only the low 9 permission bits are ever
-/// touched; any higher bits (file type, setuid/setgid/sticky) already on
-/// disk are preserved untouched. A no-op on any non-Unix platform (Windows
-/// has no equivalent permission-bits model, so this must be silent there,
-/// not an error).
-/// Applies a materialized regular file's replicated metadata: extended
-/// attributes first, permission bits second. The order is the contract.
-/// Setting or listing attributes needs access the target mode may not
-/// grant (`apply_xattrs` opens the file for reading, and a `user.*`
-/// attribute can only be written by someone who may write the file), so a
-/// replicated mode such as `0o200` or `0o444` applied first would make the
-/// attribute step fail with a permission error. The freshly written file
-/// still carries the mode it was created with until the last step here.
-pub fn apply_file_metadata(
-    path: &Path,
-    unix_mode: Option<u32>,
-    xattrs: &[(String, Vec<u8>)],
-) -> Result<(), StorageError> {
-    apply_xattrs(path, xattrs)?;
-    apply_unix_mode(path, unix_mode)
-}
-
-/// Evidence from one write attempt that a path's replicated extended
-/// attributes were set and then strictly re-read as exactly the desired set
-/// ([`verify_replicated_xattrs_exact`]) BEFORE that attempt applied the
-/// final mode. Only [`apply_file_metadata_verified`] constructs it.
-///
-/// It exists for the case a later re-read cannot cover: a replicated mode
-/// that revokes the owner's read permission (`0o200`) makes the attributes
-/// unreadable once the mode lands, although changing the mode does not
-/// change them. A caller that just wrote the file may use this in place of
-/// a re-read. A caller proving disk state it did not just write must still
-/// re-read with [`verify_replicated_xattrs_exact`], and an unreadable file
-/// is then correctly "not provable".
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct XattrsConfirmedInAttempt {
-    path: PathBuf,
-    xattrs: Vec<(String, Vec<u8>)>,
-}
-
-impl XattrsConfirmedInAttempt {
-    fn new(path: &Path, xattrs: &[(String, Vec<u8>)]) -> Self {
-        let mut xattrs = xattrs.to_vec();
-        xattrs.sort();
-        Self { path: path.to_path_buf(), xattrs }
-    }
-
-    /// Whether this confirmation is about `path` holding exactly `xattrs`.
-    /// A caller must check this before relying on it, so a confirmation
-    /// can never be spent on a different path or a different version.
-    pub fn covers(&self, path: &Path, xattrs: &[(String, Vec<u8>)]) -> bool {
-        let mut desired = xattrs.to_vec();
-        desired.sort();
-        self.path == path && self.xattrs == desired
-    }
-}
-
-/// Why [`apply_file_metadata_verified`] could not confirm the attributes.
-#[derive(Debug)]
-pub enum XattrsNotConfirmed {
-    /// Read back, and not the desired set.
-    Mismatch,
-    /// Could not be set or read back, e.g. a file whose current mode already
-    /// denies the owner read access.
-    Unreadable(StorageError),
-}
-
-/// What [`apply_file_metadata_verified`] established about one attempt.
-#[derive(Debug)]
-#[must_use = "the attribute confirmation is the ExactObject evidence; dropping it loses the proof"]
-pub struct AppliedFileMetadata {
-    xattrs: Result<XattrsConfirmedInAttempt, XattrsNotConfirmed>,
-}
-
-impl AppliedFileMetadata {
-    pub fn into_xattrs(self) -> Result<XattrsConfirmedInAttempt, XattrsNotConfirmed> {
-        self.xattrs
-    }
-}
-
-/// Where the replicated-xattr half of an exact-object proof comes from, for
-/// every writer that publishes one (local convergence, access hydration,
-/// materialization repair), so they all accept exactly the same evidence.
-///
-/// A path this attempt just wrote carries the attempt's own strict check,
-/// taken before the final mode was applied ([`apply_file_metadata_verified`]).
-/// A path whose disk state this attempt did not write is re-proved from disk,
-/// and on Linux an unreadable file then cannot be proved -- which is the
-/// correct answer, not something to accept as exact.
-#[derive(Debug)]
-pub enum XattrEvidence {
-    /// This attempt set the attributes and strictly re-read them.
-    ConfirmedInAttempt(XattrsConfirmedInAttempt),
-    /// This attempt set the attributes but could not confirm them.
-    NotConfirmedInAttempt(XattrsNotConfirmed),
-    /// Nothing was written in this attempt; prove what disk holds now.
-    ReproveFromDisk,
-}
-
-impl From<AppliedFileMetadata> for XattrEvidence {
-    fn from(applied: AppliedFileMetadata) -> Self {
-        match applied.into_xattrs() {
-            Ok(confirmed) => Self::ConfirmedInAttempt(confirmed),
-            Err(reason) => Self::NotConfirmedInAttempt(reason),
-        }
-    }
-}
-
-/// Why [`XattrEvidence::prove`] refused to back an exact claim.
-#[derive(Debug)]
-pub enum XattrProofRefused {
-    /// An in-attempt confirmation for a different path or attribute set.
-    ConfirmationDoesNotCover,
-    /// This attempt set the attributes but could not confirm them.
-    NotConfirmedInAttempt,
-    /// Re-read from disk, and not the desired set.
-    DiskMismatch,
-    /// Re-read from disk failed (e.g. an owner-unreadable file).
-    DiskUnreadable(StorageError),
-}
-
-impl XattrEvidence {
-    /// Whether this evidence proves `out_path` holds exactly `desired`. An
-    /// in-attempt confirmation counts only for the path and set it was taken
-    /// for; `ReproveFromDisk` re-reads strictly and never treats a failed
-    /// read as a match.
-    pub fn prove(
-        &self,
-        out_path: &Path,
-        desired: &[(String, Vec<u8>)],
-    ) -> Result<(), XattrProofRefused> {
-        match self {
-            Self::ConfirmedInAttempt(confirmed) if confirmed.covers(out_path, desired) => Ok(()),
-            Self::ConfirmedInAttempt(_) => Err(XattrProofRefused::ConfirmationDoesNotCover),
-            Self::NotConfirmedInAttempt(_) => Err(XattrProofRefused::NotConfirmedInAttempt),
-            Self::ReproveFromDisk => match verify_replicated_xattrs_exact(out_path, desired) {
-                Ok(true) => Ok(()),
-                Ok(false) => Err(XattrProofRefused::DiskMismatch),
-                Err(error) => Err(XattrProofRefused::DiskUnreadable(error)),
-            },
-        }
-    }
-}
-
-/// [`apply_file_metadata`] for a caller that will claim the result as an
-/// exact object: sets the attributes, strictly re-reads them while the file
-/// still has the mode it was written with, applies the final mode, and
-/// returns what the re-read established. Order:
-///
-/// 1. apply the replicated extended attributes
-/// 2. strictly verify them
-/// 3. apply the final permission bits
-///
-/// A permission error setting the attributes (a file already carrying an
-/// owner-unreadable mode) is reported as [`XattrsNotConfirmed::Unreadable`],
-/// not as a hard error, so the caller leaves the path unproven instead of
-/// failing everything around it. Any other error is returned as is.
-pub fn apply_file_metadata_verified(
-    path: &Path,
-    unix_mode: Option<u32>,
-    xattrs: &[(String, Vec<u8>)],
-) -> Result<AppliedFileMetadata, StorageError> {
-    let confirmation = match apply_xattrs(path, xattrs) {
-        Ok(()) => match verify_replicated_xattrs_exact(path, xattrs) {
-            Ok(true) => Ok(XattrsConfirmedInAttempt::new(path, xattrs)),
-            Ok(false) => Err(XattrsNotConfirmed::Mismatch),
-            Err(error) => Err(XattrsNotConfirmed::Unreadable(error)),
-        },
-        Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            Err(XattrsNotConfirmed::Unreadable(StorageError::Io(error)))
-        }
-        Err(error) => return Err(error),
-    };
-    apply_unix_mode(path, unix_mode)?;
-    Ok(AppliedFileMetadata { xattrs: confirmation })
-}
-
-#[cfg(unix)]
-pub fn apply_unix_mode(path: &Path, unix_mode: Option<u32>) -> Result<(), StorageError> {
-    use std::os::unix::fs::PermissionsExt;
-    const PERMISSION_BITS: u32 = 0o777;
-    let Some(unix_mode) = unix_mode else {
+    if exec_from_mode(mode) == exec {
         return Ok(());
-    };
-    let metadata = fs::metadata(path)?;
+    }
     let mut perms = metadata.permissions();
-    let mode = perms.mode();
-    let new_mode = (mode & !PERMISSION_BITS) | (unix_mode & PERMISSION_BITS);
-    if new_mode != mode {
-        perms.set_mode(new_mode);
-        fs::set_permissions(path, perms)?;
-    }
+    perms.set_mode(mode_with_exec(mode, exec, false));
+    fs::set_permissions(path, perms)?;
     Ok(())
 }
 
-/// See the `#[cfg(unix)]` `apply_unix_mode` above — the no-op
-/// Windows/other-platform counterpart needed for cross-platform parity.
-/// `unix_mode` is retained-only, not exact-required, on a non-Unix
-/// target -- see `unix_mode_already_matches_disk`'s own non-Unix arm and
-/// `SettlementEvidence::ExactObject`'s doc comment for the full model.
 #[cfg(not(unix))]
-pub fn apply_unix_mode(_path: &Path, _unix_mode: Option<u32>) -> Result<(), StorageError> {
+pub fn apply_exec(_path: &Path, _exec: bool) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// Sets an already-materialized regular file's replicated extended
-/// attributes to exactly `xattrs` — the
-/// write-side counterpart to `chunker::read_replicated_xattrs`. Scoped to
-/// the same `user.*` allow-list the read side captures under: only names
-/// in that namespace are ever set or removed here, so an attribute this
-/// device's capture path was never allowed to read is never touched by
-/// materialization either, mirroring `apply_unix_mode`'s "only the bits we
-/// replicate" discipline. An attribute already on disk under `user.*` but
-/// absent from `xattrs` is removed (a fresh temp-then-rename target
-/// normally carries none, but this keeps a re-materialized path from
-/// accumulating stale attributes from an earlier, different version at the
-/// same path). Best-effort: a failure to set or remove one attribute (e.g.
-/// a filesystem with no xattr support) is silently skipped, matching
-/// `read_replicated_xattrs`'s own "no attributes" fallback rather than
-/// failing the whole materialization over metadata that was never
-/// content-integrity-critical to begin with.
-#[cfg(target_os = "linux")]
-const LINUX_ALLOWED_XATTR_PREFIX: &str = "user.";
-
-/// Whether `name` is inside the one extended-attribute namespace this
-/// sync tool ever replicates on Linux -- the single predicate
-/// `apply_xattrs` uses on BOTH its set and remove sides, so the two can
-/// never disagree about which names are "replicated" ones. Factored out
-/// so it is directly unit-testable without needing a real filesystem or
-/// real syscalls at all (setting a genuinely privileged namespace like
-/// `trusted.*`/`security.*` to prove a filter caught it would require
-/// root in the first place, which would prove nothing about this
-/// specific code path).
-#[cfg(target_os = "linux")]
-fn is_replicated_xattr_name(name: &str) -> bool {
-    name.starts_with(LINUX_ALLOWED_XATTR_PREFIX)
-}
-
-#[cfg(target_os = "linux")]
-pub fn apply_xattrs(path: &Path, xattrs: &[(String, Vec<u8>)]) -> Result<(), StorageError> {
-    use std::os::unix::io::AsRawFd;
-
-    let file = fs::File::open(path)?;
-    let fd = file.as_raw_fd();
-
-    let existing = crate::chunker::list_xattr_names_for_apply(fd)
-        .into_iter()
-        .filter(|name| is_replicated_xattr_name(name));
-    for name in existing {
-        if !xattrs.iter().any(|(n, _)| n == &name) {
-            if let Ok(c_name) = std::ffi::CString::new(name) {
-                unsafe { libc::fremovexattr(fd, c_name.as_ptr()) };
-            }
-        }
-    }
-    // Defense in depth, independent of `FileMeta::decode`'s own
-    // allow-list rejection: this is the last point before a real
-    // `fsetxattr` syscall, so a non-allow-listed name must never reach
-    // it regardless of how it got here (a future caller that builds
-    // `xattrs` some other way, a decode check that regresses). Silently
-    // dropped, not an error -- exactly how every other best-effort
-    // outcome in this function is already handled.
-    for (name, value) in xattrs.iter().filter(|(name, _)| is_replicated_xattr_name(name)) {
-        if let Ok(c_name) = std::ffi::CString::new(name.as_str()) {
-            unsafe {
-                libc::fsetxattr(
-                    fd,
-                    c_name.as_ptr(),
-                    value.as_ptr() as *const libc::c_void,
-                    value.len(),
-                    0,
-                )
-            };
-        }
-    }
-    Ok(())
-}
-
-/// See the `#[cfg(target_os = "linux")]` `apply_xattrs` above — every other
-/// platform's read side (`read_replicated_xattrs`) never captures anything,
-/// so there is nothing this device would ever need to write back; kept as
-/// an explicit no-op for cross-platform parity rather than `#[cfg]`-hiding
-/// the call sites.
-#[cfg(not(target_os = "linux"))]
-pub fn apply_xattrs(_path: &Path, _xattrs: &[(String, Vec<u8>)]) -> Result<(), StorageError> {
-    Ok(())
+/// Applies a materialized regular file's replicated metadata: the execute flag, the only part of the
+/// permission model that is replicated.
+pub fn apply_file_metadata(path: &Path, exec: bool) -> Result<(), StorageError> {
+    apply_exec(path, exec)
 }
 
 /// Materializes a symlink record at `out_path`, pointing at `target` (the

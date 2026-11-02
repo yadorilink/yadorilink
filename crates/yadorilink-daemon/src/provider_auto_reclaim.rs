@@ -88,7 +88,9 @@ impl Verdict {
             Retained::VersionMoved | Retained::NotConfirmed | Retained::NotDownloaded => {
                 Self::Changed
             }
-            Retained::HostRefused | Retained::NothingFreed => Self::SafetyBlocked,
+            Retained::HostRefused | Retained::NothingFreed | Retained::HeldAsHistory => {
+                Self::SafetyBlocked
+            }
         }
     }
 }

@@ -642,13 +642,18 @@ impl LocalMutationStore for TestReplica {
         )
     }
 
-    fn remove_file(
+    fn erase_ignored_path(
         &self,
         group_id: &str,
         path: &str,
         permit: &RootCommitPermit,
     ) -> Result<bool, SyncSqliteError> {
-        self.file_index_repository().remove_file(group_id, path, permit)
+        self.file_index_repository().remove_file(
+            group_id,
+            path,
+            yadorilink_sync_sqlite::file_index::ErasureReason::IgnoreSweep,
+            permit,
+        )
     }
 
     fn record_group_block_provenance(

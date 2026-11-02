@@ -99,7 +99,15 @@ pub enum CliError {
     /// supply a verified manifest (fail closed). Nothing was downloaded or changed.
     #[error("{0}")]
     UpdateRefused(String),
+
+    /// The service refused a primary-ownership hand-over (`share transfer ...`) for a stated
+    /// reason; nothing changed. Its own exit code, so a script can tell it from a failure.
+    #[error("{0}")]
+    PrimaryTransferRefused(yadorilink_client_core::PrimaryTransferRefusal),
 }
+
+/// Exit code of [`CliError::PrimaryTransferRefused`].
+pub const EXIT_PRIMARY_TRANSFER_REFUSED: i32 = 20;
 
 /// Exit code of [`CliError::ManagedElsewhere`].
 pub const EXIT_MANAGED_ELSEWHERE: i32 = 19;
@@ -202,6 +210,7 @@ impl CliError {
             CliError::Rewind { exit, .. } => exit.code(),
             CliError::ManagedElsewhere(_) => EXIT_MANAGED_ELSEWHERE,
             CliError::UpdateRefused(_) => 4,
+            CliError::PrimaryTransferRefused(_) => EXIT_PRIMARY_TRANSFER_REFUSED,
         }
     }
 
@@ -243,6 +252,7 @@ impl CliError {
             CliError::Rewind { .. } => "cli_rewind",
             CliError::ManagedElsewhere(_) => "cli_managed_elsewhere",
             CliError::UpdateRefused(_) => "cli_update_refused",
+            CliError::PrimaryTransferRefused(_) => "cli_primary_transfer_refused",
         }
     }
 }
@@ -353,9 +363,9 @@ impl From<CoreError> for CliError {
             CoreError::NotLoggedIn => CliError::NotLoggedIn,
             CoreError::CredentialStore(store) => CliError::CredentialStore(store),
             CoreError::AuthFailed(message) => CliError::AuthFailed(message),
-            CoreError::DeviceSuperseded | CoreError::AccountMismatch => {
-                CliError::AuthFailed(e.to_string())
-            }
+            CoreError::DeviceSuperseded
+            | CoreError::AccountMismatch
+            | CoreError::PairingCodeRefused => CliError::AuthFailed(e.to_string()),
             CoreError::TermsConsentRequired { .. } => {
                 CliError::SignInRequired("the Terms must be accepted to continue".to_owned())
             }
@@ -368,6 +378,7 @@ impl From<CoreError> for CliError {
             CoreError::LimitExceeded { message, .. } => CliError::LimitExceeded(message),
             CoreError::DaemonNotRunning => CliError::DaemonNotRunning,
             CoreError::ManagedElsewhere(message) => CliError::ManagedElsewhere(message),
+            CoreError::PrimaryTransferRefused(refusal) => CliError::PrimaryTransferRefused(refusal),
             e @ CoreError::DaemonUnresponsive => CliError::Other(e.to_string()),
             CoreError::DaemonProtocolMismatch { client, daemon } => CliError::Other(format!(
                 "CLI/daemon protocol version mismatch (CLI {client}, daemon {daemon}); run \
@@ -389,12 +400,7 @@ impl From<CoreError> for CliError {
             }
             CoreError::DaemonCommand {
                 code: ApplicationErrorCode::AccessDenied, message, ..
-            } => CliError::Other(format!(
-                "the system has not allowed YadoriLink to access this folder, so nothing was \
-                     linked. On macOS, allow it in System Settings > Privacy & Security > Files \
-                     and Folders (or Full Disk Access); on Windows, give your account access to \
-                     the folder. Then run the command again, or choose another folder ({message})"
-            )),
+            } => CliError::Other(access_denied_message(&message)),
             CoreError::DaemonCommand { code: ApplicationErrorCode::InviteExpired, .. } => {
                 CliError::Other(
                     "this invite has expired; ask the person who sent it for a new one".to_string(),
@@ -419,10 +425,9 @@ impl From<CoreError> for CliError {
                 InvalidArgument::StorageMode(value) => {
                     format!("invalid --storage-mode {value:?} (expected eager or on-demand)")
                 }
-                InvalidArgument::Role(value) => format!(
-                    "invalid --role {value:?} (expected viewer or editor); owner is not \
-                     available via this command yet"
-                ),
+                InvalidArgument::Role(value) => {
+                    format!("invalid --role {value:?} (expected viewer, editor or owner)")
+                }
             }),
             e @ CoreError::ReauthenticationRequired => CliError::Other(e.to_string()),
             CoreError::Forbidden(message)
@@ -460,6 +465,40 @@ impl From<serde_json::Error> for CliError {
     }
 }
 
+/// The text for a folder the system refused YadoriLink access to. The cause differs per
+/// operating system, so each names only its own remedy; on Linux (including a container) the
+/// folder's owner and mode against the account the daemon runs as is the whole story.
+fn access_denied_message(detail: &str) -> String {
+    #[cfg(target_vendor = "apple")]
+    {
+        format!(
+            "the system has not allowed YadoriLink to access this folder, so nothing was linked. \
+             Allow it in System Settings > Privacy & Security > Files and Folders (or Full Disk \
+             Access). Then run the command again, or choose another folder ({detail})"
+        )
+    }
+    #[cfg(windows)]
+    {
+        format!(
+            "the system has not allowed YadoriLink to access this folder, so nothing was linked. \
+             Give your account access to the folder. Then run the command again, or choose \
+             another folder ({detail})"
+        )
+    }
+    #[cfg(not(any(target_vendor = "apple", windows)))]
+    {
+        let account = match yadorilink_local_storage::root_access::daemon_account() {
+            Some((uid, gid)) => format!("uid {uid}, gid {gid}"),
+            None => "its own account".to_owned(),
+        };
+        format!(
+            "permission denied: {detail}. YadoriLink runs as {account} and that account cannot \
+             read and write this folder, so nothing was linked. {} Then run the command again.",
+            yadorilink_local_storage::root_access::remedy("<folder>")
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -474,6 +513,7 @@ mod refusal_detail_tests {
         yadorilink_local_storage::startup_refusal::record(
             dir.path(),
             &yadorilink_local_storage::startup_refusal::StartupRefusal {
+                code: None,
                 reason: "cannot open".into(),
                 start_over: Some(yadorilink_local_storage::startup_refusal::StartOver {
                     sync_db: "/d/db".into(),

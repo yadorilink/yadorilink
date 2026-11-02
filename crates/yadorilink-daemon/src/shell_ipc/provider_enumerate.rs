@@ -12,8 +12,8 @@ use yadorilink_ipc_proto::shellipc::shell_ipc_message::Payload;
 use yadorilink_ipc_proto::shellipc::{
     ChangeScope, EntryKind as WireEntryKind, EnumerateChangesRequest, EnumerateChangesResponse,
     EnumerateChildrenRequest, EnumerateChildrenResponse, EnumerateFailure,
-    EnumerateWorkingSetRequest, EnumerateWorkingSetResponse, ProviderItem, ProviderItemRequest,
-    ProviderItemResponse, ShellIpcMessage,
+    EnumerateWorkingSetRequest, EnumerateWorkingSetResponse, LocalState, ProviderItem,
+    ProviderItemRequest, ProviderItemResponse, ShellIpcMessage,
 };
 use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_sync_sqlite::provider_enumerate::{
@@ -82,13 +82,25 @@ fn wire_item(item: &ShownItem, read_only: bool) -> ProviderItem {
         } as i32,
         size: item.size,
         mtime_unix_nanos: item.mtime_unix_nanos,
-        unix_mode: item.unix_mode,
+        exec: item.exec,
         content_version: versioned(&item.content_version.0, item.generation),
         metadata_version: versioned(&item.metadata_version, item.generation),
         content_pending: item.content_pending,
         symlink_target: item.symlink_target.clone(),
         parent_generation: item.parent_generation,
+        local_state: engine_local_state(item),
     }
+}
+
+/// What the engine holds of the item, from its row. A folder has no bytes of its own, so a
+/// folder with a row is present and current; one without a row is unknown.
+fn engine_local_state(item: &ShownItem) -> Option<LocalState> {
+    use yadorilink_replica_domain::session_state::MaterializationState as Row;
+    let row = match item.kind {
+        RecordKind::Directory => item.materialization.map(|_| Row::Present),
+        _ => item.materialization,
+    };
+    super::to_shell_local_state(row, true)
 }
 
 /// Whether this device may NOT author into the group (a Reader, or a group whose policy is withheld):

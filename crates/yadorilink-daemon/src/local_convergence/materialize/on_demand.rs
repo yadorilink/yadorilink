@@ -9,12 +9,13 @@ impl super::super::LocalConvergenceExecutor {
     pub(super) fn materialize_on_demand_lane(
         &self,
         plan: &MaterializationPlan<'_>,
+        proofs: &yadorilink_sync_sqlite::retention::RetentionProofs,
     ) -> Result<LocalMaterializeOutcome, PeerSessionError> {
         let MaterializationPlan { group_id, record, permit: root_commit_permit, .. } = *plan;
         // A hazardous record is held: no on-disk artifact under this name at
         // all, and never any alternate name.
         if let Some(reason) = &plan.hazard_reason {
-            return self.hold_for_hazard(plan, reason);
+            return self.hold_for_hazard(plan, reason, proofs);
         }
         // Nothing is written at the path, but the version this row now
         // names is not the one any object there was fetched for, so the
@@ -61,6 +62,7 @@ impl super::super::LocalConvergenceExecutor {
             &plan.columns,
             &|| self.root_lease_for(group_id),
             object_present,
+            yadorilink_sync_sqlite::retention::Retention::Proofs(proofs),
             root_commit_permit,
         )?;
         // Nothing is written, so an object already at the path keeps the

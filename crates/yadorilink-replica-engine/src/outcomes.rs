@@ -7,6 +7,8 @@
 /// warning here.
 pub struct CustodyEvaluation {
     pub present: bool,
+    /// The proof is still running; `present` is `false` for now and the asker should ask again.
+    pub in_progress: bool,
     pub warning: Option<CustodyWarning>,
 }
 

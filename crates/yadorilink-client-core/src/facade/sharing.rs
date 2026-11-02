@@ -7,7 +7,8 @@ use super::{existing_directory, folder_memberships, offering_force, ClientCore};
 use crate::dto::{
     self, AcceptInviteOutcome, ApproveOutcome, AssignableRole, DeviceSummary, FolderMode,
     GroupSummary, InviteSummary, MemberSummary, MembershipOutcome, PendingApprovalSummary,
-    PendingInviteSummary, ProviderInviteOutcome, RevokeEdgeOutcome, ShareSummary,
+    PendingInviteSummary, PrimaryTransferAccepted, PrimaryTransferSummary, ProviderInviteOutcome,
+    RevokeEdgeOutcome, ShareSummary,
 };
 use crate::error::{CoreError, DesktopError};
 use crate::ops;
@@ -16,6 +17,7 @@ fn role_name(role: AssignableRole) -> &'static str {
     match role {
         AssignableRole::Viewer => "viewer",
         AssignableRole::Editor => "editor",
+        AssignableRole::Owner => "owner",
     }
 }
 
@@ -162,6 +164,81 @@ impl ClientCore {
         role: AssignableRole,
     ) -> Result<(), DesktopError> {
         Ok(ops::shares::change_role_resolved(&group_id, &device_id, role_name(role)).await?)
+    }
+
+    // ---- primary ownership ------------------------------------------------------------
+
+    /// Offers this account's folder `group_id` to the account that owns `target_device_id`, an
+    /// active member device of the folder. The target account must accept; the offer
+    /// lasts seven days and a folder has at most one. Idempotent across retries and restarts.
+    ///
+    /// # Errors
+    /// `Refused` with `PrimaryTransferNotPrimary`, `PrimaryTransferTargetNotMember`,
+    /// `PrimaryTransferTargetSameAccount`, `PrimaryTransferGroupNotActive`,
+    /// `PrimaryTransferConflict` (another offer is pending) or `PrimaryTransferNotFound`;
+    /// `PermissionDenied(QuotaExceeded)`; coordination failures.
+    pub async fn offer_primary_transfer(
+        &self,
+        group_id: String,
+        target_device_id: String,
+    ) -> Result<PrimaryTransferSummary, DesktopError> {
+        let offer = ops::primary_transfer::offer(&group_id, &target_device_id).await?;
+        Ok(dto::primary_transfer_summary(&offer))
+    }
+
+    /// Withdraws a pending offer this account made.
+    ///
+    /// # Errors
+    /// `Refused` with `PrimaryTransferConflict` (already settled), `PrimaryTransferNotFound`.
+    pub async fn cancel_primary_transfer(
+        &self,
+        group_id: String,
+        transfer_id: String,
+    ) -> Result<PrimaryTransferSummary, DesktopError> {
+        let transfer = ops::primary_transfer::cancel(&group_id, &transfer_id).await?;
+        Ok(dto::primary_transfer_summary(&transfer))
+    }
+
+    /// Accepts an offer made to this account (from any of its devices): the folder moves onto this
+    /// account's quota and this account becomes its primary owner.
+    ///
+    /// # Errors
+    /// `Refused` with `PrimaryTransferOfferExpired`, `PrimaryTransferConflict`,
+    /// `PrimaryTransferTargetNotMember`, `PrimaryTransferGroupNotActive`,
+    /// `PrimaryTransferNotFound`; `PermissionDenied(QuotaExceeded)` when the folder does not fit
+    /// this account's limits.
+    pub async fn accept_primary_transfer(
+        &self,
+        group_id: String,
+        transfer_id: String,
+    ) -> Result<PrimaryTransferAccepted, DesktopError> {
+        let accepted = ops::primary_transfer::accept(&group_id, &transfer_id).await?;
+        Ok(dto::primary_transfer_accepted(&accepted))
+    }
+
+    /// Turns down an offer made to this account.
+    ///
+    /// # Errors
+    /// `Refused` with `PrimaryTransferConflict` (already settled), `PrimaryTransferNotFound`.
+    pub async fn decline_primary_transfer(
+        &self,
+        group_id: String,
+        transfer_id: String,
+    ) -> Result<PrimaryTransferSummary, DesktopError> {
+        let transfer = ops::primary_transfer::decline(&group_id, &transfer_id).await?;
+        Ok(dto::primary_transfer_summary(&transfer))
+    }
+
+    /// The pending, unexpired offers this account made (`Outgoing`) or received (`Incoming`).
+    /// Fetched on demand; never part of the status timer.
+    ///
+    /// # Errors
+    /// Coordination failures.
+    pub async fn list_primary_transfers(
+        &self,
+    ) -> Result<Vec<PrimaryTransferSummary>, DesktopError> {
+        let transfers = ops::primary_transfer::list().await?;
+        Ok(transfers.iter().map(dto::primary_transfer_summary).collect())
     }
 
     /// Takes a device's access to a group away.

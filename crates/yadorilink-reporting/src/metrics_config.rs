@@ -51,7 +51,10 @@ pub struct MetricsConfigStore {
 
 impl MetricsConfigStore {
     pub fn new(config_dir: impl AsRef<Path>) -> Self {
-        MetricsConfigStore { path: config_dir.as_ref().join("metrics_config.json") }
+        let path = config_dir.as_ref().join("metrics_config.json");
+        // The config directory is not this crate's to restrict; only its own file is.
+        crate::local_store::private_fs::tighten_existing_file(&path);
+        MetricsConfigStore { path }
     }
 
     /// Deliberately does **not** write anything to disk just by loading —
@@ -86,7 +89,7 @@ impl MetricsConfigStore {
         }
         let json = serde_json::to_string_pretty(config)?;
         let tmp_path = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp_path, json)?;
+        crate::local_store::private_fs::write_private_file(&tmp_path, json.as_bytes())?;
         std::fs::rename(&tmp_path, &self.path)?;
         Ok(())
     }

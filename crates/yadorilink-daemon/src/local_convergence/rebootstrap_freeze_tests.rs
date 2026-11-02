@@ -474,11 +474,25 @@ async fn an_index_row_of_a_frozen_group_cannot_be_deleted() {
     let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
     let rows = h.state.file_index_repository();
 
-    assert!(rows.remove_file(GROUP, "d/p", &permit).is_err());
+    assert!(rows
+        .remove_file(
+            GROUP,
+            "d/p",
+            yadorilink_sync_sqlite::file_index::ErasureReason::IgnoreSweep,
+            &permit
+        )
+        .is_err());
     assert!(h.state.get_file(GROUP, "d/p").unwrap().is_some());
 
     unfreeze(&h);
-    assert!(rows.remove_file(GROUP, "d/p", &permit).unwrap());
+    assert!(rows
+        .remove_file(
+            GROUP,
+            "d/p",
+            yadorilink_sync_sqlite::file_index::ErasureReason::IgnoreSweep,
+            &permit
+        )
+        .unwrap());
 }
 
 /// Evicting in a frozen group is refused before its row is touched: the row is not
@@ -588,4 +602,43 @@ fn a_capture_authority(
         &device.unwrap(),
         CAPTURING_RECOVERY_ID,
     )
+}
+
+/// A live repair pass that visits no row but leaves a path held (a directory of the user's holds
+/// the name) reports the hold, so the periodic tick that would skip quiet passes keeps running;
+/// once the user removes the directory, with no database write, the next pass releases it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_zero_row_live_repair_pass_reports_the_path_it_left_held() {
+    use yadorilink_filesystem_sync::materialization_repair::{
+        repair_interrupted_materializations, RepairMode,
+    };
+    let h = Harness::new(true);
+    captured(&h, "d/p", b"the row's version").await;
+    std::fs::remove_file(h.path("d/p")).unwrap();
+    std::fs::create_dir(h.path("d/p")).unwrap();
+    std::fs::write(h.path("d/p/mine"), b"the user's own content").unwrap();
+    h.state.held_path_repository().hold_unauthorable_local_edit(GROUP, "d/p").unwrap();
+    let pass = |h: &Harness| {
+        tokio::task::block_in_place(|| {
+            repair_interrupted_materializations(
+                h.state.as_ref(),
+                &crate::adapters::block_store_ports::BlockStorePortsAdapter::new(h.store.clone()),
+                &h.path(""),
+                GROUP,
+                RepairMode::Live,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap()
+        })
+    };
+
+    let blocked = pass(&h);
+    assert_eq!(blocked.rows_visited, 0, "{blocked:?}");
+    assert_eq!(blocked.held_paths_remaining, 1, "{blocked:?}");
+
+    std::fs::remove_dir_all(h.path("d/p")).unwrap();
+    let released = pass(&h);
+    assert_eq!(released.held_paths_remaining, 0, "{released:?}");
+    assert!(!released.held_path_reconciled.is_empty(), "{released:?}");
 }

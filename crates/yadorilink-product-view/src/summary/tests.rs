@@ -167,12 +167,12 @@ fn each_attention_condition_is_needs_attention() {
         (LinkStatus { conflict_count: 1, ..link("a") }, AttentionReason::Conflict),
         (LinkStatus { conflicts_pending: 1, ..link("a") }, AttentionReason::Conflict),
         (
-            LinkStatus { durability_status: Durability::AtRisk as i32, ..link("a") },
+            LinkStatus {
+                durability_status: Durability::AtRisk as i32,
+                full_replica_device_ids: vec!["other".into()],
+                ..link("a")
+            },
             AttentionReason::DurabilityAtRisk,
-        ),
-        (
-            LinkStatus { durability_status: Durability::Unknown as i32, ..link("a") },
-            AttentionReason::DurabilityUnconfirmed,
         ),
         (
             LinkStatus { degraded: true, ..link("a") },
@@ -330,14 +330,23 @@ fn bytes_remaining_is_unknown_when_another_folder_has_queued_work() {
     assert_eq!(s.bytes_remaining, None);
 }
 
+/// A copy that is not confirmed yet is the protection line, never a reason: not before the first
+/// round, not after it, and not for a status that says nothing.
 #[test]
-fn a_durability_check_still_pending_is_not_attention() {
-    let l = LinkStatus {
-        durability_status: Durability::Unknown as i32,
-        durability_check_pending: true,
-        ..link("a")
-    };
-    assert_eq!(folder(&l), ProductState::UpToDate);
+fn an_unconfirmed_copy_is_never_attention() {
+    for (status, pending) in [
+        (Durability::Unknown, true),
+        (Durability::Unknown, false),
+        (Durability::Unspecified, false),
+    ] {
+        let l = LinkStatus {
+            durability_status: status as i32,
+            durability_check_pending: pending,
+            ..link("a")
+        };
+        assert_eq!(folder(&l), ProductState::UpToDate, "{status:?} pending={pending}");
+        assert_eq!(ProductStatusSummary::for_folder(&l).attention_count, 0);
+    }
 }
 
 #[test]
@@ -456,7 +465,11 @@ fn next_action_follows_the_state() {
     assert_eq!(next(&[paused.clone(), conflict.clone()]), Some(ProductAction::ReviewConflict));
 
     // The most severe problem wins over an earlier, milder one.
-    let at_risk = LinkStatus { durability_status: Durability::AtRisk as i32, ..link("c") };
+    let at_risk = LinkStatus {
+        durability_status: Durability::AtRisk as i32,
+        full_replica_device_ids: vec!["other".into()],
+        ..link("c")
+    };
     assert_eq!(next(&[conflict, at_risk]), Some(ProductAction::ViewDetails));
 
     let waiting = LinkStatus {
@@ -482,6 +495,61 @@ fn a_waiting_approval_request_needs_attention_and_offers_the_review() {
     assert_eq!(folder(&link("a")), ProductState::UpToDate);
     // A conflict is milder than nothing else but not milder than a warning of equal rank: the
     // first reported among equals wins, and the severe one still outranks both.
-    let at_risk = LinkStatus { durability_status: Durability::AtRisk as i32, ..link("c") };
+    let at_risk = LinkStatus {
+        durability_status: Durability::AtRisk as i32,
+        full_replica_device_ids: vec!["other".into()],
+        ..link("c")
+    };
     assert_eq!(next(&[waiting, at_risk]), Some(ProductAction::ViewDetails));
+}
+
+/// A folder only this device holds reads at risk (protection) but is not a fault: nothing the
+/// person must do is wrong, so the state stays up to date. With another full copy configured,
+/// at risk means content nobody can provide, and that does need attention.
+#[test]
+fn a_folder_only_this_device_holds_is_at_risk_but_not_attention() {
+    let alone = LinkStatus { durability_status: Durability::AtRisk as i32, ..link("a") };
+    assert_eq!(folder(&alone), ProductState::UpToDate);
+    assert_eq!(global(std::slice::from_ref(&alone)).state, ProductState::UpToDate);
+    let missing = LinkStatus { full_replica_device_ids: vec!["other".into()], ..alone };
+    assert_eq!(folder(&missing), ProductState::NeedsAttention);
+}
+
+/// A reason that belongs to no folder makes the global state Needs attention and counts, and a
+/// device that is merely away does not.
+#[test]
+fn a_general_reason_drives_the_global_state_and_an_absent_device_does_not() {
+    let response = |reasons: &[&str]| StatusResponse {
+        links: vec![link("a")],
+        attention_reasons: reasons.iter().map(|r| r.to_string()).collect(),
+        ..Default::default()
+    };
+    let signed_out = ProductStatusSummary::global_of(&response(&["sign_in_required"]));
+    assert_eq!(signed_out.state, ProductState::NeedsAttention);
+    assert_eq!(signed_out.attention_count, 1);
+    assert_eq!(signed_out.next_action, Some(ProductAction::SignIn));
+    let away = ProductStatusSummary::global_of(&response(&["peer_disconnected:d1"]));
+    assert_eq!(away.state, ProductState::UpToDate);
+    assert_eq!(away.attention_count, 0);
+    let folder_reason = ProductStatusSummary::global_of(&response(&["conflict:a"]));
+    assert_eq!(folder_reason.attention_count, 0, "folder reasons are counted from the links");
+}
+
+/// General reasons of every scope drive the global state, including a Waiting-kind one that is
+/// meant to lift the state (an unconfirmed device replacement), a volume, a device on another
+/// version and a code this build does not know; only an absent device does not.
+#[test]
+fn general_reasons_of_each_scope_count_and_only_an_absent_device_does_not() {
+    for raw in
+        ["replacement_unconfirmed", "low_disk:/data", "peer_update_required:d1", "from_the_future"]
+    {
+        let response = StatusResponse {
+            links: vec![link("a")],
+            attention_reasons: vec![raw.to_string()],
+            ..Default::default()
+        };
+        let summary = ProductStatusSummary::global_of(&response);
+        assert_eq!(summary.state, ProductState::NeedsAttention, "{raw}");
+        assert_eq!(summary.attention_count, 1, "{raw}");
+    }
 }

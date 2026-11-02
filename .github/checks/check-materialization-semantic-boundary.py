@@ -337,7 +337,7 @@ ALLOWLIST: dict[str, dict[str, int]] = {
         "snapshot_mutation_fence": 1,
         "publish_materialized_generation_if_fence_current": 1,
         "commit_internal_materialized_state_if_fence_current": 2,
-        "dag_lookup_materialized_generation": 2,
+        "dag_lookup_materialized_generation": 3,
         "dag_usable_proof_names_current_version": 2,
         "dag_snapshot_mutation_fence": 3,
         "dag_zero_work_settlement_if_already_current": 1,
@@ -577,9 +577,9 @@ ALLOWLIST: dict[str, dict[str, int]] = {
 #   R sync-sqlite/store.rs                                         12
 #   R sync-sqlite/structural_origin.rs                              3
 #   ------------------------------------------------------------
-#   total 190 = lane 43 + owner 91 + repository 56 (the per-file rows above are
+#   total 191 = lane 43 + owner 92 + repository 56 (the per-file rows above are
 #   indicative; the pins in ALLOWLIST are authoritative)
-EXPECTED_ALLOWED = 190
+EXPECTED_ALLOWED = 191
 
 # The in-family row mutators outside `FORBIDDEN`. Each also writes
 # materialization-relevant columns (a peer row's version and authoring, the
@@ -587,12 +587,13 @@ EXPECTED_ALLOWED = 190
 # materialization, so each site is pinned rather than forbidden.
 IN_FAMILY = (
     "apply_projected_row_atomic",
-    "erase_local_only_file",
+    "erase_path_rows",
     "record_block_provenance",
     "record_group_block_provenance",
     "set_authoring_change_hash",
     "upsert_file_with_origin",
     "upsert_file_with_origin_and_author",
+    "upsert_file_with_origin_retaining",
 )
 
 IN_FAMILY_ALLOWLIST: dict[str, dict[str, int]] = {
@@ -619,14 +620,14 @@ IN_FAMILY_ALLOWLIST: dict[str, dict[str, int]] = {
     },
     D + "replica_coordinator/peer_replica_state.rs": {
         "record_block_provenance": 1,
-        "upsert_file_with_origin": 1,
-        "record_group_block_provenance": 1,
+        "upsert_file_with_origin_retaining": 1,
+        "record_group_block_provenance": 2,
     },
     # Owner operations: the row persist of a fresh write, the symlink open,
     # the hazard hold, and the retired copy's erase.
     D + "replica_coordinator/materialization_owner/lanes.rs": {
         "apply_projected_row_atomic": 1,
-        "erase_local_only_file": 1,
+        "erase_path_rows": 1,
     },
     # Local capture: provenance of freshly chunked blocks.
     L + "local_change/record_builder.rs": {
@@ -635,14 +636,10 @@ IN_FAMILY_ALLOWLIST: dict[str, dict[str, int]] = {
     L + "scan_block_staging.rs": {
         "record_group_block_provenance": 1,
     },
-    # Repository layer.
-    S + "file_index.rs": {
-        "upsert_file_with_origin": 1,
-    },
 }
 
 # Pinned total of IN_FAMILY_ALLOWLIST:
-#   total 13 = lane 5 + owner 7 + repository 1
+#   total 13 = lane 5 + owner 8 + repository 0
 EXPECTED_IN_FAMILY_ALLOWED = 13
 
 # The orchestration-lane files that still hold raw calls of either section.

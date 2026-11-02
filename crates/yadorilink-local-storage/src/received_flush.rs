@@ -117,6 +117,44 @@ fn plain_fsync(file: &fs::File, target: Target) -> std::io::Result<()> {
 /// renamed in, to recognise it again at the barrier.
 pub type ObjectKey = (u64, u64);
 
+/// What a writer saw of a file right after it flushed the file's data: its length and modification
+/// time. A later write by anyone moves at least one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub struct FlushedStamp {
+    len: u64,
+    mtime_unix_nanos: i128,
+}
+
+/// The stamp of the file at `path` (not following a symlink), where the platform gives one.
+#[cfg(unix)]
+pub fn flushed_stamp(path: &Path) -> Option<FlushedStamp> {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path).ok().map(|meta| FlushedStamp {
+        len: meta.len(),
+        mtime_unix_nanos: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
+    })
+}
+
+#[cfg(not(unix))]
+pub fn flushed_stamp(_path: &Path) -> Option<FlushedStamp> {
+    None
+}
+
+#[cfg(unix)]
+fn stamp_of(file: &fs::File) -> Option<FlushedStamp> {
+    use std::os::unix::fs::MetadataExt;
+    file.metadata().ok().map(|meta| FlushedStamp {
+        len: meta.len(),
+        mtime_unix_nanos: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
+    })
+}
+
+#[cfg(not(unix))]
+fn stamp_of(_file: &fs::File) -> Option<FlushedStamp> {
+    None
+}
+
 /// The key of the object at `path`, where the platform has one.
 #[cfg(unix)]
 pub fn object_key(path: &Path) -> Option<ObjectKey> {
@@ -130,13 +168,13 @@ pub fn object_key(_path: &Path) -> Option<ObjectKey> {
 }
 
 #[cfg(unix)]
-fn key_of(file: &fs::File) -> Option<ObjectKey> {
+pub(crate) fn key_of(file: &fs::File) -> Option<ObjectKey> {
     use std::os::unix::fs::MetadataExt;
     file.metadata().ok().map(|meta| (meta.dev(), meta.ino()))
 }
 
 #[cfg(not(unix))]
-fn key_of(_file: &fs::File) -> Option<ObjectKey> {
+pub(crate) fn key_of(_file: &fs::File) -> Option<ObjectKey> {
     None
 }
 
@@ -162,6 +200,7 @@ fn flush_one(
     plain: bool,
     is_dir: bool,
     expected: Option<ObjectKey>,
+    flushed: Option<FlushedStamp>,
 ) -> std::io::Result<()> {
     injected_failure(path)?;
     let file = open_for_received_flush(path, is_dir)?;
@@ -169,6 +208,13 @@ fn flush_one(
     // put something else there) must not be flushed in its place.
     if expected.is_some() && key_of(&file) != expected {
         return Err(std::io::Error::other("the object at this path is not the one received"));
+    }
+    // The writer flushed this file's data before it renamed it into place. If the file is still
+    // exactly as the writer left it (same length and modification time) nothing is owed for the
+    // file itself here; the directory flush follows. A file that changed since (an editor wrote
+    // to it) is flushed as before, so its new bytes are covered too.
+    if !is_dir && flushed.is_some() && stamp_of(&file) == flushed {
+        return Ok(());
     }
     let (op, target) = if is_dir {
         (crate::io_diag::Op::DirFsync, Target::Directory)
@@ -203,14 +249,93 @@ pub fn flush_received_files(
     workers: usize,
 ) -> Vec<ReceivedFlushOutcome> {
     let keys = vec![None; files.len()];
-    flush_received_objects(files, &keys, mode, workers)
+    let data_flushed = vec![None; files.len()];
+    flush_received_objects(files, &keys, &data_flushed, mode, workers)
+}
+
+/// Flushes the directory entry of each path (its parent directory, once per distinct parent, and
+/// in the second mode the one drive barrier per device), without touching the paths themselves.
+/// For a temp file whose content is durable elsewhere: what must reach stable storage before it
+/// is renamed is its NAME, so that after a power cut the temp's presence says whether the rename
+/// was lost. A path whose parent could not be flushed answers `Failed`.
+pub fn flush_parent_directories(
+    paths: &[PathBuf],
+    mode: ReceivedFlushMode,
+    workers: usize,
+) -> Vec<ReceivedFlushOutcome> {
+    let plain = mode == ReceivedFlushMode::FsyncThenOneFullFsync;
+    let mut dirs: Vec<PathBuf> = paths
+        .iter()
+        .map(|file| match file.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => PathBuf::from("."),
+        })
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    let dir_results: Vec<std::sync::Mutex<Option<std::io::Result<()>>>> =
+        dirs.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    for_each_concurrently(dirs.len(), workers, |index| {
+        let result = flush_one(&dirs[index], plain, true, None, None);
+        *dir_results[index].lock().unwrap_or_else(|p| p.into_inner()) = Some(result);
+    });
+    let dir_devices: Vec<Option<u64>> = dirs.iter().map(|dir| device_of(dir)).collect();
+    let mut barriers: std::collections::HashMap<u64, std::io::Result<()>> =
+        std::collections::HashMap::new();
+    if plain {
+        for (dir, device) in dirs.iter().zip(&dir_devices) {
+            let Some(device) = device else { continue };
+            if barriers.contains_key(device) {
+                continue;
+            }
+            let result = injected_failure(paths.first().unwrap_or(dir)).and_then(|()| {
+                let handle = open_for_received_flush(dir, true)?;
+                crate::io_diag::time(crate::io_diag::Op::FileFsync, 0, || {
+                    flush::sync_directory(&handle)
+                })
+            });
+            barriers.insert(*device, result);
+        }
+    }
+    paths
+        .iter()
+        .map(|file| {
+            let parent = match file.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+                _ => PathBuf::from("."),
+            };
+            let dir_index = dirs.binary_search(&parent).expect("every parent was collected");
+            if let Some(Err(e)) =
+                dir_results[dir_index].lock().unwrap_or_else(|p| p.into_inner()).as_ref()
+            {
+                return ReceivedFlushOutcome::Failed(format!("{}: {e}", parent.display()));
+            }
+            if let Some(Err(e)) = dir_devices[dir_index].and_then(|device| barriers.get(&device)) {
+                return ReceivedFlushOutcome::Failed(format!("drive flush: {e}"));
+            }
+            // The drive barrier of the second mode could not be issued for a directory whose
+            // device is unknown: its name is not known durable, and this answer feeds a
+            // verdict that deletes, so it must not say so.
+            if plain && dir_devices[dir_index].is_none() {
+                return ReceivedFlushOutcome::Failed(format!(
+                    "{}: the drive barrier could not be issued",
+                    parent.display()
+                ));
+            }
+            ReceivedFlushOutcome::Flushed
+        })
+        .collect()
 }
 
 /// [`flush_received_files`] that also checks each file is still the object
-/// recorded in `keys` (same length as `files`); another object there is `Failed`.
+/// recorded in `keys` (same length as `files`); another object there is `Failed`. A file whose entry
+/// in `data_flushed` is set had its data flushed by its writer before the rename: if it is still as
+/// the writer left it, it is checked and its directory flushed, but the file itself is not flushed
+/// again; if it changed, it is flushed.
 pub fn flush_received_objects(
     files: &[PathBuf],
     keys: &[Option<ObjectKey>],
+    data_flushed: &[Option<FlushedStamp>],
     mode: ReceivedFlushMode,
     workers: usize,
 ) -> Vec<ReceivedFlushOutcome> {
@@ -218,7 +343,7 @@ pub fn flush_received_objects(
     let file_results: Vec<std::sync::Mutex<Option<std::io::Result<()>>>> =
         files.iter().map(|_| std::sync::Mutex::new(None)).collect();
     for_each_concurrently(files.len(), workers, |index| {
-        let result = flush_one(&files[index], plain, false, keys[index]);
+        let result = flush_one(&files[index], plain, false, keys[index], data_flushed[index]);
         *file_results[index].lock().unwrap_or_else(|p| p.into_inner()) = Some(result);
     });
 
@@ -234,7 +359,7 @@ pub fn flush_received_objects(
     let dir_results: Vec<std::sync::Mutex<Option<std::io::Result<()>>>> =
         dirs.iter().map(|_| std::sync::Mutex::new(None)).collect();
     for_each_concurrently(dirs.len(), workers, |index| {
-        let result = flush_one(&dirs[index], plain, true, None);
+        let result = flush_one(&dirs[index], plain, true, None, None);
         *dir_results[index].lock().unwrap_or_else(|p| p.into_inner()) = Some(result);
     });
 

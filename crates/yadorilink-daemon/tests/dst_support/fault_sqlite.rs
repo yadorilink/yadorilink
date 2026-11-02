@@ -256,9 +256,9 @@ impl<'a> FaultingSyncState<'a> {
         Ok(self.inner.file_index_repository().list_files(group_id)?)
     }
 
-    pub fn get_unix_mode(&self, group_id: &str, path: &str) -> Result<Option<u32>, SyncError> {
+    pub fn get_exec(&self, group_id: &str, path: &str) -> Result<bool, SyncError> {
         self.guard(SqliteOp::GetUnixMode)?;
-        Ok(self.inner.file_index_repository().get_unix_mode(group_id, path)?)
+        Ok(self.inner.file_index_repository().get_exec(group_id, path)?)
     }
 }
 

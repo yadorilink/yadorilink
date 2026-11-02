@@ -5,8 +5,12 @@
 //! learned by a real probe: a scratch directory and a file created, looked up
 //! under another spelling and removed again (see
 //! `yadorilink_peer_session::hazard::is_case_insensitive_filesystem`). The
-//! answer is deliberately never cached: a path is not a mount instance, and a
-//! different volume can be mounted at the same path.
+//! answer is kept only under the scope it was taken in (see
+//! `yadorilink_fs_platform::folding_scope`): the mounted filesystem instance,
+//! the directory itself and its per-directory folding flag. A path alone is not
+//! that scope, so a different volume mounted at the same path, a replaced root
+//! or a flipped flag reads as another scope and is probed afresh; so is any
+//! root whose scope cannot be named and any probe that could not run.
 //!
 //! A pass settles its files concurrently and every one of them asks several
 //! times (the displacement guard twice, the sibling flush, the hazard check),
@@ -14,7 +18,10 @@
 //! task that polls the whole run: about ten probes per file, serialised, were
 //! the largest single share of a bulk receive's wall time.
 //!
-//! The requesters share a probe without sharing an answer that is older than
+//! Within one scope the answer is therefore asked of the filesystem once, not
+//! once per ask.
+//!
+//! Where there is no known scope, the requesters share a probe without sharing an answer that is older than
 //! their question. A request joins a probe only while that probe has not
 //! started; a request that finds the probe already running starts the next
 //! one. So every answer comes from a probe that began after its requester
@@ -26,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::watch;
+use yadorilink_fs_platform::folding_scope::FoldingScope;
 
 use super::types::VolumeFolding;
 
@@ -61,11 +69,9 @@ impl ProbedFolding {
     pub(crate) fn probe_now(root: &Path) -> Self {
         #[cfg(test)]
         run_probe_hook(root);
-        Self {
-            case_insensitive: yadorilink_peer_session::hazard::probed_case_insensitivity(root),
-            normalization_insensitive:
-                yadorilink_peer_session::hazard::probed_normalization_insensitivity(root),
-        }
+        let (case_insensitive, normalization_insensitive) =
+            yadorilink_peer_session::hazard::probed_folding(root);
+        Self { case_insensitive, normalization_insensitive }
     }
 
     /// The folding when both probes ran; `None` when either could not, for a
@@ -94,10 +100,17 @@ struct Flight {
 
 type Flights = Arc<Mutex<HashMap<PathBuf, Arc<Flight>>>>;
 
+/// The most scopes remembered; a daemon has a handful of roots.
+const MAX_SCOPES: usize = 64;
+
+type Known = Arc<Mutex<HashMap<FoldingScope, ProbedFolding>>>;
+
 /// The probes this executor has waiting to start, per root.
 pub(crate) struct VolumeProbes {
     waiting: Flights,
+    known: Known,
     probe: fn(&Path) -> ProbedFolding,
+    scope: fn(&Path) -> Option<FoldingScope>,
 }
 
 impl Default for VolumeProbes {
@@ -109,12 +122,51 @@ impl Default for VolumeProbes {
 impl VolumeProbes {
     /// Probes with `probe` instead of the real thing, so a test can count them.
     pub(crate) fn with_probe(probe: fn(&Path) -> ProbedFolding) -> Self {
-        Self { waiting: Flights::default(), probe }
+        Self::with_probe_and_scope(probe, FoldingScope::of)
+    }
+
+    /// As [`Self::with_probe`], naming scopes with `scope` as well.
+    pub(crate) fn with_probe_and_scope(
+        probe: fn(&Path) -> ProbedFolding,
+        scope: fn(&Path) -> Option<FoldingScope>,
+    ) -> Self {
+        Self { waiting: Flights::default(), known: Known::default(), probe, scope }
     }
 
     /// The folding of the volume under `root`, from a probe that starts after
     /// this call.
     pub(crate) async fn folding(&self, root: &Path) -> ProbedFolding {
+        let scope = (self.scope)(root);
+        if let Some(found) = scope.as_ref().and_then(|scope| self.recall(scope)) {
+            return found;
+        }
+        let found = self.folding_by_probe(root).await;
+        if let Some(scope) = scope {
+            // Kept only for the scope the probe began in, and only as a full
+            // answer: a probe that could not run is asked again.
+            if found.known().is_some() && (self.scope)(root).as_ref() == Some(&scope) {
+                let mut known = self.known.lock().unwrap_or_else(|p| p.into_inner());
+                if known.len() >= MAX_SCOPES {
+                    known.clear();
+                }
+                known.insert(scope, found);
+            }
+        }
+        found
+    }
+
+    /// Forgets every kept answer, so the next ask probes (and awaits) again.
+    #[cfg(test)]
+    #[allow(dead_code, reason = "only the tests of platforms that name a scope call it")]
+    pub(crate) fn forget(&self) {
+        self.known.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+
+    fn recall(&self, scope: &FoldingScope) -> Option<ProbedFolding> {
+        self.known.lock().unwrap_or_else(|p| p.into_inner()).get(scope).copied()
+    }
+
+    async fn folding_by_probe(&self, root: &Path) -> ProbedFolding {
         let (flight, launch) = {
             let mut waiting = self.waiting.lock().unwrap_or_else(|p| p.into_inner());
             match waiting.get(root) {
@@ -253,5 +305,110 @@ mod tests {
         let found = VolumeProbes::default().folding(dir.path()).await;
         assert!(found.known().is_some());
         assert_eq!(found, ProbedFolding::probe_now(dir.path()));
+    }
+
+    static SCOPED_PROBES: AtomicUsize = AtomicUsize::new(0);
+    static SCOPE_NAME: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
+    static FAILING_PROBES: AtomicUsize = AtomicUsize::new(0);
+
+    fn counted_scoped(_: &Path) -> ProbedFolding {
+        SCOPED_PROBES.fetch_add(1, Ordering::SeqCst);
+        ProbedFolding { case_insensitive: Some(false), normalization_insensitive: Some(true) }
+    }
+
+    fn counted_failing(_: &Path) -> ProbedFolding {
+        FAILING_PROBES.fetch_add(1, Ordering::SeqCst);
+        ProbedFolding { case_insensitive: Some(true), normalization_insensitive: None }
+    }
+
+    fn current_scope(_: &Path) -> Option<FoldingScope> {
+        SCOPE_NAME.lock().unwrap().map(FoldingScope::from_parts)
+    }
+
+    /// One test body: the scope is process-global, so the cases run in order.
+    #[tokio::test]
+    async fn an_answer_is_kept_for_its_scope_only() {
+        let root = PathBuf::from("/scoped-root");
+        let probes = VolumeProbes::with_probe_and_scope(counted_scoped, current_scope);
+
+        // A scope that cannot be named is never served from memory.
+        *SCOPE_NAME.lock().unwrap() = None;
+        probes.folding(&root).await;
+        probes.folding(&root).await;
+        assert_eq!(SCOPED_PROBES.load(Ordering::SeqCst), 2);
+
+        // The same scope: probed once.
+        *SCOPE_NAME.lock().unwrap() = Some("mount-1");
+        for _ in 0..5 {
+            assert_eq!(probes.folding(&root).await.normalization_insensitive, Some(true));
+        }
+        assert_eq!(SCOPED_PROBES.load(Ordering::SeqCst), 3);
+
+        // Another mount, directory or folding flag at the same path: probed again.
+        *SCOPE_NAME.lock().unwrap() = Some("mount-2");
+        probes.folding(&root).await;
+        probes.folding(&root).await;
+        assert_eq!(SCOPED_PROBES.load(Ordering::SeqCst), 4);
+
+        // Back to the first scope: its answer is still its own.
+        *SCOPE_NAME.lock().unwrap() = Some("mount-1");
+        probes.folding(&root).await;
+        assert_eq!(SCOPED_PROBES.load(Ordering::SeqCst), 4);
+
+        // A probe that could not run fully is not kept, and stays fail-closed.
+        *SCOPE_NAME.lock().unwrap() = Some("mount-3");
+        let failing = VolumeProbes::with_probe_and_scope(counted_failing, current_scope);
+        for expected in 1..=3 {
+            let found = failing.folding(&root).await;
+            assert_eq!(found.known(), None);
+            assert!(found.or_conservative().normalization_insensitive);
+            assert_eq!(FAILING_PROBES.load(Ordering::SeqCst), expected);
+        }
+    }
+
+    static FLIP_PROBES: AtomicUsize = AtomicUsize::new(0);
+    static FLIP_SCOPE: AtomicUsize = AtomicUsize::new(0);
+
+    fn probe_that_changes_the_scope(_: &Path) -> ProbedFolding {
+        FLIP_PROBES.fetch_add(1, Ordering::SeqCst);
+        FLIP_SCOPE.fetch_xor(1, Ordering::SeqCst);
+        ProbedFolding { case_insensitive: Some(false), normalization_insensitive: Some(false) }
+    }
+
+    fn flipping_scope(_: &Path) -> Option<FoldingScope> {
+        Some(FoldingScope::from_parts(&FLIP_SCOPE.load(Ordering::SeqCst).to_string()))
+    }
+
+    #[tokio::test]
+    async fn an_answer_from_a_probe_during_which_the_scope_changed_is_not_kept() {
+        let probes =
+            VolumeProbes::with_probe_and_scope(probe_that_changes_the_scope, flipping_scope);
+        let root = PathBuf::from("/flipping-root");
+        // The scope alternates, so a stale insertion under the scope the probe
+        // began in would be served on the third ask.
+        for _ in 0..3 {
+            probes.folding(&root).await;
+        }
+        assert_eq!(FLIP_PROBES.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_real_root_is_probed_once_where_the_platform_names_its_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        if FoldingScope::of(dir.path()).is_none() {
+            return;
+        }
+        let probes = VolumeProbes::with_probe(counted_real_root);
+        for _ in 0..4 {
+            probes.folding(dir.path()).await;
+        }
+        assert_eq!(REAL_ROOT_PROBES.load(Ordering::SeqCst), 1);
+    }
+
+    static REAL_ROOT_PROBES: AtomicUsize = AtomicUsize::new(0);
+
+    fn counted_real_root(_: &Path) -> ProbedFolding {
+        REAL_ROOT_PROBES.fetch_add(1, Ordering::SeqCst);
+        ProbedFolding { case_insensitive: Some(false), normalization_insensitive: Some(false) }
     }
 }

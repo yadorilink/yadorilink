@@ -93,6 +93,7 @@ fn admit_file(db: &Arc<SyncDatabase>, path: &str, size: u64) {
                 deleted: false,
             },
             "device-that-was-here-first",
+            crate::retention::Retention::OwnEdit,
         )
     })
     .expect("the file admission must succeed");
@@ -239,6 +240,7 @@ fn a_join_floor_is_scoped_to_the_group_that_was_joined() {
                 deleted: false,
             },
             DEVICE,
+            crate::retention::Retention::OwnEdit,
         )
     })
     .unwrap();

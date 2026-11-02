@@ -82,6 +82,7 @@ fn is_read_only(payload: &ReqPayload) -> bool {
             | ReqPayload::DiagnosticsPreview(_)
             | ReqPayload::DiagnosticsExport(_)
             | ReqPayload::RewindPreview(_)
+            | ReqPayload::ResolveFolder(_)
             | ReqPayload::ListRecoveryOperations(_)
             | ReqPayload::ShowRecoveryOperation(_)
             | ReqPayload::MaterializationStatus(_)
@@ -390,7 +391,7 @@ mod tests {
 
         let answer = tokio::time::timeout(
             Duration::from_secs(600),
-            exchange(client, ReqPayload::Shutdown(ShutdownRequest {})),
+            exchange(client, ReqPayload::Shutdown(ShutdownRequest { restart: false })),
         )
         .await
         .expect("a shutdown sent to a silent daemon must give up on its own");
@@ -473,8 +474,8 @@ mod tests {
         assert!(is_read_only(&ReqPayload::Status(StatusRequest {})));
         assert!(!is_read_only(&ReqPayload::Pause(PauseRequest::default())));
         assert!(!is_read_only(&ReqPayload::UpdateInstall(UpdateInstallRequest::default())));
-        assert!(!is_read_only(&ReqPayload::Shutdown(ShutdownRequest {})));
-        assert!(only_stops_the_daemon(&ReqPayload::Shutdown(ShutdownRequest {})));
+        assert!(!is_read_only(&ReqPayload::Shutdown(ShutdownRequest { restart: false })));
+        assert!(only_stops_the_daemon(&ReqPayload::Shutdown(ShutdownRequest { restart: false })));
         assert!(only_stops_the_daemon(&ReqPayload::RequestSafeStop(
             RequestSafeStopRequest::default()
         )));

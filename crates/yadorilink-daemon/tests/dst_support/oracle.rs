@@ -646,9 +646,8 @@ impl GlobalOracle {
                             current.size,
                             current.mtime_unix_nanos,
                             current.record_kind,
-                            current.unix_mode,
+                            current.exec,
                             current.symlink_target.clone(),
-                            current.xattrs.clone(),
                         )
                         .version_hash;
                     // The authoring-identity invariant is defined over LIVE
@@ -693,7 +692,7 @@ impl GlobalOracle {
                                     current.mtime_unix_nanos,
                                     current.blocks.len(),
                                     current.record_kind,
-                                    current.unix_mode,
+                                    current.exec,
                                     record.deleted,
                                 ),
                             });
@@ -1320,10 +1319,9 @@ mod tests {
             0,
             FileMeta {
                 mtime_unix_nanos: mtime,
-                unix_mode: None,
+                exec: false,
                 symlink_target: None,
                 record_kind: RecordKind::File,
-                xattrs: Vec::new(),
             },
         );
         let record = FileRecord {
@@ -1754,6 +1752,7 @@ mod tests {
                         },
                         DEVICE,
                         Some(&identity),
+                        yadorilink_sync_sqlite::retention::Retention::OwnEdit,
                     )
                 })
                 .unwrap();

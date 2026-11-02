@@ -308,6 +308,42 @@ impl ReplicaCoordinator {
         }
     }
 
+    /// Withdraws the witness of every open write intent of `group_id` whose target directory is
+    /// not there (under `root`). A witnessed temp can only vouch for a missing name if the
+    /// directory it was flushed in is itself still there: one lost with the cut makes every
+    /// entry in it look gone, and anything that re-creates it (a rebuild, a restore, a receive)
+    /// leaves it empty. This runs FIRST at link start, before any step that can create a
+    /// directory, so that every later repair pass, scheduled ones included, sees no witness and
+    /// rebuilds. Returns how many were withdrawn.
+    ///
+    /// A directory that cannot be looked at (a volume that is not mounted yet, a permission
+    /// error) counts as missing: the witness is gone for good and a later genuine delete in
+    /// that directory is rebuilt rather than kept, the safe direction. The landed mark is not
+    /// withdrawn here; it relies on the repair pass's own start-of-pass check.
+    pub fn withdraw_witnesses_without_their_directory(
+        &self,
+        group_id: &str,
+        root: &Path,
+    ) -> Result<usize, yadorilink_sync_sqlite::SyncSqliteError> {
+        let witnessed =
+            self.database.read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+                yadorilink_sync_sqlite::list_temp_witnesses(conn, group_id)
+            })?;
+        let mut withdrawn = 0;
+        for (path, _) in witnessed {
+            let directory_stands = root
+                .join(&path)
+                .parent()
+                .and_then(|parent| std::fs::symlink_metadata(parent).ok())
+                .is_some_and(|meta| meta.is_dir());
+            if !directory_stands {
+                self.materialization_intent_repository().clear_temp_witness(group_id, &path)?;
+                withdrawn += 1;
+            }
+        }
+        Ok(withdrawn)
+    }
+
     /// Link start: removes the temp files a crash left under `root`, which
     /// are exactly the ones `materialization_tmp_files` names -- written
     /// before each was created, deleted after each was renamed away or
@@ -327,8 +363,26 @@ impl ReplicaCoordinator {
     ) -> Result<Vec<std::path::PathBuf>, yadorilink_sync_sqlite::SyncSqliteError> {
         let ledger = self.temp_ledger(group_id);
         let mut removed = Vec::new();
+        // A temp an open write intent names as its witness (see
+        // `materialization_intents.temp_witness`) is evidence for the repair that follows: whether
+        // it is still there says whether the rename of a now-missing name was lost. It is kept,
+        // with its record, until the intent is gone.
+        let witnessed: std::collections::HashSet<std::path::PathBuf> = self
+            .database
+            .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+                yadorilink_sync_sqlite::list_temp_witnesses(conn, group_id)
+            })?
+            .into_iter()
+            .map(|(path, name)| {
+                let target = root.join(&path);
+                target.with_file_name(name)
+            })
+            .collect();
         for recorded in ledger.list()? {
             let path = std::path::PathBuf::from(&recorded);
+            if witnessed.contains(&path) {
+                continue;
+            }
             // Resolved without walking through a symlinked directory, so a
             // component swapped for a link while stopped cannot aim the removal
             // outside the root. A name that cannot be resolved that way is not

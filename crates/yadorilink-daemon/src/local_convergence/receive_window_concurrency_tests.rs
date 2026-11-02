@@ -247,10 +247,9 @@ async fn one_files_failure_leaves_the_other_files_written_as_in_the_serial_pass(
             10,
             FileMeta {
                 mtime_unix_nanos: 1,
-                unix_mode: Some(0o644),
+                exec: false,
                 symlink_target: None,
                 record_kind: RecordKind::File,
-                xattrs: Vec::new(),
             },
         );
         h.state
@@ -394,10 +393,9 @@ pub(super) async fn run_workload_full(
         10,
         FileMeta {
             mtime_unix_nanos: 1,
-            unix_mode: Some(0o644),
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     );
     h.state

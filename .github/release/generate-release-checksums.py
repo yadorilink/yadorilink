@@ -34,6 +34,13 @@ import hashlib
 import sys
 from pathlib import Path
 
+if sys.version_info < (3, 10):
+    # `Path.write_text(newline=...)` needs 3.10: refuse up front instead of failing part way.
+    sys.exit(
+        "generate-release-checksums.py needs Python 3.10 or newer, "
+        f"found {sys.version_info.major}.{sys.version_info.minor}"
+    )
+
 
 def sha256_of(path: Path) -> str:
     digest = hashlib.sha256()

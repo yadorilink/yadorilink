@@ -25,6 +25,7 @@
 
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
+use yadorilink_sqlite_runtime::CachedStatements as _;
 
 use crate::error::SyncSqliteError;
 use crate::file_identity_codec::{
@@ -120,7 +121,7 @@ pub fn bump_mutation_fence(
     // Every lane takes this step inside the path's lock before its first write,
     // so it is where a frozen group stops them all.
     crate::native_rebootstrap::refuse_materialization_if_frozen(conn, group_id)?;
-    conn.query_row(
+    conn.query_row_cached(
         "INSERT INTO path_actual_mutation_fences
             (group_id, path, mutation_generation, last_mutation_kind, last_mutation_at)
          VALUES (?1, ?2, 1, ?3, ?4)
@@ -157,14 +158,14 @@ pub fn snapshot_mutation_fence(
     group_id: &str,
     path: &str,
 ) -> Result<i64, SyncSqliteError> {
-    conn.execute(
+    conn.execute_cached(
         "INSERT INTO path_actual_mutation_fences
             (group_id, path, mutation_generation, last_mutation_kind, last_mutation_at)
          VALUES (?1, ?2, 0, 'snapshot-created', 0)
          ON CONFLICT (group_id, path) DO NOTHING",
         rusqlite::params![group_id, path],
     )?;
-    conn.query_row(
+    conn.query_row_cached(
         "SELECT mutation_generation FROM path_actual_mutation_fences
           WHERE group_id = ?1 AND path = ?2",
         rusqlite::params![group_id, path],
@@ -365,7 +366,7 @@ pub(crate) fn replace_proof_basis(
     path: &str,
     basis: &crate::materialization_basis::ReflectedHeads,
 ) -> Result<(), SyncSqliteError> {
-    conn.execute(
+    conn.execute_cached(
         "UPDATE path_materialized_generations SET reflected_heads = ?3 \
          WHERE group_id = ?1 AND path = ?2",
         rusqlite::params![group_id, path, basis],
@@ -449,7 +450,7 @@ pub fn publish_materialized_generation_if_fence_current(
     now_unix_nanos: i64,
 ) -> Result<Option<DiskGenerationBasis>, SyncSqliteError> {
     let live: Option<i64> = conn
-        .query_row(
+        .query_row_cached(
             "SELECT mutation_generation FROM path_actual_mutation_fences \
              WHERE group_id = ?1 AND path = ?2",
             rusqlite::params![group_id, path],
@@ -833,7 +834,7 @@ pub fn lookup_materialized_generation(
     path: &str,
 ) -> Result<Option<DiskGenerationBasis>, SyncSqliteError> {
     let row: Option<GenerationRow> = conn
-        .query_row(
+        .query_row_cached(
             "SELECT g.generation_id, g.reflected_heads, g.resolved_path_state_hash, \
                     g.object_kind, g.version_hash, g.filesystem_identity \
                FROM path_materialized_generations g \
@@ -867,7 +868,7 @@ pub fn lookup_materialized_generation_diagnostic(
     path: &str,
 ) -> Result<Option<DiskGenerationBasis>, SyncSqliteError> {
     let row: Option<GenerationRow> = conn
-        .query_row(
+        .query_row_cached(
             "SELECT generation_id, reflected_heads, resolved_path_state_hash, object_kind, \
                     version_hash, filesystem_identity \
              FROM path_materialized_generations WHERE group_id = ?1 AND path = ?2",

@@ -169,7 +169,7 @@ impl Fixture {
     /// Stores `content` as this group's blocks and returns the version a
     /// peer would name for it.
     pub(super) fn content_version(&self, content: &[u8], mtime: i64) -> FileVersion {
-        self.content_version_with_mode(content, mtime, None)
+        self.content_version_with_mode(content, mtime, false)
     }
 
     /// [`Self::content_version`] naming a Unix mode, so that the file a pass
@@ -179,7 +179,7 @@ impl Fixture {
         &self,
         content: &[u8],
         mtime: i64,
-        unix_mode: Option<u32>,
+        exec: bool,
     ) -> FileVersion {
         let block_size = yadorilink_local_storage::chunker::DEFAULT_BLOCK_SIZE;
         let mut blocks = Vec::new();
@@ -196,10 +196,9 @@ impl Fixture {
             content.len() as u64,
             FileMeta {
                 mtime_unix_nanos: mtime,
-                unix_mode,
+                exec,
                 symlink_target: None,
                 record_kind: RecordKind::File,
-                xattrs: Vec::new(),
             },
         )
     }

@@ -7,10 +7,11 @@
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::{
-    ConflictedFileInfo, EvictRequest, EvictResponse, FileVersionInfo, HydrateRequest,
-    ListConflictsRequest, ListTrashRequest, ListVersionsRequest, MaterializationStatusRequest,
-    MaterializationStatusResponse, RestoreTrashOperationRequest, RestoreTrashOperationResponse,
-    RestoreTrashRequest, RestoreVersionRequest, TrashedFileInfo,
+    ActivityEventInfo, ConflictedFileInfo, EvictRequest, EvictResponse, FileVersionInfo,
+    HydrateRequest, ListActivityRequest, ListConflictsRequest, ListTrashRequest,
+    ListVersionsRequest, MaterializationStatusRequest, MaterializationStatusResponse,
+    RestoreTrashOperationRequest, RestoreTrashOperationResponse, RestoreTrashRequest,
+    RestoreVersionRequest, TrashedFileInfo,
 };
 use yadorilink_ipc_proto::daemonctl::{
     PinItemRequest, PinItemResponse, UnpinItemRequest, UnpinItemResponse,
@@ -33,6 +34,18 @@ pub async fn list_conflicts(
         return Err(unexpected());
     };
     Ok(list.files.into_iter().filter(|f| local_path.is_none_or(|p| f.local_path == p)).collect())
+}
+
+/// Recent file events across every linked folder, newest first, one page at a
+/// time: `before_cursor` is the `cursor` of the last event of the previous page.
+pub async fn list_activity(
+    request: ListActivityRequest,
+) -> Result<Vec<ActivityEventInfo>, CoreError> {
+    let resp = control::send(ReqPayload::ListActivity(request)).await?;
+    let Some(RespPayload::ListActivity(list)) = resp.payload else {
+        return Err(unexpected());
+    };
+    Ok(list.events)
 }
 
 /// Currently-recoverable trashed files, across every link, or only the link
@@ -71,12 +84,20 @@ pub async fn restore_trash_operation(
 /// Every retained version of one file, newest first including the current
 /// one.
 pub async fn list_versions(absolute_path: String) -> Result<Vec<FileVersionInfo>, CoreError> {
+    Ok(list_version_history(absolute_path).await?.versions)
+}
+
+/// [`list_versions`] with the times at which this device no longer has the version that was
+/// current (`not_kept`: one entry per recorded event).
+pub async fn list_version_history(
+    absolute_path: String,
+) -> Result<yadorilink_ipc_proto::daemonctl::ListVersionsResponse, CoreError> {
     let resp =
         control::send(ReqPayload::ListVersions(ListVersionsRequest { absolute_path })).await?;
     let Some(RespPayload::ListVersions(list)) = resp.payload else {
         return Err(unexpected());
     };
-    Ok(list.versions)
+    Ok(list)
 }
 
 /// Restores one file to a specific prior version, or (when `version_seq` is
@@ -170,12 +191,35 @@ pub fn evict_refusal(code: &str) -> Option<EvictRefusal> {
         "nothing_freed" => {
             ("the data is still referenced by other files on this device", false, "")
         }
+        "held_as_history" => (
+            "an older version of the file that this device keeps as history uses the same data",
+            false,
+            "",
+        ),
         "not_downloaded" => {
             ("the file is not downloaded on this device, so there is nothing to free", false, "")
         }
         "not_confirmed" => {
             ("the download has not been confirmed yet, or the file is being updated", true, again)
         }
+        // Why a call that succeeded still freed nothing (`EvictResponse.not_freed_reason`).
+        "path_changing" => ("the file is being changed or was only just downloaded", true, again),
+        "not_present" => ("the file is not fully on this device yet", true, again),
+        "no_longer_current" => {
+            ("a newer version of the file arrived or the file was removed", true, again)
+        }
+        "file_replaced" => ("the file was replaced while it was being freed", true, again),
+        "differs_from_synced" => (
+            "the file has changes on this device that are not synced yet",
+            true,
+            "Wait until it has synced, then try again.",
+        ),
+        "volume_not_durable" => (
+            "this disk cannot be shown to keep deletions safe, so nothing is removed from it",
+            false,
+            "",
+        ),
+        "in_use" => ("a program has the file open", true, "Close it, then try again."),
         "host_refused" => (
             "the system would not free it just now; it may have changes that are not shared yet",
             true,

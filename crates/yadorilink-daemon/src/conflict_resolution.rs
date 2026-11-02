@@ -18,6 +18,8 @@
 //!   with a no-replace move. A name taken in the meantime is never overwritten:
 //!   the move fails and the next name is tried.
 
+mod provider;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -91,6 +93,21 @@ pub(crate) fn conflict_copy_resolvable(
         && conflict_copy_source_path(copy_path) != copy_path
 }
 
+/// Whether the folder the copy is in can take the resolution now: always for a plain folder, and
+/// for a provider folder when its root takes changes and the copy and its original are shown.
+/// A folder whose state cannot be read offers nothing.
+pub(crate) fn resolvable_in_folder(
+    coordinator: &ReplicaCoordinator,
+    group_id: &str,
+    copy_path: &str,
+) -> bool {
+    match provider::provider_root_of(coordinator, group_id) {
+        Ok(None) => true,
+        Ok(Some(root_id)) => provider::resolvable_now(coordinator, &root_id, copy_path),
+        Err(_) => false,
+    }
+}
+
 /// Resolves the conflict copy at `copy_path` (relative to the group's root) and
 /// returns the absolute path that holds its content afterwards.
 pub(crate) async fn resolve_conflict(
@@ -116,6 +133,9 @@ pub(crate) async fn resolve_conflict(
                 "it is not a file with a known original name".into()
             }
         }));
+    }
+    if let Some(root_id) = provider::provider_root_of(coordinator, group_id)? {
+        return provider::resolve(state, &root_id, copy_path, choice).await;
     }
     let root = hydration::local_root_for_group(state, group_id)?;
     let copy_abs = root.join(copy_path);

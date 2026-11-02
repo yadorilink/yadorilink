@@ -31,6 +31,13 @@ const HEALTHY_TIMEOUT: Duration = Duration::from_secs(10);
 /// partition. Only ever evaluated while a link is cut.
 const CUT_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How long a healed lane may take to carry bytes again. A healthy lane carries them at once, so a
+/// large value costs nothing when it recovers; it only bounds the wait when it does not. The path
+/// is a real QUIC connection on the real clock, whose probes into a cut double their interval, so
+/// how soon it moves again after a cut depends on the machine, not on the code under test (see
+/// `substrate_wire_faults.rs`).
+const HEAL_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Two devices on one simulated network, under one fault controller.
 struct Pair {
     a: std::sync::Arc<TestPeerNode>,
@@ -115,31 +122,37 @@ fn body() -> Vec<u8> {
     (0..4096u32).map(|i| (i % 251) as u8).collect()
 }
 
-/// Healthy, then cut, then cut the other way, then healed -- on one network,
-/// one controller and one pair of endpoints throughout.
+/// A partition is a property of the link: whichever side asks, the exchange stops while it is cut
+/// and the lane carries again once it is healed. `from_a` picks which endpoint asks.
 ///
-/// Deliberately one test. Splitting it would let each phase pass against a
-/// freshly built pair, and "it works after heal" means nothing if the healed
-/// case is allowed to be a different network than the partitioned one.
-#[tokio::test]
-async fn a_partition_stops_both_directions_and_heal_restores_them() {
+/// One cut, then its heal, on one network, one controller and one pair of endpoints. Cutting a
+/// second time on the same connection would add its silence to the first (QUIC doubles the
+/// interval between probes into the dark), so each direction of asking is a test of its own on a
+/// pair of its own. Splitting does not let the healed case be a different network than the
+/// partitioned one: within each test the heal is on the very endpoints that were cut.
+async fn cut_and_heal(from_a: bool) {
     let network = TestNetwork::new();
     let faults = SimFaultController::new();
     let p = pair(&network, &faults).await;
     let payload = body();
+    // The side that asks, the side that serves, and the name the asker dials.
+    let (asker, server, server_name) =
+        if from_a { (&p.a, &p.b, "device-b") } else { (&p.b, &p.a, "device-a") };
 
     // (1) Healthy: the lane works before any fault, so a later failure is
     // attributable to the fault and not to the setup.
-    let serving = serve_blocks(p.b.clone(), payload.clone());
-    let got = block_round_trip(&p.a, "device-b", &payload, HEALTHY_TIMEOUT).await;
+    let serving = serve_blocks(server.clone(), payload.clone());
+    let got = block_round_trip(asker, server_name, &payload, HEALTHY_TIMEOUT).await;
     assert_eq!(got.as_deref(), Some(payload.as_slice()), "the healthy lane must carry bytes");
     assert_eq!(serving.await.expect("serving task"), b"want");
     assert_eq!(faults.dropped_datagrams(), 0, "nothing may be dropped while no link is cut");
 
-    // (2) Cut. A new lane on a partitioned link must not complete.
+    // (2) Cut. A new lane on a partitioned link must not complete, from either side: a carrier
+    // that only filtered the direction it was declared in would let a peer answer a request it
+    // should never have received.
     faults.partition(p.a_id, p.b_id);
-    let serving = serve_blocks(p.b.clone(), payload.clone());
-    let got = block_round_trip(&p.a, "device-b", &payload, CUT_TIMEOUT).await;
+    let serving = serve_blocks(server.clone(), payload.clone());
+    let got = block_round_trip(asker, server_name, &payload, CUT_TIMEOUT).await;
     assert!(got.is_none(), "a lane completed across a cut link");
     assert!(
         faults.dropped_datagrams() > 0,
@@ -148,19 +161,11 @@ async fn a_partition_stops_both_directions_and_heal_restores_them() {
     );
     serving.abort();
 
-    // (3) The reverse direction is cut too. A partition is a property of the
-    // link, and a carrier that only filtered the direction it was declared in
-    // would let a peer answer a request it should never have received.
-    let serving = serve_blocks(p.a.clone(), payload.clone());
-    let got = block_round_trip(&p.b, "device-a", &payload, CUT_TIMEOUT).await;
-    assert!(got.is_none(), "a lane completed across a cut link in the reverse direction");
-    serving.abort();
-
-    // (4) Healed, on the same endpoints, same network, same controller.
+    // (3) Healed, on the same endpoints, same network, same controller.
     let dropped_before_heal = faults.dropped_datagrams();
     faults.heal(p.a_id, p.b_id);
-    let serving = serve_blocks(p.b.clone(), payload.clone());
-    let got = block_round_trip(&p.a, "device-b", &payload, HEALTHY_TIMEOUT).await;
+    let serving = serve_blocks(server.clone(), payload.clone());
+    let got = block_round_trip(asker, server_name, &payload, HEAL_TIMEOUT).await;
     assert_eq!(
         got.as_deref(),
         Some(payload.as_slice()),
@@ -168,7 +173,7 @@ async fn a_partition_stops_both_directions_and_heal_restores_them() {
     );
     assert_eq!(serving.await.expect("serving task"), b"want");
 
-    // (5) Drop semantics, not hold. If the partition had queued what it
+    // (4) Drop semantics, not hold. If the partition had queued what it
     // stopped, healing would have replayed it -- and the count of discarded
     // datagrams would have to fall as the queue drained. It does not,
     // because there is no queue.
@@ -182,9 +187,9 @@ async fn a_partition_stops_both_directions_and_heal_restores_them() {
         "the link is still recorded as cut after healing"
     );
 
-    // A cancelled attempt stays cancelled. The two cut phases gave up when
-    // their budget expired, which dropped their futures and with them their
-    // streams; healing the link must not bring one back to life.
+    // A cancelled attempt stays cancelled. The cut phase gave up when its budget expired, which
+    // dropped its future and with it its stream; healing the link must not bring it back to
+    // life.
     //
     // Note what this does NOT show. It is not evidence that the carrier
     // discards rather than holds, and it cannot be: datagrams a partition
@@ -194,12 +199,24 @@ async fn a_partition_stops_both_directions_and_heal_restores_them() {
     // caller walked away does not complete later. The carrier's own
     // no-hold-queue property is stated where it can be isolated from QUIC
     // entirely, in `sim_fault`'s own tests.
-    let cancelled = serve_blocks(p.b.clone(), payload.clone());
+    let cancelled = serve_blocks(server.clone(), payload.clone());
     let late = tokio::time::timeout(Duration::from_secs(2), cancelled).await;
     assert!(
         late.is_err(),
         "an exchange completed after heal although its requester had already given up"
     );
+}
+
+/// Healthy, cut, healed, asking from A.
+#[tokio::test]
+async fn a_partition_stops_the_exchange_asked_from_a_and_heal_restores_it() {
+    cut_and_heal(true).await;
+}
+
+/// The same asking from B: the partition stops the reverse direction too, and heal restores it.
+#[tokio::test]
+async fn a_partition_stops_the_exchange_asked_from_b_and_heal_restores_it() {
+    cut_and_heal(false).await;
 }
 
 /// The negative control: the same wrapper, never told to cut anything, must

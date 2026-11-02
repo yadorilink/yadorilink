@@ -13,7 +13,7 @@ fn cause(item: AttentionItem) -> &'static str {
         I::FileWatchLimit => "The system's limit on watched files is reached, so changes in this folder are picked up late or not at all until the limit is raised.",
         I::LinkedTwice => "This folder is linked in more than one place, so nothing syncs.",
         I::OwnershipLost => "This folder's ownership marker is gone; re-link or restart to continue.",
-        I::NotJoined => "This folder is not joined to its folder group, so it no longer syncs. Its files are kept as they are.",
+        I::NotJoined => "This folder is not joined to its shared folder, so it no longer syncs. Its files are kept as they are.",
         I::VolumeChanged => "This folder is no longer on the disk it was set up on, so deletions are not synced until that disk is back or the folder is linked again.",
         I::VolumeUnconfirmed => "This folder's disk has no identity that survives a remount (FAT, exFAT, xfs before Linux 6.5), so after it was mounted again it cannot be told from another disk holding a copy. Nothing syncs until you confirm it is the right disk.",
         I::NoSafeCopy => "This folder has no safe second copy; losing this disk would lose data.",
@@ -21,14 +21,16 @@ fn cause(item: AttentionItem) -> &'static str {
         I::ContentUnavailable => "Immediate fetch from another device is not confirmed. Data already stored on this device may still be readable.",
         I::ContentAvailabilityUnknown => "It is not known yet whether missing files can be fetched.",
         I::ConflictNeedsReview => "Some files have conflicting copies.",
-        I::ApprovalPending => "A device is waiting for your approval to join this folder group.",
+        I::ApprovalPending => "A device is waiting for your approval to join this shared folder.",
         I::FileHeld => "Some files were not applied to this device.",
         I::UnsupportedFilename => "Its name cannot be used on this device: it collides with another file's name or is not allowed here.",
         I::FileNotReadable => "The existing file on this device cannot be read by you, so its update was not applied.",
+        I::RebuildNeeded => "This device's history of this folder can no longer catch up from the other devices, so it takes a fresh copy of their state from a connected device. Your files here are kept.",
+        I::IndexDamaged => "A stored record of a file in this folder cannot be read back, so this folder cannot say whether its data is safe or fetchable until the record is repaired.",
         I::UnreadableFiles => "Some files in this folder cannot be read, so they are skipped and not synced. Nothing was deleted, and the rest of the folder keeps syncing.",
         I::StrandedDirectory => "A folder could not be removed safely and was left under a temporary name; nothing was deleted.",
-        I::ProviderNotReady => "This provider folder is not ready to use.",
-        I::ProviderFilesFailing => "Some files in this provider folder keep failing to download.",
+        I::ProviderNotReady => "This File Provider folder is not ready to use.",
+        I::ProviderFilesFailing => "Some files in this File Provider folder keep failing to download.",
         I::EditsKeptBeside => "Edits were kept beside a file instead of replacing it.",
         I::ProviderOrphan => "A File Provider folder exists that no linked folder uses.",
         I::DiskFull => "The disk is almost full, so syncing is paused.",
@@ -45,6 +47,7 @@ fn cause(item: AttentionItem) -> &'static str {
         I::ReplacementSignInRequired => "The confirmation of the device replacement was refused because you are signed out. Sign in again so it can go through; your files are kept.",
         I::TermsConsentRequired => "The service is refusing requests until you accept the updated Terms. Your files, folders and this device are kept and nothing is unlinked; sync of what is already set up keeps its local state. Sign in again to review and accept the Terms in your browser.",
         I::SignInRequired => "Signing in again is required (the Terms may have changed): the service refused to renew this computer's session. Your files, folders and this device are kept. Sign in again to continue.",
+        I::AccountDeletionRequested => "Deleting this account was requested on another device. Open the account's settings to cancel it if this was not you.",
         I::AccountDeletionPending => "This account is scheduled for deletion. Your files on this computer are kept; the account can still be restored from its settings before the grace period ends.",
         I::AccountDeletionUrgent => "This account is about to be deleted: removing it would leave a shared folder without a safe copy, and the deletion goes ahead soon regardless. Review the account's settings now to restore it, or make another device a full copy.",
         I::Unrecognized => "Needs attention.",
@@ -60,7 +63,7 @@ fn next_step(item: AttentionItem) -> &'static str {
         I::ReplacementSignInRequired | I::TermsConsentRequired | I::SignInRequired => {
             "yadorilink login"
         }
-        I::NotJoined => "accept a new invite to the folder group into this folder (yadorilink share accept <invite> --path <folder>), or unlink it (yadorilink unlink)",
+        I::NotJoined => "accept a new invite to the shared folder into this folder (yadorilink share accept <invite> --path <folder>), or unlink it (yadorilink unlink)",
         I::VolumeUnconfirmed => {
             "check the right disk is mounted, then: yadorilink readopt <folder>"
         }
@@ -105,8 +108,11 @@ fn next_step(item: AttentionItem) -> &'static str {
         | I::ProviderFilesFailing
         | I::EditsKeptBeside
         | I::RetryableFailure
+        | I::AccountDeletionRequested
         | I::AccountDeletionPending
         | I::AccountDeletionUrgent
+        | I::IndexDamaged
+        | I::RebuildNeeded
         | I::Unrecognized => "yadorilink status --details",
     }
 }

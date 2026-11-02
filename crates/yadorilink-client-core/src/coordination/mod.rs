@@ -5,3 +5,4 @@
 pub mod credential_store;
 pub mod device_config;
 pub mod http_client;
+pub(crate) mod name_lookup;

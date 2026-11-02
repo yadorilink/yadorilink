@@ -68,6 +68,10 @@ pub struct LinkProgressRollup {
 }
 
 struct Entry {
+    /// The attempt that registered this entry: only its guard may update or remove it. A later
+    /// attempt for the same (group, path) replaces the entry with its own token, after which the
+    /// earlier attempt's updates and removal are no-ops.
+    token: u64,
     path: String,
     bytes_done: u64,
     bytes_total: u64,
@@ -144,6 +148,8 @@ struct Inner {
     /// above which resets to nothing once a transfer's entry is torn down).
     transfer_bytes_total: AtomicU64,
     block_fetch_seconds: Histogram,
+    /// Source of the attempt tokens of [`TransferProgressGuard`].
+    next_token: AtomicU64,
 }
 
 /// Cheap-to-clone (`Arc`-backed) handle so it can be handed into
@@ -163,6 +169,7 @@ impl TransferProgressTracker {
             active: Mutex::new(HashMap::new()),
             transfer_bytes_total: AtomicU64::new(0),
             block_fetch_seconds: Histogram::new(),
+            next_token: AtomicU64::new(0),
         }))
     }
 
@@ -180,9 +187,11 @@ impl TransferProgressTracker {
         let group_id = group_id.into();
         let path = path.into();
         let key = (group_id.clone(), path.clone());
+        let token = self.0.next_token.fetch_add(1, Ordering::Relaxed) + 1;
         self.0.active.lock().unwrap_or_else(|p| p.into_inner()).insert(
             key.clone(),
             Entry {
+                token,
                 path,
                 bytes_done: 0,
                 bytes_total,
@@ -192,7 +201,7 @@ impl TransferProgressTracker {
                 started_at_unix: now_unix(),
             },
         );
-        TransferProgressGuard { tracker: self.clone(), key: Some(key) }
+        TransferProgressGuard { tracker: self.clone(), key: Some(key), token }
     }
 
     /// Records one more successfully-fetched-and-stored block for the
@@ -216,8 +225,30 @@ impl TransferProgressTracker {
         self.0.block_fetch_seconds.observe(seconds);
     }
 
-    fn remove(&self, key: &(String, String)) {
-        self.0.active.lock().unwrap_or_else(|p| p.into_inner()).remove(key);
+    /// Records one block for the transfer registered under `token`; a no-op for the entry of a
+    /// later attempt (or none), but the byte total of the process still counts the bytes.
+    fn record_block_done_for(&self, key: &(String, String), token: u64, bytes: u64, peer_id: &str) {
+        if let Some(entry) = self
+            .0
+            .active
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut(key)
+            .filter(|entry| entry.token == token)
+        {
+            entry.bytes_done = entry.bytes_done.saturating_add(bytes);
+            entry.blocks_done = entry.blocks_done.saturating_add(1);
+            entry.source_peer = peer_id.to_string();
+        }
+        self.0.transfer_bytes_total.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Removes the entry only while it is still the one `token` registered.
+    fn remove(&self, key: &(String, String), token: u64) {
+        let mut active = self.0.active.lock().unwrap_or_else(|p| p.into_inner());
+        if active.get(key).is_some_and(|entry| entry.token == token) {
+            active.remove(key);
+        }
     }
 
     /// Every currently-active transfer, for `yadorilink status`
@@ -304,12 +335,25 @@ impl TransferProgressTracker {
 pub struct TransferProgressGuard {
     tracker: TransferProgressTracker,
     key: Option<(String, String)>,
+    token: u64,
+}
+
+impl TransferProgressGuard {
+    /// Records one more block for this attempt's own entry. Unlike
+    /// [`TransferProgressTracker::record_block_done`], which finds the entry by (group, path),
+    /// this applies only while the entry is still this attempt's: a late block of an earlier
+    /// attempt cannot advance the entry a newer attempt registered for the same path.
+    pub fn record_block_done(&self, bytes: u64, peer_id: &str) {
+        if let Some(key) = &self.key {
+            self.tracker.record_block_done_for(key, self.token, bytes, peer_id);
+        }
+    }
 }
 
 impl Drop for TransferProgressGuard {
     fn drop(&mut self) {
         if let Some(key) = self.key.take() {
-            self.tracker.remove(&key);
+            self.tracker.remove(&key, self.token);
         }
     }
 }

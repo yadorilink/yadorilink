@@ -49,7 +49,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(turmoil)"] }
 too_many_lines = "warn"
 
 [workspace.package]
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 edition = "2021"
 license = "AGPL-3.0-only"
 repository = "https://github.com/yadorilink/yadorilink"
@@ -85,6 +85,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.11"
+xxhash-rust = { version = "0.8.15", default-features = false, features = ["xxh3"] }
 # Negotiated zstd compression for sync-protocol block/index payloads —
 # scoped to `yadorilink-peer-session` only, not a dependency of any other
 # crate.

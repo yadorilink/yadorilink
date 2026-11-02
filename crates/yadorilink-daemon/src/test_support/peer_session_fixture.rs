@@ -98,9 +98,8 @@ pub fn payload_with_meta(
             record.size,
             record.mtime_unix_nanos,
             record_kind,
-            None,
+            false,
             symlink_target.map(|t| t.to_vec()),
-            Vec::new(),
         ),
     )
 }
@@ -243,11 +242,34 @@ impl Device {
         book: yadorilink_lane_ports::testing::TestAddressBook,
         node: Arc<yadorilink_lane_ports::testing::TestPeerNode>,
     ) -> Self {
+        Self::in_world_with_node_and_tuning(device_id, book, node, None)
+    }
+
+    /// A device whose engine runs with `tuning` instead of the defaults.
+    pub async fn new_with_tuning(
+        device_id: &str,
+        tuning: crate::engine_tuning::EngineTuning,
+    ) -> Self {
+        let book = yadorilink_lane_ports::testing::TestAddressBook::new();
+        let node =
+            yadorilink_lane_ports::testing::TestPeerNode::start(device_id, book.clone()).await;
+        Self::in_world_with_node_and_tuning(device_id, book, node, Some(tuning))
+    }
+
+    fn in_world_with_node_and_tuning(
+        device_id: &str,
+        book: yadorilink_lane_ports::testing::TestAddressBook,
+        node: Arc<yadorilink_lane_ports::testing::TestPeerNode>,
+        tuning: Option<crate::engine_tuning::EngineTuning>,
+    ) -> Self {
         // Deterministic per-id key so the peer can pin the verifying key and a
         // failing run is reproducible.
         let seed: [u8; 32] = sha256_bytes(device_id.as_bytes()).try_into().unwrap();
         let root = tempfile::tempdir().unwrap();
-        let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+        let state = Arc::new(match tuning {
+            Some(tuning) => ReplicaCoordinator::open_in_memory_with(tuning).unwrap(),
+            None => ReplicaCoordinator::open_in_memory().unwrap(),
+        });
         // Link `GROUP` at this device's root, the same way linking the folder
         // would. A session's sync roots are *derived from* the link table in
         // production (`sync_roots_for_groups` reads `list_links`), and the
@@ -1031,10 +1053,30 @@ pub fn spawn_session_configured_ex(
     install_convergence_driver: bool,
     root_commit_authority_provider: Option<Arc<dyn RootCommitAuthorityProvider>>,
 ) -> Arc<TestPeerRuntime> {
+    spawn_session_configured_with_deps(
+        device,
+        peer_device_id,
+        shared_group_ids,
+        install_convergence_driver,
+        root_commit_authority_provider,
+        None,
+    )
+}
+
+/// [`spawn_session_configured_ex`] with the session's capability injections given (the defaults
+/// of `PeerSyncSessionDeps::standalone` when `None`).
+pub fn spawn_session_configured_with_deps(
+    device: &Device,
+    peer_device_id: &str,
+    shared_group_ids: Vec<String>,
+    install_convergence_driver: bool,
+    root_commit_authority_provider: Option<Arc<dyn RootCommitAuthorityProvider>>,
+    deps: Option<PeerSyncSessionDeps>,
+) -> Arc<TestPeerRuntime> {
     let convergence_groups = shared_group_ids.clone();
     let convergence_state = device.state.clone();
 
-    let deps = PeerSyncSessionDeps::standalone();
+    let deps = deps.unwrap_or_else(PeerSyncSessionDeps::standalone);
     let mut ports = ExecutorPorts::denied();
     if let Some(provider) = root_commit_authority_provider {
         ports.root_commit_authority_provider = provider;

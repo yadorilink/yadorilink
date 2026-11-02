@@ -27,21 +27,10 @@
 //!   replica converges on one version without a conflicted copy. This happens
 //!   before any copy is made, so authors of one losing content later move the
 //!   same version to the same copy path. Any other difference (bytes, mode,
-//!   symlink target, xattrs, kind) is a real contest, with one exception: for
-//!   a regular file, no mode (a device without unix permissions) equals a
-//!   plain non-executable read/write mode ([`ModeBridge`]). Only the
-//!   mode-less head moves, and it adopts the existing Unix version, so a Unix
-//!   mode is never changed or dropped and a Unix head is never replaced by a
-//!   mode-less one. A set exec bit, other mode bits and several differing
-//!   Unix modes stay a contest. The bridge only decides where a mode-less
-//!   head goes, never who wins: the version that keeps a path is the largest
-//!   raw [`crate::native_state::win_key`] of the heads present, a pure
-//!   function of the multiset of raw version hashes. It never changes when a
-//!   loser is removed, replaced or adopts, and no head that holds the path
-//!   adopts, so concurrent plans that saw different subsets of the heads can
-//!   never all abandon the path. The price: when the mode-less version has
-//!   the largest hash, the Unix head of the same bytes is an ordinary loser
-//!   and is moved to a conflicted copy.
+//!   symlink target, exec, kind) is a real contest. The version that keeps a path is the largest raw
+//!   [`crate::native_state::win_key`] of the heads present, a pure function of the multiset of raw version
+//!   hashes; no head that holds the path adopts, so concurrent plans that saw different subsets of the heads
+//!   can never all abandon the path.
 //! * Every delta is self-contained: it puts every version it removes, so no
 //!   admitted prefix of a plan can leave a head removed without its copy.
 //! * An author holds at most [`MAX_SELF_HEADS`] heads at a path. A put into a
@@ -59,7 +48,7 @@ use crate::file::RecordKind;
 use crate::ids::{ContentIdentity, DeltaHash, SyncPath, VersionHash};
 use crate::limits::MAX_PATH_BYTES;
 use crate::native_project::loses;
-use crate::native_state::{win_key, HeadPayload, LiveHead, NativeState, RemoteOp};
+use crate::native_state::{HeadPayload, LiveHead, NativeState, RemoteOp};
 use crate::signed_delta::{DeltaPut, HeadRef};
 
 /// What fork planning needs to know about one version: its kind, and the
@@ -70,60 +59,12 @@ pub struct VersionInfo {
     /// `None` makes the version its own content: it is the same content as
     /// itself and as nothing else.
     pub content: Option<ContentIdentity>,
-    /// How the version relates to the other platform's idea of a mode, for a
-    /// regular file with no exec bit (see [`ModeBridge`]); `None` otherwise.
-    pub mode_bridge: Option<ModeBridge>,
-}
-
-/// The cross-platform view of a regular file's mode. A device without unix
-/// permissions records no mode, while a Unix device records the permission
-/// word, so the same bytes written on both are never equal by
-/// [`ContentIdentity`]. A version with no mode (`modeless`) is the same
-/// content as a version whose mode has no exec bit and no bit beyond
-/// read/write (`!modeless`) when everything else is equal (`base` is the
-/// identity with the mode removed). A set exec bit, any other mode bit, a
-/// symlink or a directory is never bridged.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct ModeBridge {
-    pub base: ContentIdentity,
-    pub modeless: bool,
 }
 
 impl From<RecordKind> for VersionInfo {
     fn from(kind: RecordKind) -> Self {
-        VersionInfo { kind, content: None, mode_bridge: None }
+        VersionInfo { kind, content: None }
     }
-}
-
-/// The version a mode-less `own` (a version with no mode) stands for among the
-/// heads at the path: the largest version of the one content that holds the
-/// same bytes with a non-executable mode. `Some(None)` when there is no such
-/// version, or when there are several that differ in mode (which of them the
-/// mode-less head should become is then not decided, and it stays a real
-/// contest); `None` while a version record is missing.
-///
-/// Only the mode-less head ever moves, and it moves to a version that already
-/// exists, which keeps the Unix author's mode untouched; a head with a mode is
-/// never replaced by a mode-less one.
-fn mode_bridge_target<K: Into<VersionInfo>>(
-    own: &VersionInfo,
-    heads_at_path: &crate::native_state::PathHeads,
-    info_of: &impl Fn(&VersionHash) -> Option<K>,
-) -> Option<Option<VersionHash>> {
-    let Some(bridge) = own.mode_bridge.filter(|b| b.modeless) else { return Some(None) };
-    let mut identities: BTreeSet<ContentIdentity> = BTreeSet::new();
-    let mut best: Option<VersionHash> = None;
-    for payload in heads_at_path.values() {
-        let other: VersionInfo = info_of(&payload.version)?.into();
-        let Some(other_bridge) = other.mode_bridge.filter(|b| !b.modeless) else { continue };
-        if other_bridge.base != bridge.base {
-            continue;
-        }
-        let Some(identity) = other.content else { continue };
-        identities.insert(identity);
-        best = best.max(Some(payload.version));
-    }
-    Some(if identities.len() == 1 { best } else { None })
 }
 
 /// The version `version` should be replaced by, if any: the largest version
@@ -139,19 +80,6 @@ pub fn adoption_version<K: Into<VersionInfo>>(
     info_of: impl Fn(&VersionHash) -> Option<K>,
 ) -> Option<Option<VersionHash>> {
     let own: VersionInfo = info_of(version)?.into();
-    if let Some(target) = mode_bridge_target(&own, heads_at_path, &info_of)? {
-        // The version that keeps the path never moves, and never adopts: the
-        // winner is the largest raw [`win_key`] at the path whichever heads
-        // are present, so removing or replacing a loser cannot change it.
-        let own_key = win_key(own.kind == RecordKind::Directory, *version);
-        for payload in heads_at_path.values() {
-            let other: VersionInfo = info_of(&payload.version)?.into();
-            if win_key(other.kind == RecordKind::Directory, payload.version) > own_key {
-                return Some(Some(target));
-            }
-        }
-        return Some(None);
-    }
     let Some(identity) = own.content else { return Some(None) };
     if own.kind == RecordKind::Directory {
         return Some(None);

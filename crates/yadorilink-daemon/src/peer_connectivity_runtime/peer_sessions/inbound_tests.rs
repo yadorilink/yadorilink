@@ -116,6 +116,43 @@ async fn a_keeper_in_backoff_takes_the_peers_inbound_link() {
     drop((alice_dir, bob_dir));
 }
 
+/// The dialing side is asleep because its native connection is up. When that connection ends it
+/// must redial at once, not at its next poll (five seconds): the poll is only a safety net.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_native_connection_that_ends_is_redialled_without_waiting_for_the_poll() {
+    let [alice_key, bob_key, _] = ordered_key_bytes();
+    let (alice, alice_dir) = device(ALICE, alice_key);
+    let (bob, bob_dir) = device(BOB, bob_key);
+    pin(&alice, BOB, bob_key);
+    pin(&bob, ALICE, alice_key);
+    let alice_stack = stack(&alice).await;
+    let bob_stack = stack(&bob).await;
+    teach(&alice_stack, &bob_stack);
+    teach(&bob_stack, &alice_stack);
+    bob.install_peer_session_driver(PeerSessionDriver::start(bob.clone(), bob_stack));
+    alice.install_peer_session_driver(PeerSessionDriver::start(alice.clone(), alice_stack));
+    assert!(
+        within(STEP, || alice.native_replication.is_attached(BOB)
+            && bob.native_replication.is_attached(ALICE))
+        .await,
+        "native replication attaches beside the sessions"
+    );
+    // Let alice's keeper settle into its up-connection wait.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Bob ends his side of it; alice's connection closes with it.
+    let before = alice.native_replication.attached_peer(BOB);
+    bob.native_replication.detach(ALICE);
+    assert!(
+        within(Duration::from_secs(3), || {
+            alice.native_replication.is_attached(BOB) && bob.native_replication.is_attached(ALICE)
+        })
+        .await,
+        "redialled well inside the five second poll (was attached as {before:?})"
+    );
+    drop((alice_dir, bob_dir));
+}
+
 struct Rotation {
     alice: Arc<DaemonState>,
     alice_stack: Arc<SyncStack>,

@@ -178,6 +178,62 @@ pub struct SendAuthorizationGrant {
     pub receiver_reachability: SubstrateReachability,
 }
 
+/// A freshly minted cross-account Send link (`POST /send/links`).
+#[derive(Debug, Clone)]
+pub struct CreatedSendLink {
+    pub link_id: String,
+    /// Shown once; the service keeps only its hash.
+    pub code: String,
+    pub expires_at_unix: i64,
+}
+
+/// The sender's view of a link (`GET /send/links/:id`).
+#[derive(Debug, Clone)]
+pub struct SendLinkStatus {
+    /// `open`, `redeemed`, `granted`, `cancelled` or `expired`.
+    pub state: String,
+    pub receiver_device_name: Option<String>,
+}
+
+/// What a signed-in holder of a code may see of a link before redeeming it
+/// (`POST /send/links/preview`).
+#[derive(Debug, Clone)]
+pub struct SendLinkPreview {
+    pub sender_name: String,
+    /// (name, size in bytes) of each file the link carries; empty when the sender attached none.
+    pub files: Vec<(String, u64)>,
+    pub expires_at_unix: i64,
+}
+
+/// Why a send-link call to the coordination plane failed, as a kind a caller can branch on
+/// without reading the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendLinkCallKind {
+    /// The service could not be reached.
+    Unreachable,
+    /// 401 or 403: this device's sign-in is not accepted.
+    SignInRequired,
+    /// 404: for a redeem, the service's one uniform refusal (unknown, expired, used or
+    /// cancelled); for another call, the link is not one of this account's.
+    NotFound,
+    /// The service has Send links switched off (a 404 carrying the code `send_links_disabled`).
+    FeatureDisabled,
+    Other,
+}
+
+/// A failed send-link call: its kind plus the text for a details view.
+#[derive(Debug, Clone)]
+pub struct SendLinkCallError {
+    pub kind: SendLinkCallKind,
+    pub message: String,
+}
+
+impl std::fmt::Display for SendLinkCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// Where a device's iroh endpoint answers, in the wire shape the
 /// coordination plane uses for it (`{direct, relays}`). Unparseable direct
 /// addresses are dropped.
@@ -348,12 +404,14 @@ impl std::fmt::Display for DeviceListingError {
 pub use imp::{
     activate_create, activate_invite_accept, activate_join, cancel_create,
     cancel_create_classified, cancel_invite_accept_classified, cancel_join, cancel_join_classified,
-    commit_handoff_role_loss, compensate_handoff_role_loss, consume_send_authorization,
-    fetch_edge_state, find_account_device, find_handoff_lease, list_account_device_keys,
-    prepare_create, prepare_invite_accept, prepare_join, query_enrollment_operation,
-    query_membership_operation, query_membership_operation_categorized, query_role_loss_operation,
+    cancel_send_link, commit_handoff_role_loss, compensate_handoff_role_loss,
+    consume_send_authorization, create_send_link, fetch_edge_state, find_account_device,
+    find_handoff_lease, list_account_device_keys, prepare_create, prepare_invite_accept,
+    prepare_join, preview_send_link, query_enrollment_operation, query_membership_operation,
+    query_membership_operation_categorized, query_role_loss_operation, redeem_send_link,
     release_handoff_lease, report_endpoint, request_authorization_checkpoint,
-    request_handoff_lease, request_send_authorization, resolve_edge, set_storage_mode,
+    request_handoff_lease, request_send_authorization, request_send_link_authorization,
+    resolve_edge, send_link_status, set_storage_mode,
 };
 // `MintedInvite` is `pub(crate)` (defined in `application::model`, a
 // crate-internal module) -- unlike every other re-export above, whose
@@ -559,13 +617,14 @@ mod imp {
 
     use super::{
         categorize_error_status, evidence_http_client, ActivateOutcome, CoordinationAuth,
-        CoordinationCallError, DeviceListingError, EnrollmentOperationRecord,
+        CoordinationCallError, CreatedSendLink, DeviceListingError, EnrollmentOperationRecord,
         EnrollmentRemoteRequest, EnrollmentRemoteStatus, HandoffCommitResult, HandoffLeaseGrant,
         MembershipOperationLookup, MembershipOperationRecord, MembershipRemoteRequest,
         MembershipRemoteRequestGroup, MembershipRemoteResult, MembershipRemoteStatus,
         RemoteEvidenceErrorCategory, RemoteQueryError, RoleLossCommitOutcome,
         RoleLossCommitRequest, RoleLossCompensationOutcome, RoleLossOperationRecord,
-        SendAuthorizationGrant, SendAuthorized, StorageModeWriteError, SubstrateReachability,
+        SendAuthorizationGrant, SendAuthorized, SendLinkCallError, SendLinkCallKind,
+        SendLinkPreview, SendLinkStatus, StorageModeWriteError, SubstrateReachability,
     };
 
     /// `skip_serializing_if` predicate for an optional boolean request
@@ -1328,7 +1387,13 @@ mod imp {
         }
         let url = format!("{addr}/shares/groups/{group_id}/handoff/lease");
         let body = Body { target_device_id };
-        let result = reqwest::Client::new().post(&url).json(&body).send_authorized(auth).await;
+        let Ok(client) = reqwest::Client::builder()
+            .timeout(crate::native_checkpoint_flush::CHECKPOINT_REQUEST_TIMEOUT)
+            .build()
+        else {
+            return None;
+        };
+        let result = client.post(&url).json(&body).send_authorized(auth).await;
         match result {
             Ok(resp) if resp.status().is_success() => match resp.json::<Resp>().await {
                 Ok(r) => Some(HandoffLeaseGrant {
@@ -2418,6 +2483,22 @@ mod imp {
             sender_device_id: &'a str,
             receiver_device_id: &'a str,
         }
+        post_send_grant(
+            auth,
+            &format!("{addr}/send/authorization"),
+            &Body { sender_device_id, receiver_device_id },
+        )
+        .await
+    }
+
+    /// Posts a grant request (same-account `POST /send/authorization`, or a
+    /// redeemed link's `POST /send/links/:id/authorization`) and parses the
+    /// grant both answer with.
+    async fn post_send_grant(
+        auth: &CoordinationAuth,
+        url: &str,
+        body: &impl Serialize,
+    ) -> Result<SendAuthorizationGrant, String> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct ReceiverBody {
@@ -2434,11 +2515,9 @@ mod imp {
             expires_at: i64,
             receiver: ReceiverBody,
         }
-        let url = format!("{addr}/send/authorization");
-        let body = Body { sender_device_id, receiver_device_id };
         let resp = reqwest::Client::new()
-            .post(&url)
-            .json(&body)
+            .post(url)
+            .json(body)
             .send_authorized(auth)
             .await
             .map_err(|e| format!("could not reach the coordination plane: {e}"))?;
@@ -2469,6 +2548,232 @@ mod imp {
                 .map(Into::into)
                 .unwrap_or_default(),
         })
+    }
+
+    /// The pair-bound grant for a redeemed cross-account Send link --
+    /// `POST /send/links/:id/authorization`. Issued once per link.
+    pub async fn request_send_link_authorization(
+        addr: &str,
+        auth: &CoordinationAuth,
+        link_id: &str,
+        sender_device_id: &str,
+    ) -> Result<SendAuthorizationGrant, String> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            sender_device_id: &'a str,
+        }
+        post_send_grant(
+            auth,
+            &format!("{addr}/send/links/{link_id}/authorization"),
+            &Body { sender_device_id },
+        )
+        .await
+    }
+
+    /// Mints a one-use expiring cross-account Send link --
+    /// `POST /send/links`. The code is shown once; the service keeps only
+    /// its hash.
+    pub async fn create_send_link(
+        addr: &str,
+        auth: &CoordinationAuth,
+        sender_device_id: &str,
+        ttl_seconds: Option<u32>,
+        files: &[(String, u64)],
+    ) -> Result<CreatedSendLink, SendLinkCallError> {
+        #[derive(Serialize)]
+        struct File<'a> {
+            name: &'a str,
+            size: u64,
+        }
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            sender_device_id: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            ttl_seconds: Option<u32>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            files: Vec<File<'a>>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Resp {
+            link_id: String,
+            code: String,
+            expires_at: i64,
+        }
+        let resp = send_link_request(
+            reqwest::Client::new().post(format!("{addr}/send/links")).json(&Body {
+                sender_device_id,
+                ttl_seconds,
+                files: files.iter().map(|(name, size)| File { name, size: *size }).collect(),
+            }),
+            auth,
+            "create the send link",
+        )
+        .await?;
+        let parsed: Resp = resp.json().await.map_err(|e| SendLinkCallError {
+            kind: SendLinkCallKind::Other,
+            message: format!("unparseable send-link response: {e}"),
+        })?;
+        Ok(CreatedSendLink {
+            link_id: parsed.link_id,
+            code: parsed.code,
+            expires_at_unix: parsed.expires_at,
+        })
+    }
+
+    /// Redeems a code with one of this account's devices --
+    /// `POST /send/links/redeem`. Returns the link id. Every failure (unknown,
+    /// expired, used, cancelled) is the service's one uniform refusal.
+    pub async fn redeem_send_link(
+        addr: &str,
+        auth: &CoordinationAuth,
+        code: &str,
+        receiver_device_id: &str,
+    ) -> Result<String, SendLinkCallError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            code: &'a str,
+            receiver_device_id: &'a str,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Resp {
+            link_id: String,
+        }
+        let resp = send_link_request(
+            reqwest::Client::new()
+                .post(format!("{addr}/send/links/redeem"))
+                .json(&Body { code, receiver_device_id }),
+            auth,
+            "redeem the send link",
+        )
+        .await?;
+        let parsed: Resp = resp.json().await.map_err(|e| SendLinkCallError {
+            kind: SendLinkCallKind::Other,
+            message: format!("unparseable send-link response: {e}"),
+        })?;
+        Ok(parsed.link_id)
+    }
+
+    /// What a link carries and who sends it, before redeeming --
+    /// `POST /send/links/preview`. Reads only; the service refuses every link that is not open
+    /// alike (`NotFound`).
+    pub async fn preview_send_link(
+        addr: &str,
+        auth: &CoordinationAuth,
+        code: &str,
+    ) -> Result<SendLinkPreview, SendLinkCallError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            code: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct File {
+            name: String,
+            size: u64,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Resp {
+            sender_name: String,
+            expires_at: i64,
+            #[serde(default)]
+            files: Vec<File>,
+        }
+        let resp = send_link_request(
+            reqwest::Client::new().post(format!("{addr}/send/links/preview")).json(&Body { code }),
+            auth,
+            "read the send link",
+        )
+        .await?;
+        let parsed: Resp = resp.json().await.map_err(|e| SendLinkCallError {
+            kind: SendLinkCallKind::Other,
+            message: format!("unparseable send-link response: {e}"),
+        })?;
+        Ok(SendLinkPreview {
+            sender_name: parsed.sender_name,
+            files: parsed.files.into_iter().map(|f| (f.name, f.size)).collect(),
+            expires_at_unix: parsed.expires_at,
+        })
+    }
+
+    /// The sender's view of a link -- `GET /send/links/:id`.
+    pub async fn send_link_status(
+        addr: &str,
+        auth: &CoordinationAuth,
+        link_id: &str,
+    ) -> Result<SendLinkStatus, SendLinkCallError> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Resp {
+            state: String,
+            #[serde(default)]
+            receiver_device_name: Option<String>,
+        }
+        let resp = send_link_request(
+            reqwest::Client::new().get(format!("{addr}/send/links/{link_id}")),
+            auth,
+            "read the send link",
+        )
+        .await?;
+        let parsed: Resp = resp.json().await.map_err(|e| SendLinkCallError {
+            kind: SendLinkCallKind::Other,
+            message: format!("unparseable send-link response: {e}"),
+        })?;
+        Ok(SendLinkStatus {
+            state: parsed.state,
+            receiver_device_name: parsed.receiver_device_name,
+        })
+    }
+
+    /// Cancels a link and revokes its unconsumed grant -- `DELETE /send/links/:id`.
+    pub async fn cancel_send_link(
+        addr: &str,
+        auth: &CoordinationAuth,
+        link_id: &str,
+    ) -> Result<(), SendLinkCallError> {
+        send_link_request(
+            reqwest::Client::new().delete(format!("{addr}/send/links/{link_id}")),
+            auth,
+            "cancel the send link",
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Whether a 404 body is the service's "Send links are switched off" answer, which an
+    /// unknown link's plain 404 is not.
+    fn is_send_links_disabled(body: &str) -> bool {
+        serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("code").and_then(|c| c.as_str().map(str::to_owned)))
+            .is_some_and(|code| code == "send_links_disabled")
+    }
+
+    async fn send_link_request(
+        request: reqwest::RequestBuilder,
+        auth: &CoordinationAuth,
+        what: &str,
+    ) -> Result<reqwest::Response, SendLinkCallError> {
+        let resp = request.send_authorized(auth).await.map_err(|e| SendLinkCallError {
+            kind: SendLinkCallKind::Unreachable,
+            message: format!("could not reach the coordination plane: {e}"),
+        })?;
+        if resp.status().is_success() {
+            return Ok(resp);
+        }
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let kind = match status.as_u16() {
+            401 | 403 => SendLinkCallKind::SignInRequired,
+            404 if is_send_links_disabled(&text) => SendLinkCallKind::FeatureDisabled,
+            404 => SendLinkCallKind::NotFound,
+            _ => SendLinkCallKind::Other,
+        };
+        Err(SendLinkCallError { kind, message: format!("could not {what} ({status}): {text}") })
     }
 
     /// Atomically consumes a grant -- `POST /send/authorization/:grantId/consume`
@@ -2541,6 +2846,184 @@ mod imp {
         /// that takes a string at all.
         fn test_auth() -> yadorilink_fapi_client::CoordinationAuth {
             yadorilink_fapi_client::test_support::offline_auth()
+        }
+
+        #[tokio::test]
+        async fn a_send_link_goes_from_created_to_redeemed_to_a_pair_bound_grant() {
+            use super::{
+                cancel_send_link, create_send_link, redeem_send_link,
+                request_send_link_authorization, send_link_status,
+            };
+            use base64::Engine as _;
+            use wiremock::matchers::body_json;
+            let key = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/send/links"))
+                .and(body_json(serde_json::json!({ "senderDeviceId": "dev-a", "ttlSeconds": 600 })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "linkId": "link-1", "code": "ABCD-EFGH", "expiresAt": 1234
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/send/links/redeem"))
+                .and(body_json(
+                    serde_json::json!({ "code": "ABCD-EFGH", "receiverDeviceId": "dev-b" }),
+                ))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "linkId": "link-1" })),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/send/links/link-1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "linkId": "link-1", "state": "redeemed", "expiresAt": 1234,
+                    "receiverDeviceName": "Bob laptop"
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/send/links/link-1/authorization"))
+                .and(body_json(serde_json::json!({ "senderDeviceId": "dev-a" })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "grantId": "g1", "nonce": "n1", "expiresAt": 99,
+                    "receiver": { "deviceId": "dev-b", "signingPublicKeyBase64": key }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("DELETE"))
+                .and(path("/send/links/link-1"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "cancelled": true })),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let (addr, auth) = (server.uri(), test_auth());
+
+            let link = create_send_link(&addr, &auth, "dev-a", Some(600), &[]).await.unwrap();
+            assert_eq!((link.link_id.as_str(), link.code.as_str()), ("link-1", "ABCD-EFGH"));
+            assert_eq!(
+                redeem_send_link(&addr, &auth, &link.code, "dev-b").await.unwrap(),
+                "link-1"
+            );
+            let status = send_link_status(&addr, &auth, "link-1").await.unwrap();
+            assert_eq!(status.state, "redeemed");
+            assert_eq!(status.receiver_device_name.as_deref(), Some("Bob laptop"));
+            let grant =
+                request_send_link_authorization(&addr, &auth, "link-1", "dev-a").await.unwrap();
+            assert_eq!(
+                (grant.grant_id.as_str(), grant.nonce.as_str(), grant.receiver_device_id.as_str()),
+                ("g1", "n1", "dev-b")
+            );
+            assert_eq!(grant.receiver_signing_key, [9u8; 32]);
+            cancel_send_link(&addr, &auth, "link-1").await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_preview_reads_the_link_and_a_refusal_is_the_uniform_not_found() {
+            use super::{create_send_link, preview_send_link};
+            use wiremock::matchers::{body_json, method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/send/links"))
+                .and(body_json(serde_json::json!({
+                    "senderDeviceId": "dev-a",
+                    "files": [{ "name": "a.txt", "size": 5 }]
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "linkId": "link-1", "code": "CODE", "expiresAt": 9
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/send/links/preview"))
+                .and(body_json(serde_json::json!({ "code": "GOOD" })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "senderName": "Kai's Mac",
+                    "expiresAt": 1_800_000_000,
+                    "files": [{ "name": "a.txt", "size": 5 }]
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/send/links/preview"))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "error": "send link is invalid, expired, or already used"
+                })))
+                .mount(&server)
+                .await;
+            let (addr, auth) = (server.uri(), test_auth());
+            create_send_link(&addr, &auth, "dev-a", None, &[("a.txt".to_string(), 5)])
+                .await
+                .unwrap();
+            let preview = preview_send_link(&addr, &auth, "GOOD").await.unwrap();
+            assert_eq!(preview.sender_name, "Kai's Mac");
+            assert_eq!(preview.files, vec![("a.txt".to_string(), 5)]);
+            assert_eq!(preview.expires_at_unix, 1_800_000_000);
+            let refused = preview_send_link(&addr, &auth, "BAD").await.unwrap_err();
+            assert_eq!(refused.kind, super::super::SendLinkCallKind::NotFound);
+        }
+
+        #[tokio::test]
+        async fn a_service_with_send_links_off_is_told_apart_from_an_unknown_link() {
+            use super::{preview_send_link, send_link_status};
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/send/links/preview"))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "error": "send links are not available", "code": "send_links_disabled"
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/send/links/link-1"))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "error": "send link not found"
+                })))
+                .mount(&server)
+                .await;
+            let (addr, auth) = (server.uri(), test_auth());
+            let off = preview_send_link(&addr, &auth, "ANY").await.unwrap_err();
+            assert_eq!(off.kind, super::super::SendLinkCallKind::FeatureDisabled);
+            let unknown = send_link_status(&addr, &auth, "link-1").await.unwrap_err();
+            assert_eq!(unknown.kind, super::super::SendLinkCallKind::NotFound);
+        }
+
+        #[tokio::test]
+        async fn refused_send_link_calls_surface_the_service_refusal() {
+            use super::{redeem_send_link, request_send_link_authorization};
+            let server = MockServer::start().await;
+            // Reused, expired, cancelled and unknown codes all look like this.
+            Mock::given(method("POST"))
+                .and(path("/send/links/redeem"))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "error": "send link is invalid, expired, or already used"
+                })))
+                .mount(&server)
+                .await;
+            // A second grant request for the same link, or one before redeem.
+            Mock::given(method("POST"))
+                .and(path("/send/links/link-1/authorization"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+            let (addr, auth) = (server.uri(), test_auth());
+            let err = redeem_send_link(&addr, &auth, "USED-CODE", "dev-b").await.unwrap_err();
+            assert!(err.message.contains("404") && err.message.contains("already used"), "{err}");
+            // The uniform refusal is typed, so a front end never reads the text.
+            assert_eq!(err.kind, super::super::SendLinkCallKind::NotFound);
+            assert!(request_send_link_authorization(&addr, &auth, "link-1", "dev-a")
+                .await
+                .is_err());
         }
 
         #[tokio::test]

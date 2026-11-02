@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Runs the same Clippy check as the pull-request gate (clippy-changed) before a push:
+# the crates this branch touches against origin/main, warnings denied. Slow on a cold
+# target directory; fast when the worktree's target is warm.
+# Enable once per clone: git config core.hooksPath .githooks
+# Skipping it (git push --no-verify) is for emergencies only: CI runs the same check.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+export PATH="$HOME/.cargo/bin:$PATH"
+
+# Only an update of the checked-out branch is linted (Clippy needs the sources of what is pushed);
+# deleting a ref, pushing a tag or another branch is skipped, with a note for the last case.
+lint=0
+head_sha="$(git rev-parse HEAD)"
+while read -r local_ref local_sha _remote_ref _remote_sha; do
+  case "$local_ref" in
+    refs/heads/*)
+      if [ "$local_sha" = "$head_sha" ]; then
+        lint=1
+      elif [ "$local_sha" != "0000000000000000000000000000000000000000" ]; then
+        echo "pre-push: $local_ref is not the checked-out commit; clippy skipped." >&2
+      fi ;;
+  esac
+done
+[ "$lint" -eq 1 ] || exit 0
+
+if ! git rev-parse --verify -q origin/main >/dev/null; then
+  echo "pre-push: no origin/main to compare with; skipping clippy (run git fetch origin main)." >&2
+  exit 0
+fi
+
+args="$(python3 .github/ci/changed-crates.py origin/main)"
+if [ -z "$args" ]; then
+  echo "pre-push: no Rust-relevant change: nothing to lint"
+  exit 0
+fi
+if [ -z "${PROTOC:-}" ] && ! command -v protoc >/dev/null; then
+  echo "pre-push: protoc not found (put it on PATH or set PROTOC); the workspace does not build without it." >&2
+  exit 1
+fi
+
+echo "pre-push: clippy arguments: $args"
+# shellcheck disable=SC2086
+cargo clippy --locked $args --all-targets -- -D warnings
+case " $args " in
+  *" -p yadorilink-mobile-ffi "*|*"--workspace"*)
+    cargo clippy --locked -p yadorilink-mobile-ffi --features bindgen --all-targets -- -D warnings ;;
+esac

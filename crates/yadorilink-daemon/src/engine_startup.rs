@@ -334,6 +334,31 @@ pub(crate) fn start_provider(
     #[cfg(any(windows, unix))]
     let _ = shell_context.handoff.get();
 
+    // A daemon-side author of a provider folder (a conflict copy's resolution) commits through the
+    // same write path as the extension. Weak: the state would otherwise own the context that owns
+    // the state.
+    #[cfg(any(windows, unix))]
+    {
+        let context = Arc::downgrade(&shell_context);
+        state.set_provider_applier(Arc::new(move |request| {
+            let context = context.upgrade();
+            Box::pin(async move {
+                match context {
+                    Some(context) => crate::shell_ipc::apply_for_app(&context, &request).await,
+                    None => yadorilink_ipc_proto::shellipc::ProviderApplyChangeResponse {
+                        request_id: request.request_id,
+                        session_id: request.session_id,
+                        operation_seq: request.operation_seq,
+                        failure: yadorilink_ipc_proto::shellipc::ProviderApplyFailure::NotReady
+                            as i32,
+                        error: "the provider side is stopping".into(),
+                        ..Default::default()
+                    },
+                }
+            })
+        }));
+    }
+
     #[cfg(any(windows, unix))]
     {
         let context = shell_context.clone();
@@ -447,6 +472,7 @@ pub(crate) fn data_refusal(
             );
     if unusable {
         StartupRefusal {
+            code: None,
             reason: head,
             start_over: Some(StartOver {
                 sync_db: sync_db_path.to_path_buf(),

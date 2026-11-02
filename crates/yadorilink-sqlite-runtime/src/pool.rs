@@ -193,7 +193,10 @@ impl r2d2::ManageConnection for CountedManager {
     }
 
     fn has_broken(&self, connection: &mut CountedConnection) -> bool {
-        self.inner.has_broken(connection)
+        // A connection handed back inside a transaction (its rollback failed, e.g. SQLITE_LOCKED
+        // under shared-cache table locks) would refuse every later BEGIN and keep its locks:
+        // discard it instead of returning it to the pool.
+        !connection.is_autocommit() || self.inner.has_broken(connection)
     }
 }
 
@@ -321,5 +324,36 @@ pub(crate) fn retry_on_database_locked<T, E: SqlOperationError>(
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+/// `query_row` and `execute` that reuse the connection's prepared-statement cache.
+///
+/// `rusqlite::Connection::query_row` and `execute` prepare their SQL on every call, so a hot
+/// path pays the SQL parse and plan each time (a third of the receiver's CPU while 10,000
+/// small files were received, measured by a sampling profile). These two do exactly what the
+/// originals do, through `prepare_cached`, and the cache holds [`STATEMENT_CACHE_CAPACITY`]
+/// statements per connection. Only for SQL text that is a fixed literal: a statement built per
+/// call would fill the cache with one-off entries.
+pub trait CachedStatements {
+    fn query_row_cached<T, P, F>(&self, sql: &str, params: P, f: F) -> rusqlite::Result<T>
+    where
+        P: rusqlite::Params,
+        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>;
+
+    fn execute_cached<P: rusqlite::Params>(&self, sql: &str, params: P) -> rusqlite::Result<usize>;
+}
+
+impl CachedStatements for rusqlite::Connection {
+    fn query_row_cached<T, P, F>(&self, sql: &str, params: P, f: F) -> rusqlite::Result<T>
+    where
+        P: rusqlite::Params,
+        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    {
+        self.prepare_cached(sql)?.query_row(params, f)
+    }
+
+    fn execute_cached<P: rusqlite::Params>(&self, sql: &str, params: P) -> rusqlite::Result<usize> {
+        self.prepare_cached(sql)?.execute(params)
     }
 }

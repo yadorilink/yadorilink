@@ -113,6 +113,16 @@ pub enum Error {
     #[error("the device authorization expired before it was approved")]
     DeviceAuthorizationExpired,
 
+    /// The server's abuse budget refused the request (HTTP 429). Nothing was changed; trying
+    /// again after `retry_after` (when the server said) is the remedy.
+    #[error("{step} was rate limited{}", retry_hint(*.retry_after))]
+    RateLimited { step: &'static str, retry_after: Option<std::time::Duration> },
+
+    /// A sign-in that was meant to need no browser was sent to one (the web page's sign-in
+    /// ended, or an identity provider was asked for). Nothing was changed.
+    #[error("the sign-in needed a browser: {0}")]
+    BrowserRequired(String),
+
     /// The credential store refused.
     #[error(transparent)]
     Store(#[from] crate::store::StoreError),
@@ -146,6 +156,11 @@ pub enum Error {
     /// checks anyway rather than let a malformed value panic inside `reqwest`.
     #[error("{0}")]
     InvalidHeaderValue(String),
+}
+
+fn retry_hint(retry_after: Option<std::time::Duration>) -> String {
+    retry_after
+        .map_or_else(String::new, |wait| format!("; try again in {} seconds", wait.as_secs()))
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

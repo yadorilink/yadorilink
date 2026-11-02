@@ -240,7 +240,8 @@ async fn version_present_query_for_an_unauthorized_group_is_refused_not_answered
         let present = session_a
             .session
             .request_version_present(GROUP, "a.bin", version_hash, &blocks, true)
-            .await;
+            .await
+            .is_held();
         assert!(
             present,
             "sanity: an authorized peer querying the identical durably-held version must get \
@@ -260,7 +261,8 @@ async fn version_present_query_for_an_unauthorized_group_is_refused_not_answered
         let present = session_a
             .session
             .request_version_present(GROUP, "a.bin", version_hash, &blocks, true)
-            .await;
+            .await
+            .is_held();
         assert!(
             !present,
             "an unauthorized/unshared peer must never receive a truthful present:true for \
@@ -321,6 +323,48 @@ async fn concurrent_requests_for_one_hash_in_two_groups_are_not_cross_wired() {
         refused.unwrap().is_none(),
         "the group the peer refused must receive nothing -- an identical hash in another group \
          is a different question, and its answer must not be handed to this one"
+    );
+}
+
+/// A response larger than the block the requester asked for is refused before its body is read:
+/// the declared size of the block bounds what it may bring, so a peer cannot make a request for a
+/// small block cost the memory of a large one. The same bytes are accepted when the block is
+/// declared at its true size.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_response_larger_than_the_block_asked_for_is_refused() {
+    let device_b = Device::new("device-b").await;
+    let data = incompressible_bytes("a body larger than the block that was asked for", 64 * 1024);
+    let hash = sha256_bytes(&data);
+
+    let responder_node = device_b.fake_peer("device-a").await;
+    let session_b = spawn_session_without_convergence_driver(&device_b, "device-a");
+    let responder_data = data.clone();
+    let responder_node_for_task = responder_node.clone();
+    let responder = tokio::spawn(async move {
+        serve_block_requests_on_lane(&responder_node_for_task, 2, |_, _| {
+            BlockAnswer::found(responder_data.clone())
+        })
+        .await;
+    });
+
+    let declared_small =
+        session_b.session.fetch_block_sized(GROUP, "oversized.bin", &hash, 1024).await.unwrap();
+    let declared_true = session_b
+        .session
+        .fetch_block_sized(GROUP, "oversized.bin", &hash, data.len() as u64)
+        .await
+        .unwrap();
+    await_responder(responder).await;
+
+    assert!(
+        declared_small.is_none(),
+        "a body of {} bytes was accepted for a block declared at 1024",
+        data.len()
+    );
+    assert_eq!(
+        declared_true.map(|bytes| bytes.to_vec()),
+        Some(data),
+        "the same bytes must be accepted when the block is declared at its true size"
     );
 }
 
@@ -1598,7 +1642,9 @@ async fn a_peer_answering_from_another_generation_or_with_an_unknown_kind_never_
     use yadorilink_peer_session::ports::PeerServiceStream;
     use yadorilink_peer_session::service_rpc::{encode_response, ServiceResponse};
 
-    let yes = encode_response(&ServiceResponse::VersionPresent { present: true });
+    let yes = encode_response(&ServiceResponse::VersionPresent {
+        answer: yadorilink_peer_session::service_rpc::ProofAnswer::Held,
+    });
     let with_version = |version: u8| {
         let mut bytes = yes.clone();
         bytes[0] = version;
@@ -1606,7 +1652,9 @@ async fn a_peer_answering_from_another_generation_or_with_an_unknown_kind_never_
     };
     let mut unknown_kind = yes.clone();
     unknown_kind[1] = 0xEE;
-    let wrong_kind = encode_response(&ServiceResponse::CustodyAcquire { granted: true });
+    let wrong_kind = encode_response(&ServiceResponse::CustodyAcquire {
+        answer: yadorilink_peer_session::service_rpc::ProofAnswer::Held,
+    });
 
     // (reply, whether this reply is a generation mismatch)
     let replies = [
@@ -1641,7 +1689,7 @@ async fn a_peer_answering_from_another_generation_or_with_an_unknown_kind_never_
             .await;
         responder.await.unwrap();
 
-        assert!(!present, "an unusable answer must never read as present");
+        assert!(!present.is_held(), "an unusable answer must never read as present");
         assert_eq!(session_b.session.rpc_version_mismatch(), is_generation_mismatch);
     }
 }

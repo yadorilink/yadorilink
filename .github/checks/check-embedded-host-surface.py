@@ -60,12 +60,19 @@ PROCESS_MODEL_MODULES = [
     "nas_admin",
     "nas_admin_bridge",
     "reporting_ipc",
-    "send_transfer",
     "update",
     "update_ipc",
 ]
 # Compiled in the embedded build, whatever their names suggest.
-ENGINE_MODULES = ["shell_ipc", "shell_context", "shell_status", "supervise", "resource_lock"]
+ENGINE_MODULES = [
+    "shell_ipc",
+    "shell_context",
+    "shell_status",
+    "supervise",
+    "resource_lock",
+    # Track Send's engine side: cross-account Send links and transfers on the embedded host.
+    "send_transfer",
+]
 SHELL_IPC_TRANSPORTS = ["client", "unix_transport", "windows_transport"]
 SHELL_IPC_PROVIDER_FILES = ["provider_apply", "provider_enumerate", "provider_materialize"]
 PM = 'feature = "process-model"'

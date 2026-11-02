@@ -27,6 +27,9 @@ pub(crate) struct EvictOutcome {
     pub dehydrated: bool,
     pub blocks_reclaimed: u64,
     pub bytes_reclaimed: u64,
+    /// Why the call freed nothing, as the stable code the control response carries; `None` when it freed the file or
+    /// the reason is not known (a directory answers for many files and names none).
+    pub not_freed: Option<&'static str>,
 }
 
 /// The transition a path is in the middle of, if any.
@@ -94,6 +97,8 @@ struct ProgressState {
     done: u64,
     reported: u64,
     finished: bool,
+    /// The bytes the attempt had to fetch from peers, once it knows.
+    fetch: Option<u64>,
 }
 
 impl AssemblyProgress {
@@ -104,6 +109,7 @@ impl AssemblyProgress {
         state.content = content;
         state.planned = content.saturating_mul(2);
         state.done = 0;
+        state.fetch = None;
     }
 
     /// Adds `bytes` to be fetched from peers to the plan. Called once per attempt, before any
@@ -111,6 +117,17 @@ impl AssemblyProgress {
     pub(crate) fn plan_fetch(&self, bytes: u64) {
         let mut state = self.lock();
         state.planned = state.planned.saturating_add(bytes);
+        state.fetch = Some(bytes);
+    }
+
+    /// How many bytes of the content this device already held when the attempt started, so that
+    /// nothing of them was fetched again: the blocks an interrupted earlier attempt (or an earlier
+    /// version) left behind. Blocks are whole, so a resume restarts at the first block not held,
+    /// never inside one. `None` until the attempt knows what it has to fetch; `Some(0)` for a
+    /// fetch from the start; the content's size when every byte was already here.
+    pub(crate) fn resumed_from(&self) -> Option<u64> {
+        let state = self.lock();
+        state.fetch.map(|fetch| state.content.saturating_sub(fetch))
     }
 
     /// `bytes` more were fetched, written or verified.
@@ -197,6 +214,11 @@ pub(crate) struct PinOutcome {
     /// Why the path's content could not be downloaded just now, when it could not. The pin
     /// stands regardless.
     pub download_error: Option<String>,
+    /// Why a file beneath the path is not yet held in the block store, when one is not: the pin
+    /// stands regardless, but a later edit of that file could lose the version it promises.
+    /// `"changing_retry"` (being captured into the store; pin again once it settles) or
+    /// `"not_kept_error"` (could not be checked).
+    pub history_not_kept_reason: Option<&'static str>,
 }
 
 pub(crate) trait MaterializationPort: Send + Sync {

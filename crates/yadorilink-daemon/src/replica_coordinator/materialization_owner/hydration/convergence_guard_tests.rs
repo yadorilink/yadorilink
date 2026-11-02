@@ -165,7 +165,7 @@ async fn hydrating_state_guard_does_not_clobber_a_superseding_newer_version() {
     };
 
     // The supersession: a column the version is derived from moves.
-    state.file_index_repository().set_unix_mode(GROUP, "doc.txt", Some(0o755), &permit).unwrap();
+    state.file_index_repository().set_exec(GROUP, "doc.txt", true, &permit).unwrap();
     let superseding_version = state
         .file_index_repository()
         .canonical_current_row(GROUP, "doc.txt")

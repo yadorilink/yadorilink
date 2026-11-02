@@ -1003,9 +1003,22 @@ unsafe fn report_progress(info: &CF_CALLBACK_INFO, total: u64, completed: u64) {
     );
 }
 
+/// What a materialization that got no answer in time is reported as (see [`fetch_failure_status`]).
+const UNANSWERED_FAILURE: i32 =
+    yadorilink_ipc_proto::shellipc::MaterializeFailure::Unobtainable as i32;
+
 /// The completion status that tells Explorer and applications why a fetch failed: a full disk,
 /// an unreachable device, a version that is gone and a reader that left are different problems.
-/// Anything else stays the generic failure.
+/// Anything else stays the generic failure. One cause, one code:
+///
+/// * not enough room on the disk (including the reserve the daemon keeps free):
+///   `STATUS_CLOUD_FILE_INSUFFICIENT_RESOURCES` (`ERROR_CLOUD_FILE_INSUFFICIENT_RESOURCES`,
+///   0x80070183). The Cloud Files driver passes on only its own `STATUS_CLOUD_FILE_*` statuses:
+///   measured on Windows 11, `STATUS_DISK_FULL` reaches the reader as the generic
+///   `ERROR_CLOUD_FILE_UNSUCCESSFUL` (0x80070185), so this is the closest code the reader can be
+///   given; `yadorilink status` carries the actual reason (waiting for free space);
+/// * no reachable device has the bytes, or the daemon did not deliver them in time:
+///   `STATUS_CLOUD_FILE_NETWORK_UNAVAILABLE` (`ERROR_CLOUD_FILE_NETWORK_UNAVAILABLE`, 0x80070184).
 fn fetch_failure_status(failure: FetchFailure) -> NTSTATUS {
     match failure {
         FetchFailure::LowDisk => STATUS_CLOUD_FILE_INSUFFICIENT_RESOURCES,
@@ -1058,7 +1071,13 @@ impl windowed_fetch::Window for ProviderFetch<'_> {
             target,
             &on_progress,
         )
-        .ok_or("the daemon did not answer the materialization")?;
+        .ok_or_else(|| {
+            // The daemon was asked and the bytes did not come in time (it is still waiting for a
+            // device that is away, or it is not there): the reader is told the same thing as when
+            // the daemon says so itself, whichever of the two happens first.
+            self.refusal.store(UNANSWERED_FAILURE, Ordering::Relaxed);
+            "the daemon did not answer the materialization"
+        })?;
         if !response.ok {
             self.refusal.store(response.failure, Ordering::Relaxed);
             return Err(format!(
@@ -1332,6 +1351,12 @@ mod tests {
             FetchFailure::Other,
         ];
         let statuses: Vec<_> = kinds.iter().map(|k| fetch_failure_status(*k).0).collect();
+        // An unreachable device is ERROR_CLOUD_FILE_NETWORK_UNAVAILABLE, also when the daemon did
+        // not answer in time (the code must not depend on which of the two came first).
+        assert_eq!(
+            fetch_failure_status(FetchFailure::from_wire(super::UNANSWERED_FAILURE)),
+            windows::Win32::Foundation::STATUS_CLOUD_FILE_NETWORK_UNAVAILABLE
+        );
         for (i, a) in statuses.iter().enumerate() {
             assert!(*a != 0, "{:?} is a failure", kinds[i]);
             for (j, b) in statuses.iter().enumerate() {

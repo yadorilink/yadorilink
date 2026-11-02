@@ -27,11 +27,18 @@ pub struct DurableVersionQuery {
 #[derive(Clone)]
 pub struct PeerReplicaEngine {
     deps: ReplicaEngineDependencies,
+    proofs: std::sync::Arc<proof_flights::ProofFlights>,
 }
 
 impl PeerReplicaEngine {
     pub fn new(deps: ReplicaEngineDependencies) -> Self {
-        Self { deps }
+        Self::with_proof_wait(deps, proof_flights::DEFAULT_WAIT)
+    }
+
+    /// [`Self::new`] with the time a request waits for a running proof of a version before it
+    /// answers "not held".
+    pub fn with_proof_wait(deps: ReplicaEngineDependencies, wait: std::time::Duration) -> Self {
+        Self { deps, proofs: std::sync::Arc::new(proof_flights::ProofFlights::new(wait)) }
     }
 
     /// Whether this device durably holds *exactly* the queried version and
@@ -53,11 +60,37 @@ impl PeerReplicaEngine {
     ///    block answers `present: false`.
     pub fn holds_version_durably(&self, query: &DurableVersionQuery) -> CustodyEvaluation {
         match self.matching_blocks(query) {
-            Ok(blocks) => CustodyEvaluation {
-                present: self
-                    .blocks_are_held(&FolderGroupId(query.folder_group_id.clone()), &blocks),
-                warning: None,
-            },
+            Ok(blocks) => {
+                match self.proof_verdict(query, &blocks) {
+                    proof_flights::Verdict::Held => {}
+                    proof_flights::Verdict::NotHeld => {
+                        return CustodyEvaluation {
+                            present: false,
+                            in_progress: false,
+                            warning: None,
+                        };
+                    }
+                    proof_flights::Verdict::Running => {
+                        return CustodyEvaluation {
+                            present: false,
+                            in_progress: true,
+                            warning: None,
+                        };
+                    }
+                }
+                // The proof may have run for a while: the version is read again, and its blocks
+                // checked once more, under the guard that keeps a sweep out.
+                let _no_block_deletion = self.deps.leases.begin_reference_write();
+                match self.matching_blocks(query) {
+                    Ok(blocks) => CustodyEvaluation {
+                        present: self
+                            .still_held(&FolderGroupId(query.folder_group_id.clone()), &blocks),
+                        in_progress: false,
+                        warning: None,
+                    },
+                    Err(refusal) => refusal,
+                }
+            }
             Err(refusal) => refusal,
         }
     }
@@ -79,11 +112,11 @@ impl PeerReplicaEngine {
             self.deps.durability.retention_policy(&group),
             Ok(Some(ReplicaRetentionPolicy::Eager))
         ) {
-            return Err(CustodyEvaluation { present: false, warning: None });
+            return Err(CustodyEvaluation { present: false, in_progress: false, warning: None });
         }
         let Ok(query_hash_bytes): Result<[u8; 32], _> = query.version_hash.as_slice().try_into()
         else {
-            return Err(CustodyEvaluation { present: false, warning: None });
+            return Err(CustodyEvaluation { present: false, in_progress: false, warning: None });
         };
         let query_hash = VersionHash(query_hash_bytes);
 
@@ -93,13 +126,25 @@ impl PeerReplicaEngine {
         let matching_blocks = if query.for_handoff {
             let roots = match self.deps.durability.retained_roots(&group, &path) {
                 Ok(roots) => roots,
-                Err(_) => return Err(CustodyEvaluation { present: false, warning: None }),
+                Err(_) => {
+                    return Err(CustodyEvaluation {
+                        present: false,
+                        in_progress: false,
+                        warning: None,
+                    })
+                }
             };
             match roots.into_iter().find(|root: &DurabilityRoot| {
                 !root.deleted && root.version.version_hash == query_hash
             }) {
                 Some(root) => root.version.blocks,
-                None => return Err(CustodyEvaluation { present: false, warning: None }),
+                None => {
+                    return Err(CustodyEvaluation {
+                        present: false,
+                        in_progress: false,
+                        warning: None,
+                    })
+                }
             }
         } else {
             let root = match self.deps.durability.current_root(&group, &path) {
@@ -107,6 +152,7 @@ impl PeerReplicaEngine {
                 Err(error) => {
                     return Err(CustodyEvaluation {
                         present: false,
+                        in_progress: false,
                         warning: Some(CustodyWarning {
                             message: format!(
                                 "current version record is unreadable for {}/{}: {error}",
@@ -115,10 +161,20 @@ impl PeerReplicaEngine {
                         }),
                     });
                 }
-                Ok(_) => return Err(CustodyEvaluation { present: false, warning: None }),
+                Ok(_) => {
+                    return Err(CustodyEvaluation {
+                        present: false,
+                        in_progress: false,
+                        warning: None,
+                    })
+                }
             };
             if root.version.version_hash != query_hash {
-                return Err(CustodyEvaluation { present: false, warning: None });
+                return Err(CustodyEvaluation {
+                    present: false,
+                    in_progress: false,
+                    warning: None,
+                });
             }
             root.version.blocks
         };
@@ -132,13 +188,41 @@ impl PeerReplicaEngine {
                 },
             )
         {
-            return Err(CustodyEvaluation { present: false, warning: None });
+            return Err(CustodyEvaluation { present: false, in_progress: false, warning: None });
         }
         Ok(matching_blocks)
     }
 
-    /// Steps 5-6 of [`Self::holds_version_durably`].
-    fn blocks_are_held(&self, group: &FolderGroupId, matching_blocks: &[VersionBlock]) -> bool {
+    /// Steps 5-6 of [`Self::holds_version_durably`], run once at a time per version (see
+    /// `proof_flights`): `Running` while the proof is still going, so the requester is told so and
+    /// asks again instead of timing out on a proof that cannot finish within its deadline.
+    fn proof_verdict(
+        &self,
+        query: &DurableVersionQuery,
+        blocks: &[VersionBlock],
+    ) -> proof_flights::Verdict {
+        let Ok(version_hash): Result<[u8; 32], _> = query.version_hash.as_slice().try_into() else {
+            return proof_flights::Verdict::NotHeld;
+        };
+        let engine = self.clone();
+        let group = FolderGroupId(query.folder_group_id.clone());
+        let path = yadorilink_replica_domain::ids::SyncPath(query.file_path.clone());
+        let blocks = blocks.to_vec();
+        let key = (query.folder_group_id.clone(), query.file_path.clone(), version_hash);
+        self.proofs.run(key, move || engine.prove_blocks(&group, &path, &blocks))
+    }
+
+    /// The proof itself. The version is put into the store and read back under one
+    /// reference-write guard, so a sweep cannot take it between the two.
+    fn prove_blocks(
+        &self,
+        group: &FolderGroupId,
+        path: &yadorilink_replica_domain::ids::SyncPath,
+        matching_blocks: &[VersionBlock],
+    ) -> bool {
+        let _no_block_deletion = self.deps.leases.begin_reference_write();
+        // A file-only version is brought into the store first (see the port's doc).
+        self.deps.durability.ensure_version_in_store(group, path, matching_blocks);
         // 5. Provenance.
         if !matching_blocks
             .iter()
@@ -149,6 +233,17 @@ impl PeerReplicaEngine {
 
         // 6. Full checksum verification.
         matching_blocks.iter().all(|b| self.deps.durability.verify_block(&b.hash).is_ok())
+    }
+
+    /// Whether the blocks a finished proof verified (possibly a while ago) are still in the store
+    /// with their provenance. Called under the reference-write guard, which keeps a sweep from
+    /// taking them afterwards.
+    fn still_held(&self, group: &FolderGroupId, blocks: &[VersionBlock]) -> bool {
+        let hashes: Vec<_> = blocks.iter().map(|b| b.hash.clone()).collect();
+        blocks
+            .iter()
+            .all(|b| matches!(self.deps.durability.has_block_provenance(group, &b.hash), Ok(true)))
+            && self.deps.durability.blocks_in_store(&hashes)
     }
 
     /// Durably takes custody of exactly the queried version for `requester`,
@@ -172,17 +267,33 @@ impl PeerReplicaEngine {
         membership_generation: u64,
         attempt_token: [u8; 16],
     ) -> CustodyEvaluation {
-        let _no_block_deletion = self.deps.leases.begin_reference_write();
         let query = DurableVersionQuery { for_handoff: false, ..query.clone() };
         let blocks = match self.matching_blocks(&query) {
             Ok(blocks) => blocks,
             Err(refusal) => return refusal,
         };
         let Ok(version_hash): Result<[u8; 32], _> = query.version_hash.as_slice().try_into() else {
-            return CustodyEvaluation { present: false, warning: None };
+            return CustodyEvaluation { present: false, in_progress: false, warning: None };
         };
-        if !self.blocks_are_held(&FolderGroupId(query.folder_group_id.clone()), &blocks) {
-            return CustodyEvaluation { present: false, warning: None };
+        // The proof runs outside this call's guard (it takes its own), so that a long proof is
+        // not repeated by every retry. The version is then read again and the blocks checked
+        // once more under the guard that covers the commit.
+        match self.proof_verdict(&query, &blocks) {
+            proof_flights::Verdict::Held => {}
+            proof_flights::Verdict::NotHeld => {
+                return CustodyEvaluation { present: false, in_progress: false, warning: None };
+            }
+            proof_flights::Verdict::Running => {
+                return CustodyEvaluation { present: false, in_progress: true, warning: None };
+            }
+        }
+        let _no_block_deletion = self.deps.leases.begin_reference_write();
+        let blocks = match self.matching_blocks(&query) {
+            Ok(blocks) => blocks,
+            Err(refusal) => return refusal,
+        };
+        if !self.still_held(&FolderGroupId(query.folder_group_id.clone()), &blocks) {
+            return CustodyEvaluation { present: false, in_progress: false, warning: None };
         }
         let request = CustodyLeaseRequest {
             group_id: query.folder_group_id.clone(),
@@ -194,9 +305,10 @@ impl PeerReplicaEngine {
             attempt_token,
         };
         match self.deps.leases.acquire(&request) {
-            Ok(held) => CustodyEvaluation { present: held, warning: None },
+            Ok(held) => CustodyEvaluation { present: held, in_progress: false, warning: None },
             Err(error) => CustodyEvaluation {
                 present: false,
+                in_progress: false,
                 warning: Some(CustodyWarning {
                     message: format!(
                         "custody lease could not be committed for {}/{}: {error}",
@@ -256,6 +368,8 @@ impl PeerReplicaEngine {
         self.deps.durability.root_set_summary(group).ok()
     }
 }
+
+mod proof_flights;
 
 #[cfg(test)]
 mod lease_tests;

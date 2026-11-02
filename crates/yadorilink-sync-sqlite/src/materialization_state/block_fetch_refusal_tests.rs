@@ -99,7 +99,12 @@ fn clearing_a_refusal_removes_only_that_exact_peer_path_version_row() {
     );
 
     // `refusing_peer` later successfully delivers the block.
-    repo.clear_block_fetch_refusal(group_id, path, version, refusing_peer).unwrap();
+    repo.clear_block_fetch_refusals(
+        group_id,
+        &[(path.to_string(), version.to_string())],
+        refusing_peer,
+    )
+    .unwrap();
 
     let remaining = repo.refusing_peers_for_path(group_id, path, version).unwrap();
     assert_eq!(
@@ -143,7 +148,7 @@ fn clearing_a_refusal_for_one_version_does_not_affect_a_different_version() {
     )
     .unwrap();
 
-    repo.clear_block_fetch_refusal(group_id, path, v1, peer).unwrap();
+    repo.clear_block_fetch_refusals(group_id, &[(path.to_string(), v1.to_string())], peer).unwrap();
 
     assert!(
         repo.refusing_peers_for_path(group_id, path, v1).unwrap().is_empty(),
@@ -153,5 +158,47 @@ fn clearing_a_refusal_for_one_version_does_not_affect_a_different_version() {
         repo.refusing_peers_for_path(group_id, path, v2).unwrap(),
         std::collections::HashSet::from([peer.to_string()]),
         "v2's independent refusal must be untouched by clearing v1's"
+    );
+}
+
+/// The keys of one fetch batch are cleared together: every listed
+/// (path, version) of the delivering peer goes, while a version that is not
+/// listed, another peer's refusal and an empty key list are untouched.
+#[test]
+fn clearing_a_batch_removes_every_listed_key_and_nothing_else() {
+    let repo = MaterializationStateRepository::new(open_test_db());
+    let group_id = "group-1";
+    let peer = "peer-m";
+    let other_peer = "peer-w";
+    for (path, version, who) in [
+        ("a.txt", "v1", peer),
+        ("b.txt", "v1", peer),
+        ("c.txt", "v1", peer),
+        ("a.txt", "v1", other_peer),
+    ] {
+        repo.record_block_fetch_refusal(group_id, path, version, who, "no provenance", 1000)
+            .unwrap();
+    }
+
+    repo.clear_block_fetch_refusals(group_id, &[], peer).unwrap();
+    assert_eq!(repo.refusing_peers_for_path(group_id, "a.txt", "v1").unwrap().len(), 2);
+
+    repo.clear_block_fetch_refusals(
+        group_id,
+        &[("a.txt".into(), "v1".into()), ("b.txt".into(), "v1".into())],
+        peer,
+    )
+    .unwrap();
+
+    assert_eq!(
+        repo.refusing_peers_for_path(group_id, "a.txt", "v1").unwrap(),
+        std::collections::HashSet::from([other_peer.to_string()]),
+        "another peer's refusal of a cleared key must stand"
+    );
+    assert!(repo.refusing_peers_for_path(group_id, "b.txt", "v1").unwrap().is_empty());
+    assert_eq!(
+        repo.refusing_peers_for_path(group_id, "c.txt", "v1").unwrap(),
+        std::collections::HashSet::from([peer.to_string()]),
+        "a key that was not listed must stay"
     );
 }

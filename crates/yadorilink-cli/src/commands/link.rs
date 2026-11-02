@@ -114,6 +114,9 @@ fn print_preflight_report(report: &LinkPreflightReport) {
     for warning in report.warnings() {
         println!("warning: {warning}");
     }
+    for note in report.notes() {
+        println!("note: {note}");
+    }
 }
 
 /// The acknowledgement gate. Returns whether the caller has
@@ -218,6 +221,16 @@ fn short(root_id: &str) -> String {
     root_id.chars().take(8).collect()
 }
 
+/// The folder's state in the same five words `status` uses, as the daemon computed it. A listing
+/// that carries none reads as needing attention, never as up to date.
+fn folder_state_word(link: &LinkStatus) -> &'static str {
+    yadorilink_client_core::attention::ProductStatusSummary::from_wire(
+        &link.product.clone().unwrap_or_default(),
+    )
+    .state
+    .label()
+}
+
 fn links_lines(links: &[LinkStatus]) -> Vec<String> {
     let mut lines = Vec::new();
     if links.is_empty() {
@@ -229,7 +242,7 @@ fn links_lines(links: &[LinkStatus]) -> Vec<String> {
             link.local_path.clone()
         } else {
             format!(
-                "provider folder '{}' (root {})",
+                "{} (File Provider, root {})",
                 link.provider_display_name,
                 short(&link.provider_root_id)
             )
@@ -238,7 +251,7 @@ fn links_lines(links: &[LinkStatus]) -> Vec<String> {
             "{}  group={}  {}{}{}{}{}",
             place,
             link.group_id,
-            crate::commands::status::link_state_label(link),
+            folder_state_word(link),
             if link.conflict_count > 0 {
                 format!("  conflicts={}", link.conflict_count)
             } else {

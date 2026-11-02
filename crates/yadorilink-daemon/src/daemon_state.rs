@@ -4,6 +4,7 @@
 //! connectivity and per-link watcher tasks, neither of which makes sense
 //! to persist.
 
+use crate::group_db_facts::{GroupDbSource, LiveDb};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -11,6 +12,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
+use yadorilink_peer_session::service_rpc::ProofAnswer;
 
 use tokio::sync::broadcast;
 use yadorilink_filesystem_sync::block_liveness::{
@@ -20,7 +22,7 @@ use yadorilink_local_storage::BlockStore;
 use yadorilink_replica_domain::file::VersionBlock;
 use yadorilink_replica_domain::ids::VersionHash;
 use yadorilink_replica_domain::local_op::PolicyUnavailable;
-use yadorilink_replica_engine::custody::{CustodyStamp, FullReplicaCustody};
+use yadorilink_replica_engine::custody::{CustodyStamp, FullReplicaCustody, StoreResidency};
 
 #[cfg(test)]
 use crate::background_custody::BackgroundCustodyEvidence;
@@ -58,38 +60,64 @@ pub use peer_authority::PeerAuthorityState;
 pub(crate) const RETENTION_EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
 const MATERIALIZATION_REPAIR_SWEEP_INTERVAL: Duration = Duration::from_secs(90);
 
-/// Test-only hook overriding the value every subsequently-constructed
-/// `DaemonState`'s materialization-repair scheduler starts with, closing a
-/// race `set_materialization_repair_sweep_interval` alone cannot: that
-/// setter only takes effect on the scheduler's *next* sleep, so a caller
-/// racing against `DaemonState::new` (which has already spawned the
-/// scheduler by the time it returns) cannot guarantee its override lands
-/// before that task's first read — especially on a multi-threaded runtime,
-/// where the newly-spawned task can start executing on a different worker
-/// thread immediately, with no `.await` needed to hand it control. A test
-/// that needs to prove convergence with NO help from this periodic sweep
-/// needs the FIRST sleep, not just subsequent ones, to already
-/// reflect the override. Set this before constructing any `DaemonState`
-/// whose scheduler should start with it.
-static MATERIALIZATION_REPAIR_SWEEP_INTERVAL_OVERRIDE_FOR_TESTS: std::sync::OnceLock<
-    Mutex<Option<Duration>>,
-> = std::sync::OnceLock::new();
+/// The sweep intervals a test gives the `DaemonState` it is constructing.
+///
+/// A scheduler reads its interval on its first sleep, and `DaemonState::new_in` has already
+/// spawned the scheduler by the time it returns, so an interval set afterwards through
+/// `set_materialization_repair_sweep_interval` cannot make the first sleep short: a test that
+/// needs its sweep to run from the start gives the interval at construction. The values apply to
+/// one construction and to no other state, so tests that run as threads of one process cannot
+/// change what each other's daemons do. A field left `None` keeps the production interval.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StateIntervals {
+    /// How often the materialization-repair sweep runs.
+    pub materialization_repair_sweep: Option<Duration>,
+    /// How often the custody-confirmation sweep runs.
+    pub custody_confirmation_sweep: Option<Duration>,
+}
 
-pub fn set_default_materialization_repair_sweep_interval_for_tests(interval: Duration) {
-    *MATERIALIZATION_REPAIR_SWEEP_INTERVAL_OVERRIDE_FOR_TESTS
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner()) = Some(interval);
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    /// The intervals of the construction in progress on this thread; see
+    /// [`construct_with_intervals`]. Construction is synchronous, so the thread that sets it is
+    /// the thread that reads it.
+    static CONSTRUCTION_INTERVALS: std::cell::Cell<StateIntervals> =
+        std::cell::Cell::new(StateIntervals::default());
+}
+
+/// Runs `construct` with `intervals` applying to the `DaemonState` it builds, then restores what
+/// applied before.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn construct_with_intervals<R>(
+    intervals: StateIntervals,
+    construct: impl FnOnce() -> R,
+) -> R {
+    struct Restore(StateIntervals);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CONSTRUCTION_INTERVALS.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(CONSTRUCTION_INTERVALS.with(|cell| cell.replace(intervals)));
+    construct()
+}
+
+/// The custody-confirmation interval the construction in progress on this thread asks for.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn construction_custody_confirmation_sweep() -> Option<Duration> {
+    CONSTRUCTION_INTERVALS.with(std::cell::Cell::get).custody_confirmation_sweep
 }
 
 fn default_materialization_repair_sweep_interval() -> Duration {
-    MATERIALIZATION_REPAIR_SWEEP_INTERVAL_OVERRIDE_FOR_TESTS
-        .get()
-        .and_then(|m| *m.lock().unwrap_or_else(|p| p.into_inner()))
-        .unwrap_or(MATERIALIZATION_REPAIR_SWEEP_INTERVAL)
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(interval) =
+        CONSTRUCTION_INTERVALS.with(std::cell::Cell::get).materialization_repair_sweep
+    {
+        return interval;
+    }
+    MATERIALIZATION_REPAIR_SWEEP_INTERVAL
 }
-
-pub use crate::durability_service::set_default_custody_confirmation_sweep_interval_for_tests;
 
 /// How often the role-loss-operation reconciliation sweep
 /// (`ReplicaRoleService::reconcile_role_loss`, scheduled by `RecoveryJob`)
@@ -151,6 +179,26 @@ impl FullReplicaCustody for DaemonState {
         stamp: &CustodyStamp,
     ) -> bool {
         self.custody_confirmation_still_valid(group_id, path, version_hash, stamp)
+    }
+
+    fn ensure_version_in_store(
+        &self,
+        group_id: &str,
+        path: &str,
+        file_path: &std::path::Path,
+        blocks: &[yadorilink_replica_domain::file::BlockInfo],
+    ) -> StoreResidency {
+        let store = crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
+            self.block_store.clone(),
+        );
+        crate::store_residency::ensure_file_in_store(
+            &self.replica_coordinator,
+            &store,
+            group_id,
+            path,
+            file_path,
+            blocks,
+        )
     }
 }
 
@@ -247,6 +295,25 @@ impl Drop for BackstopPass {
 /// See `DaemonState::provider_content_probe`.
 pub(crate) type ProviderContentProbe = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
+/// See `DaemonState::provider_lease_lookup`.
+pub(crate) type ProviderLeaseLookup = Arc<
+    dyn Fn(&str) -> Option<Arc<yadorilink_root_authority::root_commit::RootLease>> + Send + Sync,
+>;
+
+/// See `DaemonState::provider_applier`.
+pub(crate) type ProviderApplier = Arc<
+    dyn Fn(
+            yadorilink_ipc_proto::shellipc::ProviderApplyChangeRequest,
+        ) -> crate::application::ports::BoxFuture<
+            'static,
+            yadorilink_ipc_proto::shellipc::ProviderApplyChangeResponse,
+        > + Send
+        + Sync,
+>;
+
+/// See `DaemonState::volume_identity_probe`.
+pub(crate) type VolumeIdentityProbe = Arc<dyn Fn(&std::path::Path) -> bool + Send + Sync>;
+
 /// Where this device's own account stands in its deletion lifecycle, as the netmap's
 /// `self.accountDeletionState` reports it. A value this build does not know reads as `None`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -254,6 +321,8 @@ pub(crate) enum AccountDeletionState {
     /// No deletion pending (also: the plane did not say).
     #[default]
     None,
+    /// Deletion asked for on a device of this account but not yet confirmed.
+    Requested,
     /// Deletion confirmed and in its ordinary grace window.
     Pending,
     /// The departing-account durability guard is blocking finalization and its bounded escape
@@ -318,6 +387,11 @@ pub struct DaemonState {
     /// `InboxQueries` report a clear "not ready yet" error for that
     /// window rather than blocking a control-socket request on it.
     pub send_service: tokio::sync::OnceCell<Arc<yadorilink_send::SendService>>,
+    /// The Send links this device created and the transfer each started; read by the send
+    /// commands and by startup reconciliation, so there is one copy.
+    pub(crate) send_links: crate::send_transfer::LinkBook,
+    /// The Send links this device redeemed and has not yet received an offer for.
+    pub(crate) redeemed_send_links: crate::send_transfer::RedeemBook,
     /// Track Send grant-derived peers this device currently knows about
     /// through the coordination plane's short-lived, sender+receiver-bound
     /// rendezvous grant primitive -- never through ordinary netmap
@@ -424,6 +498,10 @@ pub struct DaemonState {
     #[cfg(any(test, feature = "test-support"))]
     pub test_seal_checkpoint_source:
         Mutex<Option<Arc<dyn crate::checkpoint_source::CheckpointSource>>>,
+    /// Raised when a native checkpoint flush was refused or got no answer from the
+    /// coordination plane, which leaves the deltas pending (unsendable). The
+    /// publication-retry task waits on it ([`crate::maintenance::publication_retry`]).
+    pub(crate) publication_retry: tokio::sync::Notify,
     /// This device's observability-facing runtime state -- see
     /// `crate::runtime_telemetry::RuntimeTelemetry`'s own doc comment.
     pub telemetry: Arc<crate::runtime_telemetry::RuntimeTelemetry>,
@@ -579,6 +657,19 @@ pub struct DaemonState {
     /// own evidence (see `provider_status::eager_status_complete`). Installed once by the shell
     /// side when it starts; absent until then and in tests, which reads as "not complete".
     provider_content_probe: std::sync::OnceLock<ProviderContentProbe>,
+    /// Resolves a group to the lease its provider root authors under: the SAME `Arc<RootLease>`
+    /// the provider write path (`ProviderWriter`) admits through, so a daemon-side author of a
+    /// provider group (a rewind) is mutually exclusive with the extension's own writes. Installed
+    /// by the shell context; `None` before the provider side starts. The latest install wins.
+    provider_lease_lookup: Mutex<Option<ProviderLeaseLookup>>,
+    /// Commits one change of a provider folder through the provider write path (the decision, the
+    /// operation record and the follow-ups of a change the extension asked for), for a daemon-side
+    /// author that has no extension connection: resolving a conflict copy. Installed by the shell
+    /// context; `None` before the provider side starts.
+    provider_applier: Mutex<Option<ProviderApplier>>,
+    /// Answers whether a linked folder's filesystem can prove object identity, for the status
+    /// warning. `None` is the real, cached filesystem probe; a test sets its own answer.
+    volume_identity_probe: Mutex<Option<VolumeIdentityProbe>>,
     /// Serializes [`Self::flush_pending_checkpoint_for_group`] across its
     /// two production triggers (`on_local_native_commit`, on every local
     /// mutation, and `peer_orchestrator.rs`'s reconnect hook, on every WS
@@ -1013,6 +1104,7 @@ impl DaemonState {
         let (status_push_tx, _) = broadcast::channel(256);
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let local_device_id = device_id.clone();
+        let last_seen_database = replica_coordinator.database();
         let governance_config = GovernanceConfigStore::new(&config_dir);
         // Apply whatever's on disk
         // (or the safe unlimited/no-override default if nothing's ever
@@ -1090,9 +1182,12 @@ impl DaemonState {
             ),
             peers: Arc::new(crate::peer_registry::PeerRegistry::new()),
             peer_connectivity: Arc::new(
-                crate::peer_connectivity_runtime::PeerConnectivityRuntime::new(local_device_id),
+                crate::peer_connectivity_runtime::PeerConnectivityRuntime::new(local_device_id)
+                    .with_last_seen_in(last_seen_database),
             ),
             send_service: tokio::sync::OnceCell::new(),
+            send_links: crate::send_transfer::LinkBook::open(&config_dir.join("send")),
+            redeemed_send_links: crate::send_transfer::RedeemBook::open(&config_dir.join("send")),
             send_grant_peers: Mutex::new(Vec::new()),
             authority: Arc::new(PeerAuthorityState::restored_from(offline_authorization)),
             device_signing_key: Mutex::new(None),
@@ -1108,6 +1203,7 @@ impl DaemonState {
             background_tasks: Mutex::new(Vec::new()),
             #[cfg(any(test, feature = "test-support"))]
             test_seal_checkpoint_source: Mutex::new(None),
+            publication_retry: tokio::sync::Notify::new(),
             telemetry: Arc::new(crate::runtime_telemetry::RuntimeTelemetry::new(status_push_tx)),
             in_flight_broadcasts: AtomicI64::new(0),
             shutdown_tx,
@@ -1144,6 +1240,9 @@ impl DaemonState {
             gc: Arc::new(crate::gc_state::GcState::new()),
             coordination_client_config: std::sync::OnceLock::new(),
             provider_content_probe: std::sync::OnceLock::new(),
+            provider_lease_lookup: Mutex::new(None),
+            provider_applier: Mutex::new(None),
+            volume_identity_probe: Mutex::new(None),
             flush_lock: tokio::sync::Mutex::new(()),
             native_replication: Arc::new(
                 crate::native_replication_runtime::NativeReplicationHub::default(),
@@ -1415,14 +1514,16 @@ impl DaemonState {
     /// OTHER derivations that must fail closed the same way (e.g.
     /// `FetchAvailability`) can reuse it instead of re-deriving an
     /// equivalent-but-possibly-drifting copy of the same precedence.
-    pub(crate) fn daemon_wide_evidence_uncertain(&self, group_id: &str) -> bool {
+    ///
+    /// Reads the ledger facts it needs from `db`: live on a decision path, collected for a status.
+    pub(crate) fn daemon_wide_evidence_uncertain_from(
+        &self,
+        group_id: &str,
+        db: &dyn GroupDbSource,
+    ) -> bool {
         self.durability.latch_load_failed()
             || self.durability.scope_unknown()
-            || self
-                .replica_coordinator
-                .membership_operation_repository()
-                .has_recovery_blocked_membership_operation()
-                .unwrap_or(true)
+            || db.recovery_blocked()
             || self.authority.is_group_policy_stale(group_id)
             // The per-group post-`--force` latch (`durability.is_latched_unknown`)
             // is folded into `group_durability_status`'s own `Unknown`
@@ -1449,6 +1550,15 @@ impl DaemonState {
     /// round-trip (too costly to run on every `status` call); it only ever
     /// reads what the background sweep already cached.
     pub fn group_durability_status(&self, group_id: &str) -> GroupDurabilityStatus {
+        self.group_durability_status_from(group_id, &LiveDb::new(self, group_id))
+    }
+
+    /// [`Self::group_durability_status`] over ledger facts the caller already holds.
+    pub(crate) fn group_durability_status_from(
+        &self,
+        group_id: &str,
+        db: &dyn GroupDbSource,
+    ) -> GroupDurabilityStatus {
         // The three account-wide/group-scoped "cannot currently confirm"
         // facts (latch-table load failure, an unresolved unknown-scope
         // removal, a recovery-blocked membership operation) are gathered
@@ -1477,7 +1587,7 @@ impl DaemonState {
         // where this device itself is a full replica still catching up to
         // head. `Protected` is never derived from local materialization
         // alone without consulting any peer.
-        let (facts, _) = self.gather_durability_facts(group_id);
+        let facts = self.gather_durability_facts_from(group_id, db);
         tracing::debug!(
             local_device_id = %self.device_id,
             %group_id,
@@ -1492,50 +1602,37 @@ impl DaemonState {
     /// [`Self::dump_durability_diagnostics`]). `latched_unknown` is left
     /// `false`: `DurabilityService::classify` fills it in from its own latch
     /// table.
-    fn gather_durability_facts(
+    fn gather_durability_facts_from(
         &self,
         group_id: &str,
-    ) -> (
-        crate::durability_service::DurabilityFacts,
-        Result<
-            yadorilink_sync_sqlite::MaterializationCounts,
-            yadorilink_sync_sqlite::SyncSqliteError,
-        >,
-    ) {
-        let counts = self
-            .replica_coordinator
-            .materialization_state_repository()
-            .materialization_counts(group_id);
-        let materialization = match &counts {
-            Ok(counts)
+        db: &dyn GroupDbSource,
+    ) -> crate::durability_service::DurabilityFacts {
+        let materialization = match db.counts() {
+            Some(counts)
                 if counts.placeholder == 0 && counts.hydrating == 0 && counts.evicting == 0 =>
             {
                 Ok(crate::durability_service::MaterializationHealth::FullyLocal)
             }
-            Ok(_) => Ok(crate::durability_service::MaterializationHealth::Partial),
-            Err(_) => Err(()),
+            Some(_) => Ok(crate::durability_service::MaterializationHealth::Partial),
+            None => Err(()),
         };
-        let facts = crate::durability_service::DurabilityFacts {
+        crate::durability_service::DurabilityFacts {
             latch_load_failed: self.durability.latch_load_failed(),
             scope_unknown: self.durability.scope_unknown(),
-            recovery_blocked: self
-                .replica_coordinator
-                .membership_operation_repository()
-                .has_recovery_blocked_membership_operation()
-                .unwrap_or(true),
+            recovery_blocked: db.recovery_blocked(),
             latched_unknown: false,
             group_policy_stale: self.authority.is_group_policy_stale(group_id),
             materialization,
-            is_local_full_replica: self.is_local_full_replica(group_id),
+            is_local_full_replica: db.is_local_full_replica(),
             any_other_full_replica_peer_configured: self
                 .authority
                 .any_other_full_replica_peer_configured(group_id),
-            peer_confirmed_custody: self.has_fresh_custody_confirmation(group_id),
+            peer_confirmed_custody: self.has_fresh_custody_confirmation_from(group_id, db),
             ever_confirmation_swept: self.durability.has_ever_been_custody_swept(group_id),
+            provisional_first_round: self.durability.first_round_is_provisional(group_id),
             known_unobtainable_required_content: self
-                .has_known_unobtainable_required_content(group_id),
-        };
-        (facts, counts)
+                .has_known_unobtainable_required_content_from(group_id, db),
+        }
     }
 
     /// re-checks free space for every Degraded link whose backoff
@@ -1689,8 +1786,10 @@ impl DaemonState {
         guard.retain(|p| p.expires_at_unix > now);
     }
 
-    /// Records (or, for the same signing key, replaces) a Track Send
-    /// grant-derived peer -- see `send_grant_peers`'s own field doc comment
+    /// Records (or, for the same grant, replaces) a Track Send
+    /// grant-derived peer. Grants are kept per grant, not per signing key: two Send links from one
+    /// sender to one receiving device are two live grants for the same key at once, and each
+    /// offer must find its own -- see `send_grant_peers`'s own field doc comment
     /// for the two call sites this serves and why this is never a way to
     /// reach ordinary netmap-authorized peer state.
     pub fn record_send_grant_peer(&self, peer: SendGrantPeer) {
@@ -1702,20 +1801,31 @@ impl DaemonState {
             return;
         }
         Self::prune_expired_send_grant_peers(&mut guard);
-        guard.retain(|p| p.signing_key != peer.signing_key);
+        guard.retain(|p| p.grant_id != peer.grant_id);
         guard.push(peer);
     }
 
-    /// The grant-derived peer currently on record for `signing_key`, if its
-    /// grant has not yet expired. `device_id_for_key`'s and `consume_grant`'s
-    /// own sender-identity derivation both rest on this: a Track Send
-    /// connection's handshake-authenticated key (its iroh endpoint id) is
-    /// looked up here, never trusted from anything the connection itself
-    /// claims.
+    /// A grant-derived peer currently on record for `signing_key` (the one expiring last, when
+    /// there are several), if its grant has not yet expired. Admission and
+    /// `device_id_for_key` rest on this: a Track Send connection's handshake-authenticated key
+    /// (its iroh endpoint id) is looked up here, never trusted from anything the connection
+    /// itself claims.
     pub fn send_grant_peer_by_key(&self, signing_key: &[u8; 32]) -> Option<SendGrantPeer> {
         let mut guard = self.send_grant_peers.lock().unwrap_or_else(|p| p.into_inner());
         Self::prune_expired_send_grant_peers(&mut guard);
-        guard.iter().find(|p| &p.signing_key == signing_key).cloned()
+        guard
+            .iter()
+            .filter(|p| &p.signing_key == signing_key)
+            .max_by_key(|p| p.expires_at_unix)
+            .cloned()
+    }
+
+    /// The grant `grant_id` on record for `signing_key`, if it has not expired: what an offer
+    /// presenting that grant over a connection authenticated as `signing_key` is checked against.
+    pub fn send_grant_for(&self, signing_key: &[u8; 32], grant_id: &str) -> Option<SendGrantPeer> {
+        let mut guard = self.send_grant_peers.lock().unwrap_or_else(|p| p.into_inner());
+        Self::prune_expired_send_grant_peers(&mut guard);
+        guard.iter().find(|p| &p.signing_key == signing_key && p.grant_id == grant_id).cloned()
     }
 
     /// The grant-derived peer currently on record for `device_id`, if its
@@ -1725,7 +1835,7 @@ impl DaemonState {
     pub fn send_grant_peer_by_device_id(&self, device_id: &str) -> Option<SendGrantPeer> {
         let mut guard = self.send_grant_peers.lock().unwrap_or_else(|p| p.into_inner());
         Self::prune_expired_send_grant_peers(&mut guard);
-        guard.iter().find(|p| p.device_id == device_id).cloned()
+        guard.iter().filter(|p| p.device_id == device_id).max_by_key(|p| p.expires_at_unix).cloned()
     }
 
     /// Installs the account's list of replaced devices (`GET /devices/supersessions`, the
@@ -1978,6 +2088,11 @@ impl DaemonState {
         Some(self.peer_session_driver()?.stack().transports_for(peer_device_id))
     }
 
+    /// Whether a strong (payload-verified) custody proof is cached for the group.
+    pub(crate) fn durability_has_strong_proof(&self, group_id: &str) -> bool {
+        self.durability.fresh_strong_proof_digest(group_id).is_some()
+    }
+
     /// Whether THIS device syncs `group_id` as a full replica (its link's
     /// storage mode is eager/"store everything"). A missing link or any lookup
     /// error is treated as "not a full replica" — the guard/custody callers
@@ -2136,14 +2251,17 @@ impl DaemonState {
                 // retained version whose blocks retention could later
                 // reclaim (which would leave this device, having already
                 // dropped its own cached copy, with no durable holder).
-                let confirmed = session
-                    .request_version_present(group_id, path, version_hash, blocks, false)
-                    .await;
+                let confirmed = self
+                    .ask_proof_until_settled(group_id, &peer_id, || {
+                        session.request_version_present(group_id, path, version_hash, blocks, false)
+                    })
+                    .await
+                    == ProofAnswer::Held;
                 (peer_id, confirmed)
             })
             .collect();
 
-        let confirmed_by_any = tokio::time::timeout(VERSION_PRESENT_QUERY_OVERALL_TIMEOUT, async {
+        let confirmed_by_any = tokio::time::timeout(crate::custody_wait::WAIT_OUTER_BOUND, async {
             while let Some((peer_id, confirmed)) = queries.next().await {
                 // Re-verify AFTER the reply: the peer must still be an
                 // authorized full-replica writer AND the netmap-authorization
@@ -2164,6 +2282,35 @@ impl DaemonState {
         // expected case) is treated the same as "no peer confirmed" — fail
         // closed, matching every other unconfirmed outcome here.
         confirmed_by_any.unwrap_or(None)
+    }
+
+    /// Asks a peer for a proof ([`crate::custody_wait::settle_proof`]): while it answers that the
+    /// proof is in progress the ask is repeated, with a "checking copies" transfer row showing,
+    /// and the answer is never a refusal until the wait's deadline has passed.
+    pub(crate) async fn ask_proof_until_settled<F, Fut>(
+        &self,
+        group_id: &str,
+        peer_id: &str,
+        ask: F,
+    ) -> ProofAnswer
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = ProofAnswer>,
+    {
+        crate::custody_wait::settle_proof(
+            ask,
+            VERSION_PRESENT_QUERY_OVERALL_TIMEOUT,
+            crate::custody_wait::IN_PROGRESS_DEADLINE,
+            || {
+                self.telemetry.begin_transfer(
+                    group_id,
+                    format!("checking copies on {peer_id}"),
+                    0,
+                    0,
+                )
+            },
+        )
+        .await
     }
 
     /// Ends the lease `peer_id` holds for this device on exactly this version.
@@ -2279,6 +2426,49 @@ impl DaemonState {
         let _ = self.coordination_client_config.set(CoordinationClientConfig { addr, auth });
     }
 
+    /// Installs the provider lease lookup (see `provider_lease_lookup`).
+    pub(crate) fn set_provider_lease_lookup(&self, lookup: ProviderLeaseLookup) {
+        *self.provider_lease_lookup.lock().unwrap_or_else(|p| p.into_inner()) = Some(lookup);
+    }
+
+    /// Replaces the filesystem probe behind [`Self::volume_proves_identity`] (tests).
+    #[cfg(test)]
+    pub(crate) fn set_volume_identity_probe(&self, probe: VolumeIdentityProbe) {
+        *self.volume_identity_probe.lock().unwrap_or_else(|p| p.into_inner()) = Some(probe);
+    }
+
+    /// Whether the filesystem holding `folder` can prove an object seen again is the same object.
+    pub(crate) fn volume_proves_identity(&self, folder: &std::path::Path) -> bool {
+        let probe = self.volume_identity_probe.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        match probe {
+            Some(probe) => probe(folder),
+            None => yadorilink_fs_platform::fs_capabilities::cached_volume_proves_object_identity(
+                folder,
+            ),
+        }
+    }
+
+    /// Installs the provider applier (see `provider_applier`).
+    pub(crate) fn set_provider_applier(&self, applier: ProviderApplier) {
+        *self.provider_applier.lock().unwrap_or_else(|p| p.into_inner()) = Some(applier);
+    }
+
+    /// The provider applier, or `None` when the provider side is not running.
+    pub(crate) fn provider_applier(&self) -> Option<ProviderApplier> {
+        self.provider_applier.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// The lease of the provider root declared for `group_id`, or `None` when the group has no
+    /// ready provider root here or the provider side is not running (fail closed).
+    pub(crate) fn provider_root_lease_for(
+        &self,
+        group_id: &str,
+    ) -> Option<Arc<yadorilink_root_authority::root_commit::RootLease>> {
+        let lookup =
+            self.provider_lease_lookup.lock().unwrap_or_else(|p| p.into_inner()).clone()?;
+        lookup(group_id)
+    }
+
     /// Installs the provider-content probe. A no-op if already set.
     pub(crate) fn set_provider_content_probe(&self, probe: ProviderContentProbe) {
         let _ = self.provider_content_probe.set(probe);
@@ -2345,8 +2535,12 @@ impl DaemonState {
     /// The device whose answer to the background custody check currently backs
     /// `group_id`'s `Protected` status; `None` when the confirmation is not fresh or
     /// vacuous (nothing to corroborate).
-    pub(crate) fn group_custody_confirmed_peer(&self, group_id: &str) -> Option<String> {
-        if !self.has_fresh_custody_confirmation(group_id) {
+    pub(crate) fn group_custody_confirmed_peer_from(
+        &self,
+        group_id: &str,
+        db: &dyn GroupDbSource,
+    ) -> Option<String> {
+        if !self.has_fresh_custody_confirmation_from(group_id, db) {
             return None;
         }
         self.durability
@@ -2387,7 +2581,12 @@ impl DaemonState {
     /// to retained history alone therefore no longer invalidates a
     /// corroboration, which is correct: the corroboration never claimed
     /// anything about retained history in the first place.
+    #[cfg(test)]
     fn has_fresh_custody_confirmation(&self, group_id: &str) -> bool {
+        self.has_fresh_custody_confirmation_from(group_id, &LiveDb::new(self, group_id))
+    }
+
+    fn has_fresh_custody_confirmation_from(&self, group_id: &str, db: &dyn GroupDbSource) -> bool {
         let Some((_, confirmed_digest)) =
             self.durability.fresh_corroboration(group_id, self.authority.membership_generation())
         else {
@@ -2397,8 +2596,7 @@ impl DaemonState {
         // the whole-root-set one: those are different sets the moment a
         // group retains a single superseded version, and comparing one
         // against the other would make this answer `false` forever.
-        self.local_root_set_summary(group_id)
-            .is_some_and(|now| now.current_digest == confirmed_digest)
+        db.root_set_summary().is_some_and(|now| now.current_digest == confirmed_digest)
     }
 
     /// This device's own root-set summary for `group_id`, memoised against
@@ -2426,12 +2624,20 @@ impl DaemonState {
     /// a root set this device has moved past is not evidence about the one
     /// it holds now.
     pub fn group_durability_evidence(&self, group_id: &str) -> DurabilityEvidence {
+        self.group_durability_evidence_from(group_id, &LiveDb::new(self, group_id))
+    }
+
+    pub(crate) fn group_durability_evidence_from(
+        &self,
+        group_id: &str,
+        db: &dyn GroupDbSource,
+    ) -> DurabilityEvidence {
         if let Some(digest) = self.durability.fresh_strong_proof_digest(group_id) {
-            if self.local_durability_roots_digest(group_id) == Some(digest) {
+            if db.roots_digest() == Some(digest) {
                 return DurabilityEvidence::VerifiedPayload;
             }
         }
-        if self.has_fresh_custody_confirmation(group_id) {
+        if self.has_fresh_custody_confirmation_from(group_id, db) {
             return DurabilityEvidence::CorroboratedIndex;
         }
         DurabilityEvidence::None
@@ -2440,7 +2646,15 @@ impl DaemonState {
     /// Whether `group_id`'s durability is `Unknown` only because no custody
     /// check has run for it yet. See [`crate::durability_service::first_check_pending`].
     pub fn group_durability_check_pending(&self, group_id: &str) -> bool {
-        let (mut facts, _) = self.gather_durability_facts(group_id);
+        self.group_durability_check_pending_from(group_id, &LiveDb::new(self, group_id))
+    }
+
+    pub(crate) fn group_durability_check_pending_from(
+        &self,
+        group_id: &str,
+        db: &dyn GroupDbSource,
+    ) -> bool {
+        let mut facts = self.gather_durability_facts_from(group_id, db);
         facts.latched_unknown = self.durability.is_latched_unknown(group_id);
         crate::durability_service::first_check_pending(&facts)
     }
@@ -2516,54 +2730,24 @@ impl DaemonState {
     /// before returning `true`. Only meaningful for a local full replica:
     /// an OnDemand device's own `Remote` rows are its ordinary
     /// steady state, not a durability signal.
-    fn has_known_unobtainable_required_content(&self, group_id: &str) -> bool {
-        if !self.is_local_full_replica(group_id) {
+    fn has_known_unobtainable_required_content_from(
+        &self,
+        group_id: &str,
+        db: &dyn GroupDbSource,
+    ) -> bool {
+        if !db.is_local_full_replica() {
             return false;
         }
-        let Ok(paths) = self
-            .replica_coordinator
-            .materialization_state_repository()
-            .list_materialization_repair_candidates(group_id)
-        else {
-            return false;
-        };
-        if paths.is_empty() {
+        let mut candidates = db.unobtainable_candidates().peekable();
+        if candidates.peek().is_none() {
             return false;
         }
         let current_writers = self.authority.current_group_writers(group_id);
-        for path in &paths {
-            // Facts 1+2 (still native-justified, missing locally) are
-            // implied by `path` being a repair candidate at all --
-            // `list_materialization_repair_candidates`'s own WHERE
-            // clause already requires `state = 'current'`, `deleted = 0`,
-            // and `placeholder`/`hydrating`.
-            // ONE read for the origin and the version alike. Refusal
-            // evidence is keyed by the exact version it is about, and
-            // `ensure_blocks_present_core` records it under the version
-            // its payload named. A lookup key stitched together out of
-            // six separate reads can name a version no incarnation of
-            // the row ever had, and would then match nothing this or any
-            // other device ever recorded -- silently answering "no
-            // refusals" for a path that has them, which is the fail-open
-            // direction for "this content is unobtainable".
-            let Ok(Some(row)) = self
-                .replica_coordinator
-                .file_index_repository()
-                .canonical_current_row(group_id, path)
-            else {
-                continue;
-            };
-            let Some(origin_device_id) = row.origin_device_id.clone() else {
-                continue;
-            };
-            let current_version_hash = row.version_hash().to_hex();
-            let Ok(refusers) = self
-                .replica_coordinator
-                .materialization_state_repository()
-                .refusing_peers_for_path(group_id, path, &current_version_hash)
-            else {
-                continue;
-            };
+        for candidate in candidates {
+            // Facts 1+2 (still native-justified, missing locally) are implied by the path being
+            // a repair candidate at all.
+            let origin_device_id = &candidate.origin_device_id;
+            let refusers = &candidate.refusers;
             // Fact 3: the presumed sole holder (this path's origin) has
             // left authoritative membership, OR has itself explicitly
             // refused this exact version. Without that second clause,
@@ -2584,8 +2768,7 @@ impl DaemonState {
             // alone. Still a current writer but HAS refused => no longer
             // exempt; falls through to Fact 4 below, where it's already
             // correctly counted via `refusers.contains`.
-            if current_writers.contains(&origin_device_id) && !refusers.contains(&origin_device_id)
-            {
+            if current_writers.contains(origin_device_id) && !refusers.contains(origin_device_id) {
                 continue;
             }
             // Fact 4: every OTHER current writer has EXPLICITLY,
@@ -2654,7 +2837,16 @@ impl DaemonState {
     /// The current-digest re-derivation below has the identical role as
     /// `has_fresh_custody_confirmation`'s own -- see that method's doc
     /// comment.
+    #[cfg(test)]
     pub(crate) fn fetch_available_via_confirmed_peer(&self, group_id: &str) -> bool {
+        self.fetch_available_via_confirmed_peer_from(group_id, &LiveDb::new(self, group_id))
+    }
+
+    pub(crate) fn fetch_available_via_confirmed_peer_from(
+        &self,
+        group_id: &str,
+        db: &dyn GroupDbSource,
+    ) -> bool {
         let Some((peer_device_id, confirmed_digest)) =
             self.durability.fresh_corroboration(group_id, self.authority.membership_generation())
         else {
@@ -2671,7 +2863,7 @@ impl DaemonState {
         // netmap-authorization generation counter -- otherwise a real
         // HIGH-severity false-`AvailableNow` gap. Fail closed (`None`) if the current enumeration
         // itself errors.
-        let Some(current_roots) = self.local_root_set_summary(group_id) else {
+        let Some(current_roots) = db.root_set_summary() else {
             return false;
         };
         if current_roots.current_digest != confirmed_digest {
@@ -3119,8 +3311,72 @@ impl DaemonState {
         &self,
         group_id: &str,
     ) -> Option<(crate::coordination_client::HandoffLeaseGrant, [u8; 32])> {
-        let attested_digest = self.full_replica_handoff_ready_digest(group_id).await?;
-        let config = self.coordination_client_config.get()?;
+        self.request_handoff_lease_checked(group_id).await.ok()
+    }
+
+    /// [`Self::request_handoff_lease`] with the reason a lease was not requested, when it is worth
+    /// asking again.
+    ///
+    /// Before the coordination service is asked, the current versions of the group's files are
+    /// brought into the block store from the files that hold them (`store_residency`): the lease
+    /// promises those versions, and a version captured as a hash only, or received, is held by its
+    /// file alone, which a user's next edit replaces. The group is asked to capture into the store
+    /// from the start of the request, so a file that is written meanwhile is not captured as a
+    /// hash only. A file that is not the version it was recorded as (edited, replaced or removed
+    /// since) is journaled for capture and answers [`LeaseRefusal::ChangingRetry`]; the same request
+    /// succeeds once that capture has landed. Nothing here retries: the caller decides when to ask
+    /// again.
+    pub(crate) async fn request_handoff_lease_checked(
+        &self,
+        group_id: &str,
+    ) -> Result<
+        (crate::coordination_client::HandoffLeaseGrant, [u8; 32]),
+        crate::application::ports::handoff::LeaseRefusal,
+    > {
+        use crate::application::ports::handoff::LeaseRefusal;
+        let unspecified = LeaseRefusal::Unspecified;
+        let attested_digest =
+            self.full_replica_handoff_ready_digest(group_id).await.ok_or(unspecified)?;
+        let config = self.coordination_client_config.get().ok_or(unspecified)?;
+        #[cfg(any(test, feature = "test-support"))]
+        fire_lease_attested_hook(&self.device_id);
+        let hold = self
+            .replica_coordinator
+            .store_mode_requests()
+            .hold(group_id, crate::ingest_policy::STORE_MODE_REQUEST_TTL);
+        match crate::store_residency::bring_current_versions_into_daemon_store(self, group_id, "")
+            .await
+        {
+            Ok(crate::store_residency::Residency::InStore) => {}
+            Ok(crate::store_residency::Residency::Pending(paths)) => {
+                // Left to expire: the request stays in force, so the capture of these paths that
+                // the journal now asks for goes into the store.
+                hold.leave_to_expire();
+                tracing::info!(
+                    group_id,
+                    pending = paths.len(),
+                    "handoff lease request declined for now: files are being captured into the store"
+                );
+                return Err(LeaseRefusal::ChangingRetry);
+            }
+            Err(error) => {
+                tracing::warn!(%error, group_id, "handoff lease request declined: could not bring the current versions into the store");
+                return Err(unspecified);
+            }
+        }
+        let granted = self.record_requested_handoff_lease(group_id, attested_digest, config).await;
+        drop(hold);
+        granted.ok_or(unspecified)
+    }
+
+    /// The coordination-plane request and the local pin of [`Self::request_handoff_lease_checked`],
+    /// once the current versions are in the store.
+    async fn record_requested_handoff_lease(
+        &self,
+        group_id: &str,
+        attested_digest: [u8; 32],
+        config: &CoordinationClientConfig,
+    ) -> Option<(crate::coordination_client::HandoffLeaseGrant, [u8; 32])> {
         let grant = crate::coordination_client::request_handoff_lease(
             &config.addr,
             &config.auth,
@@ -3552,15 +3808,31 @@ impl DaemonState {
                 self.authority.membership_generation(),
             ));
         }
-        for (peer_id, session) in self.peers.all_sessions() {
-            if excluded_device_id == Some(peer_id.as_str()) {
-                continue;
-            }
-            if !self.peer_may_hold_custody(&peer_id, group_id) {
-                continue;
-            }
-            let generation = self.authority.membership_generation();
-            if self.peer_holds_entire_group(&peer_id, &session, group_id, &roots.roots).await {
+        // Every candidate is checked at once: one that is still reading its copy back (it answers
+        // "in progress" for a long while) must not keep another that holds everything from being
+        // asked. The first that does is the target.
+        use futures_util::stream::{FuturesUnordered, StreamExt};
+        let candidates: Vec<_> = self
+            .peers
+            .all_sessions()
+            .into_iter()
+            .filter(|(peer_id, _)| excluded_device_id != Some(peer_id.as_str()))
+            .filter(|(peer_id, _)| self.peer_may_hold_custody(peer_id, group_id))
+            .collect();
+        let mut checks: FuturesUnordered<_> = candidates
+            .into_iter()
+            .map(|(peer_id, session)| {
+                let roots = &roots.roots;
+                async move {
+                    let generation = self.authority.membership_generation();
+                    let holds =
+                        self.peer_holds_entire_group(&peer_id, &session, group_id, roots).await;
+                    (peer_id, generation, holds)
+                }
+            })
+            .collect();
+        while let Some((peer_id, generation, holds)) = checks.next().await {
+            if holds {
                 // A whole-group handoff target is confirmed again: any
                 // post-force `Unknown` latch for this group no
                 // longer reflects reality, so clear it back toward
@@ -3633,15 +3905,18 @@ impl DaemonState {
             // root against any version it still retains (current OR retained
             // history), since a handoff must cover every durability root, not
             // just current heads.
-            if !session
-                .request_version_present(
-                    group_id,
-                    &root.path,
-                    root.version_hash,
-                    &root.blocks,
-                    true,
-                )
+            if self
+                .ask_proof_until_settled(group_id, peer_id, || {
+                    session.request_version_present(
+                        group_id,
+                        &root.path,
+                        root.version_hash,
+                        &root.blocks,
+                        true,
+                    )
+                })
                 .await
+                != ProofAnswer::Held
             {
                 return false;
             }
@@ -3958,7 +4233,9 @@ impl DaemonState {
         // Deliberately BEFORE the wake, not after: the wake lets the
         // peer session driver start pushing, and a peer can only be sent
         // a delta that is already Published.
-        self.fork_contested_heads(group_id);
+        // This runs under callers that hold a path lock (a restore), so the pass never waits for
+        // one (`fork_contested_group`).
+        self.fork_contested_group(group_id).await;
         self.flush_pending_native_checkpoint_for_group(group_id).await;
         self.note_local_commit_for_group(group_id).await;
     }
@@ -3979,8 +4256,23 @@ impl DaemonState {
     /// sendable to every attached peer. The flush is serialized per device
     /// (the coordination plane numbers a device's checkpoints); the
     /// push, which waits on peers, happens after the lock is released.
+    ///
+    /// A flush the coordination plane refused or did not answer leaves the deltas
+    /// pending, and a pending delta is never sent to a peer. Nothing else is
+    /// guaranteed to flush them again (the plane connection can stay up across a
+    /// short outage, and no further local edit may come), so the failure arms the
+    /// publication-retry task, which flushes again with a growing delay until
+    /// the plane answers.
     pub(crate) async fn flush_pending_native_checkpoint_for_group(&self, group_id: &str) {
-        let published = {
+        if self.flush_group_publication(group_id).await {
+            self.publication_retry.notify_one();
+        }
+    }
+
+    /// [`Self::flush_pending_native_checkpoint_for_group`] that reports, instead of arming
+    /// the retry, whether the flush has to be tried again.
+    pub(crate) async fn flush_group_publication(&self, group_id: &str) -> bool {
+        let (published, retry) = {
             let _guard = self.flush_lock.lock().await;
             self.flush_pending_native_checkpoint_for_group_inner(group_id).await
         };
@@ -3988,6 +4280,7 @@ impl DaemonState {
             let group = yadorilink_replica_domain::ids::FolderGroupId(group_id.to_string());
             self.native_replication.push_published(&group, &hashes).await;
         }
+        retry
     }
 
     /// Test-only: dials `device` for native replication the way a session
@@ -4011,6 +4304,12 @@ impl DaemonState {
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_rebootstrap_hook_for_test(&self, hook: Option<crate::native_rebootstrap::Hook>) {
         self.native_replication.set_rebootstrap_hook_for_test(hook);
+    }
+
+    /// Test-only: shortens the time a rebootstrap spends fetching blocks no peer may hold.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_recovery_fetch_cap_for_test(&self, cap: Option<std::time::Duration>) {
+        self.native_replication.set_recovery_fetch_cap_for_test(cap);
     }
 
     /// What `device` has said it no longer holds the history for, per group, as the
@@ -4037,14 +4336,17 @@ impl DaemonState {
         self.flush_pending_native_checkpoint_for_group(group_id).await
     }
 
-    /// The deltas the flush just published, if it published any.
+    /// The deltas the flush just published, if it published any, and whether the
+    /// plane refused or did not answer (the flush must be tried again).
     async fn flush_pending_native_checkpoint_for_group_inner(
         &self,
         group_id: &str,
-    ) -> Option<Vec<yadorilink_replica_domain::native_state::DeltaHash>> {
-        let source = self.seal_checkpoint_source()?;
-        let signing_key = self.device_signing_key()?;
-        let policy = self.authority.group_policy_state(group_id)?;
+    ) -> (Option<Vec<yadorilink_replica_domain::native_state::DeltaHash>>, bool) {
+        let Some(source) = self.seal_checkpoint_source() else { return (None, false) };
+        let Some(signing_key) = self.device_signing_key() else { return (None, false) };
+        let Some(policy) = self.authority.group_policy_state(group_id) else {
+            return (None, false);
+        };
         let resolve_authority_key = |key_id: &[u8; 32], policy_head: &[u8; 32]| {
             policy.resolve_authority_key(key_id, policy_head)
         };
@@ -4068,13 +4370,14 @@ impl DaemonState {
                         checkpoint_seq,
                         "native checkpoint flush: published pending batch"
                     );
-                    Some(flushed.published)
+                    (Some(flushed.published), false)
                 }
-                _ => None,
+                crate::checkpoint_source::FlushOutcome::Refused => (None, true),
+                _ => (None, false),
             },
             Err(e) => {
                 tracing::warn!(group_id, error = %e, "native checkpoint flush failed");
-                None
+                (None, false)
             }
         }
     }
@@ -4152,7 +4455,7 @@ impl DaemonState {
         self: &Arc<Self>,
         sync_roots: std::collections::HashMap<String, std::path::PathBuf>,
     ) -> Arc<crate::local_convergence::LocalConvergenceExecutor> {
-        crate::local_convergence::LocalConvergenceExecutor::new(
+        let executor = crate::local_convergence::LocalConvergenceExecutor::new(
             self.replica_coordinator.clone(),
             self.device_id.clone(),
             self.clone(),
@@ -4170,7 +4473,37 @@ impl DaemonState {
                 // executor is built per call.
                 override_bytes: self.governance_config.load_or_default().headroom_override_bytes,
             },
-        )
+        );
+        executor.attach_transfer_progress(self.telemetry.transfer_progress_handle());
+        executor
+    }
+}
+
+/// Test-only failpoints: a closure that runs once, on the next lease request of a device, after the
+/// device has attested the group ready and before the current versions are brought into the store
+/// (keyed by device id, which tests make unique per node).
+#[cfg(any(test, feature = "test-support"))]
+type LeaseHooks = std::sync::Mutex<std::collections::HashMap<String, Box<dyn FnOnce() + Send>>>;
+
+#[cfg(any(test, feature = "test-support"))]
+static LEASE_ATTESTED_HOOKS: std::sync::OnceLock<LeaseHooks> = std::sync::OnceLock::new();
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn arm_lease_attested_hook(device_id: &str, hook: Box<dyn FnOnce() + Send>) {
+    LEASE_ATTESTED_HOOKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(device_id.to_owned(), hook);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn fire_lease_attested_hook(device_id: &str) {
+    let hook = LEASE_ATTESTED_HOOKS.get().and_then(|hooks| {
+        hooks.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(device_id)
+    });
+    if let Some(hook) = hook {
+        hook();
     }
 }
 

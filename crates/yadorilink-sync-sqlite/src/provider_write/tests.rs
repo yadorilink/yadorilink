@@ -49,10 +49,9 @@ fn version_of(bytes: &[u8]) -> VersionHash {
         bytes.len() as u64,
         FileMeta {
             mtime_unix_nanos: MTIME,
-            unix_mode: Some(0o644),
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     )
     .version_hash
@@ -86,16 +85,14 @@ impl Fx {
             base: BaseVersion::Unknown,
             content: None,
             symlink_target: None,
-            metadata: MetadataInput {
-                unix_mode: Some(0o644),
-                mtime_unix_nanos: Some(MTIME),
-                xattrs: None,
-            },
+            metadata: MetadataInput { exec: None, mtime_unix_nanos: Some(MTIME) },
             recursive: false,
             max_subtree: DEFAULT_MAX_SUBTREE,
             base_generation: None,
             parent_generation: None,
             observed_revision: None,
+            restore: false,
+            announce_to_os: false,
             now_ms: 1_700_000_000_000,
         }
     }
@@ -524,6 +521,41 @@ fn an_edit_on_a_stale_or_unknown_base_never_touches_the_canonical_version() {
             assert_eq!(fx.count("provider_apply_log"), log_before + 1);
         }
     }
+}
+
+/// A restore (its content is a retained version, not bytes the user brought) is decided on the
+/// view alone: on the current view it applies in place, and a view that is not the current one is
+/// refused whole, with no conflict copy of the retained bytes.
+#[test]
+fn a_restore_applies_on_the_current_view_and_is_stale_otherwise() {
+    let fx = Fx::new();
+    let item = fx.create(None, "a.txt", b"one").item_id;
+    let v1 = version_of(b"one");
+    fx.modify(item, b"two", BaseVersion::Unknown).unwrap();
+    let restore = |base: BaseVersion| {
+        let mut input = fx.input(ChangeKind::Modify);
+        input.item_id = Some(item);
+        input.content = Some(content(b"one"));
+        input.base = base;
+        input.restore = true;
+        fx.run(&input)
+    };
+
+    // A view that is not the current one: nothing is authored and nothing is kept.
+    let paths = fx.live_paths();
+    let heads = fx.count("native_heads");
+    let stale = restore(BaseVersion::Opaque(v1));
+    assert!(matches!(stale, Err(ApplyError::StaleView(_))), "{stale:?}");
+    assert_eq!(fx.live_paths(), paths, "a refused restore leaves no conflict copy");
+    assert_eq!(fx.count("native_heads"), heads);
+    assert_eq!(fx.row_version("a.txt"), Some(version_of(b"two")));
+
+    // The current view (the item's shown version): the old contents are the new version, in place.
+    let applied = restore(BaseVersion::Unknown).unwrap();
+    assert_eq!(applied.outcome, OutcomeKind::Applied);
+    assert_eq!(fx.row_version("a.txt"), Some(v1));
+    assert_eq!(fx.live_paths(), paths);
+    assert_eq!(fx.heads_at("a.txt"), 1);
 }
 
 #[test]
@@ -1437,6 +1469,99 @@ fn anchors_outside_the_retained_range_are_expired() {
         .is_ok());
 }
 
+/// The retention sweep keeps the feed bounded without ever moving the anchor: an anchor inside
+/// the kept range still answers, one the sweep passed is expired (a full enumeration), and the
+/// revision never goes backwards.
+#[test]
+fn retention_sweep_expires_only_anchors_it_passed() {
+    let fx = Fx::new();
+    fx.create(None, "a", b"a");
+    fx.forget_exposure();
+    fx.page(&[], None, 10);
+    for name in ["b", "c", "d"] {
+        fx.peer_creates(name);
+    }
+    let current = fx.revision();
+    assert!(current >= 3);
+    // Nothing is old or beyond the count bound: nothing is dropped and every anchor answers.
+    assert_eq!(fx.repo.prune_all_change_events(1).unwrap(), 0);
+    assert!(fx.repo.enumerate_changes(&fx.root, &ChangeScope::WorkingSet, 0, 10, 1000).is_ok());
+    // Everything is older than the age bound: all events go, the floor reaches the revision.
+    let dropped = fx.repo.prune_all_change_events(i64::MAX / 2).unwrap();
+    assert!(dropped as u64 >= current);
+    assert_eq!(fx.revision(), current, "pruning never moves the anchor");
+    assert!(matches!(
+        fx.repo.enumerate_changes(&fx.root, &ChangeScope::WorkingSet, 0, 10, 1000),
+        Err(ChangesError::AnchorExpired)
+    ));
+    // The current anchor still answers (no changes), after the sweep.
+    let none = fx.changes(&ChangeScope::WorkingSet, current, 10);
+    assert!(none.upserts.is_empty() && none.removed.is_empty() && !none.more);
+}
+
+/// The anchor is durable: after the database is closed and reopened (an engine stop and start)
+/// the same anchor still answers incrementally, newer changes are found past it, the revision
+/// never goes backwards, and an anchor from beyond it is expired.
+#[test]
+fn an_anchor_survives_a_reopen_and_stays_monotonic() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sync.sqlite3");
+    let init = |conn: &rusqlite::Connection| {
+        crate::replica_tables::init(conn)
+            .map_err(|e| yadorilink_sqlite_runtime::DatabaseError::CorruptSchema(format!("{e:?}")))
+    };
+    let (root, anchor) = {
+        let db = Arc::new(SyncDatabase::open(&path, init).unwrap());
+        LinkRepository::new(db.clone()).add_link("/provider/p", GROUP).unwrap();
+        let repo = ProviderRepository::new(db.clone());
+        let root = repo.declare_root(GROUP, ProviderKind::IosFileProvider, "P").unwrap();
+        repo.mark_install_done(&root).unwrap();
+        let fx = Fx {
+            db,
+            repo,
+            root: root.clone(),
+            key: SigningKey::from_bytes(&[5u8; 32]),
+            seq: Cell::new(0),
+        };
+        fx.create(None, "a", b"a");
+        fx.forget_exposure();
+        fx.page(&[], None, 10);
+        fx.peer_creates("b");
+        (root, fx.revision())
+    };
+    assert!(anchor >= 1);
+
+    let db = Arc::new(SyncDatabase::open(&path, init).unwrap());
+    let repo = ProviderRepository::new(db.clone());
+    let fx = Fx {
+        db,
+        repo,
+        root: root.clone(),
+        key: SigningKey::from_bytes(&[5u8; 32]),
+        seq: Cell::new(0),
+    };
+    assert_eq!(fx.revision(), anchor, "the revision is what was acknowledged before the reopen");
+    // Nothing happened since: an empty, final page that hands back the same anchor.
+    let quiet = fx.changes(&ChangeScope::WorkingSet, anchor, 10);
+    assert!(quiet.upserts.is_empty() && quiet.removed.is_empty() && !quiet.more);
+    assert_eq!(quiet.next_anchor, anchor);
+    // A change after the reopen is found past the old anchor, and the revision only grows.
+    fx.peer_creates("c");
+    assert!(fx.revision() > anchor);
+    let later = fx.changes(&ChangeScope::WorkingSet, anchor, 10);
+    assert_eq!(later.next_anchor, fx.revision());
+    assert!(!later.upserts.is_empty() || !later.removed.is_empty());
+    assert!(matches!(
+        fx.repo.enumerate_changes(&root, &ChangeScope::WorkingSet, fx.revision() + 1, 10, 1000),
+        Err(ChangesError::AnchorExpired)
+    ));
+    // A root the database does not know is expired, never an empty "no changes".
+    assert!(matches!(
+        fx.repo.enumerate_changes("deadbeef", &ChangeScope::WorkingSet, anchor, 10, 1000),
+        Err(ChangesError::AnchorExpired)
+    ));
+}
+
 /// A walk of the working set is closed by the change feed: an item first shown by a listing AFTER
 /// the walk's first page (possibly with an id below the cursor) has a first-publication event
 /// above the walk's anchor, so `changes since anchor` restores it. The walk is keyset by id and
@@ -1964,7 +2089,7 @@ fn a_move_together_with_bytes_from_a_stale_folder_view_does_not_apply() {
     assert_eq!(fx.row_version("from/a"), Some(current), "the canonical version changed");
 }
 
-/// (f2) A move that also carries replicated metadata (mode, mtime) is not structural-only either: on
+/// (f2) A move that also carries replicated metadata (exec flag, mtime) is not structural-only either: on
 /// a stale item generation it is refused as before (nothing moves).
 #[test]
 fn a_move_together_with_metadata_on_a_stale_generation_is_a_stale_view() {
@@ -1974,7 +2099,8 @@ fn a_move_together_with_metadata_on_a_stale_generation_is_a_stale_view() {
     let mut input = fx.input(ChangeKind::Modify);
     input.item_id = Some(item);
     input.new_parent = Some(Some(to.item_id));
-    // `Fx::input` carries a mode and an mtime.
+    // `Fx::input` carries an mtime; the exec flag makes it a semantic edit as well.
+    input.metadata.exec = Some(true);
     input.base_generation = Some(item_generation_of(&fx, &item) + 99);
     assert!(stale_view(fx.run_raw(&input)));
     assert_eq!(fx.live_paths(), ["a", "to"], "moved on a stale view");
@@ -1997,12 +2123,12 @@ fn mtime_of(fx: &Fx, path: &str) -> Option<i64> {
         .unwrap()
 }
 
-fn unix_mode_of(fx: &Fx, path: &str) -> Option<i64> {
+fn exec_of(fx: &Fx, path: &str) -> Option<i64> {
     fx.db
         .read::<_, SyncSqliteError>(|conn| {
             Ok(conn
                 .query_row(
-                    "SELECT unix_mode FROM files WHERE group_id = ?1 AND path = ?2 \
+                    "SELECT exec FROM files WHERE group_id = ?1 AND path = ?2 \
                      AND state = 'current' AND deleted = 0",
                     [GROUP, path],
                     |r| r.get::<_, i64>(0),
@@ -2015,7 +2141,7 @@ fn unix_mode_of(fx: &Fx, path: &str) -> Option<i64> {
 fn mtime_only(fx: &Fx, item: ItemId, base: VersionHash, generation: u64, mtime: i64) -> ApplyInput {
     let mut input = fx.input(ChangeKind::Modify);
     input.item_id = Some(item);
-    input.metadata = MetadataInput { unix_mode: None, mtime_unix_nanos: Some(mtime), xattrs: None };
+    input.metadata = MetadataInput { exec: None, mtime_unix_nanos: Some(mtime) };
     input.base = BaseVersion::Opaque(base);
     input.base_generation = Some(generation);
     input
@@ -2084,42 +2210,42 @@ fn an_mtime_with_a_rename_renames_by_identity_and_follows_the_advisory_rule() {
     assert_eq!(mtime_of(&fx, "c"), v2_mtime, "a stale mtime overwrote the newer one");
 }
 
-/// A peer's mode-only change makes the version hashes differ but not the content: a queued mtime-only
-/// callback still applies (the content is the one the mtime was set on) and the peer's mode is kept.
+/// A peer's exec-only change makes the version hashes differ but not the content: a queued mtime-only
+/// callback still applies (the content is the one the mtime was set on) and the peer's flag is kept.
 #[test]
-fn an_mtime_survives_a_peers_mode_only_change() {
+fn an_mtime_survives_a_peers_exec_only_change() {
     let fx = Fx::new();
     let item = fx.create(None, "a", b"v1").item_id;
     let v1 = fx.row_version("a").unwrap();
     let generation = item_generation_of(&fx, &item);
-    let v1_mode = fx.peer_changes_mode("a", 70, 0o600);
-    assert_ne!(v1, v1_mode, "the mode change must change the version hash");
-    let result = fx.run_raw(&mtime_only(&fx, item, v1, generation, 7_000_000_000));
+    let v1_mode = fx.peer_changes_exec("a", 70, true);
+    assert_ne!(v1, v1_mode, "the exec change must change the version hash");
+    // The fixture changes the row behind the engine's back (the native head is still v1), so the
+    // new version competes with that head and wins by its hash; an mtime whose version wins is
+    // used, and the refused attempts roll back whole.
+    let (result, mtime) = (0..64)
+        .map(|k| 7_000_000_000 + k)
+        .map(|mtime| (fx.run_raw(&mtime_only(&fx, item, v1, generation, mtime)), mtime))
+        .find(|(result, _)| result.is_ok())
+        .expect("some mtime yields the winning version");
     assert!(result.is_ok(), "{result:?}");
-    assert_eq!(mtime_of(&fx, "a"), Some(7_000_000_000), "the user's mtime was dropped");
-    assert_eq!(unix_mode_of(&fx, "a"), Some(0o600), "the peer's mode was reverted");
+    assert_eq!(mtime_of(&fx, "a"), Some(mtime), "the user's mtime was dropped");
+    assert_eq!(exec_of(&fx, "a"), Some(1), "the peer's exec flag was reverted");
 }
 
-/// Mode and xattrs are semantic: stale ones are refused exactly as before.
+/// The exec flag is semantic: a stale one is refused exactly as before.
 #[test]
-fn a_stale_mode_only_or_xattr_only_modify_is_still_refused() {
+fn a_stale_exec_only_modify_is_still_refused() {
     let fx = Fx::new();
     let item = fx.create(None, "a", b"v1").item_id;
     let v1 = fx.row_version("a").unwrap();
     let stale = item_generation_of(&fx, &item) + 9;
-    let mut mode = mtime_only(&fx, item, v1, stale, 0);
-    mode.metadata = MetadataInput { unix_mode: Some(0o600), mtime_unix_nanos: None, xattrs: None };
-    assert!(stale_view(fx.run_raw(&mode)));
-    let mut xattr = mtime_only(&fx, item, v1, stale, 0);
-    xattr.metadata = MetadataInput {
-        unix_mode: None,
-        mtime_unix_nanos: None,
-        xattrs: Some(vec![("user.k".into(), b"v".to_vec())]),
-    };
-    assert!(stale_view(fx.run_raw(&xattr)));
-    // An mtime that rides with a mode is not advisory either.
+    let mut exec = mtime_only(&fx, item, v1, stale, 0);
+    exec.metadata = MetadataInput { exec: Some(true), mtime_unix_nanos: None };
+    assert!(stale_view(fx.run_raw(&exec)));
+    // An mtime that rides with the flag is not advisory either.
     let mut both = mtime_only(&fx, item, v1, stale, 1_000);
-    both.metadata.unix_mode = Some(0o600);
+    both.metadata.exec = Some(true);
     assert!(stale_view(fx.run_raw(&both)));
 }
 
@@ -2286,13 +2412,14 @@ impl Fx {
         self.row_version(path).unwrap()
     }
 
-    /// A peer's MODE-only change: a new current row with the same bytes and another unix mode.
-    fn peer_changes_mode(&self, path: &str, seq: i64, mode: i64) -> VersionHash {
+    /// A peer's EXEC-only change: a new current row with the same bytes and another exec flag.
+    fn peer_changes_exec(&self, path: &str, seq: i64, exec: bool) -> VersionHash {
+        let mode = i64::from(exec);
         self.db
             .write_immediate::<_, SyncSqliteError>(|tx| {
                 tx.execute(
                     "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, \
-                     deleted, version_seq, state, unix_mode, native_authoring_identity) \
+                     deleted, version_seq, state, exec, native_authoring_identity) \
                      SELECT group_id, path, size, mtime_unix_nanos, blocks_json, 0, ?3, 'new', ?4, \
                             native_authoring_identity \
                      FROM files WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
@@ -2468,10 +2595,41 @@ fn kept_edits_are_deduplicated_counted_and_never_carry_a_rename() {
     // A metadata-only edit has no bytes to keep and authors nothing.
     let mut chmod = fx.input(ChangeKind::Modify);
     chmod.item_id = Some(item);
-    chmod.metadata.unix_mode = Some(0o600);
+    chmod.metadata.exec = Some(true);
     chmod.base = BaseVersion::Opaque(VersionHash([77u8; 32]));
     assert!(matches!(fx.run(&chmod), Err(ApplyError::KeepLocal { .. })));
     assert_eq!(fx.live_paths().len(), 4);
+}
+
+/// A file that was only ever served in windows (a large file read front to back) has no served
+/// record, and the host sends a renamed placeholder's bytes with the rename (the rename clears the
+/// in-sync bit). The bytes are the item's own, so the rename stands: it must not be dropped
+/// (the name went back when the hydration ended and the peer never saw the rename).
+#[test]
+fn a_rename_that_carries_the_items_own_bytes_stands_when_nothing_proves_the_bytes() {
+    let fx = Fx::new();
+    let item = fx.create(None, "a.txt", b"canonical").item_id;
+    fx.db
+        .write_immediate::<_, SyncSqliteError>(|tx| {
+            tx.execute(
+                "UPDATE provider_items SET served_content_sig = NULL, served_mixed = 0",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(fx.served(&item), Served::Never);
+    let v = fx.row_version("a.txt").unwrap();
+    let mut renamed = fx.input(ChangeKind::Modify);
+    renamed.item_id = Some(item);
+    renamed.name = Some("b.txt".into());
+    renamed.content = Some(content(b"canonical"));
+    renamed.base = BaseVersion::Opaque(v);
+    let result = fx.run(&renamed).unwrap();
+    assert_eq!(result.outcome, OutcomeKind::Applied);
+    assert_eq!(fx.live_paths(), vec!["b.txt".to_string()], "the rename was dropped");
+    assert_eq!(fx.row_version("b.txt"), Some(v), "the canonical version changed");
+    assert_eq!(result.item.unwrap().name, "b.txt");
 }
 
 // ---- an ambiguous delete deletes nothing ----
@@ -2525,10 +2683,10 @@ fn an_absent_base_is_unknown_for_edits_metadata_and_deletes() {
     assert_eq!(fx.row_version("a.txt"), Some(v), "canonical was overwritten");
     assert!(fx.kept_beside("a.txt", b"typed on an unnamed base"));
 
-    // Metadata alone (mode) on an unnamed base: canonical metadata is not replaced.
+    // Metadata alone (exec) on an unnamed base: canonical metadata is not replaced.
     let mut chmod = fx.input(ChangeKind::Modify);
     chmod.item_id = Some(item);
-    chmod.metadata.unix_mode = Some(0o600);
+    chmod.metadata.exec = Some(true);
     chmod.base = BaseVersion::Unknown;
     chmod.base_generation = Some(generation);
     assert!(matches!(fx.run_raw(&chmod), Err(ApplyError::KeepLocal { .. })));
@@ -3348,30 +3506,33 @@ fn an_old_folder_hash_with_a_new_generation_cannot_delete_the_folder() {
     let dir = fx.create_dir(None, "d");
     let _ = fx.page(&[], None, 10);
     let old_hash = fx.shown_version_of("d");
-    // A remote replacement with another mode: a different version, the generation moves, and
-    // nothing is announced yet.
+    // A remote replacement: the item's generation moves and nothing is announced yet. A directory
+    // has the one canonical version whatever its row says, so its hash does not move: only the
+    // generation tells the old view from the new one.
     fx.db
         .write_immediate::<_, SyncSqliteError>(|tx| {
-            tx.execute(
-                "UPDATE files SET unix_mode = 448 WHERE group_id = ?1 AND path = 'd' AND state = 'current'",
-                [GROUP],
-            )?;
             yadorilink_sqlite_runtime::note_item_replaced(tx, GROUP, "d")?;
             Ok(())
         })
         .unwrap();
     let new_hash = fx.row_version("d").unwrap();
-    assert_ne!(new_hash, old_hash, "the replacement did not change the directory's version");
-    let generation = item_generation_of(&fx, &dir.item_id);
+    assert_eq!(new_hash, old_hash, "every directory has the one canonical version");
+    let old_generation = item_generation_of(&fx, &dir.item_id);
+    let generation = old_generation;
     // What enumeration issues now: the published hash with the new generation.
     let shown = fx.repo.lookup_item(&fx.root, &dir.item_id).unwrap().unwrap().0;
     assert_eq!(shown.content_version, old_hash);
     assert_eq!(shown.generation, generation);
 
     let before = fx.live_paths();
-    let mixed =
-        folder_delete_raw(&fx, dir.item_id, BaseVersion::Opaque(old_hash), Some(generation));
-    assert!(stale_view(mixed), "an old hash with a new generation deleted the folder");
+    // The view the OS saw before the replacement: the same hash, the generation before it.
+    let mixed = folder_delete_raw(
+        &fx,
+        dir.item_id,
+        BaseVersion::Opaque(old_hash),
+        Some(old_generation.saturating_sub(1)),
+    );
+    assert!(stale_view(mixed), "an old generation deleted the folder");
     assert_eq!(fx.live_paths(), before);
     let current =
         folder_delete_raw(&fx, dir.item_id, BaseVersion::Opaque(new_hash), Some(generation));
@@ -3498,10 +3659,9 @@ fn the_conflict_copy_name_has_no_fixed_limit() {
         c.size,
         FileMeta {
             mtime_unix_nanos: 0,
-            unix_mode: super::replicated_mode(Some(0o644)),
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     );
     let sig = super::kept_edit_semantic_key(&version);
@@ -3545,6 +3705,61 @@ fn a_structural_directory_rename_acts_on_its_identity() {
     assert_eq!(fx.live_paths(), ["t/x"]);
     assert!(rename("u", BaseVersion::Opaque(VersionHash([8; 32]))).is_ok());
     assert_eq!(fx.live_paths(), ["u/x"]);
+}
+
+/// The answer to a folder rename or move carries the token the listing shows for the folder, so
+/// the app can delete the folder on it without listing again.
+#[test]
+fn a_structural_directory_rename_answers_with_the_listing_token() {
+    let fx = Fx::new();
+    let _ = fx.page(&[], None, 10);
+    fx.peer_updates("s/x", 200);
+    let _ = fx.page(&[], None, 10);
+    let item = fx.item_of("s");
+    let mut rename = fx.input(ChangeKind::Modify);
+    rename.item_id = Some(item);
+    rename.name = Some("t".into());
+    rename.metadata = MetadataInput::default();
+    rename.base = BaseVersion::Unknown;
+    rename.base_generation = Some(item_generation_of(&fx, &item));
+    let answer = fx.run_raw(&rename).unwrap().item.expect("the renamed folder");
+    let (shown, _) = fx.repo.lookup_item(&fx.root, &item).unwrap().expect("the folder is listed");
+    assert_eq!(answer.content_version, shown.content_version);
+    assert_eq!(answer.generation, shown.generation);
+    assert_eq!(answer.exec, shown.exec);
+    let mut gone = fx.input(ChangeKind::Delete);
+    gone.item_id = Some(item);
+    gone.base = BaseVersion::Opaque(answer.content_version);
+    gone.base_generation = Some(answer.generation);
+    gone.recursive = true;
+    assert!(fx.run_raw(&gone).is_ok(), "the answer's token deletes the folder");
+    assert!(fx.live_paths().is_empty());
+}
+
+/// The same for an explicit folder and a file: what a rename or move answers is what the listing
+/// shows afterwards.
+#[test]
+fn a_rename_answers_with_the_listing_token_for_every_kind() {
+    let fx = Fx::new();
+    let _ = fx.page(&[], None, 10);
+    let dir = fx.create_dir(None, "d");
+    let file = fx.create(Some(dir.item_id), "f.txt", b"bytes");
+    let other = fx.create_dir(None, "e");
+    for (item, name, parent) in
+        [(dir.item_id, Some("d2"), None), (file.item_id, Some("g.txt"), Some(Some(other.item_id)))]
+    {
+        let mut input = fx.input(ChangeKind::Modify);
+        input.item_id = Some(item);
+        input.name = name.map(Into::into);
+        input.new_parent = parent;
+        input.metadata = MetadataInput::default();
+        input.base = BaseVersion::Unknown;
+        input.base_generation = Some(item_generation_of(&fx, &item));
+        let answer = fx.run_raw(&input).unwrap().item.expect("the renamed item");
+        let (shown, _) = fx.repo.lookup_item(&fx.root, &item).unwrap().expect("listed");
+        assert_eq!(answer.content_version, shown.content_version, "{name:?}");
+        assert_eq!(answer.generation, shown.generation, "{name:?}");
+    }
 }
 
 /// A structural directory's subtree bound is enforced before any row is loaded, for a delete
@@ -3623,37 +3838,31 @@ fn the_upload_journal_survives_an_undecided_operation_and_clears_when_decided() 
 
 // ---- kept edits keep their replicated metadata (X1) ----
 
-/// Two rejected edits with the SAME bytes but different replicated metadata (a mode, an xattr) are
-/// two users' data and keep two copies; the same bytes and metadata retried at different times
-/// (different mtimes) keep one.
+/// Two rejected edits with the SAME bytes but a different execute flag are two users' data and keep
+/// two copies; the same bytes and flag retried at different times (different mtimes) keep one.
 #[test]
 fn kept_edits_with_different_metadata_keep_separate_copies() {
     let fx = Fx::new();
     let item = fx.create(None, "a.txt", b"canonical").item_id;
     let before = fx.live_paths().len();
-    let keep = |xattr: &str, mode: u32, mtime: i64| {
+    let keep = |exec: bool, mtime: i64| {
         let mut edit = fx.input(ChangeKind::Modify);
         edit.item_id = Some(item);
         edit.content = Some(content(b"same stale bytes"));
         edit.base = BaseVersion::Opaque(VersionHash([77u8; 32]));
         edit.base_generation = Some(item_generation_of(&fx, &item));
-        edit.metadata.unix_mode = Some(mode);
+        edit.metadata.exec = Some(exec);
         edit.metadata.mtime_unix_nanos = Some(mtime);
-        edit.metadata.xattrs = Some(vec![(xattr.to_owned(), b"v".to_vec())]);
         fx.run_raw(&edit).unwrap();
     };
-    keep("user.a", 0o644, MTIME);
-    keep("user.a", 0o644, MTIME + 5_000_000_000);
-    keep("user.a", 0o644, MTIME + 9_000_000_000);
+    keep(false, MTIME);
+    keep(false, MTIME + 5_000_000_000);
+    keep(false, MTIME + 9_000_000_000);
     assert_eq!(fx.live_paths().len(), before + 1, "retries at other times made more copies");
-    // Only xattrs the platform replicates are semantic metadata (`user.*` on Linux).
-    let replicated = usize::from(cfg!(target_os = "linux"));
-    keep("user.b", 0o644, MTIME);
-    assert_eq!(fx.live_paths().len(), before + 1 + replicated, "another xattr was merged");
-    keep("user.a", 0o600, MTIME);
-    assert_eq!(fx.live_paths().len(), before + 2 + replicated, "another mode was merged");
-    keep("user.b", 0o644, MTIME + 1);
-    assert_eq!(fx.live_paths().len(), before + 2 + replicated);
+    keep(true, MTIME);
+    assert_eq!(fx.live_paths().len(), before + 2, "another exec flag was merged");
+    keep(true, MTIME + 1);
+    assert_eq!(fx.live_paths().len(), before + 2);
 }
 
 // ---- a destination is an identity (V1, X3) ----
@@ -3721,38 +3930,40 @@ fn kept_key(from: &str, bytes: &[u8]) -> [u8; 32] {
         c.size,
         FileMeta {
             mtime_unix_nanos: 0,
-            unix_mode: super::replicated_mode(Some(0o644)),
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     );
     let sig = super::kept_edit_semantic_key(&version);
     Sha256::new().chain_update(sig.as_bytes()).chain_update(from.as_bytes()).finalize().into()
 }
 
-/// (Y2) A stale edit with the same bytes as the canonical version but another mode is the user's
-/// data and gets its own copy; the same mode and bytes keep nothing.
+/// (Y2) A stale edit with the same bytes as the canonical version but another exec flag is the user's
+/// data and gets its own copy; the same flag and bytes keep nothing.
 #[test]
-fn a_stale_edit_with_the_canonical_bytes_and_another_mode_is_kept() {
+fn a_stale_edit_with_the_canonical_bytes_and_another_exec_flag_is_kept() {
     let fx = Fx::new();
     let item = fx.create(None, "a.txt", b"same bytes").item_id;
     let before = fx.live_paths().len();
-    let stale = |mode: u32, seq: i64| {
+    let stale = |exec: bool, seq: i64| {
         let mut edit = fx.input(ChangeKind::Modify);
         edit.item_id = Some(item);
         edit.content = Some(content(b"same bytes"));
         edit.base = BaseVersion::Opaque(VersionHash([66u8; 32]));
         edit.base_generation = Some(item_generation_of(&fx, &item));
-        edit.metadata.unix_mode = Some(mode);
+        edit.metadata.exec = Some(exec);
         edit.operation_seq += seq as u64;
         fx.run_raw(&edit).unwrap();
     };
-    let canonical_mode = 0o644;
-    stale(canonical_mode, 10);
-    assert_eq!(fx.live_paths().len(), before, "identical bytes and mode kept a copy");
-    stale(0o600, 20);
-    assert_eq!(fx.live_paths().len(), before + 1, "another mode on the same bytes was dropped");
+    stale(false, 10);
+    assert_eq!(fx.live_paths().len(), before, "identical bytes and flag kept a copy");
+    stale(true, 20);
+    assert_eq!(
+        fx.live_paths().len(),
+        before + 1,
+        "another exec flag on the same bytes was dropped"
+    );
 }
 
 /// (Y3) When the quarantine entry or its folder is occupied by a user file, or by a directory with a
@@ -3926,9 +4137,9 @@ fn a_create_of_an_existing_file_with_the_same_bytes_adopts_it_and_other_bytes_st
         fx.run_raw(&create_input(&fx, None, "a.txt", EntryKind::File, Some(b"different"))).unwrap();
     assert_eq!(other.outcome, OutcomeKind::Concurrent);
     assert!(fx.kept_beside("a.txt", b"different"), "{:?}", fx.live_paths());
-    // Same bytes but another mode is not "the same": same treatment.
+    // Same bytes but another exec flag is not "the same": same treatment.
     let mut moded = create_input(&fx, None, "a.txt", EntryKind::File, Some(b"same"));
-    moded.metadata.unix_mode = Some(0o600);
+    moded.metadata.exec = Some(true);
     assert_eq!(fx.run_raw(&moded).unwrap().outcome, OutcomeKind::Concurrent);
 }
 

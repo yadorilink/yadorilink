@@ -135,7 +135,6 @@ pub(crate) fn build_application_services(state: Arc<DaemonState>) -> Arc<Applica
     #[cfg(feature = "process-model")]
     let update = Arc::new(runtime::update::DaemonUpdateCommandAdapter::new(state.clone()));
 
-    #[cfg(feature = "process-model")]
     let send_transfer = Arc::new(crate::send_transfer::SendTransferService::new(state.clone()));
     #[cfg(feature = "process-model")]
     let nas_admin = Arc::new(crate::nas_admin_bridge::NasAdminSessions::new(&state));
@@ -160,7 +159,6 @@ pub(crate) fn build_application_services(state: Arc<DaemonState>) -> Arc<Applica
         #[cfg(feature = "process-model")]
         update,
         link_lifecycle,
-        #[cfg(feature = "process-model")]
         send_transfer,
         #[cfg(feature = "process-model")]
         nas_admin,
@@ -178,6 +176,7 @@ pub(crate) fn build_query_services(state: Arc<DaemonState>) -> Arc<QueryServices
         state.replica_coordinator.clone(),
         state.device_id.clone(),
         state.links.clone(),
+        state.governance_config.clone(),
     ));
     #[cfg(feature = "process-model")]
     let update_status = Arc::new(crate::queries::update_status::UpdateStatusQueryService::new(
@@ -214,6 +213,8 @@ pub(crate) fn build_query_services(state: Arc<DaemonState>) -> Arc<QueryServices
     let file_history = Arc::new(crate::queries::file_history::FileHistoryQueryService::new(
         state.replica_coordinator.clone(),
         linked_path.clone(),
+        state.device_id.clone(),
+        state.block_store.clone(),
     ));
     let governance = Arc::new(crate::queries::governance::GovernanceQueryService::new(
         state.governance_config.clone(),
@@ -251,7 +252,6 @@ pub(crate) fn build_query_services(state: Arc<DaemonState>) -> Arc<QueryServices
             query::handoff_readiness::DaemonHandoffReadinessReader::new(state.clone()),
         )));
 
-    #[cfg(feature = "process-model")]
     let inbox = Arc::new(crate::send_transfer::InboxQueries::new(state.clone()));
 
     let rewind = Arc::new(crate::rewind::RewindQueries::new(state.clone()));
@@ -271,7 +271,6 @@ pub(crate) fn build_query_services(state: Arc<DaemonState>) -> Arc<QueryServices
         handoff_readiness,
         #[cfg(feature = "process-model")]
         update_status,
-        #[cfg(feature = "process-model")]
         inbox,
         rewind,
     })

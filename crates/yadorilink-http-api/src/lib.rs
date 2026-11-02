@@ -37,11 +37,12 @@
 //! Web UI (`webui.rs`) instead reads that endpoint with a plain
 //! `fetch()` and parses the `text/event-stream` framing itself.
 //!
-//! Binding is loopback-only and not configurable past that: [`bind`] always
-//! binds `127.0.0.1`, and best-effort also `[::1]` (a failure to bind the
-//! IPv6 side -- e.g. no IPv6 support on the host -- is logged and does not
-//! prevent serving on IPv4). There is no code path in this crate that binds
-//! any other interface.
+//! Binding is loopback-only by default: [`bind`] always binds `127.0.0.1`,
+//! and best-effort also `[::1]` (a failure to bind the IPv6 side -- e.g. no
+//! IPv6 support on the host -- is logged and does not prevent serving on
+//! IPv4). There is no code path in this crate that binds any other
+//! interface; remote administration (`remote.rs`) works only through a
+//! reverse proxy or authenticated tunnel that reaches the loopback listener.
 //!
 //! A failed `[::1]` bind is more than a missing feature, though: `localhost`
 //! resolves to `[::1]` first on many systems, so if some OTHER local process
@@ -61,6 +62,7 @@ pub mod control_client;
 pub mod error;
 pub mod handlers;
 mod peer;
+pub mod remote;
 pub mod security;
 pub mod token;
 mod webui;
@@ -83,6 +85,7 @@ use conn_limit::ConnLimitedListener;
 pub use config::HttpApiConfig;
 use control_client::ControlClient;
 pub use peer::{PeerIo, PeerStreams};
+pub use remote::{RemoteAdminConfig, RemoteBoundary, RemoteConfigError, RemoteSettings};
 
 /// File name of [`HttpApiConfig::token_path`] inside the daemon's state
 /// directory.
@@ -241,6 +244,13 @@ pub async fn bind(config: &HttpApiConfig) -> anyhow::Result<HttpApiHandle> {
         allowed_origins.push(format!("http://[::1]:{bound_port}"));
     }
     allowed_origins.extend(config.extra_allowed_origins.iter().cloned());
+    // A trusted reverse proxy / tunnel on this host forwards the public name
+    // to the loopback listener: accept exactly that one name and its https
+    // origin there. The bearer token is still required.
+    if let Some(remote) = &config.remote {
+        allowed_hosts.push(remote.public_host.clone());
+        allowed_origins.push(remote.origin());
+    }
 
     let token = token::generate();
     token::write_token_file(&config.token_path, &token).with_context(|| {

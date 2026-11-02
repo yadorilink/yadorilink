@@ -30,7 +30,7 @@ pub(crate) use governance::{GovernanceCommandPort, GovernanceLimits};
 pub(crate) use group_admin::GroupAdministration;
 #[allow(unused_imports)]
 pub(crate) use handoff::{
-    DurabilityCommandPort, HandoffCommandPort, HandoffLeaseGrant, HandoffTicketGrant,
+    DurabilityCommandPort, HandoffCommandPort, HandoffLeaseGrant, HandoffTicketGrant, LeaseRefusal,
 };
 #[allow(unused_imports)]
 pub(crate) use link_lifecycle::{

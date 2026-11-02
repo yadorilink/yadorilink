@@ -26,11 +26,13 @@
 //! peer-availability details are not on `LinkStatus` today and are added when
 //! a trustworthy source exists.
 
-use crate::attention::{AttentionItem, ProductAction};
+use crate::attention::{Attention, AttentionItem, AttentionScope, ProductAction};
 use crate::availability::AvailabilitySummary;
 use crate::folder::DegradedCause;
 use crate::protection::ProtectionSummary;
-use yadorilink_ipc_proto::daemonctl::{FetchAvailability, GroupDurabilityStatus, LinkStatus};
+use yadorilink_ipc_proto::daemonctl::{
+    FetchAvailability, GroupDurabilityStatus, LinkStatus, StatusResponse,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProductState {
@@ -68,12 +70,13 @@ pub enum AttentionReason {
     HeldFile,
     /// Files the scan cannot read and that need the person (`unreadable_files`).
     UnreadableFiles,
+    /// A stored file record of the folder could not be read back (`index_damaged_path`).
+    IndexDamaged,
+    RebuildNeeded,
     /// Requests to join the folder's group wait for this account's decision.
     ApprovalPending,
     /// No durable copy of the group's data exists anywhere.
     DurabilityAtRisk,
-    /// The group's durability cannot currently be confirmed (a check still pending is not this).
-    DurabilityUnconfirmed,
 }
 
 impl AttentionReason {
@@ -88,9 +91,10 @@ impl AttentionReason {
             AttentionReason::StrandedDirectory => AttentionItem::StrandedDirectory,
             AttentionReason::HeldFile => AttentionItem::FileHeld,
             AttentionReason::UnreadableFiles => AttentionItem::UnreadableFiles,
+            AttentionReason::IndexDamaged => AttentionItem::IndexDamaged,
+            AttentionReason::RebuildNeeded => AttentionItem::RebuildNeeded,
             AttentionReason::ApprovalPending => AttentionItem::ApprovalPending,
             AttentionReason::DurabilityAtRisk => AttentionItem::NoSafeCopy,
-            AttentionReason::DurabilityUnconfirmed => AttentionItem::SafeCopyUnconfirmed,
         }
     }
 }
@@ -106,6 +110,9 @@ pub struct ProductStatusSummary {
     pub waiting_count: u64,
     /// Reasons behind attention (per-folder summaries only).
     pub attention_reasons: Vec<AttentionReason>,
+    /// Attention that belongs to no folder (sign-in, update, a volume, identity, a provider
+    /// folder), set only by [`ProductStatusSummary::global_of`]. Each counts in `attention_count`.
+    pub general_attention: Vec<AttentionItem>,
     /// Bytes left in the active transfers; `Some` only when every folder
     /// with an active transfer has a known total and no other queued work (an eager folder
     /// still partially materialized), so a UI never shows a made-up figure
@@ -146,13 +153,11 @@ fn flags(link: &LinkStatus) -> Flags {
     let durability = link.durability_status();
     let checks = [
         (link.conflict_count > 0 || link.conflicts_pending > 0, AttentionReason::Conflict),
-        (durability == GroupDurabilityStatus::AtRisk, AttentionReason::DurabilityAtRisk),
+        // One device holding the folder is a standing configuration, not a fault: protection
+        // reads at risk, but nothing the person must do is wrong, so it is not attention.
         (
-            matches!(
-                durability,
-                GroupDurabilityStatus::Unknown | GroupDurabilityStatus::Unspecified
-            ) && !link.durability_check_pending,
-            AttentionReason::DurabilityUnconfirmed,
+            durability == GroupDurabilityStatus::AtRisk && !crate::protection::is_single_copy(link),
+            AttentionReason::DurabilityAtRisk,
         ),
         (
             link.degraded,
@@ -164,6 +169,8 @@ fn flags(link: &LinkStatus) -> Flags {
         (link.stranded_directory_count > 0, AttentionReason::StrandedDirectory),
         (link.held_file_count > 0, AttentionReason::HeldFile),
         (link.unreadable_file_count > 0, AttentionReason::UnreadableFiles),
+        (!link.index_damaged_path.is_empty(), AttentionReason::IndexDamaged),
+        (link.rebuild_needed, AttentionReason::RebuildNeeded),
         (link.pending_approvals > 0, AttentionReason::ApprovalPending),
     ];
     let reasons = checks.into_iter().filter(|(on, _)| *on).map(|(_, r)| r).collect();
@@ -214,7 +221,26 @@ impl ProductStatusSummary {
         Self::aggregate(links)
     }
 
+    /// The whole status as one summary: every folder, plus the reasons that belong to no folder.
+    /// A general reason makes the state Needs attention even when every folder is up to date.
+    pub fn global_of(response: &StatusResponse) -> Self {
+        let general = response
+            .attention_reasons
+            .iter()
+            .map(|raw| Attention::from_reason(raw))
+            .filter(|a| !matches!(a.scope, AttentionScope::Folder(_)))
+            // A device being away is a wait (availability), never a reason on its own.
+            .filter(|a| a.item != AttentionItem::PeerUnavailable)
+            .map(|a| a.item)
+            .collect();
+        Self::aggregate_with(&response.links, general)
+    }
+
     fn aggregate(links: &[LinkStatus]) -> Self {
+        Self::aggregate_with(links, Vec::new())
+    }
+
+    fn aggregate_with(links: &[LinkStatus], general_attention: Vec<AttentionItem>) -> Self {
         let all: Vec<Flags> = links.iter().map(flags).collect();
         let count = |pick: fn(&Flags) -> bool| all.iter().filter(|f| pick(f)).count() as u64;
         // Every active transfer counts, whatever state precedence gives its folder (a conflicted
@@ -226,13 +252,17 @@ impl ProductStatusSummary {
         } else {
             active.iter().try_fold(0u64, |sum, f| Some(sum.saturating_add(f.bytes_remaining?)))
         };
-        let state = all.iter().map(state_of).fold(ProductState::UpToDate, strongest);
+        let mut state = all.iter().map(state_of).fold(ProductState::UpToDate, strongest);
+        if !general_attention.is_empty() {
+            state = strongest(state, ProductState::NeedsAttention);
+        }
         let attention_reasons: Vec<AttentionReason> =
             all.iter().flat_map(|f| f.reasons.iter().copied()).collect();
         let next_action = match state {
             ProductState::NeedsAttention => attention_reasons
                 .iter()
                 .map(|r| r.item())
+                .chain(general_attention.iter().copied())
                 // `max_by_key` keeps the last of equal keys; the reverse keeps the first reported.
                 .rev()
                 .max_by_key(|item| item.severity())
@@ -243,11 +273,12 @@ impl ProductStatusSummary {
         };
         ProductStatusSummary {
             state,
-            attention_count: count(|f| !f.reasons.is_empty()),
+            attention_count: count(|f| !f.reasons.is_empty()) + general_attention.len() as u64,
             paused_count: count(|f| f.paused),
             syncing_count: count(|f| f.syncing),
             waiting_count: count(|f| f.waiting),
             attention_reasons,
+            general_attention,
             bytes_remaining,
             availability: AvailabilitySummary::aggregate(
                 &links.iter().map(AvailabilitySummary::from_link).collect::<Vec<_>>(),

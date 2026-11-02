@@ -11,7 +11,11 @@
 use std::path::{Path, PathBuf};
 
 /// The App Group shared with the Finder and File Provider extensions.
-pub const MACOS_APP_GROUP: &str = "group.com.juntaki.yadorilink.shared";
+// A build may name other ids through the build-time environment variable below; unset, these are the product's ids.
+pub const MACOS_APP_GROUP: &str = match option_env!("YADORILINK_APP_GROUP") {
+    Some(id) => id,
+    None => "group.com.juntaki.yadorilink.shared",
+};
 
 /// The shell socket inside a group container.
 pub fn shell_socket_in(container: &Path) -> PathBuf {
@@ -41,6 +45,14 @@ pub fn container_url(group: &str) -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn macos_app_group_follows_the_build_identity() {
+        assert_eq!(
+            super::MACOS_APP_GROUP,
+            option_env!("YADORILINK_APP_GROUP").unwrap_or("group.com.juntaki.yadorilink.shared")
+        );
+    }
+
     use super::*;
 
     #[test]

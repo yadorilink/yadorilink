@@ -19,4 +19,4 @@ tracing = { workspace = true }
 # resolve addresses.
 yadorilink-sync-substrate = { path = "../yadorilink-sync-substrate", features = ["test-support"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
-iroh = "1.1"
+iroh = "1.4"

@@ -15,6 +15,7 @@
 //! materialization job is needed) -- callers decide, this crate only
 //! persists already-decided writes atomically.
 
+pub mod activity;
 pub mod author_incarnation;
 pub mod content_write_open;
 pub mod dag_store;
@@ -31,6 +32,7 @@ pub mod file_identity_codec;
 pub mod file_index;
 pub mod handoff_lease;
 pub mod held_path;
+pub mod history_freed;
 pub mod link;
 pub mod local_author;
 pub mod local_capture_provenance;
@@ -97,6 +99,7 @@ pub mod remote_custody_lease;
 mod replica_schema;
 pub mod replica_tables;
 pub mod restore_operation;
+pub mod retention;
 pub mod rewind_commit;
 pub mod rewind_plan;
 pub mod rewind_run;
@@ -115,9 +118,10 @@ pub use error::SyncSqliteError;
 pub use handoff_lease::HandoffLeaseRepository;
 pub use held_path::HeldPathRepository;
 pub use materialization_intent_repository::{
-    clear_flush_pending_in_tx, flush_pending_proof_identity, write_landed_unproven,
-    IntentDisposition, MaterializationIntentRepository, MaterializationTempLedger,
-    TempReleaseQueue,
+    clear_flush_pending_in_tx, flush_pending_proof_identity, list_temp_witnesses,
+    record_temp_witnesses_in_tx, write_landed_unproven, write_removal_facts, IntentDisposition,
+    MaterializationIntentRepository, MaterializationTempLedger, TempReleaseQueue,
+    WriteRemovalFacts,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use materialization_state::{fail_placeholder_reads_for_path, fail_state_reads_for_path};

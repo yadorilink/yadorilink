@@ -17,7 +17,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use bytes::Bytes;
+use yadorilink_local_storage::VerifiedBlock;
 
 use yadorilink_replica_domain::file::BlockInfo;
 
@@ -28,7 +28,7 @@ pub enum BlockFetch {
     /// The peer served the block, and it hashed to the key it was asked
     /// for. Verification happens before this is returned, so a caller
     /// never sees bytes that failed their own hash.
-    Fetched { hash: Vec<u8>, data: Bytes },
+    Fetched(VerifiedBlock),
     /// The peer does not have it, would not serve it, or never answered.
     /// To the caller these are the same fact -- the block did not arrive,
     /// try elsewhere or later -- so they stay one variant.

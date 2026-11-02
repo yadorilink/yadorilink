@@ -239,10 +239,12 @@ impl ProviderEvictor {
         };
         let cached_before = self.reclaim.has_cached_blocks(group_id, path);
         let reclaimed = self.reclaim.reclaim(prepared).await?;
-        let retained = (reclaimed.blocks == 0).then_some(if cached_before {
-            Retained::NothingFreed
-        } else {
+        let retained = (reclaimed.blocks == 0).then_some(if !cached_before {
             Retained::NotDownloaded
+        } else if self.reclaim.history_holds_blocks(group_id, path) {
+            Retained::HeldAsHistory
+        } else {
+            Retained::NothingFreed
         });
         Ok(ProviderEvictOutcome { dehydrated, reclaimed, retained })
     }

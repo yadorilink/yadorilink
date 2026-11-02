@@ -136,6 +136,12 @@ pub enum NotCorroboratedReason {
     /// content. Contradiction: this is precisely the state a bare digest
     /// comparison would have mistaken for custody.
     PeerNotMaterialized,
+    /// A peer answered, its current state agrees and is materialized, but some of it is held by
+    /// the peer's folder alone (not in its block store). Such a copy is lost to a later edit or
+    /// delete before capture notices, so it is not custody; the group is reported at the weaker
+    /// state until the peer's content is in its store (a pin, a lease or a handoff brings it
+    /// there). Contradiction, like [`Self::PeerNotMaterialized`].
+    PeerHoldsFilesOnly,
     /// The cycle's premises moved while it ran: this device's own root set,
     /// the membership generation, or the group's link state. Absence — the
     /// cycle learned nothing either way, and a moved root set already
@@ -151,7 +157,10 @@ impl NotCorroboratedReason {
     /// retract a still-fresh positive.
     pub fn is_contradiction(self) -> bool {
         match self {
-            Self::PeerNotEager | Self::CurrentStateDiffers | Self::PeerNotMaterialized => true,
+            Self::PeerNotEager
+            | Self::CurrentStateDiffers
+            | Self::PeerNotMaterialized
+            | Self::PeerHoldsFilesOnly => true,
             Self::NoCandidatePeer
             | Self::NoUsableReply
             | Self::PremisesMoved
@@ -166,6 +175,7 @@ impl NotCorroboratedReason {
             Self::PeerNotEager => "peer_not_eager",
             Self::CurrentStateDiffers => "current_state_differs",
             Self::PeerNotMaterialized => "peer_not_materialized",
+            Self::PeerHoldsFilesOnly => "peer_holds_files_only",
             Self::PremisesMoved => "premises_moved",
             Self::LocalStateUnreadable => "local_state_unreadable",
         }
@@ -384,6 +394,12 @@ pub(crate) async fn run_cycle(
             // the index alone; this is where they stop looking identical.
             if !summary.fully_materialized {
                 reason = NotCorroboratedReason::PeerNotMaterialized;
+                continue;
+            }
+            // Materialized is not stored: a copy that is only a file in the peer's folder goes
+            // away with a user's edit or delete before anything notices.
+            if summary.file_only_current_count != 0 {
+                reason = NotCorroboratedReason::PeerHoldsFilesOnly;
                 continue;
             }
             // Re-verify AFTER the reply, like every other custody path

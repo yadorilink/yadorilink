@@ -64,6 +64,7 @@ async fn identify_reports_an_app_bundle_daemon_and_its_data_area() {
     assert_eq!(report.owner, "gui");
     assert_eq!(report.install_root.replace('\\', "/"), "/Applications/YadoriLink.app");
     assert_eq!(report.pid, 77);
+    assert_eq!(report.data_dir, config.path().display().to_string());
     assert_eq!(report.ownership_status, OwnershipRecordStatus::Missing as i32);
     assert!(!config.path().join(ownership::FILE_NAME).exists(), "identify is read-only");
 }

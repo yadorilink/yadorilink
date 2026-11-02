@@ -178,7 +178,7 @@ impl Harness {
             SigningKey::from_bytes(&[7u8; 32]),
         )
         .unwrap();
-        self.state.author_contest_forks(&key, GROUP, &|_, _| true).map(|_| ())
+        self.state.author_contest_forks(&key, GROUP, &|_, _| true, None).map(|_| ())
     }
 
     /// Every path native holds a head for: what a pass seeded by the armed
@@ -341,8 +341,19 @@ impl Harness {
         }
     }
 
+    #[cfg(unix)]
+    pub(super) fn root_lease(&self) -> Arc<RootLease> {
+        self.root_lease.clone()
+    }
+
     pub(super) fn path(&self, rel: &str) -> std::path::PathBuf {
         self.root.join(rel)
+    }
+
+    /// The directory the block store lives in.
+    #[cfg(unix)]
+    pub(super) fn store_root(&self) -> &std::path::Path {
+        self._store_dir.path()
     }
 
     /// The link teardown's first step: the lease refuses every new operation.
@@ -1391,7 +1402,12 @@ async fn startup_repair_does_not_author_unproven_older_bytes_under_an_incomplete
     )
     .unwrap();
 
-    assert_eq!(report.quarantined_dirty.len(), 1, "{report:?}");
+    // The older bytes are the object this device captured, untouched since (only the proof was
+    // voided): no edit. They stay for the newer version to replace, and are not turned into a
+    // conflict copy.
+    assert_eq!(report.stood_down, vec!["notes.txt".to_string()], "{report:?}");
+    assert!(report.quarantined_dirty.is_empty(), "{report:?}");
+    assert_eq!(std::fs::read(h.path("notes.txt")).unwrap(), older);
     assert!(!h.state.dirty_path_repository().is_path_dirty(GROUP, "notes.txt").unwrap());
     h.redrive().await;
     let heads = h.native_heads("notes.txt");
@@ -1685,13 +1701,9 @@ async fn a_metadata_only_local_edit_counts_as_uncaptured() {
     assert!(check().unwrap(), "a chmod alone is an uncaptured edit");
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert!(!check().unwrap());
-
-    #[cfg(target_os = "linux")]
-    {
-        yadorilink_local_storage::apply_xattrs(&file, &[("user.tag".into(), b"mine".to_vec())])
-            .unwrap();
-        assert!(check().unwrap(), "an xattr alone is an uncaptured edit");
-    }
+    // Only the execute flag is replicated: another permission change is no edit.
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!check().unwrap(), "a chmod that leaves the execute flag alone is not an edit");
 }
 
 /// The accumulator task has exited (watcher gone, executor gone) while the

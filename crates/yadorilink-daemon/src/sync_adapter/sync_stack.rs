@@ -35,6 +35,9 @@ pub enum SyncStackError {
 
     #[error("the netmap carries no address for {0}, so it cannot be dialled")]
     Unreachable(String),
+
+    #[error("no connection to {device} within {within:?}; dialling again")]
+    DialTimedOut { device: String, within: std::time::Duration },
 }
 
 /// The reconciliation stack, running.
@@ -92,12 +95,7 @@ impl SyncStack {
             .bind_endpoint(
                 signing_key.to_bytes(),
                 &state.authority,
-                #[cfg(feature = "process-model")]
                 crate::send_transfer::track_send_admission(&state),
-                #[cfg(not(feature = "process-model"))]
-                yadorilink_sync_substrate::AdmitWhen::new(
-                    |_: &yadorilink_sync_substrate::PeerId| false,
-                ),
                 #[cfg(feature = "process-model")]
                 offer_nas_admin.then(|| {
                     Arc::new(crate::nas_admin::AccountDevices::of(&state))

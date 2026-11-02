@@ -153,6 +153,9 @@ impl AsyncRead for LaneRecv {
     }
 }
 
+/// Application close code of a connection closed for having no relay path.
+pub const RELAY_PATH_MISSING_CLOSE_CODE: u32 = 0x5245;
+
 /// Which kind of network path is carrying a connection's traffic.
 ///
 /// An observation, never an authorization input. `verify_proof_carrying_change`
@@ -165,15 +168,32 @@ pub enum Carrier {
     Direct,
 }
 
-/// The kind of the selected path of `connection`, if one is selected.
+/// The kind of the path carrying `connection`'s traffic, if there is one.
 fn carrier_of(connection: &iroh::endpoint::Connection) -> Option<Carrier> {
-    connection.paths().iter().find(|path| path.is_selected()).map(|path| {
-        if path.is_relay() {
-            Carrier::Relay
-        } else {
-            Carrier::Direct
-        }
-    })
+    let paths: Vec<(bool, Carrier)> = connection
+        .paths()
+        .iter()
+        .map(|path| {
+            (path.is_selected(), if path.is_relay() { Carrier::Relay } else { Carrier::Direct })
+        })
+        .collect();
+    carrier_from_paths(&paths)
+}
+
+/// The carrier given each open path's `(selected, kind)`.
+///
+/// The selected path, when this connection has one. iroh selects one address per peer, shared by
+/// all of the peer's connections, so a connection that lost the selected address (its direct path
+/// timed out while another connection still holds it) has no selected path for the second or so
+/// until iroh reopens it. Its traffic does not stop: QUIC falls back to a backup path. When every
+/// path that is open is of one kind, that is the kind carrying it, and calling the connection
+/// "not connected" for that second would be wrong.
+fn carrier_from_paths(paths: &[(bool, Carrier)]) -> Option<Carrier> {
+    if let Some((_, carrier)) = paths.iter().find(|(selected, _)| *selected) {
+        return Some(*carrier);
+    }
+    let first = paths.first()?.1;
+    paths.iter().all(|(_, carrier)| *carrier == first).then_some(first)
 }
 
 /// The carrier of one connection, reported each time its paths change, until
@@ -218,6 +238,14 @@ pub const LANE_TAG_DEADLINE: std::time::Duration = std::time::Duration::from_sec
 pub struct InboundStream {
     send: iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
+}
+
+#[cfg(feature = "test-support")]
+impl InboundStream {
+    /// The stream's halves, with no lane tag read and no lane budget taken.
+    pub fn into_raw_for_test(self) -> (iroh::endpoint::SendStream, iroh::endpoint::RecvStream) {
+        (self.send, self.recv)
+    }
 }
 
 /// An established connection to one peer.
@@ -432,9 +460,52 @@ impl PeerLink {
         }
     }
 
+    /// Every path of this connection as text: kind, address, round-trip time, whether selected.
+    #[cfg(feature = "test-support")]
+    pub fn path_summary_for_test(&self) -> Vec<String> {
+        self.connection
+            .paths()
+            .iter()
+            .map(|path| {
+                format!(
+                    "{} addr={:?} rtt={:?} selected={}",
+                    if path.is_relay() { "relay" } else { "direct" },
+                    path.remote_addr(),
+                    path.rtt(),
+                    path.is_selected()
+                )
+            })
+            .collect()
+    }
+
+    /// Transport counters of this connection (packets, bytes, congestion events) as text.
+    #[cfg(feature = "test-support")]
+    pub fn stats_summary_for_test(&self) -> String {
+        format!("{:?}", self.connection.stats())
+    }
+
     /// Whether a direct path is open at all, selected or not.
     pub fn has_direct_path(&self) -> bool {
         self.connection.paths().iter().any(|path| path.is_ip())
+    }
+
+    /// Whether a relay path is open on this connection, selected or not.
+    ///
+    /// A connection made before either side knew the other's relay has none,
+    /// and iroh never opens one on a live connection afterwards.
+    pub fn has_relay_path(&self) -> bool {
+        self.connection.paths().iter().any(|path| path.is_relay())
+    }
+
+    /// Identifies this connection among the links of a process; stable for its life.
+    pub fn connection_id(&self) -> usize {
+        self.connection.stable_id()
+    }
+
+    /// Close the connection because it has no relay path to fall back on, so
+    /// that the redial (which looks the peer up afresh) can get one.
+    pub fn close_for_missing_relay_path(&self) {
+        self.connection.close(RELAY_PATH_MISSING_CLOSE_CODE.into(), b"no relay path");
     }
 
     /// Close the connection. Idempotent.
@@ -696,4 +767,27 @@ fn map_event(
         iroh::endpoint::PathEvent::Lagged { .. } => PathUpdate::Lagged,
         _ => PathUpdate::Selected,
     })
+}
+
+#[cfg(test)]
+mod carrier_tests {
+    use super::{carrier_from_paths, Carrier};
+
+    #[test]
+    fn the_selected_path_decides() {
+        let paths = [(false, Carrier::Relay), (true, Carrier::Direct)];
+        assert_eq!(carrier_from_paths(&paths), Some(Carrier::Direct));
+    }
+
+    #[test]
+    fn a_connection_left_with_only_a_relay_path_is_on_the_relay_not_unconnected() {
+        assert_eq!(carrier_from_paths(&[(false, Carrier::Relay)]), Some(Carrier::Relay));
+        assert_eq!(carrier_from_paths(&[(false, Carrier::Direct)]), Some(Carrier::Direct));
+    }
+
+    #[test]
+    fn mixed_unselected_paths_and_no_paths_say_nothing() {
+        assert_eq!(carrier_from_paths(&[(false, Carrier::Relay), (false, Carrier::Direct)]), None);
+        assert_eq!(carrier_from_paths(&[]), None);
+    }
 }

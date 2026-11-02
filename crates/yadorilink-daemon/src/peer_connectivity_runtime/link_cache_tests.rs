@@ -662,3 +662,57 @@ async fn a_retired_link_leaves_the_cache_when_it_closes_or_its_grace_ends() {
     wait_until(|| links.retired_count_for_tests(ALICE) == 0).await;
     assert_eq!(links.retired_count_for_tests(ALICE), 0, "no entry outlives its grace period");
 }
+
+/// An accepted link answers a caller whose own dial is still in its handshake; the dial is left
+/// to finish alone. If that link then dies (a network cut), the next caller must not queue behind
+/// the old handshake, which can take half a minute on paths that no longer exist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dial_left_behind_by_an_accepted_link_does_not_hold_up_the_next_caller() {
+    let fx = bob_with_alice_dialling_in().await;
+    let runtime = fx.bob.runtime_for_tests().clone();
+    let peer = fx.bob.endpoint().peer_id_of(ALICE).unwrap();
+    let inbound = runtime.connect(peer).await.expect("stands in for the accepted link");
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let leader = {
+        let bob = fx.bob.clone();
+        tokio::spawn(async move {
+            bob.endpoint()
+                .link_to(ALICE, move |_| async move {
+                    let _ = started_tx.send(());
+                    pending::<Dial>().await
+                })
+                .await
+        })
+    };
+    started_rx.await.expect("the leader is dialling");
+    fx.bob.endpoint().links.offer_accepted(ALICE, &inbound);
+    leader.await.unwrap().unwrap().expect("answered by the accepted link");
+
+    inbound.close();
+    // The network came back (`recycle_when_network_returns` says so).
+    assert_eq!(fx.bob.endpoint().links.supersede_detached_dials(), 1);
+    let dials = Arc::new(AtomicUsize::new(0));
+    let dial = counted_dial(&fx.bob, &dials);
+    let next = tokio::time::timeout(Duration::from_secs(5), fx.bob.endpoint().link_to(ALICE, dial))
+        .await
+        .expect("the next caller queued behind a dial left over from the lost network");
+    assert!(next.unwrap().is_some());
+    assert_eq!(dials.load(Ordering::SeqCst), 1, "it dialled for itself");
+}
+
+/// A connection that closed while it waited in the accept queue is not news of the peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queued_link_that_closed_is_not_announced_as_the_peer_reconnecting() {
+    let fx = bob_with_alice_dialling_in().await;
+    let runtime = fx.bob.runtime_for_tests().clone();
+    let peer = fx.bob.endpoint().peer_id_of(ALICE).unwrap();
+    let mut heard = fx.bob.endpoint().links.subscribe_inbound();
+    let dead = runtime.connect(peer).await.expect("a link");
+    dead.close();
+    fx.bob.endpoint().links.offer_accepted(ALICE, &dead);
+    assert!(heard.try_recv().is_err(), "a dead link was announced");
+
+    let live = runtime.connect(peer).await.expect("a link");
+    fx.bob.endpoint().links.offer_accepted(ALICE, &live);
+    assert!(matches!(heard.try_recv(), Ok(device) if device == ALICE));
+}

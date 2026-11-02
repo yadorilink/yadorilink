@@ -314,7 +314,7 @@ async fn an_untouched_older_write_is_not_authored_as_a_metadata_only_edit() {
     fx.captured("mode.sh").await;
     fx.state
         .file_index_repository()
-        .set_unix_mode(GROUP, "mode.sh", Some(0o755), &RootCommitPermit::for_tests())
+        .set_exec(GROUP, "mode.sh", true, &RootCommitPermit::for_tests())
         .unwrap();
     assert!(
         crate::ports::LocalMutationStore::disk_is_untouched_proven_write(

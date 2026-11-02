@@ -314,6 +314,12 @@ impl RootIdentityCheck {
     pub fn verify(&self) -> Result<(), RootAuthorityError> {
         verify_sidecar_identity(&self.root, self.expected)
     }
+
+    /// Whether `other` observes the same sidecar against the same expectation, so one
+    /// successful verification stands for both.
+    pub fn observes_same_as(&self, other: &Self) -> bool {
+        self.root == other.root && self.expected == other.expected
+    }
 }
 
 impl Drop for SyncRootLock {

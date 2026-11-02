@@ -29,16 +29,21 @@ pub use yadorilink_client_core::dto;
 
 pub use account::{
     AccountCommand, AccountDeletionImpact, AccountDeletionRequest, AccountDeletionStatus,
-    AccountStatus, BeginSignIn, DeviceRegistration, LoginEvent, NotRejoined, PollSignIn,
-    SignInCancellation, SignInId, SignInStep, SignOutOutcome, StartOverProgress, StartOverReport,
+    AccountStatus, BeginPairingSignIn, BeginSignIn, DeviceRegistration, LoginEvent, NotRejoined,
+    PollSignIn, SignInCancellation, SignInId, SignInStep, SignOutOutcome, StartOverProgress,
+    StartOverReport,
 };
 pub use commands::{
-    ordinary_folder_links_supported, CallError, CallOptions, CancelHandle, Command, CommandError,
-    CommandErrorKind, CommandOutput, CreateShare, DesktopError, DoctorCheck, DoctorStatus,
-    HandoffInfo, JoinGroup, JoinShare, LinkFolder, LinkedFolder, PauseFor, PauseLink,
-    PreservedItem, PreservedKind, PreservedRef, PreservedRefusal, ProviderFolder,
-    ReadoptMarkedFolder, ReadoptOutcome, ReadoptRefusal, RestoreVersion, ResumeLink, ShareFolder,
-    ShareOutcome, SpaceManagement, UnlinkFolder, UnlinkOutcome,
+    ordinary_folder_links_supported, ApplyChange, ApplyResponse, CallError, CallOptions,
+    CancelHandle, Command, CommandError, CommandErrorKind, CommandOutput, CreateShare, DeletedItem,
+    DeletedItems, DeletedParent, DeliveryItem, DeliveryOutcome, DeliveryReport, DeliveryState,
+    DesktopError, DoctorCheck, DoctorStatus, HandoffInfo, HistoryEntryKind, HistoryOutcome,
+    HistoryVersionState, ItemDelivery, ItemHistory, ItemVersion, JoinGroup, JoinShare, LinkFolder,
+    LinkedFolder, PauseFor, PauseLink, PreservedItem, PreservedKind, PreservedRef,
+    PreservedRefusal, ProviderFolder, ReadoptMarkedFolder, ReadoptOutcome, ReadoptRefusal,
+    RestoreVersion, ResumeLink, SendLinkEntry, ShareFolder, ShareOutcome, SpaceManagement,
+    StageMode, StageRefused, StageSource, StagedHow, StagedUpload, UnlinkFolder, UnlinkOutcome,
+    MAX_DELETED_ITEMS, MAX_DELIVERY_ITEMS,
 };
 
 /// The one parser for invite links and codes, and the reason a permission refusal carries.
@@ -437,10 +442,12 @@ impl EmbeddedHost {
         let (from_read, incoming) = mpsc::channel::<ShellIpcMessage>(CHANNEL_QUEUE);
         // The channel's two pumps run on the engine's runtime, so that waiting for a message
         // is cancel-safe on the host's side: a dropped `recv` loses no half-read frame.
+        let accounts = running.accounts.clone();
         running.runtime.spawn(async move {
-            while let Ok(Some(message)) =
+            while let Ok(Some(mut message)) =
                 yadorilink_ipc_proto::framing::read_message::<ShellIpcMessage>(&mut read).await
             {
+                name_holder(&accounts, &mut message).await;
                 if from_read.send(message).await.is_err() {
                     return;
                 }
@@ -536,6 +543,18 @@ impl EmbeddedHost {
         Ok(())
     }
 
+    /// Declares an On-Demand provider folder for `group_id` on the running engine and returns its
+    /// root id (hex); it runs from the next start. For hosts without a File Provider, which
+    /// refuse provider folders at enrollment.
+    #[doc(hidden)]
+    pub fn add_provider_link_for_test(&self, group_id: &str) -> Result<String, HostError> {
+        let phase = self.phase();
+        let Phase::Running(running) = &*phase else {
+            return Err(Self::wrong_state("add a provider link", phase.state()));
+        };
+        Ok(running.engine.add_provider_link_for_test(group_id))
+    }
+
     /// Makes the running engine's next stop wait for `release`. For tests of a stop that does
     /// not finish.
     #[doc(hidden)]
@@ -629,6 +648,27 @@ impl Drop for EmbeddedHost {
         // A dropped host cannot report: it waits for the drain as long as it takes, because
         // releasing the data area earlier would let another engine in under the old one.
         while self.stop().is_err() {}
+    }
+}
+
+/// How long a failed fetch waits for the account's device names before it is delivered without
+/// the holder's name.
+const HOLDER_NAME_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Fills `holder_device_name` of an unobtainable fetch from the account's device list. The engine
+/// knows ids only; the name is best effort and stays empty when the list cannot be read in time.
+async fn name_holder(accounts: &account::AccountCommands, message: &mut ShellIpcMessage) {
+    use yadorilink_ipc_proto::shellipc::shell_ipc_message::Payload;
+    let Some(Payload::MaterializeToTempResponse(response)) = &mut message.payload else {
+        return;
+    };
+    if response.holder_device_id.is_empty() || !response.holder_device_name.is_empty() {
+        return;
+    }
+    if let Ok(names) = tokio::time::timeout(HOLDER_NAME_WAIT, accounts.device_names()).await {
+        if let Some(name) = names.get(&response.holder_device_id) {
+            response.holder_device_name.clone_from(name);
+        }
     }
 }
 

@@ -7,7 +7,7 @@
 
 use yadorilink_client_core::ops::files;
 use yadorilink_ipc_proto::daemonctl::{
-    ConflictedFileInfo, EntryKind, FileVersionInfo, TrashedFileInfo,
+    ConflictedFileInfo, EntryKind, FileVersionInfo, NotKeptSpan, TrashedFileInfo, VersionContent,
 };
 
 use yadorilink_client_core::attention as view;
@@ -30,16 +30,70 @@ fn absolute_path(local_path: &str) -> Result<String, CliError> {
 /// file").
 pub async fn versions(local_path: String) -> Result<(), CliError> {
     let absolute_path = absolute_path(&local_path)?;
-    let versions = files::list_versions(absolute_path).await?;
-    if versions.is_empty() {
+    let history = files::list_version_history(absolute_path).await?;
+    if history.versions.is_empty() && history.not_kept.is_empty() {
         println!("No retained versions for {local_path}.");
         return Ok(());
     }
     let devices = DeviceNames::load().await;
-    for version in &versions {
+    for version in &history.versions {
         println!("{}", version_line(version, &devices));
     }
+    for line in not_kept_lines(&history.not_kept) {
+        println!("{line}");
+    }
     Ok(())
+}
+
+/// One line per stretch of time in which this device no longer has the version that was current:
+/// the recorded events of the path, adjacent or overlapping ones joined (nothing is merged where
+/// it is stored), each naming every reason present.
+fn not_kept_lines(spans: &[NotKeptSpan]) -> Vec<String> {
+    struct Group {
+        from: Option<i64>,
+        to: Option<i64>,
+        reasons: Vec<&'static str>,
+    }
+    let words = |reason: &str| match reason {
+        "LowSpace" => Some("the disk was nearly full"),
+        "Expired" => Some("the retention period ended"),
+        _ => None,
+    };
+    let mut sorted: Vec<&NotKeptSpan> =
+        spans.iter().filter(|span| words(&span.reason).is_some()).collect();
+    sorted.sort_by_key(|span| span.from_unix_nanos.unwrap_or(i64::MIN));
+    let mut groups: Vec<Group> = Vec::new();
+    for span in sorted {
+        let reason = words(&span.reason).expect("filtered above");
+        match groups.last_mut() {
+            Some(group)
+                if group
+                    .to
+                    .is_none_or(|end| span.from_unix_nanos.is_none_or(|start| start <= end)) =>
+            {
+                group.to = match (group.to, span.to_unix_nanos) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    _ => None,
+                };
+                if !group.reasons.contains(&reason) {
+                    group.reasons.push(reason);
+                }
+            }
+            _ => groups.push(Group {
+                from: span.from_unix_nanos,
+                to: span.to_unix_nanos,
+                reasons: vec![reason],
+            }),
+        }
+    }
+    groups
+        .iter()
+        .map(|group| {
+            let from = group.from.map_or("the beginning".to_string(), format_local_time);
+            let to = group.to.map_or("now".to_string(), format_local_time);
+            format!("Versions from {from} to {to} are not kept ({})", group.reasons.join("; "))
+        })
+        .collect()
 }
 
 fn version_line(v: &FileVersionInfo, devices: &DeviceNames) -> String {
@@ -50,14 +104,19 @@ fn version_line(v: &FileVersionInfo, devices: &DeviceNames) -> String {
     } else {
         format!("{}  size={}", v.mtime_unix_nanos, v.size)
     };
+    // Said only for an older file version: whether this device still holds its bytes (a restore
+    // of one it does not hold has to ask a peer, and may find none).
+    let held = match v.content() {
+        VersionContent::NotApplicable => "",
+        VersionContent::Kept => "  content=kept",
+        VersionContent::NotKept => "  content=not-kept",
+    };
     format!(
-        "v{}  {content}  from {}  state={}  mode={}",
+        "v{}  {content}  from {}  state={}{held}  exec={}",
         v.version_seq,
         devices.label(&v.origin_device_id),
         v.state,
-        // `-` for "no Unix permission info" (e.g. authored on Windows) --
-        // never fabricated as a fake octal value.
-        v.unix_mode.map(|mode| format!("{mode:#o}")).unwrap_or_else(|| "-".to_string()),
+        if v.exec { "yes" } else { "no" },
     )
 }
 

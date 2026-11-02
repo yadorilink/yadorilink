@@ -8,8 +8,8 @@ use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPaylo
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::rewind_execute_response::Outcome;
 use yadorilink_ipc_proto::daemonctl::{
-    RewindActionCounts, RewindExecuteRequest, RewindPreviewRequest, RewindPreviewResponse,
-    RewindRefused, RewindRun, RewindStatusRequest,
+    ResolveFolderRequest, RewindActionCounts, RewindExecuteRequest, RewindPreviewRequest,
+    RewindPreviewResponse, RewindRefused, RewindRun, RewindStatusRequest,
 };
 
 use crate::daemon::control;
@@ -41,11 +41,28 @@ pub async fn resolve_folder_group(folder: &str) -> Result<String, CoreError> {
         return Ok(link.group_id.clone());
     }
     let canonical = std::fs::canonicalize(folder).ok().map(|p| p.to_string_lossy().to_string());
-    links
+    if let Some(link) = links
         .iter()
         .find(|l| l.local_path == folder || canonical.as_deref() == Some(l.local_path.as_str()))
-        .map(|l| l.group_id.clone())
-        .ok_or_else(|| CoreError::InvalidInput(format!("{folder} is not a linked folder")))
+    {
+        return Ok(link.group_id.clone());
+    }
+    // A File Provider folder has no directory the daemon was linked at: the daemon's own resolver
+    // finds it from where the file manager shows it, as for every other command that takes a path.
+    match control::send(ReqPayload::ResolveFolder(ResolveFolderRequest {
+        path: folder.to_string(),
+    }))
+    .await
+    {
+        Ok(response) => match response.payload {
+            Some(RespPayload::ResolveFolder(found)) => Ok(found.group_id),
+            Some(RespPayload::Error(message)) => Err(CoreError::InvalidInput(message)),
+            _ => Err(CoreError::InvalidInput(format!("{folder} is not a linked folder"))),
+        },
+        // The daemon cannot be asked (not running, release mismatch, no answer): say that, not that
+        // the folder is unknown.
+        Err(error) => Err(error),
+    }
 }
 
 /// What a rewind of `group_id` to `at_unix_nanos` (on the daemon device's

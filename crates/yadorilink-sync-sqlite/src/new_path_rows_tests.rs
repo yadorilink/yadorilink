@@ -130,10 +130,9 @@ impl Side {
                     0,
                     FileMeta {
                         mtime_unix_nanos: *salt,
-                        unix_mode: Some(0o644),
+                        exec: false,
                         symlink_target: None,
                         record_kind: RecordKind::File,
-                        xattrs: Vec::new(),
                     },
                 );
                 PreparedLocalMutation::Upsert {
@@ -149,8 +148,7 @@ impl Side {
                         record_kind: RecordKind::File,
                         symlink_target: None,
                         symlink_out_of_root: false,
-                        unix_mode: Some(0o644),
-                        xattrs: Vec::new(),
+                        exec: false,
                     }),
                     version,
                     native_witness: witness,
@@ -326,10 +324,9 @@ fn remote_version(salt: u8) -> FileVersion {
         0,
         FileMeta {
             mtime_unix_nanos: 10_000 + i64::from(salt),
-            unix_mode: Some(0o600),
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     )
 }
@@ -379,7 +376,8 @@ impl RemoteChain {
 }
 
 /// The columns whose value is the clock or a random identifier, which no two commits share.
-const VOLATILE_COLUMNS: [&str; 8] = [
+const VOLATILE_COLUMNS: [&str; 9] = [
+    "at_unix_nanos",
     "admitted_at_unix_nanos",
     "last_mutation_at",
     "generation_id",
@@ -416,7 +414,11 @@ fn dump_all(conn: &Connection, skip_columns: &[&str]) -> BTreeMap<String, Vec<Ve
             .unwrap()
             .map(Result::unwrap)
             .filter(|c| {
-                !VOLATILE_COLUMNS.contains(&c.as_str()) && !skip_columns.contains(&c.as_str())
+                !VOLATILE_COLUMNS.contains(&c.as_str())
+                    && !skip_columns.contains(&c.as_str())
+                    // The shortcut logs its new paths together, ahead of the rest of the
+                    // batch: the same events in another order, so the cursor differs.
+                    && !(table == "activity_events" && c == "id")
             })
             .collect();
         if columns.is_empty() {
@@ -778,12 +780,12 @@ fn a_new_path_is_written_as_a_finished_row() {
     let side = Side::new(Mode::Grouped);
     let evidence = Evidence::new(3);
     side.commit(&[Spec::Put { path: "fresh/a".into(), salt: 1 }], &evidence, None).unwrap();
-    let row: (i64, String, String, i64, String, String, i64) = side
+    let row: (i64, String, String, i64, String, i64, i64) = side
         .db
         .write_immediate::<_, SyncSqliteError>(|tx| {
             Ok(tx.query_row(
                 "SELECT version_seq, state, materialization_state, deleted, record_kind, \
-                 xattrs_json, native_authoring_identity IS NOT NULL FROM files \
+                 exec, native_authoring_identity IS NOT NULL FROM files \
                  WHERE group_id = 'g1' AND path = 'fresh/a'",
                 [],
                 |r| {
@@ -800,7 +802,7 @@ fn a_new_path_is_written_as_a_finished_row() {
             )?)
         })
         .unwrap();
-    assert_eq!(row, (1, "current".into(), "present".into(), 0, "file".into(), "[]".into(), 1));
+    assert_eq!(row, (1, "current".into(), "present".into(), 0, "file".into(), 0, 1));
 }
 
 /// A path any table the shortcut relies on names is not new.

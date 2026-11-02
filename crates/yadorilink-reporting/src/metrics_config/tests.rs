@@ -38,3 +38,32 @@ fn set_without_an_addr_keeps_the_previously_configured_one() {
     assert!(!config.enabled);
     assert_eq!(config.bind_addr, "127.0.0.1:9999");
 }
+
+#[cfg(unix)]
+#[test]
+fn the_saved_config_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, store) = store();
+    store.set(true, None).unwrap();
+    let mode =
+        std::fs::metadata(dir.path().join("metrics_config.json")).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_old_wide_open_config_is_tightened_when_the_store_is_opened() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("metrics_config.json");
+    std::fs::write(&file, b"{}").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let dir_mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+    let _store = MetricsConfigStore::new(dir.path());
+    assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+        dir_mode,
+        "the config directory itself is left alone"
+    );
+}

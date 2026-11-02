@@ -1241,3 +1241,29 @@ async fn a_volume_confirmation_lands_only_on_the_link_it_was_made_for() {
     let missing = LinkRuntimeController::new(state.clone()).readopt_volume("/elsewhere").await;
     assert!(missing.is_err(), "{missing:?}");
 }
+
+/// A quiet live repair pass lets the next interval tick be skipped, but not while a path is still
+/// held (only the filesystem can resolve that), not after a visited row, and never for an install
+/// wake or after a database write.
+#[test]
+fn a_repair_tick_is_skipped_only_after_a_pass_that_left_nothing_for_the_filesystem_to_resolve() {
+    use yadorilink_filesystem_sync::materialization_repair::MaterializationRepairReport;
+    let quiet = MaterializationRepairReport::default();
+
+    let mut skip = RepairSkip::default();
+    assert!(!skip.skips(true, 7), "nothing ran yet");
+    skip.note_pass(7, &quiet);
+    assert!(skip.skips(true, 7));
+    assert!(!skip.skips(false, 7), "an install wake must run");
+    assert!(!skip.skips(true, 8), "a database write since the pass must run");
+    skip.disarm();
+    assert!(!skip.skips(true, 7));
+
+    let held = MaterializationRepairReport { held_paths_remaining: 1, ..Default::default() };
+    skip.note_pass(7, &held);
+    assert!(!skip.skips(true, 7), "a zero-row pass that left a path held armed the skip");
+
+    let visited = MaterializationRepairReport { rows_visited: 1, ..Default::default() };
+    skip.note_pass(7, &visited);
+    assert!(!skip.skips(true, 7));
+}

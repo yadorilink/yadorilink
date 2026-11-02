@@ -24,13 +24,22 @@ pub(crate) fn declared_root() -> (Arc<ReplicaCoordinator>, String) {
 }
 
 fn rename(coordinator: &ReplicaCoordinator, table: &str, from: &str, to: &str) {
-    coordinator
-        .database()
-        .write_immediate::<_, SyncSqliteError>(|tx| {
+    // The schema change needs every statement on the table finished, and the driver under test is
+    // reading it concurrently: a table lock held by one of its reads is a reason to try again, not
+    // to fail the test (it failed on a slower host).
+    let mut last = None;
+    for _ in 0..100 {
+        let renamed = coordinator.database().write_immediate::<_, SyncSqliteError>(|tx| {
             tx.execute_batch(&format!("ALTER TABLE {table} RENAME COLUMN {from} TO {to}"))?;
             Ok(())
-        })
-        .unwrap();
+        });
+        match renamed {
+            Ok(()) => return,
+            Err(error) => last = Some(error),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("could not rename {table}.{from}: {:?}", last.unwrap());
 }
 
 /// Reads of `table.column` fail until the returned guard's `restore` runs.

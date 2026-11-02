@@ -126,6 +126,13 @@ pub enum RewindUnavailableReason {
     /// The versions of the path from that time were removed by version
     /// retention.
     RemovedByRetention,
+    /// The version that held then was dropped when its retention period ended
+    /// (older than 30 days and more than 10 newer versions); the device
+    /// recorded that, so no other version is offered in its place.
+    NotKeptExpired,
+    /// The version that held then was not kept because the disk was nearly
+    /// full when it was replaced.
+    NotKeptLowSpace,
     /// This device dropped its record of the path when the path was
     /// excluded from sync, then indexed it again.
     ExcludedFromSync,
@@ -145,6 +152,12 @@ impl RewindUnavailableReason {
                  history (e.g. your NAS)"
             }
             Self::RemovedByRetention => "older versions were removed by retention",
+            Self::NotKeptExpired => {
+                "the version from that time was not kept: the retention period ended"
+            }
+            Self::NotKeptLowSpace => {
+                "the version from that time was not kept: the disk was nearly full"
+            }
             Self::ExcludedFromSync => {
                 "this device dropped its earlier record when the path was excluded from sync"
             }

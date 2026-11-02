@@ -20,7 +20,7 @@ r2d2_sqlite = "0.24"
 # only so `build_pool` can choose that pool's drop behavior.
 scheduled-thread-pool = "0.2.7"
 # `write_immediate_offloaded` runs a commit on the blocking pool.
-tokio = { workspace = true, features = ["rt"] }
+tokio = { workspace = true, features = ["rt", "sync"] }
 
 [dev-dependencies]
 tempfile = "3"

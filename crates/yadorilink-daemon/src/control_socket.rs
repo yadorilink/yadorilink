@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 
-use crate::application::ports::SubmitReportError;
+use crate::application::ports::{LeaseRefusal, SubmitReportError};
 use crate::application::replica_role_service::StorageModeError;
 use crate::error::NextStep;
 use yadorilink_ipc_proto::daemonctl::rewind_execute_response::Outcome as RewindExecuteOutcome;
@@ -24,14 +24,14 @@ use yadorilink_ipc_proto::daemonctl::{
     delete_group_command_response, join_and_link_command_response, mint_invite_command_response,
     remove_device_command_response, revoke_device_command_response, revoke_edge_command_response,
     AcceptInviteCommandResponse, ApplicationCommandError, ApplicationErrorCode,
-    CancelTransferResponse, CheckFullReplicaHandoffReadyExcludingResponse,
+    CancelSendLinkResponse, CancelTransferResponse, CheckFullReplicaHandoffReadyExcludingResponse,
     CheckFullReplicaHandoffReadyResponse, ConflictedFileInfo, ConnectionAttemptTrace,
     ConnectivityDoctorCategory, ConnectivityDoctorResponse, CreateAndLinkCommandResponse,
-    DaemonControlRequest, DaemonControlResponse, DeleteGroupCommandResponse,
-    EnrollmentCommandOutcome, EvictResponse, FileVersionInfo, GcResponse,
-    GetSpaceManagementResponse, HandoffResult, HealthResponse, HydrateResponse, InboxFileSummary,
-    InboxTransfer, JoinAndLinkCommandResponse, LatchGroupDurabilityUnknownResponse,
-    LimitsSetResponse, LimitsShowResponse, LinkPreflightResponse, LinkRequest, LinkResponse,
+    CreateSendLinkResponse, DaemonControlRequest, DaemonControlResponse,
+    DeleteGroupCommandResponse, EnrollmentCommandOutcome, EvictResponse, FileVersionInfo,
+    GcResponse, GetSpaceManagementResponse, HandoffResult, HealthResponse, HydrateResponse,
+    JoinAndLinkCommandResponse, LatchGroupDurabilityUnknownResponse, LimitsSetResponse,
+    LimitsShowResponse, LinkPreflightResponse, LinkRequest, LinkResponse, ListActivityResponse,
     ListConflictsResponse, ListConnectionTracesResponse, ListInboxResponse, ListLinksResponse,
     ListQueueItemsResponse, ListRecoveryOperationsResponse, ListSentTransfersResponse,
     ListTrashResponse, ListVersionsResponse, LocalState as WireLocalState,
@@ -39,7 +39,7 @@ use yadorilink_ipc_proto::daemonctl::{
     MaterializationStatusResponse, MembershipHandoffResult, MintInviteCommandResponse,
     MintedInviteInfo, NasAdminFailureKind, ObtainHandoffTicketResponse, OpenNasAdminResponse,
     PauseResponse, PendingEnrollmentKind, PinItemResponse, PreviewSpaceReclaimResponse, QueueItem,
-    ReadoptVolumeResponse, ReceiveTransferResponse, RefusedWithNextStep,
+    ReadoptVolumeResponse, ReceiveTransferResponse, RedeemSendLinkResponse, RefusedWithNextStep,
     ReleaseHandoffTicketResponse, RemoveDeviceCommandResponse, RemovePendingEnrollmentResponse,
     ReplicaMembershipCommandOutcome, ReportingConsentState, ReportingStatusResponse,
     RequestHandoffLeaseResponse, RestoreTrashOperationFailure, RestoreTrashOperationResponse,
@@ -48,7 +48,7 @@ use yadorilink_ipc_proto::daemonctl::{
     RevokeEdgeCommandResponse, RewindActionCounts as WireRewindActionCounts, RewindExecuteResponse,
     RewindPathEntry as WireRewindPathEntry, RewindPlanStale, RewindPreviewResponse, RewindRefused,
     RewindRenameCandidate as WireRewindRenameCandidate, RewindRun as WireRewindRun,
-    RewindRunStarted, RewindStatusResponse, SendFileResponse, SentTransferEntry,
+    RewindRunStarted, RewindStatusResponse, SendFileResponse, SendLinkStatusResponse,
     SetSpaceManagementResponse, SetStorageModeResponse, ShowQueueItemResponse, ShutdownResponse,
     SpaceReclaimPreviewItem, TaskLiveness, TrashedFileInfo, UnlinkResponse, UnpinItemResponse,
 };
@@ -58,6 +58,19 @@ use crate::enrollment_commands::{self, link_refusal_code};
 use crate::pause_deadline::PauseDuration;
 use crate::reporting_ipc;
 use crate::status_report::encode_link_status;
+/// A send command's refusal: typed when the failure is one a front end words itself.
+fn send_failure_payload(failure: crate::send_transfer::SendFailure) -> RespPayload {
+    match failure.code {
+        Some(code) => RespPayload::CommandError(ApplicationCommandError {
+            code: code as i32,
+            message: failure.message,
+            group_ids: Vec::new(),
+            operation_id: String::new(),
+        }),
+        None => RespPayload::Error(failure.message),
+    }
+}
+
 #[cfg(test)]
 #[allow(
     unused_imports,
@@ -242,6 +255,20 @@ pub mod windows_transport {
 
     use crate::control_context::ControlContext;
     use crate::windows_pipe_security::PipeSecurityAttributes;
+
+    /// Waits until a server spawned on `pipe_name` accepts a connection. A fixed sleep after
+    /// spawning cannot promise that on a busy machine (the pipe does not exist until the server
+    /// creates its first instance, and is busy while it creates the next).
+    pub async fn wait_until_bound(pipe_name: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while tokio::net::windows::named_pipe::ClientOptions::new().open(pipe_name).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pipe {pipe_name} was not accepting connections within 10s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
 
     // `PipeSecurityAttributes` holds a raw `*mut c_void` and is therefore
     // `!Send`. Constructing it (and calling `as_mut_ptr` into it) inside a
@@ -452,6 +479,7 @@ async fn handle_request(
             daemon_protocol_version: yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
         };
     }
+    let changes_state = !is_polled_read(&req.payload);
     let payload = match req.payload {
         Some(ReqPayload::Link(r)) => {
             match enrollment_commands::require_risks_acknowledged(
@@ -532,11 +560,23 @@ async fn handle_request(
             }
         }
 
-        Some(ReqPayload::ListLinks(_)) => match context.queries.link_status.list_links() {
+        Some(ReqPayload::ListLinks(_)) => match context.status_hub.list_links().await {
             Ok(links) => RespPayload::ListLinks(ListLinksResponse {
-                links: links.into_iter().map(encode_link_status).collect(),
+                links: links
+                    .into_iter()
+                    .map(encode_link_status)
+                    .map(|mut link| {
+                        // The state and the action only: a listing has no peers to read
+                        // availability or protection from.
+                        link.product = Some(
+                            yadorilink_product_view::ProductStatusSummary::for_folder(&link)
+                                .to_wire(),
+                        );
+                        link
+                    })
+                    .collect(),
             }),
-            Err(e) => RespPayload::Error(e.to_string()),
+            Err(message) => RespPayload::Error(message),
         },
 
         Some(ReqPayload::Pause(r)) => {
@@ -592,9 +632,19 @@ async fn handle_request(
         // `yadorilink versions <path>`.
         Some(ReqPayload::ListVersions(r)) => {
             match context.queries.file_history.list_versions(&r.absolute_path) {
-                Ok(Some(versions)) => RespPayload::ListVersions(ListVersionsResponse {
-                    versions: versions.into_iter().map(version_to_proto).collect(),
-                }),
+                Ok(Some(versions)) => {
+                    match context.queries.file_history.not_kept_spans(&r.absolute_path) {
+                        Ok(spans) => RespPayload::ListVersions(ListVersionsResponse {
+                            versions: versions.into_iter().map(version_to_proto).collect(),
+                            not_kept: spans
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(not_kept_to_proto)
+                                .collect(),
+                        }),
+                        Err(e) => RespPayload::Error(e.to_string()),
+                    }
+                }
                 Ok(None) => RespPayload::Error("path is not under any linked folder".into()),
                 Err(e) => RespPayload::Error(e.to_string()),
             }
@@ -607,7 +657,7 @@ async fn handle_request(
         // being none to restore to is reported as a clear error rather
         // than silently no-op'ing.
         Some(ReqPayload::RestoreVersion(r)) => {
-            match context.queries.linked_path.resolve(&r.absolute_path) {
+            match context.queries.linked_path.resolve_any(&r.absolute_path) {
                 Some((group_id, path)) => {
                     match context
                         .application
@@ -646,20 +696,102 @@ async fn handle_request(
             Err(e) => RespPayload::Error(e.to_string()),
         },
 
+        // The Activity page: recent file events across every linked folder.
+        Some(ReqPayload::ListActivity(r)) => {
+            match context
+                .queries
+                .file_history
+                .list_activity(crate::queries::file_history::activity_query_from_proto(&r))
+            {
+                Ok(events) => RespPayload::ListActivity(ListActivityResponse {
+                    events: events
+                        .into_iter()
+                        .map(crate::queries::file_history::activity_view_to_proto)
+                        .collect(),
+                }),
+                Err(e) => RespPayload::Error(e.to_string()),
+            }
+        }
+
         // Keep this / Keep both: the daemon decides and performs it.
         Some(ReqPayload::ResolveConflict(r)) => {
             RespPayload::ResolveConflict(resolve_conflict(context, &r).await)
         }
 
-        // Track Send: `yadorilink send <source_path> <target_device>`.
+        // Track Send: `yadorilink send <source_path>... <target_device>`.
         Some(ReqPayload::SendFile(r)) => {
-            match context.application.send_transfer.send(&r.source_path, &r.target_device).await {
+            match context.application.send_transfer.send(&r.source_paths, &r.target_device).await {
                 Ok(outcome) => RespPayload::SendFile(SendFileResponse {
                     transfer_id: outcome.transfer_id,
                     files_offered: outcome.files_offered,
                     total_size: outcome.total_size,
                 }),
-                Err(e) => RespPayload::Error(e),
+                Err(e) => send_failure_payload(e),
+            }
+        }
+
+        // Cross-account one-shot Send links: create, redeem, cancel.
+        Some(ReqPayload::CreateSendLink(r)) => {
+            match context
+                .application
+                .send_transfer
+                .create_link(r.ttl_seconds, &r.source_paths)
+                .await
+            {
+                Ok(link) => RespPayload::CreateSendLink(CreateSendLinkResponse {
+                    link_id: link.link_id,
+                    code: link.code,
+                    expires_at_unix: link.expires_at_unix,
+                }),
+                Err(e) => send_failure_payload(e),
+            }
+        }
+        Some(ReqPayload::RedeemSendLink(r)) => {
+            match context
+                .application
+                .send_transfer
+                .redeem_link(&r.code, &r.receiver_device_id, &r.destination_dir)
+                .await
+            {
+                Ok((link_id, destination_dir)) => {
+                    RespPayload::RedeemSendLink(RedeemSendLinkResponse { link_id, destination_dir })
+                }
+                Err(e) => send_failure_payload(e),
+            }
+        }
+        Some(ReqPayload::CancelSendLink(r)) => {
+            match context.application.send_transfer.cancel_link(&r.link_id).await {
+                Ok(()) => RespPayload::CancelSendLink(CancelSendLinkResponse {}),
+                Err(e) => send_failure_payload(e),
+            }
+        }
+        Some(ReqPayload::PreviewSendLink(r)) => {
+            match context.application.send_transfer.preview_link(&r.code).await {
+                Ok(preview) => RespPayload::PreviewSendLink(
+                    yadorilink_ipc_proto::daemonctl::PreviewSendLinkResponse {
+                        sender_name: preview.sender_name,
+                        files: preview
+                            .files
+                            .into_iter()
+                            .map(|(name, size)| yadorilink_ipc_proto::daemonctl::SendLinkFile {
+                                name,
+                                size,
+                            })
+                            .collect(),
+                        expires_at_unix: preview.expires_at_unix,
+                    },
+                ),
+                Err(e) => send_failure_payload(e),
+            }
+        }
+        Some(ReqPayload::SendLinkStatus(r)) => {
+            match context.application.send_transfer.link_status(&r.link_id).await {
+                Ok(view) => RespPayload::SendLinkStatus(SendLinkStatusResponse {
+                    state: view.state as i32,
+                    receiver_device_name: view.receiver_device_name,
+                    transfer_id: view.transfer_id,
+                }),
+                Err(e) => send_failure_payload(e),
             }
         }
 
@@ -668,19 +800,7 @@ async fn handle_request(
             Ok(transfers) => RespPayload::ListInbox(ListInboxResponse {
                 transfers: transfers
                     .into_iter()
-                    .map(|t| InboxTransfer {
-                        transfer_id: t.transfer_id,
-                        sender_device_id: t.sender_device_id,
-                        files: t
-                            .files
-                            .into_iter()
-                            .map(|(relative_path, size)| InboxFileSummary { relative_path, size })
-                            .collect(),
-                        total_size: t.total_size,
-                        offered_at_unix_nanos: t.offered_at_unix_nanos,
-                        status: t.status.to_string(),
-                        failure: t.failure.unwrap_or_default(),
-                    })
+                    .map(crate::send_transfer::inbox_entry_to_proto)
                     .collect(),
             }),
             Err(e) => RespPayload::Error(e),
@@ -691,20 +811,7 @@ async fn handle_request(
             Ok(transfers) => RespPayload::ListSentTransfers(ListSentTransfersResponse {
                 transfers: transfers
                     .into_iter()
-                    .map(|t| SentTransferEntry {
-                        transfer_id: t.transfer_id,
-                        target_device_id: t.target_device_id,
-                        files: t
-                            .files
-                            .into_iter()
-                            .map(|(relative_path, size)| InboxFileSummary { relative_path, size })
-                            .collect(),
-                        total_size: t.total_size,
-                        created_at_unix_nanos: t.created_at_unix_nanos,
-                        status: t.status.to_string(),
-                        failure: t.failure.unwrap_or_default(),
-                        can_retry: t.can_retry,
-                    })
+                    .map(crate::send_transfer::sent_entry_to_proto)
                     .collect(),
             }),
             Err(e) => RespPayload::Error(e),
@@ -790,13 +897,13 @@ async fn handle_request(
                     files_received: outcome.files_received,
                     bytes_received: outcome.bytes_received,
                 }),
-                Err(e) => RespPayload::Error(e),
+                Err(e) => send_failure_payload(e),
             }
         }
 
         // `yadorilink trash restore <path>`.
         Some(ReqPayload::RestoreTrash(r)) => {
-            match context.queries.linked_path.resolve(&r.absolute_path) {
+            match context.queries.linked_path.resolve_any(&r.absolute_path) {
                 Some((group_id, path)) => {
                     match context
                         .application
@@ -814,7 +921,7 @@ async fn handle_request(
 
         // `yadorilink trash restore --folder <path>`.
         Some(ReqPayload::RestoreTrashOperation(r)) => {
-            match context.queries.linked_path.resolve(&r.absolute_path) {
+            match context.queries.linked_path.resolve_any(&r.absolute_path) {
                 Some((group_id, path)) => {
                     match context
                         .application
@@ -921,12 +1028,10 @@ async fn handle_request(
             }
         }
 
-        Some(ReqPayload::Status(_)) => {
-            match crate::status_report::build_status(context, Some(&context.config_dir)) {
-                Ok(response) => RespPayload::Status(response),
-                Err(message) => RespPayload::Error(message),
-            }
-        }
+        Some(ReqPayload::Status(_)) => match context.status_hub.status().await {
+            Ok(response) => RespPayload::Status(response),
+            Err(message) => RespPayload::Error(message),
+        },
 
         Some(ReqPayload::LimitsSet(r)) => {
             match context
@@ -950,6 +1055,23 @@ async fn handle_request(
             })
         }
 
+        // The folder a command line names, a plain linked folder or a File Provider folder at its
+        // place in the file manager: the one resolver, and only the folder itself.
+        Some(ReqPayload::ResolveFolder(r)) => {
+            use crate::queries::linked_path::FolderPath;
+            match context.queries.linked_path.resolve_folder(&r.path) {
+                FolderPath::Folder(group_id) => RespPayload::ResolveFolder(
+                    yadorilink_ipc_proto::daemonctl::ResolveFolderResponse { group_id },
+                ),
+                FolderPath::Inside(_) => RespPayload::Error(format!(
+                    "{} is inside a linked folder, not the folder itself: name the folder",
+                    r.path
+                )),
+                FolderPath::NotLinked => {
+                    RespPayload::Error(format!("{} is not a linked folder", r.path))
+                }
+            }
+        }
         Some(ReqPayload::Hydrate(r)) => match context.queries.linked_path.resolve(&r.absolute_path)
         {
             Some((group_id, path)) => {
@@ -973,6 +1095,7 @@ async fn handle_request(
                         dehydrated: outcome.dehydrated,
                         blocks_reclaimed: outcome.blocks_reclaimed,
                         bytes_reclaimed: outcome.bytes_reclaimed,
+                        not_freed_reason: outcome.not_freed.map(str::to_owned).unwrap_or_default(),
                         ..Default::default()
                     }),
                     Err(e) => RespPayload::Error(e.to_string()),
@@ -991,6 +1114,7 @@ async fn handle_request(
                                 .retained
                                 .map(|why| why.code().to_owned())
                                 .unwrap_or_default(),
+                            not_freed_reason: String::new(),
                         }),
                         Err(e) => RespPayload::Error(e.to_string()),
                     }
@@ -1008,6 +1132,10 @@ async fn handle_request(
                     Ok(outcome) => RespPayload::PinItem(PinItemResponse {
                         retention: Some(retention_to_proto(outcome.retention)),
                         download_error: outcome.download_error.unwrap_or_default(),
+                        history_not_kept_reason: outcome
+                            .history_not_kept_reason
+                            .unwrap_or_default()
+                            .to_owned(),
                     }),
                     Err(e) => RespPayload::Error(e.to_string()),
                 }
@@ -1115,7 +1243,7 @@ async fn handle_request(
             }
         }
 
-        Some(ReqPayload::Shutdown(_)) => {
+        Some(ReqPayload::Shutdown(request)) => {
             tracing::info!("shutdown requested via control socket");
             // route through the same graceful-shutdown path
             // `main.rs` uses for SIGTERM/SIGINT instead of calling
@@ -1126,7 +1254,11 @@ async fn handle_request(
             // once it observes this; a `send` error just means every
             // receiver (i.e. `main.rs` itself) is already gone, which
             // only happens if the process is already on its way out.
-            context.application.lifecycle.request_shutdown();
+            if request.restart {
+                context.application.lifecycle.request_shutdown_to_restart();
+            } else {
+                context.application.lifecycle.request_shutdown();
+            }
             RespPayload::Shutdown(ShutdownResponse {})
         }
 
@@ -1322,10 +1454,23 @@ async fn handle_request(
         // is surfaced directly as `DaemonControlResponse.error`, same as
         // every other fallible request in this match.
         Some(ReqPayload::Gc(r)) => match context.application.gc.run_sweep(r.dry_run).await {
-            Ok(report) => RespPayload::Gc(GcResponse {
-                blocks_deleted: report.blocks_deleted,
-                bytes_reclaimed: report.bytes_reclaimed,
-            }),
+            Ok(report) => {
+                let usage = if r.dry_run {
+                    context.queries.file_history.kept_history_usage().ok()
+                } else {
+                    None
+                };
+                let (kept_history_bytes, kept_history_versions) = match usage {
+                    Some((bytes, versions)) => (Some(bytes), Some(versions)),
+                    None => (None, None),
+                };
+                RespPayload::Gc(GcResponse {
+                    blocks_deleted: report.blocks_deleted,
+                    bytes_reclaimed: report.bytes_reclaimed,
+                    kept_history_bytes,
+                    kept_history_versions,
+                })
+            }
             Err(e) => RespPayload::Error(e.to_string()),
         },
 
@@ -1453,15 +1598,20 @@ async fn handle_request(
         // local-record round trip this drives.
         Some(ReqPayload::RequestHandoffLease(r)) => {
             match context.application.handoff.request_lease(&r.group_id).await {
-                Some(grant) => RespPayload::RequestHandoffLease(RequestHandoffLeaseResponse {
+                Ok(grant) => RespPayload::RequestHandoffLease(RequestHandoffLeaseResponse {
                     requested: true,
                     lease_id: grant.lease_id,
                     expires_at_unix: grant.expires_at_unix,
+                    not_requested_reason: String::new(),
                 }),
-                None => RespPayload::RequestHandoffLease(RequestHandoffLeaseResponse {
+                Err(refusal) => RespPayload::RequestHandoffLease(RequestHandoffLeaseResponse {
                     requested: false,
                     lease_id: String::new(),
                     expires_at_unix: 0,
+                    not_requested_reason: match refusal {
+                        LeaseRefusal::ChangingRetry => "changing_retry".to_owned(),
+                        LeaseRefusal::Unspecified => String::new(),
+                    },
                 }),
             }
         }
@@ -1747,10 +1897,30 @@ async fn handle_request(
         None => RespPayload::Error("empty request".to_string()),
     };
 
+    // Every request counts as changing state unless it is one of the reads shells poll: a poll
+    // that bumped the epoch would make the next status wait for a rebuild.
+    if changes_state {
+        context.status_hub.command_completed();
+    }
     DaemonControlResponse {
         payload: Some(payload),
         daemon_protocol_version: yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
     }
+}
+
+/// The requests that only read, and that shells ask repeatedly. Anything not listed is treated as
+/// changing state (see `StatusHub`), which costs at worst one extra build.
+fn is_polled_read(payload: &Option<ReqPayload>) -> bool {
+    matches!(
+        payload,
+        Some(
+            ReqPayload::Status(_)
+                | ReqPayload::ListLinks(_)
+                | ReqPayload::Health(_)
+                | ReqPayload::Identify(_)
+                | ReqPayload::ListConflicts(_)
+        )
+    )
 }
 
 // `classify_link_failure`/`enrollment_link_to_request` live in
@@ -2140,14 +2310,34 @@ fn rewind_run_to_proto(run: yadorilink_replica_domain::rewind::RewindRun) -> Wir
     }
 }
 
-fn version_to_proto(v: yadorilink_replica_domain::session_state::VersionRecord) -> FileVersionInfo {
+fn not_kept_to_proto(
+    span: yadorilink_sync_sqlite::history_freed::FreedSpan,
+) -> yadorilink_ipc_proto::daemonctl::NotKeptSpan {
+    yadorilink_ipc_proto::daemonctl::NotKeptSpan {
+        from_unix_nanos: span.from_unix_nanos,
+        to_unix_nanos: span.to_unix_nanos,
+        from_seq: span.from_seq,
+        to_seq: span.to_seq,
+        reason: span.reason.as_str().to_string(),
+    }
+}
+
+fn version_to_proto(view: crate::queries::file_history::VersionView) -> FileVersionInfo {
+    use crate::queries::file_history::VersionContent;
+    use yadorilink_ipc_proto::daemonctl::VersionContent as Wire;
+    let v = view.record;
     FileVersionInfo {
+        content: match view.content {
+            VersionContent::NotApplicable => Wire::NotApplicable,
+            VersionContent::Kept => Wire::Kept,
+            VersionContent::NotKept => Wire::NotKept,
+        } as i32,
         version_seq: v.version_seq,
         size: v.size as i64,
         mtime_unix_nanos: v.mtime_unix_nanos,
         state: v.state.as_db_str().to_string(),
         origin_device_id: v.origin_device_id.unwrap_or_default(),
-        unix_mode: v.unix_mode,
+        exec: v.exec,
         kind: entry_kind_to_proto(v.record_kind) as i32,
     }
 }
@@ -2247,7 +2437,7 @@ async fn resolve_conflict(
             };
         }
     };
-    let result = match context.queries.linked_path.resolve(&request.copy_path) {
+    let result = match resolve_item(context, &request.copy_path) {
         None => refusal(
             ApplicationErrorCode::TargetNotFound,
             "path is not under any linked folder".into(),
@@ -2309,11 +2499,7 @@ fn resolve_item(
     context: &crate::control_context::ControlContext,
     absolute_path: &str,
 ) -> Option<(String, String)> {
-    context
-        .queries
-        .linked_path
-        .resolve(absolute_path)
-        .or_else(|| context.queries.linked_path.resolve_provider(absolute_path))
+    context.queries.linked_path.resolve_any(absolute_path)
 }
 
 /// What `item_actions` reads about one item.
@@ -2416,6 +2602,8 @@ mod migration_safety_tests;
 
 #[cfg(test)]
 mod link_risk_tests;
+#[cfg(test)]
+mod resolve_folder_tests;
 
 #[cfg(test)]
 mod nas_admin_wire_tests;

@@ -115,6 +115,18 @@ pub(crate) struct LinkStatusView {
     pub(crate) paused: bool,
     /// Unix time a timed pause ends; 0 when not paused or paused until resumed.
     pub(crate) paused_until_unix: i64,
+    /// Why the folder cannot be written, empty when it can (a filesystem probe, collected off the
+    /// request path); always empty for a provider folder.
+    pub(crate) root_access_warning: String,
+    /// A stored file record of the folder that cannot be read back; empty when none.
+    pub(crate) index_damaged_path: String,
+    /// This device's history can no longer catch up by deltas: a verified closure puts the
+    /// installed frontier out of step with its peers'. The device takes a peer's sealed state
+    /// when one is connected.
+    pub(crate) rebuild_needed: bool,
+    /// Versions not kept because the disk was nearly full: in the last day, and in the last 30.
+    pub(crate) history_skipped_last_day: u32,
+    pub(crate) history_skipped_last_30_days: u32,
     pub(crate) conflict_count: u64,
     /// Paths contested in the replicated state, not yet resolved by their fork.
     pub(crate) conflicts_pending: u64,
@@ -126,6 +138,9 @@ pub(crate) struct LinkStatusView {
     pub(crate) hydrated_count: u64,
     pub(crate) placeholder_count: u64,
     pub(crate) hydrating_count: u64,
+    /// Content bytes of the live regular files / of those held only as placeholders.
+    pub(crate) total_bytes: u64,
+    pub(crate) online_only_bytes: u64,
     /// Content fetches requested and not finished (see `LinkStatus.requested_content_count`).
     pub(crate) requested_content_count: u64,
     pub(crate) held_files: Vec<HeldFileView>,
@@ -180,8 +195,66 @@ pub(crate) struct LinkStatusView {
     pub(crate) custody_confirmed_by: Vec<String>,
 }
 
+impl LinkStatusView {
+    /// Reports protection and availability as unknown: for facts too old to stand a positive
+    /// claim on. Never `Pending`, which would hide the unknown from the attention rollup.
+    pub(crate) fn withhold_positive_claims(&mut self) {
+        self.durability_status = GroupDurabilityStatus::Unknown;
+        self.durability_evidence = DurabilityEvidence::None;
+        self.durability_check_pending = false;
+        self.fetch_availability = FetchAvailability::Unknown;
+        self.custody_confirmed_by.clear();
+    }
+}
+
+/// Everything one link's status reads from the ledger, the filesystem and the block store,
+/// collected off the request path; composing it with the in-memory facts reads none of them.
+pub(crate) struct LinkFacts {
+    pub(crate) link: yadorilink_replica_domain::session_state::FolderLink,
+    pub(crate) counts: yadorilink_sync_sqlite::MaterializationCounts,
+    pub(crate) db: crate::group_db_facts::CollectedDb,
+    pub(crate) conflict_count: u64,
+    pub(crate) conflicts_pending: u64,
+    pub(crate) held_files: Vec<HeldFileView>,
+    pub(crate) skipped_symlink_count: u64,
+    pub(crate) stranded_directory_count: u64,
+    pub(crate) paused_until_unix: i64,
+    pub(crate) provider: Option<(String, String)>,
+    pub(crate) ambiguous_local_paths: Vec<String>,
+    pub(crate) capture_volume_changed: bool,
+    pub(crate) capture_volume_unconfirmed: bool,
+    pub(crate) conflict_note: String,
+    pub(crate) root_access_warning: String,
+    /// Every placeholder can be opened from blocks this device already holds; false when the
+    /// link is fully hydrated.
+    pub(crate) placeholders_held_locally: bool,
+    /// A path with a current, materialized row has a pending local edit or delete in the dirty
+    /// journal (or the journal could not be read): the row's claim about its bytes is not
+    /// settled.
+    pub(crate) dirty_content: bool,
+    /// A stored file record of the folder that cannot be read back, found by the audit of
+    /// `crate::index_audit`.
+    pub(crate) index_damaged_path: Option<String>,
+    pub(crate) rebuild_needed: bool,
+    pub(crate) history_skipped_last_day: u32,
+    pub(crate) history_skipped_last_30_days: u32,
+}
+
+impl LinkFacts {
+    pub(crate) fn local_path(&self) -> &str {
+        self.link.key()
+    }
+
+    pub(crate) fn group_id(&self) -> &str {
+        &self.link.group_id
+    }
+}
+
 pub(crate) trait LinkStatusReadPort: Send + Sync {
+    /// Collects and composes in place; for a caller that decides something from the answer.
     fn list_links(&self) -> Result<Vec<LinkStatusView>, crate::sync_error::SyncError>;
+    fn collect_links(&self) -> Result<Vec<LinkFacts>, crate::sync_error::SyncError>;
+    fn compose_links(&self, facts: &[LinkFacts]) -> Vec<LinkStatusView>;
 }
 
 pub(crate) struct LinkStatusQueryService {
@@ -195,5 +268,13 @@ impl LinkStatusQueryService {
 
     pub(crate) fn list_links(&self) -> Result<Vec<LinkStatusView>, crate::sync_error::SyncError> {
         self.reader.list_links()
+    }
+
+    pub(crate) fn collect_links(&self) -> Result<Vec<LinkFacts>, crate::sync_error::SyncError> {
+        self.reader.collect_links()
+    }
+
+    pub(crate) fn compose_links(&self, facts: &[LinkFacts]) -> Vec<LinkStatusView> {
+        self.reader.compose_links(facts)
     }
 }

@@ -7,6 +7,12 @@
 
 use crate::exe_replaced::SUPERVISED_ARG;
 
+/// Container/systemd health probe: succeeds only when a daemon answers a status request.
+pub const HEALTHCHECK_ARG: &str = "--healthcheck";
+
+/// Installer probe: can this build use the data already on this device? See [`crate::data_compat`].
+pub const CHECK_DATA_COMPAT_ARG: &str = "--check-data-compat";
+
 /// What the process was asked to do.
 #[derive(Debug, PartialEq, Eq)]
 pub enum LaunchAction {
@@ -16,6 +22,10 @@ pub enum LaunchAction {
     Version,
     /// Print usage and exit 0.
     Help,
+    /// Ask the running daemon (over its control socket) whether it is healthy; exit 0 or 1.
+    Healthcheck,
+    /// Read the state database read-only and say, by exit status, whether this build can use it.
+    CheckDataCompat,
     /// Print the refusal and usage to stderr and exit 2; carries the offending argument.
     Refuse(String),
 }
@@ -34,6 +44,12 @@ where
     if args.iter().any(|a| a == "--version" || a == "-V") {
         return LaunchAction::Version;
     }
+    if args.iter().any(|a| a == HEALTHCHECK_ARG) {
+        return LaunchAction::Healthcheck;
+    }
+    if args.iter().any(|a| a == CHECK_DATA_COMPAT_ARG) {
+        return LaunchAction::CheckDataCompat;
+    }
     match args.into_iter().find(|a| a != SUPERVISED_ARG) {
         Some(unknown) => LaunchAction::Refuse(unknown),
         None => LaunchAction::Run,
@@ -43,11 +59,14 @@ where
 /// The usage text.
 pub fn usage() -> String {
     format!(
-        "Usage: yadorilink-daemon [{SUPERVISED_ARG}]\n\n\
+        "Usage: yadorilink-daemon [{SUPERVISED_ARG}] | {HEALTHCHECK_ARG} | {CHECK_DATA_COMPAT_ARG}\n\n\
          Runs the YadoriLink sync daemon in the foreground. Settings come from the environment, \
          not from arguments.\n\n\
          Options:\n  \
          {SUPERVISED_ARG}  exit with a restart status when the installed executable is replaced\n  \
+         {HEALTHCHECK_ARG}  exit 0 if the daemon on this state directory answers, 1 otherwise\n  \
+         {CHECK_DATA_COMPAT_ARG}  read the data on this device without changing it; exit 0 if this \
+         build can use it (or there is none), 20 if a newer build wrote it, 21 if that cannot be told\n  \
          -h, --help  print this help and exit\n  \
          -V, --version  print the version and exit\n"
     )
@@ -81,6 +100,16 @@ mod tests {
         for args in shipped {
             assert_eq!(classify(args.iter().copied()), LaunchAction::Run, "{args:?}");
         }
+    }
+
+    #[test]
+    fn the_data_check_never_starts_a_daemon() {
+        assert_eq!(classify(["--check-data-compat"]), LaunchAction::CheckDataCompat);
+    }
+
+    #[test]
+    fn healthcheck_never_starts_a_daemon() {
+        assert_eq!(classify(["--healthcheck"]), LaunchAction::Healthcheck);
     }
 
     #[test]

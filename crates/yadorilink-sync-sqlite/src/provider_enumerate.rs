@@ -30,7 +30,7 @@ pub struct ShownItem {
     pub kind: RecordKind,
     pub size: u64,
     pub mtime_unix_nanos: i64,
-    pub unix_mode: u32,
+    pub exec: bool,
     pub content_version: VersionHash,
     pub metadata_version: [u8; 32],
     pub content_pending: bool,
@@ -43,6 +43,10 @@ pub struct ShownItem {
     /// Download"). Decided from current state each time the item is read; false whenever the state
     /// that decides it cannot be read.
     pub eviction_allowed: bool,
+    /// The row's materialization state on this device: whether the engine holds the item's
+    /// bytes. `None` for a structural directory (no row of its own) and whenever the row cannot
+    /// be read.
+    pub materialization: Option<yadorilink_replica_domain::session_state::MaterializationState>,
 }
 
 impl ShownItem {
@@ -97,7 +101,7 @@ impl yadorilink_sqlite_runtime::SqlOperationError for EnumerateError {
 
 /// The version a structural directory (one with no row of its own) is shown at.
 pub(crate) fn structural_version() -> FileVersion {
-    FileVersion::directory(Some(0o755))
+    FileVersion::directory()
 }
 
 struct Candidate {
@@ -228,6 +232,28 @@ fn os_may_drop_copy(
     Ok(!kept)
 }
 
+/// The materialization state of the row at `path`; `None` when there is none or it cannot be
+/// read (the item is then reported as unknown, never as absent).
+fn engine_materialization(
+    conn: &rusqlite::Connection,
+    group_id: &str,
+    path: &str,
+) -> Option<yadorilink_replica_domain::session_state::MaterializationState> {
+    let state: Option<String> = conn
+        .query_row(
+            "SELECT materialization_state FROM files \
+             WHERE group_id = ?1 AND path = ?2 AND state = 'current' AND deleted = 0",
+            rusqlite::params![group_id, path],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    state
+        .as_deref()
+        .map(yadorilink_replica_domain::session_state::MaterializationState::from_db_str)
+}
+
 fn shown_item(
     conn: &rusqlite::Connection,
     group_id: &str,
@@ -259,13 +285,14 @@ fn shown_item(
         kind: version.meta.record_kind,
         size: version.size,
         mtime_unix_nanos: version.meta.mtime_unix_nanos,
-        unix_mode: version.meta.unix_mode.unwrap_or(0) & 0o7777,
+        exec: version.meta.exec,
         content_version: version.version_hash,
         metadata_version: metadata_version(&version),
         content_pending: pending,
         symlink_target: version.meta.symlink_target.clone().unwrap_or_default(),
         generation: state.generation,
         eviction_allowed: os_may_drop_copy(conn, group_id, path, version.meta.record_kind)?,
+        materialization: engine_materialization(conn, group_id, path),
         parent_generation: {
             let parent_path = split_parent(path).0;
             if parent_path.is_empty() {
@@ -872,6 +899,35 @@ impl ProviderRepository {
                 anchor: namespace_revision(conn, root_id)?,
             })
         })
+    }
+}
+
+/// How many change events a provider root keeps, and for how long: the retention of the anchors
+/// the OS holds. An anchor older than this is answered "expired" and the OS enumerates in full.
+pub const CHANGE_EVENTS_KEEP: usize = 10_000;
+pub const CHANGE_EVENTS_MAX_AGE_S: i64 = 30 * 86_400;
+
+impl ProviderRepository {
+    /// Applies the change-event retention to every provider root, so the feed (and the database)
+    /// stays bounded however rarely the OS asks. Returns how many events were dropped.
+    ///
+    /// # Errors
+    /// Database failures.
+    pub fn prune_all_change_events(&self, now_s: i64) -> Result<usize, SyncSqliteError> {
+        let roots: Vec<String> = self.database_for_write().read::<_, SyncSqliteError>(|conn| {
+            let mut stmt = conn.prepare("SELECT root_id FROM provider_roots")?;
+            let rows = stmt.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            Ok(rows)
+        })?;
+        let mut dropped = 0;
+        for root in roots {
+            dropped += self.prune_change_events(
+                &root,
+                CHANGE_EVENTS_KEEP,
+                now_s.saturating_sub(CHANGE_EVENTS_MAX_AGE_S),
+            )?;
+        }
+        Ok(dropped)
     }
 }
 

@@ -55,7 +55,7 @@ rejected with a message asking to restart or finish updating.
 
 This section states exactly what happens while some of your devices run a newer or
 older release than others. It applies to the pre-1.0 line, including
-v0.1.0-beta.8, and complements the policy above and [CUTOVER.md](CUTOVER.md) (the generation
+v0.1.0-beta.9, and complements the policy above and [CUTOVER.md](CUTOVER.md) (the generation
 ledger). The enforced rule is about protocol generations, not release numbers:
 **devices on different protocol generations do not sync with each other.** They
 refuse each other cleanly, and nothing is lost while they wait for the update.
@@ -134,15 +134,15 @@ differs; the release notes say when.
 
 ### Releases of the current generation
 
-v0.1.0-beta.5, the first public release, v0.1.0-beta.6, v0.1.0-beta.7 and v0.1.0-beta.8 all
+v0.1.0-beta.5, the first public release, v0.1.0-beta.6, v0.1.0-beta.7, v0.1.0-beta.8 and v0.1.0-beta.9 all
 carry the same protocol generation (`PROTOCOL_VERSION` 4, `RPC_VERSION` 2). Their
 peers pass the lane hello and service RPC checks and can talk to each other; no
 code compares the release number. No build before beta.5 was public, so no
 older peer is supported and none is promised.
 
 The local state schema is separate and is per device, not part of the peer
-handshake. `SCHEMA_VERSION` is 132 in beta.5 and 133 in beta.6, beta.7 and beta.8.
+handshake. `SCHEMA_VERSION` is 132 in beta.5, 133 in beta.6, beta.7 and beta.8, and 134 in beta.9.
 Nothing is migrated, so a build refuses a state database of the other schema
-(beta.5 and beta.6, beta.7 or beta.8 refuse each other's database). A device that
-moves between beta.5 and a later beta must recreate its local state as described
+(beta.5, beta.6 to beta.8, and beta.9 each refuse the others' database). A device that
+moves between these groups must recreate its local state as described
 in the release notes; after that it can sync with peers on the other release.

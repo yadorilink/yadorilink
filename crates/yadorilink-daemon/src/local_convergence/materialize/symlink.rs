@@ -11,6 +11,7 @@ impl super::super::LocalConvergenceExecutor {
     pub(super) fn materialize_symlink_lane(
         &self,
         plan: &MaterializationPlan<'_>,
+        proofs: &yadorilink_sync_sqlite::retention::RetentionProofs,
     ) -> Result<LocalMaterializeOutcome, PeerSessionError> {
         let MaterializationPlan {
             group_id,
@@ -22,7 +23,7 @@ impl super::super::LocalConvergenceExecutor {
             ..
         } = *plan;
         if let Some(reason) = &plan.hazard_reason {
-            return self.hold_for_hazard(plan, reason);
+            return self.hold_for_hazard(plan, reason, proofs);
         }
         // The same last line of defence the content, placeholder and
         // tombstone lanes have: creating the link renames it over whatever
@@ -138,6 +139,7 @@ impl super::super::LocalConvergenceExecutor {
                 windows_opt_in,
                 origin_device_id,
                 authoring,
+                retention: yadorilink_sync_sqlite::retention::Retention::Proofs(proofs),
                 permit: root_commit_permit,
             },
             record,
@@ -160,9 +162,6 @@ impl super::super::LocalConvergenceExecutor {
                     RecordKind::Symlink,
                     &written,
                     mutation_generation,
-                    // A symlink version carries no replicated xattrs; the
-                    // gate only applies to regular files.
-                    &super::super::types::XattrEvidence::ReproveFromDisk,
                 )? {
                     Some(evidence) => Ok(MaterializeResult::Settled(evidence).into()),
                     None => Ok(MaterializeResult::RetryRequired.into()),

@@ -318,9 +318,8 @@ fn commit_chunk_in_tx(
             row.size,
             row.mtime_unix_nanos,
             row.record_kind,
-            row.unix_mode,
+            row.exec,
             row.symlink_target,
-            row.xattrs,
         );
         if version.version_hash != hash {
             return Err(changed(&entry.path));

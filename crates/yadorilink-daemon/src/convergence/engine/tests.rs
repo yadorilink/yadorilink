@@ -1,8 +1,9 @@
 #![cfg(test)]
 
 use super::{
-    majority_author, origin_first_indices, parse_reconcile_paths, rotation_indices,
-    MAX_JOBS_PER_TICK_PER_GROUP, MAX_PATHS_PER_RECONCILE_ATTEMPT, MAX_RECONCILE_PATHS_OVERRIDE,
+    idle_wait, majority_author, origin_first_indices, parse_reconcile_paths, rotation_indices,
+    RunOnceOutcome, FALLBACK_POLL_INTERVAL, IDLE_BACKSTOP_INTERVAL, MAX_JOBS_PER_TICK_PER_GROUP,
+    MAX_PATHS_PER_RECONCILE_ATTEMPT, MAX_RECONCILE_PATHS_OVERRIDE, MIN_DEADLINE_WAIT,
 };
 
 #[test]
@@ -230,4 +231,25 @@ fn the_default_window_equals_the_default_write_concurrency() {
         MAX_PATHS_PER_RECONCILE_ATTEMPT,
         crate::local_convergence::reconcile_native::DEFAULT_RECEIVE_WRITE_CONCURRENCY
     );
+}
+
+fn idle(wait_for_write: bool, wake_at: Option<i64>) -> RunOnceOutcome {
+    RunOnceOutcome { immediate_backlog: false, wait_for_write, wake_at }
+}
+
+/// A tick with nothing runnable sleeps until the earliest backed-off deadline, or the backstop
+/// when no row is waiting on the clock (standing parked, paused or held rows do not shorten it:
+/// a write unblocks those). Only a tick that could not read the table keeps the one-second poll.
+#[test]
+fn an_idle_engine_sleeps_to_the_next_deadline_not_a_one_second_poll() {
+    let now = 1_000_000_000_000;
+    assert_eq!(idle_wait(&idle(true, None), now), IDLE_BACKSTOP_INTERVAL);
+    assert_eq!(
+        idle_wait(&idle(true, Some(now + 7_000_000_000)), now),
+        std::time::Duration::from_secs(7)
+    );
+    // Far deadlines wait no longer than the backstop; past ones are looked at again shortly.
+    assert_eq!(idle_wait(&idle(true, Some(now + 900_000_000_000)), now), IDLE_BACKSTOP_INTERVAL);
+    assert_eq!(idle_wait(&idle(true, Some(now - 5)), now), MIN_DEADLINE_WAIT);
+    assert_eq!(idle_wait(&idle(false, None), now), FALLBACK_POLL_INTERVAL);
 }

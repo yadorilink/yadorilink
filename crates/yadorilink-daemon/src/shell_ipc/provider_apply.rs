@@ -12,6 +12,14 @@
 //! known and ready, and the group's authorization (the authoring layer's own refusal) decides the
 //! role. A failure never evicts or drops the user's local bytes; the failure codes say what the
 //! extension does with them.
+//!
+//! The embedding app (iOS) asks without a socket, through [`apply_for_app`]: the caller is the
+//! process that owns the engine, so there is no connection to vouch for and no host to be
+//! attached. What the app's write needs is the declared root without an error of its own; the
+//! domain being registered with the OS, or an extension having run once, is evidence about the
+//! Files app and not about this engine's data, so it is not required. Every other check (the
+//! group's authorization, the base, the identity of the operation, durable before acknowledged)
+//! is the same code.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -49,6 +57,15 @@ const CANCELLED: u8 = 1;
 const COMMITTING: u8 = 2;
 
 type Gate = Arc<std::sync::atomic::AtomicU8>;
+
+/// Who is asking, which decides what vouches for the request.
+enum Caller<'a> {
+    /// A connection of the shell socket: it must have sent the extension handshake for the root,
+    /// with a host app attached, and the root must be ready.
+    Extension(&'a Arc<Handshakes>),
+    /// The process that owns the engine.
+    App,
+}
 
 /// What one connection knows: the roots whose extension handshake it sent, and the commit gate
 /// of each apply request it has in flight.
@@ -199,19 +216,9 @@ fn start(
     let handle = tokio::spawn(async move {
         let _reserved = reserved;
         let _gate_guard = gate_guard;
-        let outcome = run(&context, &handshakes, &request, &gate).await;
+        let outcome = run(&context, Caller::Extension(&handshakes), &request, &gate).await;
         if let Err(failure) = &outcome {
-            // The message can quote a file or folder name ("x is taken"): it is logged only at debug.
-            tracing::debug!(error = %failure.error, "the refused provider change's message");
-            tracing::warn!(
-                code = ?failure.code,
-                kind = request.kind,
-                item = %hex::encode(&request.item_id),
-                operation_seq = request.operation_seq,
-                base_generation = ?request.base_generation,
-                parent_generation = ?request.parent_generation,
-                "a provider change was not applied"
-            );
+            log_refusal(&request, failure);
         }
         // The one terminal transition: only the side that takes the handle answers.
         let claimed = registry
@@ -222,6 +229,8 @@ fn start(
         if claimed.is_none() {
             return;
         }
+        // Before the answer, so a status after the host sees it shows the change.
+        context.telemetry.command_completed();
         send_plain(
             &reply,
             response_of(&request.request_id, &request.session_id, request.operation_seq, outcome),
@@ -253,15 +262,15 @@ fn fingerprint(request: &ProviderApplyChangeRequest) -> [u8; 32] {
     }
     put("symlink", &request.symlink_target);
     if let Some(meta) = &request.metadata {
-        put("mode", &meta.unix_mode.map_or(Vec::new(), |m| m.to_be_bytes().to_vec()));
+        put("exec", &meta.exec.map_or(Vec::new(), |e| vec![u8::from(e)]));
         put("mtime", &meta.mtime_unix_nanos.map_or(Vec::new(), |m| m.to_be_bytes().to_vec()));
-        put("replace-xattrs", &[meta.replace_xattrs as u8]);
-        for xattr in &meta.xattrs {
-            put("xattr-name", xattr.name.as_bytes());
-            put("xattr-value", &xattr.value);
-        }
     }
     put("recursive", &[request.recursive as u8]);
+    // Only when present, so the fingerprint of every earlier operation is unchanged.
+    if let Some(restore) = &request.restore_from {
+        put("restore-path", restore.path.as_bytes());
+        put("restore-version", &restore.version_hash);
+    }
     // The view the operation was made against: a retry with another view is another operation.
     for (tag, value) in [
         ("base-generation", request.base_generation),
@@ -367,18 +376,50 @@ fn journal_upload(
     Ok(Some(used))
 }
 
+/// One request of the embedding app: the same decision and commit as a socket request, answered
+/// as the wire response (a typed refusal is a response, never an error of the call). Nothing
+/// cancels it once started; a caller that gave up replays the same operation identity to learn
+/// the outcome.
+pub(crate) async fn apply_for_app(
+    context: &Arc<ShellContext>,
+    request: &ProviderApplyChangeRequest,
+) -> ProviderApplyChangeResponse {
+    let gate: Gate = Arc::new(std::sync::atomic::AtomicU8::new(RUNNING));
+    let outcome = run(context, Caller::App, request, &gate).await;
+    if let Err(failure) = &outcome {
+        log_refusal(request, failure);
+    }
+    response_for(&request.request_id, &request.session_id, request.operation_seq, outcome)
+}
+
+fn log_refusal(request: &ProviderApplyChangeRequest, failure: &Failure) {
+    // The message can quote a file or folder name ("x is taken"): it is logged only at debug.
+    tracing::debug!(error = %failure.error, "the refused provider change's message");
+    tracing::warn!(
+        code = ?failure.code,
+        kind = request.kind,
+        item = %hex::encode(&request.item_id),
+        operation_seq = request.operation_seq,
+        base_generation = ?request.base_generation,
+        parent_generation = ?request.parent_generation,
+        "a provider change was not applied"
+    );
+}
+
 async fn run(
     context: &Arc<ShellContext>,
-    handshakes: &Arc<Handshakes>,
+    caller: Caller<'_>,
     request: &ProviderApplyChangeRequest,
     gate: &Gate,
 ) -> Result<ApplyResult, Failure> {
     // Who may ask.
-    if !handshakes.has(&request.root_id) || !context.provider_host.host_connected() {
-        return Err(Failure::new(
-            ProviderApplyFailure::NotReady,
-            "no extension handshake on this connection, or no host app is attached",
-        ));
+    if let Caller::Extension(handshakes) = &caller {
+        if !handshakes.has(&request.root_id) || !context.provider_host.host_connected() {
+            return Err(Failure::new(
+                ProviderApplyFailure::NotReady,
+                "no extension handshake on this connection, or no host app is attached",
+            ));
+        }
     }
     let Some(handoff) = context.handoff.get() else {
         return Err(Failure::new(ProviderApplyFailure::NotReady, "no temp root is configured"));
@@ -393,7 +434,11 @@ async fn run(
         .into_iter()
         .find(|r| r.root_id == root)
         .ok_or_else(|| Failure::new(ProviderApplyFailure::NotReady, "unknown provider root"))?;
-    if declared.readiness() != Readiness::Ready {
+    let ready = match caller {
+        Caller::Extension(_) => declared.readiness() == Readiness::Ready,
+        Caller::App => declared.error_description.is_none(),
+    };
+    if !ready {
         return Err(Failure::new(ProviderApplyFailure::NotReady, "the provider root is not ready"));
     }
 
@@ -454,7 +499,7 @@ async fn run(
     // A create's parent field absent means the root, as for an empty one.
     let new_parent =
         if kind == ChangeKind::Create { Some(new_parent.flatten()) } else { new_parent };
-    let metadata = request.metadata.clone().unwrap_or_default();
+    let metadata = request.metadata.unwrap_or_default();
     let fingerprint = fingerprint(request);
 
     // An operation already decided is answered from its record: nothing is read or ingested.
@@ -475,33 +520,33 @@ async fn run(
         Err(error) => return Err(map_error(error, &request.content)),
     }
 
+    // A restore takes its contents from a retained version. The blocks are held (or fetched) and
+    // kept from deletion until the change commits.
+    let _restore_activity =
+        request.restore_from.as_ref().map(|_| context.writer.state().begin_write_activity());
+    let restored = match &request.restore_from {
+        None => None,
+        Some(source) => {
+            let by_app = matches!(caller, Caller::App);
+            let (group, item) = (&declared.group_id, item_id);
+            Some(
+                restore_for_request(context, by_app, request, (group, &root), item, kind, source)
+                    .await?,
+            )
+        }
+    };
+
     // The extension's copy, when there is one.
     let mut ingested_name: Option<String> = None;
     let content = match (&request.content, request.entry_kind, kind) {
         (Some(source), _, ChangeKind::Create | ChangeKind::Modify) => {
-            let dir = handoff.ingest_dir().to_path_buf();
             let used = upload.clone().unwrap_or_else(|| source.ingest_name.clone());
-            let (name, size, sha) = (used.clone(), source.size, source.sha256.clone());
-            let writer = context.writer.clone();
-            let ingested = tokio::task::spawn_blocking(move || {
-                crate::provider_ingest::ingest(&dir, &name, size, &sha, &writer.store())
-            })
-            .await
-            .map_err(|e| Failure::new(ProviderApplyFailure::Retry, e.to_string()))?
-            .map_err(map_ingest)?;
-            let hashes: Vec<Vec<u8>> = ingested.blocks.iter().map(|b| b.hash.clone()).collect();
-            context
-                .writer
-                .record_provenance(&declared.group_id, &hashes)
-                .map_err(|e| Failure::new(ProviderApplyFailure::Retry, e))?;
-            // The journaled copy is verified: this retry's own copy is redundant.
-            if used != source.ingest_name {
-                let _ = std::fs::remove_file(handoff.ingest_dir().join(&source.ingest_name));
-            }
+            let ingested =
+                ingest_copy(context, &handoff, &declared.group_id, source, &used).await?;
             ingested_name = Some(used);
-            Some(ContentInput { blocks: ingested.blocks, size: ingested.size })
+            Some(ingested)
         }
-        _ => None,
+        _ => restored.as_ref().and_then(|r| r.content.clone()),
     };
 
     let input = ApplyInput {
@@ -513,22 +558,14 @@ async fn run(
         item_id,
         new_parent,
         name: request.name.clone(),
-        entry_kind: match WireEntryKind::try_from(request.entry_kind) {
-            Ok(WireEntryKind::Directory) => EntryKind::Directory,
-            Ok(WireEntryKind::Symlink) => EntryKind::Symlink,
-            _ => EntryKind::File,
-        },
+        entry_kind: entry_kind_of(request, restored.as_ref()),
         base,
         content,
         symlink_target: (!request.symlink_target.is_empty())
             .then(|| request.symlink_target.clone()),
-        metadata: MetadataInput {
-            unix_mode: metadata.unix_mode,
-            mtime_unix_nanos: metadata.mtime_unix_nanos,
-            xattrs: metadata.replace_xattrs.then(|| {
-                metadata.xattrs.iter().map(|x| (x.name.clone(), x.value.clone())).collect()
-            }),
-        },
+        metadata: metadata_input(&metadata, restored.as_ref()),
+        restore: restored.is_some(),
+        announce_to_os: restored.as_ref().is_some_and(|r| r.announce_to_os),
         recursive: request.recursive,
         max_subtree: yadorilink_sync_sqlite::provider_write::DEFAULT_MAX_SUBTREE,
         base_generation,
@@ -546,6 +583,7 @@ async fn run(
         .writer
         .lease(&root, &declared.group_id, &handoff.domain_dir(&root))
         .map_err(|e| Failure::new(ProviderApplyFailure::NotReady, e))?;
+    let announce_to_os = input.announce_to_os;
     let (coordinator, device_id) =
         (context.replica_coordinator.clone(), context.writer.device_id());
     let gate = gate.clone();
@@ -583,6 +621,10 @@ async fn run(
     if outcome.is_ok() {
         push_evidence(context, repo, &root);
         context.writer.after_commit(&declared.group_id).await;
+        if announce_to_os {
+            // The OS does not hold these bytes: announce the new version and signal it now.
+            context.publication.kick(&root);
+        }
     }
 
     // The copy is spent once the change committed or can never commit.
@@ -598,6 +640,182 @@ async fn run(
         }
     }
     outcome.map_err(|error| map_error(error, &request.content))
+}
+
+/// Reads the copy `used` (the journaled upload, or the request's own) and stores its blocks.
+async fn ingest_copy(
+    context: &Arc<ShellContext>,
+    handoff: &crate::provider_handoff::HandoffRoot,
+    group_id: &str,
+    source: &yadorilink_ipc_proto::shellipc::ProviderContentSource,
+    used: &str,
+) -> Result<ContentInput, Failure> {
+    // Before the file is read: when the volume cannot take the blocks of a file this size with its
+    // headroom, the answer is LOW_DISK and the staged copy is kept for a retry. Held until the
+    // blocks are stored.
+    let _space = context
+        .writer
+        .reserve_space(source.size)
+        .map_err(|m| Failure::new(ProviderApplyFailure::LowDisk, m))?;
+    let dir = handoff.ingest_dir().to_path_buf();
+    let (name, size, sha) = (used.to_owned(), source.size, source.sha256.clone());
+    let writer = context.writer.clone();
+    let ingested = tokio::task::spawn_blocking(move || {
+        crate::provider_ingest::ingest(&dir, &name, size, &sha, &writer.store())
+    })
+    .await
+    .map_err(|e| Failure::new(ProviderApplyFailure::Retry, e.to_string()))?
+    .map_err(map_ingest)?;
+    let hashes: Vec<Vec<u8>> = ingested.blocks.iter().map(|b| b.hash.clone()).collect();
+    context
+        .writer
+        .record_provenance(group_id, &hashes)
+        .map_err(|e| Failure::new(ProviderApplyFailure::Retry, e))?;
+    // The journaled copy is verified: this retry's own copy is redundant.
+    if used != source.ingest_name {
+        let _ = std::fs::remove_file(handoff.ingest_dir().join(&source.ingest_name));
+    }
+    Ok(ContentInput { blocks: ingested.blocks, size: ingested.size })
+}
+
+/// What a restore asks the write to author: the retained version's contents and execute flag.
+struct Restored {
+    /// The bytes came from another item's version (a conflict copy restored over its original),
+    /// so the OS does not hold them: the new version is announced and the OS fetches it, as it
+    /// does for a change from a peer.
+    announce_to_os: bool,
+    content: Option<ContentInput>,
+    entry_kind: EntryKind,
+    exec: bool,
+}
+
+/// The kind the change authors: a restore's is the version's, any other change's is the request's.
+fn entry_kind_of(request: &ProviderApplyChangeRequest, restored: Option<&Restored>) -> EntryKind {
+    match restored {
+        Some(restored) => restored.entry_kind,
+        None => match WireEntryKind::try_from(request.entry_kind) {
+            Ok(WireEntryKind::Directory) => EntryKind::Directory,
+            Ok(WireEntryKind::Symlink) => EntryKind::Symlink,
+            _ => EntryKind::File,
+        },
+    }
+}
+
+/// The metadata the change sets. A restore without metadata of its own gets the version's
+/// execute flag.
+fn metadata_input(
+    metadata: &yadorilink_ipc_proto::shellipc::ProviderItemMetadata,
+    restored: Option<&Restored>,
+) -> MetadataInput {
+    MetadataInput {
+        exec: metadata.exec.or(restored.map(|r| r.exec)),
+        mtime_unix_nanos: metadata.mtime_unix_nanos,
+    }
+}
+
+/// The contents a restore request asks for. Only the embedding app may restore, and the request
+/// names a version instead of bytes and is a create or a modify.
+async fn restore_for_request(
+    context: &Arc<ShellContext>,
+    by_app: bool,
+    request: &ProviderApplyChangeRequest,
+    (group_id, root): (&str, &str),
+    item: Option<ItemId>,
+    kind: ChangeKind,
+    source: &yadorilink_ipc_proto::shellipc::ProviderRestoreSource,
+) -> Result<Restored, Failure> {
+    if !by_app {
+        return Err(Failure::new(
+            ProviderApplyFailure::NotFound,
+            "a restore is asked for by the embedding app only",
+        ));
+    }
+    if request.content.is_some() || kind == ChangeKind::Delete {
+        return Err(Failure::new(
+            ProviderApplyFailure::IngestRejected,
+            "a restore names a version instead of bytes, and is a create or a modify",
+        ));
+    }
+    restore_content(context, group_id, root, item, kind, source).await
+}
+
+/// Resolves a restore's version and makes its blocks local. The version must be a retained,
+/// non-deleted version of the file or folder at the source's path; a MODIFY must be for the live
+/// item at that very path.
+async fn restore_content(
+    context: &Arc<ShellContext>,
+    group_id: &str,
+    root: &str,
+    item: Option<ItemId>,
+    kind: ChangeKind,
+    source: &yadorilink_ipc_proto::shellipc::ProviderRestoreSource,
+) -> Result<Restored, Failure> {
+    use yadorilink_replica_domain::file::RecordKind;
+    let not_found = |text: &str| Failure::new(ProviderApplyFailure::NotFound, text);
+    let hash: [u8; 32] = source
+        .version_hash
+        .as_slice()
+        .try_into()
+        .map_err(|_| not_found("a version hash is not 32 bytes"))?;
+    let mut announce_to_os = false;
+    if let (ChangeKind::Modify, Some(item)) = (kind, item) {
+        let at = context.replica_coordinator.provider_repository().path_for_item(root, &item);
+        // Live at the version's own path, or at the original path of a conflict copy whose
+        // version it is (Keep this restores the copy over its original).
+        let named_path = |path: &String| {
+            *path == source.path
+                || yadorilink_replica_domain::conflict::conflict_copy_source_path(&source.path)
+                    == *path
+        };
+        if !matches!(&at, Ok(Some((path, true))) if named_path(path)) {
+            return Err(not_found("the item is not live at the path of the version"));
+        }
+        announce_to_os = !matches!(&at, Ok(Some((path, true))) if *path == source.path);
+    }
+    let versions = context
+        .replica_coordinator
+        .sqlite()
+        .dag_list_versions(group_id, &source.path)
+        .map_err(|e| Failure::new(ProviderApplyFailure::Retry, e.to_string()))?;
+    let version =
+        versions.into_iter().find(|v| !v.deleted && v.version_hash.0 == hash).ok_or_else(|| {
+            Failure::new(
+                ProviderApplyFailure::VersionUnavailable,
+                "that version is not retained any more",
+            )
+        })?;
+    let exec = version.exec;
+    match version.record_kind {
+        RecordKind::Symlink => Err(not_found("a symlink cannot be restored")),
+        RecordKind::Directory if kind != ChangeKind::Create => {
+            Err(not_found("a folder is restored by creating it"))
+        }
+        RecordKind::Directory => Ok(Restored {
+            announce_to_os: false,
+            content: None,
+            entry_kind: EntryKind::Directory,
+            exec: false,
+        }),
+        RecordKind::File => {
+            context.writer.ensure_blocks(group_id, &version.blocks).await.map_err(|error| {
+                use crate::provider_writer::EnsureBlocksError as E;
+                match error {
+                    E::LowDisk(message) => Failure::new(ProviderApplyFailure::LowDisk, message),
+                    E::Unavailable => Failure::new(
+                        ProviderApplyFailure::VersionUnavailable,
+                        "no reachable device holds the bytes of that version",
+                    ),
+                    E::Failed(message) => Failure::new(ProviderApplyFailure::Retry, message),
+                }
+            })?;
+            Ok(Restored {
+                announce_to_os,
+                content: Some(ContentInput { blocks: version.blocks, size: version.size }),
+                entry_kind: EntryKind::File,
+                exec,
+            })
+        }
+    }
 }
 
 /// The change recorded the handoff of the version it authored: tell the host, which echoes the
@@ -674,6 +892,22 @@ fn response_of(
     operation_seq: u64,
     outcome: Result<ApplyResult, Failure>,
 ) -> ShellIpcMessage {
+    ShellIpcMessage {
+        payload: Some(Payload::ProviderApplyChangeResponse(response_for(
+            request_id,
+            session_id,
+            operation_seq,
+            outcome,
+        ))),
+    }
+}
+
+fn response_for(
+    request_id: &[u8],
+    session_id: &[u8],
+    operation_seq: u64,
+    outcome: Result<ApplyResult, Failure>,
+) -> ProviderApplyChangeResponse {
     let mut message = ProviderApplyChangeResponse {
         request_id: request_id.to_vec(),
         session_id: session_id.to_vec(),
@@ -714,7 +948,7 @@ fn response_of(
                 ),
                 size: item.size,
                 mtime_unix_nanos: item.mtime_unix_nanos,
-                unix_mode: item.unix_mode,
+                exec: item.exec,
                 current: item.current,
                 namespace_revision: item.namespace_revision,
                 parent_generation: item.parent_generation,
@@ -726,7 +960,7 @@ fn response_of(
             message.suggested_name = failure.suggested_name;
         }
     }
-    ShellIpcMessage { payload: Some(Payload::ProviderApplyChangeResponse(message)) }
+    message
 }
 
 #[cfg(test)]

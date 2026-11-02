@@ -146,6 +146,7 @@ async fn the_local_page_address_serves_the_nas_dashboard_on_loopback() {
         port_path: dir.path().join("http-api-port"),
         port: 0,
         extra_allowed_origins: Vec::new(),
+        remote: None,
     };
     let handle = yadorilink_http_api::bind(&config).await.unwrap();
     let dashboard = crate::nas_admin::Dashboard { streams: Some(handle.peer_streams()) };

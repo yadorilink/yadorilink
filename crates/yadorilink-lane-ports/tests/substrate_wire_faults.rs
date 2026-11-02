@@ -23,6 +23,17 @@ use yadorilink_sync_substrate::Lane;
 const GROUP: &str = "wire-fault-group";
 const HEALTHY_TIMEOUT: Duration = Duration::from_secs(20);
 const CUT_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a healed lane may take to carry bytes again. A healthy lane carries them at once, so a
+/// large value costs nothing when the lane recovers; it only bounds the wait when it does not.
+///
+/// The path is a real QUIC connection on the real clock (a paused clock leaves it real: the
+/// connection's timers keep the runtime busy, so the test still takes as long as it claims). QUIC
+/// loses nothing on a cut but time: every probe into the dark doubles the interval to the next
+/// one, so how soon a connection that was cut moves again depends on how long it was silent and
+/// on a round-trip estimate taken from the real, possibly loaded, scheduler. A bound on that wait
+/// is a bound on the machine, so it is generous, and a test never lets the silence of one phase
+/// add to the next on the same connection.
+const HEAL_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct Pair {
     a: Arc<TestPeerNode>,
@@ -87,10 +98,13 @@ fn body(len: u32) -> Vec<u8> {
     (0..len).map(|i| ((i * 7) % 251) as u8).collect()
 }
 
-/// A->B cut: the request never arrives. B->A cut instead: the request
-/// arrives and the answer does not. Healing one direction restores it.
+/// The reply direction cut (B->A): the request arrives, the answer cannot, and healing that one
+/// direction restores the lane.
+///
+/// One cut, then its heal, on one connection; the request-direction cut is the next test on a
+/// connection of its own, so the silence of one does not lengthen the other's recovery.
 #[tokio::test]
-async fn a_one_way_cut_stops_exactly_one_direction() {
+async fn a_cut_reply_direction_lets_the_request_through_and_heals() {
     let network = TestNetwork::new();
     let faults = SimFaultController::new();
     let p = pair(&network, &faults).await;
@@ -112,9 +126,32 @@ async fn a_one_way_cut_stops_exactly_one_direction() {
         arrived.load(Ordering::SeqCst) > before,
         "the request did not reach B although only B->A is cut: the cut is not one-way"
     );
+    assert!(faults.dropped_datagrams() > 0, "no datagram was discarded: the fault did not fire");
+    assert!(!faults.is_cut(p.a_id, p.b_id), "the request direction must stay open");
+
+    faults.heal_one_way(p.b_id, p.a_id);
+    // Healed: the same endpoints and network carry again.
+    let got = round_trip(&p.a, "device-b", &payload, HEAL_TIMEOUT).await;
+    assert_eq!(got.as_deref(), Some(payload.as_slice()), "the lane did not recover after heal");
+    serving.abort();
+}
+
+/// The request direction cut (A->B): nothing reaches B, and healing that one direction restores
+/// the lane.
+#[tokio::test]
+async fn a_cut_request_direction_reaches_nothing_and_heals() {
+    let network = TestNetwork::new();
+    let faults = SimFaultController::new();
+    let p = pair(&network, &faults).await;
+    let payload = body(4096);
+    let arrived = Arc::new(AtomicUsize::new(0));
+    let serving = serve(p.b.clone(), payload.clone(), arrived.clone());
+
+    let got = round_trip(&p.a, "device-b", &payload, HEALTHY_TIMEOUT).await;
+    assert_eq!(got.as_deref(), Some(payload.as_slice()), "the healthy lane must carry bytes");
+    assert_eq!(arrived.load(Ordering::SeqCst), 1);
 
     // Request direction cut: nothing reaches B.
-    faults.heal_one_way(p.b_id, p.a_id);
     faults.partition_one_way(p.a_id, p.b_id);
     let before = arrived.load(Ordering::SeqCst);
     let got = round_trip(&p.a, "device-b", &payload, CUT_TIMEOUT).await;
@@ -124,8 +161,7 @@ async fn a_one_way_cut_stops_exactly_one_direction() {
     assert!(!faults.is_cut(p.b_id, p.a_id), "the reverse direction must stay open");
 
     faults.heal_one_way(p.a_id, p.b_id);
-    // Healed: the same endpoints and network carry again.
-    let got = round_trip(&p.a, "device-b", &payload, HEALTHY_TIMEOUT).await;
+    let got = round_trip(&p.a, "device-b", &payload, HEAL_TIMEOUT).await;
     assert_eq!(got.as_deref(), Some(payload.as_slice()), "the lane did not recover after heal");
     serving.abort();
 }

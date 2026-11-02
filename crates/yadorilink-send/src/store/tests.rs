@@ -20,6 +20,7 @@ fn sample_manifest(transfer_id: &str) -> SendManifest {
         }],
         total_size: 10,
         offered_at_unix_nanos: 42,
+        ..Default::default()
     }
 }
 
@@ -38,7 +39,7 @@ fn outbound_offer_round_trips_through_the_store() {
     assert_eq!(row.manifest, manifest);
     assert_eq!(row.status, OutboundStatus::Offered);
 
-    store.mark_outbound_acked("t1").unwrap();
+    store.mark_outbound_acked("t1", 0).unwrap();
     assert_eq!(store.get_outbound("t1").unwrap().unwrap().status, OutboundStatus::Acked);
 }
 
@@ -69,9 +70,12 @@ fn find_outbound_by_source_and_target_recovers_an_existing_offer() {
         .insert_outbound_offered("t1", "device-b", &[7u8; 32], "/src/file", &manifest, 100)
         .unwrap();
 
-    let found = store.find_outbound_by_source_and_target("/src/file", "device-b").unwrap();
+    let found = store.find_outbound_by_source_and_target("/src/file", "device-b", "").unwrap();
     assert_eq!(found.unwrap().transfer_id, "t1");
-    assert!(store.find_outbound_by_source_and_target("/src/other", "device-b").unwrap().is_none());
+    assert!(store
+        .find_outbound_by_source_and_target("/src/other", "device-b", "")
+        .unwrap()
+        .is_none());
 }
 
 /// `Rejected` is genuinely terminal: once a row is rejected,
@@ -91,7 +95,10 @@ fn find_outbound_by_source_and_target_skips_a_rejected_row() {
 
     // The rejected row must be invisible to the idempotency lookup --
     // not handed back for a caller to mutate.
-    assert!(store.find_outbound_by_source_and_target("/src/file", "device-b").unwrap().is_none());
+    assert!(store
+        .find_outbound_by_source_and_target("/src/file", "device-b", "")
+        .unwrap()
+        .is_none());
 
     // A re-send for the exact same (source, target) mints a genuinely
     // new row/transfer id, exactly as `offer_send` does when the
@@ -101,12 +108,12 @@ fn find_outbound_by_source_and_target_skips_a_rejected_row() {
         .insert_outbound_offered("t2", "device-b", &[7u8; 32], "/src/file", &manifest2, 200)
         .unwrap();
 
-    let found = store.find_outbound_by_source_and_target("/src/file", "device-b").unwrap();
+    let found = store.find_outbound_by_source_and_target("/src/file", "device-b", "").unwrap();
     assert_eq!(found.unwrap().transfer_id, "t2");
 
     // Acking the new transfer must never resurrect the old, rejected
     // one under a different status.
-    store.mark_outbound_acked("t2").unwrap();
+    store.mark_outbound_acked("t2", 0).unwrap();
     assert_eq!(store.get_outbound("t1").unwrap().unwrap().status, OutboundStatus::Rejected);
     assert_eq!(store.get_outbound("t2").unwrap().unwrap().status, OutboundStatus::Acked);
 }
@@ -118,8 +125,8 @@ fn find_outbound_by_source_and_target_skips_a_rejected_row() {
 fn duplicate_inbound_offer_is_idempotent() {
     let (store, _dir) = open_store();
     let manifest = sample_manifest("t1");
-    assert!(store.insert_inbound_if_new("t1", "device-a", &manifest, 100).unwrap());
-    assert!(!store.insert_inbound_if_new("t1", "device-a", &manifest, 100).unwrap());
+    assert!(store.insert_inbound_if_new("t1", "device-a", "", &manifest, 100).unwrap());
+    assert!(!store.insert_inbound_if_new("t1", "device-a", "", &manifest, 100).unwrap());
     assert_eq!(store.list_inbound_recent(20).unwrap().len(), 1);
 }
 
@@ -131,7 +138,7 @@ fn duplicate_inbound_offer_is_idempotent() {
 fn claim_inbound_destination_is_sticky_across_resumes() {
     let (store, _dir) = open_store();
     let manifest = sample_manifest("t1");
-    store.insert_inbound_if_new("t1", "device-a", &manifest, 100).unwrap();
+    store.insert_inbound_if_new("t1", "device-a", "", &manifest, 100).unwrap();
 
     let first = store.claim_inbound_destination("t1", "/dest/one").unwrap();
     assert_eq!(first, "/dest/one");
@@ -152,17 +159,17 @@ fn status_of(store: &SendStore, id: &str) -> InboundStatus {
 fn interrupting_in_progress_rows_marks_only_those_failed() {
     let (store, _dir) = open_store();
     for id in ["running", "waiting", "done"] {
-        store.insert_inbound_if_new(id, "device-a", &sample_manifest(id), 100).unwrap();
+        store.insert_inbound_if_new(id, "device-a", "", &sample_manifest(id), 100).unwrap();
     }
     store.claim_inbound_destination("running", "/dest/running").unwrap();
     store.claim_inbound_destination("done", "/dest/done").unwrap();
-    store.mark_inbound_completed("done").unwrap();
+    store.mark_inbound_completed("done", 0).unwrap();
 
-    assert_eq!(store.interrupt_in_progress_inbound().unwrap(), 1);
+    assert_eq!(store.interrupt_in_progress_inbound(0).unwrap(), 1);
     assert_eq!(status_of(&store, "running"), InboundStatus::Failed);
     assert_eq!(status_of(&store, "waiting"), InboundStatus::Pending);
     assert_eq!(status_of(&store, "done"), InboundStatus::Completed);
-    assert_eq!(store.interrupt_in_progress_inbound().unwrap(), 0);
+    assert_eq!(store.interrupt_in_progress_inbound(0).unwrap(), 0);
 }
 
 /// Canceling twice, or canceling something already finished, changes
@@ -171,15 +178,15 @@ fn interrupting_in_progress_rows_marks_only_those_failed() {
 fn cancel_is_idempotent_and_scoped_to_one_transfer() {
     let (store, _dir) = open_store();
     for id in ["a", "b", "done"] {
-        store.insert_inbound_if_new(id, "device-a", &sample_manifest(id), 100).unwrap();
+        store.insert_inbound_if_new(id, "device-a", "", &sample_manifest(id), 100).unwrap();
     }
     store.claim_inbound_destination("a", "/dest/a").unwrap();
     store.claim_inbound_destination("b", "/dest/b").unwrap();
-    store.mark_inbound_completed("done").unwrap();
+    store.mark_inbound_completed("done", 0).unwrap();
 
-    assert!(store.cancel_inbound("a").unwrap());
-    assert!(!store.cancel_inbound("a").unwrap(), "second cancel is a no-op");
-    assert!(!store.cancel_inbound("done").unwrap(), "a finished transfer cannot be canceled");
+    assert!(store.cancel_inbound("a", 0).unwrap());
+    assert!(!store.cancel_inbound("a", 0).unwrap(), "second cancel is a no-op");
+    assert!(!store.cancel_inbound("done", 0).unwrap(), "a finished transfer cannot be canceled");
 
     assert_eq!(status_of(&store, "a"), InboundStatus::Canceled);
     assert_eq!(status_of(&store, "b"), InboundStatus::InProgress);
@@ -191,10 +198,10 @@ fn cancel_is_idempotent_and_scoped_to_one_transfer() {
 #[test]
 fn failure_does_not_overwrite_a_cancel() {
     let (store, _dir) = open_store();
-    store.insert_inbound_if_new("a", "device-a", &sample_manifest("a"), 100).unwrap();
+    store.insert_inbound_if_new("a", "device-a", "", &sample_manifest("a"), 100).unwrap();
     store.claim_inbound_destination("a", "/dest/a").unwrap();
-    store.cancel_inbound("a").unwrap();
-    assert!(!store.fail_inbound("a").unwrap());
+    store.cancel_inbound("a", 0).unwrap();
+    assert!(!store.fail_inbound("a", "interrupted", 0).unwrap());
     assert_eq!(status_of(&store, "a"), InboundStatus::Canceled);
 }
 
@@ -205,11 +212,11 @@ fn recent_listing_keeps_unfinished_rows_and_bounds_finished_ones() {
     let (store, _dir) = open_store();
     for n in 0..5 {
         let id = format!("old{n}");
-        store.insert_inbound_if_new(&id, "device-a", &sample_manifest(&id), 100 + n).unwrap();
+        store.insert_inbound_if_new(&id, "device-a", "", &sample_manifest(&id), 100 + n).unwrap();
         store.claim_inbound_destination(&id, "/d").unwrap();
-        store.mark_inbound_completed(&id).unwrap();
+        store.mark_inbound_completed(&id, 0).unwrap();
     }
-    store.insert_inbound_if_new("waiting", "device-a", &sample_manifest("waiting"), 1).unwrap();
+    store.insert_inbound_if_new("waiting", "device-a", "", &sample_manifest("waiting"), 1).unwrap();
 
     let listed: Vec<String> =
         store.list_inbound_recent(2).unwrap().into_iter().map(|t| t.transfer_id).collect();
@@ -225,7 +232,7 @@ fn a_decline_ends_offered_and_accepted_transfers_only() {
         store.insert_outbound_offered(id, "d", &[1; 32], "/s", &sample_manifest(id), 1).unwrap();
         match prepare {
             1 | 3 => {
-                store.mark_outbound_acked(id).unwrap();
+                store.mark_outbound_acked(id, 0).unwrap();
                 if prepare == 3 {
                     store.mark_outbound_completed(id).unwrap();
                 }
@@ -246,8 +253,8 @@ fn a_decline_ends_offered_and_accepted_transfers_only() {
     assert_eq!(store.outbound_status("completed").unwrap(), Some(OutboundStatus::Completed));
 }
 
-/// Which transfers on record keep their chunks: every sent one, and every received one but a
-/// completed one (the others can still resume).
+/// Which transfers on record keep their chunks: a sent one still going, and a received one that
+/// can still resume (pending or failed).
 #[test]
 fn live_chunk_hashes_cover_what_a_transfer_can_still_need() {
     let (store, _dir) = open_store();
@@ -261,15 +268,17 @@ fn live_chunk_hashes_cover_what_a_transfer_can_still_need() {
     store.insert_outbound_offered("out", "d", &[7; 32], "/s", &manifest_with("out", 1), 1).unwrap();
     store.cancel_outbound("out").unwrap();
     for (id, byte) in [("pending", 2u8), ("failed", 3), ("canceled", 4), ("completed", 5)] {
-        store.insert_inbound_if_new(id, "s", &manifest_with(id, byte), 1).unwrap();
+        store.insert_inbound_if_new(id, "s", "", &manifest_with(id, byte), 1).unwrap();
     }
-    store.fail_inbound("failed").unwrap();
-    store.cancel_inbound("canceled").unwrap();
-    store.mark_inbound_completed("completed").unwrap();
+    store.fail_inbound("failed", "interrupted", 0).unwrap();
+    store.cancel_inbound("canceled", 0).unwrap();
+    store.mark_inbound_completed("completed", 0).unwrap();
 
     let live = store.live_chunk_hashes().unwrap();
-    for kept in [1u8, 2, 3, 4] {
+    for kept in [2u8, 3] {
         assert!(live.contains(&hex_of(kept)), "chunk {kept} is still needed");
     }
-    assert!(!live.contains(&hex_of(5)), "a completed receive needs none");
+    for gone in [1u8, 4, 5] {
+        assert!(!live.contains(&hex_of(gone)), "a finished transfer needs none ({gone})");
+    }
 }

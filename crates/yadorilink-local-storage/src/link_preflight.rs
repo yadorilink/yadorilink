@@ -159,9 +159,23 @@ pub struct LinkPreflightReport {
     /// path this preflight discovers before the folder is ever linked, so
     /// it does not read as an ordinary, dismissible ignore-pattern match.
     pub reserved_namespace_blocked_paths: Vec<String>,
+    /// Set when the folder's filesystem cannot prove that an object seen again is the same
+    /// object (tmpfs, some network and overlay mounts): removals and renames from other devices
+    /// are then not applied here. Not a risky condition (it does not need acknowledgement); it is
+    /// told as a note, see [`Self::notes`].
+    pub volume_identity_unproven: bool,
 }
 
 impl LinkPreflightReport {
+    /// Facts the user should read that do not stop the link: one line each.
+    pub fn notes(&self) -> Vec<String> {
+        if self.volume_identity_unproven {
+            vec![crate::root_access::unproven_identity_note()]
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Refusals no acknowledgement can override: nested links. Unlike
     /// [`Self::warnings`], these are never accepted with `--yes` or an
     /// interactive confirmation -- two linked folders over the same files
@@ -279,6 +293,24 @@ pub fn run_preflight_at_home(
     headroom_override_bytes: Option<u64>,
     home: Option<&Path>,
 ) -> LinkPreflightReport {
+    run_preflight_with_identity_probe(
+        local_path,
+        existing_link_paths,
+        headroom_override_bytes,
+        home,
+        yadorilink_fs_platform::fs_capabilities::cached_volume_proves_object_identity,
+    )
+}
+
+/// [`run_preflight_at_home`] with the answer to "can this folder's filesystem prove object
+/// identity" supplied by the caller, so a test is deterministic on any host.
+pub fn run_preflight_with_identity_probe(
+    local_path: &Path,
+    existing_link_paths: &[String],
+    headroom_override_bytes: Option<u64>,
+    home: Option<&Path>,
+    proves_identity: impl Fn(&Path) -> bool,
+) -> LinkPreflightReport {
     let mut report = LinkPreflightReport { path_exists: local_path.exists(), ..Default::default() };
     if !report.path_exists {
         return report;
@@ -292,6 +324,7 @@ pub fn run_preflight_at_home(
         report.scan_truncated = scan.scan_truncated;
         report.ignore_rules_unreadable = scan.ignore_rules_unreadable;
         report.reserved_namespace_blocked_paths = scan.reserved_namespace_blocked_paths;
+        report.volume_identity_unproven = !proves_identity(local_path);
     }
     report.free_space = free_space::classify_volume(local_path, headroom_override_bytes).ok();
     report.nested_conflicts = detect_nested_conflicts(local_path, existing_link_paths);

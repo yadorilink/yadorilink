@@ -41,10 +41,3 @@ pub const MAX_PATH_BYTES: usize = 4096;
 
 /// The largest number of `/`-separated segments a single path may have.
 pub const MAX_PATH_SEGMENTS: usize = 255;
-
-/// The largest number of extended attributes a single `FileMeta` may
-/// carry. Real allow-listed xattr sets are always small (a
-/// handful of app-set attributes at most); this is an untrusted-input
-/// bound on a peer's encoded bytes, matching `MAX_BLOCKS`'s own
-/// reasoning, not a real-world capacity estimate.
-pub const MAX_XATTRS: usize = 256;

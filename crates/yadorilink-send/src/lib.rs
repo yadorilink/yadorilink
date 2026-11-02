@@ -17,7 +17,7 @@
 //! - [`session`]: [`session::SendService`], the orchestration layer CLI/
 //!   daemon integration calls into.
 //!
-//! Scope for v1: same-account devices only. Every outbound offer requires a
+//! Every outbound offer requires a
 //! fresh, short-lived, sender+receiver-bound Track Send rendezvous grant --
 //! obtained unconditionally by `offer_send` and enforced unconditionally by
 //! `handle_offer` -- regardless of whether the target device is ALSO
@@ -26,9 +26,10 @@
 //! authorization only ever supplies device addressing elsewhere (e.g. a
 //! receiver's pull-phase dial back to a sender it already accepted an offer
 //! from); it is never treated as sufficient to send or receive on its own.
-//! See [`session::DeviceDirectory`]'s own doc comment for why cross-account
-//! send stays out of scope by construction rather than merely unimplemented,
-//! and `crates/yadorilink-daemon`'s `send_transfer` module for the grant
+//! Cross-account send is the same lane with a different way to obtain the
+//! grant: a redeemed, one-use Send link (see [`session::DeviceDirectory`]'s
+//! doc comment). Nothing in this crate knows the difference. See
+//! `crates/yadorilink-daemon`'s `send_transfer` module for the grant
 //! primitive's full design (this crate itself only calls
 //! [`session::DeviceDirectory::request_grant`]/`consume_grant`; it has no
 //! idea a coordination plane exists).
@@ -39,8 +40,8 @@ pub mod session;
 pub mod store;
 pub mod wire;
 
-pub use error::{failure, Result, SendError};
+pub use error::{failure, DialReason, Result, SendError};
 pub use session::{
     DeviceDirectory, GrantedDevice, InboxEntry, ReceiveOutcome, ResolvedDevice, SendOfferOutcome,
-    SendService, SentEntry, TransferDirection,
+    SendService, SentEntry, Timing, TransferDirection,
 };

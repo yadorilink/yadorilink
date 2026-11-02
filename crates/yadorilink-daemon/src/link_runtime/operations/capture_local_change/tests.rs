@@ -1136,3 +1136,38 @@ async fn a_redrive_waits_for_the_group_policy_then_captures() {
     assert_eq!(journal_rows(&fx.deps), 0);
     assert!(fx.redrive().await.unwrap().records.is_empty());
 }
+
+/// The policy loading is the event that ends a redrive's wait: the handle's own redrive, which
+/// the policy load triggers, captures what the periodic backstop would have captured a tick later.
+#[tokio::test]
+async fn the_handle_redrive_after_the_policy_loads_captures_the_waiting_edit() {
+    let mut fx = handoff_fixture();
+    let policy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let provider_flag = policy.clone();
+    fx.deps.replica_coordinator.set_local_policy_head_provider(Arc::new(move |_group_id| {
+        if provider_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            Ok([0u8; 32])
+        } else {
+            Err(yadorilink_replica_domain::local_op::PolicyUnavailable)
+        }
+    }));
+    let file = fx.write("a.txt");
+    let mut requester = Box::pin(fx.handle.flush_pending_local_change("group-1", "a.txt"));
+    poll_once_to_pending(&mut requester);
+    fx.flush_rx
+        .try_recv()
+        .unwrap()
+        .reply
+        .send(Some((file, FsChangeKind::CreatedOrModified, 1)))
+        .unwrap();
+    drop(requester);
+    assert!(is_journaled(&fx.deps, "a.txt"));
+
+    fx.handle.redrive_dirty_journal("group-1").await.unwrap();
+    assert!(is_journaled(&fx.deps, "a.txt"), "no policy yet: the row waits");
+
+    policy.store(true, std::sync::atomic::Ordering::SeqCst);
+    fx.handle.redrive_dirty_journal("group-1").await.unwrap();
+    assert!(indexed_live(&fx.deps, "a.txt").is_some());
+    assert_eq!(journal_rows(&fx.deps), 0);
+}

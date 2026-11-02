@@ -8,6 +8,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use yadorilink_sqlite_runtime::CachedStatements as _;
 
 use rusqlite::OptionalExtension;
 
@@ -30,6 +31,10 @@ pub struct MaterializationCounts {
     pub hydrating: u64,
     /// Files being evicted: not a request for content.
     pub evicting: u64,
+    /// Bytes of every live regular file's content, whatever its state.
+    pub total_bytes: u64,
+    /// Bytes of the live regular files held only as online-only placeholders (`Remote`).
+    pub online_only_bytes: u64,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -83,7 +88,7 @@ impl MaterializationStateRepository {
         }
         self.database.read::<_, SyncSqliteError>(|conn| {
             let state: Option<String> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT materialization_state FROM files \
                      WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
                     rusqlite::params![group_id, path],
@@ -105,7 +110,7 @@ impl MaterializationStateRepository {
         prefix: &str,
     ) -> Result<MaterializationState, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT DISTINCT materialization_state FROM files WHERE group_id = ?1 AND \
                  state = 'current' AND deleted = 0 AND record_kind = 'file' AND \
                  (?2 = '' OR substr(path, 1, length(?2) + 1) = ?2 || '/')",
@@ -134,7 +139,7 @@ impl MaterializationStateRepository {
     ) -> Result<(), SyncSqliteError> {
         let affected = self.database.write::<_, SyncSqliteError>(|conn| {
             permit.verify()?;
-            Ok(conn.execute(
+            Ok(conn.execute_cached(
                 "UPDATE files SET materialization_state = ?1 \
                  WHERE group_id = ?2 AND path = ?3 AND state = 'current'",
                 rusqlite::params![state.as_db_str(), group_id, path],
@@ -186,7 +191,7 @@ impl MaterializationStateRepository {
     ) -> Result<bool, SyncSqliteError> {
         let affected = self.database.write::<_, SyncSqliteError>(|conn| {
             permit.verify()?;
-            Ok(conn.execute(
+            Ok(conn.execute_cached(
                 "UPDATE files SET materialization_state = ?1 \
                  WHERE group_id = ?2 AND path = ?3 AND state = 'current' \
                    AND materialization_state = ?4",
@@ -317,7 +322,7 @@ impl MaterializationStateRepository {
     /// Both updates share one transaction; the count is every row moved
     /// out of `Hydrating`.
     fn reset_hydrating_in(tx: &rusqlite::Connection) -> Result<usize, SyncSqliteError> {
-        let restored = tx.execute(
+        let restored = tx.execute_cached(
             "UPDATE files SET materialization_state = ?1 \
                  WHERE materialization_state = ?2 AND state = 'current' AND deleted = 0 \
                    AND COALESCE(record_kind, ?3) = ?3 \
@@ -341,7 +346,7 @@ impl MaterializationStateRepository {
                 RecordKind::File.as_db_str(),
             ],
         )?;
-        let demoted = tx.execute(
+        let demoted = tx.execute_cached(
             "UPDATE files SET materialization_state = ?1 \
                  WHERE materialization_state = ?2 AND state = 'current' \
                    AND NOT ( \
@@ -407,7 +412,7 @@ impl MaterializationStateRepository {
     /// blocks, quarantine that placeholder as a divergent "user edit", and
     /// journal it as a new local path — fabricating a zero-filled conflict copy.
     fn reset_evicting_in(conn: &rusqlite::Connection) -> Result<usize, SyncSqliteError> {
-        Ok(conn.execute(
+        Ok(conn.execute_cached(
             "UPDATE files SET materialization_state = ?1 \
              WHERE materialization_state = ?2 AND state = 'current'",
             rusqlite::params![
@@ -432,7 +437,7 @@ impl MaterializationStateRepository {
             let mut kept_states = Vec::with_capacity(keep.len());
             for (group_id, path) in keep {
                 let state: Option<String> = tx
-                    .query_row(
+                    .query_row_cached(
                         "SELECT materialization_state FROM files \
                          WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
                         rusqlite::params![group_id, path],
@@ -445,7 +450,7 @@ impl MaterializationStateRepository {
             let evicting = Self::reset_evicting_in(tx)?;
             for ((group_id, path), state) in keep.iter().zip(kept_states) {
                 if let Some(state) = state {
-                    tx.execute(
+                    tx.execute_cached(
                         "UPDATE files SET materialization_state = ?1 \
                          WHERE group_id = ?2 AND path = ?3 AND state = 'current'",
                         rusqlite::params![state, group_id, path],
@@ -453,7 +458,7 @@ impl MaterializationStateRepository {
                 }
             }
             for (group_id, path) in promote {
-                tx.execute(
+                tx.execute_cached(
                     "UPDATE files SET materialization_state = ?1 \
                      WHERE group_id = ?2 AND path = ?3 AND state = 'current' \
                        AND materialization_state = ?4",
@@ -474,7 +479,7 @@ impl MaterializationStateRepository {
     /// startup resets so that what they demote can be reconciled with disk.
     pub fn list_transient_rows(&self) -> Result<Vec<(String, String)>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT group_id, path FROM files \
                  WHERE state = 'current' AND deleted = 0 \
                    AND materialization_state IN ('hydrating', 'evicting')",
@@ -497,22 +502,38 @@ impl MaterializationStateRepository {
         group_id: &str,
     ) -> Result<MaterializationCounts, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT materialization_state, COUNT(*) FROM files
+            let mut stmt = conn.prepare_cached(
+                "SELECT materialization_state, COUNT(*),
+                        COALESCE(SUM(CASE WHEN record_kind = ?3 THEN size ELSE 0 END), 0)
+                 FROM files
                  WHERE group_id = ?1 AND state = 'current' AND deleted = 0
                    AND record_kind <> ?2
                  GROUP BY materialization_state",
             )?;
-            let rows = stmt
-                .query_map(rusqlite::params![group_id, RecordKind::Directory.as_db_str()], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
-                })?;
+            let rows = stmt.query_map(
+                rusqlite::params![
+                    group_id,
+                    RecordKind::Directory.as_db_str(),
+                    RecordKind::File.as_db_str()
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)? as u64,
+                        r.get::<_, i64>(2)?.max(0) as u64,
+                    ))
+                },
+            )?;
             let mut counts = MaterializationCounts::default();
             for row in rows {
-                let (state, count) = row?;
+                let (state, count, bytes) = row?;
+                counts.total_bytes = counts.total_bytes.saturating_add(bytes);
                 match MaterializationState::from_db_str(&state) {
                     MaterializationState::Present => counts.hydrated = count,
-                    MaterializationState::Remote => counts.placeholder = count,
+                    MaterializationState::Remote => {
+                        counts.placeholder = count;
+                        counts.online_only_bytes = bytes;
+                    }
                     MaterializationState::Hydrating => counts.hydrating = count,
                     MaterializationState::Evicting => counts.evicting = count,
                 }
@@ -531,7 +552,7 @@ impl MaterializationStateRepository {
         group_id: &str,
     ) -> Result<std::collections::HashMap<String, MaterializationState>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT path, materialization_state FROM files \
                  WHERE group_id = ?1 AND deleted = 0 AND state = 'current'",
             )?;
@@ -587,7 +608,7 @@ impl MaterializationStateRepository {
         between_reads: impl Fn(),
     ) -> Result<HashSet<ContentHash>, SyncSqliteError> {
         self.database.read_snapshot::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT group_id, path, state, blocks_json FROM files WHERE deleted = 0",
             )?;
             let rows = stmt.query_map([], |r| {
@@ -643,7 +664,7 @@ impl MaterializationStateRepository {
     ) -> Result<Vec<(String, String)>, SyncSqliteError> {
         let wanted: HashSet<String> = blocks.iter().map(|b| hex::encode(&b.hash.0)).collect();
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT group_id, path, blocks_json FROM files \
                  WHERE deleted = 0 AND state = 'current' AND materialization_state = ?1 \
                    AND record_kind = ?2 AND NOT (group_id = ?3 AND path = ?4)",
@@ -680,7 +701,7 @@ impl MaterializationStateRepository {
         max_files: usize,
     ) -> Result<Option<HashSet<Vec<u8>>>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT record_kind, blocks_json FROM files \
                  WHERE group_id = ?1 AND state = 'current' AND deleted = 0 \
                    AND materialization_state = ?2 AND record_kind <> ?3 \
@@ -765,7 +786,7 @@ impl MaterializationStateRepository {
             // gone, so none of its files are ever repair-eligible. The daemon
             // scheduler already filters orphaned links before calling this, but
             // the core query must not depend on that to stay correct.
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT f.path FROM files f \
                  JOIN links l ON l.group_id = f.group_id \
                  WHERE f.group_id = ?1 \
@@ -806,7 +827,7 @@ impl MaterializationStateRepository {
         now_unix_nanos: i64,
     ) -> Result<(), SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
-            conn.execute(
+            conn.execute_cached(
                 "INSERT INTO block_fetch_refusals \
                      (group_id, path, version_hash, peer_device_id, reason, refused_at_unix_nanos) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
@@ -827,24 +848,31 @@ impl MaterializationStateRepository {
     }
 
     /// Deletes any refusal previously recorded for `peer_device_id` against
-    /// `path` at `version_hash` -- called on a SUCCESSFUL fetch, so a peer
-    /// that once refused a version but has since obtained it can never be
-    /// read as still refusing it. Refusals for OTHER versions of the same
-    /// path are untouched (they were never evidence about this version to
-    /// begin with, since the table is version-scoped).
-    pub fn clear_block_fetch_refusal(
+    /// each `(path, version_hash)` of `keys` -- called on a SUCCESSFUL fetch,
+    /// so a peer that once refused a version but has since obtained it can
+    /// never be read as still refusing it. Refusals for OTHER versions of the
+    /// same path are untouched (they were never evidence about this version
+    /// to begin with, since the table is version-scoped). The keys of one
+    /// committed fetch batch go in one transaction: one writer-gate
+    /// acquisition for the batch instead of one per file, with the same
+    /// unconditional delete for each key.
+    pub fn clear_block_fetch_refusals(
         &self,
         group_id: &str,
-        path: &str,
-        version_hash: &str,
+        keys: &[(String, String)],
         peer_device_id: &str,
     ) -> Result<(), SyncSqliteError> {
-        self.database.write::<_, SyncSqliteError>(|conn| {
-            conn.execute(
+        if keys.is_empty() {
+            return Ok(());
+        }
+        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
+            let mut delete = tx.prepare_cached(
                 "DELETE FROM block_fetch_refusals \
                  WHERE group_id = ?1 AND path = ?2 AND version_hash = ?3 AND peer_device_id = ?4",
-                rusqlite::params![group_id, path, version_hash, peer_device_id],
             )?;
+            for (path, version_hash) in keys {
+                delete.execute(rusqlite::params![group_id, path, version_hash, peer_device_id])?;
+            }
             Ok(())
         })
     }
@@ -864,7 +892,7 @@ impl MaterializationStateRepository {
         version_hash: &str,
     ) -> Result<std::collections::HashSet<String>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT peer_device_id FROM block_fetch_refusals \
                  WHERE group_id = ?1 AND path = ?2 AND version_hash = ?3",
             )?;
@@ -958,7 +986,7 @@ impl MaterializationStateRepository {
     ) -> Result<Option<HeldState>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             let row: Option<(Option<String>, Option<i64>)> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT held_reason, held_since_unix_nanos FROM files \
                      WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
                     rusqlite::params![group_id, path],
@@ -971,6 +999,33 @@ impl MaterializationStateRepository {
                 }
                 _ => None,
             }))
+        })
+    }
+
+    /// Every held, live file of `group_id` with its hold, in path order, from ONE statement on the
+    /// partial held index. What `Status` lists, instead of asking [`Self::get_held_state`] of every
+    /// file of the group (a query per file, on every `status` call).
+    pub fn list_held_states(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<(String, HeldState)>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT path, held_reason, held_since_unix_nanos FROM files \
+                 WHERE group_id = ?1 AND state = 'current' AND held_reason IS NOT NULL \
+                   AND held_since_unix_nanos IS NOT NULL AND deleted = 0 ORDER BY path",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![group_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    HeldState { reason: r.get(1)?, since_unix_nanos: r.get(2)? },
+                ))
+            })?;
+            let mut held = Vec::new();
+            for row in rows {
+                held.push(row?);
+            }
+            Ok(held)
         })
     }
 
@@ -989,7 +1044,7 @@ impl MaterializationStateRepository {
         since_unix_nanos: i64,
     ) -> Result<(), SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
-            let affected = conn.execute(
+            let affected = conn.execute_cached(
                 "UPDATE files SET held_reason = ?1, held_since_unix_nanos = ?2, held_key = NULL \
                  WHERE group_id = ?3 AND path = ?4 AND state = 'current'",
                 rusqlite::params![reason, since_unix_nanos, group_id, path],
@@ -1015,7 +1070,7 @@ impl MaterializationStateRepository {
         key: Option<&str>,
     ) -> Result<(), SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
-            let affected = conn.execute(
+            let affected = conn.execute_cached(
                 "UPDATE files SET held_reason = ?1, held_since_unix_nanos = ?2, held_key = ?3 \
                  WHERE group_id = ?4 AND path = ?5 AND state = 'current'",
                 rusqlite::params![reason, since_unix_nanos, key, group_id, path],
@@ -1036,7 +1091,7 @@ impl MaterializationStateRepository {
     ) -> Result<Option<String>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             Ok(conn
-                .query_row(
+                .query_row_cached(
                     "SELECT held_key FROM files \
                      WHERE group_id = ?1 AND path = ?2 AND state = 'current' \
                        AND held_reason IS NOT NULL",
@@ -1059,7 +1114,7 @@ impl MaterializationStateRepository {
     /// not itself the recheck.
     pub fn list_held_paths(&self, group_id: &str) -> Result<Vec<String>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT path FROM files \
                  WHERE group_id = ?1 AND state = 'current' AND held_reason IS NOT NULL",
             )?;
@@ -1077,7 +1132,7 @@ impl MaterializationStateRepository {
     /// record don't first need to check whether it was ever held.
     pub fn clear_held(&self, group_id: &str, path: &str) -> Result<(), SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
-            conn.execute(
+            conn.execute_cached(
                 "UPDATE files SET held_reason = NULL, held_since_unix_nanos = NULL, \
                  held_key = NULL \
                  WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
@@ -1096,7 +1151,7 @@ impl MaterializationStateRepository {
         group_id: &str,
         path: &str,
     ) -> Result<(), SyncSqliteError> {
-        tx.execute(
+        tx.execute_cached(
             "UPDATE files SET held_reason = NULL, held_since_unix_nanos = NULL, \
              held_key = NULL \
              WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
@@ -1122,7 +1177,7 @@ impl MaterializationStateRepository {
     ) -> Result<(), SyncSqliteError> {
         let affected = self.database.write::<_, SyncSqliteError>(|conn| {
             permit.verify()?;
-            Ok(conn.execute(
+            Ok(conn.execute_cached(
                 "UPDATE files SET placeholder_dev = ?1, placeholder_ino = ?2, \
                  placeholder_provider_kind = ?3 \
                  WHERE group_id = ?4 AND path = ?5 AND state = 'current'",
@@ -1173,7 +1228,7 @@ impl MaterializationStateRepository {
         self.database.write::<_, SyncSqliteError>(|conn| {
             permit.verify()?;
             let existing: Option<(Option<i64>, Option<i64>, Option<String>)> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT placeholder_dev, placeholder_ino, placeholder_provider_kind \
                      FROM files WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
                     rusqlite::params![group_id, path],
@@ -1188,7 +1243,7 @@ impl MaterializationStateRepository {
                     });
                 }
             }
-            let affected = conn.execute(
+            let affected = conn.execute_cached(
                 "UPDATE files SET placeholder_dev = ?1, placeholder_ino = ?2, \
                  placeholder_provider_kind = ?3 \
                  WHERE group_id = ?4 AND path = ?5 AND state = 'current'",
@@ -1224,7 +1279,7 @@ impl MaterializationStateRepository {
     ) -> Result<(), SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
             permit.verify()?;
-            conn.execute(
+            conn.execute_cached(
                 "UPDATE files SET placeholder_dev = NULL, placeholder_ino = NULL, \
                  placeholder_provider_kind = NULL \
                  WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
@@ -1274,7 +1329,7 @@ impl MaterializationStateRepository {
         }
         self.database.read::<_, SyncSqliteError>(|conn| {
             let row: Option<(Option<i64>, Option<i64>, Option<String>)> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT placeholder_dev, placeholder_ino, placeholder_provider_kind \
                      FROM files \
                      WHERE group_id = ?1 AND path = ?2 AND state = 'current' \
@@ -1319,7 +1374,7 @@ impl MaterializationStateRepository {
     ) -> Result<Option<RecordedPlaceholderGeneration>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             let row: Option<(Option<i64>, Option<i64>, Option<String>)> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT placeholder_dev, placeholder_ino, placeholder_provider_kind \
                      FROM files \
                      WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
@@ -1356,7 +1411,7 @@ impl MaterializationStateRepository {
     ) -> Result<std::collections::HashMap<String, RecordedPlaceholderGeneration>, SyncSqliteError>
     {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT path, placeholder_dev, placeholder_ino, placeholder_provider_kind \
                  FROM files \
                  WHERE group_id = ?1 AND deleted = 0 AND state = 'current' \
@@ -1488,7 +1543,7 @@ fn files_block_hashes(
     conn: &rusqlite::Connection,
 ) -> Result<HashSet<ContentHash>, SyncSqliteError> {
     let mut live = HashSet::new();
-    let mut stmt = conn.prepare("SELECT blocks_json FROM files WHERE deleted = 0")?;
+    let mut stmt = conn.prepare_cached("SELECT blocks_json FROM files WHERE deleted = 0")?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
     for row in rows {
         let blocks: Vec<BlockInfo> = serde_json::from_str(&row?)?;

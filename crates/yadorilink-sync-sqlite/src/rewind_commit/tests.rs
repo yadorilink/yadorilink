@@ -36,10 +36,9 @@ fn version(salt: i64) -> FileVersion {
         0,
         FileMeta {
             mtime_unix_nanos: salt,
-            unix_mode: Some(0o644),
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     )
 }
@@ -89,8 +88,7 @@ impl Replica {
                         record_kind: RecordKind::File,
                         symlink_target: None,
                         symlink_out_of_root: false,
-                        unix_mode: Some(0o644),
-                        xattrs: Vec::new(),
+                        exec: false,
                     }),
                     version,
                     native_witness: Some(witness),
@@ -154,6 +152,25 @@ impl Replica {
         self.db
             .read::<_, SyncSqliteError>(|conn| {
                 crate::rewind_plan::compute_rewind_plan(conn, GROUP, target, &|_| false)
+            })
+            .unwrap()
+    }
+
+    /// Every row of the folder index for the group, all states and all columns: what the
+    /// projection writes, never the commit.
+    fn index_rows(&self) -> Vec<Vec<rusqlite::types::Value>> {
+        self.db
+            .read::<_, SyncSqliteError>(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT * FROM files WHERE group_id = ?1 ORDER BY path, version_seq, state",
+                )?;
+                let columns = stmt.column_count();
+                let rows = stmt
+                    .query_map([GROUP], |r| {
+                        (0..columns).map(|i| r.get::<_, rusqlite::types::Value>(i)).collect()
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
             })
             .unwrap()
     }
@@ -302,8 +319,17 @@ fn a_chunk_authors_exactly_the_plan_and_advances_the_journal() {
     assert_eq!((counts.create, counts.replace, counts.delete), (1, 1, 1));
     let chunks = replica.prefetched_run(&plan);
     let (_, deltas_before, _) = replica.snapshot();
+    let rows_before = replica.index_rows();
+    assert!(!rows_before.is_empty(), "the folder index has rows to leave alone");
 
     assert_eq!(replica.commit(0, &chunks[0], true), RewindChunkOutcome::Committed { done: true });
+    // The commit authors signed changes and arms the projection; the index rows are the
+    // projection's to write, so none has changed here (no projection runs in this harness).
+    assert_eq!(
+        replica.index_rows(),
+        rows_before,
+        "the commit wrote index rows itself instead of leaving them to the projection"
+    );
 
     // Exactly the target's content: `a` back to 1, `b` back as 2, no `c`.
     assert_eq!(

@@ -185,52 +185,44 @@ async fn a_directory_whose_structural_mkdir_is_in_flight_is_not_authored() {
     assert_eq!(ops_at(&state, "pending"), Vec::<String>::new());
 }
 
-/// D5: a `chmod` of a structural directory is the user operating on the
-/// directory itself, which makes it explicit with the mode they gave it.
+/// A directory's mode is not replicated: a chmod of a structural directory does not promote it to an
+/// explicit entry (that takes someone making or replacing the directory, not changing its mode).
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn chmod_of_a_structural_directory_promotes_it_to_an_explicit_directory_with_its_mode() {
-    if !yadorilink_fs_platform::fs_capabilities::temp_dir_proves_object_identity_for_test() {
-        return;
-    }
+async fn chmod_of_a_structural_directory_does_not_promote_it() {
     use std::os::unix::fs::PermissionsExt as _;
     let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
     let root = canonical_root(&root_dir);
     adopt_root(&state, GROUP, &root);
     std::fs::create_dir(root.join("s")).unwrap();
-    std::fs::set_permissions(root.join("s"), std::fs::Permissions::from_mode(0o755)).unwrap();
     record_structural(&state, &root, "s");
 
-    event(&proc, &root, &root.join("s"), FsChangeKind::CreatedOrModified).await;
-    assert_eq!(ops_at(&state, "s"), Vec::<String>::new(), "untouched, it is still structural");
-
-    std::fs::set_permissions(root.join("s"), std::fs::Permissions::from_mode(0o700)).unwrap();
-    event(&proc, &root, &root.join("s"), FsChangeKind::CreatedOrModified).await;
-
-    assert_eq!(ops_at(&state, "s"), ["put-dir"]);
-    let row = state.file_index_repository().canonical_current_row(GROUP, "s").unwrap().unwrap();
-    assert_eq!(row.snapshot.record_kind, RecordKind::Directory);
-    assert_eq!(row.snapshot.unix_mode, Some(0o700));
+    for mode in [0o700, 0o755, 0o1700, 0o1755] {
+        std::fs::set_permissions(root.join("s"), std::fs::Permissions::from_mode(mode)).unwrap();
+        event(&proc, &root, &root.join("s"), FsChangeKind::CreatedOrModified).await;
+        proc.scan_existing_files(GROUP, &root).unwrap();
+        assert_eq!(ops_at(&state, "s"), Vec::<String>::new(), "{mode:o}: still structural");
+    }
 }
 
-/// A chmod of an explicit directory is a new version of it.
+/// A chmod of an explicit directory is not a new version of it: nothing about its mode is replicated.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn chmod_of_an_explicit_directory_authors_its_new_mode() {
+async fn chmod_of_an_explicit_directory_authors_nothing() {
     use std::os::unix::fs::PermissionsExt as _;
     let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
     let root = canonical_root(&root_dir);
     adopt_root(&state, GROUP, &root);
     std::fs::create_dir(root.join("e")).unwrap();
-    std::fs::set_permissions(root.join("e"), std::fs::Permissions::from_mode(0o755)).unwrap();
     event(&proc, &root, &root.join("e"), FsChangeKind::CreatedOrModified).await;
+    assert_eq!(ops_at(&state, "e"), ["put-dir"]);
 
-    std::fs::set_permissions(root.join("e"), std::fs::Permissions::from_mode(0o750)).unwrap();
-    event(&proc, &root, &root.join("e"), FsChangeKind::CreatedOrModified).await;
-
-    assert_eq!(ops_at(&state, "e"), ["put-dir", "put-dir"]);
-    let row = state.file_index_repository().canonical_current_row(GROUP, "e").unwrap().unwrap();
-    assert_eq!(row.snapshot.unix_mode, Some(0o750));
+    for mode in [0o750, 0o700, 0o755] {
+        std::fs::set_permissions(root.join("e"), std::fs::Permissions::from_mode(mode)).unwrap();
+        event(&proc, &root, &root.join("e"), FsChangeKind::CreatedOrModified).await;
+        proc.scan_existing_files(GROUP, &root).unwrap();
+        assert_eq!(ops_at(&state, "e"), ["put-dir"], "{mode:o}: no new version");
+    }
 }
 
 /// The ledger names a structural directory by identity. A different
@@ -563,36 +555,6 @@ async fn rm_rf_does_not_delete_child_admitted_but_not_yet_projected() {
         .get_file(GROUP, "a/new.txt")
         .unwrap()
         .is_some_and(|r| !r.deleted));
-}
-
-/// D5 promotes a structural directory on a change of its replicated mode
-/// (the permission bits) only. A setuid, setgid or sticky bit is part of
-/// the directory's tracked metadata but not of its replicated mode, so
-/// setting one promotes nothing.
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_special_bit_on_a_structural_directory_does_not_promote_it() {
-    if !yadorilink_fs_platform::fs_capabilities::temp_dir_proves_object_identity_for_test() {
-        return;
-    }
-    use std::os::unix::fs::PermissionsExt as _;
-    let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
-    let root = canonical_root(&root_dir);
-    adopt_root(&state, GROUP, &root);
-    std::fs::create_dir(root.join("s")).unwrap();
-    std::fs::set_permissions(root.join("s"), std::fs::Permissions::from_mode(0o755)).unwrap();
-    record_structural(&state, &root, "s");
-
-    std::fs::set_permissions(root.join("s"), std::fs::Permissions::from_mode(0o1755)).unwrap();
-    event(&proc, &root, &root.join("s"), FsChangeKind::CreatedOrModified).await;
-    proc.scan_existing_files(GROUP, &root).unwrap();
-    assert_eq!(ops_at(&state, "s"), Vec::<String>::new(), "a sticky bit is not a mode change");
-
-    std::fs::set_permissions(root.join("s"), std::fs::Permissions::from_mode(0o1700)).unwrap();
-    event(&proc, &root, &root.join("s"), FsChangeKind::CreatedOrModified).await;
-    assert_eq!(ops_at(&state, "s"), ["put-dir"]);
-    let row = state.file_index_repository().canonical_current_row(GROUP, "s").unwrap().unwrap();
-    assert_eq!(row.snapshot.unix_mode, Some(0o700));
 }
 
 /// Takes away the permission to search `dir` and gives it back on drop, so a

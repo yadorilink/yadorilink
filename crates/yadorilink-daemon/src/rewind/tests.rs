@@ -172,6 +172,30 @@ fn an_approved_plan_with_unavailable_paths_cannot_start() {
     );
 }
 
+/// A path whose version from that time was recorded as not kept refuses the rewind and names the
+/// reason, instead of being rewound to some other version.
+#[test]
+fn an_approved_plan_with_versions_that_were_not_kept_cannot_start_and_says_why() {
+    let plan = plan_of(vec![
+        entry(
+            "a",
+            RewindPathAction::Unavailable { reason: RewindUnavailableReason::NotKeptExpired },
+        ),
+        entry(
+            "b",
+            RewindPathAction::Unavailable { reason: RewindUnavailableReason::NotKeptLowSpace },
+        ),
+    ]);
+    let approved = plan.plan_id();
+    let refused = accept_approved_plan(plan, &approved).unwrap_err();
+    assert_eq!(
+        refused.to_string(),
+        "2 files unavailable; rewind cannot start: 1 because the version from that time was not \
+         kept: the retention period ended; 1 because the version from that time was not kept: the \
+         disk was nearly full"
+    );
+}
+
 mod against_a_daemon {
     use std::sync::Arc;
 
@@ -298,6 +322,7 @@ mod against_a_daemon {
             .remove_file(
                 GROUP,
                 "steady.txt",
+                yadorilink_sync_sqlite::file_index::ErasureReason::IgnoreSweep,
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
@@ -321,6 +346,7 @@ mod against_a_daemon {
             .remove_file(
                 GROUP,
                 path,
+                yadorilink_sync_sqlite::file_index::ErasureReason::IgnoreSweep,
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap());

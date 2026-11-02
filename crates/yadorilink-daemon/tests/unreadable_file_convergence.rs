@@ -57,7 +57,7 @@ async fn device(account: &support::TestAccount, name: &str, group_id: &str) -> D
     let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = support::open_file_backed_replica_coordinator();
     let sync_state = Arc::new(sync_state);
-    let state = DaemonState::new(id.clone(), sync_state, store);
+    let state = support::fast_daemon_state(id.clone(), sync_state, store);
     support::ensure_device_signing_key(&state);
     Device {
         state,

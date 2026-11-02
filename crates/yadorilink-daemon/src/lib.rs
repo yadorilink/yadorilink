@@ -34,7 +34,10 @@ pub mod coordination_client;
 pub mod credential_store;
 pub mod custody_handoff;
 pub mod custody_holds;
+pub(crate) mod custody_wait;
 pub mod daemon_state;
+#[cfg(feature = "process-model")]
+pub mod data_compat;
 pub mod device_config;
 #[cfg(feature = "process-model")]
 pub mod diagnostics_ipc;
@@ -49,13 +52,19 @@ pub mod exe_replaced;
 #[cfg(feature = "process-model")]
 pub mod exe_watch;
 pub mod fd_limit;
+pub(crate) mod file_block_source;
 pub mod gc;
 pub mod gc_state;
 pub mod governance_config;
+pub(crate) mod group_db_facts;
 pub mod handoff_proof;
+#[cfg(feature = "process-model")]
+pub mod healthcheck;
 pub mod hydration;
 pub mod hydration_single_flight;
 pub mod identity;
+pub(crate) mod index_audit;
+pub(crate) mod ingest_policy;
 pub mod install_witness;
 pub mod instance_nonce;
 #[cfg(feature = "process-model")]
@@ -66,6 +75,9 @@ pub mod local_convergence;
 #[cfg(feature = "process-model")]
 pub mod log_roll;
 pub mod log_throttle;
+pub(crate) mod store_residency;
+#[cfg(feature = "process-model")]
+pub use yadorilink_local_storage::mac_claim;
 pub mod machine_fingerprint;
 pub(crate) mod maintenance;
 pub mod maintenance_coordinator;
@@ -89,6 +101,7 @@ mod native_test_support;
 pub(crate) mod obligation_tick_metrics;
 pub mod path_witness_sink;
 pub mod peer_connectivity_runtime;
+mod peer_last_seen;
 pub mod peer_orchestrator;
 pub mod peer_registry;
 #[cfg(windows)]
@@ -103,6 +116,7 @@ pub mod recovery;
 pub mod recovery_diagnosis;
 pub mod recovery_evidence;
 pub mod recovery_snapshot;
+pub(crate) mod redial_pacing;
 /// `ReplicaCoordinator` -- see that module's own doc comment for what it
 /// is.
 pub mod replica_coordinator;
@@ -116,6 +130,7 @@ pub mod route;
 pub mod runtime_telemetry;
 pub mod space_management_config;
 pub(crate) mod status_dimensions;
+pub(crate) mod status_facts;
 pub(crate) mod status_report;
 pub mod sync_adapter;
 pub mod sync_runtime;
@@ -124,6 +139,7 @@ pub(crate) mod conflict_resolution;
 pub(crate) mod file_actions;
 pub(crate) mod pause_deadline;
 pub(crate) mod provider_auto_reclaim;
+pub(crate) mod provider_delivery;
 pub(crate) mod provider_eager;
 pub(crate) mod provider_evict;
 pub(crate) mod provider_evidence;
@@ -139,10 +155,10 @@ pub(crate) mod provider_publication;
 #[cfg(test)]
 pub(crate) mod provider_read_fault;
 pub(crate) mod provider_reclaim;
+pub(crate) mod provider_stage;
 pub(crate) mod provider_status;
 pub(crate) mod provider_writer;
 pub(crate) mod requested_opens;
-#[cfg(feature = "process-model")]
 pub mod send_transfer;
 pub mod shell_context;
 pub mod shell_ipc;

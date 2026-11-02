@@ -68,6 +68,20 @@ pub struct LocalConvergenceExecutor {
     /// This device's block content. Reading and writing it is local work; only
     /// *obtaining* a block this device does not have needs a peer.
     pub(crate) store: Arc<dyn yadorilink_peer_session::ports::BlockContentStore>,
+    /// The same store without the in-memory blocks of the passes in flight (`store` reads those
+    /// first): what is durable. A version is kept only if this holds it, never because a pass
+    /// happens to hold a block of it in memory for now.
+    pub(crate) durable_store: Arc<dyn yadorilink_peer_session::ports::BlockContentStore>,
+    /// Blocks the passes in flight hold in memory instead of in `store` (single-pass receive);
+    /// `store` reads them first.
+    pub(crate) window_blocks: Arc<window_blocks::WindowBlocks>,
+    /// Completely written and verified temps of large files, waiting for their settle (single-pass
+    /// receive). Empty unless something registers one.
+    pub(crate) filled_temps: Arc<filled_temps::FilledTemps>,
+    /// Partly filled large-file temps kept for a later attempt of their version (this process only).
+    pub(crate) partial_temps: Arc<filled_temps::PartialTemps>,
+    /// Reads the files of replaced versions into the store, many files per durable commit.
+    pub(crate) retention_queue: Arc<retention_batch::RetentionIngestQueue>,
     /// How many blocks each group has been allowed to eagerly fetch.
     ///
     /// A budget on this device's own appetite for content, spent by whatever
@@ -79,6 +93,11 @@ pub struct LocalConvergenceExecutor {
     /// bookkeeping can stand back while it does.
     pub(crate) block_write_activity_provider:
         Arc<dyn yadorilink_peer_session::peer_session::BlockWriteActivityProvider>,
+    /// Where an eager receive reports the bytes it has fetched of the file it is receiving, for
+    /// the status model's per-folder transfer. Attached by the daemon; an executor without one
+    /// (a test) reports nothing.
+    pub(crate) transfer_progress:
+        std::sync::OnceLock<crate::transfer_progress::TransferProgressTracker>,
     /// Test-only, one-shot: runs between the assembly of an eager write's
     /// temp file and the final local-edit check that precedes its rename, so
     /// a test can land a local write in exactly that window.
@@ -104,6 +123,9 @@ pub struct LocalConvergenceExecutor {
     /// (0 = environment, 1 = on, 2 = off).
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) batch_open_override: std::sync::atomic::AtomicU8,
+    /// Test seam for `single_pass`: 0 follows the tuning, 1 forces on, 2 forces off.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) single_pass_override: std::sync::atomic::AtomicU8,
     /// Test-only: pins the deferred receive flush (`0` leaves the environment's
     /// choice, `1` flushes each file with a full flush, `2` the single-barrier
     /// mode, `3` off).
@@ -267,8 +289,13 @@ mod materialize;
 pub mod obligation_claims;
 mod receive_write_gate;
 pub(crate) use receive_write_gate::parse_permits;
+mod filled_temps;
+mod large_file_sink;
 mod received_flush_barrier;
+pub(crate) mod retention_batch;
+pub(crate) mod version_retention;
 mod volume_probe;
+mod window_blocks;
 
 /// Whether `set` excludes `path` of `group_id` from sync: the ignore file
 /// itself, a pattern that matches it as a file, or a directory-only pattern
@@ -309,6 +336,12 @@ mod receive_content_write_tests;
 /// unobserved local edit survives as a head.
 #[cfg(test)]
 mod delete_projection_tests;
+#[cfg(all(test, unix))]
+mod own_edit_retention_tests;
+#[cfg(all(test, unix))]
+mod store_residency_tests;
+#[cfg(all(test, unix))]
+mod version_retention_flow_tests;
 
 /// A path a rebootstrap protects is written, removed, moved and authored by
 /// nothing but the rebootstrap, on every lane.
@@ -359,6 +392,8 @@ mod receive_deferred_flush_tests;
 mod receive_edit_crash_sequence_tests;
 #[cfg(test)]
 mod receive_rename_edit_crash_sequence_tests;
+#[cfg(test)]
+mod unflushed_delete_tests;
 
 #[cfg(all(test, unix))]
 mod power_cut_tests;
@@ -460,15 +495,13 @@ pub(crate) enum OwnCaptureRule {
     ProjectAsBefore,
 }
 
-/// Whether the regular file at `out_path` already has `version`'s mode and
-/// replicated extended attributes -- read-only, the same comparison that
-/// decides whether a metadata repair has anything to write.
-pub(crate) fn mode_and_xattrs_match_disk(
+/// Whether the regular file at `out_path` already has `version`'s execute flag -- read-only, the
+/// same comparison that decides whether a metadata repair has anything to write.
+pub(crate) fn exec_matches_disk(
     out_path: &Path,
     version: &yadorilink_replica_domain::file::FileVersion,
 ) -> Result<bool, PeerSessionError> {
-    Ok(yadorilink_local_storage::unix_mode_already_matches_disk(out_path, version.meta.unix_mode)?
-        && yadorilink_local_storage::xattrs_already_match_disk(out_path, &version.meta.xattrs)?)
+    Ok(yadorilink_local_storage::exec_already_matches_disk(out_path, version.meta.exec)?)
 }
 
 /// What `recapture_instead_of_projecting` achieved.
@@ -483,6 +516,14 @@ pub(crate) enum Recapture {
 }
 
 impl LocalConvergenceExecutor {
+    /// Lets the executor report receive progress to `tracker` (once; later calls are ignored).
+    pub(crate) fn attach_transfer_progress(
+        &self,
+        tracker: crate::transfer_progress::TransferProgressTracker,
+    ) {
+        let _ = self.transfer_progress.set(tracker);
+    }
+
     // One argument per injected dependency of the executor.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -512,6 +553,15 @@ impl LocalConvergenceExecutor {
                 })
                 .collect(),
         );
+        let window_blocks =
+            Arc::new(window_blocks::WindowBlocks::new(window_blocks::WINDOW_BLOCKS_CAPACITY_BYTES));
+        let durable_store = Arc::clone(&store);
+        let store: Arc<dyn yadorilink_peer_session::ports::BlockContentStore> =
+            Arc::new(window_blocks::WindowOverlayStore::new(store, Arc::clone(&window_blocks)));
+        let retention_queue = retention_batch::RetentionIngestQueue::new(
+            Arc::clone(&durable_store),
+            Arc::clone(&state),
+        );
         Arc::new(Self {
             state,
             local_device_id,
@@ -534,8 +584,14 @@ impl LocalConvergenceExecutor {
             pending_local_change_flush,
             canonical_sync_roots,
             store,
+            durable_store,
+            window_blocks,
+            filled_temps: Arc::new(filled_temps::FilledTemps::default()),
+            partial_temps: Arc::new(filled_temps::PartialTemps::default()),
+            retention_queue,
             eager_admission: StdMutex::new(HashMap::new()),
             block_write_activity_provider,
+            transfer_progress: std::sync::OnceLock::new(),
             #[cfg(any(test, feature = "test-support"))]
             between_assemble_and_persist_hook: StdMutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
@@ -549,6 +605,8 @@ impl LocalConvergenceExecutor {
             #[cfg(any(test, feature = "test-support"))]
             #[cfg(any(test, feature = "test-support"))]
             batch_open_override: std::sync::atomic::AtomicU8::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            single_pass_override: std::sync::atomic::AtomicU8::new(0),
             #[cfg(any(test, feature = "test-support"))]
             deferred_flush_override: std::sync::atomic::AtomicU8::new(0),
             volume_probes: volume_probe::VolumeProbes::default(),
@@ -748,7 +806,51 @@ impl LocalConvergenceExecutor {
                 .map(|found| found == DiskContentComparison::PresentButDifferent)
         };
         let state = self.state.get_materialization_state(group_id, rel_path)?;
+        // A write that repair stood down (or that failed before its rename) leaves the row
+        // in flight over the previous version with its intent open. Nothing else marks those
+        // bytes as the device's own, and a user may have written to the file since: unless the
+        // file is still the previous version, or already holds what is being written, it is
+        // protected like any other uncaptured write.
+        if state == Some(MaterializationState::Hydrating)
+            && self.state.has_materialization_intent(group_id, rel_path)?
+        {
+            if self.state.disk_is_untouched_pre_image_at(group_id, rel_path, out_path)? {
+                return Ok(false);
+            }
+            let holds = |blocks: &[yadorilink_replica_domain::file::BlockInfo]| {
+                disk_content_comparison(out_path, blocks)
+                    .map(|found| found == DiskContentComparison::Matched)
+            };
+            if holds(&local_row.blocks)? || incoming.map(holds).transpose()?.unwrap_or(false) {
+                return Ok(false);
+            }
+            // Bytes this device itself wrote for the path (an earlier write whose proof was
+            // lost, or the version the last proof named) are what an open write replaces, not an
+            // edit: the same pre-image rule capture applies to the path.
+            let disk_blocks =
+                yadorilink_local_storage::chunker::hash_file_blocks(out_path, true, |_, _| {
+                    Ok::<(), yadorilink_local_storage::StorageError>(())
+                })?;
+            let disk_target = yadorilink_local_storage::intent_target_hash(&disk_blocks);
+            let pre_images =
+                yadorilink_local_capture::ports::LocalMutationStore::pre_image_content_targets(
+                    &*self.state,
+                    group_id,
+                    rel_path,
+                )
+                .map_err(crate::sync_error::SyncError::from)?;
+            return Ok(!pre_images.contains(&disk_target));
+        }
         if !matches!(state, Some(MaterializationState::Present | MaterializationState::Remote)) {
+            return Ok(false);
+        }
+        // A write opened over this path that has renamed nothing leaves the object the device
+        // wrote before standing under an invalidated proof (and, after a failed attempt, under a
+        // row that already names the incoming version). Those bytes are the pre-image of that
+        // write: no local edit, so it may go on.
+        if self.state.has_materialization_intent(group_id, rel_path)?
+            && self.state.disk_is_untouched_pre_image_at(group_id, rel_path, out_path)?
+        {
             return Ok(false);
         }
         if state == Some(MaterializationState::Remote)
@@ -756,9 +858,9 @@ impl LocalConvergenceExecutor {
         {
             return Ok(false);
         }
-        // Bytes are not the whole of a local edit: a chmod or xattr change
-        // moves neither, yet the scanner captures it as one. Ask the scanner's
-        // own question (disk mode and xattrs against the row's, exactly).
+        // Bytes are not the whole of a local edit: a chmod +x/-x moves
+        // neither, yet the scanner captures it as one. Ask the scanner's
+        // own question (the disk's execute flag against the row's).
         let metadata_edited = self.disk_metadata_differs_from_row(group_id, rel_path, out_path)?;
         if state == Some(MaterializationState::Present)
             && self.state.dag_has_usable_materialized_generation(group_id, rel_path)?
@@ -790,9 +892,7 @@ impl LocalConvergenceExecutor {
         }
     }
 
-    /// Whether the mode or replicated xattrs on disk differ from the row's,
-    /// compared as the scanner does (`on_disk != indexed`, a row without a
-    /// mode included).
+    /// Whether the execute flag on disk differs from the row's, compared as the scanner does.
     fn disk_metadata_differs_from_row(
         &self,
         group_id: &str,
@@ -803,16 +903,13 @@ impl LocalConvergenceExecutor {
             return Ok(false);
         };
         let meta = row.to_file_version().meta;
-        let file = match std::fs::File::open(out_path) {
-            Ok(file) => file,
+        let metadata = match std::fs::metadata(out_path) {
+            Ok(metadata) => metadata,
             Err(error) if is_absent(&error) => return Ok(false),
             Err(error) => return Err(error.into()),
         };
-        // Off Unix a disk has no mode to compare.
-        let mode_differs = cfg!(unix)
-            && file.metadata().map(|m| yadorilink_local_storage::unix_mode_from_metadata(&m))?
-                != meta.unix_mode;
-        Ok(mode_differs || yadorilink_local_storage::read_replicated_xattrs(&file) != meta.xattrs)
+        // Off Unix a disk has no flag to compare.
+        Ok(cfg!(unix) && yadorilink_local_storage::exec_from_metadata(&metadata) != meta.exec)
     }
 
     /// Whether removing `rel_path` on a projected removal would destroy
@@ -849,20 +946,20 @@ impl LocalConvergenceExecutor {
         Ok(match row.record_kind {
             RecordKind::File if lstat.is_file() => {
                 use yadorilink_replica_domain::session_state::MaterializationState;
-                // A version covers mode and replicated xattrs as well as
-                // bytes, so a local chmod or xattr change capture has not
+                // A version covers the execute flag as well as
+                // bytes, so a local chmod +x/-x capture has not
                 // recorded is as unobserved by the remover as a content
                 // edit. An untouched placeholder is left out as above; any
                 // state this cannot vouch for (missing, or mid-hydration or
                 // eviction) is refused rather than removed unchecked.
                 match row.materialization_state {
                     Some(MaterializationState::Present) => {
-                        !mode_and_xattrs_match_disk(out_path, &row.to_file_version())?
+                        !exec_matches_disk(out_path, &row.to_file_version())?
                     }
                     Some(MaterializationState::Remote) => {
                         !self
                             .is_untouched_placeholder_of_this_device(group_id, rel_path, out_path)?
-                            && !mode_and_xattrs_match_disk(out_path, &row.to_file_version())?
+                            && !exec_matches_disk(out_path, &row.to_file_version())?
                     }
                     _ => true,
                 }
@@ -971,13 +1068,8 @@ impl LocalConvergenceExecutor {
         };
         let file_type = lstat.file_type();
         let moved_on = match kind {
-            RecordKind::Directory if file_type.is_dir() => {
-                // Off Unix a disk has no mode to compare.
-                cfg!(unix)
-                    && version.meta.unix_mode.is_some()
-                    && yadorilink_local_storage::unix_mode_from_metadata(&lstat)
-                        != version.meta.unix_mode
-            }
+            // A directory's mode is not replicated: any directory is the one the version names.
+            RecordKind::Directory if file_type.is_dir() => false,
             RecordKind::Directory => true,
             RecordKind::Symlink if file_type.is_symlink() => {
                 let target = std::fs::read_link(&out_path)
@@ -1001,7 +1093,7 @@ impl LocalConvergenceExecutor {
                 let record = file_record_from_version(rel_path, version);
                 disk_content_comparison(&out_path, &record.blocks)?
                     == DiskContentComparison::PresentButDifferent
-                    || !mode_and_xattrs_match_disk(&out_path, version)?
+                    || !exec_matches_disk(&out_path, version)?
             }
         };
         Ok(if moved_on { OwnCaptureOnDisk::MovedOn } else { OwnCaptureOnDisk::Holds })
@@ -1165,12 +1257,7 @@ impl LocalConvergenceExecutor {
                     // exact name, because this name collides with a live
                     // sibling that a plain lookup resolves to instead.
                     let root = self.sync_root(group_id)?;
-                    let volume = types::VolumeFolding {
-                        case_insensitive: hazard::is_case_insensitive_filesystem(&root),
-                        normalization_insensitive: hazard::is_normalization_insensitive_filesystem(
-                            &root,
-                        ),
-                    };
+                    let volume = volume_probe::ProbedFolding::probe_now(&root).or_conservative();
                     if !self.observably_absent_by_exact_name(group_id, &record.path, volume)? {
                         return Ok(MaterializeResult::RetryRequired);
                     }
@@ -1208,6 +1295,14 @@ impl LocalConvergenceExecutor {
             );
             return Ok(MaterializeResult::RetryRequired);
         }
+        // The version this delete removes is accounted for before anything is removed: its bytes
+        // are in the store (read from the file now, if they are only there), or this device never
+        // had them. After the removal below there would be nothing left to read.
+        let Some(retention_proofs) =
+            self.proofs_before_removing(group_id, record, &out_path).await?
+        else {
+            return Ok(MaterializeResult::RetryRequired);
+        };
         // Opened before the delete syscall below, not after -- same
         // "before the bytes are written" contract every OTHER physical
         // mutator in this codebase already follows
@@ -1279,6 +1374,7 @@ impl LocalConvergenceExecutor {
                 origin_device_id,
                 None,
                 &|| self.root_lease_for(group_id),
+                yadorilink_sync_sqlite::retention::Retention::Proofs(&retention_proofs),
             )?;
         } else {
             // The path carries no native head: it is a pure local artifact
@@ -1290,7 +1386,7 @@ impl LocalConvergenceExecutor {
             // this group has native history: nothing about a purely local
             // decision can ever satisfy "verified authoring identity". There
             // is no fact to assert here, so erase the row instead of
-            // asserting a tombstone -- exactly `erase_local_only_file`'s
+            // asserting a tombstone -- exactly `erase_path_rows`'s
             // ("not a tombstone, an erasure", mirroring
             // `FileIndexRepository::remove_file`'s own existing ignore-sweep
             // use) documented semantics.
@@ -1298,6 +1394,7 @@ impl LocalConvergenceExecutor {
                 delete_intent_guard,
                 group_id,
                 &record.path,
+                yadorilink_sync_sqlite::file_index::ErasureReason::LocalOnlyArtifact,
                 root_commit_permit,
             )?;
         }
@@ -1966,6 +2063,23 @@ pub(crate) mod removal_ordering_probe {
 
     pub(super) fn fire(removed: &Path) {
         let probe = PROBES.lock().unwrap().as_ref().and_then(|m| m.get(removed).cloned());
+        if let Some(probe) = probe {
+            probe();
+        }
+    }
+
+    /// A probe that runs right after the retention proofs for a removal of the path have been
+    /// made, before the path is looked at again and removed: where an editor saving over the file
+    /// while the proofs were being made lands.
+    static AFTER_PROOF: Mutex<Option<HashMap<PathBuf, Probe>>> = Mutex::new(None);
+
+    #[cfg(unix)]
+    pub(crate) fn arm_after_proof(path: PathBuf, probe: impl Fn() + Send + Sync + 'static) {
+        AFTER_PROOF.lock().unwrap().get_or_insert_with(HashMap::new).insert(path, Arc::new(probe));
+    }
+
+    pub(super) fn fire_after_proof(path: &Path) {
+        let probe = AFTER_PROOF.lock().unwrap().as_ref().and_then(|m| m.get(path).cloned());
         if let Some(probe) = probe {
             probe();
         }

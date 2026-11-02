@@ -234,18 +234,12 @@ impl ReplicaCoordinator {
         operation_id: &str,
         out_path: &std::path::Path,
         wrote_under_mutation_generation: i64,
-        // False when the write could not confirm every exact-required field
-        // it set (its replicated xattrs): the restore is still committed,
-        // but with no observed identity, so no exact proof is published
-        // and the row does not claim to hold the content.
-        exact_claimable: bool,
         permit: &yadorilink_root_authority::root_commit::RootCommitPermit<'_>,
     ) -> Result<yadorilink_replica_domain::session_state::RestoreCommitOutcome, SyncError> {
         self.restore_operation_repository().mark_restore_disk_committed(operation_id, permit)?;
         // Observed after the disk write, so the proof describes what a
         // reader would now find.
-        let restored_identity =
-            if exact_claimable { FileIdentity::observe_path(out_path).ok() } else { None };
+        let restored_identity = FileIdentity::observe_path(out_path).ok();
         Ok(self.restore_operation_repository().commit_restore_operation(
             operation_id,
             restored_identity.as_ref(),
@@ -295,8 +289,7 @@ impl ReplicaCoordinator {
         lstat: Option<&std::fs::Metadata>,
         lstat_identity: crate::hydration::DiskIdentity,
         record: &yadorilink_replica_domain::file::FileRecord,
-        unix_mode: Option<u32>,
-        xattrs: &[(String, Vec<u8>)],
+        exec: bool,
         permit: &RootCommitPermit<'_>,
     ) -> Result<bool, SyncError> {
         let generation =
@@ -317,12 +310,8 @@ impl ReplicaCoordinator {
                     || (yadorilink_local_storage::disk_bytes_match_indexed_blocks(
                         out_path,
                         &record.blocks,
-                    )? && yadorilink_local_storage::unix_mode_already_matches_disk(
-                        out_path, unix_mode,
-                    )? && matches!(
-                        yadorilink_local_storage::verify_replicated_xattrs_exact(out_path, xattrs),
-                        Ok(true)
-                    ) && crate::hydration::disk_identity(out_path)? == lstat_identity)
+                    )? && yadorilink_local_storage::exec_already_matches_disk(out_path, exec)?
+                        && crate::hydration::disk_identity(out_path)? == lstat_identity)
             }
         };
         if !may_replace {

@@ -58,6 +58,32 @@ CREATE TABLE IF NOT EXISTS send_inbound_transfers (
     destination_dir TEXT,
     offered_at_unix_nanos INTEGER NOT NULL
 );
+
+-- How to reach the sender of an inbound transfer, as the directory resolved it when the offer
+-- was accepted (an encoded `ResolvedDevice`). A sender on another account is known to this
+-- device only through the grant of its offer, which does not outlive the process or the grant;
+-- without this, a receive resumed later could not find who to pull from.
+CREATE TABLE IF NOT EXISTS send_inbound_senders (
+    transfer_id TEXT PRIMARY KEY,
+    address TEXT NOT NULL
+);
+
+-- What the sender has still to be told about an inbound transfer that ended: 'completed',
+-- 'canceled' or 'failed'. Written in the same transaction as the status change, deleted once the
+-- sender answered, so a notice lost on the network is sent again instead of leaving the sender
+-- believing the transfer is still going.
+CREATE TABLE IF NOT EXISTS send_inbound_notices (
+    transfer_id TEXT PRIMARY KEY,
+    outcome TEXT NOT NULL,
+    noted_at_unix_nanos INTEGER NOT NULL
+);
+
+-- When an accepted outbound transfer was last accepted or served from, so a sender can tell a
+-- receiver that is fetching from one that went away.
+CREATE TABLE IF NOT EXISTS send_outbound_activity (
+    transfer_id TEXT PRIMARY KEY,
+    last_active_unix_nanos INTEGER NOT NULL
+);
 ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,8 +106,8 @@ pub enum OutboundStatus {
     /// The sender stopped it. Terminal until the person retries it: nothing is served for it, and
     /// the receiver is told so when it comes to pull.
     Canceled,
-    /// The receiver reported that it wrote every file (`TransferDone`). Terminal, but it keeps
-    /// serving: a receiver that lost what it wrote may pull again.
+    /// The receiver reported that it wrote every file (`TransferDone`). Terminal: the content is
+    /// released and nothing more is served.
     Completed,
 }
 
@@ -227,23 +253,32 @@ impl SendStore {
     /// back. A declined, canceled or completed one is over: a re-send mints a genuinely new
     /// transfer id instead of reusing and mutating it, and the finished row is left in place for
     /// the history (a canceled or declined one is revived only by an explicit retry).
+    ///
+    /// Only one made under the same Send link (`link_id`, empty for none) is handed back: the
+    /// receiver tells links apart by the id in the manifest, and two links carrying the same files
+    /// to the same device are two transfers.
     pub fn find_outbound_by_source_and_target(
         &self,
         source_path: &str,
         target_device_id: &str,
+        link_id: &str,
     ) -> Result<Option<OutboundTransfer>> {
         self.db.read(|conn| -> Result<Option<OutboundTransfer>> {
-            Ok(conn
-                .query_row(
-                    "SELECT transfer_id, target_device_id, target_signing_key, source_path, manifest_encoded, status, created_at_unix_nanos
+            let mut stmt = conn.prepare(
+                "SELECT transfer_id, target_device_id, target_signing_key, source_path, manifest_encoded, status, created_at_unix_nanos
                  FROM send_outbound_transfers
                  WHERE source_path = ?1 AND target_device_id = ?2
                    AND status IN ('offered', 'acked')
-                 ORDER BY created_at_unix_nanos DESC LIMIT 1",
-                    params![source_path, target_device_id],
-                    row_to_outbound,
-                )
-                .optional()?)
+                 ORDER BY created_at_unix_nanos DESC",
+            )?;
+            let rows = stmt.query_map(params![source_path, target_device_id], row_to_outbound)?;
+            for row in rows {
+                let row = row?;
+                if row.manifest.link_id == link_id {
+                    return Ok(Some(row));
+                }
+            }
+            Ok(None)
         })
     }
 
@@ -278,11 +313,67 @@ impl SendStore {
         })
     }
 
+    /// Whether an offer made under a Send link to the device holding `target_signing_key` was
+    /// created at or after `since_unix_nanos`. The recipient of a link is on another account, so
+    /// the sender's netmap does not list it, and the grant that let it in ends minutes after the
+    /// offer: this is what keeps admitting it to fetch the content, or to be told it was canceled.
+    pub fn has_link_outbound_for(
+        &self,
+        target_signing_key: &[u8; 32],
+        since_unix_nanos: i64,
+    ) -> Result<bool> {
+        self.db.read(|conn| -> Result<bool> {
+            let mut stmt = conn.prepare(
+                "SELECT transfer_id, target_device_id, target_signing_key, source_path, manifest_encoded, status, created_at_unix_nanos
+                 FROM send_outbound_transfers
+                 WHERE target_signing_key = ?1 AND created_at_unix_nanos >= ?2",
+            )?;
+            let rows =
+                stmt.query_map(params![&target_signing_key[..], since_unix_nanos], row_to_outbound)?;
+            for row in rows {
+                if !row?.manifest.link_id.is_empty() {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+    }
+
     /// Records the receiver's acceptance. False when the transfer was no longer offered, for
     /// instance because it was canceled while the offer was in flight: a canceled transfer stays
     /// canceled.
-    pub fn mark_outbound_acked(&self, transfer_id: &str) -> Result<bool> {
-        self.transition_outbound(transfer_id, &["offered"], OutboundStatus::Acked)
+    pub fn mark_outbound_acked(&self, transfer_id: &str, now_unix_nanos: i64) -> Result<bool> {
+        let acked = self.transition_outbound(transfer_id, &["offered"], OutboundStatus::Acked)?;
+        if acked {
+            self.touch_outbound_activity(transfer_id, now_unix_nanos)?;
+        }
+        Ok(acked)
+    }
+
+    /// Notes that an accepted transfer was just accepted or served from.
+    pub fn touch_outbound_activity(&self, transfer_id: &str, now_unix_nanos: i64) -> Result<()> {
+        self.db.write(|conn| -> Result<()> {
+            conn.execute(
+                "INSERT INTO send_outbound_activity (transfer_id, last_active_unix_nanos)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(transfer_id) DO UPDATE SET last_active_unix_nanos = excluded.last_active_unix_nanos",
+                params![transfer_id, now_unix_nanos],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// When `transfer_id` was last accepted or served from, when that is on record.
+    pub fn outbound_last_activity(&self, transfer_id: &str) -> Result<Option<i64>> {
+        self.db.read(|conn| -> Result<Option<i64>> {
+            Ok(conn
+                .query_row(
+                    "SELECT last_active_unix_nanos FROM send_outbound_activity WHERE transfer_id = ?1",
+                    params![transfer_id],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        })
     }
 
     /// Marks a declined offer terminal -- called once `offer_send` has
@@ -463,6 +554,20 @@ impl SendStore {
                     ),
                     params![keep, spare],
                 )?;
+                let side_tables: &[&str] = if table == "send_inbound_transfers" {
+                    &["send_inbound_senders", "send_inbound_notices"]
+                } else {
+                    &["send_outbound_activity"]
+                };
+                for side in side_tables {
+                    conn.execute(
+                        &format!(
+                            "DELETE FROM {side}
+                             WHERE transfer_id IN ({old}) AND transfer_id != ?2"
+                        ),
+                        params![keep, spare],
+                    )?;
+                }
                 conn.execute(
                     &format!(
                         "DELETE FROM {table} WHERE transfer_id IN ({old}) AND transfer_id != ?2"
@@ -474,18 +579,20 @@ impl SendStore {
         })
     }
 
-    /// The hex hash of every chunk a transfer still on record can need from the block store:
-    /// every sent transfer (a completed one keeps serving until pruned, a canceled or declined
-    /// one can be retried without its content being stored again) and every received one but a
-    /// completed one, whose files are written (pending, in progress, failed and canceled ones
-    /// resume from the blocks already pulled). A manifest that cannot be decoded fails the whole
-    /// call: an incomplete set must never reach a deletion decision.
+    /// The hex hash of every chunk a transfer still going can need from the block store: a sent
+    /// transfer that is offered or accepted (it is being served), and a received one that is
+    /// pending, in progress or failed (it resumes from the blocks already pulled). A finished
+    /// transfer needs none: a completed receive has written its files, and a canceled or
+    /// declined send stores its content again when retried. A manifest that cannot be decoded
+    /// fails the whole call: an incomplete set must never reach a deletion decision.
     pub fn live_chunk_hashes(&self) -> Result<std::collections::HashSet<String>> {
         self.db.read(|conn| -> Result<std::collections::HashSet<String>> {
             let mut live = std::collections::HashSet::new();
             for sql in [
-                "SELECT manifest_encoded FROM send_outbound_transfers",
-                "SELECT manifest_encoded FROM send_inbound_transfers WHERE status != 'completed'",
+                "SELECT manifest_encoded FROM send_outbound_transfers
+                 WHERE status IN ('offered', 'acked')",
+                "SELECT manifest_encoded FROM send_inbound_transfers
+                 WHERE status NOT IN ('completed', 'canceled')",
             ] {
                 let mut stmt = conn.prepare(sql)?;
                 let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
@@ -502,11 +609,11 @@ impl SendStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn delete_outbound_for_tests(&self, transfer_id: &str) {
+    pub(crate) fn delete_sender_address_for_tests(&self, transfer_id: &str) {
         self.db
             .write(|conn| -> Result<()> {
                 conn.execute(
-                    "DELETE FROM send_outbound_transfers WHERE transfer_id = ?1",
+                    "DELETE FROM send_inbound_senders WHERE transfer_id = ?1",
                     params![transfer_id],
                 )?;
                 Ok(())
@@ -524,12 +631,13 @@ impl SendStore {
         &self,
         transfer_id: &str,
         sender_device_id: &str,
+        sender_address: &str,
         manifest: &SendManifest,
         offered_at_unix_nanos: i64,
     ) -> Result<bool> {
         let encoded = manifest.encode_to_vec();
-        let rows = self.db.write(|conn| -> Result<usize> {
-            Ok(conn.execute(
+        self.db.write_immediate(|tx| -> Result<bool> {
+            let rows = tx.execute(
                 "INSERT OR IGNORE INTO send_inbound_transfers
                     (transfer_id, sender_device_id, manifest_encoded, status, destination_dir, offered_at_unix_nanos)
                  VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
@@ -540,9 +648,59 @@ impl SendStore {
                     InboundStatus::Pending.as_str(),
                     offered_at_unix_nanos,
                 ],
-            )?)
-        })?;
-        Ok(rows > 0)
+            )?;
+            if rows > 0 {
+                tx.execute(
+                    "INSERT OR REPLACE INTO send_inbound_senders (transfer_id, address) VALUES (?1, ?2)",
+                    params![transfer_id, sender_address],
+                )?;
+            }
+            Ok(rows > 0)
+        })
+    }
+
+    /// How to reach the sender of `transfer_id`, as recorded when its offer was accepted.
+    pub fn inbound_sender_address(&self, transfer_id: &str) -> Result<Option<String>> {
+        self.db.read(|conn| -> Result<Option<String>> {
+            Ok(conn
+                .query_row(
+                    "SELECT address FROM send_inbound_senders WHERE transfer_id = ?1",
+                    params![transfer_id],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        })
+    }
+
+    /// The notices still owed to senders, as `(transfer_id, outcome)`, oldest first. A notice
+    /// older than `keep_since_unix_nanos` is dropped instead: a sender that stayed unreachable
+    /// that long has long since shown the transfer as stopped by itself.
+    pub fn pending_notices(&self, keep_since_unix_nanos: i64) -> Result<Vec<(String, String)>> {
+        self.db.write(|conn| -> Result<Vec<(String, String)>> {
+            conn.execute(
+                "DELETE FROM send_inbound_notices WHERE noted_at_unix_nanos < ?1",
+                params![keep_since_unix_nanos],
+            )?;
+            let mut stmt = conn.prepare(
+                "SELECT transfer_id, outcome FROM send_inbound_notices
+                 ORDER BY noted_at_unix_nanos ASC, transfer_id ASC",
+            )?;
+            let rows =
+                stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
+    /// The sender answered the notice of `transfer_id`, so it is not owed any more -- unless the
+    /// notice has since changed (`outcome` is the one that was sent).
+    pub fn clear_notice(&self, transfer_id: &str, outcome: &str) -> Result<()> {
+        self.db.write(|conn| -> Result<()> {
+            conn.execute(
+                "DELETE FROM send_inbound_notices WHERE transfer_id = ?1 AND outcome = ?2",
+                params![transfer_id, outcome],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn get_inbound(&self, transfer_id: &str) -> Result<Option<InboundTransfer>> {
@@ -581,35 +739,46 @@ impl SendStore {
 
     /// Startup recovery: a receive runs only inside the daemon that started
     /// it, so any `in_progress` row found when the store is opened has
-    /// nothing driving it. Marks them failed (resumable) and returns how
-    /// many there were.
-    pub fn interrupt_in_progress_inbound(&self) -> Result<usize> {
-        self.transition_inbound_where_status_in(
+    /// nothing driving it. Marks them failed (resumable), with the interrupted reason, and owes
+    /// the sender a notice of each; returns how many there were.
+    pub fn interrupt_in_progress_inbound(&self, now_unix_nanos: i64) -> Result<usize> {
+        self.transition_inbound(
             None,
             &[InboundStatus::InProgress],
             InboundStatus::Failed,
+            Some(("failed", crate::error::failure::INTERRUPTED)),
+            now_unix_nanos,
         )
     }
 
     /// Marks an unfinished transfer canceled. False (and no change) when it
     /// was already canceled or has completed, which is what makes cancel
     /// idempotent.
-    pub fn cancel_inbound(&self, transfer_id: &str) -> Result<bool> {
-        Ok(self.transition_inbound_where_status_in(
+    pub fn cancel_inbound(&self, transfer_id: &str, now_unix_nanos: i64) -> Result<bool> {
+        Ok(self.transition_inbound(
             Some(transfer_id),
             &[InboundStatus::Pending, InboundStatus::InProgress, InboundStatus::Failed],
             InboundStatus::Canceled,
+            Some(("canceled", "")),
+            now_unix_nanos,
         )? > 0)
     }
 
-    /// Records that a running receive stopped with an error. Only an
+    /// Records that a running receive stopped with the error `reason`. Only an
     /// `in_progress` row changes: a transfer canceled underneath the receive
-    /// stays canceled.
-    pub fn fail_inbound(&self, transfer_id: &str) -> Result<bool> {
-        Ok(self.transition_inbound_where_status_in(
+    /// stays canceled. The failure reason and the sender's notice are written with the status.
+    pub fn fail_inbound(
+        &self,
+        transfer_id: &str,
+        reason: &str,
+        now_unix_nanos: i64,
+    ) -> Result<bool> {
+        Ok(self.transition_inbound(
             Some(transfer_id),
             &[InboundStatus::InProgress],
             InboundStatus::Failed,
+            Some(("failed", reason)),
+            now_unix_nanos,
         )? > 0)
     }
 
@@ -617,37 +786,73 @@ impl SendStore {
     /// resumed here, so a cancel that lands while a receive is starting
     /// cannot be undone by it.
     pub fn resume_inbound(&self, transfer_id: &str) -> Result<bool> {
-        Ok(self.transition_inbound_where_status_in(
+        Ok(self.transition_inbound(
             Some(transfer_id),
             &[InboundStatus::Failed],
             InboundStatus::InProgress,
+            None,
+            0,
         )? > 0)
     }
 
     /// Makes a canceled transfer resumable again (failed). The explicit
     /// retry is the only caller.
     pub fn uncancel_inbound(&self, transfer_id: &str) -> Result<bool> {
-        Ok(self.transition_inbound_where_status_in(
+        Ok(self.transition_inbound(
             Some(transfer_id),
             &[InboundStatus::Canceled],
             InboundStatus::Failed,
+            None,
+            0,
         )? > 0)
     }
 
-    fn transition_inbound_where_status_in(
+    /// Moves the rows in one of the `from` statuses (all of them, or just `transfer_id`) to `to`.
+    /// With `notice` -- `(outcome, failure reason)` -- the same transaction owes each moved row's
+    /// sender a notice of that outcome and records the reason (when not empty), so the status and
+    /// what the sender is told never disagree after a crash.
+    fn transition_inbound(
         &self,
         transfer_id: Option<&str>,
         from: &[InboundStatus],
         to: InboundStatus,
+        notice: Option<(&str, &str)>,
+        now_unix_nanos: i64,
     ) -> Result<usize> {
         let from_list =
             from.iter().map(|s| format!("'{}'", s.as_str())).collect::<Vec<_>>().join(", ");
-        self.db.write(|conn| -> Result<usize> {
-            let sql = format!(
-                "UPDATE send_inbound_transfers SET status = ?1
-                 WHERE status IN ({from_list}) AND (?2 IS NULL OR transfer_id = ?2)"
-            );
-            Ok(conn.execute(&sql, params![to.as_str(), transfer_id])?)
+        self.db.write_immediate(|tx| -> Result<usize> {
+            let moved: Vec<String> = {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT transfer_id FROM send_inbound_transfers
+                     WHERE status IN ({from_list}) AND (?1 IS NULL OR transfer_id = ?1)"
+                ))?;
+                let rows = stmt.query_map(params![transfer_id], |row| row.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for id in &moved {
+                tx.execute(
+                    "UPDATE send_inbound_transfers SET status = ?1 WHERE transfer_id = ?2",
+                    params![to.as_str(), id],
+                )?;
+                if let Some((outcome, reason)) = notice {
+                    tx.execute(
+                        "INSERT INTO send_inbound_notices (transfer_id, outcome, noted_at_unix_nanos)
+                         VALUES (?1, ?2, ?3)
+                         ON CONFLICT(transfer_id) DO UPDATE SET
+                            outcome = excluded.outcome, noted_at_unix_nanos = excluded.noted_at_unix_nanos",
+                        params![id, outcome, now_unix_nanos],
+                    )?;
+                    if !reason.is_empty() {
+                        tx.execute(
+                            "INSERT INTO send_transfer_failures (transfer_id, reason) VALUES (?1, ?2)
+                             ON CONFLICT(transfer_id) DO UPDATE SET reason = excluded.reason",
+                            params![id, reason],
+                        )?;
+                    }
+                }
+            }
+            Ok(moved.len())
         })
     }
 
@@ -686,11 +891,24 @@ impl SendStore {
         })
     }
 
-    pub fn mark_inbound_completed(&self, transfer_id: &str) -> Result<()> {
-        self.db.write(|conn| -> Result<()> {
-            conn.execute(
+    /// Marks the transfer completed, clears its failure note and owes the sender the news, all
+    /// in one transaction.
+    pub fn mark_inbound_completed(&self, transfer_id: &str, now_unix_nanos: i64) -> Result<()> {
+        self.db.write_immediate(|tx| -> Result<()> {
+            tx.execute(
                 "UPDATE send_inbound_transfers SET status = ?1 WHERE transfer_id = ?2",
                 params![InboundStatus::Completed.as_str(), transfer_id],
+            )?;
+            tx.execute(
+                "DELETE FROM send_transfer_failures WHERE transfer_id = ?1",
+                params![transfer_id],
+            )?;
+            tx.execute(
+                "INSERT INTO send_inbound_notices (transfer_id, outcome, noted_at_unix_nanos)
+                 VALUES (?1, 'completed', ?2)
+                 ON CONFLICT(transfer_id) DO UPDATE SET
+                    outcome = excluded.outcome, noted_at_unix_nanos = excluded.noted_at_unix_nanos",
+                params![transfer_id, now_unix_nanos],
             )?;
             Ok(())
         })

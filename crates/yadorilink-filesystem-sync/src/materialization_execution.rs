@@ -68,6 +68,19 @@ pub enum AbandonedEviction {
     PlaceholderMayExist,
 }
 
+/// The durable facts about an open write intent from which startup repair decides whether a
+/// MISSING name was removed by the user (the delete stands) or lost with a rename that never
+/// reached stable storage (the file is rebuilt).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteRemovalEvidence {
+    /// The write recorded that its placement reached stable storage and nothing has proven it.
+    pub landed_unproven: bool,
+    /// The name of the temp file (beside the target) whose directory
+    /// entry was flushed before the rename. Present after a power cut, the rename was lost; gone,
+    /// the name was renamed durably and then removed.
+    pub temp_witness: Option<String>,
+}
+
 /// An open, durably-recorded materialization intent for one path, returned
 /// by [`MaterializationExecutionPort::open_materialization_intent_guard`].
 /// Opaque here (the concrete guard is `yadorilink-daemon`'s own
@@ -129,18 +142,12 @@ pub struct RepairRowSnapshot {
     /// A separate accessor would add a read to every row of a sweep that
     /// runs at whole-replica scale.
     pub current_version: Option<yadorilink_replica_domain::ids::VersionHash>,
-    /// The mode and the replicated xattrs this row records, from that
-    /// same statement.
+    /// The execute flag this row records, from that same statement.
     ///
-    /// Carried, not fetched where they are applied. Every repair arm
-    /// that writes a file follows it with a real `chmod` and
-    /// `fsetxattr`, and both fields are hashed into `current_version` --
-    /// so re-reading them after the bytes are down applies one
-    /// incarnation's metadata under another incarnation's proof, and the
-    /// exactness gate cannot catch it, because it verifies against the
-    /// same row that supplied the wrong value.
-    pub unix_mode: Option<u32>,
-    pub xattrs: Vec<(String, Vec<u8>)>,
+    /// Carried, not fetched where it is applied. Every repair arm that writes a file follows it with a
+    /// real `chmod`, and the flag is hashed into `current_version` -- so re-reading it after the bytes
+    /// are down applies one incarnation's metadata under another incarnation's proof.
+    pub exec: bool,
 }
 
 /// This crate's own error type for the materialization/eviction/repair
@@ -172,12 +179,6 @@ pub enum MaterializationExecutionError {
 
     #[error("eviction of {0:?} was rejected")]
     EvictionRejected(String),
-
-    /// A reconstruct wrote the bytes and mode, but the replicated extended
-    /// attributes it set could not be confirmed, so it has no exact proof.
-    /// Path-local and retriable, like any other failed reconstruct.
-    #[error("replicated extended attributes not proven: {0}")]
-    ReplicatedXattrsNotProven(String),
 
     /// A `dehydrate_windows_placeholder` call's outcome could not be
     /// determined. Not every returned error means dehydration did NOT
@@ -253,7 +254,6 @@ impl MaterializationExecutionError {
             Self::Io(_)
             | Self::NotFound(_)
             | Self::EvictionRejected(_)
-            | Self::ReplicatedXattrsNotProven(_)
             | Self::EvictionOutcomeAmbiguous(_)
             | Self::PathEscapesRoot(_) => true,
             Self::Storage(storage) => {
@@ -452,6 +452,32 @@ pub trait MaterializationExecutionPort: Send + Sync {
         Ok(false)
     }
 
+    /// What is durably known about the write intent open on `path` that bears on whether a
+    /// missing name was removed by the user (see [`WriteRemovalEvidence`]). `None` when no write
+    /// intent is open.
+    fn write_removal_evidence(
+        &self,
+        _group_id: &str,
+        _path: &str,
+    ) -> Result<Option<WriteRemovalEvidence>, MaterializationExecutionError> {
+        Ok(None)
+    }
+
+    /// Records, durably, that the bytes of the write open on `path` were placed
+    /// under fence `mutation_generation` and the placement reached stable
+    /// storage (see [`Self::write_landed_unproven`]). Every writer that places an
+    /// object under an open intent calls this right after the placement, and a
+    /// failure fails the write: the intent stays open and the path unsettled.
+    fn mark_write_landed(
+        &self,
+        _group_id: &str,
+        _path: &str,
+        _mutation_generation: i64,
+        _permit: &RootCommitPermit,
+    ) -> Result<(), MaterializationExecutionError> {
+        Ok(())
+    }
+
     /// For a path whose write intent waits for the batch flush of a received
     /// file (the write's proof was published, its file may not have reached
     /// stable storage): the identity that proof recorded for the file. `None`
@@ -573,6 +599,31 @@ pub trait MaterializationExecutionPort: Send + Sync {
         group_id: &str,
         path: &str,
         out_path: &Path,
+    ) -> Result<bool, MaterializationExecutionError>;
+
+    /// Whether the regular file at `out_path` is, untouched, the object the path's last proof
+    /// named, even though a write opened since has invalidated that proof: the pre-image of a
+    /// write that never renamed anything. It is no local edit and no interrupted write's output.
+    /// Fail-closed: any doubt is `false`.
+    fn disk_is_untouched_pre_image(
+        &self,
+        group_id: &str,
+        path: &str,
+        out_path: &Path,
+    ) -> Result<bool, MaterializationExecutionError>;
+
+    /// Stands a path down for the materialization lane when repair finds its write interrupted
+    /// over an untouched pre-image and the version's bytes nowhere to rebuild from: moves the row
+    /// from `row_state` (still the same `version`) to the in-flight state with the intent left
+    /// open, and bumps the path's fence so no stale proof outlives the decision. `false` when the
+    /// row moved (nothing was written).
+    fn stand_down_over_pre_image(
+        &self,
+        group_id: &str,
+        path: &str,
+        row_state: MaterializationState,
+        version: Option<&yadorilink_replica_domain::ids::VersionHash>,
+        permit: &RootCommitPermit<'_>,
     ) -> Result<bool, MaterializationExecutionError>;
 
     /// The recovery lane's own commit, for a path this pass has verified

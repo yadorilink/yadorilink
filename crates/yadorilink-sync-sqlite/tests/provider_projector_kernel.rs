@@ -45,10 +45,9 @@ fn version_of(i: usize) -> FileVersion {
         65536,
         FileMeta {
             mtime_unix_nanos: MTIME,
-            unix_mode: Some(0o644),
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     )
 }

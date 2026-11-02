@@ -275,6 +275,11 @@ impl Action {
 pub(crate) async fn run(context: std::sync::Arc<crate::shell_context::ShellContext>) {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     loop {
+        // Nothing to send to without a host: wait for one to attach instead of ticking.
+        if !context.provider_host.host_connected() {
+            context.provider_host.wait_connected().await;
+            interval.reset();
+        }
         interval.tick().await;
         if !context.provider_host.host_connected() {
             continue;

@@ -163,11 +163,21 @@ fn links_lines_are_pinned_verbatim() {
         skipped_symlink_count: 5,
         ..base_link()
     };
+    // As the daemon lists them: with the folder's state computed.
+    let listed = |link: LinkStatus| LinkStatus {
+        product: Some(
+            yadorilink_client_core::attention::ProductStatusSummary::for_folder(&link).to_wire(),
+        ),
+        ..link
+    };
     assert_eq!(
-        links_lines(&[base_link(), ondemand]),
+        links_lines(&[
+            listed(LinkStatus { durability_status: 1, ..base_link() }),
+            listed(ondemand)
+        ]),
         vec![
-            "/tmp/photos  group=group-1  syncing".to_string(),
-            "/tmp/docs  group=group-2  paused  conflicts=2  on-demand (hydrated=3 placeholder=4 \
+            "/tmp/photos  group=group-1  Up to date".to_string(),
+            "/tmp/docs  group=group-2  Needs attention  conflicts=2  on-demand (hydrated=3 placeholder=4 \
              hydrating=1)  skipped_symlinks=5"
                 .to_string(),
         ]

@@ -46,10 +46,9 @@ fn empty_version(mtime: i64) -> FileVersion {
         0,
         FileMeta {
             mtime_unix_nanos: mtime,
-            unix_mode: None,
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     )
 }
@@ -208,10 +207,9 @@ async fn unignoring_a_path_whose_content_cannot_be_locally_fetched_still_rearms_
         4096,
         FileMeta {
             mtime_unix_nanos: 1_700_000_200,
-            unix_mode: None,
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     );
     admit_change(&state, "device-a", &key, "needs-a-real-fetch.bin", &version);

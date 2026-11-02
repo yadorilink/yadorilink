@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use yadorilink_sqlite_runtime::CachedStatements as _;
 
 use rusqlite::{Connection, OptionalExtension};
 use yadorilink_replica_domain::file::{BlockInfo, FileVersion, RecordKind};
@@ -54,7 +55,7 @@ impl CanonicalCurrentRow {
 
 /// The current-row column list, in the order [`decode_current_row`] reads it.
 const CURRENT_ROW_COLUMNS: &str = "size, mtime_unix_nanos, blocks_json, deleted, record_kind, \
-     symlink_target, unix_mode, xattrs_json, materialization_state, origin_device_id, \
+     symlink_target, exec, materialization_state, origin_device_id, \
      symlink_out_of_root";
 
 /// Decodes the [`CURRENT_ROW_COLUMNS`] starting at column `base` of `r`: the one place the
@@ -70,11 +71,10 @@ fn decode_current_row(
     let deleted: i64 = r.get(base + 3)?;
     let record_kind: String = r.get(base + 4)?;
     let symlink_target: Option<Vec<u8>> = r.get(base + 5)?;
-    let unix_mode: i64 = r.get(base + 6)?;
-    let xattrs_json: String = r.get(base + 7)?;
-    let mstate: Option<String> = r.get(base + 8)?;
-    let origin_device_id: Option<String> = r.get(base + 9)?;
-    let symlink_out_of_root: i64 = r.get(base + 10)?;
+    let exec: i64 = r.get(base + 6)?;
+    let mstate: Option<String> = r.get(base + 7)?;
+    let origin_device_id: Option<String> = r.get(base + 8)?;
+    let symlink_out_of_root: i64 = r.get(base + 9)?;
     let blocks: Vec<BlockInfo> = serde_json::from_str(&blocks_json).map_err(|error| {
         SyncSqliteError::CorruptState(format!(
             "stored block list for current version of {path} is corrupt: {error}"
@@ -88,8 +88,7 @@ fn decode_current_row(
             deleted: deleted != 0,
             record_kind: RecordKind::from_db_str(&record_kind),
             symlink_target,
-            unix_mode: crate::file_index::decode_unix_mode_column(unix_mode),
-            xattrs: crate::file_index::decode_xattrs_column(&xattrs_json)?,
+            exec: exec != 0,
         },
         materialization_state: mstate
             .as_deref()
@@ -163,7 +162,7 @@ impl SqliteSyncStore {
     /// put.
     pub fn native_group_heads(&self, group_id: &str) -> Result<Vec<DeltaHash>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT DISTINCT provenance FROM native_heads WHERE group_id = ?1 \
                  ORDER BY provenance",
             )?;
@@ -188,7 +187,7 @@ impl SqliteSyncStore {
     ) -> Result<bool, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             let present: Option<i64> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT 1 FROM file_versions WHERE group_id = ?1 AND version_hash = ?2",
                     rusqlite::params![group.as_str(), &hash.0[..]],
                     |r| r.get(0),
@@ -207,7 +206,7 @@ impl SqliteSyncStore {
     ) -> Result<Option<FileVersion>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             let encoded: Option<Vec<u8>> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT encoded FROM file_versions WHERE group_id = ?1 AND version_hash = ?2",
                     rusqlite::params![group.as_str(), &hash.0[..]],
                     |r| r.get(0),
@@ -239,7 +238,7 @@ impl SqliteSyncStore {
         block_hash: &[u8],
     ) -> Result<bool, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            Ok(conn.query_row(
+            Ok(conn.query_row_cached(
                 "SELECT EXISTS(SELECT 1 FROM group_block_provenance \
                  WHERE group_id = ?1 AND block_hash = ?2)",
                 rusqlite::params![group.as_str(), block_hash],
@@ -301,9 +300,9 @@ impl SqliteSyncStore {
         path: &str,
     ) -> Result<Vec<RetainedVersion>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT version_seq, size, mtime_unix_nanos, blocks_json, deleted, state, \
-                        origin_device_id, record_kind, symlink_target, unix_mode, xattrs_json \
+                        origin_device_id, record_kind, symlink_target, exec \
                  FROM files WHERE group_id = ?1 AND path = ?2 ORDER BY version_seq DESC",
             )?;
             let rows = stmt.query_map(rusqlite::params![group.as_str(), path], |r| {
@@ -318,7 +317,6 @@ impl SqliteSyncStore {
                     r.get::<_, String>(7)?,
                     r.get::<_, Option<Vec<u8>>>(8)?,
                     r.get::<_, i64>(9)?,
-                    r.get::<_, String>(10)?,
                 ))
             })?;
             let mut out = Vec::new();
@@ -333,8 +331,7 @@ impl SqliteSyncStore {
                     origin_device_id,
                     record_kind,
                     symlink_target,
-                    unix_mode,
-                    xattrs_json,
+                    exec,
                 ) = row?;
                 let blocks: Vec<BlockInfo> =
                     serde_json::from_str(&blocks_json).map_err(|error| {
@@ -353,8 +350,7 @@ impl SqliteSyncStore {
                     origin_device_id,
                     record_kind: RecordKind::from_db_str(&record_kind),
                     symlink_target,
-                    unix_mode: crate::file_index::decode_unix_mode_column(unix_mode),
-                    xattrs: crate::file_index::decode_xattrs_column(&xattrs_json)?,
+                    exec: exec != 0,
                 });
             }
             Ok(out)
@@ -749,6 +745,70 @@ impl SqliteSyncStore {
             == IdentityRevalidation::Confirmed)
     }
 
+    /// Whether the regular file at `out_path` is exactly the object this daemon's most recent
+    /// proof for the path named, whether or not a mutation fence bump has invalidated that proof
+    /// since: the pre-image of a write that has been opened over the path and has not renamed
+    /// anything yet. A stale proof never vouches for the CONTENT of what is on disk; this asks only
+    /// whether the object is still the very one the daemon put there (identity and, where the
+    /// volume cannot show a rewrite, the same evidence the usable check demands), so the bytes
+    /// cannot be a local edit made since.
+    pub fn disk_is_untouched_pre_image_at(
+        &self,
+        group_id: &str,
+        path: &str,
+        out_path: &std::path::Path,
+        birth_time_granularity: yadorilink_fs_platform::fs_identity::TimestampGranularity,
+    ) -> Result<bool, SyncSqliteError> {
+        use crate::materialized_generation::{
+            lookup_materialized_generation_diagnostic, revalidate_identity_against_disk,
+            IdentityRevalidation, MaterializedObjectKind,
+        };
+        let found = self.database.read::<_, SyncSqliteError>(|conn| {
+            let Some(basis) = lookup_materialized_generation_diagnostic(conn, group_id, path)?
+            else {
+                return Ok(None);
+            };
+            if basis.object_kind != MaterializedObjectKind::RegularFile {
+                return Ok(None);
+            }
+            let Some(version) = basis.version else { return Ok(None) };
+            let Some(file_version) = crate::dag_store::get_file_version(conn, group_id, &version)?
+            else {
+                return Ok(None);
+            };
+            if file_version.meta.record_kind != yadorilink_replica_domain::file::RecordKind::File {
+                return Ok(None);
+            }
+            let mut offset = 0u64;
+            let blocks: Vec<yadorilink_replica_domain::file::BlockInfo> = file_version
+                .blocks
+                .iter()
+                .map(|block| {
+                    let info = yadorilink_replica_domain::file::BlockInfo {
+                        hash: block.hash.0.clone(),
+                        offset,
+                        size: block.size,
+                    };
+                    offset += u64::from(block.size);
+                    info
+                })
+                .collect();
+            Ok(Some((basis, blocks)))
+        })?;
+        let Some((basis, blocks)) = found else { return Ok(false) };
+        if revalidate_identity_against_disk(&basis, out_path, birth_time_granularity)
+            != IdentityRevalidation::Confirmed
+        {
+            return Ok(false);
+        }
+        // The identity says the object was not replaced; on a volume whose clocks cannot show an
+        // in-place rewrite it says nothing about the bytes. The bytes are the recorded version's,
+        // or this is not the pre-image: what matches a version in the history cannot be an edit
+        // that history lacks.
+        Ok(yadorilink_local_storage::disk_content_comparison(out_path, &blocks)
+            .is_ok_and(|found| found == yadorilink_local_storage::DiskContentComparison::Matched))
+    }
+
     /// The filesystem identity of the directory most recently published as
     /// materialized for the explicit Directory entry at `(group_id, path)`,
     /// read without the fence check: a later fence bump says the proof no
@@ -836,7 +896,7 @@ impl SqliteSyncStore {
         group_id: &str,
     ) -> Result<u64, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let count: i64 = conn.query_row(
+            let count: i64 = conn.query_row_cached(
                 "SELECT COUNT(*) FROM projection_obligations \
                  WHERE group_id = ?1 AND state = 'pending'",
                 [group_id],
@@ -900,6 +960,13 @@ impl SqliteSyncStore {
                 per_group_limit,
                 total_limit,
             )
+        })
+    }
+
+    /// Delegate for [`crate::projection_obligations::next_obligation_wake`].
+    pub fn dag_next_obligation_wake(&self) -> Result<Option<i64>, SyncSqliteError> {
+        self.database.read_snapshot::<_, SyncSqliteError>(|conn| {
+            crate::projection_obligations::next_obligation_wake(conn)
         })
     }
 

@@ -84,6 +84,7 @@ async fn start() -> TestServer {
         port_path: dir.path().join("http-api-port"),
         port: 0,
         extra_allowed_origins: Vec::new(),
+        remote: None,
     };
     let handle = yadorilink_http_api::bind(&config).await.expect("http api bind");
     let port = handle.port;
@@ -334,6 +335,7 @@ async fn bind_only_ever_uses_loopback_addresses() {
         port_path: dir.path().join("http-api-port"),
         port: 0,
         extra_allowed_origins: Vec::new(),
+        remote: None,
     };
     let handle = yadorilink_http_api::bind(&config).await.unwrap();
     let addrs = handle.bound_addrs();
@@ -853,6 +855,7 @@ async fn partial_v6_bind_does_not_trust_localhost_identity() {
         port_path: dir.path().join("http-api-port"),
         port,
         extra_allowed_origins: Vec::new(),
+        remote: None,
     };
     let handle = yadorilink_http_api::bind(&config)
         .await
@@ -1270,6 +1273,7 @@ async fn start_with_hanging_control_socket() -> HangingControlServer {
         port_path: dir.path().join("http-api-port"),
         port: 0,
         extra_allowed_origins: Vec::new(),
+        remote: None,
     };
     let handle = yadorilink_http_api::bind(&config).await.expect("http api bind");
     let port = handle.port;
@@ -1357,6 +1361,7 @@ async fn bind_records_the_bound_port_and_nothing_secret() {
         port_path: dir.path().join("http-api-port"),
         port: 0,
         extra_allowed_origins: Vec::new(),
+        remote: None,
     };
     let handle = yadorilink_http_api::bind(&config).await.unwrap();
     let recorded = std::fs::read_to_string(&config.port_path).expect("port file written");
@@ -1413,6 +1418,7 @@ async fn the_port_file_goes_away_when_the_dashboard_stops() {
         port_path: dir.path().join("http-api-port"),
         port: 0,
         extra_allowed_origins: Vec::new(),
+        remote: None,
     };
     let handle = yadorilink_http_api::bind(&config).await.unwrap();
     let port = handle.port;
@@ -1626,6 +1632,7 @@ fn port_file_config(dir: &std::path::Path) -> HttpApiConfig {
         port_path: dir.join("http-api-port"),
         port: 0,
         extra_allowed_origins: Vec::new(),
+        remote: None,
     }
 }
 
@@ -1801,6 +1808,7 @@ async fn peer_streams_report_the_dashboard_stopped() {
         port_path: dir.path().join("http-api-port"),
         port: 0,
         extra_allowed_origins: Vec::new(),
+        remote: None,
     };
     let handle = yadorilink_http_api::bind(&config).await.unwrap();
     let port = handle.port;
@@ -1827,6 +1835,7 @@ async fn a_stopped_dashboard_ends_the_streams_it_was_serving() {
         port_path: dir.path().join("http-api-port"),
         port: 0,
         extra_allowed_origins: Vec::new(),
+        remote: None,
     };
     let handle = yadorilink_http_api::bind(&config).await.unwrap();
     let peer = handle.peer_streams();

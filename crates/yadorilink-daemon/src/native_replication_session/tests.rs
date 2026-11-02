@@ -343,10 +343,9 @@ pub(crate) fn author_delta_with_version(
         0,
         FileMeta {
             mtime_unix_nanos: mtime,
-            unix_mode: None,
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     );
     let author = AuthorId { device: DeviceId(DEVICE.into()), incarnation: IncarnationId([1; 16]) };
@@ -658,10 +657,9 @@ fn author_two_put_delta(c: &SyncDatabase) -> [yadorilink_replica_domain::file::F
             0,
             FileMeta {
                 mtime_unix_nanos: mtime,
-                unix_mode: None,
+                exec: false,
                 symlink_target: None,
                 record_kind: RecordKind::File,
-                xattrs: Vec::new(),
             },
         )
     };

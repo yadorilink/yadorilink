@@ -35,7 +35,7 @@ fn new_test_daemon(device_id: &str) -> TestDaemon {
     // tears the temp dir down on exit.
     let store = Arc::new(SegmentBlockStore::new(Box::leak(Box::new(store_dir)).path()).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
-    let state = DaemonState::new(device_id.to_string(), sync_state, store);
+    let state = support::fast_daemon_state(device_id.to_string(), sync_state, store);
     TestDaemon { state }
 }
 

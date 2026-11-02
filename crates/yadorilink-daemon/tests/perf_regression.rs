@@ -21,7 +21,6 @@ use std::time::{Duration, Instant};
 mod support;
 
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
-use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::hydration;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_storage::{chunk_file, SegmentBlockStore};
@@ -79,7 +78,11 @@ async fn large_file_scan_does_not_block_concurrent_async_work() {
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
-    let state = DaemonState::new("device-a".into(), sync_state.clone(), store);
+    let state = yadorilink_daemon::test_support::isolated_daemon_state(
+        "device-a".into(),
+        sync_state.clone(),
+        store,
+    );
     // A registered (non-empty device_id) DaemonState with no signing key
     // fails closed in `build_change_processor` -- see that
     // function's own doc comment: without one, this device's local edits
@@ -189,7 +192,11 @@ async fn large_file_hydration_does_not_block_concurrent_async_work() {
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
-    let dest_state = DaemonState::new("device-dest".into(), dest_sync_state.clone(), dest_store);
+    let dest_state = yadorilink_daemon::test_support::isolated_daemon_state(
+        "device-dest".into(),
+        dest_sync_state.clone(),
+        dest_store,
+    );
     // `hydrate` fails closed via `root_lease_for` unless the daemon is
     // actively linked/watching the group -- this test builds `dest_state`
     // directly rather than through full daemon startup, so it never pays
@@ -234,8 +241,11 @@ async fn large_file_hydration_does_not_block_concurrent_async_work() {
     // `upsert_file` row can never satisfy it and every block request comes
     // back refused -- which reaches this test as `HydrationFailed`, long
     // before it can observe the concurrent-async-work property it is about.
-    let source_state =
-        DaemonState::new("device-source".into(), source_sync_state.clone(), source_store.clone());
+    let source_state = yadorilink_daemon::test_support::isolated_daemon_state(
+        "device-source".into(),
+        source_sync_state.clone(),
+        source_store.clone(),
+    );
     source_state.install_test_root_commit_authority(GROUP);
     let source_version = yadorilink_replica_domain::file::FileVersion::new(
         source_record
@@ -249,10 +259,9 @@ async fn large_file_hydration_does_not_block_concurrent_async_work() {
         source_record.size,
         yadorilink_replica_domain::file::FileMeta {
             mtime_unix_nanos: source_record.mtime_unix_nanos,
-            unix_mode: None,
+            exec: false,
             symlink_target: None,
             record_kind: yadorilink_replica_domain::file::RecordKind::File,
-            xattrs: Vec::new(),
         },
     );
     let source_signing = yadorilink_transport::DeviceSigningKeyPair::generate().signing;

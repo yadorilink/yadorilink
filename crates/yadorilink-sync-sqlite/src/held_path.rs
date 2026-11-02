@@ -35,6 +35,7 @@
 //! reconciliation itself placed.
 
 use std::sync::Arc;
+use yadorilink_sqlite_runtime::CachedStatements as _;
 
 use rusqlite::{params, Connection, OptionalExtension};
 pub use yadorilink_replica_domain::session_state::HeldPath;
@@ -76,7 +77,7 @@ pub fn has_live_descendant_row(
     path: &str,
 ) -> Result<bool, SyncSqliteError> {
     Ok(conn
-        .query_row(
+        .query_row_cached(
             "SELECT 1 FROM files WHERE group_id = ?1 AND path > ?2 AND path < ?3 \
                AND state = 'current' AND deleted = 0 LIMIT 1",
             params![group_id, format!("{path}/"), format!("{path}0")],
@@ -97,7 +98,7 @@ pub(crate) fn hold_in_tx(
     path: &str,
     now_unix_nanos: i64,
 ) -> Result<(), SyncSqliteError> {
-    conn.execute(
+    conn.execute_cached(
         "INSERT INTO held_paths (group_id, path, held_at_unix_nanos) \
          VALUES (?1, ?2, ?3) \
          ON CONFLICT(group_id, path) DO UPDATE SET generation = generation + 1",
@@ -116,13 +117,13 @@ pub fn is_held(conn: &Connection, group_id: &str, path: &str) -> Result<bool, Sy
 
 pub fn held_paths(conn: &Connection, group_id: &str) -> Result<Vec<String>, SyncSqliteError> {
     let mut stmt =
-        conn.prepare("SELECT path FROM held_paths WHERE group_id = ?1 ORDER BY path ASC")?;
+        conn.prepare_cached("SELECT path FROM held_paths WHERE group_id = ?1 ORDER BY path ASC")?;
     let rows = stmt.query_map([group_id], |r| r.get::<_, String>(0))?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 pub fn list_holds(conn: &Connection, group_id: &str) -> Result<Vec<HeldPath>, SyncSqliteError> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT path, generation FROM held_paths WHERE group_id = ?1 \
          ORDER BY path ASC",
     )?;
@@ -148,14 +149,14 @@ pub fn release_in_tx(
     generation: i64,
     now_unix_nanos: i64,
 ) -> Result<bool, SyncSqliteError> {
-    let removed = conn.execute(
+    let removed = conn.execute_cached(
         "DELETE FROM held_paths WHERE group_id = ?1 AND path = ?2 AND generation = ?3",
         params![group_id, path, generation],
     )?;
     if removed == 0 {
         return Ok(false);
     }
-    let live: bool = conn.query_row(
+    let live: bool = conn.query_row_cached(
         "SELECT EXISTS (SELECT 1 FROM files WHERE group_id = ?1 AND path = ?2 \
             AND state = 'current' AND deleted = 0)",
         params![group_id, path],
@@ -166,7 +167,7 @@ pub fn release_in_tx(
         // entry's content is materialized by the projection scheduled
         // below), so a file or symlink row has no local object: `Remote`.
         // A directory row keeps its state: the directory is the object.
-        conn.execute(
+        conn.execute_cached(
             "UPDATE files SET materialization_state = 'remote' \
              WHERE group_id = ?1 AND path = ?2 AND state = 'current' AND deleted = 0 \
                AND materialization_state = 'present' \
@@ -284,7 +285,7 @@ impl HeldPathRepository {
             // the row's version. Reconciliation preserves the edit as a
             // conflict copy and, once the path is empty, releases the hold
             // with the row `Remote`.
-            tx.execute(
+            tx.execute_cached(
                 "UPDATE files SET materialization_state = 'present', placeholder_dev = NULL, \
                         placeholder_ino = NULL, placeholder_provider_kind = NULL \
                  WHERE group_id = ?1 AND path = ?2 AND state = 'current' AND deleted = 0",

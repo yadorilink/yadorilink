@@ -52,6 +52,29 @@ pub struct BeginSignIn {
     pub reauthenticate: bool,
 }
 
+/// Start a sign-in with a pairing code from the account's web page: no browser is involved, the
+/// code approves this device. Ends the sign-in that was running, like [`BeginSignIn`]; reports
+/// `Enrolling` and then `SignedIn` (or fails with a typed refusal: a refused code is
+/// `Refused` with `PairingCodeInvalid`, a malformed one `InvalidInput`).
+#[derive(Clone, PartialEq, Eq)]
+pub struct BeginPairingSignIn {
+    /// The code as the person typed it or a QR scan read it (`XXXX-XXXX-XXXX`, or the link the
+    /// QR carries); any case, with or without hyphens.
+    pub pairing_code: String,
+    /// Ends the sign-in as failed when it has not finished in time.
+    pub overall_timeout: Option<Duration>,
+}
+
+impl std::fmt::Debug for BeginPairingSignIn {
+    /// The code is a bearer secret for ten minutes: never printed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BeginPairingSignIn")
+            .field("pairing_code", &"<redacted>")
+            .field("overall_timeout", &self.overall_timeout)
+            .finish()
+    }
+}
+
 /// Wait for the next step of a sign-in.
 ///
 /// Events are numbered from 1. `after` is the number of the last event the caller has: the call
@@ -96,6 +119,9 @@ pub enum AccountCommand {
     /// one is stopped first, so by the time the new one starts it can no longer write the
     /// credential store.
     BeginSignIn(BeginSignIn),
+    /// Starts a sign-in with a pairing code, ending the one that was running exactly as
+    /// [`Self::BeginSignIn`] does.
+    BeginPairingSignIn(BeginPairingSignIn),
     /// The next step of a sign-in.
     PollSignIn(PollSignIn),
     /// Cancels the sign-in `id` if it is the current one (any other id is already ended).
@@ -155,6 +181,34 @@ pub enum AccountCommand {
     /// The folder groups this account owns and may join on this device (identity only: id and
     /// name). Read-only.
     ListJoinableGroups,
+    /// The devices of one folder group: name, whether each keeps a full replica, online. Read-only.
+    ListGroupDevices {
+        group_id: String,
+    },
+    /// Offers the primary ownership of `group_id` (a folder this account owns) to the account that
+    /// owns `target_device_id`, an active member device of it. The target must
+    /// accept; an offer lasts seven days. Retries and restarts replay the same offer.
+    OfferPrimaryTransfer {
+        group_id: String,
+        target_device_id: String,
+    },
+    /// Withdraws a pending offer this account made.
+    CancelPrimaryTransfer {
+        group_id: String,
+        transfer_id: String,
+    },
+    /// Accepts an offer made to this account: it becomes the folder's primary owner.
+    AcceptPrimaryTransfer {
+        group_id: String,
+        transfer_id: String,
+    },
+    /// Turns down an offer made to this account.
+    DeclinePrimaryTransfer {
+        group_id: String,
+        transfer_id: String,
+    },
+    /// The pending offers this account made or received. Read-only.
+    ListPrimaryTransfers,
     /// Asks for account deletion; nothing is deleted until it is confirmed. Refused as
     /// `DurabilityBlocked` until `acknowledge_impact` when the impact is not empty.
     RequestDeletion {
@@ -183,9 +237,52 @@ impl AccountCommand {
                 | Self::SignInOrigins
                 | Self::DeletionImpact
                 | Self::ListJoinableGroups
+                | Self::ListGroupDevices { .. }
+                | Self::ListPrimaryTransfers
                 | Self::DeletionStatus
         )
     }
+}
+
+/// The primary-ownership hand-over commands; each is one account-level call whose
+/// operation id is kept in the state directory `dir`.
+async fn primary_transfer(
+    dir: &std::path::Path,
+    settings: &CredentialSettings,
+    command: AccountCommand,
+) -> Result<CommandOutput, DesktopError> {
+    use yadorilink_client_core::dto::{primary_transfer_accepted, primary_transfer_summary};
+    let auth = require_auth_in(dir, settings).await?;
+    Ok(match command {
+        AccountCommand::OfferPrimaryTransfer { group_id, target_device_id } => {
+            CommandOutput::PrimaryTransfer(primary_transfer_summary(
+                &ops::primary_transfer::offer_in(&auth, dir, &group_id, &target_device_id).await?,
+            ))
+        }
+        AccountCommand::CancelPrimaryTransfer { group_id, transfer_id } => {
+            CommandOutput::PrimaryTransfer(primary_transfer_summary(
+                &ops::primary_transfer::cancel_in(&auth, dir, &group_id, &transfer_id).await?,
+            ))
+        }
+        AccountCommand::DeclinePrimaryTransfer { group_id, transfer_id } => {
+            CommandOutput::PrimaryTransfer(primary_transfer_summary(
+                &ops::primary_transfer::decline_in(&auth, dir, &group_id, &transfer_id).await?,
+            ))
+        }
+        AccountCommand::AcceptPrimaryTransfer { group_id, transfer_id } => {
+            CommandOutput::PrimaryTransferAccepted(primary_transfer_accepted(
+                &ops::primary_transfer::accept_in(&auth, dir, &group_id, &transfer_id).await?,
+            ))
+        }
+        AccountCommand::ListPrimaryTransfers => CommandOutput::PrimaryTransfers(
+            ops::primary_transfer::list_with(&auth)
+                .await?
+                .iter()
+                .map(primary_transfer_summary)
+                .collect(),
+        ),
+        other => unreachable!("not a primary-transfer command: {other:?}"),
+    })
 }
 
 /// How a sign-in session is built over a state directory.
@@ -264,6 +361,32 @@ impl AccountCommands {
         }
     }
 
+    /// Replaces the engine's one sign-in with the session `make` builds and begins it.
+    ///
+    /// The whole begin runs under the sign-in slot (nothing here awaits), so a cancel of the
+    /// current sign-in is ordered before or after it, never between.
+    fn begin_session(
+        &self,
+        make: impl FnOnce() -> Arc<LoginSession>,
+    ) -> Result<CommandOutput, DesktopError> {
+        let mut slot = self.current();
+        // The one that was running is stopped BEFORE the new one starts: it can no longer write
+        // the credential store, so the new sign-in's precheck reads the store as the old one
+        // left it.
+        if let Some((_, previous)) = &*slot {
+            previous.session.cancel();
+        }
+        let session = make();
+        session.begin()?;
+        let id = SignInId(self.next_id.fetch_add(1, Ordering::SeqCst));
+        let sign_in = Arc::new(SignIn {
+            session,
+            delivered: tokio::sync::Mutex::new(Delivered { seq: 0, last: None }),
+        });
+        *slot = Some((id, sign_in));
+        Ok(CommandOutput::SignInBegun(id))
+    }
+
     fn current(&self) -> std::sync::MutexGuard<'_, Option<(SignInId, Arc<SignIn>)>> {
         self.sign_in.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -298,6 +421,18 @@ impl AccountCommands {
     /// # Errors
     /// `Refused(StartOverRestartRequired)` for a new start over on an engine that has not restarted since one
     /// finished; the operation's own errors otherwise.
+    /// The account's device names by id, for labelling activity. Empty when signed out or the
+    /// list cannot be read: a name is never worth failing a read for.
+    pub(crate) async fn device_names(&self) -> std::collections::HashMap<String, String> {
+        let Ok(auth) = require_auth_in(&self.config_dir, &self.settings).await else {
+            return std::collections::HashMap::new();
+        };
+        ops::devices::list_devices_with(&auth)
+            .await
+            .map(|devices| devices.into_iter().map(|d| (d.device_id, d.device_name)).collect())
+            .unwrap_or_default()
+    }
+
     pub(crate) async fn start_over_with<P: ops::start_over::StartOverPorts>(
         &self,
         ports: &P,
@@ -332,32 +467,32 @@ impl AccountCommands {
             AccountCommand::Status => {
                 CommandOutput::Account(Box::new(self.account_status_with(None)))
             }
-            AccountCommand::BeginSignIn(begin) => {
-                // The whole begin runs under the sign-in slot (nothing here awaits), so a
-                // cancel of the current sign-in is ordered before or after it, never between.
-                let mut slot = self.current();
-                // The one that was running is stopped BEFORE the new one starts: it can no
-                // longer write the credential store, so the new sign-in's precheck reads the
-                // store as the old one left it.
-                if let Some((_, previous)) = &*slot {
-                    previous.session.cancel();
-                }
-                let session = (self.sign_in_factory)(
+            AccountCommand::BeginSignIn(begin) => self.begin_session(|| {
+                (self.sign_in_factory)(
                     self.config_dir.clone(),
                     LoginOptions {
                         flow: LoginFlow::DeviceCode,
                         overall_timeout: begin.overall_timeout,
                     },
                     begin.reauthenticate,
-                );
-                session.begin()?;
-                let id = SignInId(self.next_id.fetch_add(1, Ordering::SeqCst));
-                let sign_in = Arc::new(SignIn {
-                    session,
-                    delivered: tokio::sync::Mutex::new(Delivered { seq: 0, last: None }),
-                });
-                *slot = Some((id, sign_in));
-                CommandOutput::SignInBegun(id)
+                )
+            })?,
+            AccountCommand::BeginPairingSignIn(begin) => {
+                // A malformed code is refused before the running sign-in is touched.
+                let code =
+                    yadorilink_fapi_client::PairingCode::from_scanned(&begin.pairing_code)
+                        .map_err(|e| DesktopError::invalid_input(e.to_string(), "pairing_code"))?;
+                self.begin_session(|| {
+                    yadorilink_client_core::new_pairing_login_session_in(
+                        self.config_dir.clone(),
+                        settings.clone(),
+                        code,
+                        LoginOptions {
+                            flow: LoginFlow::Loopback,
+                            overall_timeout: begin.overall_timeout,
+                        },
+                    )
+                })?
             }
             AccountCommand::PollSignIn(poll) => {
                 let sign_in = self.sign_in_of(poll.id)?;
@@ -453,6 +588,26 @@ impl AccountCommands {
                         })
                         .collect(),
                 )
+            }
+            AccountCommand::ListGroupDevices { group_id } => {
+                let auth = require_auth_in(dir, settings).await?;
+                let own = yadorilink_client_core::coordination::device_config::load_in(dir)
+                    .ok()
+                    .map(|c| c.device_id);
+                let members = ops::shares::list_members_in(&auth, dir, &group_id).await?;
+                CommandOutput::GroupDevices(
+                    members
+                        .iter()
+                        .map(|m| yadorilink_client_core::dto::member_summary(m, own.as_deref()))
+                        .collect(),
+                )
+            }
+            transfer @ (AccountCommand::OfferPrimaryTransfer { .. }
+            | AccountCommand::CancelPrimaryTransfer { .. }
+            | AccountCommand::AcceptPrimaryTransfer { .. }
+            | AccountCommand::DeclinePrimaryTransfer { .. }
+            | AccountCommand::ListPrimaryTransfers) => {
+                primary_transfer(dir, settings, transfer).await?
             }
             AccountCommand::RequestDeletion { acknowledge_impact } => {
                 let auth = require_auth_in(dir, settings).await?;

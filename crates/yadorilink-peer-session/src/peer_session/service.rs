@@ -13,6 +13,19 @@ use super::{
     PeerHandoffLeaseGrant, PeerHandoffTicketGrant, PeerSyncSession, SERVICE_RPC_MAX_BYTES,
 };
 
+fn proof_answer(
+    evaluation: &yadorilink_replica_engine::outcomes::CustodyEvaluation,
+) -> crate::service_rpc::ProofAnswer {
+    use crate::service_rpc::ProofAnswer;
+    if evaluation.present {
+        ProofAnswer::Held
+    } else if evaluation.in_progress {
+        ProofAnswer::InProgress
+    } else {
+        ProofAnswer::NotHeld
+    }
+}
+
 /// The answer an unauthorized request gets: shaped like a real one and
 /// indistinguishable from a genuine negative. A refusal that looked different
 /// would tell an unauthorized peer that the group exists.
@@ -21,7 +34,9 @@ fn refusal_for(
 ) -> crate::service_rpc::ServiceResponse {
     match request {
         crate::service_rpc::ServiceRequest::VersionPresent { .. } => {
-            crate::service_rpc::ServiceResponse::VersionPresent { present: false }
+            crate::service_rpc::ServiceResponse::VersionPresent {
+                answer: crate::service_rpc::ProofAnswer::NotHeld,
+            }
         }
         crate::service_rpc::ServiceRequest::HandoffLease { .. } => {
             crate::service_rpc::ServiceResponse::HandoffLease { grant: None }
@@ -41,7 +56,9 @@ fn refusal_for(
             crate::service_rpc::ServiceResponse::GroupDurabilitySummary { summary: None }
         }
         crate::service_rpc::ServiceRequest::CustodyAcquire { .. } => {
-            crate::service_rpc::ServiceResponse::CustodyAcquire { granted: false }
+            crate::service_rpc::ServiceResponse::CustodyAcquire {
+                answer: crate::service_rpc::ProofAnswer::NotHeld,
+            }
         }
         // Not reached for a custody release: it is answered for any
         // authenticated peer, so a lease outlives the group authorization.
@@ -240,6 +257,7 @@ impl PeerSyncSession {
                             tracing::warn!(%error, "version proof task failed; answering absent");
                             yadorilink_replica_engine::outcomes::CustodyEvaluation {
                                 present: false,
+                                in_progress: false,
                                 warning: None,
                             }
                         }
@@ -252,7 +270,9 @@ impl PeerSyncSession {
                         "refusing to serve block: current version record is unreadable"
                     );
                 }
-                crate::service_rpc::ServiceResponse::VersionPresent { present: evaluation.present }
+                crate::service_rpc::ServiceResponse::VersionPresent {
+                    answer: proof_answer(&evaluation),
+                }
             }
             crate::service_rpc::ServiceRequest::HandoffLease { group_id } => {
                 let grant = self.handoff_lease_responder.request_handoff_lease(group_id).await;
@@ -351,6 +371,7 @@ impl PeerSyncSession {
                         tracing::warn!(%error, "custody acquire task failed; refusing");
                         yadorilink_replica_engine::outcomes::CustodyEvaluation {
                             present: false,
+                            in_progress: false,
                             warning: None,
                         }
                     }
@@ -363,7 +384,9 @@ impl PeerSyncSession {
                         "refusing a custody lease"
                     );
                 }
-                crate::service_rpc::ServiceResponse::CustodyAcquire { granted: evaluation.present }
+                crate::service_rpc::ServiceResponse::CustodyAcquire {
+                    answer: proof_answer(&evaluation),
+                }
             }
             crate::service_rpc::ServiceRequest::CustodyRelease {
                 group_id,
@@ -433,6 +456,7 @@ impl PeerSyncSession {
             // from the presence of a message.
             eager: true,
             fully_materialized: summary.fully_materialized(),
+            file_only_current_count: summary.file_only_current_count,
             current_digest: summary.current_digest,
             current_count: summary.current_count,
             roots_digest: summary.roots_digest,
@@ -477,7 +501,7 @@ impl PeerSyncSession {
         version_hash: VersionHash,
         blocks: &[VersionBlock],
         for_handoff: bool,
-    ) -> bool {
+    ) -> crate::service_rpc::ProofAnswer {
         let request = crate::service_rpc::ServiceRequest::VersionPresent {
             group_id: group_id.to_string(),
             file_path: file_path.to_string(),
@@ -485,10 +509,10 @@ impl PeerSyncSession {
             blocks: blocks.to_vec(),
             for_handoff,
         };
-        matches!(
-            self.service_rpc(&self.transports.service, &request).await,
-            Some(crate::service_rpc::ServiceResponse::VersionPresent { present: true })
-        )
+        match self.service_rpc(&self.transports.service, &request).await {
+            Some(crate::service_rpc::ServiceResponse::VersionPresent { answer }) => answer,
+            _ => crate::service_rpc::ProofAnswer::NotHeld,
+        }
     }
 
     /// Asks this peer to take durable custody of exactly this version: it
@@ -503,7 +527,7 @@ impl PeerSyncSession {
         blocks: &[VersionBlock],
         membership_generation: u64,
         attempt_token: [u8; 16],
-    ) -> bool {
+    ) -> crate::service_rpc::ProofAnswer {
         let request = crate::service_rpc::ServiceRequest::CustodyAcquire {
             group_id: group_id.to_string(),
             file_path: file_path.to_string(),
@@ -512,10 +536,10 @@ impl PeerSyncSession {
             membership_generation,
             attempt_token,
         };
-        matches!(
-            self.service_rpc(&self.transports.service, &request).await,
-            Some(crate::service_rpc::ServiceResponse::CustodyAcquire { granted: true })
-        )
+        match self.service_rpc(&self.transports.service, &request).await {
+            Some(crate::service_rpc::ServiceResponse::CustodyAcquire { answer }) => answer,
+            _ => crate::service_rpc::ProofAnswer::NotHeld,
+        }
     }
 
     /// Asks this peer to end the lease it holds for this device on exactly

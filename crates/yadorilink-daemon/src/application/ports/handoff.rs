@@ -31,8 +31,21 @@ pub(crate) struct HandoffTicketGrant {
     pub(crate) target_device_id: String,
 }
 
+/// Why a lease was not requested, when it is worth asking again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeaseRefusal {
+    /// The daemon does not say why.
+    Unspecified,
+    /// A file of the group is being captured into the block store; the same request succeeds once
+    /// that has landed.
+    ChangingRetry,
+}
+
 pub(crate) trait HandoffCommandPort: Send + Sync {
-    fn request_lease<'a>(&'a self, group_id: &'a str) -> BoxFuture<'a, Option<HandoffLeaseGrant>>;
+    fn request_lease<'a>(
+        &'a self,
+        group_id: &'a str,
+    ) -> BoxFuture<'a, Result<HandoffLeaseGrant, LeaseRefusal>>;
 
     fn obtain_ticket<'a>(
         &'a self,

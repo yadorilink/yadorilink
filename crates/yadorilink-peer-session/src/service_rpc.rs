@@ -14,7 +14,7 @@ use yadorilink_replica_domain::file::VersionBlock;
 use yadorilink_replica_domain::ids::{BlockHash, VersionHash};
 
 /// Bumped if the layout below changes.
-const RPC_VERSION: u8 = 2;
+const RPC_VERSION: u8 = 4;
 
 const KIND_VERSION_PRESENT: u8 = 1;
 const KIND_HANDOFF_LEASE: u8 = 2;
@@ -54,6 +54,9 @@ pub enum ServiceRpcError {
 
     #[error("{field} is not valid UTF-8")]
     NotUtf8 { field: &'static str },
+
+    #[error("{0} is not a valid answer to a proof")]
+    BadFlag(u8),
 
     #[error("{0} unread bytes after the message")]
     TrailingBytes(usize),
@@ -154,11 +157,44 @@ impl ServiceRequest {
     }
 }
 
+/// What a responder says about a proof it was asked for (a version held, a lease granted).
+/// `InProgress` is not a refusal: the responder is still checking its copy and the asker is to
+/// ask again shortly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProofAnswer {
+    NotHeld,
+    Held,
+    InProgress,
+}
+
+impl ProofAnswer {
+    pub fn is_held(self) -> bool {
+        self == Self::Held
+    }
+
+    fn to_byte(self) -> u8 {
+        match self {
+            Self::NotHeld => 0,
+            Self::Held => 1,
+            Self::InProgress => 2,
+        }
+    }
+
+    fn from_byte(byte: u8) -> Result<Self, ServiceRpcError> {
+        match byte {
+            0 => Ok(Self::NotHeld),
+            1 => Ok(Self::Held),
+            2 => Ok(Self::InProgress),
+            other => Err(ServiceRpcError::BadFlag(other)),
+        }
+    }
+}
+
 /// The single answer to a [`ServiceRequest`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServiceResponse {
     VersionPresent {
-        present: bool,
+        answer: ProofAnswer,
     },
     /// `None` is a refusal — not granted, or not authorized. The two are
     /// deliberately indistinguishable to the asker.
@@ -181,10 +217,10 @@ pub enum ServiceResponse {
     GroupDurabilitySummary {
         summary: Option<GroupDurabilitySummary>,
     },
-    /// `granted` only when the lease row is committed. A refusal of any kind
-    /// is `false`, indistinguishable to the asker.
+    /// `Held` only when the lease row is committed. A refusal of any kind is `NotHeld`,
+    /// indistinguishable to the asker; `InProgress` says the proof is still running.
     CustodyAcquire {
-        granted: bool,
+        answer: ProofAnswer,
     },
     /// `released` only when the lease is gone, or never was. A responder that
     /// could not delete the row answers `false`, so the requester keeps
@@ -226,6 +262,11 @@ pub struct GroupDurabilitySummary {
     /// would corroborate immediately, and the group would report itself
     /// protected while precisely one device had the data.
     pub fully_materialized: bool,
+    /// How many of the responder's current rows are materialized but held by its working tree
+    /// alone (some block is not in its block store). Non-zero means the responder's copy is a
+    /// file a later edit or delete can take away, which is not custody: the asker does not
+    /// corroborate on it.
+    pub file_only_current_count: u64,
     /// Over `state = 'current'` alone, using the same digest function and
     /// the same row category the handoff proof enumerates. The convergent
     /// subset, and the only digest a positive rests on.
@@ -421,9 +462,9 @@ pub fn decode_request(bytes: &[u8]) -> Result<ServiceRequest, ServiceRpcError> {
 pub fn encode_response(response: &ServiceResponse) -> Vec<u8> {
     let mut out = vec![RPC_VERSION];
     match response {
-        ServiceResponse::VersionPresent { present } => {
+        ServiceResponse::VersionPresent { answer } => {
             out.push(KIND_VERSION_PRESENT);
-            out.push(u8::from(*present));
+            out.push(answer.to_byte());
         }
         ServiceResponse::HandoffLease { grant } => {
             out.push(KIND_HANDOFF_LEASE);
@@ -452,9 +493,9 @@ pub fn encode_response(response: &ServiceResponse) -> Vec<u8> {
         }
         ServiceResponse::Released => out.push(KIND_HANDOFF_LEASE_RELEASE),
         ServiceResponse::ReleaseNotConfirmed => out.push(KIND_HANDOFF_LEASE_RELEASE_NOT_CONFIRMED),
-        ServiceResponse::CustodyAcquire { granted } => {
+        ServiceResponse::CustodyAcquire { answer } => {
             out.push(KIND_CUSTODY_ACQUIRE);
-            out.push(u8::from(*granted));
+            out.push(answer.to_byte());
         }
         ServiceResponse::CustodyRelease { released } => {
             out.push(KIND_CUSTODY_RELEASE);
@@ -472,6 +513,7 @@ pub fn encode_response(response: &ServiceResponse) -> Vec<u8> {
                     out.push(1);
                     out.push(u8::from(summary.eager));
                     out.push(u8::from(summary.fully_materialized));
+                    out.extend_from_slice(&summary.file_only_current_count.to_be_bytes());
                     out.extend_from_slice(&summary.current_digest);
                     out.extend_from_slice(&summary.current_count.to_be_bytes());
                     out.extend_from_slice(&summary.roots_digest);
@@ -491,7 +533,9 @@ pub fn decode_response(bytes: &[u8]) -> Result<ServiceResponse, ServiceRpcError>
         return Err(ServiceRpcError::UnsupportedVersion(version));
     }
     let response = match cursor.u8()? {
-        KIND_VERSION_PRESENT => ServiceResponse::VersionPresent { present: cursor.u8()? != 0 },
+        KIND_VERSION_PRESENT => {
+            ServiceResponse::VersionPresent { answer: ProofAnswer::from_byte(cursor.u8()?)? }
+        }
         KIND_HANDOFF_LEASE => ServiceResponse::HandoffLease {
             grant: match cursor.u8()? {
                 0 => None,
@@ -515,7 +559,9 @@ pub fn decode_response(bytes: &[u8]) -> Result<ServiceResponse, ServiceRpcError>
         },
         KIND_HANDOFF_LEASE_RELEASE => ServiceResponse::Released,
         KIND_HANDOFF_LEASE_RELEASE_NOT_CONFIRMED => ServiceResponse::ReleaseNotConfirmed,
-        KIND_CUSTODY_ACQUIRE => ServiceResponse::CustodyAcquire { granted: cursor.u8()? != 0 },
+        KIND_CUSTODY_ACQUIRE => {
+            ServiceResponse::CustodyAcquire { answer: ProofAnswer::from_byte(cursor.u8()?)? }
+        }
         KIND_CUSTODY_RELEASE => ServiceResponse::CustodyRelease { released: cursor.u8()? != 0 },
         KIND_CUSTODY_REHOME => ServiceResponse::CustodyRehome { moved: cursor.u8()? != 0 },
         KIND_GROUP_DURABILITY_SUMMARY => ServiceResponse::GroupDurabilitySummary {
@@ -524,6 +570,7 @@ pub fn decode_response(bytes: &[u8]) -> Result<ServiceResponse, ServiceRpcError>
                 _ => Some(GroupDurabilitySummary {
                     eager: cursor.u8()? != 0,
                     fully_materialized: cursor.u8()? != 0,
+                    file_only_current_count: cursor.u64()?,
                     current_digest: cursor.array32()?,
                     current_count: cursor.u64()?,
                     roots_digest: cursor.array32()?,

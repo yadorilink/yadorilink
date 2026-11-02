@@ -316,6 +316,7 @@ async fn a_management_stream_reaches_the_running_dashboard_without_a_token() {
         port_path: dir.path().join("http-api-port"),
         port: 0,
         extra_allowed_origins: Vec::new(),
+        remote: None,
     };
     let handle = yadorilink_http_api::bind(&config).await.unwrap();
     let dashboard = Dashboard { streams: Some(handle.peer_streams()) };

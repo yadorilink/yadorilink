@@ -314,9 +314,16 @@ fn seed_shared_file(
     let alice_path = crate::test_support::sync_stack_fixture::link_folder(alice, alice_root.path());
     let bob_path = crate::test_support::sync_stack_fixture::link_folder(bob, bob_root.path());
     let permit = RootCommitPermit::for_tests();
-    let rec = record(FILE, 5);
+    use sha2::Digest as _;
+    let mut rec = record(FILE, 5);
+    rec.blocks[0].hash = sha2::Sha256::digest(b"hello").to_vec();
     alice.replica_coordinator.file_index_repository().upsert_file(GROUP, &rec, &permit).unwrap();
     bob.replica_coordinator.file_index_repository().upsert_file(GROUP, &rec, &permit).unwrap();
+    // Bob holds the content in his block store too (a copy that is only a file in his folder is
+    // not custody).
+    bob.block_store.put(b"hello").unwrap();
+    let hashes: Vec<Vec<u8>> = rec.blocks.iter().map(|b| b.hash.clone()).collect();
+    bob.replica_coordinator.record_block_provenance(GROUP, &hashes).unwrap();
     let on_disk = bob_path.join(FILE);
     std::fs::write(&on_disk, b"hello").unwrap();
     crate::test_support::seed_prior_cycle_proof(

@@ -261,6 +261,13 @@ impl EngineCommands {
         let (local_path, create_local_path_if_missing, display_name, token) =
             command.folder.parts();
         self.require_change_source(&display_name)?;
+        // A group has one member when it is created: this device. On-Demand means that member
+        // keeps no full copy, so the group would start (and stay, until someone joins as a full
+        // replica) with no device that holds everything, and an upload to it could be lost with
+        // this device. Refused before any journal write or remote call.
+        if command.on_demand {
+            return Err(CommandError::no_full_replica());
+        }
         let result = enrollment_commands::create_and_link(
             &self.context.application,
             Create {
@@ -500,12 +507,28 @@ impl EngineCommands {
         }
     }
 
-    /// The engine's whole status, the same one the desktop `status` reports.
+    /// The engine's whole status, collected in place: for a caller that decides something from
+    /// it. A display reads [`Self::status_snapshot`].
     ///
     /// # Errors
     /// [`CommandError`] when the runtime view cannot be read.
     pub fn status(&self) -> Result<StatusResponse, CommandError> {
-        crate::status_report::build_status(&self.context, Some(&self.config_dir)).map_err(failed)
+        crate::status_report::build_status(&self.context.status_sources).map_err(failed)
+    }
+
+    /// The engine's whole status as the status builder last collected it (waiting, bounded, for
+    /// facts newer than a command that has just finished), the same one the desktop `status`
+    /// reports. Reads no ledger, file or block index on the way.
+    ///
+    /// # Errors
+    /// [`CommandError`] when the runtime view cannot be read.
+    pub async fn status_snapshot(&self) -> Result<StatusResponse, CommandError> {
+        self.context.status_hub.status().await.map_err(failed)
+    }
+
+    /// Records that a state-changing command has finished, so the next status shows it.
+    pub fn command_completed(&self) {
+        self.context.status_hub.command_completed();
     }
 
     /// The connectivity doctor's rows.

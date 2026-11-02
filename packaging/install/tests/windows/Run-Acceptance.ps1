@@ -9,6 +9,10 @@
 # 127.0.0.1 only. The user PATH is never touched (-NoModifyPath). This is the Windows counterpart
 # of acceptance.sh: daemon-reported install_source=script, self-update gate, refusals that leave an
 # existing install untouched, uninstall that keeps the user's data.
+# Run it from an interactive console, or detached from the caller's pipes
+# (Start-Process powershell.exe -Wait -RedirectStandardOutput out.txt ...): `daemon start` leaves a
+# daemon running that inherits the launcher's handles, so a caller that waits for end-of-output on
+# a pipe (a plain `ssh host powershell -File ...`) never returns.
 param(
     [string]$Root = (Split-Path -Parent $MyInvocation.MyCommand.Path),
     [Parameter(Mandatory = $true)][string]$BinDir
@@ -32,6 +36,10 @@ $Base = "http://127.0.0.1:$((Get-Content $portFile -Raw).Trim())"
 
 $Prefix = Join-Path $T 'prefix'
 $Cfg = Join-Path $T 'cfg'
+# install.ps1 reads the data directory's ownership record, so it must see this run's, not the
+# machine's (a Store app or an earlier install would stop every install here with exit 19).
+New-Item -ItemType Directory -Force -Path $Cfg | Out-Null
+$env:YADORILINK_CONFIG_DIR = $Cfg
 $Data = Join-Path $T 'Sync'
 $Bin = Join-Path $Prefix 'bin'
 $Yl = Join-Path $Bin 'yadorilink.exe'
@@ -69,7 +77,7 @@ function Yl([string]$Rel, [string[]]$A) {
     & cmd.exe /c $bat
     $script:Rc = $LASTEXITCODE
     $script:Out = if (Test-Path $f) { (Get-Content $f) -join "`n" } else { '' }
-    foreach ($v in 'YADORILINK_CONFIG_DIR', 'YADORILINK_CREDENTIAL_STORE', 'YADORILINK_HTTP_API_DISABLE', 'YADORILINK_UPDATE_MANIFEST_URL') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
+    foreach ($v in 'YADORILINK_CREDENTIAL_STORE', 'YADORILINK_HTTP_API_DISABLE', 'YADORILINK_UPDATE_MANIFEST_URL') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 function Has($s) { $script:Out -like "*$s*" }
 function Snapshot {
@@ -164,8 +172,56 @@ try {
     # fresh install of an older version (nothing installed after the uninstall); kept data stays untouched
     Inst 'rel' 'rel' @('-Version', '1.0.0')
     if ($Rc -eq 0 -and (Has 'Installed YadoriLink 1.0.0') -and (Test-Path (Join-Path $Cfg 'keep-me.txt'))) { Ok 'fresh install of an older version works and the data directory is intact' } else { Bad 'reinstall 1.0.0' $Out }
+
+    # 6 the existing data is checked before anything is replaced (`yadorilink-daemon.exe --check-data-compat`)
+    # Against the stopped daemon's own database and against ones made unsafe on purpose; the database
+    # is the only source. Python crafts the databases (the fixture builder already needs it).
+    $db = Join-Path $Cfg 'sync-state.sqlite3'
+    $stampPy = Join-Path $T 'stamp.py'
+    Set-Content -Path $stampPy -Encoding ASCII -Value @'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+if len(sys.argv) > 2: c.execute("pragma user_version=%d" % int(sys.argv[2])); c.commit()
+else: print(c.execute("pragma user_version").fetchone()[0])
+c.close()
+'@
+    $holdPy = Join-Path $T 'hold.py'
+    Set-Content -Path $holdPy -Encoding ASCII -Value @'
+import sqlite3, sys, time
+c = sqlite3.connect(sys.argv[1], isolation_level=None)
+c.execute("pragma journal_mode=wal"); c.execute("pragma wal_autocheckpoint=0")
+c.execute("pragma user_version=%d" % int(sys.argv[2]))
+time.sleep(30)
+'@
+    $good = [int]((& python $stampPy $db) -join '')
+    Inst 'rel' 'rel' @('-Force')
+    if ($Rc -eq 0 -and (Has 'Installed YadoriLink')) { Ok "data as the stopped daemon left it (stamp $good): the install proceeds" } else { Bad 'install over the stopped daemon data' $Out }
+    & python $stampPy $db ($good + 1)
+    $before = Snapshot
+    Inst 'rel' 'rel' @('-Force')
+    if ($Rc -eq 20 -and (Has 'downgrading') -and (Has 'Nothing was installed') -and ((Snapshot) -eq $before)) { Ok 'data written by a newer build: exit 20, installed files untouched' } else { Bad "newer data (rc=$Rc)" $Out }
+    & python $stampPy $db $good
+    # a newer stamp only in the write-ahead log, with another process holding the database
+    $hold = Start-Process -FilePath python -ArgumentList @("`"$holdPy`"", "`"$db`"", ($good + 1)) -PassThru -WindowStyle Hidden
+    Start-Sleep -Seconds 2
+    $before = Snapshot
+    Inst 'rel' 'rel' @('-Force')
+    if ($Rc -eq 20 -and ((Snapshot) -eq $before)) { Ok 'a newer stamp still in the write-ahead log, another process holding the database: exit 20' } else { Bad "newer stamp in the log (rc=$Rc)" $Out }
+    Stop-Process -Id $hold.Id -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 1
+    Remove-Item "$db-wal", "$db-shm" -Force -ErrorAction SilentlyContinue
+    & python $stampPy $db $good
+    Set-Content -Path $db -Encoding ASCII -Value 'this is not a database, but it is long enough to look like a header....'
+    Remove-Item "$db-wal", "$db-shm" -Force -ErrorAction SilentlyContinue
+    $before = Snapshot
+    Inst 'rel' 'rel' @('-Force')
+    if ($Rc -eq 21 -and (Has 'start the daemon once and stop it cleanly') -and (Has 'Nothing was installed') -and ((Snapshot) -eq $before)) { Ok 'data that cannot be read: exit 21 with what to do, installed files untouched' } else { Bad "unreadable data (rc=$Rc)" $Out }
+    Remove-Item $db -Force; Remove-Item "$db-wal", "$db-shm" -Force -ErrorAction SilentlyContinue
+    Inst 'rel' 'rel' @('-Force')
+    if ($Rc -eq 0 -and (Has 'Installed YadoriLink') -and -not (Test-Path $db)) { Ok 'no data at all: the install proceeds and the check creates nothing' } else { Bad "no data (rc=$Rc)" $Out }
 } finally {
-    if (Test-Path $Yl) { $env:YADORILINK_CONFIG_DIR = $Cfg; & $Yl daemon stop 2>&1 | Out-Null; Remove-Item Env:YADORILINK_CONFIG_DIR -ErrorAction SilentlyContinue }
+    if (Test-Path $Yl) { $env:YADORILINK_CONFIG_DIR = $Cfg; & $Yl daemon stop 2>&1 | Out-Null }
+    if ($hold) { Stop-Process -Id $hold.Id -Force -ErrorAction SilentlyContinue }
     if ($server) { Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Milliseconds 500
     Remove-Item $T -Recurse -Force -ErrorAction SilentlyContinue

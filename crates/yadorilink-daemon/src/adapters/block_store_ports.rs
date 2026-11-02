@@ -60,6 +60,14 @@ impl BlockContentStore for BlockStorePortsAdapter {
     fn present_blocks(&self, hashes: &[ContentHash]) -> Result<Vec<bool>, StorageError> {
         self.0.present_blocks(hashes)
     }
+
+    fn get_framing_checked(&self, hash: &str) -> Result<Vec<u8>, StorageError> {
+        self.0.get_unchecked(hash)
+    }
+
+    fn data_dir(&self) -> Option<&std::path::Path> {
+        self.0.data_dir()
+    }
 }
 
 impl BlockReclamationStore for BlockStorePortsAdapter {

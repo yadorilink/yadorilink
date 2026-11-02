@@ -1807,10 +1807,9 @@ fn rich_version() -> FileVersion {
         8,
         FileMeta {
             mtime_unix_nanos: 77,
-            unix_mode: Some(0o640),
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: vec![("user.note".to_owned(), b"kept".to_vec())],
         },
     )
 }

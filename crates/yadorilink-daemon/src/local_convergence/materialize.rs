@@ -43,22 +43,12 @@ struct MaterializationPlan<'a> {
 }
 
 impl MaterializationPlan<'_> {
-    /// Applies the owner-executable bit and xattrs this payload specifies to
-    /// `out_path`. Every lane reads them from the payload, never the row:
-    /// what a materialization applies is decided by its payload alone.
-    ///
-    /// Returns the attempt's own strict xattr check, taken before the final
-    /// mode was applied, for the exactness gate that follows.
-    fn apply_payload_metadata(
-        &self,
-        out_path: &Path,
-    ) -> Result<super::types::XattrEvidence, PeerSessionError> {
-        let applied = yadorilink_local_storage::apply_file_metadata_verified(
-            out_path,
-            self.payload.version().meta.unix_mode,
-            &self.payload.version().meta.xattrs,
-        )?;
-        Ok(super::types::XattrEvidence::from(applied))
+    /// Applies the execute flag this payload specifies to `out_path`. Every lane reads it
+    /// from the payload, never the row: what a materialization applies is decided by its
+    /// payload alone.
+    fn apply_payload_metadata(&self, out_path: &Path) -> Result<(), PeerSessionError> {
+        yadorilink_local_storage::apply_file_metadata(out_path, self.payload.version().meta.exec)?;
+        Ok(())
     }
 }
 
@@ -181,12 +171,14 @@ impl super::LocalConvergenceExecutor {
         // payload down V2's lane, and the proof published at the end
         // names V1 either way.
         if payload.version().meta.record_kind == RecordKind::Symlink {
-            return self.materialize_symlink_lane(&plan);
+            let proofs = self.proofs_before_replacing(group_id, record).await?;
+            return self.materialize_symlink_lane(&plan, &proofs);
         }
         // Nor does a directory: it has no content to fetch or to defer to a
         // placeholder, whatever the policy.
         if payload.version().meta.record_kind == RecordKind::Directory {
-            return self.materialize_directory_lane(&plan);
+            let proofs = self.proofs_before_replacing(group_id, record).await?;
+            return self.materialize_directory_lane(&plan, &proofs);
         }
 
         // Content-identical fast path — if
@@ -223,7 +215,8 @@ impl super::LocalConvergenceExecutor {
         if eager_admitted {
             self.materialize_eager_lane(&plan).await
         } else {
-            self.materialize_on_demand_lane(&plan)
+            let proofs = self.proofs_before_replacing(group_id, record).await?;
+            self.materialize_on_demand_lane(&plan, &proofs)
         }
     }
 
@@ -411,7 +404,6 @@ impl super::LocalConvergenceExecutor {
                     kind,
                     payload.version(),
                     update.mutation_generation,
-                    &update.xattrs,
                 )? {
                     Some(evidence) => Ok(Some(MaterializeResult::Settled(evidence).into())),
                     None => Ok(Some(MaterializeResult::RetryRequired.into())),
@@ -427,6 +419,7 @@ impl super::LocalConvergenceExecutor {
         &self,
         plan: &MaterializationPlan<'_>,
         reason: &str,
+        proofs: &yadorilink_sync_sqlite::retention::RetentionProofs,
     ) -> Result<LocalMaterializeOutcome, PeerSessionError> {
         self.hold(
             plan.group_id,
@@ -435,6 +428,7 @@ impl super::LocalConvergenceExecutor {
             plan.origin_device_id,
             plan.authoring,
             &plan.columns,
+            yadorilink_sync_sqlite::retention::Retention::Proofs(proofs),
         )?;
         Ok(MaterializeResult::Settled(SettlementEvidence::HazardHeld { reason: reason.to_owned() })
             .into())

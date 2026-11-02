@@ -75,6 +75,13 @@ struct Inner {
     /// both -- the count alone cannot tell a retry from a first attempt.
     endpoint_reports_to_fail: u32,
     endpoint_reports_seen: u32,
+    /// Devices whose authorization-checkpoint requests are refused with 503 while the
+    /// connection to this plane stays up (the case a dropped connection would hide: nothing
+    /// reconnects, so nothing flushes again unless the daemon retries by itself).
+    checkpoint_refused_for: HashSet<String>,
+    /// How many requests were refused per device, so a test can wait for the refusal to have
+    /// happened rather than assume it.
+    checkpoint_refusals: HashMap<String, u32>,
     /// `(viewer_device_id, target_device_id) -> endpoints`, overriding what
     /// `target_device_id`'s own `DeviceInfo::endpoints` would otherwise
     /// publish, but ONLY in the netmap frame `viewer_device_id` itself
@@ -93,6 +100,14 @@ struct Inner {
     /// Track Send rendezvous grants -- see `serve_send_authorization_issue`'s
     /// own doc comment. grant_id -> record.
     send_authorizations: HashMap<String, FakeSendAuthorization>,
+    /// Account a test assigned a device to; unset devices are all one account.
+    device_accounts: HashMap<String, String>,
+    /// Cross-account Send links -- see `FakeSendLink`. link_id -> record.
+    send_links: HashMap<String, FakeSendLink>,
+    /// While set, a Track Send grant's push to the receiver is parked instead of delivered:
+    /// the plane has answered the sender, but the receiver's event stream has not caught up.
+    hold_send_pushes: bool,
+    held_send_pushes: Vec<(String, String)>,
     /// Per-group, append-only signed policy chain this fake has issued via
     /// `grant_role`, in the exact `PolicyRecord` shape
     /// `yadorilink_daemon::change_policy::verify_group_policy_log` accepts --
@@ -206,6 +221,24 @@ struct FakeSendAuthorization {
     sender_device_id: String,
     receiver_device_id: String,
     consumed: bool,
+}
+
+/// A cross-account Send link this fake has minted. Mirrors the Worker's
+/// `send_links` state machine (open -> redeemed -> granted, or cancelled;
+/// expiry computed) for daemon-side E2E coverage. Account scoping is not
+/// modeled here (this fake has no accounts); that, the code hashing and the
+/// uniform refusals are covered against the real Worker by its
+/// `test/send-links.test.ts`.
+#[derive(Clone)]
+struct FakeSendLink {
+    code: String,
+    sender_device_id: String,
+    receiver_device_id: Option<String>,
+    state: &'static str,
+    expired: bool,
+    grant_id: Option<String>,
+    /// (name, size) of the files the sender attached for the preview.
+    files: Vec<(String, u64)>,
 }
 
 /// A handle to the running fake. Cloneable; every clone shares one server.
@@ -695,6 +728,24 @@ impl FakeCoordination {
         self.inner.lock().unwrap().endpoint_reports_to_fail = n;
     }
 
+    /// Refuse (503) every authorization-checkpoint request of `device_id` until
+    /// `accept_checkpoints_from` lifts it, without touching any connection.
+    #[allow(dead_code)]
+    pub fn refuse_checkpoints_from(&self, device_id: &str) {
+        self.inner.lock().unwrap().checkpoint_refused_for.insert(device_id.to_string());
+    }
+
+    /// How many checkpoint requests of `device_id` have been refused so far.
+    #[allow(dead_code)]
+    pub fn checkpoint_refusals(&self, device_id: &str) -> u32 {
+        self.inner.lock().unwrap().checkpoint_refusals.get(device_id).copied().unwrap_or(0)
+    }
+
+    #[allow(dead_code)]
+    pub fn accept_checkpoints_from(&self, device_id: &str) {
+        self.inner.lock().unwrap().checkpoint_refused_for.remove(device_id);
+    }
+
     /// How many endpoint reports have arrived, refused ones included.
     #[allow(dead_code)]
     pub fn endpoint_report_count(&self) -> u32 {
@@ -706,6 +757,46 @@ impl FakeCoordination {
     #[allow(dead_code)]
     pub fn substrate_reachability_of(&self, device_id: &str) -> Option<(Vec<String>, Vec<String>)> {
         self.inner.lock().unwrap().substrate_reachability.get(device_id).cloned()
+    }
+
+    /// Puts a device on a named account, so `/send/authorization` (same-account
+    /// only, like the Worker) refuses a pair on different accounts.
+    #[allow(dead_code)]
+    pub fn set_device_account(&self, device_id: &str, account: &str) {
+        self.inner.lock().unwrap().device_accounts.insert(device_id.into(), account.into());
+    }
+
+    /// From now on a grant's push to its receiver is parked, not delivered (the receiver's event
+    /// stream lagging behind the sender's grant response).
+    #[allow(dead_code)]
+    pub fn hold_send_authorization_pushes(&self) {
+        self.inner.lock().unwrap().hold_send_pushes = true;
+    }
+
+    /// How many grant pushes are parked.
+    #[allow(dead_code)]
+    pub fn held_send_authorization_pushes(&self) -> usize {
+        self.inner.lock().unwrap().held_send_pushes.len()
+    }
+
+    /// Delivers every parked grant push and stops parking.
+    #[allow(dead_code)]
+    pub fn release_send_authorization_pushes(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.hold_send_pushes = false;
+        for (receiver, frame) in std::mem::take(&mut inner.held_send_pushes) {
+            if let Some(tx) = inner.subscribers.get(&receiver) {
+                let _ = tx.send(frame);
+            }
+        }
+    }
+
+    /// Makes a Send link past its expiry, as the clock would.
+    #[allow(dead_code)]
+    pub fn expire_send_link(&self, link_id: &str) {
+        if let Some(link) = self.inner.lock().unwrap().send_links.get_mut(link_id) {
+            link.expired = true;
+        }
     }
 
     pub fn apply_endpoint_reports(&self) {
@@ -999,6 +1090,8 @@ async fn handle_connection(mut stream: TcpStream, inner: Arc<Mutex<Inner>>) -> s
     let is_ws_upgrade = head.to_ascii_lowercase().contains("upgrade: websocket");
     if method == "GET" && target.starts_with("/netmap/subscribe") && is_ws_upgrade {
         serve_netmap_subscription(stream, &head, &target, inner).await
+    } else if let Some(route) = parse_send_link_target(&method, &target) {
+        serve_send_link(stream, &head, leftover, route, inner).await
     } else if method == "POST" {
         if target.split('?').next() == Some("/send/authorization") {
             serve_send_authorization_issue(stream, &head, leftover, inner).await
@@ -1294,6 +1387,23 @@ async fn serve_authorization_checkpoint(
             .await;
     };
 
+    let refused = {
+        let mut guard = inner.lock().unwrap();
+        let refused = guard.checkpoint_refused_for.contains(&req.device_id);
+        if refused {
+            *guard.checkpoint_refusals.entry(req.device_id.clone()).or_insert(0) += 1;
+        }
+        refused
+    };
+    if refused {
+        return respond_json(
+            &mut stream,
+            503,
+            "Service Unavailable",
+            r#"{"error":"checkpoint issuance is refused for this device"}"#,
+        )
+        .await;
+    }
     let (policy_service_key, chain, device) = {
         let inner = inner.lock().unwrap();
         (
@@ -1448,7 +1558,39 @@ async fn serve_send_authorization_issue(
     let (Some(_sender), Some(receiver)) = (sender.clone(), receiver) else {
         return respond_json(&mut stream, 404, "Not Found", r#"{"error":"unknown device"}"#).await;
     };
+    let cross_account = {
+        let inner = inner.lock().unwrap();
+        let accounts = &inner.device_accounts;
+        accounts.get(&req.sender_device_id) != accounts.get(&req.receiver_device_id)
+    };
+    if cross_account {
+        return respond_json(&mut stream, 404, "Not Found", r#"{"error":"device not found"}"#)
+            .await;
+    }
 
+    let body = issue_grant(
+        &inner,
+        &req.sender_device_id,
+        &req.receiver_device_id,
+        &receiver,
+        receiver_substrate,
+    );
+    respond_json(&mut stream, 200, "OK", &body).await
+}
+
+/// Mints and records one pair-bound grant, pushes it to the receiver, and
+/// returns the issuing response body.
+fn issue_grant(
+    inner: &Arc<Mutex<Inner>>,
+    sender_device_id: &str,
+    receiver_device_id: &str,
+    receiver: &DeviceInfo,
+    receiver_substrate: serde_json::Value,
+) -> String {
+    let req = GrantPair {
+        sender_device_id: sender_device_id.to_string(),
+        receiver_device_id: receiver_device_id.to_string(),
+    };
     let grant_id = uuid_like("grant");
     let nonce = uuid_like("nonce");
     let now = unix_now();
@@ -1470,7 +1612,7 @@ async fn serve_send_authorization_issue(
     // the coordination service's own "push happens inside the request handler"
     // convention (see `routes/send.ts`'s own comment).
     push_send_authorization(
-        &inner,
+        inner,
         &req.receiver_device_id,
         &grant_id,
         &nonce,
@@ -1478,7 +1620,7 @@ async fn serve_send_authorization_issue(
         expires_at,
     );
 
-    let body = serde_json::json!({
+    serde_json::json!({
         "grantId": grant_id,
         "nonce": nonce,
         "expiresAt": expires_at,
@@ -1488,8 +1630,12 @@ async fn serve_send_authorization_issue(
             "substrateReachability": receiver_substrate,
         },
     })
-    .to_string();
-    respond_json(&mut stream, 200, "OK", &body).await
+    .to_string()
+}
+
+struct GrantPair {
+    sender_device_id: String,
+    receiver_device_id: String,
 }
 
 /// Serves `POST /send/authorization/:grantId/consume` for real -- the
@@ -1569,8 +1715,7 @@ fn push_send_authorization(
     sender_device_id: &str,
     expires_at: i64,
 ) {
-    let inner = inner.lock().unwrap();
-    let Some(tx) = inner.subscribers.get(receiver_device_id) else { return };
+    let mut inner = inner.lock().unwrap();
     let Some(sender) = inner.devices.get(sender_device_id) else { return };
     let frame = serde_json::json!({
         "type": "send_authorization",
@@ -1582,6 +1727,11 @@ fn push_send_authorization(
         "expiresAt": expires_at,
     })
     .to_string();
+    if inner.hold_send_pushes {
+        inner.held_send_pushes.push((receiver_device_id.to_string(), frame));
+        return;
+    }
+    let Some(tx) = inner.subscribers.get(receiver_device_id) else { return };
     let _ = tx.send(frame);
 }
 
@@ -1785,4 +1935,212 @@ async fn serve_netmap_subscription(
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+enum SendLinkRoute {
+    Create,
+    Redeem,
+    Preview,
+    Status(String),
+    Cancel(String),
+    Grant(String),
+}
+
+fn parse_send_link_target(method: &str, target: &str) -> Option<SendLinkRoute> {
+    let path = target.split('?').next().unwrap_or(target);
+    let rest = path.strip_prefix("/send/links")?;
+    match (method, rest) {
+        ("POST", "") => Some(SendLinkRoute::Create),
+        ("POST", "/redeem") => Some(SendLinkRoute::Redeem),
+        ("POST", "/preview") => Some(SendLinkRoute::Preview),
+        _ => {
+            let rest = rest.strip_prefix('/')?;
+            match (method, rest.split_once('/')) {
+                ("GET", None) => Some(SendLinkRoute::Status(rest.to_string())),
+                ("DELETE", None) => Some(SendLinkRoute::Cancel(rest.to_string())),
+                ("POST", Some((id, "authorization"))) => Some(SendLinkRoute::Grant(id.to_string())),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// The Worker's `/send/links*` routes, mirrored for the daemon-side E2E: one
+/// use per code, a grant only after redeem and only once, nothing after
+/// cancel or expiry, and every redeem failure the same 404.
+async fn serve_send_link(
+    mut stream: TcpStream,
+    head: &str,
+    leftover: Vec<u8>,
+    route: SendLinkRoute,
+    inner: Arc<Mutex<Inner>>,
+) -> std::io::Result<()> {
+    let body = read_body(&mut stream, head, leftover).await?;
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+    let text = |key: &str| json.get(key).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let not_found = r#"{"error":"send link is invalid, expired, or already used"}"#;
+
+    match route {
+        SendLinkRoute::Create => {
+            let sender = text("senderDeviceId");
+            if !inner.lock().unwrap().devices.contains_key(&sender) {
+                return respond_json(&mut stream, 404, "Not Found", r#"{"error":"device"}"#).await;
+            }
+            let (link_id, code) = (uuid_like("link"), uuid_like("code"));
+            inner.lock().unwrap().send_links.insert(
+                link_id.clone(),
+                FakeSendLink {
+                    code: code.clone(),
+                    sender_device_id: sender,
+                    receiver_device_id: None,
+                    state: "open",
+                    expired: false,
+                    grant_id: None,
+                    files: json
+                        .get("files")
+                        .and_then(|f| f.as_array())
+                        .map(|files| {
+                            files
+                                .iter()
+                                .filter_map(|f| {
+                                    Some((
+                                        f.get("name")?.as_str()?.to_string(),
+                                        f.get("size")?.as_u64()?,
+                                    ))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                },
+            );
+            let body = serde_json::json!({
+                "linkId": link_id, "code": code, "expiresAt": unix_now() + 3600
+            });
+            respond_json(&mut stream, 200, "OK", &body.to_string()).await
+        }
+        SendLinkRoute::Redeem => {
+            let (code, receiver) = (text("code"), text("receiverDeviceId"));
+            let redeemed = {
+                let mut inner = inner.lock().unwrap();
+                let known = inner.devices.contains_key(&receiver);
+                inner
+                    .send_links
+                    .iter_mut()
+                    .find(|(_, l)| l.code == code)
+                    .filter(|(_, l)| {
+                        known && l.state == "open" && !l.expired && l.sender_device_id != receiver
+                    })
+                    .map(|(id, l)| {
+                        l.state = "redeemed";
+                        l.receiver_device_id = Some(receiver.clone());
+                        id.clone()
+                    })
+            };
+            match redeemed {
+                Some(link_id) => {
+                    respond_json(
+                        &mut stream,
+                        200,
+                        "OK",
+                        &serde_json::json!({ "linkId": link_id }).to_string(),
+                    )
+                    .await
+                }
+                None => respond_json(&mut stream, 404, "Not Found", not_found).await,
+            }
+        }
+        SendLinkRoute::Preview => {
+            let code = text("code");
+            let link = inner
+                .lock()
+                .unwrap()
+                .send_links
+                .values()
+                .find(|l| l.code == code && l.state == "open" && !l.expired)
+                .cloned();
+            match link {
+                Some(l) => {
+                    let files: Vec<_> = l
+                        .files
+                        .iter()
+                        .map(|(name, size)| serde_json::json!({ "name": name, "size": size }))
+                        .collect();
+                    let body = serde_json::json!({
+                        "senderName": l.sender_device_id,
+                        "expiresAt": unix_now() + 3600,
+                        "files": files,
+                    });
+                    respond_json(&mut stream, 200, "OK", &body.to_string()).await
+                }
+                None => respond_json(&mut stream, 404, "Not Found", not_found).await,
+            }
+        }
+        SendLinkRoute::Status(link_id) => {
+            let link = inner.lock().unwrap().send_links.get(&link_id).cloned();
+            match link {
+                Some(l) => {
+                    let state = if l.expired && matches!(l.state, "open" | "redeemed") {
+                        "expired"
+                    } else {
+                        l.state
+                    };
+                    let body = serde_json::json!({ "linkId": link_id, "state": state, "expiresAt": unix_now() + 3600 });
+                    respond_json(&mut stream, 200, "OK", &body.to_string()).await
+                }
+                None => {
+                    respond_json(&mut stream, 404, "Not Found", r#"{"error":"send link"}"#).await
+                }
+            }
+        }
+        SendLinkRoute::Cancel(link_id) => {
+            let cancelled = {
+                let mut inner = inner.lock().unwrap();
+                let grant =
+                    inner.send_links.get_mut(&link_id).filter(|l| l.state != "cancelled").map(
+                        |l| {
+                            l.state = "cancelled";
+                            l.grant_id.clone()
+                        },
+                    );
+                if let Some(Some(grant_id)) = &grant {
+                    if let Some(g) = inner.send_authorizations.get_mut(grant_id) {
+                        g.consumed = true;
+                    }
+                }
+                grant.is_some()
+            };
+            if cancelled {
+                respond_json(&mut stream, 200, "OK", r#"{"cancelled":true}"#).await
+            } else {
+                respond_json(&mut stream, 404, "Not Found", r#"{"error":"send link"}"#).await
+            }
+        }
+        SendLinkRoute::Grant(link_id) => {
+            let sender = text("senderDeviceId");
+            let pair = {
+                let mut inner = inner.lock().unwrap();
+                let receiver = inner.send_links.get_mut(&link_id).and_then(|l| {
+                    (l.state == "redeemed" && !l.expired && l.sender_device_id == sender)
+                        .then(|| l.receiver_device_id.clone())
+                        .flatten()
+                });
+                receiver.and_then(|receiver| {
+                    let info = inner.devices.get(&receiver).cloned()?;
+                    let substrate = substrate_json(&inner, &receiver);
+                    inner.send_links.get_mut(&link_id).unwrap().state = "granted";
+                    Some((receiver, info, substrate))
+                })
+            };
+            let Some((receiver, info, substrate)) = pair else {
+                return respond_json(&mut stream, 404, "Not Found", r#"{"error":"send link"}"#)
+                    .await;
+            };
+            let body = issue_grant(&inner, &sender, &receiver, &info, substrate);
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                inner.lock().unwrap().send_links.get_mut(&link_id).unwrap().grant_id =
+                    v["grantId"].as_str().map(str::to_string);
+            }
+            respond_json(&mut stream, 200, "OK", &body).await
+        }
+    }
 }

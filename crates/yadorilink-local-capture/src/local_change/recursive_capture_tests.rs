@@ -282,10 +282,10 @@ async fn rename_of_explicit_directory_is_one_recursive_rename_operation() {
     assert_eq!(live_kind(&state, "d/f.txt"), None);
 }
 
-/// A renamed file keeps the mode and attributes of the file it moved from when
-/// the platform cannot read them: the destination has no row to inherit from.
+/// A renamed file keeps the execute flag of the file it moved from when
+/// the platform cannot read it: the destination has no row to inherit from.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_renamed_file_keeps_the_mode_and_attributes_of_its_source_where_none_are_readable() {
+async fn a_renamed_file_keeps_the_execute_flag_of_its_source_where_it_is_unreadable() {
     if !yadorilink_fs_platform::fs_capabilities::temp_dir_proves_object_identity_for_test() {
         return;
     }
@@ -298,9 +298,7 @@ async fn a_renamed_file_keeps_the_mode_and_attributes_of_its_source_where_none_a
         event(&proc, &root, &root.join(rel), FsChangeKind::CreatedOrModified).await;
     }
     let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
-    state.file_index_repository().set_unix_mode(GROUP, "d/f.txt", Some(0o640), &permit).unwrap();
-    let attrs = vec![("user.origin".to_string(), b"linux".to_vec())];
-    state.file_index_repository().set_xattrs(GROUP, "d/f.txt", &attrs, &permit).unwrap();
+    state.file_index_repository().set_exec(GROUP, "d/f.txt", true, &permit).unwrap();
 
     proc.simulate_unobservable_modes();
     std::fs::rename(root.join("d"), root.join("e")).unwrap();
@@ -312,8 +310,7 @@ async fn a_renamed_file_keeps_the_mode_and_attributes_of_its_source_where_none_a
     .await;
 
     assert_eq!(ops_at(&state, "e/f.txt"), ["put-file"]);
-    assert_eq!(state.file_index_repository().get_unix_mode(GROUP, "e/f.txt").unwrap(), Some(0o640));
-    assert_eq!(state.file_index_repository().get_xattrs(GROUP, "e/f.txt").unwrap(), attrs);
+    assert!(state.file_index_repository().get_exec(GROUP, "e/f.txt").unwrap());
 }
 
 /// FSEvents reports both sides of a rename as a change of unknown

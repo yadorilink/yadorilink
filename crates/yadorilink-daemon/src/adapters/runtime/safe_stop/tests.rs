@@ -627,3 +627,45 @@ async fn a_shutdown_request_nobody_subscribed_to_yet_is_not_lost() {
     assert!(*f.state.shutdown_tx.borrow());
     assert!(*f.state.shutdown_tx.subscribe().borrow());
 }
+
+/// A fixture whose engine was built with `supervised` as given (the variable the image sets).
+fn fixture_supervised(supervised: bool) -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("sync-state.sqlite3");
+    let store = Arc::new(SegmentBlockStore::new(dir.path().join("blocks")).unwrap());
+    let mut tuning = ReplicaCoordinator::beside_database_tuning();
+    tuning.supervised = supervised;
+    let coordinator = Arc::new(ReplicaCoordinator::open_with(&db_path, tuning).unwrap());
+    let state = DaemonState::new("device-a".into(), coordinator, store);
+    Fixture { _dir: dir, state, db_path }
+}
+
+#[tokio::test]
+async fn a_plain_shutdown_exits_normally_and_a_shutdown_to_restart_exits_for_a_restart() {
+    use crate::adapters::runtime::runtime_control::DaemonLifecycleAdapter;
+    use crate::application::ports::DaemonLifecyclePort;
+
+    let plain = fixture_supervised(true);
+    DaemonLifecycleAdapter::new(plain.state.clone()).request_shutdown();
+    assert!(*plain.state.shutdown_tx.borrow());
+    assert!(!restart_flag(&plain.state), "an ordinary stop is not a restart");
+
+    let restart = fixture_supervised(true);
+    DaemonLifecycleAdapter::new(restart.state.clone()).request_shutdown_to_restart();
+    assert!(*restart.state.shutdown_tx.borrow());
+    assert!(restart_flag(&restart.state), "the restart reason is recorded with the signal");
+}
+
+#[tokio::test]
+async fn without_a_supervisor_a_restart_request_is_an_ordinary_stop() {
+    use crate::adapters::runtime::runtime_control::DaemonLifecycleAdapter;
+    use crate::application::ports::DaemonLifecyclePort;
+
+    let unsupervised = fixture_supervised(false);
+    DaemonLifecycleAdapter::new(unsupervised.state.clone()).request_shutdown_to_restart();
+    assert!(*unsupervised.state.shutdown_tx.borrow(), "the daemon still stops");
+    assert!(
+        !restart_flag(&unsupervised.state),
+        "nothing starts it again, so it must not exit with the restart status"
+    );
+}

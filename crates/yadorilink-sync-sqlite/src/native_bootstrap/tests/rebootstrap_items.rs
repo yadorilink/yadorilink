@@ -754,10 +754,9 @@ fn three_block_version() -> FileVersion {
         12,
         FileMeta {
             mtime_unix_nanos: 9,
-            unix_mode: Some(0o644),
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     )
 }
@@ -799,10 +798,9 @@ fn real_block_version(bytes: &[u8]) -> FileVersion {
         bytes.len() as u64,
         FileMeta {
             mtime_unix_nanos: 9,
-            unix_mode: Some(0o644),
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     )
 }
@@ -1066,10 +1064,9 @@ fn big_block_version(seed: u8, len: usize) -> FileVersion {
         len as u64,
         FileMeta {
             mtime_unix_nanos: 9,
-            unix_mode: Some(0o644),
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     )
 }

@@ -21,8 +21,7 @@ fn version(record_kind: RecordKind) -> VersionRecord {
         origin_device_id: Some("device-a".into()),
         record_kind,
         symlink_target: None,
-        unix_mode: Some(0o755),
-        xattrs: vec![],
+        exec: true,
         version_hash: VersionHash([0; 32]),
     }
 }
@@ -34,7 +33,29 @@ fn version_to_proto_carries_record_kind() {
         (RecordKind::Directory, EntryKind::Directory),
         (RecordKind::Symlink, EntryKind::Symlink),
     ] {
-        assert_eq!(version_to_proto(version(record_kind)).kind(), wire, "{record_kind:?}");
+        assert_eq!(version_to_proto(view(record_kind)).kind(), wire, "{record_kind:?}");
+    }
+}
+
+fn view(record_kind: RecordKind) -> crate::queries::file_history::VersionView {
+    crate::queries::file_history::VersionView {
+        record: version(record_kind),
+        content: crate::queries::file_history::VersionContent::NotApplicable,
+    }
+}
+
+#[test]
+fn version_to_proto_carries_what_this_device_holds() {
+    use crate::queries::file_history::VersionContent;
+    use yadorilink_ipc_proto::daemonctl::VersionContent as Wire;
+    for (content, wire) in [
+        (VersionContent::NotApplicable, Wire::NotApplicable),
+        (VersionContent::Kept, Wire::Kept),
+        (VersionContent::NotKept, Wire::NotKept),
+    ] {
+        let mut v = view(RecordKind::File);
+        v.content = content;
+        assert_eq!(version_to_proto(v).content(), wire, "{content:?}");
     }
 }
 

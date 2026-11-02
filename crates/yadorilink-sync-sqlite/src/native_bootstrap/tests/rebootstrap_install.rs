@@ -699,7 +699,7 @@ fn a_mode_only_edit_after_the_barrier_is_kept_as_a_late_edit() {
     let saved = late_edits_of(&p.w.b);
     assert_eq!(saved.len(), 1, "the chmod was lost with the original: {saved:?}");
     assert_eq!(late_content(&p, &saved[0]), [2]);
-    assert_eq!(late_meta(&p, &saved[0]).unix_mode, Some(0o755));
+    assert!(late_meta(&p, &saved[0]).exec);
 }
 
 /// Bytes and mode both changed: the item restores both.
@@ -713,7 +713,7 @@ fn a_late_edit_keeps_the_mode_and_mtime_the_file_had() {
     let saved = late_edits_of(&p.w.b);
     assert_eq!(saved.len(), 1, "{saved:?}");
     let meta = late_meta(&p, &saved[0]);
-    assert_eq!(meta.unix_mode, Some(0o750));
+    assert!(meta.exec);
     assert_eq!(meta.mtime_unix_nanos, mtime, "the mtime was the install clock");
 }
 
@@ -745,10 +745,11 @@ fn an_unchanged_original_is_removed_without_a_late_edit() {
     assert_eq!(items[0].status, QuarantineStatus::Removed);
 }
 
-/// An extended attribute set after the barrier is an edit as well.
+/// An extended attribute set after the barrier is no edit: extended attributes are not replicated, so
+/// the original goes as an unchanged copy and nothing is saved for it.
 #[cfg(target_os = "linux")]
 #[test]
-fn an_xattr_only_edit_after_the_barrier_is_kept_as_a_late_edit() {
+fn an_xattr_only_change_after_the_barrier_is_not_a_late_edit() {
     let p = preserved_scenario(&Viewer);
     let x = p.root.path().join("x");
     fs::write(&x, [2]).unwrap();
@@ -758,15 +759,20 @@ fn an_xattr_only_edit_after_the_barrier_is_kept_as_a_late_edit() {
     }
     let at = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(PRESERVED_MTIME as u64);
     fs::OpenOptions::new().write(true).open(&x).unwrap().set_modified(at).unwrap();
-    yadorilink_local_storage::apply_xattrs(&x, &[("user.note".to_owned(), b"kept".to_vec())])
-        .unwrap();
+    let name = std::ffi::CString::new("user.note").unwrap();
+    let path =
+        std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(x.as_os_str())).unwrap();
+    // SAFETY: NUL-terminated strings and a buffer valid for its length.
+    let set =
+        unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), b"kept".as_ptr().cast(), 4, 0) };
+    if set != 0 {
+        return; // a filesystem without user xattrs: nothing to show
+    }
     let fs_root = FsRoot::new(p.root.path());
     install_with(&p.w.b, p.recovery_root.path(), &fs_root, &Viewer, &mut |_| Ok(())).unwrap();
     finish(&p);
 
-    let saved = late_edits_of(&p.w.b);
-    assert_eq!(saved.len(), 1, "the xattr was lost with the original: {saved:?}");
-    assert_eq!(late_meta(&p, &saved[0]).xattrs, vec![("user.note".to_owned(), b"kept".to_vec())]);
+    assert!(late_edits_of(&p.w.b).is_empty(), "an attribute alone is not an edit");
 }
 
 #[cfg(unix)]
@@ -903,8 +909,7 @@ fn a_same_bytes_late_edit_of_other_metadata_does_not_confirm_the_recorded_item()
         bytes,
         Some(crate::native_recovery_items::LateEditMeta {
             mtime_unix_nanos: 42_000_000_000,
-            unix_mode: Some(0o600),
-            xattrs: Vec::new(),
+            exec: false,
         }),
     )
     .unwrap();

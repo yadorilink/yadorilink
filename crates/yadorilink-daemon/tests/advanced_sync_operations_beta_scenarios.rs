@@ -20,7 +20,11 @@ async fn start_daemon_with_state() -> (std::path::PathBuf, tempfile::TempDir, Ar
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(SegmentBlockStore::new(dir.path().join("blocks")).unwrap());
     let state_db = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
-    let state = DaemonState::new("device-under-test".into(), state_db, store);
+    let state = yadorilink_daemon::test_support::isolated_daemon_state(
+        "device-under-test".into(),
+        state_db,
+        store,
+    );
     let socket_path = dir.path().join("daemon.sock");
 
     let serve_path = socket_path.clone();

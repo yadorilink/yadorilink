@@ -40,6 +40,7 @@ use yadorilink_replica_domain::author::{
     AuthorId, IncarnationId, IncarnationMintReason, IncarnationRecord,
 };
 use yadorilink_replica_domain::ids::{AuthorSeq, DeviceId};
+use yadorilink_sqlite_runtime::CachedStatements as _;
 
 use crate::SyncSqliteError;
 
@@ -125,9 +126,11 @@ pub struct InstallWitness {
 pub fn install_witness(conn: &Connection) -> Result<Option<InstallWitness>, SyncSqliteError> {
     init_schema(conn)?;
     let row = conn
-        .query_row("SELECT token, generation FROM install_witness WHERE singleton = 1", [], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
-        })
+        .query_row_cached(
+            "SELECT token, generation FROM install_witness WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+        )
         .optional()?;
     let Some((token, generation)) = row else {
         return Ok(None);
@@ -149,7 +152,7 @@ pub fn store_install_witness(
     let generation = i64::try_from(witness.generation).map_err(|_| {
         SyncSqliteError::InvalidInput(format!("install witness generation {}", witness.generation))
     })?;
-    conn.execute(
+    conn.execute_cached(
         "INSERT OR REPLACE INTO install_witness (singleton, token, generation) \
          VALUES (1, ?1, ?2)",
         params![&witness.token[..], generation],
@@ -232,7 +235,7 @@ pub fn incarnation_record(conn: &Connection) -> Result<Option<IncarnationRecord>
 /// longer writes as.
 fn store(conn: &Connection, record: &IncarnationRecord) -> Result<(), SyncSqliteError> {
     atomically(conn, || {
-        conn.execute(
+        conn.execute_cached(
             "INSERT OR REPLACE INTO author_incarnation \
              (singleton, device_id, incarnation, db_instance_nonce, machine_fingerprint, \
               minted_reason, previous) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
@@ -245,7 +248,7 @@ fn store(conn: &Connection, record: &IncarnationRecord) -> Result<(), SyncSqlite
                 record.previous.as_ref().map(|previous| previous.0.to_vec()),
             ],
         )?;
-        conn.execute("DELETE FROM author_own_ahead", [])?;
+        conn.execute_cached("DELETE FROM author_own_ahead", [])?;
         Ok(())
     })
 }
@@ -385,7 +388,7 @@ pub fn note_own_author_ahead(
     if report.reported <= report.local || current_author(conn)? != report.author {
         return Ok(false);
     }
-    conn.execute(
+    conn.execute_cached(
         "INSERT INTO author_own_ahead \
          (group_id, device_id, incarnation, local_seq, reported_seq) \
          VALUES (?1, ?2, ?3, ?4, ?5) \

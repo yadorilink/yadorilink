@@ -6,6 +6,7 @@ use yadorilink_client_core::ops::updates;
 use yadorilink_ipc_proto::daemonctl::UpdateStatusResponse;
 use yadorilink_local_storage::ownership::{self, RecordState};
 
+use super::kept_installer;
 use crate::error::CliError;
 
 /// Shared by `status`/`check` — both end up printing the exact same
@@ -299,7 +300,7 @@ fn refuse_if_check_failed(status: &UpdateStatusResponse) -> Result<(), CliError>
 /// `yadorilink self-update [--version X]`: on a command-line install, judges the target version
 /// against the daemon's live verified channel manifest (fail closed) and, if allowed, prints the
 /// pinned installer command that does the verified download and atomic switch.
-pub async fn self_update(requested: Option<String>) -> Result<(), CliError> {
+pub async fn self_update(requested: Option<String>, rollback: bool) -> Result<(), CliError> {
     let exe = std::env::current_exe().unwrap_or_default();
     let record = match yadorilink_client_core::coordination::device_config::config_dir() {
         Ok(config_dir) => ownership::read(&config_dir),
@@ -309,6 +310,9 @@ pub async fn self_update(requested: Option<String>) -> Result<(), CliError> {
     // hide "the app updates this".
     if matches!(record, RecordState::Present(_) | RecordState::Unreadable(_)) {
         self_update_target(&record, "", "beta", "", None, &exe)?;
+    }
+    if rollback {
+        return roll_back(&exe);
     }
     let status = if requested.is_some() {
         updates::update_status().await?
@@ -349,6 +353,31 @@ pub async fn self_update(requested: Option<String>) -> Result<(), CliError> {
     let prefix = std::env::current_exe().ok().and_then(|exe| {
         prefix_from_exe(&std::fs::canonicalize(&exe).unwrap_or(exe), cfg!(windows))
     });
+    // The installer kept from the verified bundle does the update, when there is one and it is
+    // still the bytes that were verified. This command downloads and verifies nothing itself.
+    if let Some(prefix) = prefix.as_deref().filter(|_| !cfg!(windows)) {
+        match kept_installer::plan(&prefix.join("share").join("yadorilink")) {
+            kept_installer::Plan::Run(script) => {
+                println!(
+                    "version {target} is allowed by the verified {} channel manifest; running the \
+                     installer that came with this install.",
+                    status.channel
+                );
+                let args = vec![
+                    "--channel".to_owned(),
+                    status.channel.clone(),
+                    "--version".to_owned(),
+                    target.clone(),
+                    "--prefix".to_owned(),
+                    prefix.display().to_string(),
+                    "--yes".to_owned(),
+                ];
+                return finish_installer_run(&script, &args);
+            }
+            kept_installer::Plan::Refuse(why) => return Err(CliError::Other(why)),
+            kept_installer::Plan::Print => {}
+        }
+    }
     println!(
         "version {target} is allowed by the verified {} channel manifest.\nTo install it (the installer \
          verifies the signature and hashes again and switches atomically):\n  {}",
@@ -356,6 +385,44 @@ pub async fn self_update(requested: Option<String>) -> Result<(), CliError> {
         installer_command(&target, &status.channel, prefix.as_deref(), cfg!(windows))
     );
     Ok(())
+}
+
+/// `yadorilink self-update --rollback`: the kept installer switches back to the previous version.
+/// No manifest is involved: that version was verified when it was installed.
+fn roll_back(exe: &std::path::Path) -> Result<(), CliError> {
+    let prefix = prefix_from_exe(&std::fs::canonicalize(exe).unwrap_or(exe.to_owned()), cfg!(windows))
+        .ok_or_else(|| CliError::Other("this yadorilink does not run from an installer layout, so there is nothing to roll back".into()))?;
+    if cfg!(windows) {
+        return Err(CliError::Other(
+            "rolling back is not available from here on Windows yet: run install.ps1 with -Version of the version you want".into(),
+        ));
+    }
+    match kept_installer::plan(&prefix.join("share").join("yadorilink")) {
+        kept_installer::Plan::Run(script) => {
+            let args = vec!["--rollback".to_owned(), "--prefix".to_owned(), prefix.display().to_string()];
+            finish_installer_run(&script, &args)
+        }
+        kept_installer::Plan::Refuse(why) => Err(CliError::Other(why)),
+        kept_installer::Plan::Print => Err(CliError::Other(
+            "this install has no installer kept for updating (it was made by an older release); \
+             run the one-line installer to reinstall, then rollback is available from the next update"
+                .into(),
+        )),
+    }
+}
+
+/// Runs the verified installer and ends with its status: its output is the output, and a status
+/// with a standing answer gets that answer after it.
+fn finish_installer_run(script: &[u8], args: &[String]) -> Result<(), CliError> {
+    let status = kept_installer::run(script, args)
+        .map_err(|e| CliError::Other(format!("could not start the installer: {e}")))?;
+    if status == 0 {
+        return Ok(());
+    }
+    if let Some(text) = kept_installer::guidance_for(status) {
+        eprintln!("{text}");
+    }
+    std::process::exit(status);
 }
 
 /// What to do about a copy that no updater and no installer receipt owns: the cargo home comes

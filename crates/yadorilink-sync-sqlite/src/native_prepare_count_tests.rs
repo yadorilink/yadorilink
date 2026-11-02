@@ -96,10 +96,9 @@ fn put(i: usize) -> PreparedLocalMutation {
         0,
         FileMeta {
             mtime_unix_nanos: mtime,
-            unix_mode: Some(0o644),
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     );
     PreparedLocalMutation::Upsert {
@@ -115,8 +114,7 @@ fn put(i: usize) -> PreparedLocalMutation {
             record_kind: RecordKind::File,
             symlink_target: None,
             symlink_out_of_root: false,
-            unix_mode: Some(0o644),
-            xattrs: Vec::new(),
+            exec: false,
         }),
         version,
         native_witness: None,
@@ -262,4 +260,65 @@ fn bulk_capture_executions_per_file_are_bounded_and_do_not_grow_with_the_batch()
         per_large <= per_small + 0.5,
         "executions/file grew with the batch: {per_small:.2} at 1000, {per_large:.2} at 4000"
     );
+}
+
+/// The per-file reads of the receive path (the link gate, the root token, the volume identity
+/// and the provider refusal) compile their SQL once per connection, however many files go
+/// through them. `Connection::query_row` and `execute` prepare on every call; the reads here go
+/// through the statement cache instead (10,000 small files spent a third of the receiver's CPU
+/// re-parsing these before).
+#[test]
+fn per_file_link_reads_compile_once_per_connection() {
+    let db: std::sync::Arc<SyncDatabase> = crate::replica_tables::open_for_tests();
+    let links = crate::link::LinkRepository::new(db.clone());
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    db.write_immediate::<_, SyncSqliteError>(|tx| {
+        install_trace(tx);
+        Ok(())
+    })
+    .unwrap();
+    *statements() = Some(HashMap::new());
+    for _ in 0..200 {
+        links.link_gate_for_group("g1").unwrap();
+        links.link_root_token_for_group("g1").unwrap();
+        links.capture_volume_identity_for_group("g1").unwrap();
+    }
+    db.write_immediate::<_, SyncSqliteError>(|tx| {
+        uninstall_trace(tx);
+        Ok(())
+    })
+    .unwrap();
+    let per_text = statements().take().unwrap();
+    let executions: u64 = per_text.values().map(|(e, _)| e).sum();
+    let prepares: u64 = per_text.values().map(|(_, p)| p).sum();
+    assert!(executions >= 600, "the trace saw {executions} statements: the probe is not installed");
+    assert!(
+        prepares <= 12,
+        "{prepares} statements prepared for 200 files ({executions} executed); a statement that \
+         is prepared per call is not going through the statement cache: {:?}",
+        per_text
+            .iter()
+            .filter(|(_, (_, p))| *p > 1)
+            .map(|(s, v)| (one_line(s), *v))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The held-path listing reads the partial index of held rows, not every current row of the group
+/// (the hazard re-check runs it after every materialization completion).
+#[test]
+fn the_held_path_listing_uses_the_held_index() {
+    let db: std::sync::Arc<SyncDatabase> = crate::replica_tables::open_for_tests();
+    let plan: String = db
+        .read::<_, SyncSqliteError>(|conn| {
+            let mut stmt = conn.prepare(
+                "EXPLAIN QUERY PLAN SELECT path FROM files \
+                 WHERE group_id = ?1 AND state = 'current' AND held_reason IS NOT NULL",
+            )?;
+            let rows: Vec<String> =
+                stmt.query_map(["g1"], |r| r.get(3))?.collect::<Result<_, _>>()?;
+            Ok(rows.join(" | "))
+        })
+        .unwrap();
+    assert!(plan.contains("files_held"), "{plan}");
 }

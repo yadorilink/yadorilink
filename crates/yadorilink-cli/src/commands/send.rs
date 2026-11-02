@@ -7,13 +7,75 @@ use yadorilink_client_core::ops::transfers;
 
 use crate::error::CliError;
 
-pub async fn send(source_path: String, target_device: String) -> Result<(), CliError> {
-    let result = transfers::send_file(source_path, target_device).await?;
+pub async fn send(source_paths: Vec<String>, target_device: String) -> Result<(), CliError> {
+    let result = transfers::send_files(source_paths, target_device).await?;
     println!("Offered transfer {}", result.transfer_id);
     for file in &result.files_offered {
         println!("  {file}");
     }
     println!("Total {} bytes", result.total_size);
+    Ok(())
+}
+
+pub async fn link_create(ttl: Option<u32>, paths: Vec<String>) -> Result<(), CliError> {
+    let link = transfers::create_send_link(ttl.unwrap_or(0), paths).await?;
+    println!("Send link {}", link.link_id);
+    println!("Code: {}", link.code);
+    println!(
+        "Give the code to the recipient (valid once; it expires at unix time {}).",
+        link.expires_at_unix
+    );
+    println!("Then send with: yadorilink send <paths...> link:{}", link.link_id);
+    println!("Withdraw it with: yadorilink send-link cancel {}", link.link_id);
+    Ok(())
+}
+
+pub async fn link_redeem(
+    code: String,
+    device: Option<String>,
+    to: Option<String>,
+) -> Result<(), CliError> {
+    let redeemed = transfers::redeem_send_link(code, device, to).await?;
+    let link_id = redeemed.link_id;
+    if redeemed.destination_dir.is_empty() {
+        println!(
+            "Redeemed (link {link_id}). That device receives the files when the sender sends them."
+        );
+    } else {
+        println!(
+            "Redeemed (link {link_id}). The files are received into {} when the sender sends them; follow along with: yadorilink inbox",
+            redeemed.destination_dir
+        );
+    }
+    Ok(())
+}
+
+pub async fn link_cancel(link_id: String) -> Result<(), CliError> {
+    transfers::cancel_send_link(link_id.clone()).await?;
+    println!("Send link {link_id} canceled.");
+    Ok(())
+}
+
+pub async fn link_status(link_id: String) -> Result<(), CliError> {
+    use yadorilink_ipc_proto::daemonctl::SendLinkState;
+    let status = transfers::send_link_status(link_id.clone()).await?;
+    let state = match SendLinkState::try_from(status.state).unwrap_or(SendLinkState::Unspecified) {
+        SendLinkState::Waiting => "waiting for the recipient to redeem it",
+        SendLinkState::Redeemed => "redeemed; send to it now",
+        SendLinkState::Transferring => "transferring",
+        SendLinkState::Done => "done",
+        SendLinkState::Cancelled => "canceled",
+        SendLinkState::Expired => "expired",
+        SendLinkState::Interrupted => "interrupted before it finished",
+        SendLinkState::Unspecified => "in a state this program does not know",
+    };
+    println!("Send link {link_id}: {state}");
+    if !status.receiver_device_name.is_empty() {
+        println!("  recipient device: {}", status.receiver_device_name);
+    }
+    if !status.transfer_id.is_empty() {
+        println!("  transfer: {}", status.transfer_id);
+    }
     Ok(())
 }
 
@@ -32,6 +94,19 @@ pub async fn inbox() -> Result<(), CliError> {
             transfer.total_size,
             transfer.status,
         );
+        if !transfer.link_id.is_empty() {
+            // A link this device redeemed is received by the engine itself; any other offer under
+            // a link waits for `receive`.
+            let progress = if transfer.destination_dir.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ": {} of {} bytes into {}",
+                    transfer.received_bytes, transfer.total_size, transfer.destination_dir
+                )
+            };
+            println!("    from send link {}{progress}", transfer.link_id);
+        }
         if matches!(transfer.status.as_str(), "failed" | "canceled") {
             println!("    {}", reasons::why_stopped(&transfer.failure));
             println!("    resume with: yadorilink transfer retry {}", transfer.transfer_id);
@@ -126,6 +201,19 @@ mod reasons {
             "stalled" => {
                 "The other device stopped fetching it; it can fetch it again, or stop it with transfer cancel."
             }
+            "no_space" => "This device has no room for what arrived; free up space and retry.",
+            "local_network_blocked" => {
+                "This device's operating system refused to send to the local network, so a device on the same network could not be reached. On macOS allow the app under System Settings > Privacy & Security > Local Network; elsewhere check the firewall or VPN."
+            }
+            "sender_gone" => {
+                "The sending device stopped sending and could not be reached again; ask for it to be sent again (a new link)."
+            }
+            "receiver_canceled" => {
+                "The receiving device canceled it; it can fetch it again, or stop it with transfer cancel."
+            }
+            "receiver_stopped" => {
+                "The receiving device stopped receiving it, or has fetched nothing for a long time; for a send link, create a new one."
+            }
             "local_storage" => {
                 "This device could not store what arrived; check the destination and free space."
             }
@@ -160,7 +248,12 @@ mod tests {
             "rejected",
             "verification_failed",
             "local_storage",
+            "no_space",
             "stalled",
+            "local_network_blocked",
+            "sender_gone",
+            "receiver_canceled",
+            "receiver_stopped",
         ] {
             assert_ne!(why_stopped(code), fallback, "{code}");
         }

@@ -124,7 +124,7 @@ fn index_tree(state: &DaemonState) -> BTreeMap<String, Indexed> {
     let conn = database.pool_for_test().get().unwrap();
     let mut stmt = conn
         .prepare(
-            "SELECT path, record_kind, size, unix_mode, symlink_target FROM files \
+            "SELECT path, record_kind, size, exec, symlink_target FROM files \
              WHERE group_id = ?1 AND state = 'current' AND deleted = 0 ORDER BY path",
         )
         .unwrap();
@@ -133,14 +133,14 @@ fn index_tree(state: &DaemonState) -> BTreeMap<String, Indexed> {
             let path: String = r.get(0)?;
             let kind: String = r.get(1)?;
             let size: i64 = r.get(2)?;
-            let mode: i64 = r.get(3)?;
+            let exec: i64 = r.get(3)?;
             let target: Option<Vec<u8>> = r.get(4)?;
             let indexed = match kind.as_str() {
                 "directory" | "dir" => Indexed::Dir,
                 "symlink" => Indexed::Symlink(
                     String::from_utf8_lossy(&target.unwrap_or_default()).into_owned(),
                 ),
-                _ => Indexed::File { size: size as u64, exec: mode >= 0 && mode & 0o100 != 0 },
+                _ => Indexed::File { size: size as u64, exec: exec != 0 },
             };
             Ok((path, indexed))
         })
@@ -1264,46 +1264,27 @@ async fn a_rewind_with_no_peer_online_uses_the_ordinary_path_and_the_peer_conver
     let setup = set_up(&mesh).await;
     mesh.take_laptop_offline().await;
     let nas_id = mesh.nas.device_id.clone();
+
+    let request = approve(&mesh.nas, setup.target, &setup.changed).await;
+    let prepared = prepare_rewind(mesh.nas.state.clone(), request).await.unwrap();
+    let plan = prepared.plan().clone();
+    assert_eq!(plan_paths(&plan), setup.changed);
+    // The baseline is taken immediately before the execute.
     let ops_before = ops_by(&mesh.nas.state, &nas_id);
     let rows_before = current_rows(&mesh.nas.state);
     let started_at =
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
             as i64;
-
-    let request = approve(&mesh.nas, setup.target, &setup.changed).await;
     let started = Instant::now();
-    let prepared = prepare_rewind(mesh.nas.state.clone(), request).await.unwrap();
-    let plan = prepared.plan().clone();
-    assert_eq!(plan_paths(&plan), setup.changed);
-    // Right after the first chunk's commit, before it is announced: the
-    // rewind itself has written nothing to the disk.
-    let nas_root = mesh.nas.root.path().to_path_buf();
-    let post = setup.post.clone();
-    let disk_at_commit = Arc::new(Mutex::new(None));
-    let seen = disk_at_commit.clone();
-    let rows_at_commit = Arc::new(Mutex::new(None));
-    let rows_seen = rows_at_commit.clone();
-    let nas_state = mesh.nas.state.clone();
-    let hook: RewindHook = Arc::new(move |point| {
-        if point == RewindPoint::AfterChunk(0) {
-            *seen.lock().unwrap() = Some(changed_paths(&disk_tree(&nas_root), &post).len());
-            *rows_seen.lock().unwrap() = Some(current_rows(&nas_state));
-        }
-        true
-    });
+    // Nothing is asserted about the folder or the index at the first chunk's commit: the
+    // commit arms the projection, which runs on its own as soon as the transaction is
+    // visible, so a read at that point races it (a run on a slow disk saw the projection's
+    // first rows). That the commit itself writes no index row is asserted where it is
+    // deterministic (`rewind_commit` tests, no projection running); the rewind code writes no
+    // file, and the end state below is checked row by row and on disk.
     assert_eq!(
-        execute_rewind(mesh.nas.state.clone(), prepared, Some(hook)).await,
+        execute_rewind(mesh.nas.state.clone(), prepared, None).await,
         Some(RewindRunState::Done)
-    );
-    assert_eq!(
-        *disk_at_commit.lock().unwrap(),
-        Some(0),
-        "the commit wrote the disk itself instead of leaving it to the projection"
-    );
-    assert_eq!(
-        rows_at_commit.lock().unwrap().as_ref(),
-        Some(&rows_before),
-        "the commit wrote index rows itself instead of leaving them to the projection"
     );
     let committed = started.elapsed();
     wait_disk(&mesh.nas, &setup.original, "NAS after the offline rewind", Duration::from_secs(600))
@@ -1368,4 +1349,24 @@ async fn a_rewind_with_no_peer_online_uses_the_ordinary_path_and_the_peer_conver
     assert!(ops_by(&laptop.state, &laptop.device_id).is_empty(), "the laptop authored something");
     approve(laptop, setup.target, &BTreeSet::new()).await;
     mesh.handles.shutdown();
+}
+
+/// A count that falls to a low point, then rises again because the other device's copy of a
+/// finished chunk landed, and then climbs back down above that low point is progressing: the
+/// stall limit counts from the last improvement of the current level, not from the earliest low.
+#[test]
+fn a_rise_in_the_remaining_count_restarts_the_stall_clock() {
+    let stall = Duration::from_secs(300);
+    let mut progress = support::Progress::new(stall, Duration::from_secs(100_000));
+    let start = Instant::now();
+    let at = |secs: u64| start + Duration::from_secs(secs);
+    assert!(progress.failure_at(at(0), 2, String::new).is_none());
+    assert!(progress.failure_at(at(10), 314, String::new).is_none());
+    // Falling by one every 200s never stalls, however long it takes to get below the old low.
+    for step in 1..=5u64 {
+        let left = 314 - step as usize;
+        assert!(progress.failure_at(at(10 + step * 200), left, String::new).is_none(), "{step}");
+    }
+    // Nothing changes for longer than the limit: now it is a stall.
+    assert!(progress.failure_at(at(10 + 5 * 200 + 301), 309, String::new).is_some());
 }

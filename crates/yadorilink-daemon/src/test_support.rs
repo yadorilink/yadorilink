@@ -50,6 +50,113 @@ pub fn windows_durability_gate_allows_tests(waits_for: &str) -> bool {
     offered
 }
 
+/// A fresh state directory for one test daemon, under a directory that lives until the test
+/// process exits.
+///
+/// `DaemonState::new` reads the process-wide `YADORILINK_CONFIG_DIR`, so every daemon an
+/// integration-test process builds with it shares one state directory: its service-key pins, its
+/// space-management settings, its per-device recovery areas. Tests that run as threads of one
+/// process (every test of a consolidated test target, or the tests of one file) would then see
+/// each other's files. A state directory of its own per daemon removes that.
+#[cfg(feature = "test-support")]
+pub fn isolated_state_dir() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let root = ROOT.get_or_init(|| {
+        // Leaked on purpose: the directories must outlive every test in the process, and the
+        // operating system reclaims the temporary directory.
+        tempfile::Builder::new()
+            .prefix("yadorilink-test-state-")
+            .tempdir()
+            .expect("create the root of the test state directories")
+            .keep()
+    });
+    let dir = root.join(format!("state-{}", NEXT.fetch_add(1, Ordering::Relaxed)));
+    std::fs::create_dir_all(&dir).expect("create a test state directory");
+    dir
+}
+
+/// [`isolated_daemon_state`] with sweep `intervals` for this daemon alone, over a state
+/// directory `config_dir` when the test restarts a daemon (see [`isolated_daemon_state_in`]) and
+/// over a fresh one otherwise.
+#[cfg(feature = "test-support")]
+pub fn isolated_daemon_state_with(
+    intervals: crate::daemon_state::StateIntervals,
+    config_dir: Option<std::path::PathBuf>,
+    device_id: String,
+    replica_coordinator: std::sync::Arc<crate::replica_coordinator::ReplicaCoordinator>,
+    block_store: std::sync::Arc<dyn yadorilink_local_storage::BlockStore + Send + Sync>,
+) -> std::sync::Arc<crate::daemon_state::DaemonState> {
+    let config_dir = config_dir.unwrap_or_else(isolated_state_dir);
+    crate::daemon_state::construct_with_intervals(intervals, || {
+        isolated_daemon_state_in(config_dir, device_id, replica_coordinator, block_store)
+    })
+}
+
+/// [`isolated_daemon_state`] over the state directory `config_dir` rather than a fresh one: for a
+/// test that restarts a daemon, which reloads the pins, settings and recovery areas the earlier
+/// one left in its state directory (pass `previous.config_dir()` of the daemon being replaced).
+#[cfg(feature = "test-support")]
+pub fn isolated_daemon_state_in(
+    config_dir: std::path::PathBuf,
+    device_id: String,
+    replica_coordinator: std::sync::Arc<crate::replica_coordinator::ReplicaCoordinator>,
+    block_store: std::sync::Arc<dyn yadorilink_local_storage::BlockStore + Send + Sync>,
+) -> std::sync::Arc<crate::daemon_state::DaemonState> {
+    let state = crate::daemon_state::DaemonState::new_in(
+        config_dir,
+        device_id,
+        replica_coordinator,
+        block_store,
+    );
+    release_when_the_runtime_ends(&state);
+    state
+}
+
+/// Frees `state` when the Tokio runtime it was built in shuts down, which is when its test ends.
+///
+/// A paired state forms reference cycles with itself (its registered sessions and its peer
+/// session driver reach back to it), so letting go of the last handle does not free it: its
+/// databases, block store, watchers and sockets stay open until the process exits. A daemon
+/// exits with its process and never notices; a test process runs hundreds of tests and
+/// accumulates tens of thousands of descriptors, which is how a binary ran out of them. A task
+/// parked on the runtime owns a guard that breaks the cycles when the runtime drops its tasks,
+/// so no fixture has to remember to. The guard holds the state weakly: it neither keeps a state
+/// alive that the test released itself nor makes a test that checks the release see a holder.
+#[cfg(feature = "test-support")]
+fn release_when_the_runtime_ends(state: &std::sync::Arc<crate::daemon_state::DaemonState>) {
+    struct Release(std::sync::Weak<crate::daemon_state::DaemonState>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            if let Some(state) = self.0.upgrade() {
+                // A hook that captured the group's states reaches back to this one too.
+                state.set_rebootstrap_hook_for_test(None);
+                state.release_reference_cycles_for_tests();
+            }
+        }
+    }
+    // A state built outside a runtime has no test end to hook; its test frees it by hand.
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        let guard = Release(std::sync::Arc::downgrade(state));
+        runtime.spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+    }
+}
+
+/// [`crate::daemon_state::DaemonState::new`] over its own state directory
+/// ([`isolated_state_dir`]) instead of the process-wide one.
+#[cfg(feature = "test-support")]
+pub fn isolated_daemon_state(
+    device_id: String,
+    replica_coordinator: std::sync::Arc<crate::replica_coordinator::ReplicaCoordinator>,
+    block_store: std::sync::Arc<dyn yadorilink_local_storage::BlockStore + Send + Sync>,
+) -> std::sync::Arc<crate::daemon_state::DaemonState> {
+    isolated_daemon_state_in(isolated_state_dir(), device_id, replica_coordinator, block_store)
+}
+
 #[cfg(test)]
 pub(crate) static CONFIG_ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -163,6 +270,73 @@ pub fn seed_prior_cycle_proof(
     version
 }
 
+/// The block-reading seam a production session gets when `state` serves blocks from the user's
+/// files (`file_block_source`), for a test that builds its sessions by hand.
+#[cfg(any(test, feature = "test-support"))]
+pub fn file_block_source_for(
+    state: &std::sync::Arc<crate::daemon_state::DaemonState>,
+) -> Option<std::sync::Arc<dyn yadorilink_peer_session::ports::BlockFileSourcePort>> {
+    state.tuning().file_block_source.then(|| {
+        std::sync::Arc::new(crate::file_block_source::FileBlockSource::new(
+            state.replica_coordinator.clone(),
+            state.clone(),
+        )) as std::sync::Arc<dyn yadorilink_peer_session::ports::BlockFileSourcePort>
+    })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+/// Runs `hook` once, on `state`'s next handoff lease request, after the device has attested the
+/// group ready and before the current versions are brought into the block store: a fixed point at
+/// which a test can make a file differ from its record.
+#[cfg(any(test, feature = "test-support"))]
+pub fn on_next_lease_request(
+    state: &std::sync::Arc<crate::daemon_state::DaemonState>,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    crate::daemon_state::arm_lease_attested_hook(&state.device_id, Box::new(hook));
+}
+
+/// A handoff lease request made as the control command makes it: the granted lease id, or the
+/// stable reason code the response would carry (`None`: the daemon does not say).
+#[cfg(any(test, feature = "test-support"))]
+pub async fn request_lease_with_reason(
+    state: &std::sync::Arc<crate::daemon_state::DaemonState>,
+    group_id: &str,
+) -> Result<String, Option<&'static str>> {
+    use crate::application::ports::LeaseRefusal;
+    match state.request_handoff_lease_checked(group_id).await {
+        Ok((grant, _digest)) => Ok(grant.lease_id),
+        Err(LeaseRefusal::ChangingRetry) => Err(Some("changing_retry")),
+        Err(LeaseRefusal::Unspecified) => Err(None),
+    }
+}
+
+/// Whether `group_id`'s captures are being asked to put their blocks into the store.
+#[cfg(any(test, feature = "test-support"))]
+pub fn store_mode_requested(
+    state: &std::sync::Arc<crate::daemon_state::DaemonState>,
+    group_id: &str,
+) -> bool {
+    state.replica_coordinator.store_mode_requests().requested(group_id)
+}
+
+/// Pins `path` for `group_id` through the daemon's own pin command, as the CLI's `pin` reaches it:
+/// the pin is recorded, the files beneath are fetched, and the current versions are brought into the
+/// block store. The answer is the reason some file beneath the pin is not yet held in the store, if
+/// one is not.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn pin_item(
+    state: &std::sync::Arc<crate::daemon_state::DaemonState>,
+    group_id: &str,
+    path: &str,
+) -> Result<Option<&'static str>, crate::sync_error::SyncError> {
+    use crate::application::ports::MaterializationPort as _;
+    crate::adapters::runtime::materialization::DaemonMaterializationAdapter::new(state.clone())
+        .pin(group_id, path)
+        .await
+        .map(|outcome| outcome.history_not_kept_reason)
+}
+
 /// Freezes `group_id` the way a rebootstrap that reached the `Preserved` barrier does.
 #[cfg(any(test, feature = "test-support"))]
 pub fn freeze_group(coordinator: &crate::replica_coordinator::ReplicaCoordinator, group_id: &str) {
@@ -175,6 +349,29 @@ pub fn freeze_group(coordinator: &crate::replica_coordinator::ReplicaCoordinator
                 "preserved",
                 FROZEN_RECOVERY_ID,
             );
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// Records that versions `from_seq..to_seq` of `path` were dropped by the retention expiry, as the
+/// expiry itself does.
+#[cfg(any(test, feature = "test-support"))]
+pub fn record_versions_not_kept(
+    coordinator: &crate::replica_coordinator::ReplicaCoordinator,
+    group_id: &str,
+    path: &str,
+    from_seq: i64,
+    to_seq: i64,
+) {
+    coordinator
+        .database()
+        .write::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+            conn.execute(
+                "INSERT INTO history_freed (group_id, path, from_unix_nanos, to_unix_nanos, \
+                 from_seq, to_seq, reason, recorded_unix) VALUES (?1, ?2, NULL, NULL, ?3, ?4, 'Expired', 0)",
+                rusqlite::params![group_id, path, from_seq, to_seq],
+            )?;
             Ok(())
         })
         .unwrap();
@@ -257,4 +454,11 @@ pub async fn drain_pending_local_changes(
         .link_runtime_for(group_id)
         .ok_or_else(|| format!("{group_id} has no running link"))?;
     runtime.flush_pending_local_changes(group_id).await
+}
+
+/// Makes the contested versions of the daemon `device_id` count as not yet in the block store (or
+/// as settled again), whatever the store holds: no fork runs on that device while it is held.
+#[cfg(feature = "test-support")]
+pub fn hold_contest_settling(device_id: &str, held: bool) {
+    crate::contest_fork::hold_contest_settling_for_test(device_id, held);
 }

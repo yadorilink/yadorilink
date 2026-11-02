@@ -22,6 +22,12 @@ use crate::checkpoint_source::{
 /// The most deltas one checkpoint covers: the coordination plane refuses to
 /// sign a checkpoint claiming more leaves. A longer backlog is published in
 /// order, the rest by the next flush.
+/// How long a checkpoint request may wait for the coordination plane. A plane that
+/// accepts the connection and never answers must read as a refusal (the flush returns
+/// `Refused`, which arms the publication retry), not hang the flush forever.
+pub(crate) const CHECKPOINT_REQUEST_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
 const MAX_BATCH_LEAVES: usize = 1 << 20;
 
 /// Leaves verified between two looks at the stop signal. Verification is
@@ -97,17 +103,20 @@ pub async fn flush_pending_native_checkpoint_until(
     );
     let root = merkle_root(&leaves);
 
-    let Some((checkpoint, signature)) = source
-        .request_authorization_checkpoint(
+    let Some((checkpoint, signature)) = tokio::time::timeout(
+        CHECKPOINT_REQUEST_TIMEOUT,
+        source.request_authorization_checkpoint(
             group_id,
             device_id,
             &request_id,
             root,
             leaves.len() as u64,
             CheckpointPurpose::Publication,
-        )
-        .await
-    else {
+        ),
+    )
+    .await
+    .ok()
+    .flatten() else {
         return Ok(NativeFlush { outcome: FlushOutcome::Refused, published: Vec::new() });
     };
 

@@ -96,8 +96,8 @@ impl RestoreOperationRepository {
                   expected_current_version_seq, state, size,
                   mtime_unix_nanos, blocks_json, origin_device_id,
                   created_at_unix_nanos,
-                  record_kind, symlink_target, symlink_out_of_root, unix_mode, xattrs_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                  record_kind, symlink_target, symlink_out_of_root, exec)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 rusqlite::params![
                     operation.operation_id,
                     operation.group_id,
@@ -113,8 +113,7 @@ impl RestoreOperationRepository {
                     operation.meta.record_kind.as_db_str(),
                     operation.meta.symlink_target.as_deref(),
                     operation.meta.symlink_out_of_root,
-                    crate::file_index::encode_unix_mode_column(operation.meta.unix_mode),
-                    crate::file_index::encode_xattrs_column(&operation.meta.xattrs),
+                    i64::from(operation.meta.exec),
                 ],
             )?;
             Ok(())
@@ -172,10 +171,7 @@ impl RestoreOperationRepository {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
             permit.verify()?;
             let path = SyncPath(operation.path.clone());
-            let native_identity = author(
-                tx,
-                Op::Put { path, version: version.version_hash },
-            )?;
+            let native_identity = author(tx, Op::Put { path, version: version.version_hash })?;
             dag_store::put_file_version(tx, &operation.group_id, version)?;
             let placement = match disk_allows_in_place {
                 None => RestorePlacement::InPlace,
@@ -218,8 +214,8 @@ impl RestoreOperationRepository {
                   expected_current_version_seq, state, size, mtime_unix_nanos,
                   blocks_json, origin_device_id,
                   authoring_native_identity, created_at_unix_nanos,
-                  record_kind, symlink_target, symlink_out_of_root, unix_mode, xattrs_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?17, ?11, ?12, ?13, ?14, ?15, ?16)",
+                  record_kind, symlink_target, symlink_out_of_root, exec)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?16, ?11, ?12, ?13, ?14, ?15)",
                 rusqlite::params![
                     operation.operation_id,
                     operation.group_id,
@@ -235,8 +231,7 @@ impl RestoreOperationRepository {
                     operation.meta.record_kind.as_db_str(),
                     operation.meta.symlink_target.as_deref(),
                     operation.meta.symlink_out_of_root,
-                    crate::file_index::encode_unix_mode_column(operation.meta.unix_mode),
-                    crate::file_index::encode_xattrs_column(&operation.meta.xattrs),
+                    i64::from(operation.meta.exec),
                     native_identity.as_ref().map(NativeRowIdentity::to_bytes),
                 ],
             )?;
@@ -273,7 +268,7 @@ impl RestoreOperationRepository {
                 "SELECT operation_id, group_id, path, target_version_seq, state,
                         size, mtime_unix_nanos, blocks_json, origin_device_id,
                         expected_current_version_seq,
-                        record_kind, symlink_target, symlink_out_of_root, unix_mode, xattrs_json
+                        record_kind, symlink_target, symlink_out_of_root, exec
                  FROM restore_operations WHERE group_id = ?1
                  ORDER BY created_at_unix_nanos, operation_id",
             )?;
@@ -332,7 +327,7 @@ impl RestoreOperationRepository {
                     "SELECT operation_id, group_id, path, target_version_seq, state,
                             size, mtime_unix_nanos, blocks_json, origin_device_id,
                             expected_current_version_seq,
-                            record_kind, symlink_target, symlink_out_of_root, unix_mode, xattrs_json
+                            record_kind, symlink_target, symlink_out_of_root, exec
                      FROM restore_operations WHERE operation_id = ?1",
                     [operation_id],
                     restore_operation_from_row,
@@ -400,6 +395,8 @@ impl RestoreOperationRepository {
                 &operation.record,
                 &operation.origin_device_id,
                 native.as_ref(),
+                // The user asked for this restore: their own act.
+                crate::retention::Retention::OwnEdit,
             )?;
             // The atomic, in-transaction counterpart to `upsert_file_in_tx`
             // every other local content emission already applies its own
@@ -414,6 +411,7 @@ impl RestoreOperationRepository {
                 &operation.path,
                 &operation.meta,
             )?;
+            crate::activity::mark_restored_in_tx(tx, &operation.group_id, &operation.path)?;
             // Explicit, not implicit via the schema's own column default
             // (`Remote` as of v25). `reconcile_restore_operations`'s
             // `Present` is published only together with the proof that
@@ -558,16 +556,7 @@ pub(crate) fn restore_operation_from_row(
             record_kind: RecordKind::from_db_str(&row.get::<_, String>(10)?),
             symlink_target: row.get(11)?,
             symlink_out_of_root: row.get(12)?,
-            unix_mode: crate::file_index::decode_unix_mode_column(row.get(13)?),
-            xattrs: crate::file_index::decode_xattrs_column(&row.get::<_, String>(14)?).map_err(
-                |error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        14,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                },
-            )?,
+            exec: row.get::<_, i64>(13)? != 0,
         },
     })
 }

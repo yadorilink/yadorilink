@@ -35,6 +35,9 @@ pub struct ControlContext {
     /// Who this daemon is, for `identify`.
     #[cfg(feature = "process-model")]
     pub(crate) identity: Arc<crate::identity::RuntimeIdentity>,
+    /// What a status collects from, and the builder that serves `Status` and `ListLinks`.
+    pub(crate) status_sources: Arc<crate::status_report::StatusSources>,
+    pub(crate) status_hub: Arc<crate::status_facts::StatusHub>,
 }
 
 impl ControlContext {
@@ -43,13 +46,28 @@ impl ControlContext {
         queries: Arc<QueryServices>,
         config_dir: std::path::PathBuf,
     ) -> Self {
+        let provider_status: Arc<crate::provider_status::ProviderStatusSource> = Arc::default();
+        let auto_reclaim: Arc<crate::provider_auto_reclaim::AutoReclaimSlot> = Arc::default();
+        let status_sources = Arc::new(crate::status_report::StatusSources {
+            queries: queries.clone(),
+            application: application.clone(),
+            provider_status: provider_status.clone(),
+            auto_reclaim: auto_reclaim.clone(),
+            config_dir: config_dir.clone(),
+        });
+        let status_hub = Arc::new(crate::status_facts::StatusHub::new(
+            status_sources.clone(),
+            queries.runtime_status.telemetry(),
+        ));
         Self {
             application,
             queries,
             config_dir,
-            provider_status: Arc::default(),
+            provider_status,
             provider_evict: Arc::default(),
-            auto_reclaim: Arc::default(),
+            auto_reclaim,
+            status_sources,
+            status_hub,
             #[cfg(feature = "process-model")]
             identity: Arc::new(crate::identity::RuntimeIdentity::detect(None, None)),
         }

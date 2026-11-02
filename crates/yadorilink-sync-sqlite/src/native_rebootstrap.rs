@@ -2362,7 +2362,7 @@ fn copy_version(
         size: 0,
         sha256: sha256(&[]),
         mtime_unix_nanos: version.meta.mtime_unix_nanos,
-        unix_mode: version.meta.unix_mode,
+        exec: version.meta.exec,
         symlink_target: version.meta.symlink_target.clone(),
     };
     let failed = |f| BlockedReason::PreservationFailed(f);

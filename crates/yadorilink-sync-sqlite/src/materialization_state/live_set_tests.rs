@@ -34,10 +34,9 @@ fn version_with_block() -> FileVersion {
         4,
         FileMeta {
             mtime_unix_nanos: 1,
-            unix_mode: None,
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     )
 }

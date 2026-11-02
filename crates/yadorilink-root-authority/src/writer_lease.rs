@@ -216,6 +216,12 @@ impl WriterLease {
         })
     }
 
+    /// Whether `other` is the same lease (same record, holder and generation), so one successful
+    /// verification stands for both.
+    pub fn is_same_lease_as(&self, other: &Self) -> bool {
+        self.dir == other.dir && self.holder == other.holder && self.generation == other.generation
+    }
+
     /// The fence: errors unless the record still carries this lease's generation and holder
     /// and the term has not run out. Call immediately before a commit.
     pub fn verify(&self) -> Result<(), RootAuthorityError> {

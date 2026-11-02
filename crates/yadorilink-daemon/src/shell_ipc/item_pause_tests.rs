@@ -263,10 +263,9 @@ impl Fixture {
             0,
             FileMeta {
                 mtime_unix_nanos: mtime,
-                unix_mode: None,
+                exec: false,
                 symlink_target: None,
                 record_kind: RecordKind::File,
-                xattrs: Vec::new(),
             },
         );
         let delta = crate::test_support::remote_admission_fixture::admit_remote(
@@ -292,7 +291,7 @@ impl Fixture {
         for _ in 0..50 {
             // The scheduler's fork: this device moves its own losing heads, and
             // the peer (a simulated device) moves its own.
-            self.state.fork_contested_heads(GROUP);
+            self.state.fork_contested_heads(GROUP, None);
             crate::test_support::remote_admission_fixture::admit_remote_forks(
                 &self.state.replica_coordinator,
                 GROUP,
@@ -494,10 +493,9 @@ fn peer_mtime_for(local: yadorilink_replica_domain::ids::VersionHash, wins: bool
                 0,
                 FileMeta {
                     mtime_unix_nanos: *mtime,
-                    unix_mode: None,
+                    exec: false,
                     symlink_target: None,
                     record_kind: RecordKind::File,
-                    xattrs: Vec::new(),
                 },
             );
             (version.version_hash > local) == wins

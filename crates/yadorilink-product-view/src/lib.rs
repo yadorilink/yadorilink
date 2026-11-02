@@ -18,6 +18,7 @@ pub mod device;
 pub mod folder;
 pub mod protection;
 pub mod summary;
+pub mod wire;
 
 pub use attention::{
     Attention, AttentionItem, AttentionKind, AttentionScope, AttentionSeverity, ProductAction,

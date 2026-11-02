@@ -11,6 +11,7 @@
 
 pub mod diagnostics;
 pub mod error;
+pub mod ingest;
 pub mod local_change;
 pub mod ports;
 pub(crate) mod reconcile_gate;
@@ -20,14 +21,15 @@ pub(crate) mod test_support;
 pub mod unreadable;
 
 pub use error::LocalCaptureError;
+pub use ingest::{AlwaysIngest, Ingest, IngestPolicy};
 pub use local_change::{FlushOutcome, LocalChangeOutcome, LocalChangeProcessor};
 
 /// Deterministic race injection for other crates' test builds.
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_hooks {
     pub use crate::local_change::{
-        arm_content_read_race_hook, arm_post_capture_race_hook, arm_post_identity_race_hook,
-        disarm_content_read_race_hook, disarm_post_capture_race_hook,
-        disarm_post_identity_race_hook,
+        arm_content_read_race_hook, arm_flush_failure_hook, arm_post_capture_race_hook,
+        arm_post_identity_race_hook, disarm_content_read_race_hook, disarm_flush_failure_hook,
+        disarm_post_capture_race_hook, disarm_post_identity_race_hook,
     };
 }

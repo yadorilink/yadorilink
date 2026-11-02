@@ -38,4 +38,5 @@ pub mod entry_store;
 pub mod environment;
 pub mod error;
 pub mod error_candidates;
+pub mod private_fs;
 pub mod time;

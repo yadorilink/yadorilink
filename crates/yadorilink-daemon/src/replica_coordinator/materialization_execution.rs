@@ -223,6 +223,39 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
             .unwrap_or(false))
     }
 
+    fn disk_is_untouched_pre_image(
+        &self,
+        group_id: &str,
+        path: &str,
+        out_path: &Path,
+    ) -> Result<bool, MaterializationExecutionError> {
+        Ok(ReplicaCoordinator::disk_is_untouched_pre_image_at(self, group_id, path, out_path)
+            .unwrap_or(false))
+    }
+
+    fn stand_down_over_pre_image(
+        &self,
+        group_id: &str,
+        path: &str,
+        row_state: MaterializationState,
+        version: Option<&yadorilink_replica_domain::ids::VersionHash>,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<bool, MaterializationExecutionError> {
+        permit.verify().map_err(SyncError::from)?;
+        // No disk is touched, so the fence stays: the proof the write's open invalidated is still
+        // invalid, and this only moves the row to the state its open intent already describes.
+        Ok(self
+            .materialization_state_repository()
+            .transition_materialization_state_if_same_version(
+                group_id,
+                path,
+                Some(row_state),
+                version,
+                MaterializationState::Hydrating,
+            )
+            .map_err(SyncError::from)?)
+    }
+
     fn get_recorded_placeholder_identity(
         &self,
         group_id: &str,
@@ -562,6 +595,41 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         })
     }
 
+    fn write_removal_evidence(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<
+        Option<yadorilink_filesystem_sync::materialization_execution::WriteRemovalEvidence>,
+        MaterializationExecutionError,
+    > {
+        let facts = self
+            .database
+            .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+                yadorilink_sync_sqlite::write_removal_facts(conn, group_id, path)
+            })
+            .map_err(SyncError::from)?;
+        Ok(facts.map(|facts| {
+            yadorilink_filesystem_sync::materialization_execution::WriteRemovalEvidence {
+                landed_unproven: facts.landed_unproven,
+                temp_witness: facts.temp_witness,
+            }
+        }))
+    }
+
+    fn mark_write_landed(
+        &self,
+        group_id: &str,
+        path: &str,
+        mutation_generation: i64,
+        permit: &RootCommitPermit,
+    ) -> Result<(), MaterializationExecutionError> {
+        self.materialization_intent_repository()
+            .mark_write_landed(group_id, path, mutation_generation, permit)
+            .map_err(SyncError::from)?;
+        Ok(())
+    }
+
     fn write_landed_unproven(
         &self,
         group_id: &str,
@@ -635,8 +703,7 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
                 deleted: snapshot.deleted,
             }),
             current_version: Some(current_version),
-            unix_mode: snapshot.unix_mode,
-            xattrs: snapshot.xattrs,
+            exec: snapshot.exec,
         })
     }
 
@@ -943,6 +1010,39 @@ pub(crate) fn set_test_windows_dehydrate_confirmed_for_path(path: &Path, armed: 
 mod tests;
 
 impl ReplicaCoordinator {
+    /// Whether `out_path` holds, untouched, the file this device wrote and proved as `version` at
+    /// `path`: a standing proof (void once the path's mutation fence moves) names the row's
+    /// version, the row is exactly `version`, and the file on disk is still the object that proof
+    /// recorded (its identity, size and times). Fail-closed: any doubt is `false`.
+    ///
+    /// The proof is read before the row and the disk after both, so a version committed between
+    /// the reads makes them disagree instead of combining two versions.
+    pub(crate) fn path_settled_at_version(
+        &self,
+        group_id: &str,
+        path: &str,
+        version: &yadorilink_replica_domain::ids::VersionHash,
+        out_path: &Path,
+    ) -> Result<bool, SyncError> {
+        if !self
+            .sqlite()
+            .settled_file_paths(group_id, &[path])
+            .map_err(SyncError::from)?
+            .contains(path)
+        {
+            return Ok(false);
+        }
+        let row_is_the_version = matches!(
+            self.file_index_repository().canonical_current_row(group_id, path)?,
+            Some(row) if !row.snapshot.deleted && row.version_hash() == *version
+        );
+        Ok(row_is_the_version
+            && ReplicaCoordinator::disk_is_untouched_proven_write_at(
+                self, group_id, path, out_path,
+            )
+            .unwrap_or(false))
+    }
+
     /// Drops a restore-journal row whose write will not be published: recovery found it needs no
     /// replay, or the restore itself declined before publishing anything.
     pub(crate) fn abandon_restore_operation(

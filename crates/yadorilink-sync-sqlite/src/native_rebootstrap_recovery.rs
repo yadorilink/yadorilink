@@ -931,7 +931,7 @@ pub struct ManifestVersion {
     pub size: u64,
     pub sha256: [u8; 32],
     pub mtime_unix_nanos: i64,
-    pub unix_mode: Option<u32>,
+    pub exec: bool,
     pub symlink_target: Option<Vec<u8>>,
 }
 
@@ -1225,7 +1225,7 @@ fn version_value(version: &ManifestVersion) -> Value {
     map.insert("size".into(), Value::from(version.size));
     map.insert("sha256".into(), hex_value(&version.sha256));
     map.insert("mtime_unix_nanos".into(), Value::from(version.mtime_unix_nanos));
-    map.insert("unix_mode".into(), version.unix_mode.map_or(Value::Null, Value::from));
+    map.insert("exec".into(), Value::Bool(version.exec));
     map.insert(
         "symlink_target".into(),
         version.symlink_target.as_deref().map_or(Value::Null, hex_value),
@@ -1373,7 +1373,7 @@ fn parse_version(value: &Value) -> Result<ManifestVersion, AreaError> {
         size: get_u64(map, "size")?,
         sha256: parse_hex32(get_str(map, "sha256")?)?,
         mtime_unix_nanos: get_i64(map, "mtime_unix_nanos")?,
-        unix_mode: get(map, "unix_mode")?.as_u64().map(|mode| mode as u32),
+        exec: get_bool(map, "exec")?,
         symlink_target,
     })
 }
@@ -1466,7 +1466,7 @@ impl RecoveryArea {
             let meta = &record.meta;
             if version.record_kind != meta.record_kind.as_db_str()
                 || version.mtime_unix_nanos != meta.mtime_unix_nanos
-                || version.unix_mode != meta.unix_mode
+                || version.exec != meta.exec
                 || version.symlink_target != meta.symlink_target
             {
                 return Err(inconsistent("a version record does not match the manifest"));

@@ -79,3 +79,27 @@ fn block_fetch_histogram_renders_openmetrics_with_bucket_counts() {
     assert!(rendered.contains("yadorilink_block_fetch_seconds_count 2"));
     assert!(rendered.contains("yadorilink_block_fetch_seconds_bucket{le=\"+Inf\"} 2"));
 }
+
+/// Two attempts can register the same (group, path) (a prefetch runs before the per-group guard):
+/// the older attempt ending, or a late block of it, must not touch the newer attempt's entry.
+#[test]
+fn an_older_attempt_cannot_remove_or_advance_a_newer_attempts_entry() {
+    let tracker = TransferProgressTracker::new();
+    let older = tracker.begin("group-1", "big.bin", 1000, 10);
+    let newer = tracker.begin("group-1", "big.bin", 1000, 10);
+
+    older.record_block_done(100, "peer-a");
+    assert_eq!(tracker.snapshot()[0].bytes_done, 0, "a late block of the older attempt");
+    newer.record_block_done(250, "peer-b");
+    assert_eq!(tracker.snapshot()[0].bytes_done, 250);
+
+    drop(older);
+    let snapshot = tracker.snapshot();
+    assert_eq!(snapshot.len(), 1, "the older attempt ending must not erase the newer entry");
+    assert_eq!(snapshot[0].bytes_done, 250);
+
+    drop(newer);
+    assert!(tracker.snapshot().is_empty());
+    // The process-wide byte counter counts every byte that arrived, whichever attempt it was for.
+    assert_eq!(tracker.transfer_bytes_total(), 350);
+}

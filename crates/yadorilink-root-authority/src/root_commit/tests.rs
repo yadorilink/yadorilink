@@ -114,3 +114,18 @@ fn a_fenced_lease_refuses_a_commit_once_the_writer_lease_was_taken_over() {
     drop(op);
     assert!(matches!(lease.begin_operation(), Err(RootAuthorityError::StaleWriter(_))));
 }
+
+#[test]
+fn checks_of_one_lease_cover_each_other_and_checks_of_another_root_do_not() {
+    let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let lease_a = RootLease::new(SyncRootLock::acquire(dir_a.path()).unwrap(), "g".into(), 1);
+    let lease_b = RootLease::new(SyncRootLock::acquire(dir_b.path()).unwrap(), "g".into(), 1);
+    let (op_a, op_b) = (lease_a.begin_operation().unwrap(), lease_b.begin_operation().unwrap());
+
+    let (first, second) = (op_a.permit().owned_check(), op_a.permit().owned_check());
+    assert!(first.covers(&second) && second.covers(&first), "two checks of one lease");
+    assert!(
+        !first.covers(&op_b.permit().owned_check()),
+        "a check of another root observes something else, so verifying one is not verifying both"
+    );
+}

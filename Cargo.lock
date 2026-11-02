@@ -1891,9 +1891,9 @@ checksum = "6a756c3fac73139e83f14c2d742155dd2b78d3ee56597b419a0579b7bdd6dd78"
 
 [[package]]
 name = "iroh"
-version = "1.4.0"
+version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a11e776f1bf36f140e465133ff4108e46bd37a3d10ecdf5b1ea8dfb3bd35a7d2"
+checksum = "e3689cab508af9bcef7816c1201b403595ec6aa20e7d15e1f9683bb4be4a5b17"
 dependencies = [
  "axum",
  "backon",
@@ -4392,7 +4392,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -5767,8 +5767,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "xxhash-rust"
+version = "0.8.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
+
+[[package]]
 name = "yadorilink-cli"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "base64 0.23.1",
  "clap",
@@ -5787,6 +5793,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "windows-sys 0.61.2",
+ "wiremock",
  "yadorilink-client-core",
  "yadorilink-daemon",
  "yadorilink-fapi-client",
@@ -5804,7 +5811,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-client-core"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",
@@ -5831,7 +5838,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-client-ffi"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "tempfile",
  "tokio",
@@ -5841,7 +5848,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-daemon"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5908,12 +5915,13 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-dcf-oracle"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 
 [[package]]
 name = "yadorilink-embedded-host"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
+ "prost",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -5930,7 +5938,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-fapi-client"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "base64 0.23.1",
  "fs2",
@@ -5958,7 +5966,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-filesystem-sync"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "hex",
  "libc",
@@ -5983,7 +5991,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-fs-platform"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "caseless",
  "libc",
@@ -6000,7 +6008,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-http-api"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "anyhow",
  "axum",
@@ -6029,7 +6037,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-ipc-proto"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "prost",
  "prost-build",
@@ -6039,7 +6047,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-lane-ports"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "async-trait",
  "ed25519-dalek",
@@ -6062,7 +6070,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-local-capture"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -6087,7 +6095,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-local-storage"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "anyhow",
  "fastcdc",
@@ -6105,6 +6113,7 @@ dependencies = [
  "tracing",
  "walkdir",
  "windows-sys 0.61.2",
+ "xxhash-rust",
  "yadorilink-fs-platform",
  "yadorilink-local-storage",
  "yadorilink-replica-domain",
@@ -6114,7 +6123,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-mobile-ffi"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "prost",
  "tempfile",
@@ -6129,7 +6138,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-namespace"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "sha2",
  "thiserror 2.0.21",
@@ -6138,7 +6147,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-os-keychain"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "core-foundation",
  "security-framework-sys",
@@ -6147,7 +6156,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-peer-session"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6184,14 +6193,14 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-product-view"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "yadorilink-ipc-proto",
 ]
 
 [[package]]
 name = "yadorilink-replica-domain"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -6203,7 +6212,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-replica-engine"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -6214,7 +6223,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-reporting"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "regex",
  "reqwest 0.12.28",
@@ -6231,7 +6240,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-root-authority"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "fs2",
  "hex",
@@ -6252,13 +6261,14 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-send"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "async-trait",
  "hex",
  "prost",
  "r2d2",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -6275,7 +6285,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-sqlite-runtime"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "r2d2",
  "r2d2_sqlite",
@@ -6290,7 +6300,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-sync-protocol"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "thiserror 2.0.21",
  "tokio",
@@ -6299,7 +6309,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-sync-runtime"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "iroh",
  "thiserror 2.0.21",
@@ -6311,7 +6321,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-sync-sqlite"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -6338,7 +6348,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-sync-substrate"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "futures-util",
  "iroh",
@@ -6354,7 +6364,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-sync-wire"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "prost",
  "thiserror 2.0.21",
@@ -6363,7 +6373,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-transport"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -6382,7 +6392,7 @@ dependencies = [
 
 [[package]]
 name = "yadorilink-windows-provider-policy"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "sha2",
  "tokio",

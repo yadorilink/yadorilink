@@ -38,8 +38,7 @@ fn meta() -> LocalFileMetaColumns {
         record_kind: RecordKind::File,
         symlink_target: None,
         symlink_out_of_root: false,
-        unix_mode: None,
-        xattrs: Vec::new(),
+        exec: false,
     }
 }
 

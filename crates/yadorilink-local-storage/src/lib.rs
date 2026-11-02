@@ -33,25 +33,27 @@ pub mod io_diag;
 /// nominal destination would require is a real crate-dependency cycle, not
 /// just inconvenient.
 pub mod link_preflight;
+pub mod mac_claim;
 pub mod materialize_write;
 pub mod ownership;
 mod received_flush;
 pub mod release_descriptor;
+#[cfg(unix)]
+mod replace_keep;
 pub mod replacement_unconfirmed;
 pub mod resource_lock;
+pub mod root_access;
 pub mod segment_store;
 pub mod service_registrations;
 pub mod startup_refusal;
 mod traits;
 
-#[cfg(target_os = "linux")]
-pub use chunker::read_replicated_xattrs_strict;
 pub use chunker::{
     block_size_for, chunk_file, chunk_file_content_defined,
     chunk_file_content_defined_with_callback, chunk_file_fixed_with_callback, chunk_open_file,
     chunk_open_file_content_defined_with_callback, chunk_open_file_fixed_with_callback,
-    hash_file_blocks, hash_open_file_blocks, read_replicated_xattrs, unix_mode_from_metadata,
-    CDC_AVG_SIZE, CDC_MAX_SIZE, CDC_MIN_SIZE, CDC_SIZE_THRESHOLD, DEFAULT_BLOCK_SIZE,
+    exec_from_metadata, hash_file_blocks, hash_open_file_blocks, CDC_AVG_SIZE, CDC_MAX_SIZE,
+    CDC_MIN_SIZE, CDC_SIZE_THRESHOLD, DEFAULT_BLOCK_SIZE,
 };
 pub use content_ports::{BlockContentStore, BlockReclamationStore};
 pub use disk_verification::{
@@ -70,26 +72,26 @@ pub use materialize_write::materialize_symlink_windows;
 #[cfg(windows)]
 pub use materialize_write::materialize_symlink_windows_in;
 pub use materialize_write::{
-    apply_file_metadata, apply_file_metadata_verified, apply_unix_mode, apply_xattrs,
-    create_dir_all_never_through_a_symlink, create_explicit_directory, create_or_defer_placeholder,
-    discard_temp_file, mint_windows_placeholder_generation, mtime_already_matches_disk,
+    apply_exec, apply_file_metadata, create_dir_all_never_through_a_symlink,
+    create_explicit_directory, create_or_defer_placeholder, discard_temp_file,
+    exec_already_matches_disk, mint_windows_placeholder_generation, mtime_already_matches_disk,
     persist_reconstructed_file, persist_reconstructed_file_durable, persist_reconstructed_file_in,
     reconstruct_file, reconstruct_file_in, reconstruct_file_to_temp, reconstruct_file_to_temp_in,
     reconstruct_file_to_temp_observed, reconstruct_file_to_temp_observed_durable,
     remove_evicted_object, rename_no_replace, resolve_read_path_without_traversal,
-    stamp_mtime_at_path, sync_parent_dir, unix_mode_already_matches_disk,
-    verify_delete_target_within_canonical_root, verify_delete_target_within_root,
-    verify_replicated_xattrs_exact, verify_write_target_within_canonical_root,
-    verify_write_target_within_root, xattrs_already_match_disk, AppliedFileMetadata, Durability,
-    ExplicitDirectoryCreation, NoTempLedger, PlaceholderDiskIdentity, PlaceholderIdentityToRecord,
-    StructuralDirectoryLedger, TempFileLedger, XattrEvidence, XattrProofRefused,
-    XattrsConfirmedInAttempt, XattrsNotConfirmed, WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
+    stamp_mtime_at_path, sync_parent_dir, verify_delete_target_within_canonical_root,
+    verify_delete_target_within_root, verify_write_target_within_canonical_root,
+    verify_write_target_within_root, Durability, ExplicitDirectoryCreation, NoTempLedger,
+    PlaceholderDiskIdentity, PlaceholderIdentityToRecord, StagedFile, StructuralDirectoryLedger,
+    TempFileLedger, WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
 };
+#[cfg(unix)]
+pub use materialize_write::{exec_from_mode, mode_with_exec};
 #[cfg(any(test, feature = "test-support"))]
 pub use received_flush::{completed_flushes_under, fail_received_flushes_of, FailReceivedFlushes};
 pub use received_flush::{
-    flush_received_files, flush_received_objects, object_key, ObjectKey, ReceivedFlushMode,
-    ReceivedFlushOutcome,
+    flush_parent_directories, flush_received_files, flush_received_objects, flushed_stamp,
+    object_key, FlushedStamp, ObjectKey, ReceivedFlushMode, ReceivedFlushOutcome,
 };
 pub use segment_store::{
     CommitPoint, CompactionReport, DurableReceipt, FaultPlan, GroupCommitLimits, RecoveryReport,
@@ -97,5 +99,6 @@ pub use segment_store::{
     DEFAULT_CACHED_SEGMENT_READERS,
 };
 pub use traits::{
-    hash_block_bytes, BlockStore, ContentHash, GcReport, LocallyHashedBlock, StorageUsage,
+    hash_block_bytes, BlockMismatch, BlockStore, ContentHash, GcReport, LocallyHashedBlock,
+    StorageUsage, VerifiedBlock,
 };

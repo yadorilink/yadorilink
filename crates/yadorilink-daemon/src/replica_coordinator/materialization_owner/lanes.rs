@@ -39,6 +39,7 @@ impl ReplicaCoordinator {
     /// Writes `record` into the index with its origin, and its authoring
     /// identity when one is known, under a root operation begun from
     /// `row_authority` right now, in its own transaction.
+    #[allow(clippy::too_many_arguments)] // one argument per input of the persisted row
     pub(crate) fn persist_row_under_fresh_operation(
         &self,
         group_id: &str,
@@ -47,6 +48,7 @@ impl ReplicaCoordinator {
         authoring: Option<&yadorilink_replica_domain::native_plan::NativeRowIdentity>,
         meta: Option<&yadorilink_replica_domain::session_state::LocalFileMetaColumns>,
         row_authority: RowAuthority<'_>,
+        retention: yadorilink_sync_sqlite::retention::Retention<'_>,
     ) -> Result<(), PeerSessionError> {
         let authority = row_authority()?;
         let authority_op = authority.begin_operation()?;
@@ -57,6 +59,7 @@ impl ReplicaCoordinator {
             origin_device_id,
             authoring,
             meta,
+            retention,
             &permit,
         )
     }
@@ -76,6 +79,7 @@ impl ReplicaCoordinator {
         authoring: Option<&yadorilink_replica_domain::native_plan::NativeRowIdentity>,
         meta: &yadorilink_replica_domain::session_state::LocalFileMetaColumns,
         row_authority: RowAuthority<'_>,
+        retention: yadorilink_sync_sqlite::retention::Retention<'_>,
         permit: &'a RootCommitPermit<'a>,
     ) -> Result<LaneIntent<'a>, PeerSessionError> {
         let intent_target_hash = yadorilink_local_storage::intent_target_hash(&record.blocks);
@@ -92,6 +96,7 @@ impl ReplicaCoordinator {
             authoring,
             Some(meta),
             row_authority,
+            retention,
         )?;
         Ok(intent_guard)
     }
@@ -145,6 +150,7 @@ impl ReplicaCoordinator {
             origin_device_id,
             authoring,
             meta,
+            &yadorilink_sync_sqlite::retention::RetentionProofs::new(),
             row_authority,
             permit,
             |open| self.commit_open_single(open),
@@ -171,6 +177,7 @@ impl ReplicaCoordinator {
         origin_device_id: &str,
         authoring: Option<&yadorilink_replica_domain::native_plan::NativeRowIdentity>,
         meta: &yadorilink_replica_domain::session_state::LocalFileMetaColumns,
+        retention_proofs: &yadorilink_sync_sqlite::retention::RetentionProofs,
         row_authority: RowAuthority<'_>,
         permit: &'a RootCommitPermit<'a>,
         commit: F,
@@ -193,6 +200,7 @@ impl ReplicaCoordinator {
             origin_device_id: origin_device_id.to_owned(),
             authoring: authoring.cloned(),
             meta: meta.clone(),
+            retention_proofs: retention_proofs.clone(),
             intent_target_hash: yadorilink_local_storage::intent_target_hash(&record.blocks),
             now: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -276,8 +284,11 @@ impl ReplicaCoordinator {
         let outcomes = self
             .database
             .write_immediate::<_, yadorilink_sync_sqlite::SyncSqliteError>(|tx| {
-                let outcomes =
-                    open_content_writes_in_tx(tx, &requests, |index| items[index].verify_roots())?;
+                let mut verified = VerifiedAuthorities::default();
+                let outcomes = open_content_writes_in_tx(tx, &requests, |index| {
+                    verified.verify(&items[index].lane_check)?;
+                    verified.verify(&items[index].row_check)
+                })?;
                 #[cfg(test)]
                 {
                     self.test_observers
@@ -523,12 +534,13 @@ impl ReplicaCoordinator {
         let outcomes = self
             .database
             .write_immediate::<_, yadorilink_sync_sqlite::SyncSqliteError>(|tx| {
+                let mut verified = VerifiedAuthorities::default();
                 let outcomes = close_content_writes_in_tx(
                     tx,
                     &requests,
                     now,
                     |index| (items[index].disk_check)(),
-                    |index| items[index].root_check.verify().map_err(Into::into),
+                    |index| verified.verify(&items[index].root_check),
                 )?;
                 #[cfg(test)]
                 {
@@ -632,6 +644,7 @@ impl ReplicaCoordinator {
         meta: &yadorilink_replica_domain::session_state::LocalFileMetaColumns,
         row_authority: RowAuthority<'_>,
         object_present: bool,
+        retention: yadorilink_sync_sqlite::retention::Retention<'_>,
         permit: &'a RootCommitPermit<'a>,
     ) -> Result<LaneIntent<'a>, PeerSessionError> {
         let intent_guard = self.open_intent_and_persist_row(
@@ -641,6 +654,7 @@ impl ReplicaCoordinator {
             authoring,
             meta,
             row_authority,
+            retention,
             permit,
         )?;
         self.clear_held(group_id, &record.path)?;
@@ -707,6 +721,7 @@ impl ReplicaCoordinator {
         authoring: Option<&yadorilink_replica_domain::native_plan::NativeRowIdentity>,
         meta: &yadorilink_replica_domain::session_state::LocalFileMetaColumns,
         write_target: Option<&[u8]>,
+        retention: yadorilink_sync_sqlite::retention::Retention<'_>,
         permit: &'a RootCommitPermit<'a>,
     ) -> Result<Option<(i64, LaneIntent<'a>)>, PeerSessionError> {
         self.open_single_object_write(
@@ -717,6 +732,7 @@ impl ReplicaCoordinator {
             meta,
             write_target,
             "symlink_write",
+            retention,
             permit,
         )
     }
@@ -727,6 +743,7 @@ impl ReplicaCoordinator {
     /// unless this authored version is already current, mark it in flight
     /// (tx). The intent names the empty content, which classifies it as a
     /// write, so repair recreates a directory it finds missing under it.
+    #[allow(clippy::too_many_arguments)] // one argument per input of the persisted row
     pub(crate) fn open_directory_write<'a>(
         &'a self,
         group_id: &'a str,
@@ -734,6 +751,7 @@ impl ReplicaCoordinator {
         origin_device_id: &str,
         authoring: Option<&yadorilink_replica_domain::native_plan::NativeRowIdentity>,
         meta: &yadorilink_replica_domain::session_state::LocalFileMetaColumns,
+        retention: yadorilink_sync_sqlite::retention::Retention<'_>,
         permit: &'a RootCommitPermit<'a>,
     ) -> Result<(i64, LaneIntent<'a>), PeerSessionError> {
         self.open_single_object_write(
@@ -744,6 +762,7 @@ impl ReplicaCoordinator {
             meta,
             Some(&[]),
             "directory_write",
+            retention,
             permit,
         )?
         .ok_or_else(|| {
@@ -809,6 +828,7 @@ impl ReplicaCoordinator {
         meta: &yadorilink_replica_domain::session_state::LocalFileMetaColumns,
         write_target: Option<&[u8]>,
         fence_reason: &'static str,
+        retention: yadorilink_sync_sqlite::retention::Retention<'_>,
         permit: &'a RootCommitPermit<'a>,
     ) -> Result<Option<(i64, LaneIntent<'a>)>, PeerSessionError> {
         let opened = match write_target {
@@ -858,6 +878,7 @@ impl ReplicaCoordinator {
                 origin_device_id,
                 authoring,
                 Some(meta),
+                retention,
                 permit,
             )?;
         }
@@ -898,6 +919,7 @@ impl ReplicaCoordinator {
         origin_device_id: &str,
         authoring: Option<&yadorilink_replica_domain::native_plan::NativeRowIdentity>,
         meta: &yadorilink_replica_domain::session_state::LocalFileMetaColumns,
+        retention: yadorilink_sync_sqlite::retention::Retention<'_>,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), PeerSessionError> {
         // The row is written with the version's own metadata columns: a row
@@ -909,6 +931,7 @@ impl ReplicaCoordinator {
             origin_device_id,
             authoring,
             meta,
+            retention,
             permit,
         )?;
         // A held row is, by definition, "not materialized under any name on
@@ -1133,6 +1156,7 @@ impl ReplicaCoordinator {
     /// mid-operation, never as a fresh offline deletion. The fresh root
     /// operation is begun only here, after the hold clear, so a link that
     /// stopped meanwhile refuses the row and leaves the intent open.
+    #[allow(clippy::too_many_arguments)] // one argument per input of the persisted row
     pub(crate) fn settle_tombstone_delete(
         &self,
         delete_intent_guard: LaneIntent<'_>,
@@ -1141,6 +1165,7 @@ impl ReplicaCoordinator {
         origin_device_id: &str,
         authoring: Option<&yadorilink_replica_domain::native_plan::NativeRowIdentity>,
         row_authority: RowAuthority<'_>,
+        retention: yadorilink_sync_sqlite::retention::Retention<'_>,
     ) -> Result<(), PeerSessionError> {
         self.clear_held(group_id, &record.path)?;
         self.persist_row_under_fresh_operation(
@@ -1150,6 +1175,7 @@ impl ReplicaCoordinator {
             authoring,
             None,
             row_authority,
+            retention,
         )?;
         delete_intent_guard.clear()
     }
@@ -1164,10 +1190,11 @@ impl ReplicaCoordinator {
         delete_intent_guard: LaneIntent<'_>,
         group_id: &str,
         path: &str,
+        reason: yadorilink_sync_sqlite::file_index::ErasureReason,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), PeerSessionError> {
         self.clear_held(group_id, path)?;
-        self.erase_local_only_file(group_id, path, permit)?;
+        self.erase_path_rows(group_id, path, reason, permit)?;
         delete_intent_guard.clear()
     }
 
@@ -1292,8 +1319,7 @@ pub(crate) fn plain_file_columns() -> yadorilink_replica_domain::session_state::
         record_kind: yadorilink_replica_domain::file::RecordKind::File,
         symlink_target: None,
         symlink_out_of_root: false,
-        unix_mode: None,
-        xattrs: Vec::new(),
+        exec: false,
     }
 }
 
@@ -1306,6 +1332,9 @@ pub(crate) struct OwnedContentWriteOpen {
     pub(crate) origin_device_id: String,
     pub(crate) authoring: Option<yadorilink_replica_domain::native_plan::NativeRowIdentity>,
     pub(crate) meta: yadorilink_replica_domain::session_state::LocalFileMetaColumns,
+    /// The proofs for the versions this open's row replaces, owned so the open can run on the
+    /// blocking pool.
+    pub(crate) retention_proofs: yadorilink_sync_sqlite::retention::RetentionProofs,
     pub(crate) intent_target_hash: Vec<u8>,
     pub(crate) now: i64,
     pub(crate) lane_check: yadorilink_root_authority::root_commit::OwnedPermitCheck,
@@ -1332,6 +1361,7 @@ impl OwnedContentWriteOpen {
             intent_target_hash: &self.intent_target_hash,
             in_flight_state: yadorilink_peer_session::ports::MATERIALIZATION_IN_FLIGHT_STATE,
             now_unix_nanos: self.now,
+            retention: yadorilink_sync_sqlite::retention::Retention::Proofs(&self.retention_proofs),
         }
     }
 
@@ -1360,6 +1390,27 @@ impl OwnedContentWriteOpen {
         )?;
         self.verify_roots()?;
         Ok(fence)
+    }
+}
+
+/// The root authorities one batch transaction has already verified. The items of a batch
+/// belong to one link and share its root permit's authority, so the batch verifies each
+/// distinct authority once, after its statements and before it commits, instead of once per
+/// item: a check that observes what an earlier one observed cannot say anything new.
+#[derive(Default)]
+struct VerifiedAuthorities(Vec<yadorilink_root_authority::root_commit::OwnedPermitCheck>);
+
+impl VerifiedAuthorities {
+    fn verify(
+        &mut self,
+        check: &yadorilink_root_authority::root_commit::OwnedPermitCheck,
+    ) -> Result<(), yadorilink_sync_sqlite::SyncSqliteError> {
+        if self.0.iter().any(|done| done.covers(check)) {
+            return Ok(());
+        }
+        check.verify()?;
+        self.0.push(check.clone());
+        Ok(())
     }
 }
 

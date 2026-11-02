@@ -7,6 +7,7 @@
 //! `materialization_intents`.
 
 use std::sync::Arc;
+use yadorilink_sqlite_runtime::CachedStatements as _;
 
 use rusqlite::OptionalExtension;
 
@@ -34,7 +35,7 @@ fn keep_replaced_target(
     path: &str,
     target: &[u8],
 ) -> Result<(), SyncSqliteError> {
-    conn.execute(
+    conn.execute_cached(
         "INSERT OR IGNORE INTO materialization_replaced_targets \
          (group_id, path, target_version_hash) \
          SELECT group_id, path, target_version_hash FROM materialization_intents \
@@ -55,11 +56,11 @@ fn delete_intent(
     group_id: &str,
     path: &str,
 ) -> Result<(), SyncSqliteError> {
-    conn.execute(
+    conn.execute_cached(
         "DELETE FROM materialization_replaced_targets WHERE group_id = ?1 AND path = ?2",
         rusqlite::params![group_id, path],
     )?;
-    conn.execute(
+    conn.execute_cached(
         "DELETE FROM materialization_intents WHERE group_id = ?1 AND path = ?2 AND kind = 'write'",
         rusqlite::params![group_id, path],
     )?;
@@ -89,7 +90,7 @@ pub fn mark_flush_pending_in_tx(
     path: &str,
     mutation_generation: i64,
 ) -> Result<(), SyncSqliteError> {
-    tx.execute(
+    tx.execute_cached(
         "UPDATE materialization_intents SET mutation_generation = ?3 \
          WHERE group_id = ?1 AND path = ?2 AND kind = 'write'",
         rusqlite::params![group_id, path, mutation_generation],
@@ -107,7 +108,7 @@ pub fn clear_flush_pending_in_tx(
     path: &str,
     mutation_generation: i64,
 ) -> Result<bool, SyncSqliteError> {
-    let waiting: i64 = tx.query_row(
+    let waiting: i64 = tx.query_row_cached(
         "SELECT COUNT(*) FROM materialization_intents \
          WHERE group_id = ?1 AND path = ?2 AND kind = 'write' AND mutation_generation = ?3",
         rusqlite::params![group_id, path, mutation_generation],
@@ -120,28 +121,98 @@ pub fn clear_flush_pending_in_tx(
     Ok(true)
 }
 
+/// What startup repair knows, durably, about a write intent whose name is missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteRemovalFacts {
+    /// Marked as landed (see [`write_landed_unproven`]): the placement reached stable storage.
+    pub landed_unproven: bool,
+    /// The temp file name whose directory entry was flushed before the rename (see
+    /// [`record_temp_witnesses_in_tx`]).
+    pub temp_witness: Option<String>,
+}
+
+/// The removal facts of `path`'s open `write` intent, `None` when it has none.
+pub fn write_removal_facts(
+    conn: &rusqlite::Connection,
+    group_id: &str,
+    path: &str,
+) -> Result<Option<WriteRemovalFacts>, SyncSqliteError> {
+    let row: Option<Option<String>> = conn
+        .query_row_cached(
+            "SELECT temp_witness FROM materialization_intents \
+              WHERE group_id = ?1 AND path = ?2 AND kind = 'write'",
+            rusqlite::params![group_id, path],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(temp_witness) = row else { return Ok(None) };
+    Ok(Some(WriteRemovalFacts {
+        landed_unproven: write_landed_unproven(conn, group_id, path)?,
+        temp_witness,
+    }))
+}
+
+/// Records, in the caller's transaction, that the directory entry of each write's temp file was
+/// flushed to stable storage BEFORE the write renames it over its (new) name, so that after a
+/// power cut a missing name can be told from a lost rename: the temp still there means the
+/// rename was lost; the temp gone means it was renamed durably and then removed. Each item is
+/// `(group, path, fence the write opened under, temp file name)`; only an intent still open
+/// under that fence is marked. Returns how many
+/// were recorded.
+pub fn record_temp_witnesses_in_tx(
+    tx: &rusqlite::Transaction,
+    items: &[(&str, &str, i64, &str)],
+) -> Result<usize, SyncSqliteError> {
+    let mut recorded = 0;
+    for (group_id, path, fence, name) in items {
+        recorded += tx.execute_cached(
+            "UPDATE materialization_intents SET temp_witness = ?4 \
+              WHERE group_id = ?1 AND path = ?2 AND kind = 'write' \
+                AND mutation_generation IS NULL \
+                AND EXISTS (SELECT 1 FROM path_actual_mutation_fences f \
+                             WHERE f.group_id = ?1 AND f.path = ?2 \
+                               AND f.mutation_generation = ?3)",
+            rusqlite::params![group_id, path, fence, name],
+        )?;
+    }
+    Ok(recorded)
+}
+
+/// The temp names recorded by [`record_temp_witnesses_in_tx`] for `group_id`, as
+/// `(path, temp file name)`.
+pub fn list_temp_witnesses(
+    conn: &rusqlite::Connection,
+    group_id: &str,
+) -> Result<Vec<(String, String)>, SyncSqliteError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT path, temp_witness FROM materialization_intents \
+          WHERE group_id = ?1 AND kind = 'write' AND temp_witness IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([group_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 /// Whether `path`'s open write intent was marked as landed (see
-/// [`MaterializationIntentRepository::mark_write_landed`]) and nothing has
-/// proven or moved the write since: the fence is still the one the mark names
-/// and no proof was published under it. A write waiting for its batch flush
-/// has a proof under its fence and is excluded: its file may not have reached
-/// stable storage, so its absence says nothing about the user.
+/// [`MaterializationIntentRepository::mark_write_landed`]) and no proof was published under that
+/// write's fence since. The mark is the write's own fence stored negated, so it cannot be mistaken
+/// for the positive flush-pending marker, which belongs to a proof that is already published and
+/// whose name may not be durable. A landed mark does not lapse when another mutator moves the
+/// fence afterwards: the placement reached stable storage, so the name's absence is a removal by
+/// someone (the user; a daemon-side removal has its own delete intent, which repair reads first),
+/// never a rename that did not happen.
 pub fn write_landed_unproven(
     conn: &rusqlite::Connection,
     group_id: &str,
     path: &str,
 ) -> Result<bool, SyncSqliteError> {
-    let count: i64 = conn.query_row(
+    let count: i64 = conn.query_row_cached(
         "SELECT COUNT(*) FROM materialization_intents i \
-           JOIN path_actual_mutation_fences f \
-             ON f.group_id = i.group_id AND f.path = i.path \
           WHERE i.group_id = ?1 AND i.path = ?2 AND i.kind = 'write' \
-            AND i.mutation_generation IS NOT NULL \
-            AND f.mutation_generation = i.mutation_generation \
+            AND i.mutation_generation < 0 \
             AND NOT EXISTS ( \
                 SELECT 1 FROM path_materialized_generations g \
                  WHERE g.group_id = i.group_id AND g.path = i.path \
-                   AND g.published_under_mutation_generation = i.mutation_generation)",
+                   AND g.published_under_mutation_generation = -i.mutation_generation)",
         rusqlite::params![group_id, path],
         |r| r.get(0),
     )?;
@@ -158,7 +229,7 @@ pub fn flush_pending_proof_identity(
     path: &str,
 ) -> Result<Option<Option<yadorilink_fs_platform::fs_identity::FileIdentity>>, SyncSqliteError> {
     let blob: Option<Option<Vec<u8>>> = conn
-        .query_row(
+        .query_row_cached(
             "SELECT g.filesystem_identity FROM materialization_intents i \
                JOIN path_materialized_generations g \
                  ON g.group_id = i.group_id AND g.path = i.path \
@@ -207,14 +278,15 @@ impl MaterializationIntentRepository {
         self.database.write::<_, SyncSqliteError>(|conn| {
             permit.verify()?;
             keep_replaced_target(conn, group_id, path, target_version_hash)?;
-            conn.execute(
+            conn.execute_cached(
                 "INSERT INTO materialization_intents \
                  (group_id, path, target_version_hash, created_at_unix_nanos) \
                  VALUES (?1, ?2, ?3, ?4) \
                  ON CONFLICT(group_id, path, kind) DO UPDATE SET \
                   target_version_hash = excluded.target_version_hash, \
                   created_at_unix_nanos = excluded.created_at_unix_nanos, \
-                  mutation_generation = NULL",
+                  mutation_generation = NULL, \
+                  temp_witness = NULL",
                 rusqlite::params![group_id, path, target_version_hash, now],
             )?;
             Ok(())
@@ -227,24 +299,45 @@ impl MaterializationIntentRepository {
     /// the name's absence is the user's doing (a remove or a move), never a
     /// rename that did not happen, which is what an open intent alone cannot
     /// tell. Only the intent of that same write is marked: a newer write
-    /// reopened it, and a moved fence is no longer this write's.
+    /// reopened it, and a moved fence is no longer this write's. The mark is
+    /// stored as the fence value negated (see [`write_landed_unproven`]); the
+    /// result says whether this call marked it.
     pub fn mark_write_landed(
         &self,
         group_id: &str,
         path: &str,
         mutation_generation: i64,
         permit: &RootCommitPermit,
-    ) -> Result<(), SyncSqliteError> {
+    ) -> Result<bool, SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
             permit.verify()?;
-            conn.execute(
-                "UPDATE materialization_intents SET mutation_generation = ?3 \
+            let marked = conn.execute_cached(
+                "UPDATE materialization_intents SET mutation_generation = -?3 \
                  WHERE group_id = ?1 AND path = ?2 AND kind = 'write' \
                    AND mutation_generation IS NULL \
+                   AND ?3 > 0 \
                    AND EXISTS (SELECT 1 FROM path_actual_mutation_fences f \
                                 WHERE f.group_id = ?1 AND f.path = ?2 \
                                   AND f.mutation_generation = ?3)",
                 rusqlite::params![group_id, path, mutation_generation],
+            )?;
+            // Zero rows: another mutator moved the fence between the placement and this mark
+            // (or a newer write reopened the intent). The write loses its proof commit on the
+            // same fence and is re-driven; nothing is marked for it.
+            Ok(marked == 1)
+        })
+    }
+
+    /// Withdraws the temp witness of `path`'s intent (see [`record_temp_witnesses_in_tx`]) before
+    /// the temp it names is abandoned without having been renamed: a witness whose temp is gone
+    /// must mean "renamed", so the witness goes first, and the temp is removed only once this
+    /// succeeded. Idempotent.
+    pub fn clear_temp_witness(&self, group_id: &str, path: &str) -> Result<(), SyncSqliteError> {
+        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
+            tx.execute_cached(
+                "UPDATE materialization_intents SET temp_witness = NULL \
+                  WHERE group_id = ?1 AND path = ?2 AND kind = 'write'",
+                rusqlite::params![group_id, path],
             )?;
             Ok(())
         })
@@ -277,14 +370,15 @@ impl MaterializationIntentRepository {
         now: i64,
     ) -> Result<(), SyncSqliteError> {
         keep_replaced_target(tx, group_id, path, target_version_hash)?;
-        tx.execute(
+        tx.execute_cached(
             "INSERT INTO materialization_intents \
              (group_id, path, target_version_hash, created_at_unix_nanos) \
              VALUES (?1, ?2, ?3, ?4) \
              ON CONFLICT(group_id, path, kind) DO UPDATE SET \
               target_version_hash = excluded.target_version_hash, \
               created_at_unix_nanos = excluded.created_at_unix_nanos, \
-              mutation_generation = NULL",
+              mutation_generation = NULL, \
+              temp_witness = NULL",
             rusqlite::params![group_id, path, target_version_hash, now],
         )?;
         Ok(())
@@ -310,7 +404,7 @@ impl MaterializationIntentRepository {
         path: &str,
     ) -> Result<bool, SyncSqliteError> {
         let count: i64 = self.database.read::<_, SyncSqliteError>(|conn| {
-            Ok(conn.query_row(
+            Ok(conn.query_row_cached(
                 "SELECT COUNT(*) FROM materialization_intents WHERE group_id = ?1 AND path = ?2 \
                      AND kind = 'write'",
                 rusqlite::params![group_id, path],
@@ -336,7 +430,7 @@ impl MaterializationIntentRepository {
     ) -> Result<Option<Vec<u8>>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             Ok(conn
-                .query_row(
+                .query_row_cached(
                     "SELECT target_version_hash FROM materialization_intents \
                      WHERE group_id = ?1 AND path = ?2 AND kind = 'write'",
                     rusqlite::params![group_id, path],
@@ -358,7 +452,7 @@ impl MaterializationIntentRepository {
         group_id: &str,
     ) -> Result<std::collections::HashSet<String>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT path FROM materialization_intents WHERE group_id = ?1 AND kind = 'write'",
             )?;
             let rows = stmt.query_map([group_id], |r| r.get::<_, String>(0))?;
@@ -498,7 +592,7 @@ impl MaterializationTempLedger {
             // adopted.
             let mut inserted = Vec::with_capacity(group.len());
             for (_, group_id, tmp_path) in group.iter() {
-                let n = tx.execute(
+                let n = tx.execute_cached(
                     "INSERT OR IGNORE INTO materialization_tmp_files (group_id, tmp_path) \
                      VALUES (?1, ?2)",
                     rusqlite::params![group_id, tmp_path],
@@ -533,7 +627,7 @@ impl MaterializationTempLedger {
         released: &[(String, String)],
     ) -> Result<(), SyncSqliteError> {
         for (group_id, tmp_path) in released {
-            conn.execute(
+            conn.execute_cached(
                 "DELETE FROM materialization_tmp_files WHERE group_id = ?1 AND tmp_path = ?2",
                 rusqlite::params![group_id, tmp_path],
             )?;
@@ -551,7 +645,7 @@ impl MaterializationTempLedger {
                 .inspect_err(|_| self.requeue(released.clone()))?;
         }
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT tmp_path FROM materialization_tmp_files WHERE group_id = ?1 \
                  ORDER BY tmp_path",
             )?;
@@ -566,8 +660,8 @@ impl MaterializationTempLedger {
     /// it comes back. A path that cannot be examined counts.
     pub fn standing_stranded_count(&self) -> Result<u64, SyncSqliteError> {
         let recorded = self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt =
-                conn.prepare("SELECT dir_path FROM stranded_directories WHERE group_id = ?1")?;
+            let mut stmt = conn
+                .prepare_cached("SELECT dir_path FROM stranded_directories WHERE group_id = ?1")?;
             let rows = stmt.query_map([&self.group_id], |r| r.get::<_, String>(0))?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })?;
@@ -625,7 +719,7 @@ impl yadorilink_local_storage::TempFileLedger for MaterializationTempLedger {
         let dir_path = utf8_tmp_path(dir_path)?;
         self.database
             .write::<_, SyncSqliteError>(|conn| {
-                conn.execute(
+                conn.execute_cached(
                     "INSERT OR IGNORE INTO stranded_directories (group_id, dir_path) \
                      VALUES (?1, ?2)",
                     rusqlite::params![self.group_id, dir_path],
@@ -791,5 +885,90 @@ mod stranded_tests {
         });
         assert_eq!(results.iter().filter(|ok| **ok).count(), 1);
         assert_eq!(ledger.list().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod removal_facts_tests {
+    use super::*;
+
+    fn open(database: &Arc<SyncDatabase>, path: &str) -> i64 {
+        database
+            .write_immediate::<_, SyncSqliteError>(|tx| {
+                MaterializationIntentRepository::begin_materialization_intent_in_tx(
+                    tx, "g", path, &[1; 32], 1,
+                )?;
+                crate::materialized_generation::bump_mutation_fence(tx, "g", path, "test", 1)
+            })
+            .unwrap()
+    }
+
+    fn facts(database: &Arc<SyncDatabase>, path: &str) -> Option<WriteRemovalFacts> {
+        database.read::<_, SyncSqliteError>(|conn| write_removal_facts(conn, "g", path)).unwrap()
+    }
+
+    fn record(database: &Arc<SyncDatabase>, path: &str, fence: i64, name: &str) -> usize {
+        database
+            .write_immediate::<_, SyncSqliteError>(|tx| {
+                record_temp_witnesses_in_tx(tx, &[("g", path, fence, name)])
+            })
+            .unwrap()
+    }
+
+    /// The witness is recorded only for an intent still open under the fence its write opened
+    /// under, and is reset by every reopen and withdrawn on request.
+    #[test]
+    fn the_witness_is_recorded_only_under_the_fence_the_write_opened_under() {
+        let database = crate::replica_tables::open_for_tests();
+        let fence = open(&database, "new");
+        assert_eq!(
+            facts(&database, "new"),
+            Some(WriteRemovalFacts { landed_unproven: false, temp_witness: None })
+        );
+
+        assert_eq!(record(&database, "new", fence + 1, ".yadorilink-tmp.a"), 0, "another fence");
+        assert_eq!(record(&database, "new", fence, ".yadorilink-tmp.a"), 1);
+        assert_eq!(
+            facts(&database, "new").unwrap().temp_witness.as_deref(),
+            Some(".yadorilink-tmp.a")
+        );
+
+        // A reopen starts over: the older write's witness does not describe the newer one.
+        let reopened = open(&database, "new");
+        assert_eq!(facts(&database, "new").unwrap().temp_witness, None);
+        assert_eq!(record(&database, "new", fence, ".yadorilink-tmp.a"), 0, "the older fence");
+        assert_eq!(record(&database, "new", reopened, ".yadorilink-tmp.b"), 1);
+
+        // Withdrawn before the temp is removed.
+        MaterializationIntentRepository::new(database.clone())
+            .clear_temp_witness("g", "new")
+            .unwrap();
+        assert_eq!(facts(&database, "new").unwrap().temp_witness, None);
+        assert_eq!(facts(&database, "nothing-open"), None);
+    }
+
+    /// A landed mark and a witness are independent facts of the same intent.
+    #[test]
+    fn a_landed_mark_does_not_disturb_the_witness_and_a_reopen_clears_both() {
+        let database = crate::replica_tables::open_for_tests();
+        let fence = open(&database, "p");
+        assert_eq!(record(&database, "p", fence, ".yadorilink-tmp.a"), 1);
+        database
+            .write_immediate::<_, SyncSqliteError>(|tx| {
+                tx.execute(
+                    "UPDATE materialization_intents SET mutation_generation = ?1 WHERE path = 'p'",
+                    [-fence],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let facts_now = facts(&database, "p").unwrap();
+        assert!(facts_now.landed_unproven);
+        assert_eq!(facts_now.temp_witness.as_deref(), Some(".yadorilink-tmp.a"));
+
+        open(&database, "p");
+        let reopened = facts(&database, "p").unwrap();
+        assert!(!reopened.landed_unproven);
+        assert_eq!(reopened.temp_witness, None);
     }
 }

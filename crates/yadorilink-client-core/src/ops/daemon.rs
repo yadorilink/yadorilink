@@ -345,11 +345,38 @@ async fn daemon_answers() -> bool {
     control::send(ReqPayload::Status(StatusRequest {})).await.is_ok()
 }
 
+/// Which daemon process answers: its pid and start time from `identify`, or None when nothing
+/// answers (or it cannot say).
+async fn daemon_instance() -> Option<(u32, u64)> {
+    identify().await.ok().map(|who| (who.pid, who.started_at_unix))
+}
+
+/// Whether the daemon that was `old` has been replaced or has stopped answering. A supervisor can
+/// bring the replacement up between two polls, so the control socket never goes quiet; the
+/// process answering is what changes. A daemon that could not say who it was is waited for until
+/// it stops answering.
+async fn old_instance_is_gone(old: Option<(u32, u64)>) -> bool {
+    match old {
+        Some(old) => daemon_instance().await != Some(old),
+        None => !daemon_answers().await,
+    }
+}
+
 /// Asks the daemon to shut down cleanly. Under a supervisor that restarts it
 /// (the macOS LaunchAgent's `KeepAlive`, the Windows logon task), this is a
 /// restart.
 pub async fn stop_daemon() -> Result<(), CoreError> {
-    control::send(ReqPayload::Shutdown(ShutdownRequest {})).await?;
+    control::send(ReqPayload::Shutdown(ShutdownRequest { restart: false })).await?;
+    Ok(())
+}
+
+/// Stops the daemon so it can be started again. Under a supervisor that restarts it by itself
+/// (the container image) the daemon is told so and exits with the restart status, which the
+/// supervisor answers at once; the supervisor's pause for a daemon that dies immediately applies
+/// only to ordinary exits.
+async fn stop_daemon_to_restart() -> Result<(), CoreError> {
+    control::send(ReqPayload::Shutdown(ShutdownRequest { restart: supervised_by_environment() }))
+        .await?;
     Ok(())
 }
 
@@ -409,9 +436,10 @@ async fn restart_if_running_in(
     if !daemon_answers().await {
         return Ok(());
     }
-    stop_daemon().await?;
+    let old_instance = daemon_instance().await;
+    stop_daemon_to_restart().await?;
     let gone = tokio::time::timeout(stop_budget, async {
-        while daemon_answers().await {
+        while !old_instance_is_gone(old_instance).await {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
@@ -435,8 +463,32 @@ async fn restart_if_running_in(
         )
         .hinted(Hint::WaitThenStartDaemon));
     }
+    if supervised_by_environment() {
+        return wait_for_supervised_daemon(StartTiming::DEFAULT.budget).await;
+    }
     start_daemon_with(launch).await?;
     Ok(())
+}
+
+pub use yadorilink_local_storage::daemon_lock::SUPERVISED_ENV;
+
+/// Whether something restarts the daemon by itself whenever it exits cleanly, so that a command
+/// line that stopped it must wait for the replacement and not start a second one.
+fn supervised_by_environment() -> bool {
+    std::env::var_os(SUPERVISED_ENV).is_some_and(|v| !v.is_empty())
+}
+
+/// Waits for the replacement daemon a supervisor starts. Launching one here as well would race
+/// the supervisor for the data area's lock, and the loser exits: the supervisor's own child
+/// exiting is the end of the container.
+async fn wait_for_supervised_daemon(budget: Duration) -> Result<(), CoreError> {
+    let answered = tokio::time::timeout(budget, async {
+        while !daemon_answers().await {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await;
+    answered.map_err(|_| did_not_answer(startup_refusal()))
 }
 
 /// How long a daemon asked to stop has to stop answering.
@@ -587,7 +639,7 @@ mod tests {
             launch_steps(&agent, 501),
             vec![LaunchStep {
                 program: "/bin/launchctl".into(),
-                args: vec!["kickstart".into(), "gui/501/com.juntaki.yadorilink.daemon".into()],
+                args: vec!["kickstart".into(), format!("gui/501/{MACOS_DAEMON_AGENT_LABEL}")],
                 wait: true,
             }]
         );
@@ -710,6 +762,73 @@ mod tests {
                 return;
             }
         }
+    }
+
+    /// A daemon whose replacement is up before anyone can see a gap: it answers `identify` with
+    /// its process id, and a `shutdown` makes the next process (next pid) take over the same
+    /// socket without a moment of not answering.
+    #[cfg(unix)]
+    async fn serve_gapless_replacements(listener: &tokio::net::UnixListener) {
+        use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
+        use yadorilink_ipc_proto::daemonctl::{
+            DaemonControlRequest, DaemonControlResponse, IdentifyResponse, ShutdownResponse,
+            StatusResponse, CONTROL_PROTOCOL_VERSION,
+        };
+        use yadorilink_ipc_proto::framing::{read_message, write_message};
+        let mut pid = 100;
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let Ok(Some(request)) = read_message::<DaemonControlRequest>(&mut stream).await else {
+                continue;
+            };
+            let (payload, replaced) = match request.payload {
+                Some(ReqPayload::Shutdown(_)) => (RespPayload::Shutdown(ShutdownResponse {}), true),
+                Some(ReqPayload::Identify(_)) => (
+                    RespPayload::Identify(IdentifyResponse {
+                        pid,
+                        started_at_unix: 1_000,
+                        ..Default::default()
+                    }),
+                    false,
+                ),
+                _ => (RespPayload::Status(StatusResponse::default()), false),
+            };
+            let response = DaemonControlResponse {
+                daemon_protocol_version: CONTROL_PROTOCOL_VERSION,
+                payload: Some(payload),
+            };
+            write_message(&mut stream, &response).await.unwrap();
+            if replaced {
+                pid += 1;
+            }
+        }
+    }
+
+    /// A supervisor replaces the daemon faster than the restart polls: the socket never stops
+    /// answering, so the restart must recognise the new process, not wait for a silence.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_recognises_a_replacement_that_never_left_a_gap() {
+        let _guard = SOCKET_ENV_LOCK.lock().await;
+        let dir = socket_dir();
+        let socket = dir.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        std::env::set_var("YADORILINK_CONTROL_SOCKET", &socket);
+        let fake = tokio::spawn(async move { serve_gapless_replacements(&listener).await });
+
+        let launched = dir.path().join("launched");
+        let launch = DaemonLaunch::SpawnBinary { path: Some(launched.display().to_string()) };
+        let result = restart_if_running_in(
+            &launch,
+            dir.path(),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await;
+        std::env::remove_var("YADORILINK_CONTROL_SOCKET");
+        fake.abort();
+        result.unwrap();
+        assert!(!launched.exists(), "the replacement was already up; nothing is launched");
     }
 
     /// A running daemon read the device registration at startup, so
@@ -855,6 +974,53 @@ mod tests {
         std::env::remove_var("YADORILINK_CONTROL_SOCKET");
         fake.abort();
         result.unwrap();
+    }
+
+    /// Where a supervisor restarts the daemon (the container image), the lock is free for a moment
+    /// before the replacement takes it; a restart that launched a daemon in that moment would
+    /// race the supervisor's and the loser would exit. It waits for the supervisor's instead.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_supervised_restart_waits_for_the_supervisors_daemon_and_launches_none() {
+        let _guard = SOCKET_ENV_LOCK.lock().await;
+        let dir = socket_dir();
+        let socket = dir.path().join("daemon.sock");
+        let launched = dir.path().join("launched");
+        let script = dir.path().join("launch.sh");
+        std::fs::write(&script, format!("#!/bin/sh\ntouch '{}'\n", launched.display())).unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        std::env::set_var("YADORILINK_CONTROL_SOCKET", &socket);
+        std::env::set_var(SUPERVISED_ENV, "1");
+        let old_lock = daemon_lock::HeldLock::acquire_daemon_lock(dir.path()).unwrap();
+        let fake = tokio::spawn({
+            let socket = socket.clone();
+            let config_dir = dir.path().to_path_buf();
+            async move {
+                serve_until_shutdown(&listener).await;
+                drop(listener);
+                std::fs::remove_file(&socket).unwrap();
+                drop(old_lock);
+                // The lock is free and nothing answers, for longer than the restart polls.
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                let _new_lock = daemon_lock::HeldLock::acquire_daemon_lock(&config_dir).unwrap();
+                answer_status_forever(tokio::net::UnixListener::bind(&socket).unwrap()).await;
+            }
+        });
+        let launch = DaemonLaunch::SpawnBinary { path: Some(script.display().to_string()) };
+        let result = restart_if_running_in(
+            &launch,
+            dir.path(),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await;
+        std::env::remove_var(SUPERVISED_ENV);
+        std::env::remove_var("YADORILINK_CONTROL_SOCKET");
+        fake.abort();
+        result.unwrap();
+        assert!(!launched.exists(), "the restart must not launch a daemon under a supervisor");
     }
 
     /// A lock that never goes is reported, and nothing is launched over it.

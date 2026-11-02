@@ -47,7 +47,7 @@ use std::time::Duration;
 use super::fake_coordination::FakeCoordination;
 use super::{register_with_fake, wait_until_with_context};
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
-use yadorilink_daemon::daemon_state::DaemonState;
+use yadorilink_daemon::daemon_state::{DaemonState, StateIntervals};
 use yadorilink_daemon::peer_orchestrator;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_storage::SegmentBlockStore;
@@ -65,6 +65,10 @@ use yadorilink_replica_domain::session_state::MaterializationPolicy;
 /// vacuous by construction.
 pub struct TopologyNode {
     pub device_id: String,
+    /// The sweep intervals this node's daemon is built with, kept for its restarts.
+    intervals: StateIntervals,
+    /// What this node's engine does beyond the defaults, kept for its restarts.
+    features: super::NodeFeatures,
     pub state: Arc<DaemonState>,
     pub root: tempfile::TempDir,
     /// Own the block-store and index-DB temp directories for this node's
@@ -119,7 +123,48 @@ impl TopologyNode {
     }
 }
 
+/// A node whose daemon runs the production sweep intervals.
 pub fn new_node(device_id: &str) -> TopologyNode {
+    new_node_with(device_id, StateIntervals::default())
+}
+
+/// [`new_node`] with the one-second repair sweep the convergence scenarios use
+/// ([`super::fast_convergence_sweeps`]).
+pub fn new_node_fast(device_id: &str) -> TopologyNode {
+    new_node_with(device_id, super::fast_convergence_sweeps())
+}
+
+/// [`new_node`] with the given sweep `intervals` for its daemon (and for its restarts).
+pub fn new_node_with(device_id: &str, intervals: StateIntervals) -> TopologyNode {
+    new_node_with_in(None, device_id, intervals)
+}
+
+/// [`new_node_fast`] whose synced folder is made inside `parent`: for a test that needs the folder on a
+/// filesystem it chose (one that can prove object identity), without touching the process's temp directory.
+pub fn new_node_fast_in(parent: &std::path::Path, device_id: &str) -> TopologyNode {
+    new_node_with_in(Some(parent), device_id, super::fast_convergence_sweeps())
+}
+
+/// [`new_node_with`] with the synced folder made inside `parent` when one is given.
+pub fn new_node_with_in(
+    parent: Option<&std::path::Path>,
+    device_id: &str,
+    intervals: StateIntervals,
+) -> TopologyNode {
+    new_node_tuned(parent, device_id, intervals, Default::default())
+}
+
+/// [`new_node_fast`] whose engine has `features`.
+pub fn new_node_fast_with(device_id: &str, features: super::NodeFeatures) -> TopologyNode {
+    new_node_tuned(None, device_id, super::fast_convergence_sweeps(), features)
+}
+
+fn new_node_tuned(
+    parent: Option<&std::path::Path>,
+    device_id: &str,
+    intervals: StateIntervals,
+    features: super::NodeFeatures,
+) -> TopologyNode {
     // Suffixed with a per-process-unique counter: `ensure_isolated_config_
     // dir` gives each TEST BINARY (process) its own isolated pin-file
     // directory, but a test binary with more than one `#[tokio::test]`
@@ -146,17 +191,27 @@ pub fn new_node(device_id: &str) -> TopologyNode {
     let db_dir = tempfile::tempdir().unwrap();
     let db_path = db_dir.path().join("index.db");
     let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
-    let sync_state = Arc::new(
-        ReplicaCoordinator::open_with(&db_path, super::tuning_with_outside_witness()).unwrap(),
+    let sync_state =
+        Arc::new(ReplicaCoordinator::open_with(&db_path, super::node_tuning(features)).unwrap());
+    let state = yadorilink_daemon::test_support::isolated_daemon_state_with(
+        intervals,
+        None,
+        device_id.to_string(),
+        sync_state,
+        store,
     );
-    let state = DaemonState::new(device_id.to_string(), sync_state, store);
     let signing_key = yadorilink_transport::DeviceSigningKeyPair::generate().signing;
     state.set_device_signing_key(signing_key.clone());
     TopologyNode {
         device_id: device_id.to_string(),
+        intervals,
+        features,
         _releases_cycles: ReleasesCycles(state.clone()),
         state,
-        root: tempfile::tempdir().unwrap(),
+        root: match parent {
+            Some(parent) => tempfile::tempdir_in(parent).unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        },
         signing_key,
         store_dir,
         db_dir,
@@ -208,6 +263,11 @@ pub async fn restart_node(node: TopologyNode) -> TopologyNode {
 /// production startup leaves it.
 async fn restart_node_inner(node: TopologyNode, refused_links_expected: bool) -> TopologyNode {
     LinkRuntimeController::new(node.state.clone()).stop(&node.root.path().to_string_lossy()).await;
+    // A real restart is a new process, so nothing of the old one can still be writing to the
+    // database. Here the old generation lives in this process until the node is dropped, so its
+    // background tasks are stopped first: left running they keep writing (a large corpus still
+    // settling) and hold the database busy for longer than the reopen waits.
+    node.state.stop_background_tasks_for_tests();
     let store = Arc::new(SegmentBlockStore::new(node.store_dir.path()).unwrap());
     // Bounded retry: the OLD generation's SQLite connection pool can still
     // be mid-close (a genuine, if narrow, race between `stop()` above
@@ -220,9 +280,9 @@ async fn restart_node_inner(node: TopologyNode, refused_links_expected: bool) ->
     // it never clears).
     let mut open_attempts = 0;
     let sync_state = loop {
-        match ReplicaCoordinator::open_with(&node.db_path, super::tuning_with_outside_witness()) {
+        match ReplicaCoordinator::open_with(&node.db_path, super::node_tuning(node.features)) {
             Ok(coordinator) => break Arc::new(coordinator),
-            Err(error) if open_attempts < 10 => {
+            Err(error) if open_attempts < 50 => {
                 open_attempts += 1;
                 tracing::warn!(
                     %error,
@@ -239,7 +299,13 @@ async fn restart_node_inner(node: TopologyNode, refused_links_expected: bool) ->
     // unfinished, decided from the journal row alone, before any link
     // starts.
     sync_state.rewind_run_repository().interrupt_unfinished_runs().unwrap();
-    let state = DaemonState::new(node.device_id.clone(), sync_state, store);
+    let state = yadorilink_daemon::test_support::isolated_daemon_state_with(
+        node.intervals,
+        Some(node.state.config_dir().to_path_buf()),
+        node.device_id.clone(),
+        sync_state,
+        store,
+    );
     // Re-apply the SAME signing identity `signing_key`'s own doc comment
     // explains why: a real restart reloads this from persistent storage,
     // never generates a new one -- letting `support::ensure_device_
@@ -303,6 +369,8 @@ async fn restart_node_inner(node: TopologyNode, refused_links_expected: bool) ->
     }
     TopologyNode {
         device_id: node.device_id,
+        intervals: node.intervals,
+        features: node.features,
         _releases_cycles: ReleasesCycles(state.clone()),
         state,
         root: node.root,
@@ -319,17 +387,23 @@ async fn restart_node_inner(node: TopologyNode, refused_links_expected: bool) ->
 /// [`shutdown_substrate`] and [`TopologyHandles::take_and_shutdown`]).
 pub struct StoppedNode {
     device_id: String,
+    intervals: StateIntervals,
+    features: super::NodeFeatures,
     root: tempfile::TempDir,
     store_dir: tempfile::TempDir,
     db_dir: tempfile::TempDir,
     db_path: std::path::PathBuf,
     signing_key: ed25519_dalek::SigningKey,
+    /// The state directory the node's daemon used; the restarted daemon reloads it.
+    config_dir: std::path::PathBuf,
 }
 
 pub async fn stop_node(node: TopologyNode) -> StoppedNode {
     LinkRuntimeController::new(node.state.clone()).stop(&node.root.path().to_string_lossy()).await;
     let TopologyNode {
         device_id,
+        intervals,
+        features,
         state,
         root,
         store_dir,
@@ -340,6 +414,7 @@ pub async fn stop_node(node: TopologyNode) -> StoppedNode {
     } = node;
     state.stop_background_tasks_for_tests();
     drop(_releases_cycles);
+    let config_dir = state.config_dir().to_path_buf();
     let weak = Arc::downgrade(&state);
     drop(state);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -350,7 +425,17 @@ pub async fn stop_node(node: TopologyNode) -> StoppedNode {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    StoppedNode { device_id, root, store_dir, db_dir, db_path, signing_key }
+    StoppedNode {
+        device_id,
+        intervals,
+        features,
+        root,
+        store_dir,
+        db_dir,
+        db_path,
+        signing_key,
+        config_dir,
+    }
 }
 
 fn is_database_file(path: &Path) -> bool {
@@ -408,10 +493,22 @@ async fn start_stopped_node_inner(
     stopped: StoppedNode,
     refused_links_expected: bool,
 ) -> TopologyNode {
-    let StoppedNode { device_id, root, store_dir, db_dir, db_path, signing_key } = stopped;
+    let StoppedNode {
+        device_id,
+        intervals,
+        features,
+        root,
+        store_dir,
+        db_dir,
+        db_path,
+        signing_key,
+        config_dir,
+    } = stopped;
     // `restart_node` takes a running node; this one only supplies the identity and paths it
     // reopens, and is dropped by it.
-    let placeholder = DaemonState::new(
+    let placeholder = yadorilink_daemon::test_support::isolated_daemon_state_with(
+        intervals,
+        Some(config_dir),
         device_id.clone(),
         Arc::new(ReplicaCoordinator::open_in_memory().unwrap()),
         Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap()),
@@ -419,6 +516,8 @@ async fn start_stopped_node_inner(
     restart_node_inner(
         TopologyNode {
             device_id,
+            intervals,
+            features,
             _releases_cycles: ReleasesCycles(placeholder.clone()),
             state: placeholder,
             root,
@@ -650,6 +749,15 @@ pub async fn stand_up_canonical_topology(
     stand_up_canonical_topology_with_m_http_coordination(fake, group_id, None).await
 }
 
+/// [`stand_up_canonical_topology`] with the one-second repair sweep
+/// ([`super::fast_convergence_sweeps`]).
+pub async fn stand_up_canonical_topology_fast(
+    fake: &FakeCoordination,
+    group_id: &str,
+) -> (TopologyNode, TopologyNode, TopologyNode, TopologyHandles) {
+    stand_up_canonical_topology_with_m_http_coordination_fast(fake, group_id, None).await
+}
+
 /// [`stand_up_canonical_topology`], but with **M only** pointed at
 /// `m_http_addr` for plain HTTP coordination instead of the netmap fake.
 ///
@@ -676,9 +784,31 @@ pub async fn stand_up_canonical_topology_with_m_http_coordination(
     group_id: &str,
     m_http_addr: Option<&str>,
 ) -> (TopologyNode, TopologyNode, TopologyNode, TopologyHandles) {
-    let n = new_node("topology-n-nas");
-    let m = new_node("topology-m-mac");
-    let w = new_node("topology-w-windows");
+    stand_up_canonical_topology_with(fake, group_id, m_http_addr, StateIntervals::default()).await
+}
+
+/// [`stand_up_canonical_topology_with_m_http_coordination`] with the one-second repair sweep
+/// ([`super::fast_convergence_sweeps`]).
+pub async fn stand_up_canonical_topology_with_m_http_coordination_fast(
+    fake: &FakeCoordination,
+    group_id: &str,
+    m_http_addr: Option<&str>,
+) -> (TopologyNode, TopologyNode, TopologyNode, TopologyHandles) {
+    stand_up_canonical_topology_with(fake, group_id, m_http_addr, super::fast_convergence_sweeps())
+        .await
+}
+
+/// [`stand_up_canonical_topology_with_m_http_coordination`] with the given sweep `intervals` for
+/// all three nodes.
+pub async fn stand_up_canonical_topology_with(
+    fake: &FakeCoordination,
+    group_id: &str,
+    m_http_addr: Option<&str>,
+    intervals: StateIntervals,
+) -> (TopologyNode, TopologyNode, TopologyNode, TopologyHandles) {
+    let n = new_node_with("topology-n-nas", intervals);
+    let m = new_node_with("topology-m-mac", intervals);
+    let w = new_node_with("topology-w-windows", intervals);
 
     if let Some(addr) = m_http_addr {
         m.state.set_coordination_client_config(
@@ -744,9 +874,36 @@ pub async fn stand_up_topology_two_full_replicas_one_on_demand(
     fake: &FakeCoordination,
     group_id: &str,
 ) -> (TopologyNode, TopologyNode, TopologyNode, TopologyHandles) {
-    let n = new_node("topology-n-nas");
-    let m = new_node("topology-m-second-complete-copy");
-    let w = new_node("topology-w-windows");
+    stand_up_topology_two_full_replicas_one_on_demand_with(
+        fake,
+        group_id,
+        StateIntervals::default(),
+    )
+    .await
+}
+
+/// [`stand_up_topology_two_full_replicas_one_on_demand`] with the one-second repair sweep
+/// ([`super::fast_convergence_sweeps`]).
+pub async fn stand_up_topology_two_full_replicas_one_on_demand_fast(
+    fake: &FakeCoordination,
+    group_id: &str,
+) -> (TopologyNode, TopologyNode, TopologyNode, TopologyHandles) {
+    stand_up_topology_two_full_replicas_one_on_demand_with(
+        fake,
+        group_id,
+        super::fast_convergence_sweeps(),
+    )
+    .await
+}
+
+async fn stand_up_topology_two_full_replicas_one_on_demand_with(
+    fake: &FakeCoordination,
+    group_id: &str,
+    intervals: StateIntervals,
+) -> (TopologyNode, TopologyNode, TopologyNode, TopologyHandles) {
+    let n = new_node_with("topology-n-nas", intervals);
+    let m = new_node_with("topology-m-second-complete-copy", intervals);
+    let w = new_node_with("topology-w-windows", intervals);
 
     for node in [&n, &m, &w] {
         register_with_fake(fake, &node.state, &node.device_id, &[group_id]).await;

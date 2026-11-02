@@ -98,6 +98,7 @@ async fn ungranted_offer(from: &Device, target: &Device) -> Option<SendManifestA
                     files: vec![],
                     total_size: 0,
                     offered_at_unix_nanos: 0,
+                    ..Default::default()
                 })),
                 grant_id: String::new(),
                 grant_nonce: String::new(),
@@ -211,7 +212,7 @@ fn accepted_offer(local: &Device, peer_name: &str, peer: &Device) {
             0,
         )
         .expect("offer recorded");
-    store.mark_outbound_acked("accepted-offer").expect("offer accepted");
+    store.mark_outbound_acked("accepted-offer", 0).expect("offer accepted");
 }
 
 /// Withdraws `peer_name` from `local`'s netmap the way a netmap update that
@@ -301,4 +302,223 @@ fn a_retry_for_the_other_side_of_a_transfer_is_refused_up_front() {
     ] {
         assert!(check_retry_direction("t", actual, expected).is_ok());
     }
+}
+
+#[test]
+fn only_a_link_prefixed_target_names_a_send_link() {
+    use super::link_id_of;
+    assert_eq!(link_id_of("link:abc-123"), Some("abc-123"));
+    assert_eq!(link_id_of("link:"), None);
+    assert_eq!(link_id_of("device-bob"), None);
+    assert_eq!(link_id_of("LINK:abc"), None);
+}
+
+#[test]
+fn a_sender_proceeds_only_on_a_redeemed_link() {
+    use super::{link_readiness, LinkReadiness};
+    assert_eq!(link_readiness("redeemed"), LinkReadiness::Ready);
+    assert_eq!(link_readiness("open"), LinkReadiness::Waiting);
+    // Reuse, cancel, expiry and anything unknown stop the send before a grant is asked for,
+    // each with its own typed code.
+    use yadorilink_ipc_proto::daemonctl::ApplicationErrorCode as Code;
+    for (state, code) in [
+        ("granted", Code::SendLinkAlreadyUsed),
+        ("cancelled", Code::SendLinkCancelled),
+        ("expired", Code::SendLinkExpired),
+        ("something-new", Code::SendLinkInvalid),
+    ] {
+        assert!(
+            matches!(link_readiness(state), LinkReadiness::Refused(c, _) if c == code),
+            "{state}"
+        );
+    }
+}
+
+#[test]
+fn a_links_state_follows_the_service_and_its_transfer() {
+    use super::link_state;
+    use yadorilink_ipc_proto::daemonctl::SendLinkState as S;
+    assert_eq!(link_state("open", None, false), S::Waiting);
+    assert_eq!(link_state("redeemed", None, false), S::Redeemed);
+    assert_eq!(link_state("cancelled", None, false), S::Cancelled);
+    assert_eq!(link_state("expired", None, false), S::Expired);
+    assert_eq!(link_state("something-new", None, false), S::Unspecified);
+    // Granted: going until the receiver reports everything, unless it stopped.
+    assert_eq!(link_state("granted", None, false), S::Transferring);
+    assert_eq!(link_state("granted", Some(("accepted", false)), false), S::Transferring);
+    assert_eq!(link_state("granted", Some(("offered", false)), false), S::Transferring);
+    assert_eq!(link_state("granted", Some(("completed", false)), false), S::Done);
+    assert_eq!(link_state("granted", Some(("accepted", true)), false), S::Interrupted);
+    assert_eq!(link_state("granted", Some(("declined", false)), false), S::Interrupted);
+    assert_eq!(link_state("granted", Some(("canceled", false)), false), S::Interrupted);
+    // A send that stopped before any transfer existed, after the grant was spent.
+    assert_eq!(link_state("granted", None, true), S::Interrupted);
+    // Before the grant the link can still carry a send, so it stays redeemed.
+    assert_eq!(link_state("redeemed", None, true), S::Redeemed);
+}
+
+#[test]
+fn a_send_failure_is_typed_only_when_a_front_end_can_tell_it_apart() {
+    use super::{SendFailure, SendLinkCallError, SendLinkCallKind};
+    use yadorilink_ipc_proto::daemonctl::ApplicationErrorCode as Code;
+    use yadorilink_send::{DialReason, SendError};
+    let io_full = || std::io::Error::from(std::io::ErrorKind::StorageFull);
+    let cases: Vec<(SendFailure, Option<Code>)> = vec![
+        (SendError::Io(io_full()).into(), Some(Code::SendNoSpace)),
+        (
+            SendError::DialFailed {
+                device_id: "d".into(),
+                reason: DialReason::NoResponse,
+                detail: "x".into(),
+            }
+            .into(),
+            Some(Code::SendPeerUnreachable),
+        ),
+        (
+            SendError::DialFailed {
+                device_id: "d".into(),
+                reason: DialReason::LocalNetworkBlocked,
+                detail: "x".into(),
+            }
+            .into(),
+            Some(Code::SendLocalNetworkBlocked),
+        ),
+        (SendError::SenderGone("d".into()).into(), Some(Code::SendPeerUnreachable)),
+        (SendError::NoKnownAddress("d".into()).into(), Some(Code::SendPeerUnreachable)),
+        (SendError::ReceiverStalled.into(), Some(Code::SendInterrupted)),
+        (SendError::TransferCanceled("t".into()).into(), Some(Code::SendInterrupted)),
+        (SendError::UnknownTransfer("t".into()).into(), None),
+        ("plain".to_string().into(), None),
+        (
+            SendLinkCallError { kind: SendLinkCallKind::NotFound, message: "m".into() }.into(),
+            Some(Code::SendLinkInvalid),
+        ),
+        (
+            SendLinkCallError { kind: SendLinkCallKind::SignInRequired, message: "m".into() }
+                .into(),
+            Some(Code::LocalIdentityUnavailable),
+        ),
+        (
+            SendLinkCallError { kind: SendLinkCallKind::Unreachable, message: "m".into() }.into(),
+            Some(Code::CoordinationTransport),
+        ),
+        (SendLinkCallError { kind: SendLinkCallKind::Other, message: "m".into() }.into(), None),
+    ];
+    for (failure, code) in cases {
+        assert_eq!(failure.code, code, "{}", failure.message);
+    }
+}
+
+#[tokio::test]
+async fn link_send_waits_for_service_then_reports_retryable_not_ready() {
+    let (state, _dir) = device("device-early", 9);
+    let svc = super::SendTransferService::new(state.clone());
+    // Never up within the window: typed retryable refusal, nothing recorded on any link.
+    let Err(err) = svc.wait_for_service(Duration::from_millis(50)).await else {
+        panic!("no service was published");
+    };
+    assert_eq!(
+        err.code,
+        Some(yadorilink_ipc_proto::daemonctl::ApplicationErrorCode::CoordinationTransport)
+    );
+    assert!(err.message.contains("try again"), "{}", err.message);
+
+    // Published while the caller is waiting: the wait returns it.
+    let stack = Arc::new(
+        SyncStack::spawn(state.clone(), yadorilink_sync_substrate::NetworkConfig::direct_only())
+            .await
+            .expect("stack starts"),
+    );
+    let send_dir = tempfile::tempdir().unwrap();
+    {
+        let state = state.clone();
+        let dir = send_dir.path().to_path_buf();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            state.install_peer_session_driver(PeerSessionDriver::start(state.clone(), stack));
+            let _ = super::run(state, dir).await;
+        });
+    }
+    assert!(svc.wait_for_service(STEP).await.is_ok());
+}
+
+/// Records on `local`'s Track Send store an accepted offer to `peer` made under the Send link
+/// `link_id`.
+fn accepted_link_offer(local: &Device, peer: &Device, link_id: &str) {
+    let store = yadorilink_send::store::SendStore::open(
+        local._dirs.1.path().join("send").join("store.sqlite3"),
+    )
+    .expect("the Track Send store opens");
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        as i64;
+    store
+        .insert_outbound_offered(
+            "link-offer",
+            "recipient",
+            &peer.key(),
+            "/nowhere",
+            &SendManifest { link_id: link_id.to_string(), ..Default::default() },
+            now,
+        )
+        .expect("offer recorded");
+    store.mark_outbound_acked("link-offer", now).expect("offer accepted");
+}
+
+/// The recipient of a Send link is on another account, so the sender's netmap never lists it, and
+/// the grant it came in with is gone minutes after the offer. The link's own offer keeps
+/// admitting it, and only it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_links_recipient_off_the_netmap_is_admitted_by_its_offer_after_the_grant_is_gone() {
+    let alice = start(ALICE, 71).await;
+    let carol = start(CAROL, 72).await;
+    let dave = start("dave", 73).await;
+    // Alice's netmap lists neither: no grant is on record either.
+    accepted_link_offer(&alice, &carol, "link-1");
+
+    assert!(
+        ungranted_offer(&carol, &alice).await.is_some(),
+        "the recipient of a link's offer is admitted without a grant or a netmap entry"
+    );
+    assert!(
+        ungranted_offer(&dave, &alice).await.is_none(),
+        "a device the link was not offered to is not"
+    );
+}
+
+/// Two Send links from one sender to one receiving device are two live grants for one key at the
+/// same time; each offer is checked against its own, and neither displaces the other.
+#[tokio::test]
+async fn two_grants_for_one_sender_key_are_both_found_by_their_own_offer() {
+    use super::DaemonDeviceDirectory;
+    use yadorilink_send::DeviceDirectory;
+    let (state, _dir) = device(ALICE, 74);
+    let key = [7u8; 32];
+    let live = |grant_id: &str, nonce: &str| SendGrantPeer {
+        device_id: "sender".to_string(),
+        signing_key: key,
+        reachability: Default::default(),
+        grant_id: grant_id.to_string(),
+        nonce: nonce.to_string(),
+        expires_at_unix: i64::MAX,
+    };
+    state.record_send_grant_peer(live("grant-a", "nonce-a"));
+    state.record_send_grant_peer(live("grant-b", "nonce-b"));
+    assert!(state.send_grant_for(&key, "grant-a").is_some());
+    assert!(
+        state.send_grant_for(&key, "grant-b").is_some(),
+        "the second did not replace the first"
+    );
+    assert!(state.send_grant_for(&[8u8; 32], "grant-a").is_none(), "grants are bound to the key");
+
+    // Past the local checks the offer goes to the coordination service, which this state has no
+    // address for: that is the answer for a grant on record with the right nonce.
+    let directory = DaemonDeviceDirectory { state: Arc::downgrade(&state) };
+    let verdict = |grant_id: &'static str, nonce: &'static str| {
+        let directory = &directory;
+        async move { directory.consume_grant(grant_id, nonce, &key).await.unwrap_err() }
+    };
+    assert!(verdict("grant-a", "nonce-a").await.contains("coordination plane"));
+    assert!(verdict("grant-b", "nonce-b").await.contains("coordination plane"));
+    assert!(verdict("grant-a", "nonce-b").await.contains("invalid"), "a nonce of another grant");
+    assert!(verdict("grant-c", "nonce-a").await.contains("no pending"));
 }

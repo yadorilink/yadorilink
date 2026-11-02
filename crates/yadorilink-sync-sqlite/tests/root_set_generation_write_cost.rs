@@ -247,9 +247,13 @@ fn the_local_summary_is_linear_and_the_memo_key_is_flat() {
         // The recomputation, which a cycle pays only when the root set has
         // actually moved since the last one.
         let started = Instant::now();
-        let summary =
-            yadorilink_sync_sqlite::file_index::group_root_set_summary_on_conn(&conn, "g", 0)
-                .unwrap();
+        let summary = yadorilink_sync_sqlite::file_index::group_root_set_summary_on_conn(
+            &conn,
+            "g",
+            0,
+            &|_| true,
+        )
+        .unwrap();
         let summary_ms = started.elapsed().as_secs_f64() * 1e3;
         // `roots_count` spans all three retained states, so it is the
         // current rows plus the superseded ones `insert_n` adds for every

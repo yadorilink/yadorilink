@@ -52,7 +52,11 @@ pub use sec::SecItems;
 /// it orphans every stored credential. Must equal the string in
 /// `App.entitlements` and `Daemon.entitlements` (the macOS installer's
 /// `validate-macos-profiles.py` checks the signed bundles).
-pub const MACOS_ACCESS_GROUP: &str = "594UQF7QX3.com.juntaki.yadorilink.credentials";
+// A build may name other ids through the build-time environment variable below; unset, these are the product's ids.
+pub const MACOS_ACCESS_GROUP: &str = match option_env!("YADORILINK_KEYCHAIN_GROUP") {
+    Some(id) => id,
+    None => "594UQF7QX3.com.juntaki.yadorilink.credentials",
+};
 
 /// The iOS group, shared by the app and its File Provider extension (the engine
 /// writer), which read and write the same items. Both entitlement files declare

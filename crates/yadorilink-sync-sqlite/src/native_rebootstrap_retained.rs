@@ -91,35 +91,19 @@ pub fn count_retained_originals(conn: &Connection) -> Result<u32, SyncSqliteErro
 }
 
 /// What identifies the kept object's content and the metadata a restore would give back (mtime,
-/// permission bits and replicated xattrs where the platform has them), as one digest. A change
+/// execute flag where the platform has one), as one digest. A change
 /// to any of them is an edit that must be saved before the object goes.
 pub fn kept_fingerprint(observed: &Observed) -> Option<[u8; 32]> {
     use sha2::{Digest, Sha256};
-    let Observed::File { size, sha256, mtime_unix_nanos, unix_mode, xattrs } = observed else {
+    let Observed::File { size, sha256, mtime_unix_nanos, exec } = observed else {
         return None;
     };
     let mut hasher = Sha256::new();
     hasher.update(sha256);
     hasher.update(size.to_be_bytes());
     hasher.update(mtime_unix_nanos.to_be_bytes());
-    match unix_mode {
-        Some(mode) => {
-            hasher.update([1]);
-            hasher.update(mode.to_be_bytes());
-        }
-        None => hasher.update([0]),
-    }
-    match xattrs {
-        Some(xattrs) => {
-            hasher.update([1]);
-            hasher.update((xattrs.len() as u64).to_be_bytes());
-            for (name, value) in xattrs {
-                for part in [name.as_bytes(), value.as_slice()] {
-                    hasher.update((part.len() as u64).to_be_bytes());
-                    hasher.update(part);
-                }
-            }
-        }
+    match exec {
+        Some(exec) => hasher.update([1, u8::from(*exec)]),
         None => hasher.update([0]),
     }
     Some(hasher.finalize().into())
@@ -275,9 +259,7 @@ fn release_one(
     let Some(observed_fingerprint) = kept_fingerprint(&observed) else {
         return Ok(RetainedOutcome::Left("the claimed object is not a regular file".into()));
     };
-    let Observed::File { size, sha256: observed_sha, mtime_unix_nanos, unix_mode, xattrs } =
-        observed
-    else {
+    let Observed::File { size, sha256: observed_sha, mtime_unix_nanos, exec } = observed else {
         unreachable!("a fingerprint exists only for a regular file")
     };
     let (recorded, item_id): (Option<Vec<u8>>, Option<String>) = conn.query_row(
@@ -305,7 +287,7 @@ fn release_one(
     if observed_fingerprint != recorded || item_missing {
         // Not the bytes the row recorded: they are saved as a recovery item, registered, before
         // anything is removed, and the row then names them as the expected content.
-        let meta = LateEditMeta { mtime_unix_nanos, unix_mode, xattrs: xattrs.unwrap_or_default() };
+        let meta = LateEditMeta { mtime_unix_nanos, exec: exec.unwrap_or(false) };
         let edit = LateEdit {
             path,
             symlink: false,

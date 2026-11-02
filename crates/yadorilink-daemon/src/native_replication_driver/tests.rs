@@ -31,3 +31,35 @@ fn not_found_from_the_checkpoint_seal_path_is_a_refused_request_not_a_truncation
     assert!(!recovery_request_accepted(&refusal));
     assert!(recovery_request_accepted(&[]));
 }
+
+/// Two groups, each answered in 5 s (inside the 8 s a new connection gets per group): the sweep
+/// takes 10 s and both answers count. A limit on the whole sweep read this as silence.
+#[tokio::test(start_paused = true)]
+async fn a_slow_multi_group_sweep_is_not_read_as_a_silent_peer() {
+    let started = tokio::time::Instant::now();
+    let groups = vec![FolderGroupId("g1".into()), FolderGroupId("g2".into())];
+    let rounds = sweep(groups, |_| async {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        GroupRound::InSync
+    })
+    .await;
+    assert_eq!(started.elapsed(), Duration::from_secs(10));
+    assert_eq!(rounds.len(), 2);
+    assert!(rounds.iter().all(|(_, round)| !round.connection_is_dead()));
+}
+
+/// A fault on this side (database, request construction) or a refusal is not the connection's
+/// fault; only a peer that did not answer is.
+#[test]
+fn only_a_silent_peer_means_the_connection_is_dead() {
+    assert!(GroupRound::NoAnswer.connection_is_dead());
+    for round in [
+        GroupRound::Failed,
+        GroupRound::InSync,
+        GroupRound::Divergent,
+        GroupRound::Requested { newer: 1 },
+        GroupRound::Refused(RefusalReason::Unauthorized),
+    ] {
+        assert!(!round.connection_is_dead(), "{round:?}");
+    }
+}

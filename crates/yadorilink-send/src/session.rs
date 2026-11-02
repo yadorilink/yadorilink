@@ -16,8 +16,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use yadorilink_ipc_proto::send::{
-    chunk_stream_message, send_envelope, ChunkHeader, ChunkPullRejected, ChunkPullRequest,
-    ChunkStreamMessage, SendEnvelope, SendFileEntry, SendManifest, SendManifestAck, TransferDone,
+    chunk_stream_message, send_envelope, transfer_ended, ChunkHeader, ChunkPullRejected,
+    ChunkPullRequest, ChunkStreamMessage, SendEnvelope, SendFileEntry, SendManifest,
+    SendManifestAck, TransferDone, TransferEnded,
 };
 use yadorilink_local_storage::{
     hash_block_bytes, reconstruct_file, BlockContentStore, SegmentBlockStore,
@@ -26,8 +27,10 @@ use yadorilink_sync_substrate::{
     PeerAddress, PeerId, SubstrateNode, TrackSendConnection, TrackSendReader, TrackSendWriter,
 };
 
-use crate::error::{Result, SendError, PULL_REASON_CANCELED, PULL_REASON_NOT_ACCEPTED};
-use crate::manifest::{build_outbound_manifest, chunk_byte_size};
+use crate::error::{
+    failure, DialReason, Result, SendError, PULL_REASON_CANCELED, PULL_REASON_NOT_ACCEPTED,
+};
+use crate::manifest::{build_outbound_manifest_multi, chunk_byte_size};
 use crate::store::{InboundStatus, OutboundStatus, OutboundTransfer, SendStore};
 use crate::wire::{read_message, write_message};
 
@@ -46,6 +49,45 @@ pub struct ResolvedDevice {
 }
 
 impl ResolvedDevice {
+    /// The device as text, to be kept with a transfer and read back by [`Self::decode`].
+    fn encode(&self) -> String {
+        serde_json::json!({
+            "key": hex::encode(self.signing_key),
+            "direct": self.direct_addresses.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "relays": self.relay_urls,
+        })
+        .to_string()
+    }
+
+    /// The device `encode` described, named `device_id`; `None` when the text is not that.
+    fn decode(device_id: &str, text: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(text).ok()?;
+        let signing_key: [u8; 32] =
+            hex::decode(value.get("key")?.as_str()?).ok()?.try_into().ok()?;
+        let strings = |name: &str| -> Vec<String> {
+            value
+                .get(name)
+                .and_then(|v| v.as_array())
+                .map(|items| items.iter().filter_map(|i| i.as_str().map(str::to_owned)).collect())
+                .unwrap_or_default()
+        };
+        Some(Self {
+            device_id: device_id.to_string(),
+            signing_key,
+            direct_addresses: strings("direct").iter().filter_map(|a| a.parse().ok()).collect(),
+            relay_urls: strings("relays"),
+        })
+    }
+
+    /// The device without its direct addresses: a dial that can only go through a relay, for an
+    /// attempt that must not wait on a direct path that has not worked (a NAT that does not
+    /// hairpin, a peer answering from another network interface, a LAN this device may not
+    /// use).
+    fn relay_address(&self) -> PeerAddress {
+        PeerAddress::new(PeerId::from_bytes(self.signing_key))
+            .with_relays(self.relay_urls.iter().cloned())
+    }
+
     fn address(&self) -> PeerAddress {
         PeerAddress::new(PeerId::from_bytes(self.signing_key))
             .with_direct(self.direct_addresses.iter().copied())
@@ -67,20 +109,12 @@ impl ResolvedDevice {
 /// own doc comment for why every offer requires a grant regardless of what
 /// `resolve` says.
 ///
-/// Cross-account send is out of scope for v1 by construction, not merely
-/// unimplemented: the production implementation
-/// (`yadorilink-daemon::send_transfer::DaemonDeviceDirectory`) obtains a
-/// grant only through the coordination plane's `POST /send/authorization`
-/// route, which resolves both the sender and receiver device id against the
-/// SAME caller-account bearer token (`isDeviceOwnedByUser`, twice, against
-/// one `userId`) -- so there is no `device_query` naming a device outside
-/// the caller's own account this route can ever satisfy, independent of
-/// whatever `resolve`'s own (separately account-scoped, and
-/// cross-account-inclusive) netmap state happens to say. Sending to a
-/// device on a different account needs a cross-account permission model
-/// that does not exist yet; this trait is deliberately left as the seam a
-/// future cross-account-aware `DeviceDirectory` implementation would plug
-/// into, once that model does.
+/// Cross-account send reuses this same seam: the production implementation
+/// answers a `link:<id>` query with the grant of a redeemed Send link (the
+/// recipient on the other account picked the device; the coordination plane
+/// issues one pair-bound grant per link), and any other query with the
+/// same-account `POST /send/authorization`. This crate sees only the
+/// resulting [`GrantedDevice`]; no folder or netmap relationship is involved.
 ///
 /// Every Track Send offer -- same-account or not, netmap-visible or not --
 /// is gated by exactly ONE primitive: a short-lived, sender+receiver-bound
@@ -107,6 +141,9 @@ pub struct GrantedDevice {
     /// `device`'s key on this device, end then; see the daemon's
     /// `send_transfer` module for who reads it.
     pub expires_at_unix: i64,
+    /// The Send link the grant came from, when it did. Travels in the offer's manifest so the
+    /// receiver can tell which redeemed link an offer belongs to.
+    pub link_id: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -133,6 +170,12 @@ pub trait DeviceDirectory: Send + Sync {
     /// on this to name the sender it is about to ask `consume_grant` to
     /// validate.
     fn device_id_for_key(&self, signing_key: &[u8; 32]) -> Option<String>;
+
+    /// Called once for each offer that carries a Send link id and was newly recorded in the inbox
+    /// (grant consumed, manifest valid, accepted). The receiver's engine uses it to receive an offer
+    /// that belongs to a link this device redeemed, without another step; the default does nothing,
+    /// so the offer waits for an explicit receive.
+    fn link_offer_recorded(&self, _link_id: &str, _transfer_id: &str) {}
 
     /// Called by [`SendService::offer_send`] for EVERY outbound offer,
     /// unconditionally -- requests a Track Send rendezvous grant naming this
@@ -197,6 +240,12 @@ pub struct InboxEntry {
     pub status: &'static str,
     /// A closed code from [`crate::error::failure`] for a transfer that stopped with a reason.
     pub failure: Option<String>,
+    /// The Send link the offer arrived under, empty for any other offer.
+    pub link_id: String,
+    /// Bytes on disk so far while receiving; `total_size` once completed; 0 otherwise.
+    pub received_bytes: u64,
+    /// The folder chosen for the files, once a receive chose one.
+    pub destination_dir: Option<String>,
 }
 
 /// One outbound transfer for the sent list -- a decoded, display-ready view over a stored
@@ -238,9 +287,76 @@ pub struct ReceiveOutcome {
     pub bytes_received: u64,
 }
 
-/// How long one Track Send dial is given. iroh tries every address it has
-/// for the peer (direct and relayed) within this one attempt.
-const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// How the dials and the waits of a transfer are bounded. Defaults are what a person sitting at
+/// the other end of a transfer can be asked to wait; tests shorten them.
+#[derive(Debug, Clone, Copy)]
+pub struct Timing {
+    /// One dial attempt. iroh tries every address it has for the peer (direct and relayed)
+    /// within it. Shorter attempts were measured to do worse on a LAN behind one NAT, where
+    /// the answer is slow rather than lost.
+    pub dial_attempt: Duration,
+    /// All attempts together, with a pause that grows between them, before the dial is reported
+    /// as failed. Long enough for a hole punch to succeed on a later attempt or for the
+    /// relay to carry the handshake, short enough that a person is not left staring at a spinner.
+    pub dial_deadline: Duration,
+    /// How long a pull may receive nothing at all before its connection is treated as broken.
+    pub pull_idle: Duration,
+    /// How long a receive keeps re-dialing a sender it was fetching from, with no byte arriving,
+    /// before it gives up and reports the sender as gone.
+    pub pull_no_progress: Duration,
+    /// How long an accepted Send link transfer may go without its receiver fetching anything
+    /// before the sender reports that the receiver stopped.
+    pub receiver_idle: Duration,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Self {
+            dial_attempt: Duration::from_secs(10),
+            dial_deadline: Duration::from_secs(45),
+            pull_idle: Duration::from_secs(20),
+            pull_no_progress: Duration::from_secs(45),
+            receiver_idle: Duration::from_secs(3 * 60),
+        }
+    }
+}
+
+/// First pause between dial attempts; it doubles up to [`DIAL_BACKOFF_MAX`].
+const DIAL_BACKOFF_START: Duration = Duration::from_secs(1);
+const DIAL_BACKOFF_MAX: Duration = Duration::from_secs(4);
+
+/// How often the notices owed to senders are tried again.
+const NOTICE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The longest pause between tries of a notice whose sender stays unreachable.
+const NOTICE_RETRY_MAX: Duration = Duration::from_secs(15 * 60);
+
+/// How long a notice owed to a sender is kept trying. A sender unreachable for this long has
+/// long since shown the transfer as stopped by itself.
+const NOTICE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How far back an offer made under a Send link keeps admitting its recipient. The recipient is
+/// on another account, so the netmap never lists it and the grant it came in with ends within
+/// minutes; this is the transfer's own lifetime.
+const LINK_PULL_ADMISSION_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How often a serve notes that it is still going, for the sender's idle check.
+const ACTIVITY_NOTE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a pull for an offer this device has not yet recorded as answered waits for the answer
+/// (see `handle_pull`).
+const OFFER_ANSWER_WAIT: Duration = Duration::from_secs(5);
+
+/// How long the receiver gets to answer an offer once the connection is open.
+const OFFER_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a sender keeps re-offering under the same grant while the receiver's side refuses
+/// to talk. The grant reaches the receiver by a push that is independent of the sender's own
+/// grant response, and the receiver admits the sender only once it has it, so an offer dialed
+/// at once can find the door still shut. The grant is not spent until the receiver consumes it
+/// (an offer that never got in spent nothing), so the same offer is safe to repeat.
+const OFFER_ADMISSION_WINDOW: Duration = Duration::from_secs(20);
+const OFFER_ADMISSION_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Ceiling on how long a rejection path (`handle_offer`'s grant-check
 /// failure, `reject_pull`'s every reason) waits for `send.stopped()` --
@@ -274,11 +390,6 @@ pub const FINISHED_HISTORY_LIMIT: usize = 20;
 /// transfer finishes. Bounds the history, never what was received or sent.
 pub const FINISHED_RETAINED_LIMIT: usize = 100;
 
-/// A block newer than this is never reaped, whatever the transfers on record say: an offer writes
-/// its blocks before its transfer is recorded, and a put refreshes the age of a block it finds,
-/// so the grace covers that gap (and a sweep racing it).
-pub const BLOCK_REAP_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
-
 /// Removes a receive from the running set however it ends.
 struct ActiveReceive<'a> {
     running: &'a std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>,
@@ -304,6 +415,10 @@ pub struct SendService {
     /// Held, briefly and never across an await, by a cancel (its count and its write) and by a
     /// retry's final check and reopening, so the two cannot interleave.
     outbound_lifecycle: std::sync::Mutex<()>,
+    /// Held while a sent transfer's content is stored and recorded, and while unneeded blocks are
+    /// reaped, so a reap never sees blocks that are stored but not yet recorded. Taken before
+    /// `outbound_lifecycle` when both are.
+    block_lifecycle: std::sync::Mutex<()>,
     store: SendStore,
     block_store: SegmentBlockStore,
     directory: Arc<dyn DeviceDirectory>,
@@ -320,6 +435,18 @@ pub struct SendService {
     serve_gate: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     /// How long one chunk write may stall; see [`SERVE_WRITE_TIMEOUT`].
     serve_write_timeout: std::sync::Mutex<Duration>,
+    /// See [`OFFER_ADMISSION_WINDOW`].
+    offer_admission_window: std::sync::Mutex<Duration>,
+    timing: std::sync::Mutex<Timing>,
+    /// Woken when a transfer ends, so the notice owed to its sender goes out at once.
+    notice_wake: Arc<tokio::sync::Notify>,
+    /// Notices being delivered now, so one transfer's is never sent twice at once.
+    notices_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// For a notice that could not be delivered: when to try again, and the pause after that.
+    /// A sender that stays offline is tried less and less often, never more than every
+    /// [`NOTICE_RETRY_MAX`].
+    notice_backoff:
+        std::sync::Mutex<std::collections::HashMap<String, (tokio::time::Instant, Duration)>>,
     /// Test-only: makes the next chunk write never progress, as a receiver that stopped reading.
     #[cfg(any(test, feature = "test-support"))]
     stall_next_serve_write: std::sync::atomic::AtomicBool,
@@ -353,7 +480,7 @@ impl SendService {
         let store = SendStore::open(store_db_path)?;
         // A receive only runs inside the process that started it, so any
         // row still marked in progress was cut off by the previous exit.
-        store.interrupt_in_progress_inbound()?;
+        store.interrupt_in_progress_inbound(now_unix_nanos())?;
         // Whatever an earlier run left beyond the bound goes now.
         store.prune_finished(FINISHED_RETAINED_LIMIT, "")?;
         let service = Self {
@@ -361,6 +488,7 @@ impl SendService {
             running_receives: std::sync::Mutex::default(),
             outbound_cancels: std::sync::atomic::AtomicU64::new(0),
             outbound_lifecycle: std::sync::Mutex::new(()),
+            block_lifecycle: std::sync::Mutex::new(()),
             store,
             block_store: SegmentBlockStore::open_process_locked(block_store_root.as_ref())?,
             directory,
@@ -370,11 +498,18 @@ impl SendService {
             #[cfg(any(test, feature = "test-support"))]
             serve_gate: std::sync::Mutex::new(None),
             serve_write_timeout: std::sync::Mutex::new(SERVE_WRITE_TIMEOUT),
+            offer_admission_window: std::sync::Mutex::new(OFFER_ADMISSION_WINDOW),
+            timing: std::sync::Mutex::new(Timing::default()),
+            notice_wake: Arc::new(tokio::sync::Notify::new()),
+            notices_in_flight: std::sync::Mutex::default(),
+            notice_backoff: std::sync::Mutex::default(),
             #[cfg(any(test, feature = "test-support"))]
             stall_next_serve_write: std::sync::atomic::AtomicBool::new(false),
         };
         // Blocks an earlier run left behind (finished transfers, abandoned offers).
-        service.note(service.reap_blocks(BLOCK_REAP_GRACE));
+        // Nothing is running yet, so whatever no transfer needs goes: this is also what reclaims
+        // the blocks of a transfer that finished just before an earlier run stopped.
+        service.note(service.reap_blocks());
         Ok(service)
     }
 
@@ -459,6 +594,21 @@ impl SendService {
         None
     }
 
+    /// Replaces the dial and wait bounds; see [`Timing`].
+    pub fn set_timing(&self, timing: Timing) {
+        *self.timing.lock().unwrap_or_else(|p| p.into_inner()) = timing;
+    }
+
+    fn timing(&self) -> Timing {
+        *self.timing.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Bounds how long an offer is repeated while the receiver is not yet admitting this device
+    /// (see [`OFFER_ADMISSION_WINDOW`]).
+    pub fn set_offer_admission_window(&self, window: Duration) {
+        *self.offer_admission_window.lock().unwrap_or_else(|p| p.into_inner()) = window;
+    }
+
     // ---- sender side ---------------------------------------------------
 
     /// `yadorilink send <source_path> <target_device>`. Idempotent: a
@@ -471,6 +621,19 @@ impl SendService {
         source_path: &Path,
         target_device_query: &str,
     ) -> Result<SendOfferOutcome> {
+        self.offer_send_many(&[source_path.to_path_buf()], target_device_query).await
+    }
+
+    /// [`Self::offer_send`] for several files and/or folders in one transfer: the same source
+    /// set (in any order) to the same target re-drives the same transfer.
+    pub async fn offer_send_many(
+        &self,
+        sources: &[PathBuf],
+        target_device_query: &str,
+    ) -> Result<SendOfferOutcome> {
+        if sources.is_empty() {
+            return Err(SendError::EmptyManifest(String::new()));
+        }
         // A Track Send grant is mandatory for EVERY offer, unconditionally
         // -- `resolve()` is deliberately never consulted here. This device
         // already having an ordinary netmap/sync relationship with the
@@ -494,18 +657,31 @@ impl SendService {
         let target = granted.device;
         let grant_id = granted.grant_id;
         let grant_nonce = granted.grant_nonce;
-        let canonical_source = std::fs::canonicalize(source_path)?;
-        let canonical_source_str = canonical_source.to_string_lossy().into_owned();
+        let link_id = granted.link_id.unwrap_or_default();
+        let mut canonical_sources =
+            sources.iter().map(std::fs::canonicalize).collect::<std::io::Result<Vec<_>>>()?;
+        canonical_sources.sort();
+        canonical_sources.dedup();
+        let canonical_source_str = crate::manifest::encode_sources(&canonical_sources);
 
-        let existing = self
-            .store
-            .find_outbound_by_source_and_target(&canonical_source_str, &target.device_id)?;
+        // A transfer made outside this link is not this link's: the receiver tells links apart by
+        // the id in the manifest.
+        let existing = self.store.find_outbound_by_source_and_target(
+            &canonical_source_str,
+            &target.device_id,
+            &link_id,
+        )?;
         let outbound = match existing {
             Some(row) => row,
             None => {
+                let _blocks = self.block_lifecycle.lock().unwrap_or_else(|p| p.into_inner());
                 let transfer_id = uuid::Uuid::new_v4().to_string();
-                let (manifest, _total_size) =
-                    build_outbound_manifest(&self.block_store, &canonical_source, &transfer_id)?;
+                let (mut manifest, _total_size) = build_outbound_manifest_multi(
+                    &self.block_store,
+                    &canonical_sources,
+                    &transfer_id,
+                )?;
+                manifest.link_id = link_id;
                 let created_at_unix_nanos = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -534,7 +710,28 @@ impl SendService {
         grant_id: String,
         grant_nonce: String,
     ) -> Result<SendOfferOutcome> {
-        let result = self.offer_once(outbound, target, grant_id, grant_nonce).await;
+        let window = *self.offer_admission_window.lock().unwrap_or_else(|p| p.into_inner());
+        let started = tokio::time::Instant::now();
+        let mut attempt = 1u32;
+        let result = loop {
+            let result =
+                self.offer_once(outbound, target, grant_id.clone(), grant_nonce.clone()).await;
+            let Err(error) = &result else { break result };
+            // Only a receiver that could not be talked to is worth another go; a decline or any
+            // local failure is final.
+            if !error.is_unreachable() || started.elapsed() >= window {
+                break result;
+            }
+            tracing::info!(
+                transfer_id = %outbound.transfer_id,
+                target = %target.device_id,
+                attempt,
+                %error,
+                "Track Send: offer not accepted yet; the receiver may not hold the grant yet, offering again"
+            );
+            attempt += 1;
+            tokio::time::sleep(OFFER_ADMISSION_RETRY_INTERVAL).await;
+        };
         match &result {
             Ok(_) => self.note(self.store.clear_failure(&outbound.transfer_id)),
             Err(error) => {
@@ -547,19 +744,23 @@ impl SendService {
     /// [`SendStore::prune_finished`], then reaps the blocks that leaves unreferenced.
     fn prune_and_reap(&self, spare: &str) -> Result<()> {
         self.store.prune_finished(FINISHED_RETAINED_LIMIT, spare)?;
-        self.reap_blocks(BLOCK_REAP_GRACE)
+        self.reap_blocks()
     }
 
     /// Deletes the blocks no transfer on record can still need (see
-    /// [`SendStore::live_chunk_hashes`]) and that are older than `grace`. The block store is
-    /// Track Send's own, so nothing else references what it holds. Content that is shared
-    /// between transfers stays as long as any of them needs it.
-    pub(crate) fn reap_blocks(&self, grace: Duration) -> Result<()> {
+    /// [`SendStore::live_chunk_hashes`]). The block store is Track Send's own, so nothing else
+    /// references what it holds. Content that is shared between transfers stays as long as any of
+    /// them needs it. Idempotent, so a crash between a transfer finishing and this running is
+    /// repaired by the next run (see [`Self::new`]).
+    pub(crate) fn reap_blocks(&self) -> Result<()> {
+        let _blocks = self.block_lifecycle.lock().unwrap_or_else(|p| p.into_inner());
         let live = self.store.live_chunk_hashes()?;
-        let cutoff =
-            std::time::SystemTime::now().checked_sub(grace).unwrap_or(std::time::UNIX_EPOCH);
-        let report =
-            yadorilink_local_storage::BlockStore::sweep(&self.block_store, &live, cutoff, false)?;
+        let report = yadorilink_local_storage::BlockStore::sweep(
+            &self.block_store,
+            &live,
+            std::time::SystemTime::now(),
+            false,
+        )?;
         if report.blocks_deleted > 0 {
             tracing::debug!(
                 blocks = report.blocks_deleted,
@@ -584,7 +785,7 @@ impl SendService {
         grant_id: String,
         grant_nonce: String,
     ) -> Result<SendOfferOutcome> {
-        let connection = dial_send(&self.node, target).await?;
+        let connection = dial_send(&self.node, target, &self.timing()).await?;
         let (mut send, mut recv) = connection.open_stream().await?;
         write_message(
             &mut send,
@@ -596,7 +797,11 @@ impl SendService {
         )
         .await?;
         send.finish().ok();
-        let ack: SendManifestAck = read_message(&mut recv).await?;
+        let ack: SendManifestAck =
+            match tokio::time::timeout(OFFER_ACK_TIMEOUT, read_message(&mut recv)).await {
+                Ok(ack) => ack?,
+                Err(_) => return Err(SendError::OfferUnanswered(target.device_id.clone())),
+            };
         if !ack.accepted {
             // Terminal, not left in `Offered`: `handle_pull` requires
             // `Acked` before serving any chunk, so a receiver that just
@@ -618,7 +823,7 @@ impl SendService {
         // proven to fail closed (a spurious rejection the receiver simply
         // retries), never a security hole, but narrowing it costs nothing
         // here since neither statement depends on the other's result.
-        self.store.mark_outbound_acked(&outbound.transfer_id)?;
+        self.store.mark_outbound_acked(&outbound.transfer_id, now_unix_nanos())?;
         connection.close(close_code::DONE, b"offer complete");
         // Offered again while already accepted is the same offer, still going. Only a cancel that
         // landed while the offer was in flight makes it not so.
@@ -659,12 +864,32 @@ impl SendService {
                     OutboundStatus::Rejected => "declined",
                     OutboundStatus::Canceled => "canceled",
                 };
-                let can_retry = matches!(
-                    row.status,
-                    OutboundStatus::Offered | OutboundStatus::Rejected | OutboundStatus::Canceled
-                );
+                // A transfer under a Send link is offered once: the link's one grant is spent,
+                // so a second offer would need a new link, never a retry.
+                let under_link = !row.manifest.link_id.is_empty();
+                let can_retry = !under_link
+                    && matches!(
+                        row.status,
+                        OutboundStatus::Offered
+                            | OutboundStatus::Rejected
+                            | OutboundStatus::Canceled
+                    );
+                let mut failure = self.store.failure(&row.transfer_id)?;
+                if failure.is_none() && under_link && row.status == OutboundStatus::Acked {
+                    // A link's receiver fetches by itself, right after accepting. One that has
+                    // fetched nothing for this long (killed, offline, gone) is not coming back
+                    // on its own; it reads as stopped, and as going again if it does fetch.
+                    let idle_limit = self.timing().receiver_idle.as_nanos() as i64;
+                    let last = self
+                        .store
+                        .outbound_last_activity(&row.transfer_id)?
+                        .unwrap_or(row.created_at_unix_nanos);
+                    if now_unix_nanos().saturating_sub(last) > idle_limit {
+                        failure = Some(failure::RECEIVER_STOPPED.to_string());
+                    }
+                }
                 Ok(SentEntry {
-                    failure: self.store.failure(&row.transfer_id)?,
+                    failure,
                     transfer_id: row.transfer_id,
                     target_device_id: row.target_device_id,
                     files: row
@@ -687,9 +912,12 @@ impl SendService {
     /// once and any later pull is refused; the receiver's copy of what it already got is not
     /// touched.
     fn cancel_outbound(&self, transfer_id: &str) -> Result<()> {
-        let _lifecycle = self.outbound_lifecycle.lock().unwrap_or_else(|p| p.into_inner());
-        self.outbound_cancels.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if self.store.cancel_outbound(transfer_id)? {
+        let canceled = {
+            let _lifecycle = self.outbound_lifecycle.lock().unwrap_or_else(|p| p.into_inner());
+            self.outbound_cancels.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.store.cancel_outbound(transfer_id)?
+        };
+        if canceled {
             self.note(self.prune_and_reap(transfer_id));
         }
         Ok(())
@@ -715,9 +943,9 @@ impl SendService {
                 status: outbound.status.as_str(),
             });
         }
-        match build_outbound_manifest(
+        match build_outbound_manifest_multi(
             &crate::manifest::HashOnlyStore,
-            Path::new(&outbound.source_path),
+            &crate::manifest::decode_sources(&outbound.source_path),
             transfer_id,
         ) {
             Ok((rebuilt, _)) if same_files(&rebuilt, &outbound.manifest) => {}
@@ -743,6 +971,20 @@ impl SendService {
             ));
         }
         {
+            // The content of a finished transfer was released, so it is stored again, and
+            // checked once more against the offer, before the transfer is live again.
+            let _blocks = self.block_lifecycle.lock().unwrap_or_else(|p| p.into_inner());
+            match build_outbound_manifest_multi(
+                &self.block_store,
+                &crate::manifest::decode_sources(&outbound.source_path),
+                transfer_id,
+            ) {
+                Ok((rebuilt, _)) if same_files(&rebuilt, &outbound.manifest) => {}
+                Ok(_) | Err(SendError::EmptyManifest(_)) => {
+                    return Err(SendError::SourceChanged(transfer_id.to_string()));
+                }
+                Err(error) => return Err(error),
+            }
             // Checked and written with no cancel in between.
             let _lifecycle = self.outbound_lifecycle.lock().unwrap_or_else(|p| p.into_inner());
             if self.outbound_cancels.load(std::sync::atomic::Ordering::SeqCst) != cancels_seen
@@ -769,8 +1011,16 @@ impl SendService {
         let rows = self.store.list_inbound_recent(FINISHED_HISTORY_LIMIT)?;
         rows.into_iter()
             .map(|row| {
+                let received_bytes = match row.status {
+                    InboundStatus::Completed => row.manifest.total_size,
+                    InboundStatus::InProgress => self.present_bytes(&row.manifest)?,
+                    _ => 0,
+                };
                 Ok(InboxEntry {
                     failure: self.store.failure(&row.transfer_id)?,
+                    link_id: row.manifest.link_id.clone(),
+                    received_bytes,
+                    destination_dir: row.destination_dir.clone(),
                     transfer_id: row.transfer_id,
                     sender_device_id: row.sender_device_id,
                     files: row
@@ -785,6 +1035,25 @@ impl SendService {
                 })
             })
             .collect()
+    }
+
+    /// Bytes of `manifest` already in this device's block store: what a receive in progress has
+    /// pulled so far.
+    fn present_bytes(&self, manifest: &SendManifest) -> Result<u64> {
+        let mut total = 0u64;
+        for entry in &manifest.files {
+            if entry.chunk_hashes.is_empty() {
+                continue;
+            }
+            let hex_hashes: Vec<String> = entry.chunk_hashes.iter().map(hex::encode).collect();
+            let present = self.block_store.present_blocks(&hex_hashes)?;
+            for (idx, here) in present.iter().enumerate() {
+                if *here {
+                    total += u64::from(crate::manifest::chunk_byte_size(entry, idx)?);
+                }
+            }
+        }
+        Ok(total)
     }
 
     /// `yadorilink receive <transfer_id> [--to <dir>]` -- the explicit
@@ -815,16 +1084,16 @@ impl SendService {
         };
         if let Err(error) = &result {
             // Only a row still in progress becomes failed: a canceled one
-            // stays canceled.
-            match self.store.fail_inbound(transfer_id) {
-                Ok(true) => {
-                    self.note(self.store.record_failure(transfer_id, error.failure_code()));
-                }
+            // stays canceled. The reason and the sender's notice go in with the status.
+            match self.store.fail_inbound(transfer_id, error.failure_code(), now_unix_nanos()) {
+                Ok(true) => self.notice_wake.notify_one(),
                 Ok(false) => {}
                 Err(error) => {
                     tracing::warn!(%error, transfer_id, "Track Send: could not record a failed receive");
                 }
             }
+            // A receive stopped by a cancel may have stored a last block after the cancel reaped.
+            self.note(self.reap_blocks());
         }
         result
     }
@@ -853,19 +1122,12 @@ impl SendService {
         let destination_dir = PathBuf::from(destination_dir);
         std::fs::create_dir_all(&destination_dir)?;
 
-        let sender = self
-            .directory
-            .resolve(&inbound.sender_device_id)
-            .ok_or_else(|| SendError::NoKnownAddress(inbound.sender_device_id.clone()))?;
+        let sender = self.sender_of(&inbound)?;
 
         let mut files_received = Vec::new();
         let mut bytes_received: u64 = 0;
         for (file_index, entry) in inbound.manifest.files.iter().enumerate() {
-            let first_missing = first_missing_chunk(&self.block_store, &entry.chunk_hashes)?;
-            if let Some(start_chunk_index) = first_missing {
-                self.pull_file(&sender, transfer_id, file_index as u32, entry, start_chunk_index)
-                    .await?;
-            }
+            self.pull_whole_file(&sender, transfer_id, file_index as u32, entry).await?;
             let out_path = safe_join(&destination_dir, &entry.relative_path)?;
             let blocks = entry
                 .chunk_hashes
@@ -892,24 +1154,84 @@ impl SendService {
             bytes_received += entry.size;
         }
 
-        self.store.mark_inbound_completed(transfer_id)?;
-        self.note(self.store.clear_failure(transfer_id));
+        // Completed, the failure note gone, and the sender owed the news -- in one transaction.
+        // The notice is delivered in the background and kept until the sender answers it.
+        self.store.mark_inbound_completed(transfer_id, now_unix_nanos())?;
+        self.notice_wake.notify_one();
         self.note(self.prune_and_reap(transfer_id));
-        self.tell_sender_done(sender, transfer_id);
         Ok(ReceiveOutcome { destination_dir, files_received, bytes_received })
     }
 
-    /// Tells the sender, in the background and best effort, that every file arrived, so its sent
-    /// list can show the transfer as completed. Nothing waits on it and a failure only means the
-    /// sender keeps showing the transfer as accepted.
-    fn tell_sender_done(&self, sender: ResolvedDevice, transfer_id: &str) {
-        let node = self.node.clone();
-        let transfer_id = transfer_id.to_string();
-        tokio::spawn(async move {
-            if let Err(error) = send_done(&node, &sender, &transfer_id).await {
-                tracing::debug!(%error, transfer_id, "Track Send: could not tell the sender the transfer finished");
+    /// Who to pull `inbound` from: the device as the directory knows it now, else as it was
+    /// reached when the offer was accepted (a sender on another account is known to the directory
+    /// only while its grant lives).
+    fn sender_of(&self, inbound: &crate::store::InboundTransfer) -> Result<ResolvedDevice> {
+        if let Some(device) = self.directory.resolve(&inbound.sender_device_id) {
+            return Ok(device);
+        }
+        self.store
+            .inbound_sender_address(&inbound.transfer_id)?
+            .and_then(|text| ResolvedDevice::decode(&inbound.sender_device_id, &text))
+            .ok_or_else(|| SendError::NoKnownAddress(inbound.sender_device_id.clone()))
+    }
+
+    /// Pulls every chunk of `entry` this device does not hold yet. A pull that breaks part way
+    /// (the connection dropped, the sender stopped sending, a dial failed) is resumed from the
+    /// first missing chunk for as long as bytes keep arriving, and for [`Timing::pull_no_progress`]
+    /// after the last one; after that the sender is reported gone. A refusal, a corrupt chunk or a
+    /// local fault ends the pull at once.
+    async fn pull_whole_file(
+        &self,
+        sender: &ResolvedDevice,
+        transfer_id: &str,
+        file_index: u32,
+        entry: &SendFileEntry,
+    ) -> Result<()> {
+        let mut last_progress = tokio::time::Instant::now();
+        let mut pause = DIAL_BACKOFF_START;
+        loop {
+            let Some(start) = first_missing_chunk(&self.block_store, &entry.chunk_hashes)? else {
+                return Ok(());
+            };
+            let timing = self.timing();
+            let outcome = self
+                .pull_file(sender, transfer_id, file_index, entry, start, &mut last_progress)
+                .await;
+            match outcome {
+                Ok(()) => {
+                    // Whole, or the sender ended the stream early: either way what is missing is
+                    // asked for again, but a pull that gained nothing must not loop.
+                    match first_missing_chunk(&self.block_store, &entry.chunk_hashes)? {
+                        Some(next) if next <= start => {
+                            return Err(SendError::Protocol(format!(
+                                "file {file_index}: the peer ended the pull before chunk {start}"
+                            )));
+                        }
+                        _ => {}
+                    }
+                }
+                Err(error) if error.is_unreachable() => {
+                    if last_progress.elapsed() >= timing.pull_no_progress {
+                        tracing::info!(
+                            transfer_id, %error,
+                            "Track Send: the sender stopped sending and could not be reached again"
+                        );
+                        return Err(match error {
+                            // This device's own network refusing is not the sender's doing.
+                            SendError::DialFailed {
+                                reason: DialReason::LocalNetworkBlocked,
+                                ..
+                            } => error,
+                            _ => SendError::SenderGone(sender.device_id.clone()),
+                        });
+                    }
+                    tracing::debug!(transfer_id, %error, "Track Send: the pull broke; resuming");
+                    tokio::time::sleep(pause).await;
+                    pause = (pause * 2).min(DIAL_BACKOFF_MAX);
+                }
+                Err(error) => return Err(error),
             }
-        });
+        }
     }
 
     /// Stops the running receive of `transfer_id`, if any, and marks the
@@ -925,7 +1247,8 @@ impl SendService {
                 .ok_or_else(|| SendError::UnknownTransfer(transfer_id.to_string()))?;
             return self.cancel_outbound(transfer_id);
         }
-        if self.store.cancel_inbound(transfer_id)? {
+        if self.store.cancel_inbound(transfer_id, now_unix_nanos())? {
+            self.notice_wake.notify_one();
             self.note(self.prune_and_reap(transfer_id));
         }
         if let Some(cancel) =
@@ -934,6 +1257,30 @@ impl SendService {
             cancel.notify_one();
         }
         Ok(())
+    }
+
+    /// Ends every receive running in this process so each is recorded as stopped (failed with
+    /// the interrupted reason) rather than left in progress, and waits, for at most `bound`,
+    /// until they have. Unlike [`Self::cancel_transfer`] this does not mark a transfer canceled:
+    /// a later receive resumes it. For a process about to stop serving, such as a mobile
+    /// host being suspended.
+    pub async fn interrupt_receives(&self, bound: Duration) {
+        let pending: Vec<Arc<tokio::sync::Notify>> = self
+            .running_receives
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        for cancel in &pending {
+            cancel.notify_one();
+        }
+        let deadline = tokio::time::Instant::now() + bound;
+        while !self.running_receives.lock().unwrap_or_else(|p| p.into_inner()).is_empty()
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// Resumes a failed or canceled inbound transfer. Before anything is
@@ -952,9 +1299,7 @@ impl SendService {
                 status: inbound.status.as_str(),
             });
         }
-        self.directory
-            .resolve(&inbound.sender_device_id)
-            .ok_or_else(|| SendError::NoKnownAddress(inbound.sender_device_id.clone()))?;
+        self.sender_of(&inbound)?;
         crate::manifest::validate_offered_manifest(&inbound.manifest)
             .map_err(SendError::Protocol)?;
         if let Some(destination) = inbound.destination_dir.as_deref() {
@@ -986,8 +1331,10 @@ impl SendService {
         file_index: u32,
         entry: &SendFileEntry,
         start_chunk_index: u32,
+        last_progress: &mut tokio::time::Instant,
     ) -> Result<()> {
-        let connection = dial_send(&self.node, sender).await?;
+        let timing = self.timing();
+        let connection = dial_send(&self.node, sender, &timing).await?;
         let (mut send, mut recv) = connection.open_stream().await?;
         write_message(
             &mut send,
@@ -1027,7 +1374,8 @@ impl SendService {
         let total_chunks = entry.chunk_hashes.len() as u32;
         let mut next_chunk_index = start_chunk_index;
         while next_chunk_index < total_chunks {
-            let message: ChunkStreamMessage = read_message(&mut recv).await?;
+            let message: ChunkStreamMessage =
+                idle(timing.pull_idle, read_message(&mut recv)).await?;
             match message.payload {
                 Some(chunk_stream_message::Payload::Rejected(ChunkPullRejected { reason })) => {
                     connection.close(close_code::REJECTED, b"pull rejected");
@@ -1057,7 +1405,7 @@ impl SendService {
                             "file {file_index} chunk {chunk_index}: expected {expected_size} bytes, peer declared {size}"
                         )));
                     }
-                    let body = read_body(&mut recv, size as usize).await?;
+                    let body = idle(timing.pull_idle, read_body(&mut recv, size as usize)).await?;
                     // Verified against this device's own manifest hash
                     // BEFORE ever reaching the block store. Content-
                     // addressing alone would keep a mismatched chunk from
@@ -1081,6 +1429,7 @@ impl SendService {
                     // comment) -- `SegmentBlockStore::put`'s single-item commit
                     // path fsyncs before returning, every time.
                     self.block_store.put(&body)?;
+                    *last_progress = tokio::time::Instant::now();
                     if let Some(pause) = self.note_chunk_confirmed() {
                         // Parks here forever (see `ChunkAbortHook::pause`'s
                         // own doc comment) -- a real crash-recovery test
@@ -1118,6 +1467,23 @@ impl SendService {
         })
     }
 
+    /// Whether the device holding `peer_key` is the recipient of an offer this device made under a
+    /// Send link. Such a recipient is on another account, so no netmap lists it, and the grant
+    /// that let it in is gone minutes after the offer; the offer itself is what admits it, for
+    /// [`LINK_PULL_ADMISSION_WINDOW`], to fetch the content, report how its receive ended, or be
+    /// told the sender canceled. Every stream it opens is still checked against the transfer
+    /// (`handle_pull`, `handle_done`, `handle_ended`): the recipient's key must be the one the
+    /// offer named.
+    pub fn expects_link_recipient(&self, peer_key: &[u8; 32]) -> bool {
+        let since = now_unix_nanos().saturating_sub(
+            i64::try_from(LINK_PULL_ADMISSION_WINDOW.as_nanos()).unwrap_or(i64::MAX),
+        );
+        self.store.has_link_outbound_for(peer_key, since).unwrap_or_else(|error| {
+            tracing::warn!(%error, "Track Send: could not read outbound offers; refusing");
+            false
+        })
+    }
+
     /// Serves every inbound Track Send connection in `inbound` for the life
     /// of this service. Each connection is handled on its own spawned task
     /// so one slow or stalled peer cannot hold up another's offer or pull.
@@ -1125,12 +1491,110 @@ impl SendService {
         self: Arc<Self>,
         mut inbound: tokio::sync::mpsc::Receiver<TrackSendConnection>,
     ) {
+        tokio::spawn(run_notice_loop(Arc::downgrade(&self), self.notice_wake.clone()));
         while let Some(connection) = inbound.recv().await {
             let service = self.clone();
             tokio::spawn(async move {
                 service.serve_connection(connection).await;
             });
         }
+    }
+
+    /// Delivers, in the background, every notice owed to a sender that has not answered yet: the
+    /// transfer completed, was canceled, or failed here. A notice that cannot be delivered now (the
+    /// sender is offline) stays on record and is tried again, so the sender converges on what
+    /// happened here as soon as it can be reached.
+    fn deliver_pending_notices(self: &Arc<Self>) {
+        let keep_since = now_unix_nanos()
+            .saturating_sub(i64::try_from(NOTICE_RETENTION.as_nanos()).unwrap_or(i64::MAX));
+        let pending = match self.store.pending_notices(keep_since) {
+            Ok(pending) => pending,
+            Err(error) => {
+                tracing::warn!(%error, "Track Send: could not read the notices owed to senders");
+                return;
+            }
+        };
+        for (transfer_id, outcome) in pending {
+            let waiting = self
+                .notice_backoff
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&transfer_id)
+                .is_some_and(|(next, _)| tokio::time::Instant::now() < *next);
+            if waiting {
+                continue;
+            }
+            if !self
+                .notices_in_flight
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(transfer_id.clone())
+            {
+                continue;
+            }
+            let service = self.clone();
+            tokio::spawn(async move {
+                let delivered = service.deliver_notice(&transfer_id, &outcome).await;
+                service
+                    .notices_in_flight
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&transfer_id);
+                match delivered {
+                    Ok(()) => {
+                        service
+                            .notice_backoff
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&transfer_id);
+                        service.note(service.store.clear_notice(&transfer_id, &outcome));
+                    }
+                    Err(error) => {
+                        let mut backoff =
+                            service.notice_backoff.lock().unwrap_or_else(|p| p.into_inner());
+                        let pause =
+                            backoff.get(&transfer_id).map_or(NOTICE_RETRY_INTERVAL, |(_, last)| {
+                                (*last * 2).min(NOTICE_RETRY_MAX)
+                            });
+                        backoff.insert(
+                            transfer_id.clone(),
+                            (tokio::time::Instant::now() + pause, pause),
+                        );
+                        tracing::debug!(
+                            %error, transfer_id,
+                            "Track Send: could not tell the sender how the transfer ended yet"
+                        );
+                    }
+                }
+            });
+        }
+    }
+
+    async fn deliver_notice(&self, transfer_id: &str, outcome: &str) -> Result<()> {
+        let inbound = self
+            .store
+            .get_inbound(transfer_id)?
+            .ok_or_else(|| SendError::UnknownTransfer(transfer_id.to_string()))?;
+        let sender = self.sender_of(&inbound)?;
+        let payload = match outcome {
+            "completed" => {
+                send_envelope::Payload::Done(TransferDone { transfer_id: transfer_id.to_string() })
+            }
+            other => send_envelope::Payload::Ended(TransferEnded {
+                transfer_id: transfer_id.to_string(),
+                outcome: if other == "canceled" {
+                    transfer_ended::Outcome::Canceled
+                } else {
+                    transfer_ended::Outcome::Failed
+                } as i32,
+                failure: if other == "failed" {
+                    self.store.failure(transfer_id)?.unwrap_or_default()
+                } else {
+                    String::new()
+                },
+            }),
+        };
+        send_notice(&self.node, &sender, &self.timing(), payload).await
     }
 
     async fn serve_connection(&self, connection: TrackSendConnection) {
@@ -1166,6 +1630,9 @@ impl SendService {
             }
             Some(send_envelope::Payload::Done(done)) => {
                 self.handle_done(&mut send, peer_key, done).await
+            }
+            Some(send_envelope::Payload::Ended(ended)) => {
+                self.handle_ended(&mut send, peer_key, ended).await
             }
             None => {
                 connection.close(close_code::PROTOCOL_ERROR, b"empty envelope");
@@ -1233,14 +1700,25 @@ impl SendService {
             .as_nanos() as i64;
         // Durably recorded BEFORE the ack -- see `SendStore::
         // insert_inbound_if_new`'s own doc comment.
-        self.store.insert_inbound_if_new(
+        // How the sender was reached, kept with the offer: its grant (the only way a sender on
+        // another account is known here) does not outlive the process.
+        let sender_address = self
+            .directory
+            .resolve(&sender_device_id)
+            .map(|device| device.encode())
+            .unwrap_or_default();
+        let recorded = self.store.insert_inbound_if_new(
             &manifest.transfer_id,
             &sender_device_id,
+            &sender_address,
             &manifest,
             offered_at_unix_nanos,
         )?;
         write_message(send, &SendManifestAck { accepted: true, reason: String::new() }).await?;
         send.finish().ok();
+        if recorded && !manifest.link_id.is_empty() {
+            self.directory.link_offer_recorded(&manifest.link_id, &manifest.transfer_id);
+        }
         Ok(())
     }
 
@@ -1275,6 +1753,35 @@ impl SendService {
         Ok(())
     }
 
+    /// The receiver says its transfer ended without completing. Either way the reason is noted on
+    /// the transfer, which stays accepted: the receiver may retry what it canceled or failed, and
+    /// its next served-through pull clears the note. The sender's list and its Send link read
+    /// the note as stopped meanwhile. Answered not accepted, and nothing changes, for a transfer
+    /// not offered to this exact device.
+    async fn handle_ended(
+        &self,
+        send: &mut TrackSendWriter,
+        peer_key: [u8; 32],
+        ended: TransferEnded,
+    ) -> Result<()> {
+        let known = matches!(
+            self.store.get_outbound(&ended.transfer_id)?,
+            Some(outbound) if outbound.target_signing_key == peer_key
+        );
+        let reason = match transfer_ended::Outcome::try_from(ended.outcome) {
+            Ok(transfer_ended::Outcome::Canceled) => Some(failure::RECEIVER_CANCELED),
+            Ok(transfer_ended::Outcome::Failed) => Some(failure::RECEIVER_STOPPED),
+            _ => None,
+        };
+        let accepted = known && reason.is_some();
+        if accepted {
+            self.note(self.store.note_serve_outcome(&ended.transfer_id, reason));
+        }
+        write_message(send, &SendManifestAck { accepted, reason: String::new() }).await?;
+        send.finish().ok();
+        Ok(())
+    }
+
     async fn handle_pull(
         &self,
         connection: &TrackSendConnection,
@@ -1294,7 +1801,20 @@ impl SendService {
         // exactly this check; an offer still in `Offered` -- the ack has
         // not landed yet, or never will -- is refused the same way, since
         // this device has no record it was ever accepted.
-        let outbound = self.store.get_outbound(&pull.transfer_id)?;
+        let mut outbound = self.store.get_outbound(&pull.transfer_id)?;
+        // A receiver that auto-receives dials back the moment it has answered the offer, which can
+        // be before this device has recorded that answer (`offer_once` writes `Acked` after reading
+        // the ack). Give the answer a moment to land rather than refusing the device the offer
+        // was made to; a decline moves the row to `Rejected`, which is refused below.
+        let wait_until = tokio::time::Instant::now() + OFFER_ANSWER_WAIT;
+        while matches!(
+            &outbound,
+            Some(o) if o.status == OutboundStatus::Offered && o.target_signing_key == peer_key
+        ) && tokio::time::Instant::now() < wait_until
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            outbound = self.store.get_outbound(&pull.transfer_id)?;
+        }
         let outbound = match outbound {
             Some(outbound) if outbound.target_signing_key != peer_key => {
                 return self
@@ -1304,14 +1824,8 @@ impl SendService {
             Some(outbound) if outbound.status == OutboundStatus::Canceled => {
                 return self.reject_pull(connection, send, PULL_REASON_CANCELED).await;
             }
-            // A completed transfer keeps serving: a receiver that could not finish writing
-            // pulls again.
-            Some(outbound)
-                if !matches!(
-                    outbound.status,
-                    OutboundStatus::Acked | OutboundStatus::Completed
-                ) =>
-            {
+            // Only an accepted transfer is served: a completed one has released its content.
+            Some(outbound) if outbound.status != OutboundStatus::Acked => {
                 return self.reject_pull(connection, send, PULL_REASON_NOT_ACCEPTED).await;
             }
             Some(outbound) => outbound,
@@ -1354,13 +1868,16 @@ impl SendService {
                 proceed.notified().await;
             }
         }
+        let mut last_noted = tokio::time::Instant::now();
+        self.note(self.store.touch_outbound_activity(transfer_id, now_unix_nanos()));
         for chunk_index in start_chunk_index..num_chunks {
+            if last_noted.elapsed() >= ACTIVITY_NOTE_INTERVAL {
+                last_noted = tokio::time::Instant::now();
+                self.note(self.store.touch_outbound_activity(transfer_id, now_unix_nanos()));
+            }
             // Anything but an accepted (or completed) transfer stops the pull: a canceled one, or
             // one that is gone.
-            if !matches!(
-                self.store.outbound_status(transfer_id)?,
-                Some(OutboundStatus::Acked | OutboundStatus::Completed)
-            ) {
+            if self.store.outbound_status(transfer_id)? != Some(OutboundStatus::Acked) {
                 return Ok(false);
             }
             let hash = &entry.chunk_hashes[chunk_index as usize];
@@ -1469,26 +1986,64 @@ async fn within<T>(
     }
 }
 
-/// Tells `sender` that `transfer_id` arrived whole and waits for its answer, so the message is not
-/// lost to the connection closing first.
-async fn send_done(node: &SubstrateNode, sender: &ResolvedDevice, transfer_id: &str) -> Result<()> {
-    let connection = dial_send(node, sender).await?;
+/// Tells `sender` how a transfer ended here (`payload`: `Done` or `Ended`) and waits for its
+/// answer, so the message is not lost to the connection closing first. Any answer, accepting or
+/// not, means the sender has dealt with it.
+async fn send_notice(
+    node: &SubstrateNode,
+    sender: &ResolvedDevice,
+    timing: &Timing,
+    payload: send_envelope::Payload,
+) -> Result<()> {
+    let connection = dial_send(node, sender, timing).await?;
     let (mut send, mut recv) = connection.open_stream().await?;
     write_message(
         &mut send,
         &SendEnvelope {
-            payload: Some(send_envelope::Payload::Done(TransferDone {
-                transfer_id: transfer_id.to_string(),
-            })),
+            payload: Some(payload),
             grant_id: String::new(),
             grant_nonce: String::new(),
         },
     )
     .await?;
     send.finish().ok();
-    let _answer: SendManifestAck = read_message(&mut recv).await?;
-    connection.close(close_code::DONE, b"done noted");
+    let _answer: SendManifestAck = idle(timing.pull_idle, read_message(&mut recv)).await?;
+    connection.close(close_code::DONE, b"notice noted");
     Ok(())
+}
+
+/// Delivers the notices owed to senders: at once when a transfer ends here, and again every
+/// [`NOTICE_RETRY_INTERVAL`] for the ones not yet answered (also right after startup, for a
+/// receive the previous process left unfinished). Ends with the service.
+async fn run_notice_loop(service: std::sync::Weak<SendService>, wake: Arc<tokio::sync::Notify>) {
+    loop {
+        let Some(strong) = service.upgrade() else { return };
+        strong.deliver_pending_notices();
+        drop(strong);
+        // Holds the wake-up only, never the service, while it waits.
+        let _ = tokio::time::timeout(NOTICE_RETRY_INTERVAL, wake.notified()).await;
+    }
+}
+
+/// `future`, or a transport error when it has produced nothing for `limit`: the other end went
+/// silent, and the connection is as good as lost.
+async fn idle<T>(
+    limit: Duration,
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(limit, future).await {
+        Ok(result) => result,
+        Err(_) => Err(SendError::Transport(yadorilink_transport::TransportError::Io(
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "the other device stopped sending"),
+        ))),
+    }
+}
+
+fn now_unix_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64
 }
 
 /// Whether two manifests offer the same files with the same content.
@@ -1543,13 +2098,126 @@ async fn read_body(recv: &mut TrackSendReader, len: usize) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Dials `device` on the Track Send ALPN, giving up after [`DIAL_TIMEOUT`].
-/// The handshake accepts an answer from `device.signing_key` only.
-async fn dial_send(node: &SubstrateNode, device: &ResolvedDevice) -> Result<TrackSendConnection> {
-    match tokio::time::timeout(DIAL_TIMEOUT, node.connect_track_send(&device.address())).await {
-        Ok(connection) => Ok(connection?),
-        Err(_) => Err(SendError::DialTimedOut(device.device_id.clone())),
+/// Dials `device` on the Track Send ALPN. Attempts of [`Timing::dial_attempt`] each follow one
+/// another, with a pause that doubles between them, until one connects or
+/// [`Timing::dial_deadline`] has passed; the failure then says what was tried and, when it can
+/// tell, why nothing answered. The handshake accepts an answer from `device.signing_key` only.
+async fn dial_send(
+    node: &SubstrateNode,
+    device: &ResolvedDevice,
+    timing: &Timing,
+) -> Result<TrackSendConnection> {
+    let started = tokio::time::Instant::now();
+    let mut pause = DIAL_BACKOFF_START;
+    let mut attempts = 0u32;
+    let (reason, last_error) = loop {
+        attempts += 1;
+        let left = timing.dial_deadline.saturating_sub(started.elapsed());
+        let limit = timing.dial_attempt.min(left.max(Duration::from_millis(1)));
+        // Every attempt tries all the addresses at once (iroh races the direct ones and the
+        // relay); every second attempt also drops the direct ones, so a direct path that
+        // answers nothing cannot keep the relay from carrying the handshake.
+        let address =
+            if attempts.is_multiple_of(2) { device.relay_address() } else { device.address() };
+        let failed = match tokio::time::timeout(limit, node.connect_track_send(&address)).await {
+            Ok(Ok(connection)) => {
+                if attempts > 1 {
+                    tracing::info!(device = %device.device_id, attempts, "Track Send: reached the device after retrying");
+                }
+                return Ok(connection);
+            }
+            Ok(Err(yadorilink_sync_substrate::SubstrateError::TrackSendDial {
+                failure,
+                message,
+            })) => (
+                match failure {
+                    yadorilink_sync_substrate::DialFailure::NoAddress => DialReason::NoAddress,
+                    yadorilink_sync_substrate::DialFailure::Refused => DialReason::Refused,
+                    yadorilink_sync_substrate::DialFailure::NoResponse => DialReason::NoResponse,
+                },
+                message,
+            ),
+            Ok(Err(other)) => (DialReason::NoResponse, other.to_string()),
+            Err(_) => (DialReason::NoResponse, "the handshake never completed".to_string()),
+        };
+        if started.elapsed() + pause >= timing.dial_deadline {
+            break failed;
+        }
+        tracing::debug!(device = %device.device_id, attempts, reason = ?failed.0, error = %failed.1, "Track Send: dial failed; trying again");
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(DIAL_BACKOFF_MAX);
+    };
+    // Nothing answered. When this device's own network is what refuses the local network, that
+    // is the reason, and the one to show: nothing the other device does can fix it.
+    let blocked = matches!(reason, DialReason::NoResponse | DialReason::NoAddress)
+        && local_network_refused(&device.direct_addresses);
+    let waited = started.elapsed().as_secs();
+    let (reason, detail) = if blocked {
+        (
+            DialReason::LocalNetworkBlocked,
+            "this device's operating system refuses to send to the local network (on macOS, the \
+             Local Network permission; elsewhere a firewall or VPN), so a device on the same \
+             network cannot be reached; a device reachable over the internet still can be"
+                .to_string(),
+        )
+    } else {
+        let tried = format!(
+            "{} direct address(es) and {} relay(s) were known",
+            device.direct_addresses.len(),
+            device.relay_urls.len()
+        );
+        let detail = match reason {
+            DialReason::NoAddress => format!("no address is known for it ({tried})"),
+            DialReason::Refused => format!("it refused the connection ({last_error})"),
+            _ => format!(
+                "the handshake never completed in {waited}s over {attempts} attempt(s) ({tried}); \
+                 the device may be offline or asleep, or a firewall may be blocking the connection \
+                 ({last_error})"
+            ),
+        };
+        (reason, detail)
+    };
+    Err(SendError::DialFailed { device_id: device.device_id.clone(), reason, detail })
+}
+
+/// Whether this device's operating system refuses to send to the local network: a datagram to one
+/// of the device's private addresses fails with "host unreachable" or "no route" right at the
+/// call, which is how macOS answers a process without the Local Network permission and how a
+/// firewall can. Nothing arrives and nothing waits for a reply; the datagram is empty.
+fn local_network_refused(addresses: &[std::net::SocketAddr]) -> bool {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    let refused = addresses.iter().filter(|a| is_local_network(a.ip())).any(|address| {
+        let bind = if address.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+        std::net::UdpSocket::bind(bind)
+            .and_then(|socket| socket.send_to(&[], address))
+            .is_err_and(|error| is_host_unreachable(&error))
+    });
+    if refused {
+        LOGGED.call_once(|| {
+            tracing::warn!(
+                "Track Send: this device's operating system refuses to send to the local network \
+                 (on macOS: allow Local Network access for the app in System Settings > Privacy \
+                 & Security); only paths over the internet and relays can work until then"
+            );
+        });
     }
+    refused
+}
+
+fn is_local_network(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// EHOSTUNREACH: 65 on macOS and the BSDs, 113 on Linux, 10065 (WSAEHOSTUNREACH) on Windows.
+fn is_host_unreachable(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::HostUnreachable
+        || matches!(error.raw_os_error(), Some(65 | 113 | 10065))
 }
 
 /// Regression tests proving that a Send offer requires a validated,

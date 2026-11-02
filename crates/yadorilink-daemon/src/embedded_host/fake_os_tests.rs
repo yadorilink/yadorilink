@@ -78,9 +78,8 @@ fn request(root_id: &[u8], seq: u64, kind: ProviderChangeKind) -> ProviderApplyC
         root_id: root_id.to_vec(),
         kind: kind as i32,
         metadata: Some(ProviderItemMetadata {
-            unix_mode: Some(0o644),
+            exec: None,
             mtime_unix_nanos: Some(1_700_000_000_000_000_000),
-            ..Default::default()
         }),
         ..Default::default()
     }
@@ -141,13 +140,13 @@ impl Client {
     fn normalize(&mut self, label: &str, response: &ProviderApplyChangeResponse) -> String {
         let item = response.item.as_ref().map(|item| {
             format!(
-                "{} name={} parent_root={} kind={} size={} mode={:o} current={} content={} rev={} pgen={}",
+                "{} name={} parent_root={} kind={} size={} exec={} current={} content={} rev={} pgen={}",
                 self.ordinal(&item.item_id),
                 item.name,
                 item.parent_item_id.is_empty(),
                 item.entry_kind,
                 item.size,
-                item.unix_mode,
+                item.exec,
                 item.current,
                 hex::encode(&item.content_version),
                 item.namespace_revision,

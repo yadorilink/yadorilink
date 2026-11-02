@@ -6,21 +6,31 @@
 //! installer elects through. The daemon is not asked: the app, which could report them, may not be
 //! running, and the state belongs to the system, not to a file of ours.
 
+// A build may name other ids through the build-time environment variable below; unset, these are the product's ids.
 #[cfg(target_os = "macos")]
-const FINDER_SYNC_ID: &str = "com.juntaki.yadorilink.FinderSync";
+const FINDER_SYNC_ID: &str = match option_env!("YADORILINK_FINDER_SYNC_ID") {
+    Some(id) => id,
+    None => "com.juntaki.yadorilink.FinderSync",
+};
 #[cfg(target_os = "macos")]
-const FILE_PROVIDER_ID: &str = "com.juntaki.yadorilink.FileProvider";
+const FILE_PROVIDER_ID: &str = match option_env!("YADORILINK_FILE_PROVIDER_ID") {
+    Some(id) => id,
+    None => "com.juntaki.yadorilink.FileProvider",
+};
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum SwitchState {
     On,
     Off,
+    /// PlugInKit does not know the extension: the app that carries it is not installed (a
+    /// command-line-only install), so there is no switch to turn on and nothing to print.
+    NotInstalled,
 }
 
 /// The state `pluginkit -mA -i <id>` printed: `+` in the first column is switched on, anything
-/// else (`-` switched off, a blank flag with no vote) is not running, and no line is unknown to
-/// PlugInKit (not installed).
+/// else (`-` switched off, a blank flag with no vote) is not running, and no line at all means
+/// PlugInKit does not know the extension (not installed).
 #[cfg(target_os = "macos")]
 pub(super) fn parse_pluginkit(output: &str, id: &str) -> SwitchState {
     for line in output.lines() {
@@ -30,7 +40,7 @@ pub(super) fn parse_pluginkit(output: &str, id: &str) -> SwitchState {
             return if flag == '+' { SwitchState::On } else { SwitchState::Off };
         }
     }
-    SwitchState::Off
+    SwitchState::NotInstalled
 }
 
 /// One line per extension that is off, each with where to turn it on.
@@ -111,9 +121,10 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_or_other_extension_is_off() {
-        assert_eq!(parse_pluginkit("", ID), SwitchState::Off);
-        assert_eq!(parse_pluginkit("+    com.other.thing(1)\n", ID), SwitchState::Off);
+    fn an_unknown_or_other_extension_is_not_installed_and_silent() {
+        assert_eq!(parse_pluginkit("", ID), SwitchState::NotInstalled);
+        assert_eq!(parse_pluginkit("+    com.other.thing(1)\n", ID), SwitchState::NotInstalled);
+        assert!(off_lines(SwitchState::NotInstalled, SwitchState::NotInstalled).is_empty());
     }
 
     #[test]

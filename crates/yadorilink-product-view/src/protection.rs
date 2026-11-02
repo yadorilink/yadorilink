@@ -84,6 +84,14 @@ pub struct ProtectionSummary {
     pub device_ids: Vec<String>,
 }
 
+/// The folder is at risk only because no other device holds a full copy: the one-device
+/// configuration. (At risk with other full copies configured means content nobody can provide,
+/// which is a fault.) It is the fact the durability classifier reads, taken from the wire.
+pub fn is_single_copy(link: &LinkStatus) -> bool {
+    link.durability_status() == yadorilink_ipc_proto::daemonctl::GroupDurabilityStatus::AtRisk
+        && link.full_replica_device_ids.is_empty()
+}
+
 impl ProtectionSummary {
     /// Read from the daemon's per-link fields; an older daemon's unset fields read `Unknown`.
     pub fn from_link(link: &LinkStatus) -> Self {

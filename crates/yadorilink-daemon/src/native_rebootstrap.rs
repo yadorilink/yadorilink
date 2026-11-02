@@ -340,7 +340,10 @@ impl Machine {
         let connected: Vec<&str> = attached.iter().map(String::as_str).collect();
         let sync_roots = self.sync_roots();
         let capture = DaemonCapture::new(self);
-        let content = DaemonContent::new(self, RECOVERY_FETCH_FROZEN_CAP);
+        let content = DaemonContent::new(
+            self,
+            self.state.native_replication.recovery_fetch_cap(RECOVERY_FETCH_FROZEN_CAP),
+        );
         let authority = self.authority();
         let ctx = self.preserve_context(&sync_roots, &capture, &content, &authority);
         let result = self.retrying(|| {
@@ -446,7 +449,10 @@ impl Machine {
         };
         let sync_roots = self.sync_roots();
         let capture = DaemonCapture::new(self);
-        let content = DaemonContent::new(self, RECOVERY_FETCH_FROZEN_CAP);
+        let content = DaemonContent::new(
+            self,
+            self.state.native_replication.recovery_fetch_cap(RECOVERY_FETCH_FROZEN_CAP),
+        );
         let authority = self.authority();
         let ctx = self.preserve_context(&sync_roots, &capture, &content, &authority);
         let closure_key =

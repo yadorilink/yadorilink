@@ -12,7 +12,7 @@ use yadorilink_replica_domain::session_state::{FolderLink, MembershipOperationSc
 
 use super::common::BoxFuture;
 use crate::application::model::{
-    MembershipCommitOutcome, MembershipOperationLookup, MembershipRemoteCommand,
+    MembershipCommitOutcome, MembershipOperationLookup, MembershipRemoteCommand, RevokeRefusal,
 };
 
 /// The durable membership-journal reads/writes `ReplicaMembershipService`
@@ -111,6 +111,18 @@ pub(crate) trait MembershipCoordination: Send + Sync {
         group_id: &'a str,
         device_id: &'a str,
     ) -> BoxFuture<'a, Result<Option<String>, String>>;
+
+    /// Asks the coordination plane whether this account may revoke
+    /// `device_id` from `group_id`, without revoking anything. `Some` is a
+    /// definite refusal, to be reported as the reason; `None` means no refusal was learned -- allowed,
+    /// or the question could not be answered (unreachable, or a coordination
+    /// plane without the check), in which case the revoke's own commit stays
+    /// the authority.
+    fn check_revoke_authority<'a>(
+        &'a self,
+        group_id: &'a str,
+        device_id: &'a str,
+    ) -> BoxFuture<'a, Option<RevokeRefusal>>;
 
     /// Best-effort audit record for a `--force` override. Never fails the
     /// caller -- a timeout/error here is logged by the adapter, not

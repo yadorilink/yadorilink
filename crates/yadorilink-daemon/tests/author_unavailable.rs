@@ -8,7 +8,6 @@ mod unix_tests {
     use std::sync::Arc;
 
     use tokio::net::UnixStream;
-    use yadorilink_daemon::daemon_state::DaemonState;
     use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
     use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
     use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
@@ -55,7 +54,11 @@ mod unix_tests {
         };
         let coordinator =
             Arc::new(ReplicaCoordinator::open_with(data.join("sync.sqlite3"), tuning).unwrap());
-        let state = DaemonState::new("device-under-test".into(), coordinator, store);
+        let state = yadorilink_daemon::test_support::isolated_daemon_state(
+            "device-under-test".into(),
+            coordinator,
+            store,
+        );
         state.set_device_signing_key(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
         assert!(state.local_author().is_none(), "no witness, no author");
 

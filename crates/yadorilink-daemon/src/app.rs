@@ -114,6 +114,57 @@ fn gate_ownership(
     Ok(())
 }
 
+/// Takes this Mac's one-build-per-Mac claim in the App Group container. A refusal is written where clients
+/// look for why the daemon is not running, with a stable code. A process that cannot reach the container
+/// (an unsigned or unentitled CLI) takes no claim and says so, except the store build, which always
+/// has the entitlement and so fails closed.
+#[cfg(target_os = "macos")]
+fn take_mac_claim(
+    install_source: &str,
+    config_dir: &std::path::Path,
+) -> anyhow::Result<Option<crate::mac_claim::Claim>> {
+    use crate::mac_claim::{Channel, Refusal};
+    use yadorilink_local_storage::startup_refusal::{self, RefusalCode, StartupRefusal};
+
+    let channel = Channel::for_install_source(install_source);
+    let container = match crate::app_group::container_url(crate::app_group::MACOS_APP_GROUP) {
+        Ok(container) => container,
+        Err(reason) if channel == Channel::Store => {
+            anyhow::bail!(
+                "cannot check which version of YadoriLink is set up on this Mac: {reason}"
+            )
+        }
+        Err(reason) => {
+            tracing::warn!(%reason, "no App Group container: the one-build-per-Mac claim is not taken");
+            return Ok(None);
+        }
+    };
+    match crate::mac_claim::acquire(&container, channel) {
+        Ok(claim) => Ok(Some(claim)),
+        Err(refusal) => {
+            let message = refusal.to_string();
+            tracing::error!("{message}");
+            let record = match &refusal {
+                Refusal::OtherChannelRunning(other) => {
+                    Some(RefusalCode::OtherChannelRunning(other.as_str().into()))
+                }
+                Refusal::OtherChannelConfigured(other) => {
+                    Some(RefusalCode::OtherChannelConfigured(other.as_str().into()))
+                }
+                Refusal::StillRunning(_) | Refusal::Unavailable(_) => None,
+            };
+            let refusal_record = match record {
+                Some(code) => StartupRefusal::coded(message, code),
+                None => StartupRefusal::plain(message),
+            };
+            if let Err(e) = startup_refusal::record(config_dir, &refusal_record) {
+                tracing::warn!(error = %e, "could not record the startup refusal");
+            }
+            Err(refusal.into())
+        }
+    }
+}
+
 /// Filesystem locations the daemon operates over. Extracted from the
 /// process environment for the real binary ([`DaemonConfig::from_env`]),
 /// but passed in explicitly so a single OS process running many daemon
@@ -218,6 +269,27 @@ impl DaemonConfig {
             shell_ipc_socket_path,
             tuning,
         })
+    }
+}
+
+/// Reads the opt-in remote-administration settings (`YADORILINK_HTTP_API_PUBLIC_HOST` and
+/// `YADORILINK_HTTP_API_TRUST_REVERSE_PROXY`: TLS is terminated by the reverse proxy or tunnel). Anything incomplete or
+/// unsafe is refused here (logged) and the dashboard stays loopback-only.
+fn remote_admin_from_env(
+    get: impl Fn(&str) -> Option<String>,
+) -> Option<yadorilink_http_api::RemoteAdminConfig> {
+    let nonempty = |name: &str| get(name).filter(|v| !v.trim().is_empty());
+    let settings = yadorilink_http_api::RemoteSettings {
+        public_host: nonempty("YADORILINK_HTTP_API_PUBLIC_HOST"),
+        trusted_proxy: nonempty("YADORILINK_HTTP_API_TRUST_REVERSE_PROXY")
+            .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes")),
+    };
+    match yadorilink_http_api::RemoteAdminConfig::from_settings(settings) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::error!(error = %e, "remote administration not enabled");
+            None
+        }
     }
 }
 
@@ -413,6 +485,14 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<RunEnd> {
         yadorilink_local_storage::io_diag::set_enabled(true);
         yadorilink_sqlite_runtime::writer_gate_stats::set_split_enabled(true);
     }
+    // Two measurement switches, honoured only while the io counters are armed (see
+    // `io_diag::set_measurement_switches`): `YADORILINK_DIAG_RECV_DISCARD=1` makes the receiving
+    // loop drop what it reads, `YADORILINK_DIAG_SERVE_CONSTANT=1` makes the serving side answer
+    // from a fixed buffer. They exist to tell which end of a transfer limits its rate.
+    yadorilink_local_storage::io_diag::set_measurement_switches(
+        std::env::var("YADORILINK_DIAG_RECV_DISCARD").as_deref() == Ok("1"),
+        std::env::var("YADORILINK_DIAG_SERVE_CONSTANT").as_deref() == Ok("1"),
+    );
     // Reads those same totals on demand rather than only at shutdown; see
     // the function's own doc comment. No-op unless the line above armed
     // them, so a production daemon installs nothing.
@@ -428,6 +508,14 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<RunEnd> {
     // Acquire before opening the block store/SQLite or touching either Unix
     // socket. In particular, a losing process must never unlink the live
     // daemon's socket before discovering that it does not own this config.
+    // The direct and the Mac App Store builds are not used on one Mac: claim this Mac first, before this
+    // daemon's own lock or any state is created. Held for the daemon's whole life.
+    #[cfg(target_os = "macos")]
+    let _mac_claim = take_mac_claim(
+        &crate::update::manager::PlatformInfo::detect(tuning.install_source.as_deref())
+            .install_source,
+        &dir,
+    )?;
     let _instance_lock = DaemonInstanceLock::acquire(&dir)?;
     // Under the lock nothing else runs, so this is where a second owner is turned away, before
     // anything below can touch the data.
@@ -723,8 +811,10 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<RunEnd> {
             port_path: http_api_port_path,
             port,
             extra_allowed_origins,
+            remote: remote_admin_from_env(|name| std::env::var(name).ok()),
         };
-        match yadorilink_http_api::bind(&http_api_config).await {
+        let bound = yadorilink_http_api::bind(&http_api_config).await;
+        match bound {
             Ok(handle) => {
                 tracing::info!(
                     port = handle.port,
@@ -2054,5 +2144,44 @@ mod stop_watch_placement_tests {
                 "{watch} must start after startup, before waiting"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod remote_admin_env_tests {
+    use super::remote_admin_from_env;
+    use std::collections::HashMap;
+
+    fn cfg(pairs: &[(&str, &str)]) -> Option<yadorilink_http_api::RemoteAdminConfig> {
+        let m: HashMap<String, String> =
+            pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
+        remote_admin_from_env(|name| m.get(name).cloned())
+    }
+
+    #[test]
+    fn unset_is_the_loopback_default() {
+        assert!(cfg(&[]).is_none());
+        assert!(cfg(&[("YADORILINK_HTTP_API_PUBLIC_HOST", "")]).is_none());
+    }
+
+    #[test]
+    fn unsafe_or_incomplete_settings_stay_loopback_only() {
+        assert!(cfg(&[("YADORILINK_HTTP_API_PUBLIC_HOST", "nas.example.net")]).is_none());
+        assert!(cfg(&[("YADORILINK_HTTP_API_TRUST_REVERSE_PROXY", "1")]).is_none());
+        // The retired daemon-side TLS settings enable nothing.
+        assert!(cfg(&[
+            ("YADORILINK_HTTP_API_PUBLIC_HOST", "nas.example.net"),
+            ("YADORILINK_HTTP_API_REMOTE_BIND", "0.0.0.0:8443"),
+        ])
+        .is_none());
+    }
+
+    #[test]
+    fn a_declared_proxy_is_accepted() {
+        assert!(cfg(&[
+            ("YADORILINK_HTTP_API_PUBLIC_HOST", "nas.example.net"),
+            ("YADORILINK_HTTP_API_TRUST_REVERSE_PROXY", "1"),
+        ])
+        .is_some());
     }
 }

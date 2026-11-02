@@ -9,7 +9,7 @@ use yadorilink_replica_domain::session_state::MembershipCommitMode;
 
 use crate::application::model::{
     HandoffCommitResult, MembershipCommitOutcome, MembershipCommitResult,
-    MembershipOperationLookup, MembershipRemoteCommand,
+    MembershipOperationLookup, MembershipRemoteCommand, RevokeRefusal,
 };
 use crate::application::ports::{BoxFuture, MembershipCoordination};
 use crate::coordination_client::{is_terms_consent_refusal, RoleLossCommitOutcome, SendAuthorized};
@@ -315,6 +315,38 @@ impl MembershipCoordination for HttpMembershipCoordination {
                 device_id,
             )
             .await
+        })
+    }
+
+    fn check_revoke_authority<'a>(
+        &'a self,
+        group_id: &'a str,
+        device_id: &'a str,
+    ) -> BoxFuture<'a, Option<RevokeRefusal>> {
+        Box::pin(async move {
+            let config = self.config()?;
+            #[derive(serde::Serialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Body<'a> {
+                device_id: &'a str,
+            }
+            let response = reqwest::Client::new()
+                .post(format!("{}/shares/groups/{group_id}/revoke-check", config.addr))
+                .json(&Body { device_id })
+                .send_authorized(&config.auth)
+                .await
+                .ok()?;
+            let status = response.status();
+            if status != reqwest::StatusCode::FORBIDDEN {
+                return None;
+            }
+            let text = response.text().await.unwrap_or_default();
+            let detail = format!("revoke device returned HTTP {status}: {text}");
+            if is_terms_consent_refusal(status, &text) {
+                Some(RevokeRefusal::TermsConsentRequired(detail))
+            } else {
+                Some(RevokeRefusal::Rejected(detail))
+            }
         })
     }
 

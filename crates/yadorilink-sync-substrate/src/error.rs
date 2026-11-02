@@ -34,6 +34,10 @@ pub enum SubstrateError {
     #[error("lane {lane} i/o failed: {reason}")]
     LaneIo { lane: Lane, reason: String },
 
+    /// A Track Send dial ended without a connection, with the reason the endpoint reported.
+    #[error("failed to connect to peer: {message}")]
+    TrackSendDial { failure: crate::observe::DialFailure, message: String },
+
     /// A Track Send stream could not be opened, accepted or finished.
     #[error("track send stream failed: {0}")]
     TrackSend(String),

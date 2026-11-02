@@ -191,3 +191,27 @@ async fn a_run_trace_partitions_the_run_wall_time_by_the_last_file_to_reach_each
     assert!(spread[Stage::Locked as usize].total() >= 30_000_000, "first and last differ");
     reset();
 }
+
+/// The block-reuse counters are inert until armed, and armed they split the
+/// planned blocks into store-held and fetched ones.
+#[tokio::test]
+async fn block_reuse_is_inert_until_armed_and_counts_held_and_fetched_blocks() {
+    let _owner = GLOBAL_TEST_LOCK.lock().await;
+    set_enabled(false);
+    reset();
+    record_block_planned(true, 100);
+    record_block_fetched(100);
+    assert_eq!(block_source_counts(), (0, 0, 0), "unarmed: nothing recorded");
+
+    set_enabled(true);
+    record_block_planned(true, 100);
+    record_block_planned(false, 200);
+    record_block_planned(false, 200);
+    record_block_fetched(200);
+    set_enabled(false);
+    assert_eq!(block_source_counts(), (3, 1, 1));
+    assert_eq!(DEDUP_STORE_BYTES.load(Ordering::Relaxed), 100);
+    assert_eq!(DEDUP_BYTES.load(Ordering::Relaxed), 500);
+    reset();
+    assert_eq!(block_source_counts(), (0, 0, 0));
+}

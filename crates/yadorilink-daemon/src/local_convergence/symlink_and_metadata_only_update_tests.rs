@@ -23,7 +23,7 @@ use yadorilink_replica_domain::session_state::MaterializationState;
 fn payload_version(
     record: &FileRecord,
     record_kind: RecordKind,
-    unix_mode: Option<u32>,
+    exec: bool,
     symlink_target: Option<&[u8]>,
 ) -> FileVersion {
     FileVersion::from_index_row(
@@ -31,9 +31,8 @@ fn payload_version(
         record.size,
         record.mtime_unix_nanos,
         record_kind,
-        unix_mode,
+        exec,
         symlink_target.map(|t| t.to_vec()),
-        Vec::new(),
     )
 }
 
@@ -119,10 +118,11 @@ fn materialize_link(
             windows_opt_in: false,
             origin_device_id: "device-a",
             authoring: None,
+            retention: yadorilink_sync_sqlite::retention::Retention::OwnEdit,
             permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         },
         record,
-        &payload_version(record, RecordKind::Symlink, None, Some(payload_target)),
+        &payload_version(record, RecordKind::Symlink, false, Some(payload_target)),
     )
     .unwrap()
 }
@@ -252,13 +252,14 @@ fn materialize_symlink_at_refuses_a_root_whose_marker_no_longer_matches() {
             windows_opt_in: false,
             origin_device_id: "device-a",
             authoring: None,
+            retention: yadorilink_sync_sqlite::retention::Retention::OwnEdit,
             permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         },
         &record,
         // A payload that genuinely WOULD have written, so the
         // refusal below is the root check doing its job rather than
         // a payload that was never eligible to write anything.
-        &payload_version(&record, RecordKind::Symlink, None, Some(b"target.txt")),
+        &payload_version(&record, RecordKind::Symlink, false, Some(b"target.txt")),
     );
     assert!(
         result.is_err(),
@@ -312,11 +313,12 @@ fn materialize_symlink_at_creates_no_directories_under_a_root_whose_marker_no_lo
             windows_opt_in: false,
             origin_device_id: "device-a",
             authoring: None,
+            retention: yadorilink_sync_sqlite::retention::Retention::OwnEdit,
             permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         },
         &record,
         // As above: a payload that genuinely would have written.
-        &payload_version(&record, RecordKind::Symlink, None, Some(b"target.txt")),
+        &payload_version(&record, RecordKind::Symlink, false, Some(b"target.txt")),
     );
     assert!(
         result.is_err(),
@@ -360,10 +362,11 @@ fn materialize_symlink_at_with_no_target_recorded_skips_disk_write_but_still_ind
             windows_opt_in: false,
             origin_device_id: "device-a",
             authoring: None,
+            retention: yadorilink_sync_sqlite::retention::Retention::OwnEdit,
             permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         },
         &record,
-        &payload_version(&record, RecordKind::Symlink, None, None),
+        &payload_version(&record, RecordKind::Symlink, false, None),
     )
     .unwrap();
 
@@ -419,10 +422,10 @@ fn metadata_only_fast_path_applies_unix_mode_without_touching_content() {
     // the mode in.
     state
         .file_index_repository()
-        .set_unix_mode(
+        .set_exec(
             "group-1",
             "script.sh",
-            Some(0o700),
+            true,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -437,7 +440,7 @@ fn metadata_only_fast_path_applies_unix_mode_without_touching_content() {
         &incoming,
         "device-a",
         None,
-        &payload_version(&incoming, RecordKind::File, Some(0o755), None),
+        &payload_version(&incoming, RecordKind::File, true, None),
         &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
     )
     .unwrap();
@@ -502,10 +505,10 @@ fn metadata_only_fast_path_snapshots_the_fence_when_metadata_already_matches_dis
     std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(0o755)).unwrap();
     state
         .file_index_repository()
-        .set_unix_mode(
+        .set_exec(
             "group-1",
             "already-correct.sh",
-            Some(0o755),
+            true,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -525,7 +528,7 @@ fn metadata_only_fast_path_snapshots_the_fence_when_metadata_already_matches_dis
         &incoming,
         "device-a",
         None,
-        &payload_version(&incoming, RecordKind::File, Some(0o755), None),
+        &payload_version(&incoming, RecordKind::File, true, None),
         &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
     )
     .unwrap();
@@ -612,10 +615,10 @@ fn metadata_only_fast_path_refuses_a_root_whose_marker_no_longer_matches() {
     std::fs::write(&out_path, b"hello").unwrap();
     state
         .file_index_repository()
-        .set_unix_mode(
+        .set_exec(
             "group-1",
             "script.sh",
-            Some(0o755),
+            true,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -702,10 +705,10 @@ fn metadata_only_fast_path_refuses_a_terminal_symlink_even_with_matching_content
 
     state
         .file_index_repository()
-        .set_unix_mode(
+        .set_exec(
             "group-1",
             "escape.txt",
-            Some(0o755),
+            true,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -857,15 +860,15 @@ fn a_supersession_during_the_write_cannot_rename_what_is_written() {
     std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(0o600)).unwrap();
     state
         .file_index_repository()
-        .set_unix_mode(
+        .set_exec(
             "group-1",
             "contended.sh",
-            Some(0o644),
+            true,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
 
-    // V2: same content, same authoring identity, different mode --
+    // V2: same content, same authoring identity, the opposite execute flag --
     // the shape that moves a row's version without moving anything
     // an in-flight write can observe. Armed to land mid-call.
     //
@@ -882,10 +885,10 @@ fn a_supersession_during_the_write_cannot_rename_what_is_written() {
                 let state = weak.upgrade().expect("coordinator outlives the call");
                 state
                     .file_index_repository()
-                    .set_unix_mode(
+                    .set_exec(
                         "group-1",
                         "contended.sh",
-                        Some(0o755),
+                        false,
                         &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
                     )
                     .unwrap();
@@ -894,8 +897,8 @@ fn a_supersession_during_the_write_cannot_rename_what_is_written() {
 
     let mut incoming = local.clone();
     incoming.mtime_unix_nanos = 999;
-    // V1: the payload. 0o644 is what must reach disk.
-    let desired = payload_version(&incoming, RecordKind::File, Some(0o644), None);
+    // V1: the payload. The execute flag it names must reach disk.
+    let desired = payload_version(&incoming, RecordKind::File, true, None);
 
     let applied = try_apply_metadata_only_update(
         state.as_ref(),
@@ -910,18 +913,17 @@ fn a_supersession_during_the_write_cannot_rename_what_is_written() {
     .unwrap();
     assert!(applied.is_some(), "an identical block list must take the metadata-only fast path");
 
-    assert_eq!(
-        state.get_unix_mode("group-1", "contended.sh").unwrap(),
-        Some(0o755),
+    assert!(
+        !state.get_exec("group-1", "contended.sh").unwrap(),
         "fixture check: the supersession must really have landed during the call, or this \
          test proves nothing"
     );
     assert_eq!(
         std::fs::metadata(&out_path).unwrap().permissions().mode() & 0o777,
-        0o644,
-        "disk must hold the mode the PAYLOAD names. Reading it from the row after the \
-         upsert -- which is what this lane used to do -- would have written 0o755 here \
-         while settling under the payload's version_hash, which bakes in 0o644: an \
+        0o700,
+        "disk must hold the execute flag the PAYLOAD names. Reading it from the row after the \
+         upsert -- which is what this lane used to do -- would have left it unset here \
+         while settling under the payload's version_hash, which bakes in the flag: an \
          ExactObject proof false about the exact field it had just applied"
     );
 }
@@ -956,10 +958,10 @@ fn metadata_only_update_on_an_already_owner_unreadable_file_is_refused_before_an
     }
     state
         .file_index_repository()
-        .set_unix_mode(
+        .set_exec(
             "group-1",
             "write-only.sh",
-            Some(0o200),
+            false,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -974,7 +976,7 @@ fn metadata_only_update_on_an_already_owner_unreadable_file_is_refused_before_an
         &incoming,
         "device-a",
         None,
-        &payload_version(&incoming, RecordKind::File, Some(0o200), None),
+        &payload_version(&incoming, RecordKind::File, false, None),
         &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
     );
     std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -995,4 +997,55 @@ fn metadata_only_update_on_an_already_owner_unreadable_file_is_refused_before_an
         "a refused update must not rewrite the row"
     );
     assert_eq!(std::fs::read(&out_path).unwrap(), b"hello");
+}
+
+/// A symlink write that stops right after the link was placed (a crash before its proof commit)
+/// has already said so: the user who then removes the link and restarts the daemon keeps that
+/// delete, because repair reads a missing name under a landed write as the user's doing.
+#[cfg(unix)]
+#[test]
+fn a_symlink_write_stopped_after_its_placement_leaves_a_user_delete_standing() {
+    let root = tempfile::tempdir().unwrap();
+    let state = linked_state(root.path());
+    let record = symlink_record("link.txt");
+    seed_symlink_row(&state, &record, b"target.txt");
+    super::types::placed_hook::set(
+        &root.path().join("link.txt"),
+        Box::new(|| panic!("the power went out after the placement")),
+    );
+
+    let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        materialize_link(&state, root.path(), &record, b"target.txt")
+    }));
+    assert!(stopped.is_err(), "setup: the write stopped after placing the link");
+    assert!(
+        state
+            .materialization_intent_repository()
+            .has_materialization_intent("group-1", "link.txt")
+            .unwrap(),
+        "setup: the intent is still open"
+    );
+    assert!(
+        std::fs::symlink_metadata(root.path().join("link.txt")).is_ok(),
+        "setup: the link was placed"
+    );
+
+    std::fs::remove_file(root.path().join("link.txt")).unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = yadorilink_local_storage::SegmentBlockStore::new(store_dir.path()).unwrap();
+    let report =
+        yadorilink_filesystem_sync::materialization_repair::repair_interrupted_materializations(
+            state.as_ref(),
+            &store,
+            root.path(),
+            "group-1",
+            yadorilink_filesystem_sync::materialization_repair::RepairMode::Startup,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+
+    assert!(
+        std::fs::symlink_metadata(root.path().join("link.txt")).is_err(),
+        "the user's delete was undone by repair: {report:?}"
+    );
 }

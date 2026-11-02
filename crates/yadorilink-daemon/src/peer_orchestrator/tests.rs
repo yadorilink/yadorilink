@@ -515,6 +515,10 @@ fn the_netmaps_own_account_deletion_state_is_additive_and_lenient() {
     assert_eq!(parse(Some(serde_json::json!({}))), None);
     assert_eq!(parse(Some(serde_json::json!({"accountDeletionState": "none"}))), Some(S::None));
     assert_eq!(
+        parse(Some(serde_json::json!({"accountDeletionState": "requested"}))),
+        Some(S::Requested)
+    );
+    assert_eq!(
         parse(Some(serde_json::json!({"accountDeletionState": "pending"}))),
         Some(S::Pending)
     );

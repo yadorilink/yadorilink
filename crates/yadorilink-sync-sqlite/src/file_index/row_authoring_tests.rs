@@ -35,7 +35,14 @@ fn identity(seq: u64) -> NativeRowIdentity {
 
 fn write(db: &SyncDatabase, record: &FileRecord, authority: Option<&NativeRowIdentity>) {
     db.write_immediate::<_, SyncSqliteError>(|tx| {
-        upsert_file_with_authoring_in_tx(tx, GROUP, record, "device-a", authority)
+        upsert_file_with_authoring_in_tx(
+            tx,
+            GROUP,
+            record,
+            "device-a",
+            authority,
+            crate::retention::Retention::OwnEdit,
+        )
     })
     .unwrap();
 }
@@ -73,7 +80,13 @@ fn a_plain_upsert_carries_the_previous_identity_forward() {
     let db = db();
     write(&db, &record("x", 1, false), Some(&identity(4)));
     db.write_immediate::<_, SyncSqliteError>(|tx| {
-        upsert_file_in_tx(tx, GROUP, &record("x", 2, false), "device-a")
+        upsert_file_in_tx(
+            tx,
+            GROUP,
+            &record("x", 2, false),
+            "device-a",
+            crate::retention::Retention::OwnEdit,
+        )
     })
     .unwrap();
     assert_eq!(read(&db, "x"), Some(identity(4)));
@@ -196,6 +209,7 @@ fn a_held_heads_provenance_does_not_license_another_identity() {
                 &record(name, 1, false),
                 "device-a",
                 Some(identity),
+                crate::retention::Retention::OwnEdit,
             )
         })
         .is_err()
@@ -302,4 +316,89 @@ fn retiring_a_scaffold_drops_that_row_and_keeps_the_versions_and_real_rows() {
     write(&db, &record("y", 1, false), Some(&identity(2)));
     assert!(!repo.retire_bootstrap_scaffold(GROUP, "y", &permit).unwrap());
     assert_eq!(files_of(&db, "y"), vec![(1, "current".into())]);
+}
+
+fn rows_of(db: &SyncDatabase, path: &str) -> i64 {
+    db.read::<_, SyncSqliteError>(|conn| {
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE group_id = ?1 AND path = ?2",
+            rusqlite::params![GROUP, path],
+            |row| row.get(0),
+        )?)
+    })
+    .unwrap()
+}
+
+#[test]
+fn a_path_with_replicated_history_is_not_erased_as_a_local_only_artifact() {
+    let db = db();
+    write(&db, &record("x", 1, false), Some(&identity(1)));
+    write(&db, &record("x", 2, false), Some(&identity(2)));
+    let repo = FileIndexRepository::new(db.clone());
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+    let before = rows_of(&db, "x");
+
+    let refused = repo.remove_file(GROUP, "x", ErasureReason::LocalOnlyArtifact, &permit);
+
+    assert!(matches!(refused, Err(SyncSqliteError::InvalidInput(_))), "{refused:?}");
+    assert_eq!(rows_of(&db, "x"), before, "a refused erasure removes nothing");
+}
+
+#[test]
+fn a_tombstoned_path_that_once_had_replicated_history_is_still_refused() {
+    let db = db();
+    write(&db, &record("x", 1, false), Some(&identity(1)));
+    write(&db, &record("x", 2, true), None);
+    let repo = FileIndexRepository::new(db.clone());
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+
+    let refused = repo.remove_file(GROUP, "x", ErasureReason::LocalOnlyArtifact, &permit);
+
+    assert!(matches!(refused, Err(SyncSqliteError::InvalidInput(_))), "{refused:?}");
+}
+
+#[test]
+fn a_local_only_artifact_without_replicated_history_is_erased() {
+    let db = db();
+    write(&db, &record("local", 1, false), None);
+    let repo = FileIndexRepository::new(db.clone());
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+
+    let removed =
+        repo.remove_file(GROUP, "local", ErasureReason::LocalOnlyArtifact, &permit).unwrap();
+
+    assert!(removed);
+    assert_eq!(rows_of(&db, "local"), 0);
+}
+
+/// The user adds the path to the ignore list: its rows go, replicated history included (the file
+/// itself is not this layer's business and stays on disk).
+#[test]
+fn the_ignore_sweep_erases_a_path_even_when_it_has_replicated_history() {
+    let db = db();
+    write(&db, &record("x", 1, false), Some(&identity(1)));
+    write(&db, &record("x", 2, false), Some(&identity(2)));
+    let repo = FileIndexRepository::new(db.clone());
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+
+    let removed = repo.remove_file(GROUP, "x", ErasureReason::IgnoreSweep, &permit).unwrap();
+
+    assert!(removed);
+    assert_eq!(rows_of(&db, "x"), 0);
+}
+
+/// A sync gives up a name that descendants need: today the rows go, history included. This keeps
+/// that behaviour and says so; the history of such a path is not kept by this erasure.
+#[test]
+fn a_namespace_displacement_erases_a_path_that_has_replicated_history() {
+    let db = db();
+    write(&db, &record("x", 1, false), Some(&identity(1)));
+    let repo = FileIndexRepository::new(db.clone());
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+
+    let removed =
+        repo.remove_file(GROUP, "x", ErasureReason::DisplacedByNamespace, &permit).unwrap();
+
+    assert!(removed);
+    assert_eq!(rows_of(&db, "x"), 0);
 }

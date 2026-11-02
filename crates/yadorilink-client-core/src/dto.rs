@@ -17,22 +17,47 @@ use crate::error::DesktopError;
 mod convert;
 
 pub use convert::{
-    account_deletion_impact, account_deletion_status, appcast_item_check, attention_reason,
-    conflict_summary, daemon_identity, file_availability, file_retention, file_version,
-    file_versions, folder_detail, folder_restore_outcome, folder_summary, gc_report,
-    handoff_summary, incoming_transfer, invite_summary, member_summary, membership_outcome,
-    outgoing_transfer, pending_approval_summary, pending_invite_summary, pin_outcome,
-    preflight_result, received_transfer, retained_original, retained_release, rewind_preview,
-    rewind_run, rewind_run_missing, rewind_start, safe_stop_outcome, sent_transfer, share_summary,
-    space_management, space_reclaim_preview, start_over_progress, status_dimensions_json,
-    status_snapshot, trashed_file, update_config, update_download_guidance, update_status,
-    RUN_MISSING_MESSAGE,
+    account_deletion_impact, account_deletion_status, activity_page, activity_request,
+    appcast_item_check, attention_reason, conflict_summary, daemon_identity, file_availability,
+    file_retention, file_version, file_versions, folder_detail, folder_restore_outcome,
+    folder_summary, gc_report, handoff_summary, incoming_transfer, invite_summary, member_summary,
+    membership_outcome, outgoing_transfer, pending_approval_summary, pending_invite_summary,
+    pin_outcome, preflight_result, primary_transfer_accepted, primary_transfer_summary,
+    received_transfer, retained_original, retained_release, rewind_preview, rewind_run,
+    rewind_run_missing, rewind_start, safe_stop_outcome, send_link, send_link_preview,
+    send_link_status, sent_transfer, share_summary, space_management, space_reclaim_preview,
+    start_over_progress, status_dimensions_json, status_snapshot, trashed_file, update_config,
+    update_download_guidance, update_status, RUN_MISSING_MESSAGE,
 };
 
 // ---- construction -------------------------------------------------------
 
 /// How [`crate::ClientCore::start_daemon`] brings the daemon up when nothing
 /// answers the control socket.
+/// Which build of the app a Mac runs: the direct download (DMG, CLI installs) or the Mac App Store build. The two are not
+/// used on one Mac at the same time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum MacBuild {
+    Direct,
+    Store,
+}
+
+/// Why this Mac's other build stops this one, or why switching builds was refused. `build` is the build that is in the way
+/// (or, for `StillRunning`, the one that must be stopped first).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum MacClaimRefusal {
+    /// A daemon of the other build is running.
+    OtherBuildRunning { build: MacBuild },
+    /// The other build completed setup on this Mac and has not given it up: switching needs the person's confirmation.
+    OtherBuildConfigured { build: MacBuild },
+    /// A daemon of this build is still running, so it cannot give the Mac up.
+    StillRunning { build: MacBuild },
+    /// The claim could not be read or written; nothing was changed.
+    Unavailable { message: String },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
 pub enum DaemonLaunch {
@@ -379,7 +404,8 @@ pub enum ProductState {
 pub struct ProductSummary {
     pub state: ProductState,
     /// Folders needing attention, paused, syncing and waiting; a folder with several
-    /// conditions counts under each, `state` picks by precedence.
+    /// conditions counts under each, `state` picks by precedence. On the global summary each
+    /// reason that belongs to no folder (sign-in, update, a volume) adds one to the attention count.
     pub attention_count: u64,
     pub paused_count: u64,
     pub syncing_count: u64,
@@ -596,6 +622,12 @@ pub struct FolderSummary {
     pub hydrating_file_count: u64,
     pub held_file_count: u64,
     pub skipped_symlink_count: u64,
+    /// Content bytes of the folder's live regular files (the local index's own sum).
+    /// `None` when the daemon is older than the field. Zero for a folder that holds no files.
+    pub total_bytes: Option<u64>,
+    /// Of `total_bytes`, the bytes held only as online-only placeholders on this device.
+    /// `None` when the daemon is older than the field.
+    pub online_only_bytes: Option<u64>,
     pub transfer: Option<FolderTransferProgress>,
     pub durability: DurabilityStatus,
     pub durability_evidence: DurabilityEvidence,
@@ -774,6 +806,9 @@ pub struct PeerSummary {
     pub reachability: PeerReachability,
     pub unreachable_category: Option<UnreachableCategory>,
     pub route: RouteKind,
+    /// The last time a session with this device was up (the present while it is connected);
+    /// `None` when this device never connected to it. Absence of any length is not a problem.
+    pub last_connected: Option<SystemTime>,
 }
 
 /// One active sync transfer.
@@ -1048,6 +1083,64 @@ pub struct ConflictSummary {
     pub identity: String,
 }
 
+/// What happened to a file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum ActivityKind {
+    Added,
+    Updated,
+    Deleted,
+    Conflict,
+    Restored,
+}
+
+/// Whose changes the Activity list shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum ActivityOrigin {
+    #[default]
+    Any,
+    ThisDevice,
+    OtherDevices,
+}
+
+/// Narrows the Activity list. No kinds = every kind.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct ActivityFilter {
+    pub kinds: Vec<ActivityKind>,
+    pub origin: ActivityOrigin,
+}
+
+/// One file event of the Activity page (最近の動き).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct ActivityEvent {
+    /// Paging cursor: pass the last event's as `before_cursor` for the next page.
+    pub cursor: i64,
+    /// The linked folder's root.
+    pub local_path: String,
+    /// The file, relative to the root.
+    pub path: String,
+    pub kind: ActivityKind,
+    /// The device that made the change, when known here.
+    pub origin_device_id: Option<String>,
+    /// Its name, when the account's device list could be read.
+    pub origin_device_name: Option<String>,
+    /// Made on this device (or by a write that carries no author).
+    pub is_this_device: bool,
+    pub at: Option<SystemTime>,
+}
+
+/// One page of the Activity list, newest first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct ActivityPage {
+    pub events: Vec<ActivityEvent>,
+    /// `before_cursor` of the next page; `None` when this page ended the list.
+    pub next_cursor: Option<i64>,
+}
+
 /// Why a conflict copy is kept under its own name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
@@ -1115,10 +1208,26 @@ pub struct FileVersion {
     /// The daemon's own state value, for a tooltip.
     pub state: String,
     pub origin_device_id: Option<String>,
-    pub unix_mode: Option<u32>,
+    /// Whether the version is executable.
+    pub exec: bool,
     /// The highest `version_seq` of the file.
     pub is_current: bool,
     pub kind: EntryKind,
+    /// Whether this device still holds the bytes of the version (a restore of a version it does not hold has to wait for
+    /// a peer, or cannot be done at all).
+    pub content: VersionContent,
+}
+
+/// Whether this device holds the bytes of a retained version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum VersionContent {
+    /// Not a statement about bytes: the current version, a deletion, a directory.
+    NotApplicable,
+    /// Every block of the version is in this device's block store.
+    Kept,
+    /// This device does not hold the version's bytes (replaced by its own edit or delete, or it never held the content).
+    NotKept,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1175,6 +1284,11 @@ pub struct PinOutcome {
     pub retention: FileRetention,
     /// Why the content could not be downloaded just now; the pin stands regardless.
     pub download_error: Option<String>,
+    /// Set when the pin stands but a file beneath it is not yet held in this device's block store,
+    /// so a later edit of it could lose the version the pin promises: `changing_retry` (the file
+    /// was edited, replaced or could not be read just now and is being captured; pin again once it
+    /// settles) or `not_kept_error` (could not be checked). Empty when every file is held.
+    pub history_not_kept_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1183,6 +1297,13 @@ pub struct EvictOutcome {
     pub evicted: bool,
     pub blocks_reclaimed: u64,
     pub bytes_reclaimed: u64,
+    /// Why nothing was freed when `evicted` is false (a stable code: "path_changing", "not_present", "no_longer_current",
+    /// "file_replaced", "differs_from_synced", "volume_not_durable", "in_use", or another the daemon names); `None` when
+    /// it was freed or the daemon does not say. A front end words it for itself.
+    pub not_freed_reason: Option<String>,
+    /// Whether asking again a moment later can work without the person doing anything else: only "path_changing" and
+    /// "not_present" (only meaningful with a reason).
+    pub retry_later: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1265,11 +1386,17 @@ pub enum ShareRole {
 }
 
 /// The roles a member can be changed to or invited with.
+///
+/// `Owner` is the delegated folder administrator: it may invite, approve,
+/// change roles and revoke, but is never the primary owner. UI hosts (Apple,
+/// Windows) must add the case to their exhaustive mappings; until a host offers
+/// it, nothing selects it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
 pub enum AssignableRole {
     Viewer,
     Editor,
+    Owner,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1307,6 +1434,56 @@ pub struct PendingApprovalSummary {
     pub group_name: String,
     pub device_id: String,
     pub requested_role: Option<ShareRole>,
+}
+
+/// Which side of a primary-ownership offer this account is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum PrimaryTransferDirection {
+    /// This account offered its folder to another account.
+    Outgoing,
+    /// Another account offered its folder to this one.
+    Incoming,
+    /// A direction a newer service added.
+    Unrecognized,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum PrimaryTransferStatus {
+    /// Waiting for the target account (listed offers are pending).
+    Pending,
+    Accepted,
+    Cancelled,
+    Declined,
+    Other {
+        raw: String,
+    },
+}
+
+/// An offer to hand a folder's primary ownership to another account. It names no account, email
+/// or person: `to_device_id` is the device the primary chose. Offers last seven days.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct PrimaryTransferSummary {
+    pub transfer_id: String,
+    pub group_id: String,
+    pub group_name: String,
+    pub direction: PrimaryTransferDirection,
+    pub status: PrimaryTransferStatus,
+    pub to_device_id: String,
+    pub created_at: SystemTime,
+    pub expires_at: SystemTime,
+}
+
+/// What accepting an offer produced: this account is now the folder's primary owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct PrimaryTransferAccepted {
+    pub transfer_id: String,
+    pub group_id: String,
+    /// The folder's membership generation after the hand-over.
+    pub membership_generation: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1488,6 +1665,81 @@ pub struct SentTransfer {
     pub total_size: u64,
 }
 
+/// How long a Send link stays redeemable. The choices the Send screens offer; the service's
+/// own minimum is 60 seconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum SendLinkTtl {
+    OneHour,
+    OneDay,
+    SevenDays,
+}
+
+impl SendLinkTtl {
+    /// The lifetime in seconds, as the service takes it.
+    #[must_use]
+    pub fn seconds(self) -> u32 {
+        match self {
+            SendLinkTtl::OneHour => 60 * 60,
+            SendLinkTtl::OneDay => 24 * 60 * 60,
+            SendLinkTtl::SevenDays => 7 * 24 * 60 * 60,
+        }
+    }
+}
+
+/// A Send link just created. The code is shown once: the service keeps only its hash.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct SendLink {
+    pub link_id: String,
+    /// What the sender hands to the recipient (on any account).
+    pub code: String,
+    pub expires_at: Option<SystemTime>,
+}
+
+/// What a signed-in holder of a code sees before redeeming it. Nothing was consumed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct SendLinkPreview {
+    /// The name of the sender's device.
+    pub sender_name: String,
+    /// What the link carries; empty when the sender attached no list.
+    pub files: Vec<IncomingFile>,
+    pub total_size: u64,
+    pub expires_at: Option<SystemTime>,
+}
+
+/// Where a Send link stands, for the sender.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum SendLinkState {
+    /// Created; nobody has redeemed it.
+    Waiting,
+    /// Redeemed: the recipient picked a device; nothing has been sent yet.
+    Redeemed,
+    /// The send was authorized and the transfer is going.
+    Transferring,
+    /// The recipient reported that it received everything.
+    Done,
+    Cancelled,
+    Expired,
+    /// The send was authorized but the transfer stopped before it finished.
+    Interrupted,
+}
+
+/// The sender's view of one Send link.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct SendLinkStatus {
+    pub link_id: String,
+    pub state: SendLinkState,
+    /// The name of the device the recipient picked, once redeemed.
+    pub receiver_device_name: Option<String>,
+    /// The transfer under this link, when this device started one since its engine last
+    /// restarted; match it against `list_sent_transfers` for progress.
+    pub transfer_id: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "ffi", derive(uniffi::Record))]
 pub struct IncomingFile {
@@ -1521,6 +1773,21 @@ pub enum TransferFailure {
     Other {
         raw: String,
     },
+    /// This device had no room to store what arrived. Declared last so the other cases keep
+    /// their wire order.
+    NoSpace,
+    /// This device's operating system refused to send to the local network (macOS Local Network
+    /// privacy, a firewall, a VPN), so a device on the same network could not be reached.
+    LocalNetworkBlocked,
+    /// The sending device stopped sending and could not be reached again. Nothing more arrives
+    /// from this offer; ask for it to be sent again (a new link).
+    SenderGone,
+    /// The receiving device canceled the transfer (the sender's view). The offer stands: the
+    /// receiver can fetch it again, or the sender can stop it.
+    ReceiverCanceled,
+    /// The receiving device's receive failed, or it has fetched nothing for a long time (the
+    /// sender's view). For a Send link, create a new one if it does not start again.
+    ReceiverStopped,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1562,6 +1829,14 @@ pub struct IncomingTransfer {
     pub failure: Option<TransferFailure>,
     /// Whether `retry_transfer` is offered: the transfer failed or was canceled.
     pub can_retry: bool,
+    /// The Send link this offer arrived under, when this device had redeemed that link: the engine
+    /// then receives it by itself, and `status` goes pending, in progress, completed (or failed,
+    /// when `can_retry` offers a retry). `None` for any other offer, which waits for `receive_transfer`.
+    pub link_id: Option<String>,
+    /// Bytes written so far while `InProgress`; `total_size` once `Completed`; 0 otherwise.
+    pub received_bytes: u64,
+    /// The folder the files are received into, once a receive chose one.
+    pub destination_dir: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1726,6 +2001,9 @@ pub struct DaemonIdentity {
     pub ownership: DataAreaOwnership,
     pub pid: u32,
     pub started_at: Option<SystemTime>,
+    /// The data directory the daemon actually uses (sign-in, device identity, sync state);
+    /// `None` from a daemon that does not report it.
+    pub data_dir: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

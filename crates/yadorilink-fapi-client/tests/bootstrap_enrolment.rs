@@ -21,7 +21,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 use yadorilink_fapi_client::{
     complete_enrolment, open_enrolment, poll_enrolment, EnrolmentPoll, EnrolmentRequest, Error,
-    Es256Key, PendingEnrolment,
+    Es256Key, PairingCode, PendingEnrolment,
 };
 
 const CLIENT_ID: &str = "ylk-AAAAAAAAAAAAAAAAAAAAAA";
@@ -31,7 +31,7 @@ fn loopback() -> Vec<String> {
 }
 
 fn request<'a>(uris: &'a [String]) -> EnrolmentRequest<'a> {
-    EnrolmentRequest { redirect_uris: uris, client_name: Some("laptop") }
+    EnrolmentRequest { redirect_uris: uris, client_name: Some("laptop"), pairing_code: None }
 }
 
 fn started(handle: &str) -> serde_json::Value {
@@ -108,7 +108,10 @@ async fn opening_a_transaction_sends_the_public_key_and_no_credential_at_all() {
 
     assert_eq!(pending.expires_in, Duration::from_secs(600));
     assert_eq!(pending.poll_interval, Duration::from_secs(5));
-    assert_eq!(pending.approval_uri, "https://as.test/bootstrap/approve?code=a-different-secret");
+    assert_eq!(
+        pending.approval_uri.as_deref(),
+        Some("https://as.test/bootstrap/approve?code=a-different-secret")
+    );
 
     let body = seen.lock().expect("lock").clone();
     assert_eq!(body["jwks"]["keys"][0]["kty"], "EC");
@@ -431,9 +434,13 @@ async fn the_loop_waits_at_the_advertised_interval_and_stops_at_the_advertised_d
             .await
             .expect_err("an enrolment nobody approves has to end");
 
-    // 30 seconds of life at 10-second intervals: three attempts, two waits.
-    assert_eq!(polls.load(Ordering::SeqCst), 3);
-    assert_eq!(*waits.lock().expect("lock"), vec![Duration::from_secs(10); 2]);
+    // 30 seconds of life: sixteen 250 ms fast waits, twenty one-second quick waits (24 s); the
+    // next wait (the advised 10 seconds) would reach the deadline, so there is no poll at 34 s
+    // against a transaction that is gone.
+    assert_eq!(polls.load(Ordering::SeqCst), 37);
+    let mut expected = vec![Duration::from_millis(250); 16];
+    expected.extend(vec![Duration::from_secs(1); 20]);
+    assert_eq!(*waits.lock().expect("lock"), expected);
     assert!(
         matches!(&err, Error::Registration(message) if message.contains("30 seconds")),
         "the failure must name the deadline it hit: {err}"
@@ -483,7 +490,9 @@ async fn an_approval_that_arrives_mid_loop_ends_it_with_the_registration() {
     // It stopped the moment it had an answer rather than running to the
     // deadline, and it did not poll again afterwards.
     assert_eq!(attempt.load(Ordering::SeqCst), 3);
-    assert_eq!(waits.lock().expect("lock").len(), 2);
+    // The approval is looked for every quarter second at first, not every advertised five: a
+    // person (or a driver) who approves within seconds is not made to wait out the advice.
+    assert_eq!(*waits.lock().expect("lock"), vec![Duration::from_millis(250); 2]);
 }
 
 // --- what a registration may not contain ------------------------------------
@@ -553,4 +562,187 @@ async fn collected(body: serde_json::Value) -> Result<(), Error> {
     let key = Es256Key::generate();
     let pending = open_against(&server, &key).await;
     poll_enrolment(&reqwest::Client::new(), &pending, &key).await.map(|_| ())
+}
+
+// --- pairing codes -----------------------------------------------------------
+
+fn paired_started(handle: &str) -> serde_json::Value {
+    serde_json::json!({
+        "bootstrap_handle": handle,
+        "expires_in": 600,
+        "poll_interval_seconds": 5,
+    })
+}
+
+#[tokio::test]
+async fn a_paired_start_sends_the_code_in_the_start_body_and_has_no_approval_link() {
+    let server = MockServer::start().await;
+    mount_discovery(&server).await;
+    let seen = Arc::new(Mutex::new(serde_json::Value::Null));
+    let recorder = seen.clone();
+    Mock::given(method("POST"))
+        .and(path("/bootstrap/start"))
+        .respond_with(move |request: &Request| {
+            *recorder.lock().expect("lock") = request.body_json().expect("JSON body");
+            ResponseTemplate::new(201).set_body_json(paired_started("p".repeat(64).as_str()))
+        })
+        .mount(&server)
+        .await;
+
+    let code = PairingCode::parse("bcdf ghjk lmnp").expect("a code");
+    let uris = loopback();
+    let key = Es256Key::generate();
+    let pending = open_enrolment(
+        &reqwest::Client::new(),
+        &server.uri(),
+        &key,
+        &EnrolmentRequest {
+            redirect_uris: &uris,
+            client_name: Some("nas"),
+            pairing_code: Some(&code),
+        },
+    )
+    .await
+    .expect("the paired transaction opens");
+
+    assert!(pending.approval_uri.is_none());
+    assert_eq!(pending.expires_in, Duration::from_secs(600));
+    let body = seen.lock().expect("lock").clone();
+    // The normalised form, and the public half of the key beside it.
+    assert_eq!(body["pairing_code"], "BCDFGHJKLMNP");
+    assert!(body["jwks"]["keys"][0].get("d").is_none());
+    let rendered = format!("{pending:?}");
+    assert!(!rendered.contains("BCDFGHJKLMNP"), "{rendered}");
+}
+
+#[tokio::test]
+async fn a_start_without_a_code_never_carries_the_member() {
+    let server = MockServer::start().await;
+    mount_discovery(&server).await;
+    let seen = Arc::new(Mutex::new(serde_json::Value::Null));
+    let recorder = seen.clone();
+    Mock::given(method("POST"))
+        .and(path("/bootstrap/start"))
+        .respond_with(move |request: &Request| {
+            *recorder.lock().expect("lock") = request.body_json().expect("JSON body");
+            ResponseTemplate::new(201).set_body_json(started("f".repeat(64).as_str()))
+        })
+        .mount(&server)
+        .await;
+    open_against(&server, &Es256Key::generate()).await;
+    assert!(seen.lock().expect("lock").get("pairing_code").is_none());
+}
+
+#[tokio::test]
+async fn a_refused_code_is_the_servers_invalid_grant_and_nothing_is_polled() {
+    let server = MockServer::start().await;
+    mount_discovery(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/bootstrap/start"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": "invalid_grant",
+            "error_description": "the pairing code is invalid or has expired",
+        })))
+        .mount(&server)
+        .await;
+    let code = PairingCode::parse("BCDF-GHJK-LMNP").expect("a code");
+    let uris = loopback();
+    let error = open_enrolment(
+        &reqwest::Client::new(),
+        &server.uri(),
+        &Es256Key::generate(),
+        &EnrolmentRequest { redirect_uris: &uris, client_name: None, pairing_code: Some(&code) },
+    )
+    .await
+    .expect_err("the code is refused");
+    assert!(error.is_invalid_grant(), "{error}");
+    assert!(!error.to_string().contains("BCDF"), "{error}");
+}
+
+#[tokio::test]
+async fn an_ordinary_start_without_an_approval_link_is_refused() {
+    let server = MockServer::start().await;
+    mount_discovery(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/bootstrap/start"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(paired_started("h")))
+        .mount(&server)
+        .await;
+    let uris = loopback();
+    let error = open_enrolment(
+        &reqwest::Client::new(),
+        &server.uri(),
+        &Es256Key::generate(),
+        &request(&uris),
+    )
+    .await
+    .expect_err("no link, no enrolment");
+    assert!(matches!(error, Error::Registration(_)), "{error}");
+}
+
+#[tokio::test]
+async fn the_abuse_budget_answers_a_start_with_the_wait_it_asked_for() {
+    let server = MockServer::start().await;
+    mount_discovery(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/bootstrap/start"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "42")
+                .set_body_json(serde_json::json!({ "error": "rate_limited" })),
+        )
+        .mount(&server)
+        .await;
+    let uris = loopback();
+    let error = open_enrolment(
+        &reqwest::Client::new(),
+        &server.uri(),
+        &Es256Key::generate(),
+        &request(&uris),
+    )
+    .await
+    .expect_err("rate limited");
+    assert!(
+        matches!(error, Error::RateLimited { retry_after: Some(wait), .. } if wait == Duration::from_secs(42)),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn a_rate_limited_poll_waits_as_asked_and_then_collects() {
+    let server = MockServer::start().await;
+    mount_discovery(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/bootstrap/start"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(started("p")))
+        .mount(&server)
+        .await;
+    let polls = Arc::new(AtomicUsize::new(0));
+    let counter = polls.clone();
+    Mock::given(method("POST"))
+        .and(path("/bootstrap/poll"))
+        .respond_with(move |_: &Request| {
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(429).insert_header("retry-after", "7")
+            } else {
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "client_id": CLIENT_ID }))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let key = Es256Key::generate();
+    let pending = open_against(&server, &key).await;
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let registration =
+        complete_enrolment(&reqwest::Client::new(), &pending, &key, recording_sleep(log.clone()))
+            .await
+            .expect("collected after the wait");
+    assert_eq!(registration.client_id, CLIENT_ID);
+    // The asked-for wait first, then the loop's own interval before the next attempt.
+    assert_eq!(
+        log.lock().expect("lock").as_slice(),
+        [Duration::from_secs(7), Duration::from_secs(5)]
+    );
 }

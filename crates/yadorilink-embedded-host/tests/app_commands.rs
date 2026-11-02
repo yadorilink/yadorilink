@@ -228,6 +228,40 @@ fn preserved_items_are_empty_on_a_fresh_engine_and_an_unknown_one_is_refused_typ
     host.stop().unwrap();
 }
 
+/// A provider folder with no history lists nothing; an unknown root or item is a failure with the
+/// engine's message, never an empty answer that would read as "nothing deleted".
+#[test]
+fn the_history_listings_of_a_fresh_provider_folder_are_empty_and_unknown_ids_are_refused() {
+    let _serial = serialized();
+    let (host, _area) = running_host();
+    let root_hex = host.add_provider_link_for_test("g-history").unwrap();
+    let root: Vec<u8> = (0..root_hex.len() / 2)
+        .map(|i| u8::from_str_radix(&root_hex[2 * i..2 * i + 2], 16).unwrap())
+        .collect();
+
+    let CommandOutput::DeletedItems(deleted) =
+        host.execute(Command::ListDeletedItems { root_id: root.clone() }, &within(30)).unwrap()
+    else {
+        panic!("a deleted list")
+    };
+    assert!(deleted.listing.items.is_empty() && !deleted.listing.truncated);
+
+    for command in [
+        Command::ListItemVersions { root_id: root.clone(), item_id: vec![7; 16] },
+        Command::ListItemVersions { root_id: root.clone(), item_id: vec![7; 3] },
+        Command::ListItemVersions { root_id: vec![9; 16], item_id: vec![7; 16] },
+        Command::ListDeletedItems { root_id: vec![9; 16] },
+    ] {
+        let result = host.execute(command.clone(), &within(30));
+        let Err(CallError::Failed(error)) = result else {
+            panic!("{command:?} should be refused: {result:?}")
+        };
+        assert_eq!(error.kind(), CommandErrorKind::Failed);
+        assert!(!error.message().is_empty());
+    }
+    host.stop().unwrap();
+}
+
 /// An ordinary folder cannot be captured by this build, so a share into one is refused before
 /// anything is created on this device or redeemed with the coordination plane.
 #[test]
@@ -301,7 +335,7 @@ fn a_provider_share_without_an_account_is_refused_typed() {
     let create = CreateShare {
         group_name: "Photos".into(),
         folder: folder.clone(),
-        on_demand: true,
+        on_demand: false,
         acknowledge_risks: false,
     };
     let (code, _) = refused_with(host.execute(Command::CreateShare(create), &within(30)));
@@ -353,5 +387,34 @@ fn a_cancelled_read_only_command_is_aborted_and_a_changing_one_is_left_to_finish
         CommandOutput::SpaceManagement(SpaceManagement { enabled: false }),
         "a command cancelled before it started changed nothing"
     );
+    host.stop().unwrap();
+}
+
+/// A new share created On-Demand would have one member that keeps no full copy: refused,
+/// typed, before any journal write or remote call; the full-copy create is not affected.
+#[test]
+fn creating_a_share_on_demand_is_refused_for_want_of_a_full_replica() {
+    let (host, _area) = running_host();
+    let create = |on_demand| {
+        Command::CreateShare(CreateShare {
+            group_name: "Photos".into(),
+            folder: ShareFolder::Provider(ProviderFolder {
+                display_name: "Photos".into(),
+                request_token: "token-1".into(),
+            }),
+            on_demand,
+            acknowledge_risks: false,
+        })
+    };
+    let Err(CallError::Failed(error)) = host.execute(create(true), &within(30)) else {
+        panic!("refused")
+    };
+    assert_eq!(error.kind(), CommandErrorKind::NoFullReplica);
+    // The full-copy create goes on to the enrollment (which this unconfigured host refuses
+    // for its own reason), proving the refusal above is the on-demand rule and nothing else.
+    let Err(CallError::Failed(error)) = host.execute(create(false), &within(30)) else {
+        panic!("refused")
+    };
+    assert_ne!(error.kind(), CommandErrorKind::NoFullReplica);
     host.stop().unwrap();
 }

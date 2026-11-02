@@ -26,6 +26,8 @@ pub(crate) mod gc_idle;
 pub(crate) mod link_volume;
 pub(crate) mod materialization_repair;
 pub(crate) mod pause_expiry;
+pub(crate) mod provider_change_retention;
+pub(crate) mod publication_retry;
 pub(crate) mod recovery;
 pub(crate) mod replacement_confirm;
 pub(crate) mod retention_expiry;

@@ -20,8 +20,18 @@ pub enum SendError {
     #[error("network error: {0}")]
     Network(#[from] yadorilink_sync_substrate::SubstrateError),
 
-    #[error("could not reach device {0} in time")]
-    DialTimedOut(String),
+    /// Every dial attempt within the deadline failed; `detail` says how, in a sentence a person
+    /// can act on (which addresses were tried, and whether this device's own network refused).
+    #[error("could not reach device {device_id}: {detail}")]
+    DialFailed { device_id: String, reason: DialReason, detail: String },
+
+    /// The other device stopped sending, and could not be reached again within the time a receive
+    /// keeps trying. The offer is of no further use from this side: ask for it to be sent again.
+    #[error("device {0} stopped sending and could not be reached again; ask for a new link or send it again")]
+    SenderGone(String),
+
+    #[error("device {0} did not answer the offer in time")]
+    OfferUnanswered(String),
 
     #[error("wire decode error: {0}")]
     Decode(#[from] prost::DecodeError),
@@ -91,9 +101,24 @@ pub enum SendError {
 
     #[error(
         "this device cannot send to {0} now without a new authorization; send it again once the \
-         device is available"
+         device is available. If it was sent through a send link (a device on another account), \
+         create a new link: a link's authorization is used once and cannot be retried"
     )]
     NeedsNewAuthorization(String),
+}
+
+/// Why a dial gave up, as far as this device can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialReason {
+    /// This device's operating system refused to send to the local network (macOS Local Network
+    /// privacy, a firewall): only a path that does not need the local network can work.
+    LocalNetworkBlocked,
+    /// There was nothing to dial: no address is known for the device.
+    NoAddress,
+    /// The device answered and turned the connection down.
+    Refused,
+    /// Nothing answered: the handshake never completed on any path.
+    NoResponse,
 }
 
 /// Closed reasons a transfer stopped, as stored and listed. Shells word them.
@@ -114,6 +139,18 @@ pub mod failure {
     pub const LOCAL_STORAGE: &str = "local_storage";
     /// The other device stopped reading what this device was sending it, so serving it ended.
     pub const STALLED: &str = "stalled";
+    /// This device had no room to store what arrived.
+    pub const NO_SPACE: &str = "no_space";
+    /// This device's operating system refused to send to the local network, so a device on the
+    /// same network could not be reached (see [`super::DialReason::LocalNetworkBlocked`]).
+    pub const LOCAL_NETWORK_BLOCKED: &str = "local_network_blocked";
+    /// The sending device stopped sending and could not be reached again; only a new offer helps.
+    pub const SENDER_GONE: &str = "sender_gone";
+    /// The receiving device canceled the transfer.
+    pub const RECEIVER_CANCELED: &str = "receiver_canceled";
+    /// The receiving device reported that its receive failed, or has fetched nothing for a long
+    /// time. The transfer is still offered: the receiver can fetch it again.
+    pub const RECEIVER_STOPPED: &str = "receiver_stopped";
     /// The transfer stopped without a clearer reason.
     pub const INTERRUPTED: &str = "interrupted";
 }
@@ -123,11 +160,48 @@ pub(crate) const PULL_REASON_CANCELED: &str = "the sender canceled this transfer
 /// What a sender tells a receiver that pulls an offer the sender does not hold as accepted.
 pub(crate) const PULL_REASON_NOT_ACCEPTED: &str = "offer was not accepted; nothing to pull";
 
+/// Whether an I/O error is the disk (or quota) being full.
+fn io_is_no_space(error: &std::io::Error) -> bool {
+    // ENOSPC, ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL
+    error.kind() == std::io::ErrorKind::StorageFull
+        || matches!(error.raw_os_error(), Some(28 | 112 | 39))
+}
+
 impl SendError {
-    /// The closed reason code for a transfer that stopped with this error.
-    pub(crate) fn failure_code(&self) -> &'static str {
+    /// Whether this device ran out of room to store what it was receiving.
+    #[must_use]
+    pub fn is_no_space(&self) -> bool {
+        use yadorilink_local_storage::StorageError;
         match self {
-            SendError::DialTimedOut(_)
+            SendError::Io(error) | SendError::Storage(StorageError::Io(error)) => {
+                io_is_no_space(error)
+            }
+            SendError::Storage(StorageError::DiskPressure { .. }) => true,
+            _ => false,
+        }
+    }
+
+    /// Whether the other device could not be reached.
+    #[must_use]
+    pub fn is_unreachable(&self) -> bool {
+        matches!(self.failure_code(), failure::UNREACHABLE | failure::LOCAL_NETWORK_BLOCKED)
+    }
+
+    /// Whether this device's own operating system refused to reach the local network.
+    #[must_use]
+    pub fn is_local_network_blocked(&self) -> bool {
+        self.failure_code() == failure::LOCAL_NETWORK_BLOCKED
+    }
+
+    /// The closed reason code for a transfer that stopped with this error.
+    pub fn failure_code(&self) -> &'static str {
+        match self {
+            SendError::DialFailed { reason: DialReason::LocalNetworkBlocked, .. } => {
+                failure::LOCAL_NETWORK_BLOCKED
+            }
+            SendError::SenderGone(_) => failure::SENDER_GONE,
+            SendError::DialFailed { .. }
+            | SendError::OfferUnanswered(_)
             | SendError::NoKnownAddress(_)
             | SendError::NoKnownDeviceKey(_)
             | SendError::Network(_)
@@ -144,6 +218,7 @@ impl SendError {
             SendError::ChunkHashMismatch { .. } | SendError::Protocol(_) | SendError::Decode(_) => {
                 failure::VERIFICATION_FAILED
             }
+            _ if self.is_no_space() => failure::NO_SPACE,
             SendError::Io(_) | SendError::Storage(_) | SendError::BadDestination(..) => {
                 failure::LOCAL_STORAGE
             }
@@ -171,6 +246,10 @@ pub type Result<T> = std::result::Result<T, SendError>;
 mod tests {
     use super::*;
 
+    fn dial_failed(reason: DialReason) -> SendError {
+        SendError::DialFailed { device_id: "d".into(), reason, detail: "x".into() }
+    }
+
     /// Each kind of stop has its own closed reason; a broken connection is never blamed on the
     /// disk, and a disk fault is never blamed on the connection.
     #[test]
@@ -180,8 +259,24 @@ mod tests {
             SendError::Transport(yadorilink_transport::TransportError::Io(io())).failure_code(),
             failure::UNREACHABLE
         );
-        assert_eq!(SendError::DialTimedOut("d".into()).failure_code(), failure::UNREACHABLE);
+        assert_eq!(dial_failed(DialReason::NoResponse).failure_code(), failure::UNREACHABLE);
+        assert_eq!(
+            dial_failed(DialReason::LocalNetworkBlocked).failure_code(),
+            failure::LOCAL_NETWORK_BLOCKED
+        );
+        assert!(dial_failed(DialReason::LocalNetworkBlocked).is_unreachable());
+        assert_eq!(SendError::SenderGone("d".into()).failure_code(), failure::SENDER_GONE);
         assert_eq!(SendError::Io(io()).failure_code(), failure::LOCAL_STORAGE);
+        let full = || std::io::Error::from(std::io::ErrorKind::StorageFull);
+        assert_eq!(SendError::Io(full()).failure_code(), failure::NO_SPACE);
+        assert!(SendError::Io(full()).is_no_space());
+        assert!(SendError::Io(std::io::Error::from_raw_os_error(28)).is_no_space());
+        assert_eq!(
+            SendError::Storage(yadorilink_local_storage::StorageError::Io(full())).failure_code(),
+            failure::NO_SPACE
+        );
+        assert!(dial_failed(DialReason::Refused).is_unreachable());
+        assert!(!SendError::Io(io()).is_unreachable());
         assert_eq!(
             SendError::PullRejected(PULL_REASON_CANCELED.into()).failure_code(),
             failure::SENDER_CANCELED

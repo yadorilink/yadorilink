@@ -42,6 +42,7 @@ fn identify_reports_the_documented_fields_for_every_install_layout() {
         assert_eq!(report.ownership_status, Status::Missing as i32);
         assert!(report.ownership_record.is_none());
         assert_eq!(report.release_id, "");
+        assert_eq!(report.data_dir, "", "no data dir known");
     }
 }
 
@@ -429,7 +430,8 @@ fn a_daemon_of_a_newer_release_refreshes_the_release_in_its_own_record() {
     updated.gate_start(config.path()).unwrap();
     let refreshed = record_of(config.path());
     assert_eq!(refreshed.release_id, format!("{}:{}", "c".repeat(40), "d".repeat(64)));
-    // Only the release and the time move: the owner and the installation stay what they were.
+    // Only the release and the time move: the owner and the installation stay what they were,
+    // the install root too (a script install is not proven to be the recorded one by its path).
     assert_eq!(
         (refreshed.owner, &refreshed.install_source, &refreshed.install_root),
         (first.owner, &first.install_source, &first.install_root)
@@ -502,4 +504,65 @@ fn a_release_that_cannot_be_recorded_refuses_the_start() {
     assert!(matches!(refused.0, Refusal::OwnerRecordUnwritable { .. }), "{refused}");
     stale.written_at = 1;
     assert_eq!(record_of(config.path()), stale, "the previous record stays");
+}
+
+/// An in-place Store update changes the package directory (`.../WindowsApps/<family>_<version>_...`)
+/// and nothing else: the record must follow it even when the build identity is unchanged.
+#[test]
+fn a_store_update_moves_the_install_root_in_the_record_even_with_the_same_release() {
+    let config = tempfile::tempdir().unwrap();
+    let old = "C:/Program Files/WindowsApps/YadoriLink_0.1.3.0_x64__abc/yadorilink-daemon.exe";
+    let new = "C:/Program Files/WindowsApps/YadoriLink_0.1.9.0_x64__abc/yadorilink-daemon.exe";
+    identity(old, "microsoft_store", Some(config.path())).gate_start(config.path()).unwrap();
+    let first = record_of(config.path());
+    let updated = identity(new, "microsoft_store", Some(config.path()));
+    updated.gate_start(config.path()).unwrap();
+    let now = record_of(config.path());
+    assert_eq!((now.owner, &now.install_source), (first.owner, &first.install_source));
+    assert_eq!(now.install_root, updated.report().install_root);
+    assert_ne!(now.install_root, first.install_root);
+}
+
+const STORE_OLD: &str =
+    "C:/Program Files/WindowsApps/YadoriLink_0.1.3.0_x64__abc123/yadorilink-daemon.exe";
+
+#[test]
+fn a_store_package_of_another_family_is_refused_and_the_record_is_untouched() {
+    let config = tempfile::tempdir().unwrap();
+    identity(STORE_OLD, "microsoft_store", Some(config.path())).gate_start(config.path()).unwrap();
+    let before = std::fs::read(config.path().join(ownership::FILE_NAME)).unwrap();
+    for other in [
+        "C:/Program Files/WindowsApps/YadoriLink.Staging_0.1.3.0_x64__abc123/d.exe",
+        "C:/Program Files/WindowsApps/YadoriLink_0.1.9.0_x64__zzz999/d.exe",
+    ] {
+        let refused =
+            identity(other, "microsoft_store", Some(config.path())).gate_start(config.path());
+        assert!(matches!(refused.unwrap_err().0, Refusal::InstallSourceMismatch { .. }), "{other}");
+        assert_eq!(std::fs::read(config.path().join(ownership::FILE_NAME)).unwrap(), before);
+    }
+}
+
+#[test]
+fn a_second_script_install_never_takes_over_the_recorded_install_root() {
+    let config = tempfile::tempdir().unwrap();
+    let (_a, exe_a) =
+        install_with_identity(&identity_json(yadorilink_ipc_proto::PROVIDER_HOST_API_VERSION));
+    let (_b, exe_b) =
+        install_with_identity(&identity_json(yadorilink_ipc_proto::PROVIDER_HOST_API_VERSION));
+    identity(&exe_a, "script", Some(config.path())).gate_start(config.path()).unwrap();
+    let first = record_of(config.path());
+    identity(&exe_b, "script", Some(config.path())).gate_start(config.path()).unwrap();
+    assert_eq!(record_of(config.path()).install_root, first.install_root);
+    assert_eq!(first.install_root, Path::new(&exe_a).parent().unwrap().display().to_string());
+}
+
+#[test]
+fn the_store_package_family_is_read_from_the_protected_path_only() {
+    assert_eq!(ownership::store_package_family(STORE_OLD).as_deref(), Some("yadorilink_abc123"));
+    assert_eq!(ownership::store_package_family("C:/tools/YadoriLink_1_x64__abc/d.exe"), None);
+    assert_eq!(ownership::store_package_family("C:/Program Files/WindowsApps/"), None);
+    assert!(ownership::is_same_store_package(
+        STORE_OLD,
+        r"C:\Program Files\WindowsApps\YadoriLink_0.1.9.0_x64__abc123\x.exe"
+    ));
 }

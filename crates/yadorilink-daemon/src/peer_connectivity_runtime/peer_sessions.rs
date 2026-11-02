@@ -60,7 +60,43 @@ pub(crate) fn keep_peer_sessions(
     stack: &Arc<SyncStack>,
 ) -> tokio::task::JoinHandle<()> {
     let changes = state.authority.subscribe_to_peer_changes();
-    tokio::spawn(follow_authorized_peers(Arc::downgrade(state), Arc::downgrade(stack), changes))
+    let keepers = follow_authorized_peers(Arc::downgrade(state), Arc::downgrade(stack), changes);
+    let recycler = recycle_when_network_returns(Arc::downgrade(stack));
+    let relay_guard = super::relay_guard::run(Arc::downgrade(stack));
+    // A peer that stops answering on its native connection is not carrying sync traffic on
+    // the sync connection either: both ride the same paths. The native side finds out (it
+    // asks the peer something every round) and says so here.
+    let weak_stack = Arc::downgrade(stack);
+    state.native_replication.on_unresponsive(Arc::new(move |device: &str| {
+        if let Some(stack) = weak_stack.upgrade() {
+            let closed = stack.endpoint().recycle_peer(device);
+            tracing::info!(peer = device, closed, "peer stopped answering; closed its connections");
+        }
+    }));
+    tokio::spawn(async move {
+        tokio::join!(keepers, recycler, relay_guard);
+    })
+}
+
+/// Closes the peer connections when the network comes back after being lost.
+///
+/// A connection that was up when the network went away is not always found dead: QUIC keeps
+/// one alive for as long as anything trickles in one direction, and a connection like that
+/// was seen to sit unusable for half a minute, and in one run for five minutes, after the
+/// network had returned, while every redial that would have worked waited for it to close. The
+/// network coming back is the moment to stop trusting what was connected before it: close
+/// those connections, and the keepers (which wake on the same event) dial fresh ones. This
+/// runs before the keepers' own dial, which waits [`crate::redial_pacing::NUDGE_SETTLE`], so a
+/// connection made in response to the event is never one of those closed.
+async fn recycle_when_network_returns(stack: Weak<SyncStack>) {
+    let Some(mut restored) = stack.upgrade().map(|stack| stack.endpoint().watch_restored()) else {
+        return;
+    };
+    while restored.changed().await.is_ok() {
+        let Some(stack) = stack.upgrade() else { return };
+        let closed = stack.endpoint().recycle_connections();
+        tracing::info!(closed, "network came back; closed the connections made before it");
+    }
 }
 
 /// One keeper per pinned peer, started and stopped as the pinned set
@@ -121,20 +157,43 @@ async fn keep_session(state: Weak<DaemonState>, stack: Weak<SyncStack>, device: 
     let mut registered =
         Registered { state: state.clone(), device: device.clone(), session: None, native: None };
     let mut attempt: u32 = 0;
+    let mut arrivals = match stack.upgrade() {
+        Some(stack) => stack.endpoint().arrivals(),
+        None => return,
+    };
     loop {
-        let started = tokio::time::Instant::now();
         let link = {
             let Some(stack) = stack.upgrade() else { return };
-            stack.link_to(&device).await.map(|link| (link, stack))
+            // A dial started against a network that has since come back is
+            // abandoned and made again at once (see `redial_pacing`).
+            let dial = crate::redial_pacing::bounded_dial(attempt, stack.link_to(&device));
+            match arrivals.run(dial).await {
+                Some(Some(linked)) => linked.map(|link| (link, stack)),
+                Some(None) => Err(crate::sync_adapter::sync_stack::SyncStackError::DialTimedOut {
+                    device: device.clone(),
+                    within: crate::redial_pacing::dial_timeout(attempt).unwrap_or_default(),
+                }),
+                None => {
+                    tracing::debug!(peer = %device, "sync dial abandoned, network came back");
+                    attempt = 0;
+                    continue;
+                }
+            }
         };
         match link {
             Ok((link, linked_stack)) => {
+                // How long the connection lived is what makes it a working one; the
+                // time spent dialling it (a dial may hang for seconds) is not.
+                let connected_at = tokio::time::Instant::now();
                 let Some(mut removals) =
                     state.upgrade().map(|state| state.peers.subscribe_to_removals())
                 else {
                     return;
                 };
                 registered.session = open_session(&state, &linked_stack, &device);
+                if registered.session.is_none() {
+                    tracing::debug!(peer = %device, "sync session keeper: another session stands for this peer; waiting for it to go");
+                }
                 if registered.session.is_some() {
                     registered.native =
                         Some(start_native_replication(&state, &linked_stack, &device));
@@ -168,25 +227,27 @@ async fn keep_session(state: Weak<DaemonState>, stack: Weak<SyncStack>, device: 
                     while carrier.next().await.is_some() {}
                 }
                 registered.release();
+                if connected_at.elapsed() > HEALTHY_CONNECTION {
+                    attempt = 0;
+                }
             }
             Err(error) => {
                 tracing::debug!(peer = %device, %error, "no iroh connection to this peer yet");
             }
-        }
-        if started.elapsed() > HEALTHY_CONNECTION {
-            attempt = 0;
         }
         // The backoff is for a peer that cannot be reached. One that opened
         // a connection to this device meanwhile (its dial can succeed while
         // ours was refused or timed out) can be, so that ends the wait.
         let Some(waiting) = stack.upgrade() else { return };
         let backoff = BackoffConfig::RECONNECT.next(attempt);
-        tokio::select! {
-            () = tokio::time::sleep(backoff) => {}
-            () = waiting.endpoint().wait_for_link(&device) => {}
-        }
+        let nudged = tokio::select! {
+            wake = arrivals.sleep(backoff) => wake == crate::redial_pacing::Wake::Nudged,
+            () = waiting.endpoint().wait_for_link(&device) => false,
+        };
         drop(waiting);
-        attempt = attempt.saturating_add(1);
+        // The network came back: the backoff the outage earned is forgotten.
+        tracing::debug!(peer = %device, attempt, nudged, ?backoff, "sync session keeper waited");
+        attempt = if nudged { 0 } else { attempt.saturating_add(1) };
     }
 }
 

@@ -55,6 +55,7 @@ fn open_item(
         origin_device_id: "device-peer".to_owned(),
         authoring: None,
         meta: crate::replica_coordinator::plain_file_columns(),
+        retention_proofs: yadorilink_sync_sqlite::retention::RetentionProofs::new(),
         now: 1,
         lane_check,
         row_check,

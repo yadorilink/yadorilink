@@ -188,7 +188,7 @@ inst s24 s24
 newhome 8
 env HOME="$H" YADORILINK_INSTALL_TEST=1 YADORILINK_INSTALL_MIN_GENERATED_AT=2000-01-01T00:00:00Z YADORILINK_INSTALL_PUBKEY_HEX="$(pub s7)" YADORILINK_INSTALL_KEY_ID=some-other-id \
     YADORILINK_INSTALL_BASE_URL="$BASE/s7" YADORILINK_INSTALL_OS=Linux YADORILINK_INSTALL_ARCH=x86_64 sh "$INSTALL" --prefix "$H/prefix" --yes > "$T/out" 2>&1; RC=$?
-{ [ $RC != 0 ] && has "not one of the pinned release keys" && nothing_installed; } && ok "wrong key id rejected" || bad "wrong key id" "$T/out"
+{ [ $RC = 22 ] && has "not one of the pinned release keys" && has "run the one-line installer again" && nothing_installed; } && ok "wrong key id rejected with exit 22 and the way out" || bad "wrong key id" "$T/out"
 
 # --- bundles that are signed and hashed correctly but wrong inside
 badbundle() { # NAME MESSAGE builder-args...
@@ -330,6 +330,47 @@ inst s1 s1 --no-modify-path
 sh "$INSTALL" --help > "$T/out" 2>&1; { has "Options:" && has "--prefix"; } && ok "--help" || bad "--help" "$T/out"
 
 
+
+# --- the installer kept for `yadorilink self-update`, and --rollback
+# The bundle carries install.sh (covered by SHA256SUMS, so by the signed manifest); a script install
+# keeps a copy and records the hash it was proven to have. A bundle from before that records nothing.
+newhome 50; fx k1 --version 0.2.0; fx k2 --version 0.3.0; fx k3 --version 0.4.0 --no-installer
+KS=$H/prefix/share/yadorilink
+inst k1 k1
+KSHA=$(sed -n 's/^installer_sha256=//p' "$KS/install-receipt")
+{ [ $RC = 0 ] && [ -x "$KS/installer/install.sh" ] && [ "$KSHA" = "$(shasum -a 256 "$KS/installer/install.sh" 2>/dev/null | cut -d' ' -f1 || sha256sum "$KS/installer/install.sh" | cut -d' ' -f1)" ] && grep -q "^installer=$KS/installer/install.sh$" "$KS/install-receipt"; } && ok "the installer from the verified bundle is kept, executable, with its proven hash in the receipt" || bad "kept installer" "$T/out"
+unzip -p "$SRV/k1/files/0.2.0/yadorilink-engine-beta-linux-x86_64.zip" SHA256SUMS | grep -q "^$KSHA  install.sh$" && ok "the recorded hash is the bundle's SHA256SUMS entry" || bad "hash is the SHA256SUMS entry"
+inst k2 k1
+{ [ $RC = 0 ] && version_is 0.3.0 && grep -q '^previous_version=0.2.0$' "$KS/install-receipt" && [ -x "$KS/installer/install.sh" ]; } && ok "upgrade records the previous version and keeps an installer" || bad "upgrade receipt" "$T/out"
+inst k3 k1
+{ [ $RC = 0 ] && version_is 0.4.0 && ! grep -q '^installer' "$KS/install-receipt" && [ ! -e "$KS/installer/install.sh" ]; } && ok "a bundle without an installer records none and drops the old kept copy" || bad "bundle without installer" "$T/out"
+# rollback
+newhome 51; fx r1 --version 0.2.0; fx r2 --version 0.3.0
+RS=$H/prefix/share/yadorilink
+rb() { env HOME="$H" SHELL=/bin/sh $INSTALL_SH "$INSTALL" --prefix "$H/prefix" --rollback > "$T/out" 2>&1; RC=$?; }
+rb; { [ $RC = 1 ] && has "nothing to roll back"; } && ok "rollback with no install: refused, nothing changed" || bad "rollback without install" "$T/out"
+inst r1 r1; rb
+{ [ $RC = 1 ] && has "no previous version" && version_is 0.2.0; } && ok "rollback with a single install: refused" || bad "rollback single" "$T/out"
+inst r2 r1; rb
+{ [ $RC = 0 ] && has "Rolled back to YadoriLink 0.2.0" && version_is 0.2.0 && grep -q '^version=0.2.0$' "$RS/install-receipt" && grep -q '^previous_version=0.3.0$' "$RS/install-receipt"; } && ok "rollback switches to the previous version and swaps the receipt" || bad "rollback" "$T/out"
+rb; { [ $RC = 0 ] && version_is 0.3.0; } && ok "a second rollback goes forward again" || bad "rollback forward" "$T/out"
+prevd=$(sed -n 's/^previous_dir=//p' "$RS/install-receipt")
+cp "$prevd/yadorilink" "$T/prev.bak"; chmod u+w "$prevd/yadorilink"; echo tampered >> "$prevd/yadorilink"
+rb
+{ [ $RC = 4 ] && has "no longer matches its SHA256SUMS" && version_is 0.3.0 && grep -q '^version=0.3.0$' "$RS/install-receipt"; } && ok "rollback refuses a previous version whose file changed" || bad "rollback tampered" "$T/out"
+cp "$T/prev.bak" "$prevd/yadorilink"
+# a truncated file list cannot vouch for the previous version: the list is tied to the engine identity
+cp "$prevd/SHA256SUMS" "$T/sums.bak"; : > "$prevd/SHA256SUMS"; rb
+{ [ $RC = 4 ] && has "no longer matches its engine identity" && version_is 0.3.0; } && ok "rollback refuses a previous version whose file list was emptied" || bad "rollback emptied list" "$T/out"
+cp "$T/sums.bak" "$prevd/SHA256SUMS"
+# the tree must be one plain name under versions/, whatever the receipt says
+cp "$RS/install-receipt" "$T/receipt.bak"
+sed "s|^previous_dir=.*|previous_dir=$RS/versions/../../elsewhere|" "$T/receipt.bak" > "$RS/install-receipt"; rb
+{ [ $RC = 1 ] && has "not a plain directory under" && version_is 0.3.0; } && ok "rollback refuses a receipt that points out of versions/" || bad "rollback escape" "$T/out"
+cp "$T/receipt.bak" "$RS/install-receipt"
+rm -rf "$prevd"; rb
+{ [ $RC = 1 ] && has "files" && has "are gone" && version_is 0.3.0; } && ok "rollback refuses when the previous version's files are gone" || bad "rollback missing" "$T/out"
+
 # --- exit codes (2 usage, 3 network, 4 signature/hash/withdrawal, 5 platform, 6 downgrade, 7 prefix)
 code_is() { [ "$RC" = "$1" ]; }
 newhome 40; fx x1
@@ -341,10 +382,29 @@ BASEURL_OVERRIDE=http://127.0.0.1:1; inst x1 x1; unset BASEURL_OVERRIDE
 { code_is 3 && nothing_installed; } && ok "exit 3: network failure" || bad "exit 3 network" "$T/out"
 TOS=FreeBSD; inst x1 x1; unset TOS
 { code_is 5 && nothing_installed; } && ok "exit 5: unsupported platform" || bad "exit 5 platform" "$T/out"
+YADORILINK_INSTALL_LOADER=/nonexistent/ld-linux-x86-64.so.2; export YADORILINK_INSTALL_LOADER; TOS=Linux; TARCH=x86_64; inst x1 x1; unset YADORILINK_INSTALL_LOADER TOS TARCH
+{ code_is 5 && has "no glibc dynamic loader" && has "container image" && nothing_installed; } && ok "exit 5: Linux without glibc's loader (Alpine/musl), before any download" || bad "exit 5 musl" "$T/out"
 inst x1 x1 --force; inst x1 x1 --prefix "$H/prefix"
 fx x0 --version 0.1.0
 inst x0 x0
 { code_is 6 && has "not downgrading"; } && ok "exit 6: downgrade refused" || bad "exit 6 downgrade" "$T/out"
+# The bundle's daemon reads the data on the machine (`--check-data-compat`, status chosen by the
+# stand-in): 20 = written by a newer build, 21 = could not be established. Both stop before
+# anything is changed; an older release without the check (status 2) installs.
+newhome 44; fx xc1
+YL_FAKE_COMPAT_RC=20; export YL_FAKE_COMPAT_RC; inst xc1 xc1; unset YL_FAKE_COMPAT_RC
+{ code_is 20 && has "fake compat message" && has "Nothing was installed" && nothing_installed; } && ok "exit 20: data written by a newer build, nothing installed" || bad "exit 20 data" "$T/out"
+YL_FAKE_COMPAT_RC=21; export YL_FAKE_COMPAT_RC; inst xc1 xc1; unset YL_FAKE_COMPAT_RC
+{ code_is 21 && has "Nothing was installed" && nothing_installed; } && ok "exit 21: data could not be read, nothing installed" || bad "exit 21 data" "$T/out"
+YL_FAKE_COMPAT_RC=5; export YL_FAKE_COMPAT_RC; inst xc1 xc1; unset YL_FAKE_COMPAT_RC
+{ code_is 21 && has "failed unexpectedly (status 5)" && nothing_installed; } && ok "exit 21: an unexpected data-check failure stops too" || bad "exit 21 unexpected" "$T/out"
+YL_FAKE_COMPAT_RC=2; export YL_FAKE_COMPAT_RC; inst xc1 xc1; unset YL_FAKE_COMPAT_RC
+{ code_is 0 && has "does not check the existing data" && version_is 0.2.0; } && ok "a release from before the data check installs, with a note" || bad "status 2 data check" "$T/out"
+fx xc2 --version 0.3.0
+YL_FAKE_COMPAT_RC=20; export YL_FAKE_COMPAT_RC; inst xc2 xc2; unset YL_FAKE_COMPAT_RC
+{ code_is 20 && version_is 0.2.0 && [ "$(ls "$H/prefix/share/yadorilink/versions" | wc -l | tr -d ' ')" = 1 ]; } && ok "an upgrade over newer data is refused and the installed version is untouched" || bad "upgrade over newer data" "$T/out"
+inst xc2 xc2
+{ code_is 0 && version_is 0.3.0; } && ok "the same upgrade installs when the data is compatible" || bad "upgrade with compatible data" "$T/out"
 newhome 41; fx x2; mkdir -p "$H/prefix"; chmod 555 "$H/prefix"
 if [ "$(id -u)" != 0 ]; then inst x2 x2; { code_is 7; } && ok "exit 7: prefix not writable" || bad "exit 7 prefix" "$T/out"; fi
 chmod 755 "$H/prefix"
@@ -444,6 +504,9 @@ cp "$SRV/pv/files/0.2.0/yadorilink-engine-beta-linux-x86_64.zip" "$FROMD/"
 cp "$SRV/verifier/yadorilink-verify-linux-x86_64" "$FROMD/"
 newhome 57; BASEURL_OVERRIDE=http://127.0.0.1:1; inst pv pv --from "$FROMD/manifest.json"; unset BASEURL_OVERRIDE
 { code_is 0 && version_is 0.2.0 && has "Withdrawal not checked" && has "offline install"; } && ok "--from installs offline and says withdrawal was not checked" || bad "--from offline" "$T/out"
+# an unpinned key in an offline manifest is a plain refusal (4), not the "too far behind" status
+newhome 56; fx s7x; TRUSTSET="other-key-id:$(pub s7x)"; inst pv pv --from "$FROMD/manifest.json"; unset TRUSTSET
+{ [ $RC = 4 ] && has "not one of the pinned release keys" && ! has "run the one-line installer again"; } && ok "an offline manifest signed by an unpinned key is a plain refusal (4), not the too-far-behind status" || bad "offline manifest status (rc=$RC)" "$T/out"
 newhome 58; inst pv pv --from "$FROMD/manifest.json"
 { code_is 0 && version_is 0.2.0 && has "does not withdraw 0.2.0"; } && ok "--from with a reachable live manifest that does not withdraw" || bad "--from live ok" "$T/out"
 newhome 59; inst pw pv --from "$FROMD/manifest.json"

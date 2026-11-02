@@ -18,7 +18,7 @@ use crate::error::DatabaseError;
 /// Bump this whenever the created shape changes at all, since the previous
 /// shape becomes unopenable by this binary and unopenable is the intended
 /// outcome.
-pub const SCHEMA_VERSION: i32 = 133;
+pub const SCHEMA_VERSION: i32 = 138;
 
 /// Reads `PRAGMA user_version` and refuses anything that is not exactly
 /// this binary's [`SCHEMA_VERSION`], in either direction: a newer stamp is
@@ -40,8 +40,13 @@ pub fn check_schema_version_supported(conn: &Connection) -> Result<(), DatabaseE
     if on_disk_version != 0 && on_disk_version < SCHEMA_VERSION {
         return Err(DatabaseError::CorruptSchema(format!(
             "index database schema v{on_disk_version} predates this build's v{SCHEMA_VERSION}, \
-             and pre-release builds do not migrate old databases -- delete the index database \
-             and re-import the folder"
+             and pre-release builds do not migrate old databases. Before you delete the index \
+             database and re-import the folder, save anything set aside for you: with the \
+             previous version run `yadorilink preserved list`, then `yadorilink preserved \
+             restore <item-id>` or `yadorilink preserved discard <item-id> --yes` for each \
+             item; if that is no longer possible, copy the `recovery-items` folder in the \
+             YadoriLink data directory somewhere safe first. Deleting the index also discards \
+             that folder's contents"
         )));
     }
     Ok(())
@@ -91,7 +96,37 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
     create_tables_and_links_triggers(conn)?;
     files_authoring_triggers(conn)?;
     create_root_set_generation(conn)?;
+    create_activity_events(conn)?;
     refuse_unverified_authoring_rows(conn, unverified_authoring_identity)
+}
+
+/// The recent-activity log (v134): one row per user-visible change the index
+/// admitted (added / updated / deleted / conflict / restored), appended in the
+/// same transaction as the `files` row it describes and pruned on insert to the
+/// newest 2000 rows within 30 days (see `yadorilink-sync-sqlite`'s `activity`).
+/// `id` is the cursor the list API pages on. A log for the UI only: nothing
+/// reads it to decide sync behavior, and losing it loses no data.
+fn create_activity_events(conn: &Connection) -> Result<(), DatabaseError> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS activity_events (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id         TEXT NOT NULL,
+            path             TEXT NOT NULL,
+            -- The `files` row version this event describes.
+            version_seq      INTEGER NOT NULL,
+            -- 'added' | 'updated' | 'deleted' | 'conflict' | 'restored'
+            kind             TEXT NOT NULL,
+            -- The device that authored the version; NULL when not known here.
+            origin_device_id TEXT,
+            at_unix_nanos    INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS activity_events_by_time ON activity_events(at_unix_nanos);
+        CREATE INDEX IF NOT EXISTS activity_events_by_row
+            ON activity_events(group_id, path, version_seq);
+        "#,
+    )?;
+    Ok(())
 }
 
 #[allow(
@@ -135,8 +170,8 @@ fn create_tables_and_links_triggers(conn: &Connection) -> Result<(), DatabaseErr
             materialization_state TEXT NOT NULL DEFAULT 'remote',
             record_kind       TEXT NOT NULL DEFAULT 'file',
             symlink_target    BLOB,
-            -- -1 means "no Unix permission info".
-            unix_mode         INTEGER NOT NULL DEFAULT -1,
+            -- Whether the file is executable (the only replicated permission).
+            exec              INTEGER NOT NULL DEFAULT 0,
             held_reason       TEXT,
             held_since_unix_nanos INTEGER,
             -- What a hold that waits on the file itself was decided
@@ -148,7 +183,6 @@ fn create_tables_and_links_triggers(conn: &Connection) -> Result<(), DatabaseErr
             placeholder_dev   INTEGER,
             placeholder_ino   INTEGER,
             placeholder_provider_kind TEXT,
-            xattrs_json       TEXT NOT NULL DEFAULT '[]',
             admitted_at_unix_nanos INTEGER,
             -- On a `trashed` row whose deletion was one part of a recursive
             -- delete or directory rename: that operation's author and id.
@@ -178,6 +212,13 @@ fn create_tables_and_links_triggers(conn: &Connection) -> Result<(), DatabaseErr
             ON files (group_id, path)
             WHERE state = 'current' AND deleted = 0
               AND instr(path, ' (conflicted copy, ') > 0;
+        -- The held rows, so the hazard re-check reads only these instead of scanning every
+        -- current row of the group each time it is woken (a wake follows every materialization
+        -- completion). The query must repeat this predicate verbatim for the planner to use
+        -- the index.
+        CREATE INDEX IF NOT EXISTS files_held
+            ON files (group_id, path)
+            WHERE state = 'current' AND held_reason IS NOT NULL;
 
         CREATE TABLE IF NOT EXISTS links (
             local_path TEXT PRIMARY KEY,
@@ -303,11 +344,7 @@ fn create_tables_and_links_triggers(conn: &Connection) -> Result<(), DatabaseErr
             record_kind       TEXT NOT NULL DEFAULT 'file',
             symlink_target    BLOB,
             symlink_out_of_root INTEGER NOT NULL DEFAULT 0,
-            -- `-1` = no Unix permission info (see `SCHEMA_VERSION` v23's
-            -- own doc comment); `0..=0o777` = actual replicated mode bits.
-            unix_mode          INTEGER NOT NULL DEFAULT -1,
-            -- See `files.xattrs_json`'s own comment (`SCHEMA_VERSION` v24).
-            xattrs_json        TEXT NOT NULL DEFAULT '[]'
+            exec               INTEGER NOT NULL DEFAULT 0
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_restore_operations_path
             ON restore_operations(group_id, path);
@@ -473,6 +510,15 @@ fn create_tables_and_links_triggers(conn: &Connection) -> Result<(), DatabaseErr
         -- empty `target_version_hash`, and is resolved by the writer on every
         -- exit, or at startup and link start when the process died. A path can
         -- carry one row of each kind at once.
+        --
+        -- `temp_witness` is, for a write whose rename is left unflushed for a
+        -- batch, the temp file name (beside the target) whose directory entry was
+        -- flushed before the rename. The rename moves that entry away and nothing
+        -- else does, so after a power cut a missing target with the temp gone was
+        -- renamed durably and then removed, while the temp still there means the
+        -- rename was lost. The same directory flush makes the name of an object
+        -- the rename replaces durable too. It is withdrawn whenever the temp is
+        -- abandoned before the rename, and reset by every new open of the intent.
         CREATE TABLE IF NOT EXISTS materialization_intents (
             group_id              TEXT NOT NULL,
             path                  TEXT NOT NULL,
@@ -480,6 +526,7 @@ fn create_tables_and_links_triggers(conn: &Connection) -> Result<(), DatabaseErr
             target_version_hash   BLOB NOT NULL,
             created_at_unix_nanos INTEGER NOT NULL,
             mutation_generation   INTEGER,
+            temp_witness          TEXT,
             PRIMARY KEY (group_id, path, kind)
         );
         -- The temp files writers are creating or have not yet renamed away or
@@ -670,6 +717,38 @@ fn create_tables_and_links_triggers(conn: &Connection) -> Result<(), DatabaseErr
             erased_at_unix_nanos INTEGER NOT NULL,
             PRIMARY KEY (group_id, path)
         );
+
+        -- The versions of a path that this device no longer keeps, one row per
+        -- event (one retention expiry's removal of one run of a path's
+        -- versions), never merged when written. A rewind asked for a time
+        -- inside `[from_unix_nanos, to_unix_nanos)`, or a restore asked for a
+        -- sequence inside `[from_seq, to_seq)`, is answered "that history was
+        -- not kept" and the reason, instead of the nearest surviving version.
+        -- The span is the time the dropped versions were current: from the
+        -- admission of the oldest dropped one to the admission of the version
+        -- that followed the newest (widened when the clock ran backwards). A
+        -- NULL bound is unbounded on that side (a dropped or neighbouring row
+        -- has no admission time). `reason` is `Expired` (the retention rule) or
+        -- `LowSpace`. Written in the transaction that drops the rows.
+        -- When each peer was last connected to this device (display only: how long a device has
+        -- been away). The newest session start or end; a revoked device's row is deleted.
+        CREATE TABLE IF NOT EXISTS peer_last_seen (
+            device_id           TEXT PRIMARY KEY,
+            last_connected_unix INTEGER NOT NULL
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS history_freed (
+            event_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id         TEXT NOT NULL,
+            path             TEXT NOT NULL,
+            from_unix_nanos  INTEGER,
+            to_unix_nanos    INTEGER,
+            from_seq         INTEGER NOT NULL,
+            to_seq           INTEGER NOT NULL,
+            reason           TEXT NOT NULL CHECK (reason IN ('Expired', 'LowSpace')),
+            recorded_unix    INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_history_freed_path
+            ON history_freed (group_id, path);
 
         -- The last authorization a live netmap gave this device about its
         -- peers, kept so a restart taken while the coordination plane is

@@ -52,13 +52,7 @@ pub async fn start(state: Arc<DaemonState>) -> ControlSocketHandle {
             )
             .await;
         });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !socket_path.exists() {
-            if std::time::Instant::now() >= deadline {
-                panic!("control socket never came up within 10s");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        yadorilink_daemon::control_socket::unix_transport::wait_until_bound(&socket_path).await;
         ControlSocketHandle { socket_path, _socket_dir: socket_dir }
     }
     #[cfg(windows)]
@@ -75,12 +69,7 @@ pub async fn start(state: Arc<DaemonState>) -> ControlSocketHandle {
             )
             .await;
         });
-        // Named pipes live in `\\.\pipe\`, not the filesystem -- no path to
-        // poll for existence, unlike the Unix socket above. A short fixed
-        // wait for the listener to create its first pipe instance matches
-        // `control_socket.rs`'s own Windows test helper (`start_daemon`)
-        // exactly.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        yadorilink_daemon::control_socket::windows_transport::wait_until_bound(&pipe_name).await;
         ControlSocketHandle { pipe_name }
     }
 }

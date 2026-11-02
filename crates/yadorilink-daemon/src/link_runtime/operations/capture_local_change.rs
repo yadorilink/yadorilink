@@ -680,6 +680,29 @@ impl LinkFlushHandle {
         Ok(())
     }
 
+    /// Re-drives this link's journaled dirty paths now, as the periodic backstop
+    /// does every few seconds (see `tasks::DIRTY_JOURNAL_REDRIVE_INTERVAL`).
+    ///
+    /// What a scan or a live edit could not emit because the group's policy had
+    /// not loaded yet is journaled and waits for exactly this; calling it when
+    /// the policy has just loaded gets the change out at once rather than at the
+    /// next tick. Idempotent and safe beside the periodic pass and the live
+    /// watcher: a path already resolved is simply cleared.
+    pub(crate) async fn redrive_dirty_journal(&self, group_id: &str) -> Result<(), String> {
+        let deps = self.deps.upgrade().ok_or("the daemon is stopping")?;
+        let _write_activity = deps.begin_write_activity();
+        let outcome = self
+            .processor
+            .redrive_dirty_journal(group_id, &self.root)
+            .await
+            .map_err(|e| e.to_string())?;
+        deps.note_capture_settled(group_id);
+        if !outcome.records.is_empty() {
+            announce_local_change(&deps, &self.local_path, group_id, outcome.records).await;
+        }
+        Ok(())
+    }
+
     /// The disk-reconcile backstop sweep's per-link operation (see
     /// the daemon's own `LinkRuntimeController::run_disk_reconcile_backstop_sweep`'s own doc for why
     /// it exists and why it is add-only): admits a `LinkOperation` from

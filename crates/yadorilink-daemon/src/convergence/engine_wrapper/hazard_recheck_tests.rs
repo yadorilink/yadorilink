@@ -14,10 +14,9 @@ fn empty_version(mtime: i64) -> FileVersion {
         0,
         FileMeta {
             mtime_unix_nanos: mtime,
-            unix_mode: None,
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     )
 }
@@ -166,12 +165,12 @@ async fn a_group_with_nothing_held_settles_immediately() {
 
 /// Seeds `path` as an existing, write-only (0o200) file whose index row
 /// and admitted version name exactly its bytes, and whose version also
-/// names a replicated `user.test` attribute the file does not carry: a
-/// metadata repair this device can neither confirm nor apply. Returns the
+/// is executable while the file is not: a metadata repair this device can
+/// neither confirm nor apply while its owner cannot read the file. Returns the
 /// file's path on disk, or `None` when running as root (nothing is
 /// unreadable to root, so there is nothing to test).
 #[cfg(target_os = "linux")]
-fn seed_owner_unreadable_file_needing_an_xattr(
+fn seed_owner_unreadable_file_needing_exec(
     state: &DaemonState,
     root: &std::path::Path,
     path: &str,
@@ -186,10 +185,9 @@ fn seed_owner_unreadable_file_needing_an_xattr(
         content.len() as u64,
         FileMeta {
             mtime_unix_nanos: 1_700_000_000,
-            unix_mode: Some(0o200),
+            exec: true,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: vec![("user.test".to_string(), b"value".to_vec())],
         },
     );
     let key = SigningKey::from_bytes(&[82u8; 32]);
@@ -248,7 +246,7 @@ async fn an_unchanged_metadata_hold_is_not_rechecked_until_the_file_changes() {
     let root = root_dir.path().canonicalize().unwrap();
     let content = b"an existing write-only file";
     let Some(out_path) =
-        seed_owner_unreadable_file_needing_an_xattr(&state, &root, "write-only.txt", content)
+        seed_owner_unreadable_file_needing_exec(&state, &root, "write-only.txt", content)
     else {
         return;
     };
@@ -305,14 +303,12 @@ async fn an_unchanged_metadata_hold_is_not_rechecked_until_the_file_changes() {
         "once the file is readable the re-check must settle the path and lift the hold"
     );
     assert_eq!(metadata_unprovable_holds(&state), 1, "a readable file is not held again");
-    assert_eq!(std::fs::metadata(&out_path).unwrap().permissions().mode() & 0o777, 0o200);
-    std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    assert_eq!(std::fs::read(&out_path).unwrap(), content);
     assert_eq!(
-        yadorilink_local_storage::read_replicated_xattrs(&std::fs::File::open(&out_path).unwrap()),
-        vec![("user.test".to_string(), b"value".to_vec())],
-        "the settled re-check must have applied the version's attribute"
+        std::fs::metadata(&out_path).unwrap().permissions().mode() & 0o777,
+        0o700,
+        "the settled re-check must have applied the version's execute flag"
     );
+    assert_eq!(std::fs::read(&out_path).unwrap(), content);
 }
 
 /// The hold is not silent: `yadorilink status` lists it as a held file
@@ -323,8 +319,7 @@ async fn a_metadata_hold_is_reported_by_link_status_with_its_reason() {
     use crate::queries::link_status::LinkStatusReadPort as _;
     let (state, root_dir) = build_state_with_adopted_group().await;
     let root = root_dir.path().canonicalize().unwrap();
-    if seed_owner_unreadable_file_needing_an_xattr(&state, &root, "write-only.txt", b"bytes")
-        .is_none()
+    if seed_owner_unreadable_file_needing_exec(&state, &root, "write-only.txt", b"bytes").is_none()
     {
         return;
     }

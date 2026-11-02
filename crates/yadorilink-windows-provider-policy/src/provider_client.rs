@@ -484,6 +484,7 @@ mod tests {
                     completed,
                     total: 100,
                     done,
+                    resumed_from: None,
                 })
             };
             vec![
@@ -531,6 +532,7 @@ mod tests {
                     completed,
                     total: progress_messages,
                     done: false,
+                    resumed_from: None,
                 });
                 write_message(&mut server, &ShellIpcMessage { payload: Some(progress) })
                     .await
@@ -625,6 +627,7 @@ mod tests {
                 completed: 1,
                 total: 2,
                 done: false,
+                resumed_from: None,
             })]
         });
         let cancel = AtomicBool::new(false);

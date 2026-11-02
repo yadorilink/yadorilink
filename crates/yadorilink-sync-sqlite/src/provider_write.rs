@@ -103,10 +103,9 @@ pub struct ContentInput {
 
 #[derive(Clone, Debug, Default)]
 pub struct MetadataInput {
-    pub unix_mode: Option<u32>,
+    /// `Some`: the item is (not) executable. An edit that carries none keeps the item's own.
+    pub exec: Option<bool>,
     pub mtime_unix_nanos: Option<i64>,
-    /// `Some`: the complete replicated xattr set.
-    pub xattrs: Option<Vec<(String, Vec<u8>)>>,
 }
 
 #[derive(Clone, Debug)]
@@ -139,6 +138,16 @@ pub struct ApplyInput {
     pub parent_generation: Option<u64>,
     pub observed_revision: Option<u64>,
     pub now_ms: i64,
+    /// The `content` is a retained version being restored, not bytes the user brought. Such a
+    /// change is decided on the view alone: a MODIFY applies only when the version the user saw
+    /// is the current one (else `StaleView`, nothing authored), and no provenance of OS-held bytes
+    /// is asked for, since the bytes did not come from the OS. A refusal keeps nothing: the
+    /// content is not the user's to lose, and no conflict copy is made of it.
+    pub restore: bool,
+    /// With `restore`: the OS does not hold the restored bytes (they are another item's
+    /// version), so the new version is not published as the OS's own. It stays to be announced and
+    /// fetched by the OS, as a change from a peer is.
+    pub announce_to_os: bool,
 }
 
 /// The item as the OS must adopt it, read back from the committed rows.
@@ -152,7 +161,7 @@ pub struct AppliedItem {
     pub metadata_version: [u8; 32],
     pub size: u64,
     pub mtime_unix_nanos: i64,
-    pub unix_mode: u32,
+    pub exec: bool,
     pub current: bool,
     pub namespace_revision: u64,
     /// The item's generation: the OS-visible version identifiers carry it.
@@ -187,7 +196,7 @@ struct StoredItem {
     metadata_version: [u8; 32],
     size: u64,
     mtime_unix_nanos: i64,
-    unix_mode: u32,
+    exec: bool,
     current: bool,
     namespace_revision: u64,
     #[serde(default = "first_generation")]
@@ -217,7 +226,7 @@ impl From<&AppliedItem> for StoredItem {
             metadata_version: item.metadata_version,
             size: item.size,
             mtime_unix_nanos: item.mtime_unix_nanos,
-            unix_mode: item.unix_mode,
+            exec: item.exec,
             current: item.current,
             namespace_revision: item.namespace_revision,
             generation: item.generation,
@@ -237,7 +246,7 @@ impl From<StoredItem> for AppliedItem {
             metadata_version: item.metadata_version,
             size: item.size,
             mtime_unix_nanos: item.mtime_unix_nanos,
-            unix_mode: item.unix_mode,
+            exec: item.exec,
             current: item.current,
             namespace_revision: item.namespace_revision,
             generation: item.generation,
@@ -334,7 +343,7 @@ impl ProviderRepository {
                 | ApplyError::NotFound(_)
                 | ApplyError::InvalidName(_)
                 | ApplyError::DirectoryNotEmpty(_),
-            ) if input.content.is_some() && input.kind != ChangeKind::Delete => {
+            ) if input.content.is_some() && !input.restore && input.kind != ChangeKind::Delete => {
                 self.database_for_write().write_immediate::<_, ApplyError>(|tx| {
                     let result = apply_in_tx(tx, input, author, origin_device_id, true)?;
                     permit.verify().map_err(SyncSqliteError::from)?;
@@ -646,10 +655,7 @@ fn structural_only(input: &ApplyInput) -> bool {
 /// Bytes, a symlink target, a replicated mode or xattrs: the edits that change what the item IS and
 /// are decided by provenance and the view, never by identity.
 fn carries_semantic_edit(input: &ApplyInput) -> bool {
-    input.content.is_some()
-        || input.symlink_target.is_some()
-        || input.metadata.unix_mode.is_some()
-        || input.metadata.xattrs.is_some()
+    input.content.is_some() || input.symlink_target.is_some() || input.metadata.exec.is_some()
 }
 
 /// A modify whose only replicated change is an mtime (with or without a rename or move). The mtime is
@@ -976,26 +982,6 @@ fn check_destination(
     Ok(())
 }
 
-fn replicated_xattr_allowed(name: &str) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        name.starts_with("user.")
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = name;
-        false
-    }
-}
-
-fn clean_xattrs(xattrs: Vec<(String, Vec<u8>)>) -> Vec<(String, Vec<u8>)> {
-    let mut kept: Vec<(String, Vec<u8>)> =
-        xattrs.into_iter().filter(|(name, _)| replicated_xattr_allowed(name)).collect();
-    kept.sort_by(|a, b| a.0.cmp(&b.0));
-    kept.dedup_by(|a, b| a.0 == b.0);
-    kept
-}
-
 fn witness(path: &str, shown: Option<VersionHash>) -> NativeCaptureWitness {
     NativeCaptureWitness {
         path: SyncPath(path.to_owned()),
@@ -1010,8 +996,7 @@ pub(crate) fn meta_columns(version: &FileVersion) -> LocalFileMetaColumns {
         record_kind: version.meta.record_kind,
         symlink_target: version.meta.symlink_target.clone(),
         symlink_out_of_root: false,
-        unix_mode: version.meta.unix_mode,
-        xattrs: version.meta.xattrs.clone(),
+        exec: version.meta.exec,
     }
 }
 
@@ -1079,11 +1064,8 @@ fn current_version_of(row: &crate::store::CanonicalCurrentRow) -> FileVersion {
 pub(crate) fn metadata_version(version: &FileVersion) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(format!(
-        "{:?}|{}|{:?}|{:?}",
-        version.meta.unix_mode,
-        version.meta.mtime_unix_nanos,
-        version.meta.record_kind,
-        version.meta.xattrs
+        "{}|{}|{:?}",
+        version.meta.exec, version.meta.mtime_unix_nanos, version.meta.record_kind
     ));
     hasher.finalize().into()
 }
@@ -1143,6 +1125,9 @@ fn applied_item(
     item: ItemId,
     expect: Option<VersionHash>,
 ) -> Result<AppliedItem, ApplyError> {
+    // The commit settles which items live where (and advances their generations): the answer is
+    // read after that, so its token is the one the listing shows.
+    yadorilink_sqlite_runtime::reconcile_provider_liveness(tx)?;
     let row = item_row(tx, root_id, &item)?
         .filter(|r| r.live)
         .ok_or_else(|| ApplyError::Retry("the item vanished".into()))?;
@@ -1162,7 +1147,7 @@ fn applied_item(
         metadata_version: metadata_version(&version),
         size: current.snapshot.size,
         mtime_unix_nanos: current.snapshot.mtime_unix_nanos,
-        unix_mode: current.snapshot.unix_mode.unwrap_or(0),
+        exec: current.snapshot.exec,
         current: version.version_hash == content_version,
         namespace_revision: namespace_revision(tx, root_id)?,
         generation: item_generation(tx, root_id, &item)?,
@@ -1219,10 +1204,6 @@ fn now_ns(input: &ApplyInput) -> i64 {
     input.now_ms.saturating_mul(1_000_000)
 }
 
-fn replicated_mode(mode: Option<u32>) -> Option<u32> {
-    mode.map(|m| m & 0o777)
-}
-
 fn mtime_for(input: &ApplyInput) -> i64 {
     input.metadata.mtime_unix_nanos.filter(|m| *m >= 0).unwrap_or_else(|| now_ns(input))
 }
@@ -1249,9 +1230,8 @@ fn create_is_already_satisfied(
                     .iter()
                     .zip(&content.blocks)
                     .all(|(have, want)| have.hash.0 == want.hash && have.size == want.size);
-            let same_mode = replicated_mode(input.metadata.unix_mode)
-                .is_none_or(|mode| existing.snapshot.unix_mode == Some(mode));
-            same_blocks && same_mode
+            let same_exec = input.metadata.exec.is_none_or(|exec| existing.snapshot.exec == exec);
+            same_blocks && same_exec
         }
         EntryKind::Symlink => false,
     }
@@ -1293,9 +1273,9 @@ fn create(
     }
     check_destination(tx, group_id, &path, None)?;
 
-    let mode = replicated_mode(input.metadata.unix_mode);
+    let exec = input.metadata.exec.unwrap_or(false);
     let version = match input.entry_kind {
-        EntryKind::Directory => FileVersion::directory(mode),
+        EntryKind::Directory => FileVersion::directory(),
         EntryKind::Symlink => {
             let target = input
                 .symlink_target
@@ -1308,10 +1288,9 @@ fn create(
                 size,
                 FileMeta {
                     mtime_unix_nanos: mtime_for(input),
-                    unix_mode: mode,
+                    exec: false,
                     symlink_target: Some(target),
                     record_kind: RecordKind::Symlink,
-                    xattrs: Vec::new(),
                 },
             )
         }
@@ -1325,10 +1304,9 @@ fn create(
                 size,
                 FileMeta {
                     mtime_unix_nanos: mtime_for(input),
-                    unix_mode: mode,
+                    exec,
                     symlink_target: None,
                     record_kind: RecordKind::File,
-                    xattrs: clean_xattrs(input.metadata.xattrs.clone().unwrap_or_default()),
                 },
             )
         }
@@ -1382,6 +1360,31 @@ fn keep_untrusted_edit_beside(
         return Ok(None);
     }
     keep_beside(tx, input, group_id, author, origin_device_id, item, from, current).map(Some)
+}
+
+/// A restore applies over the version the user saw and nothing else: the base is the item's
+/// current version at its current generation, with no newer version waiting to be announced.
+fn restore_view_is_current(
+    tx: Tx<'_>,
+    input: &ApplyInput,
+    item: &ItemId,
+    base: Option<VersionHash>,
+    current: &FileVersion,
+) -> Result<(), ApplyError> {
+    let announce_in_flight: bool = tx.query_row(
+        "SELECT announce_version_hash IS NOT NULL FROM provider_items \
+         WHERE root_id = ?1 AND item_id = ?2",
+        rusqlite::params![input.root_id, &item[..]],
+        |r| r.get(0),
+    )?;
+    let current_view = base == Some(current.version_hash)
+        && input.base_generation == Some(item_generation(tx, &input.root_id, item)?)
+        && !announce_in_flight;
+    if current_view {
+        Ok(())
+    } else {
+        Err(ApplyError::StaleView("the item changed since the user saw it".into()))
+    }
 }
 
 fn modify(
@@ -1457,9 +1460,7 @@ fn modify(
         input
     };
     let has_content = input.content.is_some() || input.symlink_target.is_some();
-    let has_metadata = input.metadata.unix_mode.is_some()
-        || input.metadata.mtime_unix_nanos.is_some()
-        || input.metadata.xattrs.is_some();
+    let has_metadata = input.metadata.exec.is_some() || input.metadata.mtime_unix_nanos.is_some();
     let puts = has_content || has_metadata;
     let dropped_mtime = advisory && !puts;
     // A modify that carries no bytes and no structural change (metadata-less, move-less) acts on the
@@ -1476,7 +1477,10 @@ fn modify(
     // authors NOTHING here (the bytes stay with the user, KEEP_LOCAL); the extension re-sends them
     // as a new file beside the item, and the canonical version is never touched.
     // (An advisory mtime over the content it was set on needs no provenance: it changes no bytes.)
-    if puts && !advisory {
+    if puts && !advisory && input.restore {
+        // A restore's bytes come from a retained version, not from the OS: only the view matters.
+        restore_view_is_current(tx, input, &item, base, &current)?;
+    } else if puts && !advisory {
         if let Some(kept) = keep_untrusted_edit_beside(
             tx,
             input,
@@ -1528,16 +1532,12 @@ fn modify(
                     }
                 })
             },
-            unix_mode: replicated_mode(input.metadata.unix_mode).or(meta_from.unix_mode),
+            exec: kind == RecordKind::File && input.metadata.exec.unwrap_or(meta_from.exec),
             symlink_target,
             record_kind: kind,
-            xattrs: match &input.metadata.xattrs {
-                Some(x) => clean_xattrs(x.clone()),
-                None => meta_from.xattrs.clone(),
-            },
         };
         Some(if kind == RecordKind::Directory {
-            FileVersion::directory(meta.unix_mode)
+            FileVersion::directory()
         } else {
             FileVersion::new(
                 if kind == RecordKind::Symlink { Vec::new() } else { blocks },
@@ -1562,7 +1562,9 @@ fn modify(
             if base != current.version_hash {
                 outcome = OutcomeKind::Concurrent;
             }
-            set_published(tx, &input.root_id, &item, version, true)?;
+            if !input.announce_to_os {
+                set_published(tx, &input.root_id, &item, version, true)?;
+            }
         }
         (version, true) => {
             let rows = live_rows_under(tx, group_id, &from)?;
@@ -1640,13 +1642,9 @@ fn keep_beside(
     };
     let meta = FileMeta {
         mtime_unix_nanos: mtime_for(input),
-        unix_mode: replicated_mode(input.metadata.unix_mode).or(current.meta.unix_mode),
+        exec: input.metadata.exec.unwrap_or(current.meta.exec),
         symlink_target: None,
         record_kind: RecordKind::File,
-        xattrs: match &input.metadata.xattrs {
-            Some(x) => clean_xattrs(x.clone()),
-            None => current.meta.xattrs.clone(),
-        },
     };
     let version = FileVersion::new(version_blocks(&content.blocks), content.size, meta);
     let canonical = |tx: Tx<'_>| -> Result<ApplyResult, ApplyError> {
@@ -1656,25 +1654,31 @@ fn keep_beside(
     // The same bytes AND the same replicated metadata as the canonical version: nothing to keep
     // (another mode or xattr is the user's data and is kept).
     if kept_edit_semantic_key(&version) == kept_edit_semantic_key(current) {
+        if input.new_parent.is_some() || input.name.is_some() {
+            // The bytes are the item's own, so there is nothing to keep and nothing for
+            // provenance to protect: the rename or move is what the user did, and it stands.
+            // (A rename clears the in-sync bit of a placeholder, so the host sends the bytes
+            // with it; an item that was only ever served in windows has no served record.)
+            let mut moved_only = input.clone();
+            moved_only.content = None;
+            moved_only.symlink_target = None;
+            moved_only.metadata = MetadataInput::default();
+            return modify(tx, &moved_only, group_id, author, origin_device_id);
+        }
         return canonical(tx);
     }
     author_copy(tx, input, group_id, author, origin_device_id, from, &version)?;
     canonical(tx)
 }
 
-/// What makes two kept edits the SAME kept edit: the bytes and the replicated SEMANTIC metadata (mode
-/// and the replicated xattr set). Retry-varying values (mtime, staging names, the clock) are not
+/// What makes two kept edits the SAME kept edit: the bytes and the replicated SEMANTIC metadata (the
+/// execute flag). Retry-varying values (mtime, staging names, the clock) are not
 /// part of it, so retries of one operation collapse to one copy while the same bytes with another
-/// mode or xattr are a different user's data and keep their own copy. Provenance's `content_sig`
+/// execute flag are a different user's data and keep their own copy. Provenance's `content_sig`
 /// deliberately excludes the metadata and is not used for this.
 fn kept_edit_semantic_key(version: &FileVersion) -> String {
     let mut key = crate::provider_provenance::content_sig(version);
-    key.push_str(&format!("|mode:{:?}", version.meta.unix_mode));
-    let mut xattrs: Vec<_> = version.meta.xattrs.iter().collect();
-    xattrs.sort();
-    for (name, value) in xattrs {
-        key.push_str(&format!("|x:{}:{}={}", name.len(), name, hex::encode(value)));
-    }
+    key.push_str(&format!("|exec:{}", version.meta.exec));
     key
 }
 
@@ -1809,10 +1813,9 @@ fn keep_refused_bytes(
     };
     let meta = FileMeta {
         mtime_unix_nanos: mtime_for(input),
-        unix_mode: replicated_mode(input.metadata.unix_mode),
+        exec: input.metadata.exec.unwrap_or(false),
         symlink_target: None,
         record_kind: RecordKind::File,
-        xattrs: clean_xattrs(input.metadata.xattrs.clone().unwrap_or_default()),
     };
     let version = FileVersion::new(version_blocks(&content.blocks), content.size, meta);
     let from = if live_row(tx, group_id, &requested)?.is_some()
@@ -1875,7 +1878,7 @@ fn modify_structural(
     validate_name(new_name)?;
     let to = join(&new_parent, new_name);
     if to == from {
-        let applied = applied_structural(tx, input, item, from)?;
+        let applied = applied_structural(tx, input, group_id, item, from)?;
         return Ok(ApplyResult {
             outcome: OutcomeKind::Applied,
             item: Some(applied),
@@ -1908,18 +1911,27 @@ fn modify_structural(
         author,
         false,
     )?;
-    let applied = applied_structural(tx, input, item, &to)?;
+    let applied = applied_structural(tx, input, group_id, item, &to)?;
     Ok(ApplyResult { outcome: OutcomeKind::Applied, item: Some(applied), replayed: false })
 }
 
 fn applied_structural(
     tx: Tx<'_>,
     input: &ApplyInput,
+    group_id: &str,
     item: &ItemId,
     path: &str,
 ) -> Result<AppliedItem, ApplyError> {
+    // The commit settles which items live where (and advances their generations): the answer is
+    // read after that, so its token is the one the listing shows.
+    yadorilink_sqlite_runtime::reconcile_provider_liveness(tx)?;
     let (parent, name) = split(path);
-    let version = FileVersion::directory(None);
+    // The version the listing shows for this directory, so the answer's token is the one a
+    // recursive delete checks: the directory's own row if it has one, else the structural version.
+    let version = match live_row(tx, group_id, path)? {
+        Some(row) => current_version_of(&row),
+        None => crate::provider_enumerate::structural_version(),
+    };
     Ok(AppliedItem {
         item_id: *item,
         parent_item_id: if parent.is_empty() {
@@ -1932,8 +1944,8 @@ fn applied_structural(
         content_version: version.version_hash,
         metadata_version: metadata_version(&version),
         size: 0,
-        mtime_unix_nanos: 0,
-        unix_mode: 0,
+        mtime_unix_nanos: version.meta.mtime_unix_nanos,
+        exec: version.meta.exec,
         current: true,
         namespace_revision: namespace_revision(tx, &input.root_id)?,
         generation: item_generation(tx, &input.root_id, item)?,

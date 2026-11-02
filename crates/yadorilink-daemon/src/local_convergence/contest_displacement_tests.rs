@@ -234,3 +234,69 @@ async fn concurrent_displacement_guards_do_not_exhaust_the_connection_pool() {
     }
     assert!(started.elapsed() < std::time::Duration::from_secs(10), "guards stalled on the pool");
 }
+
+/// A fork pass forks only the contested paths its caller found settled, each over the row it was
+/// found with: a contested path that was not among them (a peer's delta arrived while the caller
+/// was looking), or whose local row is another version since (a capture committed meanwhile),
+/// stands the whole pass down, authors nothing and leaves the candidates for the next pass; the
+/// same pass over what is current forks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_contested_path_nobody_checked_is_not_forked() {
+    let (h, mine, _theirs) = local_x_loses_to_a_peer("unchecked").await;
+    let key = crate::test_support::local_seam::replica_author_key(
+        &h.state,
+        super::growing_file_projection_tests::LOCAL_DEVICE,
+        ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]),
+    )
+    .unwrap();
+    let candidates = || {
+        h.state
+            .database()
+            .read(|conn| {
+                yadorilink_sync_sqlite::native_contest_candidates::unattempted_paths(conn, GROUP)
+            })
+            .unwrap()
+    };
+    let checked_now = || -> crate::replica_coordinator::ContestChecked {
+        h.state
+            .database()
+            .read(|conn| {
+                let mut found = std::collections::HashMap::new();
+                for path in yadorilink_sync_sqlite::native_contest_candidates::unattempted_paths(
+                    conn, GROUP,
+                )? {
+                    let row =
+                        yadorilink_sync_sqlite::native_contest_candidates::local_row_fingerprint(
+                            conn, GROUP, &path,
+                        )?;
+                    found.insert(path, row);
+                }
+                Ok::<_, yadorilink_sync_sqlite::SyncSqliteError>(found)
+            })
+            .unwrap()
+    };
+    let contested = candidates();
+    assert!(!contested.is_empty(), "fixture: a contested path is waiting for a fork pass");
+    let copy_exists = || {
+        h.state.file_index_repository().get_file(GROUP, &copy_path("x", &mine)).unwrap().is_some()
+    };
+
+    // A path nobody checked.
+    let nobody = std::collections::HashMap::new();
+    let outcome = h.state.author_contest_forks(&key, GROUP, &|_, _| true, Some(&nobody)).unwrap();
+    assert!(outcome.unchecked && outcome.forked.deltas == 0, "{outcome:?}");
+    assert_eq!(candidates(), contested, "the candidates are still unattempted");
+
+    // A path checked, then changed: its row is another version.
+    let stale = checked_now();
+    std::fs::write(h.path("x"), b"unchecked: another version, committed after the check").unwrap();
+    assert!(matches!(h.capture("x").await, LocalChangeOutcome::FileChanged(_)));
+    let outcome = h.state.author_contest_forks(&key, GROUP, &|_, _| true, Some(&stale)).unwrap();
+    assert!(outcome.unchecked && outcome.forked.deltas == 0, "{outcome:?}");
+    assert!(!copy_exists(), "no copy path was authored");
+
+    // What is current now is checked: the pass forks.
+    let current = checked_now();
+    let outcome = h.state.author_contest_forks(&key, GROUP, &|_, _| true, Some(&current)).unwrap();
+    assert!(!outcome.unchecked && outcome.forked.deltas > 0, "{outcome:?}");
+}

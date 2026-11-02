@@ -45,6 +45,21 @@ bool DeviceRegistered,
 string DefaultDeviceName,
 bool? HasLinkedFolders,
 bool StartOverPending
+public record ActivityEvent (
+long Cursor,
+string LocalPath,
+string Path,
+ActivityKind Kind,
+string? OriginDeviceId,
+string? OriginDeviceName,
+bool IsThisDevice,
+DateTime? At
+public record ActivityFilter (
+ActivityKind[] Kinds,
+ActivityOrigin Origin
+public record ActivityPage (
+ActivityEvent[] Events,
+long? NextCursor
 public record AppcastItem (
 string Version,
 ulong SparkleBuild,
@@ -108,7 +123,8 @@ string InstallRoot,
 DaemonOwner Owner,
 DataAreaOwnership Ownership,
 uint Pid,
-DateTime? StartedAt
+DateTime? StartedAt,
+string? DataDir
 public record DefaultFolder (
 string Name,
 string Path
@@ -129,7 +145,9 @@ uint RedactionCount
 public record EvictOutcome (
 bool Evicted,
 ulong BlocksReclaimed,
-ulong BytesReclaimed
+ulong BytesReclaimed,
+string? NotFreedReason,
+bool RetryLater
 public record FileAvailability (
 bool Tracked,
 MaterializationState State,
@@ -143,9 +161,10 @@ ulong Size,
 DateTime? ModifiedAt,
 string State,
 string? OriginDeviceId,
-uint? UnixMode,
+bool Exec,
 bool IsCurrent,
-EntryKind Kind
+EntryKind Kind,
+VersionContent Content
 public record FolderDetail (
 FolderSummary Summary,
 HeldFile[] HeldFiles,
@@ -171,6 +190,8 @@ ulong PlaceholderFileCount,
 ulong HydratingFileCount,
 ulong HeldFileCount,
 ulong SkippedSymlinkCount,
+ulong? TotalBytes,
+ulong? OnlineOnlyBytes,
 FolderTransferProgress? Transfer,
 DurabilityStatus Durability,
 DurabilityEvidence DurabilityEvidence,
@@ -230,7 +251,10 @@ ulong TotalSize,
 DateTime? OfferedAt,
 IncomingTransferStatus Status,
 TransferFailure? Failure,
-bool CanRetry
+bool CanRetry,
+string? LinkId,
+ulong ReceivedBytes,
+string? DestinationDir
 public record InviteSummary (
 string InviteId,
 string Code,
@@ -286,7 +310,8 @@ public record PeerSummary (
 string DeviceId,
 PeerReachability Reachability,
 UnreachableCategory? UnreachableCategory,
-RouteKind Route
+RouteKind Route,
+DateTime? LastConnected
 public record PendingApprovalSummary (
 string GroupId,
 string GroupName,
@@ -301,7 +326,8 @@ DateTime ExpiresAt,
 InviteStatus Status
 public record PinOutcome (
 FileRetention Retention,
-string? DownloadError
+string? DownloadError,
+string? HistoryNotKeptReason
 public record PreflightResult (
 string ResolvedPath,
 bool PathExists,
@@ -313,6 +339,19 @@ bool ScanTruncated,
 FreeSpace? FreeSpace,
 PreflightIssue[] Issues,
 bool RequiresAcknowledgement
+public record PrimaryTransferAccepted (
+string TransferId,
+string GroupId,
+ulong MembershipGeneration
+public record PrimaryTransferSummary (
+string TransferId,
+string GroupId,
+string GroupName,
+PrimaryTransferDirection Direction,
+PrimaryTransferStatus Status,
+string ToDeviceId,
+DateTime CreatedAt,
+DateTime ExpiresAt
 public record ProductSummary (
 ProductState State,
 ulong AttentionCount,
@@ -397,6 +436,20 @@ ulong StepsDone,
 ulong Restored,
 ulong Removed,
 string Message
+public record SendLink (
+string LinkId,
+string Code,
+DateTime? ExpiresAt
+public record SendLinkPreview (
+string SenderName,
+IncomingFile[] Files,
+ulong TotalSize,
+DateTime? ExpiresAt
+public record SendLinkStatus (
+string LinkId,
+SendLinkState State,
+string? ReceiverDeviceName,
+string? TransferId
 public record SentTransfer (
 string TransferId,
 string[] FilesOffered,
@@ -533,6 +586,16 @@ public record Grace: AccountDeletionState
 public record Other (
 string Raw
 ) : AccountDeletionState
+public enum ActivityKind: int
+Added,
+Updated,
+Deleted,
+Conflict,
+Restored
+public enum ActivityOrigin: int
+Any,
+ThisDevice,
+OtherDevices
 public record AppcastItemOutcome
 public record Allowed: AppcastItemOutcome
 public record Refused: AppcastItemOutcome
@@ -577,7 +640,8 @@ string Raw
 ) : ApproveOutcome
 public enum AssignableRole: int
 Viewer,
-Editor
+Editor,
+Owner
 public enum AttentionCategory: int
 Degraded,
 DurabilityAtRisk,
@@ -778,6 +842,22 @@ public record Cancelled: LoginEvent
 public enum LoginFlow: int
 Loopback,
 DeviceCode
+public enum MacBuild: int
+Direct,
+Store
+public record MacClaimRefusal
+public record OtherBuildRunning (
+MacBuild Build
+) : MacClaimRefusal
+public record OtherBuildConfigured (
+MacBuild Build
+) : MacClaimRefusal
+public record StillRunning (
+MacBuild Build
+) : MacClaimRefusal
+public record Unavailable (
+string Message
+) : MacClaimRefusal
 public enum MaterializationState: int
 Hydrated,
 Placeholder,
@@ -863,6 +943,18 @@ public record HomeDirectory: PreflightIssue
 public record ReservedName (
 string Path
 ) : PreflightIssue
+public enum PrimaryTransferDirection: int
+Outgoing,
+Incoming,
+Unrecognized
+public record PrimaryTransferStatus
+public record Pending: PrimaryTransferStatus
+public record Accepted: PrimaryTransferStatus
+public record Cancelled: PrimaryTransferStatus
+public record Declined: PrimaryTransferStatus
+public record Other (
+string Raw
+) : PrimaryTransferStatus
 public enum ProductAction: int
 Retry,
 ReviewConflict,
@@ -901,7 +993,24 @@ DatabaseNotRestored,
 StartOverInProgress,
 ManagedElsewhere,
 GroupMismatch,
-StartOverRestartRequired
+StartOverRestartRequired,
+SendLinkExpired,
+SendLinkAlreadyUsed,
+SendLinkCancelled,
+SendLinkInvalid,
+SendPeerUnreachable,
+SendNoSpace,
+SendInterrupted,
+SendLinksDisabled,
+SendLocalNetworkBlocked,
+PairingCodeInvalid,
+PrimaryTransferNotPrimary,
+PrimaryTransferTargetNotMember,
+PrimaryTransferTargetSameAccount,
+PrimaryTransferOfferExpired,
+PrimaryTransferGroupNotActive,
+PrimaryTransferConflict,
+PrimaryTransferNotFound
 public enum RetainedReleaseOutcome: int
 Removed,
 Gone,
@@ -967,6 +1076,18 @@ SafeStopBusyReason Reason,
 uint RetryAfterSecs,
 string Detail
 ) : SafeStopOutcome
+public enum SendLinkState: int
+Waiting,
+Redeemed,
+Transferring,
+Done,
+Cancelled,
+Expired,
+Interrupted
+public enum SendLinkTtl: int
+OneHour,
+OneDay,
+SevenDays
 public record ShareEdgeState
 public record Active: ShareEdgeState
 public record PendingApproval: ShareEdgeState
@@ -1027,6 +1148,11 @@ public record Interrupted: TransferFailure
 public record Other (
 string Raw
 ) : TransferFailure
+public record NoSpace: TransferFailure
+public record LocalNetworkBlocked: TransferFailure
+public record SenderGone: TransferFailure
+public record ReceiverCanceled: TransferFailure
+public record ReceiverStopped: TransferFailure
 public enum UnreachableCategory: int
 NoCandidates,
 NoResponse,
@@ -1054,6 +1180,10 @@ public record UpToDate: UpdateState
 public record Unknown (
 string Raw
 ) : UpdateState
+public enum VersionContent: int
+NotApplicable,
+Kept,
+NotKept
 public static class YadorilinkClientCoreMethods
 ## yadorilink_client_ffi.cs
 checksum uniffi_yadorilink_client_ffi_checksum_constructor_clientcore_new 64227
@@ -1062,6 +1192,7 @@ checksum uniffi_yadorilink_client_ffi_checksum_method_adminsession_ended 52124
 checksum uniffi_yadorilink_client_ffi_checksum_method_adminsession_local_url 39552
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_accept_invite 38974
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_accept_invite_as_provider_folder 50656
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_accept_primary_transfer 45660
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_account_deletion_impact 11416
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_account_deletion_status 30289
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_account_status 40213
@@ -1070,6 +1201,8 @@ checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_approve_request
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_bandwidth_limits 44095
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_cancel_account_deletion 28944
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_cancel_invite 32316
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_cancel_primary_transfer 36659
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_cancel_send_link 3483
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_cancel_transfer 17447
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_change_member_role 45657
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_check_appcast_item 7187
@@ -1079,7 +1212,9 @@ checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_confirm_account
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_create_default_folder 26493
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_create_group_and_link 34891
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_create_provider_folder 62686
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_create_send_link 45279
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_daemon_identity 4474
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_decline_primary_transfer 56957
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_default_folder 23999
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_deny_request 11366
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_download_guidance 19462
@@ -1096,6 +1231,7 @@ checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_join_group_and_
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_join_provider_folder 9236
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_link_folder 30635
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_account_devices 10996
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_activity 7737
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_conflicts 14685
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_folder_devices 10144
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_inbox 34764
@@ -1104,24 +1240,33 @@ checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_joinable_g
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_members 49525
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_owned_groups 21681
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_pending_approvals 11750
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_primary_transfers 51149
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_retained_originals 24344
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_send_links 64851
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_sent_transfers 58315
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_shares 7537
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_trash 56677
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_list_versions 18481
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_login_with_pairing_code 18883
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_mac_claim_refusal 30806
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_mint_invite 44921
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_nas_admin_failure_message 44660
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_new_login_session 52708
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_new_reauthentication_session 27852
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_normalize_pairing_code 58165
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_offer_primary_transfer 24695
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_open_nas_admin 48154
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_parse_invite_link 48852
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_pause_all 57662
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_pause_folder 52327
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_pin_file 43711
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_preview_send_link 18266
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_preview_space_reclaim 8104
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_readopt_folder 2078
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_receive_transfer 53281
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_redeem_send_link 39679
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_register_device 41656
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_release_mac_claim 25242
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_release_retained_originals 39245
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_remove_device 51074
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_request_account_deletion 31370
@@ -1142,7 +1287,9 @@ checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_rewind_latest 1
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_rewind_preview 18821
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_run_gc 57994
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_run_preflight 10809
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_send_link_status 6531
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_send_to_device 35923
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_send_to_link 24054
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_set_automatic_update_checks 6313
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_set_bandwidth_limits 43383
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_set_space_management 43502
@@ -1153,6 +1300,7 @@ checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_start_daemon 56
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_start_over_as_new_device 490
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_status_snapshot 49064
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_stop_daemon 59400
+checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_take_over_mac_claim 60667
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_unlink_folder 45559
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_unpin_file 1027
 checksum uniffi_yadorilink_client_ffi_checksum_method_clientcore_update_status 9610
@@ -1205,6 +1353,7 @@ public string LocalUrl()
 public interface IClientCore
 Task<AcceptInviteOutcome> AcceptInvite(string @codeOrUrl, string @localPath, FolderMode @mode, bool @acknowledgeRisks);
 Task<ProviderInviteOutcome> AcceptInviteAsProviderFolder(string @codeOrUrl, string @displayName, FolderMode @mode);
+Task<PrimaryTransferAccepted> AcceptPrimaryTransfer(string @groupId, string @transferId);
 Task<AccountDeletionImpact> AccountDeletionImpact();
 Task<AccountDeletionStatus> AccountDeletionStatus();
 Task<AccountStatus> AccountStatus();
@@ -1213,6 +1362,8 @@ Task<ApproveOutcome> ApproveRequest(string @groupId, string @deviceId);
 Task<BandwidthLimits> BandwidthLimits();
 Task<AccountDeletionStatus> CancelAccountDeletion();
 Task CancelInvite(string @inviteId);
+Task<PrimaryTransferSummary> CancelPrimaryTransfer(string @groupId, string @transferId);
+Task CancelSendLink(string @linkId);
 Task CancelTransfer(string @transferId);
 Task ChangeMemberRole(string @groupId, string @deviceId, AssignableRole @role);
 Task<AppcastItemCheck> CheckAppcastItem(AppcastItem @item, AppcastItemPhase @phase);
@@ -1222,7 +1373,9 @@ Task<AccountDeletionStatus> ConfirmAccountDeletion(string @confirmationToken);
 Task<LinkOutcome> CreateDefaultFolder(FolderMode @mode);
 Task<LinkOutcome> CreateGroupAndLink(string @groupName, string @localPath, FolderMode @mode, bool @acknowledgeRisks);
 Task<ProviderFolderOutcome> CreateProviderFolder(string @groupName, string @displayName, FolderMode @mode);
+Task<SendLink> CreateSendLink(SendLinkTtl @ttl, string[] @sourcePaths);
 Task<DaemonIdentity> DaemonIdentity();
+Task<PrimaryTransferSummary> DeclinePrimaryTransfer(string @groupId, string @transferId);
 DefaultFolder DefaultFolder();
 Task<MembershipOutcome> DenyRequest(string @groupId, string @deviceId);
 Task<UpdateDownloadGuidance> DownloadGuidance();
@@ -1239,6 +1392,7 @@ Task<LinkOutcome> JoinGroupAndLink(string @groupId, string @groupName, string @l
 Task<ProviderFolderOutcome> JoinProviderFolder(string @groupId, string @groupName, string @displayName, FolderMode @mode);
 Task<LinkOutcome> LinkFolder(string @localPath, string @groupId, FolderMode @mode, bool @acknowledgeRisks);
 Task<DeviceSummary[]> ListAccountDevices();
+Task<ActivityPage> ListActivity(uint @limit, long? @beforeCursor, ActivityFilter? @filter);
 Task<ConflictSummary[]> ListConflicts(string? @localPath);
 Task<DeviceSummary[]> ListFolderDevices();
 Task<IncomingTransfer[]> ListInbox();
@@ -1247,24 +1401,33 @@ Task<GroupSummary[]> ListJoinableGroups();
 Task<MemberSummary[]> ListMembers(string @groupId);
 Task<GroupSummary[]> ListOwnedGroups();
 Task<PendingApprovalSummary[]> ListPendingApprovals();
+Task<PrimaryTransferSummary[]> ListPrimaryTransfers();
 Task<RetainedOriginal[]> ListRetainedOriginals();
+Task<SendLinkStatus[]> ListSendLinks(string[] @linkIds);
 Task<OutgoingTransfer[]> ListSentTransfers();
 Task<ShareSummary[]> ListShares();
 Task<TrashedFile[]> ListTrash(string? @localPath);
 Task<FileVersion[]> ListVersions(string @absolutePath);
+LoginSession LoginWithPairingCode(string @code, LoginOptions @options);
+MacClaimRefusal? MacClaimRefusal();
 Task<InviteSummary> MintInvite(string @groupId, AssignableRole? @role, TimeSpan? @ttl, bool @requireApproval);
 string NasAdminFailureMessage(NasAdminFailure @failure);
 LoginSession NewLoginSession(LoginOptions @options);
 LoginSession NewReauthenticationSession(LoginOptions @options);
+string? NormalizePairingCode(string @input);
+Task<PrimaryTransferSummary> OfferPrimaryTransfer(string @groupId, string @targetDeviceId);
 Task<NasAdminOpening> OpenNasAdmin(string @deviceId);
 string ParseInviteLink(string @input);
 Task PauseAll(PauseDuration @duration);
 Task PauseFolder(string @localPath, PauseDuration @duration, string? @expectedGroupId);
 Task<PinOutcome> PinFile(string @absolutePath);
+Task<SendLinkPreview> PreviewSendLink(string @code);
 Task<SpaceReclaimPreview> PreviewSpaceReclaim();
 Task ReadoptFolder(string @localPath);
 Task<ReceivedTransfer> ReceiveTransfer(string @transferId, string? @destinationDir);
+Task<string> RedeemSendLink(string @code, string @receivingDeviceId, string? @receiveDir);
 Task<DeviceRegistration> RegisterDevice(string @name);
+MacClaimRefusal? ReleaseMacClaim(string @containerPath, MacBuild @this);
 Task<RetainedRelease[]> ReleaseRetainedOriginals(string @groupId);
 Task<MembershipOutcome> RemoveDevice(string @deviceId, bool @force);
 Task<AccountDeletionRequest> RequestAccountDeletion(bool @acknowledgeImpact);
@@ -1285,7 +1448,9 @@ Task<RewindRun?> RewindLatest(string @groupId);
 Task<RewindPreview> RewindPreview(string @groupId, DateTime @at);
 Task<GcReport> RunGc(bool @dryRun);
 Task<PreflightResult> RunPreflight(string @localPath);
+Task<SendLinkStatus> SendLinkStatus(string @linkId);
 Task<SentTransfer> SendToDevice(string @sourcePath, string @targetDeviceId);
+Task<SentTransfer> SendToLink(string @linkId, string[] @sourcePaths);
 Task<UpdateConfig> SetAutomaticUpdateChecks(bool @enabled);
 Task<BandwidthLimits> SetBandwidthLimits(BandwidthLimits @limits);
 Task<SpaceManagement> SetSpaceManagement(bool @enabled);
@@ -1296,6 +1461,7 @@ Task<DaemonStartOutcome> StartDaemon();
 Task<StartOverProgress> StartOverAsNewDevice(bool @confirmed, string @name);
 Task<StatusSnapshot> StatusSnapshot();
 Task StopDaemon();
+MacClaimRefusal? TakeOverMacClaim(string @containerPath, MacBuild @this);
 Task<UnlinkOutcome> UnlinkFolder(string @localPath, bool @force, string? @expectedGroupId);
 Task<FileRetention> UnpinFile(string @absolutePath);
 Task<UpdateStatus> UpdateStatus();
@@ -1319,6 +1485,7 @@ internal void CallWithPointer(Action<ulong> action)
 internal T CallWithPointer<T>(Func<ulong, T> func)
 public async Task<AcceptInviteOutcome> AcceptInvite(string @codeOrUrl, string @localPath, FolderMode @mode, bool @acknowledgeRisks)
 public async Task<ProviderInviteOutcome> AcceptInviteAsProviderFolder(string @codeOrUrl, string @displayName, FolderMode @mode)
+public async Task<PrimaryTransferAccepted> AcceptPrimaryTransfer(string @groupId, string @transferId)
 public async Task<AccountDeletionImpact> AccountDeletionImpact()
 public async Task<AccountDeletionStatus> AccountDeletionStatus()
 public async Task<AccountStatus> AccountStatus()
@@ -1326,6 +1493,7 @@ public async Task<bool> AcknowledgePossibleLoss()
 public async Task<ApproveOutcome> ApproveRequest(string @groupId, string @deviceId)
 public async Task<BandwidthLimits> BandwidthLimits()
 public async Task<AccountDeletionStatus> CancelAccountDeletion()
+public async Task<PrimaryTransferSummary> CancelPrimaryTransfer(string @groupId, string @transferId)
 public async Task<AppcastItemCheck> CheckAppcastItem(AppcastItem @item, AppcastItemPhase @phase)
 public async Task<UpdateStatus> CheckForUpdates()
 public async Task<SignOutOutcome> CompleteAccountDeletion()
@@ -1333,7 +1501,9 @@ public async Task<AccountDeletionStatus> ConfirmAccountDeletion(string @confirma
 public async Task<LinkOutcome> CreateDefaultFolder(FolderMode @mode)
 public async Task<LinkOutcome> CreateGroupAndLink(string @groupName, string @localPath, FolderMode @mode, bool @acknowledgeRisks)
 public async Task<ProviderFolderOutcome> CreateProviderFolder(string @groupName, string @displayName, FolderMode @mode)
+public async Task<SendLink> CreateSendLink(SendLinkTtl @ttl, string[] @sourcePaths)
 public async Task<DaemonIdentity> DaemonIdentity()
+public async Task<PrimaryTransferSummary> DeclinePrimaryTransfer(string @groupId, string @transferId)
 public DefaultFolder DefaultFolder()
 public async Task<MembershipOutcome> DenyRequest(string @groupId, string @deviceId)
 public async Task<UpdateDownloadGuidance> DownloadGuidance()
@@ -1349,6 +1519,7 @@ public async Task<LinkOutcome> JoinGroupAndLink(string @groupId, string @groupNa
 public async Task<ProviderFolderOutcome> JoinProviderFolder(string @groupId, string @groupName, string @displayName, FolderMode @mode)
 public async Task<LinkOutcome> LinkFolder(string @localPath, string @groupId, FolderMode @mode, bool @acknowledgeRisks)
 public async Task<DeviceSummary[]> ListAccountDevices()
+public async Task<ActivityPage> ListActivity(uint @limit, long? @beforeCursor, ActivityFilter? @filter)
 public async Task<ConflictSummary[]> ListConflicts(string? @localPath)
 public async Task<DeviceSummary[]> ListFolderDevices()
 public async Task<IncomingTransfer[]> ListInbox()
@@ -1357,21 +1528,30 @@ public async Task<GroupSummary[]> ListJoinableGroups()
 public async Task<MemberSummary[]> ListMembers(string @groupId)
 public async Task<GroupSummary[]> ListOwnedGroups()
 public async Task<PendingApprovalSummary[]> ListPendingApprovals()
+public async Task<PrimaryTransferSummary[]> ListPrimaryTransfers()
 public async Task<RetainedOriginal[]> ListRetainedOriginals()
+public async Task<SendLinkStatus[]> ListSendLinks(string[] @linkIds)
 public async Task<OutgoingTransfer[]> ListSentTransfers()
 public async Task<ShareSummary[]> ListShares()
 public async Task<TrashedFile[]> ListTrash(string? @localPath)
 public async Task<FileVersion[]> ListVersions(string @absolutePath)
+public LoginSession LoginWithPairingCode(string @code, LoginOptions @options)
+public MacClaimRefusal? MacClaimRefusal()
 public async Task<InviteSummary> MintInvite(string @groupId, AssignableRole? @role, TimeSpan? @ttl, bool @requireApproval)
 public string NasAdminFailureMessage(NasAdminFailure @failure)
 public LoginSession NewLoginSession(LoginOptions @options)
 public LoginSession NewReauthenticationSession(LoginOptions @options)
+public string? NormalizePairingCode(string @input)
+public async Task<PrimaryTransferSummary> OfferPrimaryTransfer(string @groupId, string @targetDeviceId)
 public async Task<NasAdminOpening> OpenNasAdmin(string @deviceId)
 public string ParseInviteLink(string @input)
 public async Task<PinOutcome> PinFile(string @absolutePath)
+public async Task<SendLinkPreview> PreviewSendLink(string @code)
 public async Task<SpaceReclaimPreview> PreviewSpaceReclaim()
 public async Task<ReceivedTransfer> ReceiveTransfer(string @transferId, string? @destinationDir)
+public async Task<string> RedeemSendLink(string @code, string @receivingDeviceId, string? @receiveDir)
 public async Task<DeviceRegistration> RegisterDevice(string @name)
+public MacClaimRefusal? ReleaseMacClaim(string @containerPath, MacBuild @this)
 public async Task<RetainedRelease[]> ReleaseRetainedOriginals(string @groupId)
 public async Task<MembershipOutcome> RemoveDevice(string @deviceId, bool @force)
 public async Task<AccountDeletionRequest> RequestAccountDeletion(bool @acknowledgeImpact)
@@ -1388,7 +1568,9 @@ public async Task<RewindRun?> RewindLatest(string @groupId)
 public async Task<RewindPreview> RewindPreview(string @groupId, DateTime @at)
 public async Task<GcReport> RunGc(bool @dryRun)
 public async Task<PreflightResult> RunPreflight(string @localPath)
+public async Task<SendLinkStatus> SendLinkStatus(string @linkId)
 public async Task<SentTransfer> SendToDevice(string @sourcePath, string @targetDeviceId)
+public async Task<SentTransfer> SendToLink(string @linkId, string[] @sourcePaths)
 public async Task<UpdateConfig> SetAutomaticUpdateChecks(bool @enabled)
 public async Task<BandwidthLimits> SetBandwidthLimits(BandwidthLimits @limits)
 public async Task<SpaceManagement> SetSpaceManagement(bool @enabled)
@@ -1398,6 +1580,7 @@ public async Task<SpaceManagement> SpaceManagement()
 public async Task<DaemonStartOutcome> StartDaemon()
 public async Task<StartOverProgress> StartOverAsNewDevice(bool @confirmed, string @name)
 public async Task<StatusSnapshot> StatusSnapshot()
+public MacClaimRefusal? TakeOverMacClaim(string @containerPath, MacBuild @this)
 public async Task<UnlinkOutcome> UnlinkFolder(string @localPath, bool @force, string? @expectedGroupId)
 public async Task<FileRetention> UnpinFile(string @absolutePath)
 public async Task<UpdateStatus> UpdateStatus()

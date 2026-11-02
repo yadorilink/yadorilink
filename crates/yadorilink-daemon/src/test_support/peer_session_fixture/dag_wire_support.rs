@@ -234,10 +234,9 @@ impl DagProducer {
             size as u64,
             FileMeta {
                 mtime_unix_nanos,
-                unix_mode: None,
+                exec: false,
                 symlink_target: None,
                 record_kind: RecordKind::File,
-                xattrs: Vec::new(),
             },
         );
 
@@ -279,10 +278,9 @@ impl DagProducer {
             0,
             FileMeta {
                 mtime_unix_nanos,
-                unix_mode: None,
+                exec: false,
                 symlink_target: None,
                 record_kind: RecordKind::File,
-                xattrs: Vec::new(),
             },
         );
         let record = FileRecord {
@@ -323,10 +321,9 @@ impl DagProducer {
             content.len() as u64,
             FileMeta {
                 mtime_unix_nanos,
-                unix_mode: None,
+                exec: false,
                 symlink_target: None,
                 record_kind: RecordKind::File,
-                xattrs: Vec::new(),
             },
         );
         (record, version)

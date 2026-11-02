@@ -115,7 +115,11 @@ fn new_device_with_store(
 ) -> TestDevice {
     let index_dir = tempfile::tempdir().unwrap();
     let sync_state = Arc::new(ReplicaCoordinator::open(index_dir.path().join("index.db")).unwrap());
-    let state = DaemonState::new(device_id.to_string(), sync_state, store);
+    let state = yadorilink_daemon::test_support::isolated_daemon_state(
+        device_id.to_string(),
+        sync_state,
+        store,
+    );
     TestDevice {
         device_id: device_id.to_string(),
         state,
@@ -183,10 +187,9 @@ async fn seed_published_serving_placeholder(
         total_size,
         yadorilink_replica_domain::file::FileMeta {
             mtime_unix_nanos: 0,
-            unix_mode: None,
+            exec: false,
             symlink_target: None,
             record_kind: yadorilink_replica_domain::file::RecordKind::File,
-            xattrs: Vec::new(),
         },
     );
     let record = FileRecord {

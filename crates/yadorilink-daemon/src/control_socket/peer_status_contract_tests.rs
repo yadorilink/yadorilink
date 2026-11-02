@@ -7,7 +7,7 @@
 //! - how the peer appears in `StatusResponse.peers` (reachability, route,
 //!   failure reason), which the CLI and the desktop app render verbatim;
 //! - whether it counts in `HealthResponse.connected_peer_count`;
-//! - whether it raises a `peer_disconnected` attention reason;
+//! - that it never raises an attention reason by itself (an absent device is availability);
 //! - whether a file whose content only that peer holds is available to
 //!   fetch now. Durability is asserted alongside and must never move with
 //!   connectivity: a fresh custody confirmation stays a fresh confirmation
@@ -213,10 +213,9 @@ async fn an_unreachable_peer_shows_why_and_is_not_available_now() {
         assert_eq!(peer.unreachable_category(), shown, "the reason is carried through");
         assert_eq!(peer.route_kind(), RouteKind::Unspecified, "no path, so no route: {why:?}");
         assert_eq!(seen.connected_peer_count, 0, "{why:?}");
-        assert_eq!(
-            seen.flagged_disconnected,
-            why != Why::DeviceReplaced,
-            "an unreachable peer needs attention, a replaced one is gone for good: {why:?}"
+        assert!(
+            !seen.flagged_disconnected,
+            "a device that is away is availability, not a reason for attention: {why:?}"
         );
         assert_eq!(seen.fetch, FetchAvailability::UnavailableNow, "{why:?}");
         assert_eq!(

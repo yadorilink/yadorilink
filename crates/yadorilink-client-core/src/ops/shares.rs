@@ -556,6 +556,17 @@ pub async fn list_members_resolved(group_id: &str) -> Result<Vec<GroupMemberInfo
     fetch_members(&auth, group_id, own_device_id().as_deref()).await
 }
 
+/// Who has access to a folder group, against a given coordination session and the state
+/// directory that holds this machine's identity (an embedded engine has no global one).
+pub async fn list_members_in(
+    auth: &CoordinationAccess,
+    dir: &std::path::Path,
+    group_id: &str,
+) -> Result<Vec<GroupMemberInfo>, CoreError> {
+    let own = crate::coordination::device_config::load_in(dir).ok().map(|c| c.device_id);
+    fetch_members(auth, group_id, own.as_deref()).await
+}
+
 /// The member listing as this machine presents it; `own_device_id` is this
 /// machine's own device.
 ///
@@ -597,10 +608,11 @@ struct ChangeRoleRequest<'a> {
     role: &'a str,
 }
 
-/// The roles a role change may move an existing member to. `owner` is
-/// deliberately absent: there is no management-authority model yet to back
-/// an Owner grant, and the coordination plane rejects it on this route.
-pub const CHANGEABLE_ROLES: [&str; 2] = ["viewer", "editor"];
+/// The roles a role change may move an existing member to. `owner` is the
+/// delegated folder administrator; the coordination plane additionally
+/// refuses it for the primary owner's own devices and refuses any change to
+/// the primary owner's access by a delegated owner.
+pub const CHANGEABLE_ROLES: [&str; 3] = ["viewer", "editor", "owner"];
 
 /// Validates a requested role for a role change.
 ///
@@ -968,6 +980,23 @@ fn approval_requests_awaiting_owner(
         .collect()
 }
 
+/// The groups in which one of this account's own devices holds a live Owner
+/// seat (a delegated Owner), read from a `GET /shares` listing.
+fn delegated_owner_group_ids(
+    edges: &[ShareEdgeInfo],
+    own_device_ids: &HashSet<String>,
+) -> HashSet<String> {
+    edges
+        .iter()
+        .filter(|edge| {
+            edge.state == "active"
+                && edge.role.as_deref() == Some("owner")
+                && own_device_ids.contains(&edge.device_id)
+        })
+        .map(|edge| edge.group_id.clone())
+        .collect()
+}
+
 /// One device waiting for this account's approval to join a folder group it
 /// owns. A distinct type from `ShareEdgeInfo`: what reaches here has already
 /// been filtered to "this account genuinely has to decide on it".
@@ -1001,10 +1030,20 @@ impl PendingApproval {
 /// notification.
 pub async fn pending_approvals() -> Result<Vec<PendingApproval>, CoreError> {
     let auth = require_auth().await?;
-    let owned_group_ids: HashSet<String> =
+    let mut managed_group_ids: HashSet<String> =
         list_groups().await?.into_iter().map(|group| group.group_id).collect();
     let resp: ListSharesResponse = get_json("/shares", &auth).await?;
-    Ok(approval_requests_awaiting_owner(resp.edges, &owned_group_ids)
+    // A delegated Owner decides on requests too, so the groups it holds
+    // an Owner seat in count alongside the ones it created. The seat is read
+    // from this same fresh listing; the coordination plane re-checks it on the
+    // approve/deny itself.
+    let own_device_ids: HashSet<String> = crate::ops::devices::list_devices_with(&auth)
+        .await?
+        .into_iter()
+        .map(|device| device.device_id)
+        .collect();
+    managed_group_ids.extend(delegated_owner_group_ids(&resp.edges, &own_device_ids));
+    Ok(approval_requests_awaiting_owner(resp.edges, &managed_group_ids)
         .into_iter()
         .map(PendingApproval::from_edge)
         .collect())

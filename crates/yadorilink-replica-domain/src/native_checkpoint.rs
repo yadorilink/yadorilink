@@ -231,7 +231,7 @@ mod tests {
         assert_eq!(NATIVE_CHECKPOINT_DOMAIN_TAG[7], NATIVE_PROTOCOL_GENERATION);
         assert_eq!(
             hex::encode(sample().checkpoint_hash().0),
-            "499a8b54f800e647710c14177de1f92432df0429c7ba028b5569f37421a05e29"
+            "141354d9039a528a26730c951287d4036510bbf73b3ade65ea82c539cd9855fd"
         );
     }
 }

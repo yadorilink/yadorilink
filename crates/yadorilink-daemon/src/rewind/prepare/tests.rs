@@ -107,6 +107,10 @@ fn namespace_snapshot(state: &DaemonState) -> (Vec<(String, i64, String, i64)>, 
 /// `doc.txt` held "old" at T and holds "new" now: one Replace, whose
 /// historical content is the block of "old".
 fn linked_state(others: &[&str]) -> Arc<DaemonState> {
+    linked_state_at(others, "/rewind/root")
+}
+
+fn linked_state_at(others: &[&str], root: &str) -> Arc<DaemonState> {
     let store = Arc::new(SegmentBlockStore::new(tempfile::tempdir().unwrap().keep()).unwrap());
     let state = DaemonState::build(
         ME.into(),
@@ -119,7 +123,7 @@ fn linked_state(others: &[&str]) -> Arc<DaemonState> {
     state.block_store.set_headroom_override_bytes(Some(0));
     write_current(&state, "doc.txt", 1, &[block_of(b"old")], 100);
     write_current(&state, "doc.txt", 2, &[block_of(b"new")], 900);
-    state.replica_coordinator.link_repository().add_link("/rewind/root", GROUP).unwrap();
+    state.replica_coordinator.link_repository().add_link(root, GROUP).unwrap();
     let mut members = vec![(ME, WriterRole::Editor)];
     members.extend(others.iter().map(|other| (*other, WriterRole::Editor)));
     state
@@ -442,4 +446,38 @@ async fn a_path_with_an_unprojected_head_is_refused_before_anything_is_recorded(
     );
     assert_eq!(latest(&state), None, "nothing recorded");
     assert!(!state.replica_coordinator.retention_paused(GROUP));
+}
+
+/// A version this device holds only as the file in the folder (its bytes were never copied into
+/// the store) is read into the store from that file when the bytes hash to the recorded version,
+/// and the rewind prepares without any peer.
+#[tokio::test]
+async fn a_version_held_only_as_the_folders_file_is_read_into_the_store() {
+    let root = tempfile::tempdir().unwrap();
+    let state = linked_state_at(&[], root.path().to_str().unwrap());
+    std::fs::write(root.path().join("doc.txt"), b"old").unwrap();
+    let request = approved(&state).await;
+    let old = block_of(b"old");
+    assert!(!state.block_store.exists(&hex::encode(&old.hash)).unwrap(), "fixture: not in store");
+
+    let prepared = prepare_rewind(state.clone(), request).await.unwrap();
+
+    assert_eq!(run(&state, prepared.run_id()).state, RewindRunState::Prefetched);
+    assert!(state.block_store.exists(&hex::encode(&old.hash)).unwrap());
+}
+
+/// A file whose bytes are not the recorded version is never taken for it: the rewind fails as
+/// unavailable, as it does when no file exists, and stores nothing.
+#[tokio::test]
+async fn a_folder_file_that_is_not_the_version_is_not_used() {
+    let root = tempfile::tempdir().unwrap();
+    let state = linked_state_at(&[], root.path().to_str().unwrap());
+    std::fs::write(root.path().join("doc.txt"), b"not old").unwrap();
+    let request = approved(&state).await;
+
+    let error = prepare_rewind(state.clone(), request).await.err().expect("must not prepare");
+
+    assert!(matches!(error, RewindPrepareError::ContentUnavailable { files: 1, .. }), "{error:?}");
+    assert!(!state.block_store.exists(&hex::encode(&block_of(b"not old").hash)).unwrap());
+    assert!(!state.block_store.exists(&hex::encode(&block_of(b"old").hash)).unwrap());
 }

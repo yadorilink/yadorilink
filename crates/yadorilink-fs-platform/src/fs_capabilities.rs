@@ -1251,17 +1251,15 @@ fn measure_birth_time_granularity(dir: &Path) -> Option<TimestampGranularity> {
     Some(TimestampGranularity::Fine)
 }
 
-/// Whether the filesystem holding the process temp dir can prove object identity across
-/// observations (an anti-reuse generation, or a fine-grained birth time). tmpfs offers
-/// neither, so the sync code correctly treats an unchanged object as `Ambiguous` and declines
-/// to author or replace it. Tests whose premise is "the same object is recognised again" call
-/// this first and skip on such a volume instead of failing for an environment reason; point
-/// `TMPDIR` at a disk-backed directory to run them. Prints the reason when it answers `false`.
-#[cfg(any(test, feature = "test-support"))]
-pub fn temp_dir_proves_object_identity_for_test() -> bool {
-    let dir = std::env::temp_dir();
-    let granularity = probe_birth_time_granularity(&dir);
-    let proven = match create_probe_artefact(&dir, "identity-proof", b"x") {
+/// Whether a filesystem object seen again in `dir` can be told from a different object that took
+/// its place: the volume offers an anti-reuse generation or a fine-grained birth time. tmpfs
+/// offers neither, so the sync code correctly treats an unchanged object there as `Ambiguous` and
+/// declines to author or replace it, which in practice means removals and renames made on other
+/// devices are not applied. Measured by creating one probe artefact in `dir` and observing it
+/// twice; `false` when that could not be done.
+pub fn probe_volume_proves_object_identity(dir: &Path) -> bool {
+    let granularity = probe_birth_time_granularity(dir);
+    match create_probe_artefact(dir, "identity-proof", b"x") {
         Ok((path, _file)) => {
             let proven =
                 match (FileIdentity::observe_path(&path), FileIdentity::observe_path(&path)) {
@@ -1272,7 +1270,36 @@ pub fn temp_dir_proves_object_identity_for_test() -> bool {
             proven
         }
         Err(_) => false,
+    }
+}
+
+static VOLUME_IDENTITY_PROOF_CACHE: std::sync::OnceLock<Mutex<HashMap<VolumeIdentity, bool>>> =
+    std::sync::OnceLock::new();
+
+/// [`probe_volume_proves_object_identity`], measured once per volume and process (the answer is a
+/// property of the filesystem, and the probe creates a file). A volume that cannot be identified
+/// is measured every time.
+pub fn cached_volume_proves_object_identity(dir: &Path) -> bool {
+    let Ok(volume) = observe_volume_identity(dir) else {
+        return probe_volume_proves_object_identity(dir);
     };
+    let cache = VOLUME_IDENTITY_PROOF_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(known) = guard.get(&volume) {
+        return *known;
+    }
+    let proven = probe_volume_proves_object_identity(dir);
+    guard.insert(volume, proven);
+    proven
+}
+
+/// Whether the filesystem holding the process temp dir can prove object identity (see
+/// [`probe_volume_proves_object_identity`]). Tests whose premise is "the same object is
+/// recognised again" call this first and skip on such a volume instead of failing for an
+/// environment reason. Prints the reason when it answers `false`.
+#[cfg(any(test, feature = "test-support"))]
+pub fn temp_dir_proves_object_identity_for_test() -> bool {
+    let proven = probe_volume_proves_object_identity(&std::env::temp_dir());
     if !proven {
         eprintln!(
             "SKIPPED: the temp filesystem cannot prove object identity (e.g. tmpfs); \

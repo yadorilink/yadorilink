@@ -168,9 +168,62 @@ pub enum Op {
     DirFsync = 23,
     /// The temp-file-to-final-name rename of a reconstructed file.
     Rename = 24,
+
+    // ---- serving a block to a peer: where one request's wall time goes ----
+    //
+    // Recorded by the session that answers a block request. `ServeRequest` is the whole request
+    // (arrival to the end of the send); its summed nanos divided by the wall time of a transfer is
+    // the average number of requests in flight at this end, and the others split that time. They
+    // overlap across requests, so they are read as shares of `ServeRequest`, not as a partition of
+    // the wall clock.
+    /// One answered block request, from the moment it was taken up to the end of the send.
+    ServeRequest = 25,
+    /// The authorization checks (group share, published reference, provenance, declared size).
+    ServeAuthorize = 26,
+    /// Waiting for a dispatch turn and the credit reservation.
+    ServeDispatchWait = 27,
+    /// Waiting for a blocking-pool thread to start the read (spawn to the read's first line).
+    ServeReadQueue = 28,
+    /// Compressing the block for the wire.
+    ServeCompress = 29,
+    /// Waiting on the upload rate limiter.
+    ServeUploadWait = 30,
+    /// Writing the response header and body to the stream.
+    ServeSend = 31,
+
+    // ---- fetching blocks from a peer: the receiving loop ----
+    /// One fetched answer taken in by the loop that issues the requests: verification, handing the
+    /// block to the commit pool or the staged file, and any wait for room in either. While this
+    /// runs the loop issues no request and polls no request in flight. Bytes = how many requests
+    /// were in flight when the answer was taken, so `bytes / calls` is the average depth.
+    FetchAbsorb = 32,
+    /// The loop waiting for the next answer (no absorb running).
+    FetchWait = 33,
+    /// One whole run of the fetch loop for a pass (first request to the last answer taken in).
+    /// Bytes = what the loop took in, so `bytes / nanos` is the loop's throughput.
+    FetchLoop = 34,
+
+    // ---- the receive commit pipeline and the writing of a large file as it arrives ----
+    /// Waiting for a group commit to finish because two are already in flight, before the next
+    /// batch may be handed to the store.
+    CommitWait = 35,
+    /// One batch handed to the store, start of its job to the end (hash check of each block,
+    /// store write, index, refusal clear). Bytes = the batch's block bytes.
+    CommitJob = 36,
+    /// A batch launched. Bytes = commits in flight once it is counted, so `bytes / calls` is the
+    /// average depth of the commit pipeline.
+    CommitDepth = 37,
+    /// Writing one block of a large file into the temp (`pwrite`).
+    SinkWrite = 38,
+    /// One data flush started while a large file fills (the checkpoint every 64 MiB).
+    SinkStepFlush = 39,
+    /// Reading the temp back to check it against the record: the reads.
+    SinkReadbackRead = 40,
+    /// Reading the temp back to check it against the record: the hashing.
+    SinkReadbackHash = 41,
 }
 
-const OP_COUNT: usize = 25;
+const OP_COUNT: usize = 42;
 
 const OP_NAMES: [&str; OP_COUNT] = [
     "submit",
@@ -198,6 +251,23 @@ const OP_NAMES: [&str; OP_COUNT] = [
     "file_fsync",
     "dir_fsync",
     "rename",
+    "serve_request",
+    "serve_authorize",
+    "serve_dispatch_wait",
+    "serve_read_queue",
+    "serve_compress",
+    "serve_upload_wait",
+    "serve_send",
+    "fetch_absorb",
+    "fetch_wait",
+    "fetch_loop",
+    "commit_wait",
+    "commit_job",
+    "commit_depth",
+    "sink_write",
+    "sink_step_flush",
+    "sink_readback_read",
+    "sink_readback_hash",
 ];
 
 /// Who asked for a block read. Set by the caller, read by the store.
@@ -499,10 +569,27 @@ pub fn percentiles(op: Op, quantiles: &[f64]) -> Vec<u64> {
         .collect()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// File fsyncs recorded by the current thread, for tests that must not be disturbed by other
+    /// tests flushing at the same time (the counters above are process-wide).
+    static THREAD_FILE_FSYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// File fsyncs the current thread has recorded while counters were armed. Tests only.
+#[cfg(all(test, unix))]
+pub(crate) fn thread_file_fsyncs() -> u64 {
+    THREAD_FILE_FSYNCS.with(std::cell::Cell::get)
+}
+
 /// Records one occurrence of `op`. Cheap enough to call unconditionally
 /// once `enabled()` has already been checked.
 #[inline]
 pub fn record(op: Op, nanos: u64, bytes: u64) {
+    #[cfg(test)]
+    if op == Op::FileFsync {
+        THREAD_FILE_FSYNCS.with(|count| count.set(count.get() + 1));
+    }
     let i = op as usize;
     CALLS[i].fetch_add(1, Ordering::Relaxed);
     NANOS[i].fetch_add(nanos, Ordering::Relaxed);
@@ -560,3 +647,89 @@ pub fn stat(op: Op) -> OpStat {
 
 #[cfg(test)]
 mod tests;
+
+// ---- measurement switches (never set in production) ----
+//
+// Two switches for telling which end of a transfer limits it:
+// "receive discard" makes the receiving loop read each answer and drop it (no check, no store, no
+// file), and "serve constant" makes the serving side answer from a fixed buffer instead of the
+// store. A transfer run with either one set does not produce the files; they exist only to read
+// the transfer rate of the other half.
+//
+// The daemon's entry point sets them from its environment (`set_measurement_switches`); this
+// module reads nothing from the process. Because a switch removes the check of received bytes, it
+// only takes effect while the io counters are armed (which is how every measurement run starts),
+// and it says so in a warning once.
+
+static RECV_DISCARD: AtomicBool = AtomicBool::new(false);
+static SERVE_CONSTANT: AtomicBool = AtomicBool::new(false);
+
+/// Sets the measurement switches. Called once, at startup, by a process that was asked for them.
+pub fn set_measurement_switches(recv_discard: bool, serve_constant: bool) {
+    RECV_DISCARD.store(recv_discard, Ordering::Relaxed);
+    SERVE_CONSTANT.store(serve_constant, Ordering::Relaxed);
+}
+
+/// Whether the receiving loop drops what it reads (see the switches above).
+pub fn recv_discard() -> bool {
+    static NOTED: std::sync::Once = std::sync::Once::new();
+    let on = enabled() && RECV_DISCARD.load(Ordering::Relaxed);
+    if on {
+        NOTED.call_once(|| {
+            tracing::warn!(
+                "measurement switch recv-discard is in effect: received blocks are read and \
+                 dropped, nothing is checked or stored"
+            );
+        });
+    }
+    on
+}
+
+/// Whether the serving side answers block requests from a fixed buffer.
+pub fn serve_constant() -> bool {
+    static NOTED: std::sync::Once = std::sync::Once::new();
+    let on = enabled() && SERVE_CONSTANT.load(Ordering::Relaxed);
+    if on {
+        NOTED.call_once(|| {
+            tracing::warn!(
+                "measurement switch serve-constant is in effect: block requests are answered \
+                 from a fixed buffer"
+            );
+        });
+    }
+    on
+}
+
+/// `len` bytes of an incompressible fixed buffer (random once per process), for the serving
+/// switch: a buffer of zeros would compress to nothing and measure the compressor instead.
+pub fn constant_block(len: usize) -> Vec<u8> {
+    static BUFFER: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let buffer = BUFFER.get_or_init(|| {
+        let mut bytes = vec![0u8; 16 * 1024 * 1024];
+        rand::fill(&mut bytes[..]);
+        bytes
+    });
+    buffer.iter().copied().cycle().take(len).collect()
+}
+
+#[cfg(test)]
+mod switch_tests {
+    use super::*;
+
+    #[test]
+    fn a_constant_block_has_exactly_the_requested_length() {
+        assert_eq!(constant_block(0).len(), 0);
+        assert_eq!(constant_block(1234).len(), 1234);
+        assert_eq!(constant_block(17 * 1024 * 1024).len(), 17 * 1024 * 1024);
+    }
+
+    #[test]
+    fn the_switches_do_nothing_unless_the_counters_are_armed() {
+        // The test process does not arm the counters; neither switch can take effect.
+        assert!(!enabled());
+        set_measurement_switches(true, true);
+        assert!(!recv_discard());
+        assert!(!serve_constant());
+        set_measurement_switches(false, false);
+    }
+}

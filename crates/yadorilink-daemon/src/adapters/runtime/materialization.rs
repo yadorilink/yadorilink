@@ -51,6 +51,37 @@ impl DaemonMaterializationAdapter {
             self.hydrate(group_id, path).await.map(|_| ())
         }
     }
+
+    /// Makes the store hold the current versions the pin keeps, from the files that hold them
+    /// (`store_residency`): a version this device received, or captured as a hash only, is held by
+    /// its file alone, and the user's next edit would replace it. The pin stands whatever this
+    /// finds. A file that is not the version it was recorded as is journaled for capture, which now
+    /// goes into the store because the item is pinned; the answer says so, so that the user can
+    /// pin again once it has settled instead of finding out when an edit loses a version.
+    async fn keep_versions_in_store(&self, group_id: &str, path: &str) -> Option<&'static str> {
+        match crate::store_residency::bring_current_versions_into_daemon_store(
+            &self.state,
+            group_id,
+            path,
+        )
+        .await
+        {
+            Ok(crate::store_residency::Residency::InStore) => None,
+            Ok(crate::store_residency::Residency::Pending(paths)) => {
+                tracing::info!(
+                    group_id,
+                    path,
+                    pending = paths.len(),
+                    "pinned: files are being captured into the block store"
+                );
+                Some("changing_retry")
+            }
+            Err(error) => {
+                tracing::warn!(%error, group_id, path, "pinned, but the current versions could not be brought into the block store");
+                Some("not_kept_error")
+            }
+        }
+    }
 }
 
 impl MaterializationPort for DaemonMaterializationAdapter {
@@ -111,12 +142,14 @@ impl MaterializationPort for DaemonMaterializationAdapter {
                 dehydrated: outcome.evicted_files > 0,
                 blocks_reclaimed: outcome.blocks_reclaimed,
                 bytes_reclaimed: outcome.bytes_reclaimed,
+                not_freed: None,
             })
         } else {
             hydration::evict(&self.state, group_id, path).map(|outcome| EvictOutcome {
                 dehydrated: outcome.dehydrated,
                 blocks_reclaimed: outcome.blocks_reclaimed,
                 bytes_reclaimed: outcome.bytes_reclaimed,
+                not_freed: outcome.not_freed.map(|why| why.code()),
             })
         };
         // The path has settled, whatever the outcome (completed, aborted, or
@@ -201,6 +234,7 @@ impl MaterializationPort for DaemonMaterializationAdapter {
                 }
             }
             let retention = self.retention(group_id, path)?;
+            let mut history_not_kept_reason = None;
             // A provider folder's content is fetched by the OS, never by the daemon. On macOS the
             // app's File Provider host asks the OS for every kept file (the provider Eager driver
             // answers its download queries with them), also after the user removes a download in
@@ -217,9 +251,17 @@ impl MaterializationPort for DaemonMaterializationAdapter {
                         .to_owned()
                 })
             } else {
-                self.fetch_kept(group_id, path).await.err().map(|e| e.to_string())
+                // A file this device holds only as bytes in the folder is read into the store
+                // before the download, so that the download finds the blocks it needs locally
+                // instead of asking peers for content this device already has. Whether the store
+                // holds the versions is answered after the download, when a placeholder has also
+                // become a file.
+                let _ = self.keep_versions_in_store(group_id, path).await;
+                let error = self.fetch_kept(group_id, path).await.err().map(|e| e.to_string());
+                history_not_kept_reason = self.keep_versions_in_store(group_id, path).await;
+                error
             };
-            Ok(PinOutcome { retention, download_error })
+            Ok(PinOutcome { retention, download_error, history_not_kept_reason })
         })
     }
 

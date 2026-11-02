@@ -13,7 +13,7 @@
 //! Every function in this module that handles data from the peer treats the
 //! connected peer as **authorized but untrusted**: it has passed
 //! coordination-plane auth and its blocks pass the hash+size check
-//! (`block_data_matches`), but its *choices* -- which blocks it asks for,
+//! (`VerifiedBlock::check`), but its *choices* -- which blocks it asks for,
 //! what path it names -- are adversarial input, not trusted metadata. A
 //! request is served only for a block the requested file's live record or a
 //! live native head of an authorized group references, and `materialize`/`hydrate_file_with_timeout`
@@ -25,8 +25,6 @@ use std::future::Future;
 use std::io::Read as _;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
-
-use sha2::{Digest, Sha256};
 
 use crate::adaptive_window::AdaptiveWindow;
 use crate::error::PeerSessionError;
@@ -122,32 +120,67 @@ const ADAPTIVE_WINDOW_MIN: usize = 1;
 /// sync engine's bottleneck.
 const COMPRESSION_LEVEL: i32 = 3;
 
-/// The sender always performs one low-level (`COMPRESSION_
-/// LEVEL`) trial compression pass on a candidate payload, then keeps the
-/// compressed form only if it beats this fraction of the raw size — a
-/// "try-compress-and-compare" heuristic, not a separate entropy-sampling
-/// pre-pass. This deliberately rejects that alternative (sampling first): it
-/// would add a second full pass over the data for marginal savings over
-/// just running the cheap level-3 pass once and checking the result size.
-/// Already-compressed/incompressible content (media, archives, encrypted
-/// files) naturally fails this check and is sent raw, at the cost of one
-/// cheap compression attempt — never a second, wasted full-ratio pass.
+/// A block is compressed only when it beats this fraction of its raw size, and a block that does
+/// not is sent raw (the compressed form is never larger than a raw one would be on the wire).
 const COMPRESSION_SKIP_THRESHOLD: f64 = 0.95;
 
-/// Compresses `data` at `COMPRESSION_
-/// LEVEL` and keeps the compressed form only when it beats `COMPRESSION_
-/// SKIP_THRESHOLD` of the raw size — otherwise (including on an
-/// encoder error, or empty input, both treated as "not worth compressing"
-/// rather than propagated, since sending raw bytes is always a safe
-/// fallback) returns the original bytes tagged `Compression::None`. Pure
-/// and synchronous — real CPU work for a multi-hundred-KB block, so every
-/// caller in this module runs it inside `tokio::task::spawn_blocking`,
-/// alongside the existing block-store I/O (same reasoning),
-/// never directly on an async runtime worker thread.
-fn compress_block(data: &[u8]) -> (Vec<u8>, i32) {
-    if data.is_empty() {
-        return (Vec::new(), yadorilink_sync_wire::COMPRESSION_NONE);
+/// How much of a block is tried before it is compressed whole: three samples of this many bytes,
+/// from its start, its middle and its end.
+///
+/// Compressing a whole block at the low level and checking the result is the cheapest way to learn
+/// what a compressible block gives, but for a block that does not compress (media, archives,
+/// encrypted or random data) it is a full pass of the compressor for nothing: measured at 5.7
+/// percent of the sender's CPU while it served one 1 GiB random file. A trial of three samples
+/// costs 12 KiB, about half a percent of a 2.5 MiB block. Only a block whose three samples all
+/// miss the threshold is sent raw without a full pass; a block with any compressible sample is
+/// compressed whole as before. The trial can be wrong in one direction only: a block that is
+/// incompressible at all three places and compressible elsewhere is sent raw, which costs
+/// bandwidth, never correctness.
+const COMPRESSION_SAMPLE_BYTES: usize = 4096;
+
+/// A block shorter than this is compressed whole: its trial would cost a large part of the
+/// compression itself.
+const COMPRESSION_SAMPLE_MIN_BLOCK: usize = 4 * COMPRESSION_SAMPLE_BYTES;
+
+/// Whether `data` is so evidently incompressible that compressing it whole is not worth trying.
+fn looks_incompressible(data: &[u8]) -> bool {
+    if data.len() < COMPRESSION_SAMPLE_MIN_BLOCK {
+        return false;
     }
+    let starts =
+        [0, (data.len() - COMPRESSION_SAMPLE_BYTES) / 2, data.len() - COMPRESSION_SAMPLE_BYTES];
+    starts.into_iter().all(|start| {
+        let sample = &data[start..start + COMPRESSION_SAMPLE_BYTES];
+        match zstd::bulk::compress(sample, COMPRESSION_LEVEL) {
+            Ok(compressed) => {
+                compressed.len() as f64 >= sample.len() as f64 * COMPRESSION_SKIP_THRESHOLD
+            }
+            // An encoder error says nothing about the data: take the usual path.
+            Err(_) => false,
+        }
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many whole-block compressions this thread has started (the tests' way of seeing that a
+    /// block was not tried).
+    static WHOLE_BLOCK_COMPRESSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Compresses `data` at `COMPRESSION_LEVEL` and keeps the compressed form only when it beats
+/// `COMPRESSION_SKIP_THRESHOLD` of the raw size; otherwise (including on an encoder error, or empty
+/// input, both treated as "not worth compressing" rather than propagated, since sending raw bytes
+/// is always a safe fallback) returns the original bytes tagged `Compression::None`. A block that
+/// evidently does not compress ([`looks_incompressible`]) is not compressed at all. Pure and
+/// synchronous: real CPU work for a multi-hundred-KB block, so every caller in this module runs it
+/// inside `tokio::task::spawn_blocking`, never directly on an async runtime worker thread.
+fn compress_block(data: &[u8]) -> (Vec<u8>, i32) {
+    if data.is_empty() || looks_incompressible(data) {
+        return (data.to_vec(), yadorilink_sync_wire::COMPRESSION_NONE);
+    }
+    #[cfg(test)]
+    WHOLE_BLOCK_COMPRESSIONS.with(|count| count.set(count.get() + 1));
     match zstd::stream::encode_all(data, COMPRESSION_LEVEL) {
         Ok(compressed)
             if (compressed.len() as f64) < (data.len() as f64) * COMPRESSION_SKIP_THRESHOLD =>
@@ -170,8 +203,8 @@ fn compress_block(data: &[u8]) -> (Vec<u8>, i32) {
 /// buffer.
 ///
 /// Callers treat an `Err` here the same way `ensure_blocks_present`
-/// already treats a hash/size mismatch (`block_data_matches` returning
-/// false) or a rejected index message: logged, the payload discarded, no
+/// already treats a hash/size mismatch (`VerifiedBlock::check` failing)
+/// or a rejected index message: logged, the payload discarded, no
 /// partial use of it — see `PeerSyncSession::fetch_block_over_stream`'s own
 /// doc comment for the reject-and-reassign path this reuses.
 fn decompress_block(
@@ -522,6 +555,9 @@ pub struct PeerSyncSession {
     /// `CustodyRehomeResponder`. A caller with no real responder passes a
     /// deny-by-default one.
     custody_rehome_responder: Arc<dyn CustodyRehomeResponder>,
+    /// Where a block the store does not hold is read from the user's file instead (verified), or
+    /// `None` when blocks are served from the store only.
+    block_file_source: Option<Arc<dyn crate::ports::BlockFileSourcePort>>,
 }
 
 impl PeerSyncSession {
@@ -577,6 +613,7 @@ impl PeerSyncSession {
             handoff_lease_responder: deps.handoff_lease_responder,
             handoff_ticket_responder: deps.handoff_ticket_responder,
             custody_rehome_responder: deps.custody_rehome_responder,
+            block_file_source: deps.block_file_source,
         })
     }
 
@@ -655,22 +692,6 @@ impl PeerSyncSession {
         self.content_bytes_received.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
-
-fn block_data_matches(block: &BlockInfo, data: &[u8]) -> bool {
-    if data.len() != block.size as usize {
-        return false;
-    }
-    let digest = Sha256::digest(data);
-    digest[..] == block.hash[..]
-}
-
-/// a peer
-/// could return data for a block that doesn't actually match what was
-/// requested (wrong content, truncated, or an outright malicious/corrupt
-/// response) — `ensure_blocks_present` must never accept and persist it
-/// as though it were the real block.
-#[cfg(test)]
-mod block_data_matches_tests;
 
 /// `compress_block`/`decompress_block`
 /// exercised directly — no `PeerSyncSession`/channel needed, mirroring
@@ -913,8 +934,8 @@ impl crate::convergence_driver::ConvergenceDriver for PeerSyncSession {
             .await?;
             Ok(crate::convergence_driver::FetchedBlock {
                 outcome: match outcome {
-                    BlockFetchOutcome::Fetched { hash, data } => {
-                        crate::convergence_driver::BlockFetch::Fetched { hash, data }
+                    BlockFetchOutcome::Fetched(block) => {
+                        crate::convergence_driver::BlockFetch::Fetched(block)
                     }
                     BlockFetchOutcome::Missing => crate::convergence_driver::BlockFetch::Missing,
                     BlockFetchOutcome::VerifiedRefusal { reason } => {
@@ -924,5 +945,97 @@ impl crate::convergence_driver::ConvergenceDriver for PeerSyncSession {
                 wire_wait,
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod compression_trial_tests {
+    use super::*;
+
+    fn random_bytes(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state & 0xFF) as u8
+            })
+            .collect()
+    }
+
+    fn text_like(len: usize) -> Vec<u8> {
+        let line = b"fn compressible() { let value = 42; println!(\"{value}\"); }\n";
+        line.iter().copied().cycle().take(len).collect()
+    }
+
+    fn whole_block_compressions() -> usize {
+        WHOLE_BLOCK_COMPRESSIONS.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn a_block_of_random_bytes_is_sent_raw_without_a_whole_block_compression() {
+        let data = random_bytes(2_500_000, 0x9E37_79B9_7F4A_7C15);
+        let before = whole_block_compressions();
+
+        let (out, compression) = compress_block(&data);
+
+        assert_eq!(compression, yadorilink_sync_wire::COMPRESSION_NONE);
+        assert_eq!(out, data, "sent as it is");
+        assert_eq!(whole_block_compressions(), before, "the compressor was not run on the block");
+    }
+
+    #[test]
+    fn a_compressible_block_is_compressed_whole_as_before() {
+        let data = text_like(1_000_000);
+        let before = whole_block_compressions();
+
+        let (out, compression) = compress_block(&data);
+
+        assert_eq!(compression, yadorilink_sync_wire::COMPRESSION_ZSTD);
+        assert!(out.len() < data.len() / 4, "it shrank ({} of {})", out.len(), data.len());
+        assert_eq!(whole_block_compressions(), before + 1);
+        let restored = decompress_block(&out, compression, data.len()).unwrap();
+        assert_eq!(restored, data, "and it decompresses to the block");
+    }
+
+    #[test]
+    fn one_compressible_place_is_enough_to_compress_the_block_whole() {
+        // Random except for its first quarter, which is text: the start sample compresses.
+        let mut data = random_bytes(1_000_000, 7);
+        let text = text_like(250_000);
+        data[..text.len()].copy_from_slice(&text);
+        let before = whole_block_compressions();
+
+        let (out, compression) = compress_block(&data);
+
+        assert_eq!(whole_block_compressions(), before + 1, "the block was tried whole");
+        assert_eq!(compression, yadorilink_sync_wire::COMPRESSION_ZSTD);
+        assert_eq!(decompress_block(&out, compression, data.len()).unwrap(), data);
+    }
+
+    #[test]
+    fn a_short_block_is_compressed_whole_whatever_it_holds() {
+        let data = random_bytes(COMPRESSION_SAMPLE_MIN_BLOCK - 1, 11);
+        let before = whole_block_compressions();
+
+        let (out, compression) = compress_block(&data);
+
+        assert_eq!(whole_block_compressions(), before + 1, "too short for a trial to pay");
+        assert_eq!(compression, yadorilink_sync_wire::COMPRESSION_NONE);
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn the_trial_only_calls_a_block_incompressible_when_all_three_samples_say_so() {
+        assert!(looks_incompressible(&random_bytes(100_000, 3)));
+        assert!(!looks_incompressible(&text_like(100_000)));
+        assert!(!looks_incompressible(&[]));
+        // Compressible at the end only.
+        let mut data = random_bytes(100_000, 5);
+        let tail = text_like(10_000);
+        let at = data.len() - tail.len();
+        data[at..].copy_from_slice(&tail);
+        assert!(!looks_incompressible(&data));
     }
 }

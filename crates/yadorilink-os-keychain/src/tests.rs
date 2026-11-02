@@ -269,3 +269,12 @@ fn the_system_keychain_without_the_entitlement_fails_closed() {
     }
     assert!(keychain.read("simulator-test").is_err(), "a read must not report absence");
 }
+
+#[test]
+fn macos_access_group_follows_the_build_identity() {
+    assert_eq!(
+        MACOS_ACCESS_GROUP,
+        option_env!("YADORILINK_KEYCHAIN_GROUP")
+            .unwrap_or("594UQF7QX3.com.juntaki.yadorilink.credentials")
+    );
+}

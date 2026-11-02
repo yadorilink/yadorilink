@@ -51,7 +51,11 @@ fn new_device(device_id: &str) -> Device {
     let db_dir = tempfile::tempdir().unwrap();
     let db_path = db_dir.path().join("index.db");
     let sync_state = Arc::new(ReplicaCoordinator::open(&db_path).unwrap());
-    let state = DaemonState::new(device_id.to_string(), sync_state, store);
+    let state = yadorilink_daemon::test_support::isolated_daemon_state(
+        device_id.to_string(),
+        sync_state,
+        store,
+    );
     ensure_device_signing_key(&state);
     // A linked group is fail-closed without a verified policy snapshot:
     // local DAG emission is withheld entirely, so the import under test
@@ -259,6 +263,7 @@ async fn wait_for_quiet(conn: &rusqlite::Connection, what: &str) {
 async fn restart(device: Device, local_path: &str, group_id: &str) -> Device {
     LinkRuntimeController::new(device.state.clone()).stop(local_path).await;
     let signing_key = device.state.device_signing_key().expect("signing key was set");
+    let config_dir = device.state.config_dir().to_path_buf();
     drop(device.state);
     let sync_state = {
         let mut attempts = 0;
@@ -273,7 +278,8 @@ async fn restart(device: Device, local_path: &str, group_id: &str) -> Device {
             }
         }
     };
-    let restarted = DaemonState::new(
+    let restarted = yadorilink_daemon::test_support::isolated_daemon_state_in(
+        config_dir,
         device.device_id.clone(),
         sync_state,
         Arc::new(SegmentBlockStore::new(device.store_dir.path()).unwrap()),

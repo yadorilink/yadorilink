@@ -25,6 +25,7 @@
 
 use ed25519_dalek::VerifyingKey;
 use rusqlite::{Connection, OptionalExtension};
+use yadorilink_sqlite_runtime::CachedStatements as _;
 
 use yadorilink_replica_domain::author::AuthorId;
 use yadorilink_replica_domain::authorization_checkpoint::MerkleProof;
@@ -810,8 +811,7 @@ fn waiters_of(
     group_id: &FolderGroupId,
     dot: &Dot,
 ) -> Result<Vec<NativeDelta>, SyncSqliteError> {
-    let mut stmt = conn.prepare(
-        "SELECT wire_bytes FROM native_delta_holds \
+    let mut stmt = conn.prepare_cached("SELECT wire_bytes FROM native_delta_holds \
          WHERE group_id = ?1 AND waiting_on_author = ?2 AND waiting_on_incarnation = ?3 AND waiting_on_seq = ?4",
     )?;
     let mut rows = stmt.query((
@@ -867,7 +867,7 @@ fn evict_oldest_holds(
         Some(author) => (Some(author.device.as_str()), Some(author.incarnation.0.as_slice())),
         None => (None, None),
     };
-    let held: i64 = conn.query_row(
+    let held: i64 = conn.query_row_cached(
         "SELECT COUNT(*) FROM native_delta_holds WHERE group_id = ?1 \
          AND (?2 IS NULL OR (author = ?2 AND incarnation = ?3))",
         rusqlite::params![group_id.as_str(), author_device, author_incarnation],
@@ -877,7 +877,7 @@ fn evict_oldest_holds(
     if excess <= 0 {
         return Ok(());
     }
-    let dropped = conn.execute(
+    let dropped = conn.execute_cached(
         "DELETE FROM native_delta_holds WHERE rowid IN ( \
              SELECT rowid FROM native_delta_holds WHERE group_id = ?1 \
              AND (?2 IS NULL OR (author = ?2 AND incarnation = ?3)) \
@@ -901,8 +901,7 @@ fn hold(
     waiting_on: &Dot,
 ) -> Result<HoldOutcome, SyncSqliteError> {
     let existing: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT wire_bytes FROM native_delta_holds WHERE group_id = ?1 AND author = ?2 AND incarnation = ?3 AND seq = ?4",
+        .query_row_cached("SELECT wire_bytes FROM native_delta_holds WHERE group_id = ?1 AND author = ?2 AND incarnation = ?3 AND seq = ?4",
             (group_id.as_str(), delta.author.device.as_str(), delta.author.incarnation.0.as_slice(), delta.seq.get() as i64),
             |row| row.get(0),
         )
@@ -919,7 +918,7 @@ fn hold(
             // landed may find a different dependency still missing, and
             // `waiters_of` only finds a hold by its stored blocker. Re-point
             // the row so the new blocker's arrival releases it.
-            conn.execute(
+            conn.execute_cached(
                 "UPDATE native_delta_holds \
                  SET waiting_on_author = ?5, waiting_on_incarnation = ?6, waiting_on_seq = ?7 \
                  WHERE group_id = ?1 AND author = ?2 AND incarnation = ?3 AND seq = ?4",
@@ -949,8 +948,7 @@ fn hold(
 
     evict_oldest_holds(conn, group_id, Some(&delta.author), MAX_HELD_PER_AUTHOR)?;
     evict_oldest_holds(conn, group_id, None, MAX_HELD_PER_GROUP)?;
-    conn.execute(
-        "INSERT INTO native_delta_holds \
+    conn.execute_cached("INSERT INTO native_delta_holds \
          (group_id, author, incarnation, seq, wire_bytes, waiting_on_author, waiting_on_incarnation, waiting_on_seq, received_at_unixtime) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, unixepoch())",
         (
@@ -973,8 +971,7 @@ fn clear_hold(
     author: &AuthorId,
     seq: AuthorSeq,
 ) -> Result<(), SyncSqliteError> {
-    conn.execute(
-        "DELETE FROM native_delta_holds WHERE group_id = ?1 AND author = ?2 AND incarnation = ?3 AND seq = ?4",
+    conn.execute_cached("DELETE FROM native_delta_holds WHERE group_id = ?1 AND author = ?2 AND incarnation = ?3 AND seq = ?4",
         (group_id.as_str(), author.device.as_str(), author.incarnation.0.as_slice(), seq.get() as i64),
     )?;
     Ok(())

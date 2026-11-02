@@ -97,21 +97,49 @@ pub fn remove_file_unless_vanished(path: &std::path::Path) {
     }
 }
 
-/// Test-isolation fix (found investigating a session-wide daemon-test
-/// failure): the daemon's config dir — and with it the peer-key-pinning store
-/// (`peer_keys.json`) — falls back to this device's REAL per-user production
-/// config directory whenever `YADORILINK_CONFIG_DIR` isn't set. Every test
-/// process on a machine then read and wrote the exact same real file;
-/// concurrent writers corrupted it into invalid JSON, which made every
-/// daemon-level test's netmap-subscription loop fail permanently —
-/// indistinguishable from a real product bug until traced to this shared file.
+/// A temporary directory on a filesystem that can prove an object is the same object when it is seen
+/// again, for the synced folders of a test whose premise is that a directory or file removed on one
+/// device is removed from the other device's disk: the daemon refuses to remove what it cannot prove is
+/// the object it recorded, so on tmpfs (`/tmp` on some hosts) such a test only times out. It is made
+/// inside Cargo's per-target temp directory (beside the build output, so on disk wherever the build is),
+/// and the test gives its path to the nodes it builds (`device_in`, `device_fast_in`, `new_node_fast_in`).
+/// Nothing process-wide changes: other tests of the same binary keep the temp directory they had.
+/// `None`, with the reason printed, only if even that location cannot prove identity; the test then skips.
+#[allow(dead_code)] // shared by test targets that do not all remove files
+pub fn identity_proving_temp_root() -> Option<tempfile::TempDir> {
+    let parent = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let made = std::fs::create_dir_all(parent)
+        .and_then(|()| tempfile::Builder::new().prefix("yl-identity-").tempdir_in(parent));
+    let dir = match made {
+        Ok(dir) => dir,
+        Err(error) => {
+            eprintln!("SKIPPED: cannot make a directory in {}: {error}", parent.display());
+            return None;
+        }
+    };
+    if yadorilink_fs_platform::fs_capabilities::probe_volume_proves_object_identity(dir.path()) {
+        Some(dir)
+    } else {
+        eprintln!(
+            "SKIPPED: {} cannot prove object identity (e.g. tmpfs); build on a disk-backed directory to run this test",
+            parent.display()
+        );
+        None
+    }
+}
+
+/// Keeps a test process off the real per-user state directory and off any state directory shared
+/// between its tests.
 ///
-/// Fixed once per test *process* (`std::sync::Once`, not per test function —
-/// `std::env::set_var` mutates process-wide state, so a fresh value per
-/// concurrently-running test function within the same binary would itself
-/// race): point every test binary at its own process-local temp directory, so
-/// no daemon-level test ever touches real per-user state, and concurrent test
-/// processes can never collide on this path.
+/// `YADORILINK_CONFIG_DIR` unset means the device's real per-user production directory: every test
+/// process on a machine would read and write the same real files (once concurrent writers
+/// corrupted the peer-key-pinning store into invalid JSON, which looked like a product bug). Set
+/// to one directory per process it would still be shared by every test thread of the process.
+/// So each test daemon is built over a state directory of its own
+/// (`test_support::isolated_daemon_state`), and this points the process-wide variable at a regular
+/// file, where anything that still resolves it fails at once.
+///
+/// Done once per process (`std::sync::Once`): `std::env::set_var` mutates process-wide state.
 pub fn ensure_isolated_config_dir() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
@@ -119,8 +147,14 @@ pub fn ensure_isolated_config_dir() {
         // process, and the process itself tears it down on exit (or the OS
         // reclaims `/tmp`) — there is no natural cleanup point inside the test
         // binary.
+        // Every test daemon is built over a state directory of its own
+        // (`test_support::isolated_daemon_state`), so nothing in a test process may use the
+        // process-wide one. Point it at a regular file: anything that still resolves it fails
+        // at once instead of sharing a directory with the other tests of the process.
         let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
-        std::env::set_var("YADORILINK_CONFIG_DIR", dir.path());
+        let not_a_directory = dir.path().join("process-wide-state-dir-is-unused");
+        std::fs::write(&not_a_directory, b"").unwrap();
+        std::env::set_var("YADORILINK_CONFIG_DIR", &not_a_directory);
         // These harnesses run no cfapi-host.exe: without a provider, a Windows
         // `Remote` row would stay a recorded identity with nothing on disk.
         yadorilink_local_storage::materialize_write::set_test_native_provider_absent(true);
@@ -168,55 +202,55 @@ pub async fn register_and_login(coordination_addr: &str, _email: &str) -> TestAc
 /// human-readable id keeps assertions readable.
 #[allow(dead_code)]
 pub async fn register_device(_account: &TestAccount, name: &str, _public_key: [u8; 32]) -> String {
-    ensure_fast_convergence_backstops_for_tests();
     name.to_string()
 }
 
-/// Sets two process-wide backstop-interval defaults to 1s, once per test
-/// process, BEFORE the first `DaemonState`/`PeerSessionDriver` this
-/// process constructs.
+/// The sweep intervals the convergence scenarios give their daemons: the materialization-repair
+/// sweep every second instead of every 90.
 ///
-/// Both setters below only take effect on their own task's *next* sleep —
-/// see each one's own doc comment — so a caller racing them against
-/// `DaemonState::new` (already spawning a materialization-repair task by
-/// the time it returns) or `ensure_reconciliation` (already spawning a
-/// driver pump by the time it returns) cannot guarantee the override lands
-/// before that task's own first read, especially on a multi-threaded
-/// runtime where a newly-spawned task can start executing on a different
-/// worker thread immediately, no `.await` required. `spawn_paired_session`'s
-/// own late, per-instance `state.set_materialization_repair_sweep_
-/// interval(1s)` call is exactly this race and cannot substitute for the
-/// global default here.
-///
-/// Investigating `multiway_conflict_matrix.rs`/`directory_conflict_matrix.rs`
-/// stalling at ~90s found BOTH gaps stacked: with only the sweep-interval
-/// race closed, the sweep ran every second from startup and still never
-/// unstalled these tests, because `MaterializationRepairJob::run_once`
-/// only re-drives paths this device's OWN index already tracks as
-/// materialization candidates — it cannot discover a Change this device
-/// never admitted into its DAG at all. The actual gap is one level up, in
-/// `sync_adapter::driver`: `SyncStack::sync_with` can complete a round that
-/// wants a hash and stages nothing, with no error (see that module's own
-/// doc comment for the exact race), and nothing before
-/// `RECONCILIATION_BACKSTOP_INTERVAL` existed ever asked that one pairing
-/// again once its single wake had fired — organically covered in most
-/// tests by literally any later local edit or netmap churn touching either
-/// side, which every one of these rows' single-write-then-converge
-/// scenarios never provides. `set_default_materialization_repair_sweep_
-/// interval_for_tests` (used correctly by `row14_strict_acceptance.rs`/
-/// `durability_unobtainable_content.rs`/`monkey_chaos.rs` already) and
-/// `sync_adapter::driver::set_default_reconciliation_backstop_interval_
-/// for_tests` (new) seed every subsequently-constructed instance's own
-/// interval directly, closing both races this file's own
-/// `setup_device`/`register_device` ordering could not.
+/// A scenario that stalls until a periodic sweep re-drives it (a round that wants a block and
+/// stages nothing completes without error, and only the sweep notices) otherwise waits the full
+/// production interval, which exceeds its convergence budget. The interval is given to each
+/// daemon at construction because the scheduler has already started by the time the constructor
+/// returns; it is a property of that daemon, not of the test process.
+pub fn fast_convergence_sweeps() -> yadorilink_daemon::daemon_state::StateIntervals {
+    yadorilink_daemon::daemon_state::StateIntervals {
+        materialization_repair_sweep: Some(std::time::Duration::from_secs(1)),
+        ..Default::default()
+    }
+}
+
+/// A test daemon over a state directory of its own, with [`fast_convergence_sweeps`].
 #[allow(dead_code)]
-fn ensure_fast_convergence_backstops_for_tests() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        yadorilink_daemon::daemon_state::set_default_materialization_repair_sweep_interval_for_tests(
-            std::time::Duration::from_secs(1),
-        );
-    });
+pub fn fast_daemon_state(
+    device_id: String,
+    replica_coordinator: Arc<ReplicaCoordinator>,
+    block_store: Arc<dyn BlockStore + Send + Sync>,
+) -> Arc<DaemonState> {
+    yadorilink_daemon::test_support::isolated_daemon_state_with(
+        fast_convergence_sweeps(),
+        None,
+        device_id,
+        replica_coordinator,
+        block_store,
+    )
+}
+
+/// [`fast_daemon_state`] over the state directory of the daemon it replaces, for a restart.
+#[allow(dead_code)]
+pub fn fast_daemon_state_in(
+    config_dir: std::path::PathBuf,
+    device_id: String,
+    replica_coordinator: Arc<ReplicaCoordinator>,
+    block_store: Arc<dyn BlockStore + Send + Sync>,
+) -> Arc<DaemonState> {
+    yadorilink_daemon::test_support::isolated_daemon_state_with(
+        fast_convergence_sweeps(),
+        Some(config_dir),
+        device_id,
+        replica_coordinator,
+        block_store,
+    )
 }
 
 /// Returns `name` as the group id (stable, no server).
@@ -367,7 +401,18 @@ impl Progress {
     /// `None` while it should go on (including when `left` is zero: the caller stops itself).
     #[allow(dead_code)]
     pub fn failure(&mut self, left: usize, context: impl FnOnce() -> String) -> Option<String> {
-        let now = std::time::Instant::now();
+        self.failure_at(std::time::Instant::now(), left, context)
+    }
+
+    /// [`Self::failure`] with the reading's time given, so a test can drive the clock.
+    #[allow(dead_code)]
+    pub fn failure_at(
+        &mut self,
+        now: std::time::Instant,
+        left: usize,
+        context: impl FnOnce() -> String,
+    ) -> Option<String> {
+        let previous = self.last;
         if left != self.last {
             self.last = left;
             self.timeline.push(((now - self.started).as_secs(), left));
@@ -375,7 +420,10 @@ impl Progress {
         if left == 0 {
             return None;
         }
-        if left < self.best {
+        // A rise is new work arriving (for example the other device's copy of a finished chunk
+        // landing), not a stall: the bar to beat becomes the new level, so the climb back down
+        // from it counts as progress even when it is still above the earlier low point.
+        if left < self.best || left > previous {
             self.best = left;
             self.improved_at = now;
         }
@@ -509,6 +557,29 @@ pub fn tuning_with_outside_witness() -> yadorilink_daemon::engine_tuning::Engine
     }
 }
 
+/// What a topology node's engine does beyond the defaults.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NodeFeatures {
+    /// Serves blocks from the user's files and captures large files as a hash only
+    /// (`file_block_source`).
+    pub serves_from_files: bool,
+    /// Keeps the blocks of small received files in memory and writes large received files straight
+    /// into their own file, instead of committing every received block to the block store
+    /// (`single_pass`).
+    pub single_pass_receive: bool,
+}
+
+/// The tuning of a topology node.
+#[allow(dead_code)]
+pub fn node_tuning(features: NodeFeatures) -> yadorilink_daemon::engine_tuning::EngineTuning {
+    yadorilink_daemon::engine_tuning::EngineTuning {
+        file_block_source: features.serves_from_files,
+        single_pass: features.single_pass_receive,
+        ..tuning_with_outside_witness()
+    }
+}
+
 /// Opens a `SyncState` the same way production does (`SyncState::open` —
 /// file-backed, WAL, `busy_timeout`) on a fresh per-call temp directory,
 /// instead of `SyncState::open_in_memory`'s shared-cache `:memory:` backend.
@@ -528,6 +599,31 @@ pub fn open_file_backed_replica_coordinator() -> (ReplicaCoordinator, tempfile::
     let dir = tempfile::tempdir().unwrap();
     let state = ReplicaCoordinator::open(dir.path().join("index.db")).unwrap();
     (state, dir)
+}
+
+/// [`open_file_backed_replica_coordinator`] for a test about the block store itself (what it
+/// holds, serves, or loses): the engine commits received blocks to the store and serves only from
+/// it, which is how a device behaves with single-pass receive switched off. Under the default a
+/// received file's blocks are not in the store and the file serves them, so a test that corrupts,
+/// withholds or counts store blocks would be testing another path.
+#[allow(dead_code)]
+pub fn open_store_first_replica_coordinator() -> (ReplicaCoordinator, tempfile::TempDir) {
+    ensure_isolated_config_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let state =
+        ReplicaCoordinator::open_with(dir.path().join("index.db"), store_first_tuning()).unwrap();
+    (state, dir)
+}
+
+/// The tuning behind [`open_store_first_replica_coordinator`].
+#[allow(dead_code)]
+pub fn store_first_tuning() -> yadorilink_daemon::engine_tuning::EngineTuning {
+    yadorilink_daemon::engine_tuning::EngineTuning {
+        single_pass: false,
+        file_block_source: false,
+        witness: yadorilink_daemon::install_witness::WitnessPlacement::BesideDatabase,
+        ..Default::default()
+    }
 }
 
 /// Pairs two in-process daemons directly over loopback, standing in for the
@@ -632,9 +728,10 @@ pub async fn connect_two_daemons_with_link(
 
 /// `connect_two_daemons_with_link` without the harness's own native
 /// dial: the production session keeper is the only dialer, as in a real
-/// daemon. An explicit dial racing the keeper's makes both sides attach
-/// crossed connections, each replacing the other, and the keeper then
-/// sleeps its full 5 s before redialling.
+/// daemon, so the pairing may return before native replication is attached.
+/// (The default pairing waits for the keeper's dial instead of racing it: a second dial
+/// beside the keeper's makes both sides attach crossed connections, each replacing the
+/// other.)
 #[allow(dead_code)]
 pub async fn connect_two_daemons_with_link_keeper_dials(
     state_a: &Arc<DaemonState>,
@@ -654,10 +751,14 @@ pub async fn connect_two_daemons_with_link_keeper_dials(
     .await
 }
 
+/// How long a pairing waits for a session keeper's own native dial before dialling itself.
+const KEEPER_NATIVE_DIAL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Who starts native replication for a pairing.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NativeDial {
-    /// The harness dials once the pairing is up.
+    /// The pairing returns with native replication attached: the harness dials for a side no
+    /// keeper dials for, and waits for the keeper's own dial on the others.
     Explicit,
     /// Left to the production keeper.
     KeeperOnly,
@@ -788,17 +889,37 @@ async fn connect_two_daemons_with_shared_fake(
     // starts it: the dialing side (the smaller endpoint id) opens it, the
     // other accepts. Peers' keys are pinned by now.
     //
-    // `KeeperOnly` dials for a side only when no keeper session stood there:
-    // a keeper that registered first has a `keep_dialed` of its own running,
-    // and a second dial from here would race it into crossed, mutually
-    // replacing connections. Where this side's registration came first, the
-    // keeper's `open_session` finds it and starts no native keeper, so this
-    // dial is the only one.
-    if native_dial == NativeDial::Explicit || !keeper_owns_a {
-        state_a.dial_native_replication_for_test(device_b_id).await;
+    // A side whose registration the production keeper made first has a
+    // `keep_dialed` of its own running, and a second dial from here would race
+    // it into crossed, mutually replacing connections. So a side the harness
+    // registered first (no keeper dial there) is dialled from here, and a side
+    // the keeper owns is given time to attach by itself; `Explicit` still
+    // guarantees the connection stands when this returns, by dialling if the
+    // keeper has not got there.
+    for (state, device, keeper_owns) in
+        [(state_a, device_b_id, keeper_owns_a), (state_b, device_a_id, keeper_owns_b)]
+    {
+        if !keeper_owns {
+            state.dial_native_replication_for_test(device).await;
+        }
     }
-    if native_dial == NativeDial::Explicit || !keeper_owns_b {
-        state_b.dial_native_replication_for_test(device_a_id).await;
+    if native_dial == NativeDial::Explicit {
+        for (state, device, keeper_owns) in
+            [(state_a, device_b_id, keeper_owns_a), (state_b, device_a_id, keeper_owns_b)]
+        {
+            if !keeper_owns {
+                continue;
+            }
+            let deadline = tokio::time::Instant::now() + KEEPER_NATIVE_DIAL_GRACE;
+            while !state.native_replication_attached_for_test(device)
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            if !state.native_replication_attached_for_test(device) {
+                state.dial_native_replication_for_test(device).await;
+            }
+        }
     }
 
     ([handle_a, handle_b], link)
@@ -1605,6 +1726,8 @@ fn spawn_paired_session(
             handoff_lease_responder: state.clone(),
             handoff_ticket_responder: state.clone(),
             custody_rehome_responder: state.clone(),
+            // As production wires it, when the engine serves from the user's files.
+            block_file_source: yadorilink_daemon::test_support::file_block_source_for(state),
             ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
         },
     );

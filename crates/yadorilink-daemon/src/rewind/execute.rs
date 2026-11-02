@@ -169,7 +169,7 @@ async fn commit_one_chunk(
     }
 
     let refused = Ok(ChunkResult::Stopped(RewindFailureKind::CommitRefused));
-    let Ok(root_lease) = state.root_lease_for(group_id) else { return refused };
+    let Some(root_lease) = state.authoring_root_lease_for(group_id) else { return refused };
     let root_op = match root_lease.begin_operation() {
         Ok(op) => op,
         // Paused for a safe stop: the run can be continued once the pause lifts.

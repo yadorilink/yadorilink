@@ -55,8 +55,12 @@ impl Default for ReconcileWake {
     }
 }
 
+/// What to do when a peer stops answering; see [`NativeReplicationHub::on_unresponsive`].
+pub(crate) type UnresponsiveHook = Arc<dyn Fn(&str) + Send + Sync>;
+
 pub(crate) struct Live {
     id: u64,
+    attached_at: tokio::time::Instant,
     env: ReplicationEnv,
     connection: NativeReplicationConnection,
     task: tokio::task::JoinHandle<()>,
@@ -86,13 +90,29 @@ pub struct NativeReplicationHub {
     machines: Mutex<std::collections::HashSet<String>>,
     /// Wakes every connection's reconcile loop; see [`Self::wake_reconcile`].
     reconcile_wake: ReconcileWake,
+    /// Told when a peer stops answering; see [`Self::on_unresponsive`].
+    unresponsive: Mutex<Option<UnresponsiveHook>>,
+    /// Bumped each time an attached connection ends on its own (the transport closed it);
+    /// see [`Self::subscribe_detach`].
+    detach_wake: ReconcileWake,
     /// Counts ingest activity; see [`Self::wake_when_ingest_goes_quiet`].
     ingest_seq: std::sync::atomic::AtomicU64,
     /// Counts ingest activity for the contest-fork pass; see [`Self::fork_when_ingest_goes_quiet`].
     fork_seq: std::sync::atomic::AtomicU64,
+    /// The daemon state the last contest-fork pass was scheduled for, so that a local commit can
+    /// schedule another pass without holding the state's `Arc`.
+    fork_state: Mutex<Option<Weak<DaemonState>>>,
+    /// Consecutive fork passes per group that found a contested version not yet in the store.
+    contest_waits: Mutex<std::collections::HashMap<String, u32>>,
+    /// Groups with a retry of their fork pass already waiting to run.
+    contest_retries: Mutex<std::collections::HashSet<String>>,
     /// Test-only: stops the rebootstrap machine at chosen points.
     #[cfg(any(test, feature = "test-support"))]
     rebootstrap_hook: Mutex<Option<crate::native_rebootstrap::Hook>>,
+    /// Test-only: replaces the time a rebootstrap may spend fetching missing blocks of the versions it
+    /// sets aside, so a test of "no peer has them" does not wait the production cap out.
+    #[cfg(any(test, feature = "test-support"))]
+    recovery_fetch_cap: Mutex<Option<std::time::Duration>>,
 }
 
 impl NativeReplicationHub {
@@ -108,6 +128,43 @@ impl NativeReplicationHub {
     /// Cheap and idempotent; rounds stay serial per connection.
     pub fn wake_reconcile(&self) {
         self.reconcile_wake.0.send_modify(|generation| *generation += 1);
+    }
+
+    /// Closes the connection attached for `device` if it has been attached for longer than
+    /// `age`. For a peer that has just opened a new connection to this device: whatever this side
+    /// connected to it earlier predates that, and is the connection most likely to be hanging on
+    /// paths the peer no longer has. A younger one was made in response to the same reconnection
+    /// and stays. Returns whether one was closed.
+    pub(crate) fn recycle_if_older_than(&self, device: &str, age: Duration) -> bool {
+        let live = self.live.lock().unwrap_or_else(|p| p.into_inner());
+        match live.get(device) {
+            Some(entry) if entry.attached_at.elapsed() > age => {
+                entry.connection.close(0, b"peer reconnected");
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Registers what to do when a peer stops answering on its native connection (close what
+    /// else is open to it). Replaces any earlier one.
+    pub(crate) fn on_unresponsive(&self, hook: UnresponsiveHook) {
+        *self.unresponsive.lock().unwrap_or_else(|p| p.into_inner()) = Some(hook);
+    }
+
+    fn note_unresponsive(&self, device: &str) {
+        let hook = self.unresponsive.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(hook) = hook {
+            hook(device);
+        }
+    }
+
+    /// A receiver that sees every later end of an attached connection. A keeper that is
+    /// asleep because its connection is up waits on this instead of looking again on a
+    /// timer: a connection the network killed was noticed up to one poll interval late.
+    /// Subscribe before checking the attachment, so an end in between is not missed.
+    pub(crate) fn subscribe_detach(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.detach_wake.0.subscribe()
     }
 
     /// When each group was last sealed for a peer, shared by every
@@ -165,6 +222,64 @@ impl NativeReplicationHub {
         });
     }
 
+    /// The wait before the next fork pass of `group_id`, which found a contested version not yet
+    /// in the store: 2 s, doubling each consecutive time up to a minute. There is no limit on the
+    /// number of passes.
+    pub(crate) fn next_contest_backoff(&self, group_id: &str) -> Duration {
+        let mut waits = self.contest_waits.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = waits.entry(group_id.to_owned()).or_insert(0);
+        let delay = Duration::from_secs(2u64 << (*count).min(5)).min(Duration::from_secs(60));
+        *count = count.saturating_add(1);
+        delay
+    }
+
+    /// Every contested version of `group_id` is in the store: the next wait starts over.
+    pub(crate) fn contest_settled(&self, group_id: &str) {
+        self.contest_waits.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(group_id);
+    }
+
+    /// Remembers the daemon state the fork passes run for. True the first time, so that a restart
+    /// asks once for a pass over the contested paths it persisted.
+    pub(crate) fn set_fork_state(&self, state: Weak<DaemonState>) -> bool {
+        let mut slot = self.fork_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let first = slot.is_none();
+        *slot = Some(state);
+        first
+    }
+
+    /// Runs another fork pass of `group_id` after a wait that doubles with each consecutive
+    /// retry. At most one retry per group waits at a time, and no ingest or commit moves it: its
+    /// own timer is separate from the ingest debounce, so a busy group cannot postpone it.
+    pub(crate) fn schedule_contest_retry(self: &Arc<Self>, group_id: &str) {
+        let state = self.fork_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        let Some(state) = state else { return };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else { return };
+        if !self
+            .contest_retries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(group_id.to_owned())
+        {
+            return;
+        }
+        let delay = self.next_contest_backoff(group_id);
+        let (hub, group) = (Arc::downgrade(self), group_id.to_owned());
+        runtime.spawn(async move {
+            tokio::time::sleep(delay).await;
+            if let Some(hub) = hub.upgrade() {
+                hub.contest_retries
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&group);
+            }
+            if let Some(state) = state.upgrade() {
+                if state.fork_contested_group(&group).await > 0 {
+                    state.on_local_native_commit(&group).await;
+                }
+            }
+        });
+    }
+
     /// Runs the contest-fork pass once, `quiet` after the last call: a burst of ingested
     /// batches costs one pass.
     pub(crate) fn fork_when_ingest_goes_quiet(
@@ -173,6 +288,7 @@ impl NativeReplicationHub {
         state: Weak<DaemonState>,
     ) {
         use std::sync::atomic::Ordering;
+        self.set_fork_state(state.clone());
         let seq = self.fork_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let Ok(runtime) = tokio::runtime::Handle::try_current() else { return };
         let hub = Arc::downgrade(self);
@@ -186,6 +302,27 @@ impl NativeReplicationHub {
                 state.fork_contested_heads_everywhere().await;
             }
         });
+    }
+
+    /// The fetch cap of a rebootstrap's final capture: `production` unless a test shortened it.
+    pub(crate) fn recovery_fetch_cap(
+        &self,
+        production: std::time::Duration,
+    ) -> std::time::Duration {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.recovery_fetch_cap.lock().unwrap_or_else(|p| p.into_inner()).unwrap_or(production)
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            production
+        }
+    }
+
+    /// Test-only: shortens (or with `None` restores) the fetch cap of a rebootstrap.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_recovery_fetch_cap_for_test(&self, cap: Option<std::time::Duration>) {
+        *self.recovery_fetch_cap.lock().unwrap_or_else(|p| p.into_inner()) = cap;
     }
 
     /// Test-only: stops every rebootstrap of this device at the points `hook` refuses.
@@ -293,7 +430,7 @@ impl NativeReplicationHub {
             GroupRound::InSync | GroupRound::Requested { .. } | GroupRound::Divergent => {
                 truncations.clear(device, group);
             }
-            GroupRound::Refused(_) | GroupRound::Failed => {}
+            GroupRound::Refused(_) | GroupRound::Failed | GroupRound::NoAnswer => {}
         }
     }
 
@@ -385,7 +522,10 @@ impl NativeReplicationHub {
                 }
             })
         };
-        let replaced = live.insert(device, Live { id, env, connection, task });
+        let replaced = live.insert(
+            device,
+            Live { id, attached_at: tokio::time::Instant::now(), env, connection, task },
+        );
         drop(live);
         if let Some(old) = replaced {
             old.task.abort();
@@ -400,7 +540,17 @@ impl NativeReplicationHub {
             live.remove(device);
             drop(live);
             self.forget_truncations(device);
+            self.detach_wake.0.send_modify(|generation| *generation += 1);
         }
+    }
+
+    /// The connection attached for `device`.
+    pub(crate) fn attached_connection(&self, device: &str) -> Option<NativeReplicationConnection> {
+        self.live
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(device)
+            .map(|l| l.connection.clone())
     }
 
     /// Ends the connection to `device`, if any.
@@ -526,7 +676,9 @@ fn outcome_of<'a>(rounds: impl IntoIterator<Item = &'a GroupRound>) -> RoundOutc
         any = true;
         match round {
             GroupRound::Requested { .. } => behind = true,
-            GroupRound::Refused(_) | GroupRound::Failed => unproductive = true,
+            GroupRound::Refused(_) | GroupRound::Failed | GroupRound::NoAnswer => {
+                unproductive = true
+            }
             GroupRound::InSync | GroupRound::Divergent => {}
         }
     }
@@ -595,6 +747,17 @@ fn note_provider_install(
     }
 }
 
+/// A native connection younger than this is not replaced when the peer opens a new connection
+/// to this device: it was made in response to the same reconnection.
+const PEER_RECONNECT_GRACE: Duration = Duration::from_secs(5);
+
+/// How long a new connection has to answer the first summary request of each group. Shorter than
+/// the steady-state request limit: a connection that cannot carry a few hundred bytes in this
+/// time is not carrying anything, however its handshake went (a dial after a network cut was
+/// seen to come back "connected" and then hear nothing for the 30 s a stream step allows). It
+/// bounds each group's own exchange, never the sweep over all of them.
+const PROBATION: Duration = Duration::from_secs(8);
+
 async fn reconcile_forever(
     env: &ReplicationEnv,
     connection: &NativeReplicationConnection,
@@ -602,40 +765,112 @@ async fn reconcile_forever(
     hub: &Weak<NativeReplicationHub>,
     wake: tokio::sync::watch::Receiver<u64>,
 ) {
-    run_paced(wake, || async {
-        let rounds = driver::reconcile(env, connection).await;
-        for (group, round) in &rounds {
-            if let Some(hub) = hub.upgrade() {
-                hub.note_round(device, group, round);
+    // Until a round has had a group to ask about; a connection with nothing shared yet proves
+    // nothing either way.
+    let probation = std::sync::atomic::AtomicBool::new(true);
+    let probation = &probation;
+    run_paced(wake, || {
+        let step = if probation.load(std::sync::atomic::Ordering::Relaxed) {
+            PROBATION
+        } else {
+            driver::REQUEST_STEP
+        };
+        async move {
+            let rounds = driver::reconcile(env, connection, step).await;
+            if !rounds.is_empty() {
+                probation.store(false, std::sync::atomic::Ordering::Relaxed);
             }
-            note_provider_install(&env.db, group, round);
-            match round {
-                GroupRound::InSync => {}
-                GroupRound::Requested { newer } => {
-                    tracing::debug!(peer = device, group = %group.0, newer, "native replication: requested a frontier diff");
+            for (group, round) in &rounds {
+                if let Some(hub) = hub.upgrade() {
+                    hub.note_round(device, group, round);
                 }
-                GroupRound::Divergent => {
-                    // Not an error by itself: it is also what a replica that is AHEAD of a slow peer
-                    // sees (the peer has nothing newer for us and will pull what it lacks). Only a
-                    // difference that persists with the peer connected and current points at a
-                    // retirement or a fork.
-                    tracing::debug!(
-                        peer = device,
-                        group = %group.0,
-                        "native replication: roots differ and the peer has nothing newer for us (we may be ahead of it)"
-                    );
-                }
-                GroupRound::Refused(reason) => {
-                    tracing::debug!(peer = device, group = %group.0, ?reason, "native replication: refused");
-                }
-                GroupRound::Failed => {
-                    tracing::debug!(peer = device, group = %group.0, "native replication: round failed");
+                note_provider_install(&env.db, group, round);
+                match round {
+                    GroupRound::InSync => {}
+                    GroupRound::Requested { newer } => {
+                        tracing::debug!(peer = device, group = %group.0, newer, "native replication: requested a frontier diff");
+                    }
+                    GroupRound::Divergent => {
+                        // Not an error by itself: it is also what a replica that is AHEAD of a slow peer
+                        // sees (the peer has nothing newer for us and will pull what it lacks). Only a
+                        // difference that persists with the peer connected and current points at a
+                        // retirement or a fork.
+                        tracing::debug!(
+                            peer = device,
+                            group = %group.0,
+                            "native replication: roots differ and the peer has nothing newer for us (we may be ahead of it)"
+                        );
+                    }
+                    GroupRound::Refused(reason) => {
+                        tracing::debug!(peer = device, group = %group.0, ?reason, "native replication: refused");
+                    }
+                    GroupRound::Failed => {
+                        // A fault on this side (database, request construction): the
+                        // connection is not to blame and a healthy peer stays connected.
+                        tracing::debug!(peer = device, group = %group.0, "native replication: round failed");
+                    }
+                    GroupRound::NoAnswer => {
+                        tracing::debug!(peer = device, group = %group.0, "native replication: no answer");
+                        // The peer did not answer in time, or the stream failed: a
+                        // connection that is not carrying traffic, whatever QUIC believes.
+                        // One was seen to stay "up" for five minutes after a network cut,
+                        // because a trickle in one direction keeps its idle timer from ever
+                        // running out.
+                        note_no_answer(hub, device, connection);
+                    }
                 }
             }
+            outcome_of(rounds.iter().map(|(_, round)| round))
         }
-        outcome_of(rounds.iter().map(|(_, round)| round))
     })
     .await
+}
+
+/// A round got no answer on `connection`. If the peer closed the connection (it replaced it with
+/// a newer one), or this side replaced it, that is not a peer gone quiet: the newer connection is
+/// healthy, and closing "everything to the peer" would destroy it along with the sync connection
+/// beside it, every time two connections to one peer crossed. The ended connection's keeper dials
+/// again by itself. A connection this side closed that is still the attached one (it was
+/// recycled for the peer's reconnect, say) proves nothing about the peer's other paths, and an
+/// open or network-lost connection is one that is not carrying traffic whatever QUIC believes:
+/// both close the peer's connections so they are dialled again.
+fn note_no_answer(
+    hub: &Weak<NativeReplicationHub>,
+    device: &str,
+    connection: &NativeReplicationConnection,
+) {
+    let superseded = || {
+        hub.upgrade()
+            .and_then(|hub| hub.attached_connection(device))
+            .is_none_or(|current| !current.is_same_connection(connection))
+    };
+    if connection.closed_by_peer() || (connection.closed_locally() && superseded()) {
+        tracing::debug!(
+            peer = device,
+            closed = ?connection.close_reason(),
+            "native replication: no answer on a connection that was closed on purpose; leaving the peer's other connections alone"
+        );
+        return;
+    }
+    unresponsive(hub, device, connection);
+}
+
+/// A peer stopped answering: close its connections (native, and through the hub's hook the sync
+/// connection that shares its paths) so the keepers dial new ones. A peer that was merely slow
+/// costs one redial.
+fn unresponsive(
+    hub: &Weak<NativeReplicationHub>,
+    device: &str,
+    connection: &NativeReplicationConnection,
+) {
+    tracing::warn!(
+        peer = device,
+        "native replication: no answer from the peer; closing its connections so they are dialled again"
+    );
+    connection.close(0, b"unresponsive");
+    if let Some(hub) = hub.upgrade() {
+        hub.note_unresponsive(device);
+    }
 }
 
 /// What a connection to `device` may see and how its deltas are verified,
@@ -643,6 +878,10 @@ async fn reconcile_forever(
 /// once.
 pub fn env_for_peer(state: &Arc<DaemonState>, device: &str) -> ReplicationEnv {
     let weak: Weak<DaemonState> = Arc::downgrade(state);
+    if state.native_replication.set_fork_state(weak.clone()) {
+        // Contested paths persisted by an earlier run are looked at once.
+        state.native_replication.fork_when_ingest_goes_quiet(Duration::from_secs(5), weak.clone());
+    }
     let device = device.to_string();
 
     let groups = {
@@ -760,6 +999,9 @@ pub fn spawn_inbound(
             let Some(device) =
                 state.authority.device_id_for_signing_key(connection.peer().as_bytes())
             else {
+                tracing::debug!(
+                    "native replication: an inbound connection from an unknown device was closed"
+                );
                 connection.close(1, b"unknown device");
                 continue;
             };
@@ -853,25 +1095,92 @@ pub async fn keep_dialed(
     device: String,
 ) {
     let mut delay = Duration::from_secs(1);
+    let mut failures: u32 = 0;
+    let mut arrivals = stack.endpoint().arrivals();
+    let mut inbound = stack.endpoint().subscribe_inbound_links();
     loop {
         let Some(state) = state.upgrade() else { return };
         if !state.peers.has_session(&device) {
             return;
         }
-        if state.native_replication.is_attached_as(
+        // Before the attachment is looked at, so an end in between is not missed.
+        let mut detached = state.native_replication.subscribe_detach();
+        let mut up = state.native_replication.is_attached_as(
             &device,
             &PeerId::from_bytes(state.authority.peer_signing_key(&device).unwrap_or_default()),
-        ) {
+        );
+        if up {
             delay = Duration::from_secs(5);
         } else {
-            match dial_if_dialer(&state, stack.endpoint(), &device).await {
-                DialOutcome::NotTheDialer => return,
-                DialOutcome::Attached => delay = Duration::from_secs(5),
-                DialOutcome::Failed => delay = (delay * 2).min(Duration::from_secs(30)),
+            // A dial made against a network that has since come back is
+            // abandoned and made again at once (see `redial_pacing`).
+            tracing::debug!(peer = %device, ?delay, "native replication: dialling");
+            let bound = crate::redial_pacing::dial_timeout(failures);
+            let dial = crate::redial_pacing::bounded_dial(
+                failures,
+                dial_if_dialer(&state, stack.endpoint(), &device),
+            );
+            match arrivals.run(dial).await {
+                None => {
+                    tracing::debug!(peer = %device, "native replication: dial abandoned, network came back");
+                    drop(state);
+                    delay = Duration::from_secs(1);
+                    failures = 0;
+                    continue;
+                }
+                Some(Some(DialOutcome::NotTheDialer)) => return,
+                Some(Some(DialOutcome::Attached)) => {
+                    delay = Duration::from_secs(5);
+                    failures = 0;
+                    up = true;
+                }
+                Some(Some(DialOutcome::Failed)) => {
+                    delay = (delay * 2).min(Duration::from_secs(30));
+                    failures = failures.saturating_add(1);
+                }
+                Some(None) => {
+                    tracing::debug!(peer = %device, ?bound, "native replication: dial timed out");
+                    delay = (delay * 2).min(Duration::from_secs(30));
+                    failures = failures.saturating_add(1);
+                }
             }
         }
+        let hub = Arc::downgrade(&state.native_replication);
         drop(state);
-        tokio::time::sleep(delay).await;
+        // Up: the wait is for the connection to end (the poll interval stays as a safety
+        // net), not for a timer to find out. Down: the backoff, which the network coming
+        // back cuts short.
+        tokio::select! {
+            wake = arrivals.sleep(delay) => {
+                if wake == crate::redial_pacing::Wake::Nudged {
+                    // The backoff earned by the outage is forgotten.
+                    delay = Duration::from_secs(1);
+                    failures = 0;
+                }
+            }
+            _ = detached.changed(), if up => {
+                // The connection that was up has ended: dial now.
+                delay = Duration::from_secs(1);
+            }
+            heard = inbound.recv() => match heard {
+                // The peer just opened a connection to this device. It is reachable from where
+                // it is now, so a connection made before that (up, and perhaps hanging on
+                // paths it no longer has) is replaced, and a dial that was backing off is
+                // made again at once.
+                Ok(opened) if opened == device => {
+                    if up {
+                        if let Some(hub) = hub.upgrade() {
+                            hub.recycle_if_older_than(&device, PEER_RECONNECT_GRACE);
+                        }
+                    } else {
+                        delay = Duration::from_secs(1);
+                        failures = 0;
+                    }
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            },
+        }
     }
 }
 
@@ -1090,5 +1399,186 @@ mod ingest_quiet_tests {
         tokio::time::sleep(Duration::from_millis(1600)).await;
         assert!(woken.has_changed().unwrap(), "no round was started after ingest went quiet");
         assert_eq!(*woken.borrow_and_update(), 1, "one wake for the whole burst");
+    }
+}
+
+#[cfg(test)]
+mod no_answer_tests {
+    use super::*;
+    use crate::sync_adapter::sync_stack::SyncStack;
+    use crate::test_support::sync_stack_fixture::{device, pin};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use yadorilink_sync_substrate::NetworkConfig;
+
+    const ALICE: &str = "device-alice";
+    const BOB: &str = "device-bob";
+
+    /// A live native connection from alice to bob, and a hub whose unresponsive hook counts
+    /// its calls.
+    async fn connected(
+    ) -> (NativeReplicationConnection, Arc<NativeReplicationHub>, Arc<AtomicUsize>, Arc<DaemonState>)
+    {
+        let (alice, alice_dir) = device(ALICE, 1);
+        let (bob, bob_dir) = device(BOB, 2);
+        pin(&alice, BOB, 2);
+        pin(&bob, ALICE, 1);
+        let alice_stack =
+            Arc::new(SyncStack::spawn(alice.clone(), NetworkConfig::direct_only()).await.unwrap());
+        let bob_stack =
+            Arc::new(SyncStack::spawn(bob.clone(), NetworkConfig::direct_only()).await.unwrap());
+        let address = bob_stack.local_address();
+        alice_stack.address_directory().record(
+            address.peer(),
+            address.direct_addrs().copied().collect(),
+            address.relay_urls().map(ToString::to_string).collect(),
+        );
+        let connection = alice_stack
+            .endpoint()
+            .connect_native_replication(address.peer())
+            .await
+            .expect("a native connection to bob");
+        // The stacks and directories outlive the test body through the connection's tasks.
+        std::mem::forget((alice_dir, bob_dir, alice_stack, bob_stack, bob));
+        let hub = Arc::new(NativeReplicationHub::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        hub.on_unresponsive(Arc::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }));
+        (connection, hub, calls, alice)
+    }
+
+    /// Two connections to one peer cross (the peer replaced this one with a newer one): the
+    /// round that finds this one closed must not take the newer one, and the sync connection
+    /// beside it, down with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_answer_on_a_connection_closed_on_purpose_leaves_the_peers_other_connections() {
+        let (connection, hub, calls, _alice) = connected().await;
+        connection.close(0, b"replaced");
+
+        note_no_answer(&Arc::downgrade(&hub), BOB, &connection);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "the peer's other connections were recycled");
+    }
+
+    /// A connection that is still open yet got no answer is a transport that is not carrying
+    /// traffic: the peer's connections are closed so they are dialled again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_answer_on_an_open_connection_recycles_the_peers_connections() {
+        let (connection, hub, calls, _alice) = connected().await;
+
+        note_no_answer(&Arc::downgrade(&hub), BOB, &connection);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(connection.closed_locally(), "the unresponsive connection is closed");
+    }
+
+    /// A connection this side closed that is still the one attached (recycled for the peer's
+    /// reconnect, say) says nothing about the peer's other paths: they are recycled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_answer_on_a_locally_closed_connection_that_is_still_attached_recycles() {
+        let (connection, hub, calls, alice) = connected().await;
+        let env = env_for_peer(&alice, BOB);
+        assert!(hub.attach_serving(BOB.into(), env, connection.clone(), || true, async {
+            std::future::pending::<()>().await
+        }));
+        connection.close(0, b"peer reconnected");
+
+        note_no_answer(&Arc::downgrade(&hub), BOB, &connection);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The production path only: both daemons run their session keepers (no harness dial, no
+    /// harness session). Two native connections cross, the first is closed by its replacement,
+    /// and the round still running on it gets no answer. The peer is not recycled for it: the
+    /// newer connection stands untouched, and both devices stay attached with their sessions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn crossed_connections_with_a_no_answer_on_the_closed_one_leave_the_pair_attached() {
+        use crate::sync_adapter::driver::PeerSessionDriver;
+        use crate::test_support::sync_stack_fixture::GROUP;
+
+        async fn within(budget: Duration, mut check: impl FnMut() -> bool) -> bool {
+            let deadline = tokio::time::Instant::now() + budget;
+            while tokio::time::Instant::now() < deadline {
+                if check() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            check()
+        }
+
+        // Alice must be the native dialer: the smaller endpoint id.
+        let mut keys: Vec<(u8, [u8; 32])> = (1u8..=12)
+            .map(|b| {
+                (b, ed25519_dalek::SigningKey::from_bytes(&[b; 32]).verifying_key().to_bytes())
+            })
+            .collect();
+        keys.sort_by_key(|(_, public)| *public);
+        let (alice_key, bob_key) = (keys[0].0, keys[1].0);
+        let (alice, _alice_dir) = device(ALICE, alice_key);
+        let (bob, _bob_dir) = device(BOB, bob_key);
+        pin(&alice, BOB, bob_key);
+        pin(&bob, ALICE, alice_key);
+        let alice_stack =
+            Arc::new(SyncStack::spawn(alice.clone(), NetworkConfig::direct_only()).await.unwrap());
+        let bob_stack =
+            Arc::new(SyncStack::spawn(bob.clone(), NetworkConfig::direct_only()).await.unwrap());
+        for (from, to) in [(&alice_stack, &bob_stack), (&bob_stack, &alice_stack)] {
+            let address = to.local_address();
+            from.address_directory().record(
+                address.peer(),
+                address.direct_addrs().copied().collect(),
+                address.relay_urls().map(ToString::to_string).collect(),
+            );
+        }
+        bob.install_peer_session_driver(PeerSessionDriver::start(bob.clone(), bob_stack));
+        alice.install_peer_session_driver(PeerSessionDriver::start(
+            alice.clone(),
+            alice_stack.clone(),
+        ));
+        let step = Duration::from_secs(20);
+        assert!(
+            within(step, || alice.native_replication.is_attached(BOB)
+                && bob.native_replication.is_attached(ALICE)
+                && alice.peers.has_session(BOB)
+                && bob.peers.has_session(ALICE))
+            .await,
+            "precondition: the keepers attach native replication beside the sessions"
+        );
+
+        // A second connection crosses the first: attaching it closes the first, "replaced".
+        let first = alice.native_replication.attached_connection(BOB).unwrap();
+        let second = alice_stack
+            .endpoint()
+            .connect_native_replication(first.peer())
+            .await
+            .expect("a second native connection");
+        assert!(matches!(attach_dialed(&alice, BOB, second), DialOutcome::Attached));
+        let newer = alice.native_replication.attached_connection(BOB).unwrap();
+        assert!(first.closed_locally(), "the first connection was closed by its replacement");
+
+        // The round that was still running on the first connection finds it closed.
+        let env = env_for_peer(&alice, BOB);
+        let round = driver::reconcile_group(&env, &first, &FolderGroupId(GROUP.into())).await;
+        assert!(matches!(round, GroupRound::NoAnswer), "{round:?}");
+        note_no_answer(&Arc::downgrade(&alice.native_replication), BOB, &first);
+
+        // The newer connection was not taken down with it.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !newer.closed_locally(),
+            "the newer connection was closed for the older one's failure"
+        );
+        // Either way the pair is attached with its sessions within seconds.
+        assert!(
+            within(Duration::from_secs(10), || alice.native_replication.is_attached(BOB)
+                && bob.native_replication.is_attached(ALICE)
+                && alice.peers.has_session(BOB)
+                && bob.peers.has_session(ALICE))
+            .await,
+            "the pair did not return to attached native replication with sessions"
+        );
     }
 }

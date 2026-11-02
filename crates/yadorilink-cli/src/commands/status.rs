@@ -8,6 +8,7 @@ use crate::commands::device_names::DeviceNames;
 use crate::error::CliError;
 
 mod reasons;
+mod summary;
 mod switches;
 
 /// The ` held=N` suffix appended to a link's summary line — empty
@@ -98,7 +99,7 @@ fn folder_label(link: &LinkStatus) -> String {
     if link.provider_display_name.is_empty() {
         link.local_path.clone()
     } else {
-        format!("provider folder '{}'", link.provider_display_name)
+        format!("{} (File Provider)", link.provider_display_name)
     }
 }
 
@@ -182,13 +183,13 @@ fn complete_copies_detail_lines(
 /// is unaffected by this feature existing.
 fn degraded_suffix(link: &LinkStatus) -> String {
     if link.degraded {
-        format!("  degraded ({})", link.degraded_reason)
+        format!("  stopped ({})", link.degraded_reason)
     } else {
         String::new()
     }
 }
 
-/// The `NOT SYNCING (this folder group is linked at N folders)` suffix — same
+/// The `NOT SYNCING (this shared folder is linked at N folders)` suffix — same
 /// "empty unless applicable" discipline as `degraded_suffix`.
 ///
 /// This state is not a degradation, it is a full stop: the group syncs nothing
@@ -204,7 +205,7 @@ fn ambiguous_suffix(link: &LinkStatus) -> String {
         return String::new();
     }
     format!(
-        "  NOT SYNCING (this folder group is linked at {} folders: {}; \
+        "  NOT SYNCING (this shared folder is linked at {} folders: {}; \
          unlink all but one to resume)",
         link.ambiguous_local_paths.len(),
         link.ambiguous_local_paths.join(", ")
@@ -225,12 +226,12 @@ fn durability_suffix(link: &LinkStatus) -> String {
     match link.durability_status() {
         GroupDurabilityStatus::Protected | GroupDurabilityStatus::Protecting => String::new(),
         GroupDurabilityStatus::Unknown if link.durability_check_pending => {
-            "  durability checking".to_string()
+            "  getting ready (checking protection)".to_string()
         }
         GroupDurabilityStatus::Unknown | GroupDurabilityStatus::Unspecified => {
-            "  durability unknown".to_string()
+            "  protection unknown".to_string()
         }
-        GroupDurabilityStatus::AtRisk => "  durability: at risk".to_string(),
+        GroupDurabilityStatus::AtRisk => "  protection: at risk".to_string(),
     }
 }
 
@@ -281,9 +282,9 @@ fn local_storage_suffix(link: &LinkStatus) -> String {
 fn fetch_availability_suffix(link: &LinkStatus) -> String {
     match link.fetch_availability() {
         FetchAvailability::AvailableNow => String::new(),
-        FetchAvailability::UnavailableNow => "  fetch not confirmed".to_string(),
+        FetchAvailability::UnavailableNow => "  waiting for a device".to_string(),
         FetchAvailability::Unknown | FetchAvailability::Unspecified => {
-            "  fetch availability unknown".to_string()
+            "  can't tell right now".to_string()
         }
     }
 }
@@ -412,14 +413,16 @@ fn reason_subject(
         | "volume_unconfirmed"
         | "held"
         | "stranded_directory"
-        | "unreadable_files" => group_label(status, arg),
+        | "unreadable_files"
+        | "index_damaged"
+        | "rebuild_needed" => group_label(status, arg),
         // The removals list that could not be read (see the daemon's `overall_status`).
-        "provider_not_ready" if arg == "removals" => "provider folder removals".to_owned(),
+        "provider_not_ready" if arg == "removals" => "File Provider folder removals".to_owned(),
         "provider_not_ready" | "provider_stuck" | "kept_edits" => status
             .provider_roots
             .iter()
             .find(|r| r.root_id == arg)
-            .map(|r| format!("provider folder '{}'", r.display_name))
+            .map(|r| format!("{} (File Provider)", r.display_name))
             .unwrap_or_default(),
         "peer_disconnected" | "peer_update_required" => device_label(names, arg, verbose),
         "provider_orphan_domain" => {
@@ -442,7 +445,7 @@ fn provider_root_lines(status: &StatusResponse, verbose: bool) -> Vec<String> {
     let mut lines = Vec::new();
     for root in &status.provider_roots {
         lines.push(format!(
-            "provider folder {}{}: {}",
+            "{} (File Provider){}: {}",
             root.display_name,
             id(&root.root_id),
             root.readiness
@@ -489,19 +492,19 @@ fn provider_root_lines(status: &StatusResponse, verbose: bool) -> Vec<String> {
     for removal in &status.provider_removals {
         if removal.unreadable {
             // Stands in for the whole list: nothing is known about removals.
-            lines.push(format!("provider folder removals: {}", removal.display_name));
+            lines.push(format!("File Provider folder removals: {}", removal.display_name));
             continue;
         }
         lines.push(if removal.removed {
             if removal.preserved_location.is_empty() {
                 format!(
-                    "provider folder {}{}: removed; the downloaded files were kept by the operating system",
+                    "{} (File Provider){}: removed; the downloaded files were kept by the operating system",
                     removal.display_name,
                     id(&removal.root_id)
                 )
             } else {
                 format!(
-                    "provider folder {}{}: removed; the downloaded files are kept at {}",
+                    "{} (File Provider){}: removed; the downloaded files are kept at {}",
                     removal.display_name,
                     id(&removal.root_id),
                     removal.preserved_location
@@ -509,7 +512,7 @@ fn provider_root_lines(status: &StatusResponse, verbose: bool) -> Vec<String> {
             }
         } else {
             format!(
-                "provider folder {}{}: removing (waiting for the app to remove the domain)",
+                "{} (File Provider){}: removing (waiting for the app to remove the domain)",
                 removal.display_name,
                 id(&removal.root_id)
             )
@@ -521,6 +524,23 @@ fn provider_root_lines(status: &StatusResponse, verbose: bool) -> Vec<String> {
         ));
     }
     lines
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// `, last seen 3d ago` for a device that is away; nothing when this device never connected to it.
+/// An absence of any length is only information, never a problem.
+fn last_seen_suffix(last_connected_unix: i64, now: i64) -> String {
+    if last_connected_unix <= 0 {
+        return String::new();
+    }
+    let ms = now.saturating_sub(last_connected_unix).max(0) as u64 * 1000;
+    format!(", last seen {} ago", age_text(ms))
 }
 
 /// An age in milliseconds as a short human text.
@@ -598,10 +618,14 @@ fn peer_connectivity_label(peer: &PeerStatus) -> String {
             "connected (via relay)".to_string()
         }
         PeerReachability::Connected => "connected".to_string(),
-        PeerReachability::Connecting => "connecting".to_string(),
-        PeerReachability::Unreachable => {
-            format!("cannot connect ({})", unreachable_category_label(peer.unreachable_category()))
+        PeerReachability::Connecting => {
+            format!("connecting{}", last_seen_suffix(peer.last_connected_unix, now_unix()))
         }
+        PeerReachability::Unreachable => format!(
+            "cannot connect ({}){}",
+            unreachable_category_label(peer.unreachable_category()),
+            last_seen_suffix(peer.last_connected_unix, now_unix())
+        ),
         PeerReachability::Unspecified => "unknown".to_string(),
     }
 }
@@ -869,8 +893,17 @@ async fn render_status_once(verbose: bool) -> Result<(), CliError> {
         Err(e) => return Err(e.into()),
     };
     // Names are looked up only when the output names a device, and never fail the command.
-    let names =
-        if names_a_device(&status) { DeviceNames::load().await } else { DeviceNames::default() };
+    // The plain peer list tolerates a name a few minutes old; a copy holder is something a person
+    // decides on (what to remove, where the data is), so those are always asked fresh.
+    let names = if names_a_device(&status) {
+        if names_a_copy_holder(&status) {
+            DeviceNames::load().await
+        } else {
+            DeviceNames::load_cached(&device_ids_named(&status)).await
+        }
+    } else {
+        DeviceNames::default()
+    };
     for line in status_lines(&status, &names, verbose) {
         println!("{line}");
     }
@@ -886,6 +919,23 @@ async fn render_status_once(verbose: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Whether the output names a device as a holder of a folder's copy or protection.
+fn names_a_copy_holder(status: &StatusResponse) -> bool {
+    status
+        .links
+        .iter()
+        .any(|l| !l.full_replica_device_ids.is_empty() || !l.protection_device_ids.is_empty())
+}
+
+/// The devices the peer list names by id.
+fn device_ids_named(status: &StatusResponse) -> Vec<&str> {
+    let mut ids: Vec<&str> =
+        status.peers.iter().map(|p| p.device_id.as_str()).filter(|id| !id.is_empty()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 /// Whether the output has a device to name: a peer, a configured full copy or a reason about a device.
 fn names_a_device(status: &StatusResponse) -> bool {
     !status.peers.is_empty()
@@ -898,8 +948,23 @@ fn names_a_device(status: &StatusResponse) -> bool {
         })
 }
 
-/// Every line one `yadorilink status` rendering prints, in order.
+/// Every line one `yadorilink status` rendering prints, in order: the short view, or with
+/// `--details` everything the status holds.
 fn status_lines(status: &StatusResponse, names: &DeviceNames, verbose: bool) -> Vec<String> {
+    if verbose {
+        detailed_status_lines(status, names, verbose)
+    } else {
+        summary::lines(status, names)
+    }
+}
+
+/// The full rendering: the overall answer, every folder with its fields, the devices, the
+/// transfers, the limits and the volumes. `verbose` also names raw ids.
+fn detailed_status_lines(
+    status: &StatusResponse,
+    names: &DeviceNames,
+    verbose: bool,
+) -> Vec<String> {
     let mut lines = Vec::new();
     let overall = overall_state_lines(status, names, verbose);
     if !overall.is_empty() {
@@ -959,6 +1024,22 @@ fn status_lines(status: &StatusResponse, names: &DeviceNames, verbose: bool) -> 
         ));
         if !link.conflict_note.is_empty() {
             lines.push(format!("  {}", link.conflict_note));
+        }
+        if !link.root_access_warning.is_empty() {
+            lines.push(format!("  WARNING: {}", link.root_access_warning));
+        }
+        if link.history_skipped_last_day > 0 {
+            lines.push(
+                "  WARNING: older versions are not being kept because the disk is nearly full"
+                    .to_string(),
+            );
+        }
+        if link.history_skipped_last_30_days > 0 {
+            lines.push(format!(
+                "  {} version{} not kept for space in the last 30 days",
+                link.history_skipped_last_30_days,
+                if link.history_skipped_last_30_days == 1 { " was" } else { "s were" },
+            ));
         }
         lines.extend(held_file_detail_lines(link, verbose));
         lines.extend(unreadable_file_detail_lines(link));

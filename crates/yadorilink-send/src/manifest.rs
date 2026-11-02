@@ -101,6 +101,81 @@ fn collect_files(source_path: &Path) -> Result<Vec<(String, PathBuf)>> {
     Ok(out)
 }
 
+/// The sources of one offer, in their stored form: a lone source is its plain path (exactly what
+/// older stores hold); several are a JSON array, which no absolute path can look like.
+pub fn encode_sources(sources: &[PathBuf]) -> String {
+    match sources {
+        [only] => only.to_string_lossy().into_owned(),
+        many => serde_json::to_string(
+            &many.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+        )
+        .expect("a list of strings always serializes"),
+    }
+}
+
+/// Inverse of [`encode_sources`].
+pub fn decode_sources(stored: &str) -> Vec<PathBuf> {
+    if stored.starts_with('[') {
+        if let Ok(list) = serde_json::from_str::<Vec<String>>(stored) {
+            return list.into_iter().map(PathBuf::from).collect();
+        }
+    }
+    vec![PathBuf::from(stored)]
+}
+
+/// `name`, or `stem (n).ext` for the first `n >= 2` that no earlier top-level name took
+/// (compared case-insensitively, since the receiver's filesystem may fold case).
+fn unique_top_name(name: &str, taken: &mut std::collections::HashSet<String>) -> String {
+    let mut candidate = name.to_string();
+    let mut n = 2;
+    while !taken.insert(candidate.to_lowercase()) {
+        candidate = match name.rsplit_once('.') {
+            Some((stem, ext)) if !stem.is_empty() => format!("{stem} ({n}).{ext}"),
+            _ => format!("{name} ({n})"),
+        };
+        n += 1;
+    }
+    candidate
+}
+
+/// Walks every source. One source is named as [`collect_files`] names it. With several, each
+/// source is a top-level item of the offer: a file is its own basename and a folder's files sit
+/// under the folder's basename; two sources with the same basename get distinct names.
+fn collect_sources(sources: &[PathBuf]) -> Result<Vec<(String, PathBuf)>> {
+    if let [only] = sources {
+        return collect_files(only);
+    }
+    let mut taken = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for source in sources {
+        let top = source
+            .file_name()
+            .ok_or_else(|| SendError::Protocol(format!("{}: has no file name", source.display())))?
+            .to_string_lossy()
+            .into_owned();
+        let top = unique_top_name(&top, &mut taken);
+        let is_dir = std::fs::symlink_metadata(source)?.is_dir();
+        for (relative, absolute) in collect_files(source)? {
+            out.push((if is_dir { format!("{top}/{relative}") } else { top.clone() }, absolute));
+        }
+    }
+    Ok(out)
+}
+
+/// The files an offer of `source_path` would carry, as (relative path, size), without chunking
+/// or storing anything: what a recipient is shown before agreeing to receive.
+pub fn list_offered_files(source_path: &Path) -> Result<Vec<(String, u64)>> {
+    list_offered_files_multi(&[source_path.to_path_buf()])
+}
+
+/// [`list_offered_files`] for an offer of several sources.
+pub fn list_offered_files_multi(sources: &[PathBuf]) -> Result<Vec<(String, u64)>> {
+    collect_sources(sources)?
+        .into_iter()
+        .map(|(relative, absolute)| Ok((relative, std::fs::metadata(&absolute)?.len())))
+        .collect()
+}
+
 /// Chunks every file under `source_path` into `store`, returning a
 /// manifest describing the offer -- `total_size` mirrors
 /// `manifest.total_size` for a caller that just needs the number without
@@ -110,9 +185,18 @@ pub fn build_outbound_manifest(
     source_path: &Path,
     transfer_id: &str,
 ) -> Result<(SendManifest, u64)> {
-    let files = collect_files(source_path)?;
+    build_outbound_manifest_multi(store, &[source_path.to_path_buf()], transfer_id)
+}
+
+/// [`build_outbound_manifest`] for an offer of several sources (see [`collect_sources`]).
+pub fn build_outbound_manifest_multi(
+    store: &dyn BlockContentStore,
+    sources: &[PathBuf],
+    transfer_id: &str,
+) -> Result<(SendManifest, u64)> {
+    let files = collect_sources(sources)?;
     if files.is_empty() {
-        return Err(SendError::EmptyManifest(source_path.display().to_string()));
+        return Err(SendError::EmptyManifest(encode_sources(sources)));
     }
     let mut entries = Vec::with_capacity(files.len());
     let mut total_size: u64 = 0;
@@ -134,9 +218,24 @@ pub fn build_outbound_manifest(
             files: entries,
             total_size,
             offered_at_unix_nanos,
+            link_id: String::new(),
         },
         total_size,
     ))
+}
+
+/// The offered name as `a/b/c`, refusing anything that is not a plain relative path: empty,
+/// absolute, a drive or UNC prefix, a backslash, or any `.` / `..` / empty component.
+fn validated_relative_path(name: &str) -> std::result::Result<&str, String> {
+    let bad = name.is_empty()
+        || name.contains('\\')
+        || name.contains('\0')
+        || name.split('/').any(|part| part.is_empty() || part == "." || part == "..")
+        || name.split('/').next().is_some_and(|first| first.contains(':'));
+    if bad {
+        return Err(format!("{name:?}: not a plain relative path"));
+    }
+    Ok(name)
 }
 
 /// Length of a chunk hash (SHA-256).
@@ -151,8 +250,17 @@ const CHUNK_HASH_LEN: usize = 32;
 pub fn validate_offered_manifest(manifest: &SendManifest) -> std::result::Result<(), String> {
     let max_chunk = yadorilink_replica_domain::limits::MAX_BLOCK_SIZE_BYTES;
     let mut total: u64 = 0;
+    let mut seen = std::collections::HashSet::new();
+    let mut dirs = std::collections::HashSet::new();
     for entry in &manifest.files {
         let name = &entry.relative_path;
+        let normal = validated_relative_path(name)?;
+        if !seen.insert(normal.to_lowercase()) {
+            return Err(format!("{name}: offered more than once"));
+        }
+        for (i, _) in normal.match_indices('/') {
+            dirs.insert(normal[..i].to_lowercase());
+        }
         if entry.chunk_size == 0 || entry.chunk_size > max_chunk {
             return Err(format!(
                 "{name}: chunk size {} is outside 1..={max_chunk}",
@@ -174,6 +282,9 @@ pub fn validate_offered_manifest(manifest: &SendManifest) -> std::result::Result
         total = total
             .checked_add(entry.size)
             .ok_or_else(|| "the file sizes overflow the total".to_string())?;
+    }
+    if let Some(clash) = seen.iter().find(|name| dirs.contains(*name)) {
+        return Err(format!("{clash}: offered as both a file and a folder"));
     }
     if total != manifest.total_size {
         return Err(format!(

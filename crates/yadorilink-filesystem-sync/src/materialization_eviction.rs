@@ -15,12 +15,13 @@ use yadorilink_local_storage::verify_write_target_within_root;
 use yadorilink_local_storage::BlockReclamationStore;
 use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::session_state::MaterializationState;
-use yadorilink_replica_engine::custody::FullReplicaCustody;
+use yadorilink_replica_engine::custody::{FullReplicaCustody, StoreResidency};
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 
 use crate::block_liveness::BlockLivenessGate;
 use crate::materialization_execution::{
-    AbandonedEviction, MaterializationExecutionError, MaterializationExecutionPort,
+    AbandonedEviction, EvictionRevalidationSnapshot, MaterializationExecutionError,
+    MaterializationExecutionPort,
 };
 
 /// Reuses `yadorilink-root-authority`'s `disk_race_fingerprint` rather than a
@@ -605,6 +606,50 @@ impl<'a> ApprovedObject<'a> {
     }
 }
 
+/// Why a call that succeeded still freed nothing: the file is exactly as it was. The codes are stable machine words
+/// (the IPC response carries them) so a front end can say "not now, because ...". Only [`NotFreed::PathChanging`] and
+/// [`NotFreed::NotPresent`] are moments that pass by themselves; asking again later is right for those two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotFreed {
+    /// The version being freed is no longer this path's current version (a newer one arrived or the file was removed).
+    NoLongerCurrent,
+    /// The file is not fully here yet (still arriving, or already a placeholder).
+    NotPresent,
+    /// A change to the path is being worked through (a save, a download that just finished): not yet settled.
+    PathChanging,
+    /// The file on disk is a different file than the one this call looked at (replaced, changed or removed while the call
+    /// worked, or right before the commit).
+    FileReplaced,
+    /// The bytes on disk are not the synced bytes (edited locally and not yet captured).
+    DiffersFromSynced,
+    /// The volume cannot be shown to keep deletions durable, so nothing is removed from it.
+    VolumeNotDurable,
+    /// Something else had the file open or removed it while this call worked.
+    InUse,
+}
+
+impl NotFreed {
+    /// The stable code for this reason (the IPC `not_freed_reason`).
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::NoLongerCurrent => "no_longer_current",
+            Self::NotPresent => "not_present",
+            Self::PathChanging => "path_changing",
+            Self::FileReplaced => "file_replaced",
+            Self::DiffersFromSynced => "differs_from_synced",
+            Self::VolumeNotDurable => "volume_not_durable",
+            Self::InUse => "in_use",
+        }
+    }
+
+    /// Whether asking again a moment later can succeed without anyone doing anything.
+    #[must_use]
+    pub const fn passes_by_itself(self) -> bool {
+        matches!(self, Self::PathChanging | Self::NotPresent)
+    }
+}
+
 /// What one [`evict_file`] call did. The materialized file is always reduced
 /// to a placeholder; whether its cached blocks were reclaimed (freeing real
 /// space) depends on full-replica custody, and never happens on a full
@@ -625,6 +670,8 @@ pub struct EvictionOutcome {
     /// `Present`, path dirty, or its on-disk identity changed), so it freed
     /// no working-tree bytes.
     pub dehydrated: bool,
+    /// Why nothing was freed when `dehydrated` is `false` and the call succeeded; `None` when it was freed.
+    pub not_freed: Option<NotFreed>,
 }
 
 /// The handles a materialization/eviction operation needs: the index, the
@@ -742,6 +789,55 @@ fn confirm_sibling_custody<'a>(
     Ok((verified, guards))
 }
 
+/// The last look at the file before the placeholder commit: the root is still the root, the
+/// target is still inside it, and the object on disk is the one first looked at, with the indexed
+/// bytes. Nothing is touched when it is not.
+fn recheck_file_before_commit(
+    state: &dyn MaterializationExecutionPort,
+    (root, group_id, path): (&Path, &str, &str),
+    out_path: &Path,
+    initial_disk_identity: &DiskIdentity,
+    blocks: &[yadorilink_replica_domain::file::BlockInfo],
+) -> Result<(), MaterializationExecutionError> {
+    state.verify_root(root, group_id)?;
+    verify_write_target_within_root(
+        out_path,
+        root,
+        &crate::materialization_execution::GroupStructuralLedger::new(state, group_id),
+    )?;
+    if disk_identity(out_path)? != *initial_disk_identity
+        || !disk_bytes_match_indexed_blocks(out_path, blocks)?
+    {
+        return Err(MaterializationExecutionError::EvictionRejected(format!(
+            "{path} changed before placeholder commit"
+        )));
+    }
+    Ok(())
+}
+
+/// A received or captured file is not copied into the store, so the bytes about to be dropped may
+/// be the only local copy of the version. Puts it there first, whatever custody answered: custody
+/// is about another device, this is about the copy being freed. Nothing has been touched yet, so
+/// a refusal leaves the file as it was. `Some` is the outcome to return instead of evicting.
+fn put_version_in_store_first(
+    custody: &dyn FullReplicaCustody,
+    group_id: &str,
+    path: &str,
+    out_path: &Path,
+    blocks: &[yadorilink_replica_domain::file::BlockInfo],
+) -> Result<Option<EvictionOutcome>, MaterializationExecutionError> {
+    match custody.ensure_version_in_store(group_id, path, out_path, blocks) {
+        StoreResidency::InStore => Ok(None),
+        StoreResidency::NotTheVersion => Ok(Some(kept(NotFreed::DiffersFromSynced))),
+        StoreResidency::Failed(reason) => {
+            Err(MaterializationExecutionError::EvictionRejected(format!(
+                "{path}: its content could not be put in the block store first, so it was not \
+                 freed: {reason}"
+            )))
+        }
+    }
+}
+
 /// Evicts one hydrated file back to a placeholder and, on an on-demand
 /// device, reclaims its now-cached blocks from the block store to free real
 /// disk space — the sync state (version, block list) is untouched.
@@ -842,19 +938,21 @@ pub fn evict_file(
             "{path} is kept on this device; stop keeping it first to free up its space"
         )));
     }
-    let still_current = revalidation.current_version.is_some_and(|current| {
+    let still_current = revalidation.current_version.as_ref().is_some_and(|current| {
         !current.deleted && current.to_file_version().version_hash == evicting_version.version_hash
     });
-    if !still_current
-        || revalidation.materialization_state != Some(MaterializationState::Present)
-        || revalidation.path_dirty
-        || disk_identity(&out_path)? != initial_disk_identity
-        || !disk_bytes_match_indexed_blocks(&out_path, &record.blocks)?
-    {
+    let not_freed = first_unmet_precondition(
+        still_current,
+        &revalidation,
+        &out_path,
+        &initial_disk_identity,
+        &record.blocks,
+    )?;
+    if let Some(reason) = not_freed {
         // Bail out before writing the placeholder: the file is left fully
         // materialized, so `dehydrated` stays `false` (the default): nothing
         // was freed.
-        return Ok(EvictionOutcome { blocks_retained: true, ..Default::default() });
+        return Ok(kept(reason));
     }
 
     // Custody is confirmed HERE, under the path lock and after the
@@ -870,7 +968,7 @@ pub fn evict_file(
     // The working-tree bytes are removed (Windows: dehydrated) below whatever the custody says,
     // so the sync root's own volume must be known durable too; otherwise nothing is touched.
     if !volume_durable(Some(root)) {
-        return Ok(EvictionOutcome { blocks_retained: true, ..Default::default() });
+        return Ok(kept(NotFreed::VolumeNotDurable));
     }
 
     // Every check that does NOT touch the file runs BEFORE the row enters
@@ -888,18 +986,17 @@ pub fn evict_file(
     // race against the queued watcher event sees a `Remote` row whose
     // on-disk bytes are stable, satisfies its own commit check, and
     // reconstructs the indexed blocks straight over the edit.
-    state.verify_root(root, group_id)?;
-    verify_write_target_within_root(
+    recheck_file_before_commit(
+        state,
+        (root, group_id, path),
         &out_path,
-        root,
-        &crate::materialization_execution::GroupStructuralLedger::new(state, group_id),
+        &initial_disk_identity,
+        &record.blocks,
     )?;
-    if disk_identity(&out_path)? != initial_disk_identity
-        || !disk_bytes_match_indexed_blocks(&out_path, &record.blocks)?
-    {
-        return Err(MaterializationExecutionError::EvictionRejected(format!(
-            "{path} changed before placeholder commit"
-        )));
+    let store_first =
+        put_version_in_store_first(custody, group_id, path, &out_path, &record.blocks);
+    if let Some(outcome) = store_first? {
+        return Ok(outcome);
     }
 
     // `Evicting` (a failure here fails the eviction with nothing else
@@ -948,7 +1045,7 @@ pub fn evict_file(
                 .map(|d| d.as_nanos() as i64)
                 .unwrap_or(0);
             state.record_dirty_path(group_id, path, kind, observed_at, permit)?;
-            return Ok(EvictionOutcome { blocks_retained: true, ..Default::default() });
+            return Ok(kept(not_freed_after(not_removed)));
         }
         Err(MaterializationExecutionError::EvictionOutcomeAmbiguous(reason)) => {
             // Unlike every other error
@@ -1098,6 +1195,46 @@ pub fn evict_file(
         bytes_reclaimed: report.bytes_reclaimed,
         blocks_retained: false,
         dehydrated: true,
+        not_freed: None,
+    })
+}
+
+/// Why a removal that did not happen freed nothing: a writer that may exist is "in use"; a competing removal or a
+/// diverged object means the file was replaced, changed or removed while the call worked.
+#[cfg(not(windows))]
+fn not_freed_after(removal: Removal) -> NotFreed {
+    match removal {
+        Removal::WriterMayExist => NotFreed::InUse,
+        _ => NotFreed::FileReplaced,
+    }
+}
+
+/// The outcome of a call that left the file exactly as it was, for `why`: nothing freed, the blocks kept.
+fn kept(why: NotFreed) -> EvictionOutcome {
+    EvictionOutcome { blocks_retained: true, not_freed: Some(why), ..Default::default() }
+}
+
+/// Nothing is written before every precondition of freeing a file holds; the first that does not is the reason the call
+/// freed nothing (`None` when all hold).
+fn first_unmet_precondition(
+    still_current: bool,
+    revalidation: &EvictionRevalidationSnapshot,
+    out_path: &Path,
+    initial_disk_identity: &DiskIdentity,
+    blocks: &[yadorilink_replica_domain::file::BlockInfo],
+) -> Result<Option<NotFreed>, MaterializationExecutionError> {
+    Ok(if !still_current {
+        Some(NotFreed::NoLongerCurrent)
+    } else if revalidation.materialization_state != Some(MaterializationState::Present) {
+        Some(NotFreed::NotPresent)
+    } else if revalidation.path_dirty {
+        Some(NotFreed::PathChanging)
+    } else if disk_identity(out_path)? != *initial_disk_identity {
+        Some(NotFreed::FileReplaced)
+    } else if !disk_bytes_match_indexed_blocks(out_path, blocks)? {
+        Some(NotFreed::DiffersFromSynced)
+    } else {
+        None
     })
 }
 
@@ -1132,4 +1269,37 @@ fn abandon_failed_eviction(
         Err(error) => return Err(error),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod not_freed_tests {
+    use super::NotFreed;
+
+    const ALL: [NotFreed; 7] = [
+        NotFreed::NoLongerCurrent,
+        NotFreed::NotPresent,
+        NotFreed::PathChanging,
+        NotFreed::FileReplaced,
+        NotFreed::DiffersFromSynced,
+        NotFreed::VolumeNotDurable,
+        NotFreed::InUse,
+    ];
+
+    #[test]
+    fn the_codes_are_distinct_stable_words() {
+        let mut codes: Vec<_> = ALL.iter().map(|why| why.code()).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), ALL.len());
+        assert!(codes.iter().all(|c| c.chars().all(|ch| ch.is_ascii_lowercase() || ch == '_')));
+    }
+
+    /// `yadorilink-client-core`'s `EvictOutcome::retry_later` is true for exactly these two codes ("path_changing",
+    /// "not_present"); a reason that needs the person must never read as "try again later".
+    #[test]
+    fn only_a_moment_that_passes_by_itself_is_retried_later() {
+        let by_itself: Vec<_> =
+            ALL.iter().filter(|why| why.passes_by_itself()).map(|why| why.code()).collect();
+        assert_eq!(by_itself, ["not_present", "path_changing"]);
+    }
 }

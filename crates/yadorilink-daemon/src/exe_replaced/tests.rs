@@ -172,6 +172,8 @@ impl FakeLifecycle {
 impl DaemonLifecyclePort for FakeLifecycle {
     fn request_shutdown(&self) {}
 
+    fn request_shutdown_to_restart(&self) {}
+
     fn request_safe_stop(&self, _deadline: Duration) -> BoxFuture<'_, SafeStopOutcome> {
         self.plain_requests.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { SafeStopOutcome::Stopping { already_in_progress: true } })

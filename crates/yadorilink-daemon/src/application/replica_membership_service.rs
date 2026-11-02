@@ -8,7 +8,9 @@ use yadorilink_replica_domain::session_state::{
 
 mod at_risk;
 
-use super::model::{MembershipCommitOutcome, MembershipOperationLookup, MembershipRemoteCommand};
+use super::model::{
+    MembershipCommitOutcome, MembershipOperationLookup, MembershipRemoteCommand, RevokeRefusal,
+};
 use super::ports::{
     HandoffTicketPort, MembershipCoordination, MembershipRepository, ReplicaReadinessPort,
 };
@@ -240,6 +242,24 @@ impl ReplicaMembershipService {
     ) -> Result<ReplicaMembershipOutcome, ReplicaMembershipError> {
         if !self.coordination.is_configured() {
             return Err(ReplicaMembershipError::LocalIdentityUnavailable);
+        }
+        // Authorization is the coordination plane's to refuse, and its reason
+        // must not depend on whether the durability gate below is satisfied:
+        // ask first, so a request it would refuse as Forbidden is reported as
+        // that rather than as "another complete copy is not ready".
+        if let Some(group_id) = &scoped_group_id {
+            if let Some(refusal) =
+                self.coordination.check_revoke_authority(group_id, &target_device_id).await
+            {
+                return Err(match refusal {
+                    RevokeRefusal::TermsConsentRequired(detail) => {
+                        ReplicaMembershipError::TermsConsentRequired { detail }
+                    }
+                    RevokeRefusal::Rejected(detail) => {
+                        ReplicaMembershipError::CoordinationRejected { detail }
+                    }
+                });
+            }
         }
         let (mut groups_at_risk, unverified, no_risk_witness) =
             match self.assess_removal_risk(&scoped_group_id, &target_device_id).await? {

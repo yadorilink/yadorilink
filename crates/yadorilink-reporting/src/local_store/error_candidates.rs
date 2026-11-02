@@ -152,14 +152,14 @@ impl ErrorCandidateStore {
         if summary.is_empty() {
             return Ok(()); // nothing redacted — no sidecar file needed
         }
-        yadorilink_fs_platform::durable_dir::create_dir_all_durably(&self.dir)?;
+        super::private_fs::create_private_dir(&self.dir)?;
         let serializable: Vec<(String, usize)> = summary
             .categories
             .iter()
             .map(|(category, count)| (format!("{category:?}"), *count))
             .collect();
         let json = serde_json::to_string_pretty(&serializable)?;
-        std::fs::write(self.summary_path(id), json)?;
+        super::private_fs::write_private_file(&self.summary_path(id), json.as_bytes())?;
         Ok(())
     }
 

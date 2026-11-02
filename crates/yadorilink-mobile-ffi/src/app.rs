@@ -5,7 +5,7 @@
 //! typed ones of [`CallFailure`](crate::CallFailure). Nothing here decides anything.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use yadorilink_embedded_host as host;
 use yadorilink_embedded_host::dto;
@@ -54,6 +54,20 @@ pub enum RefusalCode {
     AccessDenied,
     /// The account has not accepted the current Terms: signing in again shows them.
     TermsConsentRequired,
+    /// Send links. The sender's own view tells expired, used and cancelled apart; a redeemer
+    /// only ever learns `SendLinkInvalid`.
+    SendLinkExpired,
+    SendLinkAlreadyUsed,
+    SendLinkCancelled,
+    SendLinkInvalid,
+    SendPeerUnreachable,
+    SendNoSpace,
+    SendInterrupted,
+    /// The service has Send links switched off.
+    SendLinksDisabled,
+    /// This device's operating system refused to send to the local network (macOS Local Network
+    /// privacy, a firewall, a VPN); a device on the same network could not be reached.
+    SendLocalNetworkBlocked,
 }
 
 impl From<yadorilink_ipc_proto::daemonctl::ApplicationErrorCode> for RefusalCode {
@@ -88,6 +102,15 @@ impl From<yadorilink_ipc_proto::daemonctl::ApplicationErrorCode> for RefusalCode
             C::GroupMismatch => Self::GroupMismatch,
             C::AccessDenied => Self::AccessDenied,
             C::TermsConsentRequired => Self::TermsConsentRequired,
+            C::SendLinkExpired => Self::SendLinkExpired,
+            C::SendLinkAlreadyUsed => Self::SendLinkAlreadyUsed,
+            C::SendLinkCancelled => Self::SendLinkCancelled,
+            C::SendLinkInvalid => Self::SendLinkInvalid,
+            C::SendPeerUnreachable => Self::SendPeerUnreachable,
+            C::SendNoSpace => Self::SendNoSpace,
+            C::SendInterrupted => Self::SendInterrupted,
+            C::SendLinksDisabled => Self::SendLinksDisabled,
+            C::SendLocalNetworkBlocked => Self::SendLocalNetworkBlocked,
         }
     }
 }
@@ -170,6 +193,27 @@ pub enum AccountErrorKind {
     /// A local daemon is not part of this build; kept for the product's own taxonomy.
     DaemonUnavailable,
     Internal,
+    /// The pairing code of `begin_pairing_sign_in` is not accepted: never issued, expired
+    /// (ten minutes) or already used; the service does not say which. Nothing changed; the
+    /// person makes a new code on the web page. Declared last so the other kinds keep their
+    /// order.
+    PairingCodeInvalid,
+    /// A primary-ownership hand-over call was refused, one kind per reason (nothing
+    /// changed). The caller's account is not the folder's primary owner.
+    PrimaryTransferNotPrimary,
+    /// The chosen device is not an active member of the folder.
+    PrimaryTransferTargetNotMember,
+    /// The chosen device is on the caller's own account: choose a device of another person.
+    PrimaryTransferTargetSameAccount,
+    /// The offer lapsed (offers last seven days).
+    PrimaryTransferOfferExpired,
+    /// The folder is being created, handed off or deleted right now: try again shortly.
+    PrimaryTransferGroupNotActive,
+    /// Another offer is pending, this one was already settled or replaced, or the folder
+    /// changed owner or kept changing: list the pending offers and decide again.
+    PrimaryTransferConflict,
+    /// No such folder or offer for this account.
+    PrimaryTransferNotFound,
 }
 
 /// The typed error of an account command.
@@ -211,7 +255,121 @@ impl From<host::DesktopError> for AccountError {
             E::Refused { message, reason: host::RefusalReason::StartOverRestartRequired } => {
                 plain(AccountErrorKind::StartOverRestartRequired, message)
             }
-            E::Refused { message, .. } => plain(AccountErrorKind::Refused, message),
+            E::Refused { message, reason: host::RefusalReason::PairingCodeInvalid } => {
+                plain(AccountErrorKind::PairingCodeInvalid, message)
+            }
+            E::Refused { message, reason } => {
+                use host::RefusalReason as R;
+                let kind = match reason {
+                    R::PrimaryTransferNotPrimary => AccountErrorKind::PrimaryTransferNotPrimary,
+                    R::PrimaryTransferTargetNotMember => {
+                        AccountErrorKind::PrimaryTransferTargetNotMember
+                    }
+                    R::PrimaryTransferTargetSameAccount => {
+                        AccountErrorKind::PrimaryTransferTargetSameAccount
+                    }
+                    R::PrimaryTransferOfferExpired => AccountErrorKind::PrimaryTransferOfferExpired,
+                    R::PrimaryTransferGroupNotActive => {
+                        AccountErrorKind::PrimaryTransferGroupNotActive
+                    }
+                    R::PrimaryTransferConflict => AccountErrorKind::PrimaryTransferConflict,
+                    R::PrimaryTransferNotFound => AccountErrorKind::PrimaryTransferNotFound,
+                    _ => AccountErrorKind::Refused,
+                };
+                plain(kind, message)
+            }
+        }
+    }
+}
+
+// ---- primary-ownership hand-over ----------------------------------
+
+/// Which side of an ownership offer this account is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum PrimaryTransferDirection {
+    /// This account offered its folder to another account.
+    Outgoing,
+    /// Another account offered its folder to this one.
+    Incoming,
+    /// A direction a newer service added.
+    Unrecognized,
+}
+
+/// Where an ownership offer stands. A listed offer is `Pending`.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum PrimaryTransferStatus {
+    Pending,
+    Accepted,
+    Cancelled,
+    Declined,
+    /// A status a newer service added.
+    Other {
+        raw: String,
+    },
+}
+
+/// An offer to hand a folder's primary ownership to another account. It names no account, email
+/// or person: `to_device_id` is the device the primary chose. Offers last seven days.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PrimaryTransfer {
+    pub transfer_id: String,
+    pub group_id: String,
+    pub group_name: String,
+    pub direction: PrimaryTransferDirection,
+    pub status: PrimaryTransferStatus,
+    pub to_device_id: String,
+    /// Seconds since the Unix epoch.
+    pub created_at_unix: u64,
+    /// Seconds since the Unix epoch.
+    pub expires_at_unix: u64,
+}
+
+/// What accepting an offer produced: this account is now the folder's primary owner.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PrimaryTransferAccepted {
+    pub transfer_id: String,
+    pub group_id: String,
+    /// The folder's membership generation after the hand-over.
+    pub membership_generation: u64,
+}
+
+fn unix_secs(time: std::time::SystemTime) -> u64 {
+    time.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+impl From<dto::PrimaryTransferSummary> for PrimaryTransfer {
+    fn from(t: dto::PrimaryTransferSummary) -> Self {
+        Self {
+            transfer_id: t.transfer_id,
+            group_id: t.group_id,
+            group_name: t.group_name,
+            direction: match t.direction {
+                dto::PrimaryTransferDirection::Outgoing => PrimaryTransferDirection::Outgoing,
+                dto::PrimaryTransferDirection::Incoming => PrimaryTransferDirection::Incoming,
+                dto::PrimaryTransferDirection::Unrecognized => {
+                    PrimaryTransferDirection::Unrecognized
+                }
+            },
+            status: match t.status {
+                dto::PrimaryTransferStatus::Pending => PrimaryTransferStatus::Pending,
+                dto::PrimaryTransferStatus::Accepted => PrimaryTransferStatus::Accepted,
+                dto::PrimaryTransferStatus::Cancelled => PrimaryTransferStatus::Cancelled,
+                dto::PrimaryTransferStatus::Declined => PrimaryTransferStatus::Declined,
+                dto::PrimaryTransferStatus::Other { raw } => PrimaryTransferStatus::Other { raw },
+            },
+            to_device_id: t.to_device_id,
+            created_at_unix: unix_secs(t.created_at),
+            expires_at_unix: unix_secs(t.expires_at),
+        }
+    }
+}
+
+impl From<dto::PrimaryTransferAccepted> for PrimaryTransferAccepted {
+    fn from(a: dto::PrimaryTransferAccepted) -> Self {
+        Self {
+            transfer_id: a.transfer_id,
+            group_id: a.group_id,
+            membership_generation: a.membership_generation,
         }
     }
 }
@@ -267,6 +425,151 @@ pub struct JoinableGroup {
 impl From<dto::GroupSummary> for JoinableGroup {
     fn from(group: dto::GroupSummary) -> Self {
         Self { group_id: group.group_id, name: group.name }
+    }
+}
+
+/// One device of a folder group, for choosing a destination: an upload may only target a group
+/// that has a full-replica device (`full_replica`), preferably one that can write and is online.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GroupDevice {
+    pub device_id: String,
+    pub device_name: String,
+    /// The device keeps a full copy (Eager). An unrecognized mode reads as `false`.
+    pub full_replica: bool,
+    /// The device may author changes (owner or editor). A full replica that is not a writer
+    /// does not count as a delivery target.
+    pub can_write: bool,
+    pub online: bool,
+    /// Last seen, seconds since the Unix epoch; `None` when never.
+    pub last_seen_unix: Option<u64>,
+    /// This device itself.
+    pub is_this_device: bool,
+}
+
+impl From<dto::MemberSummary> for GroupDevice {
+    fn from(member: dto::MemberSummary) -> Self {
+        Self {
+            device_id: member.device_id,
+            device_name: member.device_name,
+            full_replica: member.storage == dto::MemberStorage::FullCopy,
+            can_write: matches!(member.role, dto::ShareRole::Owner | dto::ShareRole::Editor),
+            online: member.online,
+            last_seen_unix: member
+                .last_seen
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs()),
+            is_this_device: member.relationship == dto::MemberRelationship::You,
+        }
+    }
+}
+
+/// What happened to a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ActivityKind {
+    Added,
+    Updated,
+    Deleted,
+    Conflict,
+    Restored,
+}
+
+/// Whose changes the Activity list shows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, uniffi::Enum)]
+pub enum ActivityOrigin {
+    #[default]
+    Any,
+    ThisDevice,
+    OtherDevices,
+}
+
+/// Narrows the Activity list. No kinds = every kind.
+#[derive(Debug, Clone, Default, PartialEq, Eq, uniffi::Record)]
+pub struct ActivityFilter {
+    pub kinds: Vec<ActivityKind>,
+    pub origin: ActivityOrigin,
+}
+
+/// One file event of the Activity list.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ActivityEvent {
+    /// Paging cursor: pass the page's `next_cursor` as `before_cursor` for the next page.
+    pub cursor: i64,
+    /// The linked folder's root.
+    pub local_path: String,
+    /// The file, relative to the root.
+    pub path: String,
+    pub kind: ActivityKind,
+    pub origin_device_id: Option<String>,
+    /// Its name, when the account's device list could be read.
+    pub origin_device_name: Option<String>,
+    pub is_this_device: bool,
+    pub at: Option<SystemTime>,
+}
+
+/// One page of the Activity list, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ActivityPage {
+    pub events: Vec<ActivityEvent>,
+    /// `before_cursor` of the next page; `None` when this page ended the list.
+    pub next_cursor: Option<i64>,
+}
+
+impl From<ActivityKind> for dto::ActivityKind {
+    fn from(kind: ActivityKind) -> Self {
+        match kind {
+            ActivityKind::Added => Self::Added,
+            ActivityKind::Updated => Self::Updated,
+            ActivityKind::Deleted => Self::Deleted,
+            ActivityKind::Conflict => Self::Conflict,
+            ActivityKind::Restored => Self::Restored,
+        }
+    }
+}
+
+impl From<dto::ActivityKind> for ActivityKind {
+    fn from(kind: dto::ActivityKind) -> Self {
+        match kind {
+            dto::ActivityKind::Added => Self::Added,
+            dto::ActivityKind::Updated => Self::Updated,
+            dto::ActivityKind::Deleted => Self::Deleted,
+            dto::ActivityKind::Conflict => Self::Conflict,
+            dto::ActivityKind::Restored => Self::Restored,
+        }
+    }
+}
+
+impl From<ActivityFilter> for dto::ActivityFilter {
+    fn from(filter: ActivityFilter) -> Self {
+        Self {
+            kinds: filter.kinds.into_iter().map(Into::into).collect(),
+            origin: match filter.origin {
+                ActivityOrigin::Any => dto::ActivityOrigin::Any,
+                ActivityOrigin::ThisDevice => dto::ActivityOrigin::ThisDevice,
+                ActivityOrigin::OtherDevices => dto::ActivityOrigin::OtherDevices,
+            },
+        }
+    }
+}
+
+impl From<dto::ActivityPage> for ActivityPage {
+    fn from(page: dto::ActivityPage) -> Self {
+        Self {
+            events: page
+                .events
+                .into_iter()
+                .map(|e| ActivityEvent {
+                    cursor: e.cursor,
+                    local_path: e.local_path,
+                    path: e.path,
+                    kind: e.kind.into(),
+                    origin_device_id: e.origin_device_id,
+                    origin_device_name: e.origin_device_name,
+                    is_this_device: e.is_this_device,
+                    at: e.at,
+                })
+                .collect(),
+            next_cursor: page.next_cursor,
+        }
     }
 }
 
@@ -994,13 +1297,26 @@ impl From<dto::AccountDeletionStatus> for DeletionStatus {
 // ---- the methods -----------------------------------------------------------------------
 
 impl MobileHost {
-    fn run(
+    pub(crate) fn run(
         &self,
         command: host::Command,
         cancel: &CancelHandle,
         deadline_ms: Option<u64>,
     ) -> Result<host::CommandOutput, CallFailure> {
         Ok(self.inner.execute(command, &options(cancel, deadline_ms))?)
+    }
+
+    fn transfer_call(
+        &self,
+        what: &'static str,
+        command: host::AccountCommand,
+        cancel: &CancelHandle,
+        deadline_ms: Option<u64>,
+    ) -> Result<PrimaryTransfer, CallFailure> {
+        match self.account(command, cancel, deadline_ms)? {
+            host::CommandOutput::PrimaryTransfer(transfer) => Ok(transfer.into()),
+            other => Err(unexpected(what, &other)),
+        }
     }
 
     fn account(
@@ -1079,6 +1395,155 @@ impl MobileHost {
                 Ok(groups.into_iter().map(Into::into).collect())
             }
             other => Err(unexpected("list_joinable_groups", &other)),
+        }
+    }
+
+    /// The devices of one folder group: name, whether each keeps a full replica, whether it can
+    /// write, online. For the destination picker: show only groups where some device has
+    /// `full_replica` (camera uploads and uploads never target a group without one). Read-only;
+    /// needs a sign-in.
+    ///
+    /// # Errors
+    /// `Account` with `NotSignedIn`; the other [`CallFailure`] cases.
+    pub fn list_group_devices(
+        &self,
+        group_id: String,
+        cancel: &CancelHandle,
+        deadline_ms: Option<u64>,
+    ) -> Result<Vec<GroupDevice>, CallFailure> {
+        match self.account(
+            host::AccountCommand::ListGroupDevices { group_id },
+            cancel,
+            deadline_ms,
+        )? {
+            host::CommandOutput::GroupDevices(devices) => {
+                Ok(devices.into_iter().map(Into::into).collect())
+            }
+            other => Err(unexpected("list_group_devices", &other)),
+        }
+    }
+
+    /// Offers the primary ownership of `group_id` (a folder this account owns) to the account
+    /// that owns `target_device_id`, an active member device of it. The target must accept; an
+    /// offer lasts seven days and a folder has at most one pending offer. Retries and restarts
+    /// replay the same offer (the operation id is kept on disk). Needs the service and a sign-in.
+    ///
+    /// # Errors
+    /// `Account` with a `PrimaryTransfer*` kind for the service's typed refusals, `NotSignedIn`,
+    /// `Network`; the other [`CallFailure`] cases.
+    pub fn offer_primary_transfer(
+        &self,
+        group_id: String,
+        target_device_id: String,
+        cancel: &CancelHandle,
+        deadline_ms: Option<u64>,
+    ) -> Result<PrimaryTransfer, CallFailure> {
+        self.transfer_call(
+            "offer_primary_transfer",
+            host::AccountCommand::OfferPrimaryTransfer { group_id, target_device_id },
+            cancel,
+            deadline_ms,
+        )
+    }
+
+    /// Withdraws a pending offer this account made.
+    ///
+    /// # Errors
+    /// As `offer_primary_transfer`.
+    pub fn cancel_primary_transfer(
+        &self,
+        group_id: String,
+        transfer_id: String,
+        cancel: &CancelHandle,
+        deadline_ms: Option<u64>,
+    ) -> Result<PrimaryTransfer, CallFailure> {
+        self.transfer_call(
+            "cancel_primary_transfer",
+            host::AccountCommand::CancelPrimaryTransfer { group_id, transfer_id },
+            cancel,
+            deadline_ms,
+        )
+    }
+
+    /// Turns down an offer made to this account.
+    ///
+    /// # Errors
+    /// As `offer_primary_transfer`.
+    pub fn decline_primary_transfer(
+        &self,
+        group_id: String,
+        transfer_id: String,
+        cancel: &CancelHandle,
+        deadline_ms: Option<u64>,
+    ) -> Result<PrimaryTransfer, CallFailure> {
+        self.transfer_call(
+            "decline_primary_transfer",
+            host::AccountCommand::DeclinePrimaryTransfer { group_id, transfer_id },
+            cancel,
+            deadline_ms,
+        )
+    }
+
+    /// Accepts an offer made to this account (any of its devices may): the folder moves onto
+    /// this account's quota and this account becomes its primary owner.
+    ///
+    /// # Errors
+    /// As `offer_primary_transfer`.
+    pub fn accept_primary_transfer(
+        &self,
+        group_id: String,
+        transfer_id: String,
+        cancel: &CancelHandle,
+        deadline_ms: Option<u64>,
+    ) -> Result<PrimaryTransferAccepted, CallFailure> {
+        match self.account(
+            host::AccountCommand::AcceptPrimaryTransfer { group_id, transfer_id },
+            cancel,
+            deadline_ms,
+        )? {
+            host::CommandOutput::PrimaryTransferAccepted(accepted) => Ok(accepted.into()),
+            other => Err(unexpected("accept_primary_transfer", &other)),
+        }
+    }
+
+    /// The pending, unexpired ownership offers this account made or received. Read-only; needs
+    /// a sign-in.
+    ///
+    /// # Errors
+    /// `Account` with `NotSignedIn`; the other [`CallFailure`] cases.
+    pub fn list_primary_transfers(
+        &self,
+        cancel: &CancelHandle,
+        deadline_ms: Option<u64>,
+    ) -> Result<Vec<PrimaryTransfer>, CallFailure> {
+        match self.account(host::AccountCommand::ListPrimaryTransfers, cancel, deadline_ms)? {
+            host::CommandOutput::PrimaryTransfers(transfers) => {
+                Ok(transfers.into_iter().map(Into::into).collect())
+            }
+            other => Err(unexpected("list_primary_transfers", &other)),
+        }
+    }
+
+    /// Recent file events across every linked folder, newest first: the Activity list.
+    /// `limit` is clamped to 1..=500; `before_cursor` is the previous page's `next_cursor`
+    /// (`None`: the newest). Read-only. Needs no sign-in: signed out, events carry device ids
+    /// but no names.
+    ///
+    /// # Errors
+    /// The [`CallFailure`] cases.
+    pub fn list_activity(
+        &self,
+        limit: u32,
+        before_cursor: Option<i64>,
+        filter: Option<ActivityFilter>,
+        cancel: &CancelHandle,
+        deadline_ms: Option<u64>,
+    ) -> Result<ActivityPage, CallFailure> {
+        let command =
+            host::Command::ListActivity { limit, before_cursor, filter: filter.map(Into::into) };
+        match self.run(command, cancel, deadline_ms)? {
+            host::CommandOutput::Activity(page) => Ok(page.into()),
+            other => Err(unexpected("list_activity", &other)),
         }
     }
 
@@ -1359,6 +1824,37 @@ impl MobileHost {
         match self.account(host::AccountCommand::BeginSignIn(begin), cancel, deadline_ms)? {
             host::CommandOutput::SignInBegun(id) => Ok(id.0),
             other => Err(unexpected("begin_sign_in", &other)),
+        }
+    }
+
+    /// Starts a sign-in with a pairing code from the account's web page ("add this device with a
+    /// code" / QR scan) and returns its id, ending the one before. No browser is involved. Poll
+    /// it with `poll_sign_in`: the events are `Enrolling`, then `SignedIn`; a failure is the
+    /// poll's `Failed` with the typed error (below).
+    ///
+    /// `pairing_code` is what the person typed (any case, hyphens optional) or what the QR
+    /// scan read (the QR carries a link; it is accepted as it is). The code is a secret for
+    /// ten minutes: never log it.
+    ///
+    /// # Errors
+    /// `Account` with `InvalidInput` for text that cannot be a code (nothing is sent), and
+    /// `PermissionDenied` while signed in. In the poll's failure: `PairingCodeInvalid` (make a
+    /// new code on the web page), `Network` when the service cannot be reached or asks to wait
+    /// (rate limit: try again later).
+    pub fn begin_pairing_sign_in(
+        &self,
+        pairing_code: String,
+        overall_timeout_ms: Option<u64>,
+        cancel: &CancelHandle,
+        deadline_ms: Option<u64>,
+    ) -> Result<u64, CallFailure> {
+        let begin = host::BeginPairingSignIn {
+            pairing_code,
+            overall_timeout: overall_timeout_ms.map(Duration::from_millis),
+        };
+        match self.account(host::AccountCommand::BeginPairingSignIn(begin), cancel, deadline_ms)? {
+            host::CommandOutput::SignInBegun(id) => Ok(id.0),
+            other => Err(unexpected("begin_pairing_sign_in", &other)),
         }
     }
 

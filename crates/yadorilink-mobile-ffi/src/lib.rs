@@ -283,6 +283,10 @@ pub enum CallFailure {
     /// provider folder instead. Nothing was changed.
     #[error("{message}")]
     NoChangeSource { message: String },
+    /// `create_share` with `on_demand: true`: the new group's only member would keep no full
+    /// copy. Nothing was changed. Create it as a full copy, or join a group that has one.
+    #[error("{message}")]
+    NoFullReplica { message: String },
     /// The engine refused the command with a reason the app acts on; nothing was changed.
     /// `operation_id` names the enrollment operation to recover or retry, when the refusal
     /// concerns one (empty otherwise).
@@ -328,6 +332,7 @@ impl From<host::CallError> for CallFailure {
                     CommandErrorKind::Readopt(reason) => {
                         Self::ReadoptRefused { reason: reason.into(), message }
                     }
+                    CommandErrorKind::NoFullReplica => Self::NoFullReplica { message },
                     CommandErrorKind::Failed => Self::Failed { message },
                 }
             }
@@ -519,9 +524,10 @@ impl MobileHost {
         }
     }
 
-    /// Restores a file to one of its earlier versions. Returns whether a version was
-    /// restored: false when there was no earlier version. Blocks until done, cancelled or
-    /// out of time.
+    /// Restores a file of a linked directory to one of its earlier versions. Returns whether a
+    /// version was restored: false when there was no earlier version. Blocks until done,
+    /// cancelled or out of time. A provider folder has no directory: its history is read with
+    /// `list_versions` and `list_deleted` and restored with `apply_change` (`restore_from`).
     ///
     /// # Errors
     /// A [`CallFailure`].
@@ -614,6 +620,10 @@ impl ProviderChannel {
 
 mod app;
 pub use app::*;
+mod send;
+pub use send::*;
+mod writes;
+pub use writes::*;
 
 #[cfg(test)]
 mod tests;

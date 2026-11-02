@@ -60,7 +60,11 @@ fn new_device(device_id: &str) -> (Arc<DaemonState>, tempfile::TempDir, tempfile
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
-    let state = DaemonState::new(device_id.to_string(), sync_state, store);
+    let state = yadorilink_daemon::test_support::isolated_daemon_state(
+        device_id.to_string(),
+        sync_state,
+        store,
+    );
     ensure_device_signing_key(&state);
     (state, tempfile::tempdir().unwrap(), store_dir)
 }
@@ -101,10 +105,9 @@ async fn zero_progress_never_reports_an_immediate_backlog() {
             100,
             FileMeta {
                 mtime_unix_nanos: i as i64,
-                unix_mode: None,
+                exec: false,
                 symlink_target: None,
                 record_kind: RecordKind::File,
-                xattrs: Vec::new(),
             },
         );
         let _change = yadorilink_daemon::test_support::remote_admission_fixture::admit_remote(

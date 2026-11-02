@@ -633,7 +633,7 @@ mod tests {
         );
         assert_eq!(
             hex::encode(delta.body_digest()),
-            "9a3e5b9be4a47869b19b0ac4e59c9b9db5d1c55ae00a3d619b5cd43e51b7ee43"
+            "71e8646b1a7215b775532c57f84e09b623627f0144b5de271a7f58d21cd1e1be"
         );
     }
 

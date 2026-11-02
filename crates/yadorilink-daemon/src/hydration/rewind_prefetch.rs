@@ -143,6 +143,89 @@ impl DeclineEvidence {
     }
 }
 
+/// A version the rewind restores and the path whose folder file may still hold exactly it.
+#[derive(Debug, Clone)]
+pub(crate) struct LocalSourceCandidate {
+    pub(crate) path: String,
+    pub(crate) blocks: Vec<BlockInfo>,
+}
+
+/// For each candidate whose version is not yet in the block store, reads the path's file in the
+/// folder into the store if its bytes are exactly that version (each block is checked against the
+/// hash the version lists as it is read). A file that is not the version, or is gone or
+/// unreadable, is left alone: the content is then obtained from peers as before, and a version
+/// nobody holds fails the rewind as unavailable. A copy received or captured without being copied
+/// into the store is held by its file alone, and this is how the rewind uses it.
+///
+/// Returns whether reading a file that looked like the version failed locally (a store write
+/// error, the file unreadable): content that peers cannot supply is then not unobtainable, only
+/// not read this time.
+pub(crate) async fn read_local_files_into_store(
+    state: &Arc<DaemonState>,
+    group_id: &str,
+    candidates: Vec<LocalSourceCandidate>,
+) -> bool {
+    let state = state.clone();
+    let group_id = group_id.to_string();
+    let joined = tokio::task::spawn_blocking(move || {
+        let mut local_failure = false;
+        let coordinator = &state.replica_coordinator;
+        let Ok(Some(root)) =
+            coordinator.link_repository().live_link_local_path_for_group(&group_id)
+        else {
+            return false;
+        };
+        let store = crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
+            state.block_store.clone(),
+        );
+        for candidate in candidates {
+            let Ok(file) = yadorilink_local_storage::resolve_read_path_without_traversal(
+                std::path::Path::new(&root),
+                std::path::Path::new(&candidate.path),
+            ) else {
+                continue;
+            };
+            // Only a regular file of the version's size can be it: anything else (a directory, a
+            // pipe that would block the open, a file of another length) is not read at all.
+            let expected: u64 = candidate.blocks.iter().map(|block| block.size as u64).sum();
+            if !std::fs::symlink_metadata(&file)
+                .is_ok_and(|meta| meta.is_file() && meta.len() == expected)
+            {
+                continue;
+            }
+            // The ingest and the verification that follows it must not see a deletion pass take
+            // the blocks in between.
+            let _no_block_deletion = coordinator.block_liveness_gate().begin_reference_write();
+            let outcome = crate::store_residency::ensure_file_in_store(
+                coordinator,
+                &store,
+                &group_id,
+                &candidate.path,
+                &file,
+                &candidate.blocks,
+            );
+            if matches!(outcome, yadorilink_replica_engine::custody::StoreResidency::Failed(_)) {
+                local_failure = true;
+            }
+            tracing::debug!(
+                group_id,
+                path = candidate.path,
+                ?outcome,
+                "rewind: tried the folder's file as the source of a restored version"
+            );
+        }
+        local_failure
+    })
+    .await;
+    match joined {
+        Ok(local_failure) => local_failure,
+        Err(error) => {
+            tracing::warn!(%error, "rewind: reading folder files into the store failed");
+            true
+        }
+    }
+}
+
 /// Makes every block of `required` (deduplicated by the caller) present,
 /// group-provenanced and verified in the local block store, fetching what
 /// is missing from connected peers, and reports what could not be.

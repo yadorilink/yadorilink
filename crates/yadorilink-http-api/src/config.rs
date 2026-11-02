@@ -35,4 +35,7 @@ pub struct HttpApiConfig {
     /// UI dev server proxying API calls through to this adapter during
     /// development. Never a wildcard; empty in production.
     pub extra_allowed_origins: Vec<String>,
+    /// Opt-in remote administration; `None` (the default) serves loopback
+    /// only. See `remote.rs` for what each boundary means.
+    pub remote: Option<crate::remote::RemoteAdminConfig>,
 }

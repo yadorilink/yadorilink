@@ -62,6 +62,25 @@ fn marker(h: &Harness, path: &str) -> Option<i64> {
         .unwrap()
 }
 
+/// The power cut lost the rename of `path`'s received file: a new name is missing with its
+/// witnessed temp still there (the temp's directory entry was flushed before the rename), so the
+/// received file goes back to its temp name; without a witness the name simply disappears.
+pub(super) fn lose_the_rename(h: &Harness, path: &str) {
+    let from = h.path(path);
+    let witness = h
+        .state
+        .database()
+        .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+            Ok(yadorilink_sync_sqlite::write_removal_facts(conn, GROUP, path)?
+                .and_then(|facts| facts.temp_witness))
+        })
+        .unwrap();
+    match witness {
+        Some(name) => std::fs::rename(&from, from.with_file_name(name)).unwrap(),
+        None => std::fs::remove_file(&from).unwrap(),
+    }
+}
+
 /// Closed as an ordinary durable write: proof, `Present`, no intent.
 pub(super) fn closed(h: &Harness, path: &str) -> bool {
     proven(h, path) && present(h, path) && !intent_open(h, path)
@@ -228,13 +247,28 @@ async fn startup_still_quarantines_bytes_that_the_proof_does_not_describe() {
 async fn startup_rebuilds_a_missing_file_under_a_waiting_intent() {
     let h = Harness::new(false);
     let (name, content) = received_with_failed_barrier(&h, "lost-").await;
-    std::fs::remove_file(h.path(&name)).unwrap();
+    lose_the_rename(&h, &name);
 
     let report = startup(&h);
 
     assert!(report.offline_deleted.is_empty(), "{report:?}");
     assert_eq!(std::fs::read(h.path(&name)).unwrap(), content);
     assert!(closed(&h, &name));
+}
+
+/// The flush-pending marker is not a landed mark: its name may not be durable, so a later fence
+/// move does not turn the missing file into a user delete either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_missing_file_under_a_waiting_intent_is_still_rebuilt_after_the_fence_moved() {
+    let h = Harness::new(false);
+    let (name, content) = received_with_failed_barrier(&h, "moved-").await;
+    h.state.dag_bump_mutation_fence(GROUP, &name, "other_mutator").unwrap();
+    lose_the_rename(&h, &name);
+
+    let report = startup(&h);
+
+    assert!(report.offline_deleted.is_empty(), "{report:?}");
+    assert_eq!(std::fs::read(h.path(&name)).unwrap(), content);
 }
 
 /// A live pass leaves a file whose barrier is still to run to that barrier.
@@ -266,12 +300,12 @@ async fn with_the_knob_off_every_file_closes_durably_by_itself() {
 }
 
 #[test]
-fn only_macos_defers_by_default_and_zero_opts_out() {
+fn unix_defers_by_default_and_zero_opts_out() {
     use super::completion_window::parse_deferred_flush;
     use yadorilink_local_storage::ReceivedFlushMode::{FsyncThenOneFullFsync, FullFsyncEach};
-    // Unset: the Apple default is the conservative mode (one F_FULLFSYNC per
-    // file, off the critical path); every other platform keeps the per-file flush.
-    let unset = if cfg!(target_vendor = "apple") { Some(FullFsyncEach) } else { None };
+    // Unset: the Unix default is the conservative mode (one full sync per file, off the
+    // critical path, one per distinct parent directory); Windows keeps the per-file flush.
+    let unset = if cfg!(unix) { Some(FullFsyncEach) } else { None };
     assert_eq!(parse_deferred_flush(None), unset);
     // The opt-out, an empty value and anything unrecognised keep the per-file flush.
     assert_eq!(parse_deferred_flush(Some("0")), None);
@@ -574,4 +608,70 @@ async fn a_stop_between_the_unflushed_rename_and_the_commit_never_overwrites_the
             assert!(kept.is_empty(), "intact bytes need no copy: {kept:?}");
         }
     }
+}
+
+/// A received file written with the per-file flush (the default off the batch) has recorded that
+/// its rename is on stable storage by the time the write stops before its commit: a user who
+/// then deletes the file and restarts keeps the delete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_after_a_per_file_flushed_write_stands_across_a_restart() {
+    for fence_moved in [false, true] {
+        delete_after_a_per_file_flushed_write(fence_moved).await;
+    }
+}
+
+async fn delete_after_a_per_file_flushed_write(fence_moved: bool) {
+    use super::receive_window_concurrency_tests::{arm, driver};
+    use super::OverlapProbe;
+    let h = Harness::new(false);
+    pin_concurrency(&h, 4);
+    use_deferred(&h, OFF);
+    let files = names("landed-", 1);
+    let contents = publish_new_files(&h, &files).await;
+    let probe = OverlapProbe::new(super::ProbeSeam::BeforeCommit, 1, 30_000);
+    probe.hold_until_released();
+    arm(&h, &probe);
+    let task = {
+        let (convergence, files) = (h.convergence.clone(), files.clone());
+        tokio::spawn(async move {
+            convergence
+                .reconcile_paths_directly(&driver(), GROUP, files.into_iter().collect())
+                .await
+        })
+    };
+    let waited = std::time::Instant::now();
+    while probe.in_flight() < 1 {
+        assert!(waited.elapsed() < std::time::Duration::from_secs(30), "{:?}", probe.events());
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    task.abort();
+    let _ = task.await;
+    *h.convergence.overlap_probe.lock().unwrap() = None;
+    let name = &files[0];
+    assert!(intent_open(&h, name) && !proven(&h, name), "setup: stopped before the commit");
+    assert!(marker(&h, name).is_some(), "the write recorded that its rename landed");
+    assert_eq!(std::fs::read(h.path(name)).unwrap(), contents[name], "setup: bytes placed");
+
+    if fence_moved {
+        h.state.dag_bump_mutation_fence(GROUP, name, "other_mutator").unwrap();
+    }
+    std::fs::remove_file(h.path(name)).unwrap();
+    let report = startup(&h);
+
+    assert!(
+        !h.path(name).exists(),
+        "the user's delete was undone by repair (fence_moved={fence_moved}): {report:?}"
+    );
+    assert!(report.reconstructed.is_empty(), "{report:?}");
+}
+
+/// Windows never batches its flushes: its files take the per-file path (the temp flushed by its
+/// writer, the name made durable by the write-through move), so no window there has a barrier 1.
+#[test]
+fn windows_never_defers_the_flush_whatever_is_asked() {
+    use super::completion_window::parse_deferred_flush_on;
+    for raw in [None, Some("0"), Some("1"), Some("2"), Some("true")] {
+        assert_eq!(parse_deferred_flush_on(false, raw), None, "{raw:?}");
+    }
+    assert!(parse_deferred_flush_on(true, None).is_some());
 }

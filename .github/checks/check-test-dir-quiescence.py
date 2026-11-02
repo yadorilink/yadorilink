@@ -81,16 +81,25 @@ def check_swallowed(rel: str, text: str) -> list[str]:
     ]
 
 
+def locate(root: Path, name: str) -> Path:
+    """A guarded file lives in a consolidated target's directory (`it`, `it_matrix`) or directly in `tests/`."""
+    for target in ("it", "it_matrix"):
+        consolidated = root / TESTS / target / name
+        if consolidated.is_file():
+            return consolidated
+    return root / TESTS / name
+
+
 def check_tree(root: Path) -> list[str]:
     errors: list[str] = []
     for name in GUARDED:
-        path = root / TESTS / name
+        path = locate(root, name)
         if not path.is_file():
             errors.append(f"{TESTS}/{name}: guarded file is missing; update GUARDED")
             continue
         errors += check_text(path.relative_to(root).as_posix(), path.read_text(encoding="utf-8"))
     for name in SWALLOW_GUARDED:
-        path = root / TESTS / name
+        path = locate(root, name)
         if not path.is_file():
             if name not in GUARDED:
                 errors.append(f"{TESTS}/{name}: guarded file is missing; update SWALLOW_GUARDED")

@@ -21,6 +21,27 @@ use crate::error::{CoreError, Hint};
 struct RegisterDeviceRequest<'a> {
     device_name: &'a str,
     signing_public_key_base64: String,
+    /// Optional OS family the coordination plane lists (web admin "OS" column); omitted when
+    /// this build's target is not one it knows, and ignored by planes that predate the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    platform: Option<&'static str>,
+}
+
+// apple-cfg-file: ios-explicit macOS and iOS are named separately on purpose (the reported platform)
+/// The OS family of this build, as the coordination plane names it. Compile-time: the iOS
+/// app runs this same code in-process, so `target_os = "ios"` is the mobile host.
+fn device_platform() -> Option<&'static str> {
+    if cfg!(target_os = "windows") {
+        Some("windows")
+    } else if cfg!(target_os = "macos") {
+        Some("macos")
+    } else if cfg!(target_os = "ios") {
+        Some("ios")
+    } else if cfg!(target_os = "linux") {
+        Some("linux")
+    } else {
+        None
+    }
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -119,6 +140,7 @@ pub async fn register_device_in(
         &RegisterDeviceRequest {
             device_name: &device_name,
             signing_public_key_base64: signing_public_key_base64.clone(),
+            platform: device_platform(),
         },
         &auth,
     )
@@ -140,6 +162,11 @@ pub async fn register_device_in(
 pub async fn list_devices() -> Result<Vec<DeviceInfo>, CoreError> {
     let auth = require_auth().await?;
     fetch_devices(&auth, crate::ops::shares::own_device_id().as_deref()).await
+}
+
+/// [`list_devices`] against a given coordination session.
+pub async fn list_devices_with(auth: &CoordinationAccess) -> Result<Vec<DeviceInfo>, CoreError> {
+    fetch_devices(auth, None).await
 }
 
 /// The account's devices as this machine presents them; `own_device_id` is

@@ -194,3 +194,22 @@ fn a_brand_new_database_passes_the_replica_generation_check() {
     check_replica_schema_generation(&conn)
         .expect("an empty database at user_version 0 is a first run, not a stale one");
 }
+
+/// A database written by an older build is refused, not migrated, and the refusal says how to save
+/// what the older build set aside before the index is deleted (the recovery items live beside the
+/// index and go with it).
+#[test]
+fn an_older_database_is_refused_with_the_steps_to_save_recovery_items() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1).unwrap();
+    let message = check_schema_version_supported(&conn).unwrap_err().to_string();
+    for needle in [
+        "predates this build",
+        "yadorilink preserved list",
+        "preserved restore",
+        "preserved discard",
+        "recovery-items",
+    ] {
+        assert!(message.contains(needle), "{needle:?} missing from: {message}");
+    }
+}

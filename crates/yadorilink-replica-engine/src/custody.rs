@@ -45,6 +45,20 @@ impl CustodyStamp {
     }
 }
 
+/// What [`FullReplicaCustody::ensure_version_in_store`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreResidency {
+    /// The block store holds every block of the version (it did, or it does now), or this device
+    /// holds no bytes of it that could be lost.
+    InStore,
+    /// The file is not the version on record (edited, replaced or removed since): nothing was put
+    /// into the store and the file must not be treated as the synced bytes.
+    NotTheVersion,
+    /// The version could not be put into the store (no room, a read error, the file not readable as
+    /// a source right now); the reason is for the person.
+    Failed(String),
+}
+
 /// Content-blind custody oracle. A confirmation must identify the authorized
 /// full replica and the membership generation under which it answered. The
 /// same oracle must be able to revalidate that stamp immediately before the
@@ -66,6 +80,22 @@ pub trait FullReplicaCustody {
         version_hash: &VersionHash,
         stamp: &CustodyStamp,
     ) -> bool;
+
+    /// Called with the path locked, immediately before the working-tree bytes of `file_path` are
+    /// dropped: a version this device received (or captured) without copying it may exist only in
+    /// that file, and dropping the file would then drop the only local copy whatever the custody
+    /// answers say. An implementation that has a block store puts the version's blocks there
+    /// (read from the file, each checked against the hash the version lists) unless they already
+    /// are. The default holds nothing and has nothing to lose.
+    fn ensure_version_in_store(
+        &self,
+        _group_id: &str,
+        _path: &str,
+        _file_path: &std::path::Path,
+        _blocks: &[yadorilink_replica_domain::file::BlockInfo],
+    ) -> StoreResidency {
+        StoreResidency::InStore
+    }
 }
 
 // Unit tests (this crate's own, and -- via the `test-support` feature --

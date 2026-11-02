@@ -412,6 +412,23 @@ pub struct OwnedPermitCheck(
 );
 
 impl OwnedPermitCheck {
+    /// Whether verifying `other` would observe exactly what verifying `self` observes: the same
+    /// root sidecar against the same expectation and the same writer lease. A batch commit that
+    /// has verified one of them has verified both.
+    pub fn covers(&self, other: &Self) -> bool {
+        let root_same = match (&self.0, &other.0) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.observes_same_as(b),
+            _ => false,
+        };
+        let lease_same = match (&self.1, &other.1) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.is_same_lease_as(b),
+            _ => false,
+        };
+        root_same && lease_same
+    }
+
     pub fn verify(&self) -> Result<(), RootAuthorityError> {
         if let Some(check) = &self.0 {
             check.verify()?;

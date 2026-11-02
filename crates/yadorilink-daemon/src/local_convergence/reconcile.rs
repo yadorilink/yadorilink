@@ -13,7 +13,7 @@ use yadorilink_replica_domain::session_state::LinkGate;
 use yadorilink_replica_domain::session_state::MaterializationPolicy;
 
 use super::types::*;
-use super::{mode_and_xattrs_match_disk, Election, OwnCaptureOnDisk, OwnCaptureRule, Recapture};
+use super::{exec_matches_disk, Election, OwnCaptureOnDisk, OwnCaptureRule, Recapture};
 use yadorilink_fs_platform::fs_identity::disk_race_fingerprint_or_stat;
 use yadorilink_peer_session::peer_session::*;
 use yadorilink_replica_domain::native_plan::{NativePlannedNode, NativeRowIdentity};
@@ -30,6 +30,15 @@ impl super::LocalConvergenceExecutor {
         if record.deleted || !self.blocks_missing_locally(group_id, &record)? {
             return Ok(None);
         }
+        // A file received without being copied into the store holds its content only as the file
+        // in the folder. Once the path is settled at this version nothing is missing: fetching it
+        // again on every later pass would move the whole file for nothing. A path that has to be in
+        // the store (pinned, leased, the group asked to store) is still fetched into it.
+        if self.settled_at_version(group_id, path, version)
+            && !crate::ingest_policy::must_keep_in_store(&self.state, group_id, path)
+        {
+            return Ok(None);
+        }
         // Sampled now, before anything is requested, so the guard against
         // a local editor writing during the fetch has something from
         // before the window to compare against.
@@ -43,6 +52,20 @@ impl super::LocalConvergenceExecutor {
             record,
             observed_disk,
         }))
+    }
+
+    /// Whether the path's file was written and proven as exactly `version`, and nothing has
+    /// changed it since (the proof is void once the path's mutation fence moves). A proof that
+    /// cannot be read is not a proof.
+    fn settled_at_version(&self, group_id: &str, path: &str, version: &FileVersion) -> bool {
+        let Ok(out_path) = self.local_file_path(group_id, path) else { return false };
+        match self.state.path_settled_at_version(group_id, path, &version.version_hash, &out_path) {
+            Ok(settled) => settled,
+            Err(error) => {
+                tracing::warn!(group_id, path, %error, "cannot read the settlement proof of a path");
+                false
+            }
+        }
     }
 
     /// The content this device is missing locally, from native's
@@ -401,6 +424,7 @@ impl super::LocalConvergenceExecutor {
     /// Thin wrapper over `hold_record`
     /// (see that free function's doc comment) using this session's own
     /// `SyncState`.
+    #[allow(clippy::too_many_arguments)] // one argument per input of the held row
     pub(crate) fn hold(
         &self,
         group_id: &str,
@@ -409,6 +433,7 @@ impl super::LocalConvergenceExecutor {
         origin_device_id: &str,
         authoring: Option<&yadorilink_replica_domain::native_plan::NativeRowIdentity>,
         meta: &yadorilink_replica_domain::session_state::LocalFileMetaColumns,
+        retention: yadorilink_sync_sqlite::retention::Retention<'_>,
     ) -> Result<(), PeerSessionError> {
         let authority = self.root_lease_for(group_id)?;
         let authority_op = authority.begin_operation()?;
@@ -421,6 +446,7 @@ impl super::LocalConvergenceExecutor {
             origin_device_id,
             authoring,
             meta,
+            retention,
             &permit,
         )
     }
@@ -453,7 +479,6 @@ impl super::LocalConvergenceExecutor {
         kind: RecordKind,
         written: &FileVersion,
         mutation_generation: i64,
-        xattrs: &XattrEvidence,
     ) -> Result<Option<SettlementEvidence>, PeerSessionError> {
         let current_version = self
             .state
@@ -469,26 +494,6 @@ impl super::LocalConvergenceExecutor {
         }
         let version = written.version_hash;
         let out_path = self.local_file_path(group_id, path)?;
-        // The `ExactObject` proof gate: `version_hash` bakes replicated
-        // xattr bytes directly into its identity (`FileVersion::compute_
-        // hash`), so this evidence must never claim exactness without a
-        // strict, on-disk confirmation that they actually landed --
-        // `apply_xattrs` itself never surfaces a `fsetxattr`/`fremovexattr`
-        // failure as an `Err`, so nothing upstream of this call would
-        // otherwise ever catch one. Scoped to `RecordKind::File` only,
-        // matching `verify_replicated_xattrs_exact`'s own contract: a
-        // symlink/directory version's `xattrs` is always empty (never
-        // scanned, see `FileMeta::xattrs`'s own doc) and its path must
-        // never be opened with symlink-following semantics here (a
-        // dangling symlink is perfectly valid and has no followable
-        // target at all).
-        //
-        // A caller that just wrote the file passes the attempt's own
-        // confirmation, taken before the final mode was applied; one that
-        // did not passes `ReproveFromDisk`, and disk is re-read strictly.
-        if kind == RecordKind::File {
-            require_xattr_evidence(path, &out_path, &written.meta.xattrs, xattrs)?;
-        }
         // Defense-in-depth: `FileVersion`
         // accepts `RecordKind::Directory` (and, in principle, a
         // `RecordKind::Symlink` whose disk object is something else
@@ -527,6 +532,26 @@ impl super::LocalConvergenceExecutor {
         self.blocks_missing_locally_in_batch(group_id, record, None)
     }
 
+    /// Whether the settle still has to obtain `record`'s content: its blocks are not held locally
+    /// and no completely written temp of exactly this version (single-pass receive of a large file)
+    /// stands for them. A ready temp does not stand for a path that must be in the block store
+    /// (pinned, leased, the group asked to store), even one that became so after the temp was
+    /// begun: the temp is a file, and the version the promise covers has to be in the store.
+    pub(crate) fn content_missing_for_settle(
+        &self,
+        group_id: &str,
+        record: &FileRecord,
+        version_hex: &str,
+    ) -> Result<bool, PeerSessionError> {
+        if !self.blocks_missing_locally(group_id, record)? {
+            return Ok(false);
+        }
+        if !self.filled_temps.holds(group_id, &record.path, version_hex) {
+            return Ok(true);
+        }
+        Ok(crate::ingest_policy::must_keep_in_store(&self.state, group_id, &record.path))
+    }
+
     /// As [`Self::blocks_missing_locally`], but a block an earlier file in the
     /// same reconciliation window already obtained counts as held even though
     /// its provenance row is still queued behind that window's batch flush.
@@ -545,11 +570,45 @@ impl super::LocalConvergenceExecutor {
             group_id,
             &record.blocks.iter().map(|b| b.hash.clone()).collect::<Vec<_>>(),
         )?;
-        Ok(record.blocks.iter().zip(present).any(|(block, present)| {
-            !present
-                || !(provenance.contains(&block.hash)
-                    || batch.is_some_and(|b| b.already_known(&block.hash)))
-        }))
+        let mut rests_on_the_pass = false;
+        let missing = record.blocks.iter().zip(present).any(|(block, present)| {
+            if !present {
+                return true;
+            }
+            // The store this check asks answers for the blocks any pass holds in memory too (of
+            // any group), so a block can be "present" with this group's provenance from an earlier
+            // life (stored, then reclaimed) while the only copy is in memory, here or in another
+            // group's pass.
+            if self.window_blocks.contains(&hex::encode(&block.hash)) {
+                rests_on_the_pass = true;
+            }
+            if provenance.contains(&block.hash) {
+                return false;
+            }
+            // A block this group's pass keeps in memory has no provenance row (nothing durable
+            // attests to it) and is held exactly for the pass that fetched it.
+            if batch.is_some_and(|b| b.already_known(&block.hash))
+                || self.window_blocks.held_for(group_id, &hex::encode(&block.hash))
+            {
+                rests_on_the_pass = true;
+                return false;
+            }
+            true
+        });
+        if missing || !rests_on_the_pass {
+            return Ok(missing);
+        }
+        // Every block is held, but some only because this pass fetched it or keeps it in memory. A
+        // path that must be in the block store (pinned, leased, the group asked to store) needs the
+        // store itself, with this group's provenance: otherwise a path whose own commit failed
+        // would be built from a block a neighbouring path holds in memory, and its promised
+        // version would be left with its file alone.
+        if crate::ingest_policy::must_keep_in_store(&self.state, group_id, &record.path) {
+            let durable = self.durable_store.present_blocks(&hashes)?;
+            return Ok(durable.iter().any(|held| !held)
+                || record.blocks.iter().any(|b| !provenance.contains(&b.hash)));
+        }
+        Ok(false)
     }
 
     /// defense-in-depth check before writing through `out_path`
@@ -653,6 +712,20 @@ impl super::LocalConvergenceExecutor {
             return Ok(HeadroomReservation { held: None });
         }
         let root = self.sync_root(group_id)?;
+        self.preflight_disk_headroom_on(root, target_path, additional_bytes)
+    }
+
+    /// [`Self::preflight_disk_headroom`] for a write into the volume holding `root`, which is
+    /// not always the sync root (a write into the block store spends the store's volume).
+    pub(crate) fn preflight_disk_headroom_on(
+        &self,
+        root: std::path::PathBuf,
+        target_path: &Path,
+        additional_bytes: u64,
+    ) -> Result<HeadroomReservation, PeerSessionError> {
+        if !self.headroom_enforced() {
+            return Ok(HeadroomReservation { held: None });
+        }
         let volume_key = volume_key(&root);
         #[cfg(any(test, feature = "test-support"))]
         let volume_key = self
@@ -1199,6 +1272,7 @@ impl super::LocalConvergenceExecutor {
         // and the batched route defers here precisely so there is one such
         // place rather than two.
         if let Some(reason) = self.hazard_reason_for(group_id, &record).await? {
+            let proofs = self.proofs_before_replacing(group_id, &record).await?;
             let authority = self.root_lease_for(group_id)?;
             let authority_op = authority.begin_operation()?;
             let permit = authority_op.permit();
@@ -1210,6 +1284,7 @@ impl super::LocalConvergenceExecutor {
                 &projected.device_id,
                 projected_authoring.as_ref(),
                 &columns,
+                yadorilink_sync_sqlite::retention::Retention::Proofs(&proofs),
                 &permit,
             )?;
             // Durable: `hold_record` upserts the incoming record with its
@@ -1301,7 +1376,7 @@ impl super::LocalConvergenceExecutor {
                     && self.state.is_local_capture_head(group_id, target_path, &projected)?;
                 let content_matches = content_matches
                     && (!own_capture
-                        || mode_and_xattrs_match_disk(
+                        || exec_matches_disk(
                             &self.sync_root(group_id)?.join(target_path),
                             &version,
                         )?);
@@ -1326,12 +1401,17 @@ impl super::LocalConvergenceExecutor {
                         let authority = self.root_lease_for(group_id)?;
                         let authority_op = authority.begin_operation()?;
                         let permit = authority_op.permit();
+                        // The content already matches the index, so the replaced row keeps the same
+                        // blocks and there is nothing to prove; a row that did not would be refused.
                         self.state.apply_projected_row_atomic(
                             group_id,
                             &record,
                             &projected.device_id,
                             projected_authoring.as_ref(),
                             &columns,
+                            yadorilink_sync_sqlite::retention::Retention::Proofs(
+                                &yadorilink_sync_sqlite::retention::RetentionProofs::new(),
+                            ),
                             &permit,
                         )?;
                     }
@@ -1384,29 +1464,24 @@ impl super::LocalConvergenceExecutor {
                     // retained-only, never blocking, but not "never even
                     // attempted" either), and attempting it is a real
                     // mutating syscall needing the same preceding bump.
-                    let mode_and_xattrs_match = mode_and_xattrs_match_disk(&out_path, &version)?;
-                    // An own capture whose mode or attributes moved on never
-                    // got here (see `content_matches` above). An mtime that
-                    // alone differs is not an edit capture records, and not
-                    // that change's to undo either: it is left as it is,
-                    // and mtime is retained-only in the settlement.
-                    let metadata_already_matches_disk = mode_and_xattrs_match
+                    let exec_matches = exec_matches_disk(&out_path, &version)?;
+                    // An own capture whose flag moved on never got here (see
+                    // `content_matches` above). An mtime that alone differs is not
+                    // an edit capture records, and not that change's to undo either:
+                    // it is left as it is, and mtime is retained-only in the
+                    // settlement.
+                    let metadata_already_matches_disk = exec_matches
                         && (own_capture
                             || yadorilink_local_storage::mtime_already_matches_disk(
                                 &out_path,
                                 version.meta.mtime_unix_nanos,
                             )?);
-                    let (mutation_generation, xattr_evidence) = if metadata_already_matches_disk {
-                        // This path's bytes were verified (not written)
-                        // identical to the desired version above
-                        // (`content_matches`), and metadata already matches
-                        // too -- a genuine *snapshot*, never a bump, since
-                        // no mutating syscall occurs here. Nothing written,
-                        // so the xattrs are proved from disk.
-                        (
-                            self.state.dag_snapshot_mutation_fence(group_id, target_path)?,
-                            XattrEvidence::ReproveFromDisk,
-                        )
+                    let mutation_generation = if metadata_already_matches_disk {
+                        // This path's bytes were verified (not written) identical to
+                        // the desired version above (`content_matches`), and metadata
+                        // already matches too -- a genuine *snapshot*, never a bump,
+                        // since no mutating syscall occurs here.
+                        self.state.dag_snapshot_mutation_fence(group_id, target_path)?
                     } else {
                         let fence = self.state.dag_bump_mutation_fence(
                             group_id,
@@ -1419,19 +1494,12 @@ impl super::LocalConvergenceExecutor {
                             &out_path,
                             version.meta.mtime_unix_nanos,
                         )?;
-                        let applied = yadorilink_local_storage::apply_file_metadata_verified(
+                        yadorilink_local_storage::apply_file_metadata(
                             &out_path,
-                            version.meta.unix_mode,
-                            &version.meta.xattrs,
+                            version.meta.exec,
                         )?;
-                        (fence, XattrEvidence::from(applied))
+                        fence
                     };
-                    require_xattr_evidence(
-                        target_path,
-                        &out_path,
-                        &version.meta.xattrs,
-                        &xattr_evidence,
-                    )?;
                     // A path held because its file was unreadable settles
                     // here once it is readable again; the hold goes with it.
                     self.state.clear_metadata_unprovable_hold(group_id, target_path)?;

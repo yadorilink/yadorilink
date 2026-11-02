@@ -184,13 +184,23 @@ struct TestDevice {
     _index_dir: tempfile::TempDir,
 }
 
-async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
+async fn setup_device(
+    account: &TestAccount,
+    name: &str,
+    intervals: yadorilink_daemon::daemon_state::StateIntervals,
+) -> TestDevice {
     let device_id = support::register_device(account, name, [0u8; 32]).await;
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let sync_state = Arc::new(sync_state);
-    let state = DaemonState::new(device_id.clone(), sync_state, store);
+    let state = yadorilink_daemon::test_support::isolated_daemon_state_with(
+        intervals,
+        None,
+        device_id.clone(),
+        sync_state,
+        store,
+    );
     // Give the device a change-signing key before its link watch starts, so the
     // change-DAG emitter is wired and local edits actually propagate. Without
     // this, nothing this device writes is ever emitted to its peers.
@@ -687,15 +697,16 @@ async fn run_chaos(seed: u64) {
             panic!("MONKEY_CHAOS_DIAG_SWEEP_SECS={raw:?} is not a whole number of seconds: {e}")
         }),
     };
-    yadorilink_daemon::daemon_state::set_default_materialization_repair_sweep_interval_for_tests(
-        Duration::from_secs(sweep_secs),
-    );
+    let intervals = yadorilink_daemon::daemon_state::StateIntervals {
+        materialization_repair_sweep: Some(Duration::from_secs(sweep_secs)),
+        ..Default::default()
+    };
     let coordination_addr = support::start_coordination_server().await;
     let account = support::register_and_login(&coordination_addr, "monkey-chaos@example.com").await;
 
     let mut devices = Vec::with_capacity(DEVICE_COUNT);
     for i in 0..DEVICE_COUNT {
-        devices.push(setup_device(&account, &format!("device-{i}")).await);
+        devices.push(setup_device(&account, &format!("device-{i}"), intervals).await);
     }
     let group_id = support::create_folder_group(&account, "monkey-chaos-group").await;
     for device in &devices {

@@ -31,6 +31,17 @@ withdrawn or kill-switched version, a replayed manifest and a downgrade (even wi
 refused with the existing install unchanged, and `yadorilink uninstall` (Windows:
 `install.ps1 -Uninstall`) removes the programs and keeps the user's data.
 
+### The existing data is checked before anything is installed
+
+After the bundle is verified and before any file is replaced, the installers run the new
+bundle's `yadorilink-daemon --check-data-compat`. It reads the schema version stamped on the
+data already on the machine (the sync-state database, opened read-only, write-ahead log included;
+nothing is created or changed) and answers by exit status: `0` the data can be used, there is
+none, or it is older than the bundle reads (a warning); `20` it was written by a newer build, so
+installing would be a downgrade; `21` it could not be read. `20` and `21` stop the install
+(exit 20 and 21 of the installer) with nothing changed. A bundle from before the check (status
+`2`) installs with a note.
+
 ### Building the programs for the acceptance scripts
 
 The daemon verifies manifests against a key compiled into it, so the programs

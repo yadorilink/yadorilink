@@ -44,7 +44,7 @@ fn new_test_daemon(device_id: &str) -> Arc<DaemonState> {
     // tears the temp dir down on exit.
     let store = Arc::new(SegmentBlockStore::new(Box::leak(Box::new(store_dir)).path()).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
-    DaemonState::new(device_id.to_string(), sync_state, store)
+    yadorilink_daemon::test_support::isolated_daemon_state(device_id.to_string(), sync_state, store)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -145,85 +145,117 @@ impl Listener {
             return Outcome::NotTheRedirect;
         }
 
-        let mut code = None;
-        let mut state = None;
-        let mut error = None;
-        let mut iss = None;
-        for (key, value) in url.query_pairs() {
-            match key.as_ref() {
-                "code" => code = Some(value.into_owned()),
-                "state" => state = Some(value.into_owned()),
-                "error" => error = Some(value.into_owned()),
-                "iss" => iss = Some(value.into_owned()),
-                _ => {}
-            }
-        }
+        let (outcome, status, message) = judge_redirect(&url, expected_state, expected_issuer);
+        reply(&mut reader, status, message).await;
+        outcome
+    }
+}
 
-        // The state check comes FIRST, before the error is read and before the
-        // code is touched. A redirect this process did not start says nothing
-        // about this process's login, including when it says it failed.
-        if state.as_deref() != Some(expected_state) {
-            reply(&mut reader, 400, "This sign-in did not come from the login you started.").await;
-            return Outcome::Refused(
+/// What a redirect to the callback means for the login that started it, and the page to answer
+/// a browser with. Shared with the redirect a pairing sign-in follows itself (no browser):
+/// `state` and `iss` are checked before the error or the code is trusted either way.
+pub(super) fn code_from_redirect(
+    url: &Url,
+    expected_state: &str,
+    expected_issuer: &str,
+) -> Result<String, CoreError> {
+    match judge_redirect(url, expected_state, expected_issuer).0 {
+        Outcome::Code(code) => Ok(code),
+        Outcome::Refused(reason) => Err(CoreError::AuthFailed(reason)),
+        Outcome::NotTheRedirect => Err(CoreError::AuthFailed(
+            "the sign-in did not come back to the redirect this command registered".to_owned(),
+        )),
+    }
+}
+
+fn judge_redirect(
+    url: &Url,
+    expected_state: &str,
+    expected_issuer: &str,
+) -> (Outcome, u16, &'static str) {
+    let mut code = None;
+    let mut state = None;
+    let mut error = None;
+    let mut iss = None;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "code" => code = Some(value.into_owned()),
+            "state" => state = Some(value.into_owned()),
+            "error" => error = Some(value.into_owned()),
+            "iss" => iss = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+
+    // The state check comes FIRST, before the error is read and before the
+    // code is touched. A redirect this process did not start says nothing
+    // about this process's login, including when it says it failed.
+    if state.as_deref() != Some(expected_state) {
+        return (
+            Outcome::Refused(
                 "the sign-in that came back does not match the one this command started; \
                  nothing was written to the credential store"
                     .to_owned(),
-            );
-        }
+            ),
+            400,
+            "This sign-in did not come from the login you started.",
+        );
+    }
 
-        // `iss` next, before the error/code are trusted: FAPI 2.0 Final
-        // requires the Authorization Server to return an `iss` response
-        // parameter and the client to verify it against the issuer this
-        // login actually discovered against, precisely because `state`
-        // alone does not rule out a mix-up attack -- a malicious or
-        // misconfigured second Authorization Server that also happens to
-        // learn this process's `state` value could otherwise redirect here
-        // with its OWN code/error and be trusted as if it were the real
-        // issuer. `oidc-provider` sends this unconditionally on every
-        // authorization response; a redirect missing it, or naming a
-        // different issuer, is refused the same way an unmatched `state` is.
-        match iss.as_deref() {
-            Some(actual) if actual == expected_issuer => {}
-            Some(_) | None => {
-                reply(&mut reader, 400, "This sign-in did not come from the expected server.")
-                    .await;
-                return Outcome::Refused(
+    // `iss` next, before the error/code are trusted: FAPI 2.0 Final
+    // requires the Authorization Server to return an `iss` response
+    // parameter and the client to verify it against the issuer this
+    // login actually discovered against, precisely because `state`
+    // alone does not rule out a mix-up attack -- a malicious or
+    // misconfigured second Authorization Server that also happens to
+    // learn this process's `state` value could otherwise redirect here
+    // with its OWN code/error and be trusted as if it were the real
+    // issuer. `oidc-provider` sends this unconditionally on every
+    // authorization response; a redirect missing it, or naming a
+    // different issuer, is refused the same way an unmatched `state` is.
+    match iss.as_deref() {
+        Some(actual) if actual == expected_issuer => {}
+        Some(_) | None => {
+            return (
+                Outcome::Refused(
                     "the sign-in's `iss` did not match the issuer this login discovered against; \
                      nothing was written to the credential store"
                         .to_owned(),
-                );
-            }
+                ),
+                400,
+                "This sign-in did not come from the expected server.",
+            );
         }
+    }
 
-        if let Some(error) = error {
-            reply(&mut reader, 200, "You were not signed in. You can close this page.").await;
-            // The server's own code, which is a fixed OAuth vocabulary, not
-            // free text it chose: `access_denied`, `invalid_scope` and so on.
-            return Outcome::Refused(format!(
+    if let Some(error) = error {
+        // The server's own code, which is a fixed OAuth vocabulary, not
+        // free text it chose: `access_denied`, `invalid_scope` and so on.
+        return (
+            Outcome::Refused(format!(
                 "the Authorization Server refused the sign-in ({error}); \
                  nothing was written to the credential store"
-            ));
-        }
+            )),
+            200,
+            "You were not signed in. You can close this page.",
+        );
+    }
 
-        match code {
-            Some(code) if !code.is_empty() => {
-                reply(
-                    &mut reader,
-                    200,
-                    "Signed in. You can close this page and go back to the terminal.",
-                )
-                .await;
-                Outcome::Code(code)
-            }
-            _ => {
-                reply(&mut reader, 400, "The sign-in did not complete.").await;
-                Outcome::Refused(
-                    "the sign-in came back with no authorization code; nothing was written to \
-                     the credential store"
-                        .to_owned(),
-                )
-            }
-        }
+    match code {
+        Some(code) if !code.is_empty() => (
+            Outcome::Code(code),
+            200,
+            "Signed in. You can close this page and go back to the terminal.",
+        ),
+        _ => (
+            Outcome::Refused(
+                "the sign-in came back with no authorization code; nothing was written to \
+                 the credential store"
+                    .to_owned(),
+            ),
+            400,
+            "The sign-in did not complete.",
+        ),
     }
 }
 

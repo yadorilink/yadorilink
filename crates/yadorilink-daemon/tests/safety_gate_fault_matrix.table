@@ -18,7 +18,7 @@ delegate | 2.1 | seam:fail_directory_barrier_for_test | crates/yadorilink-daemon
 delegate | 2.1 |  | crates/yadorilink-daemon/src/replica_coordinator/materialization_execution/tests.rs::eviction_must_not_delete_block_used_by_hydrated_file_in_another_group
 # ---- 2.2 losing a full-replica role ----
 delegate | 2.2 |  | crates/yadorilink-daemon/src/application/replica_role_service/tests.rs::last_full_replica_cannot_unlink
-delegate | 2.2 |  | crates/yadorilink-daemon/tests/role_loss_saga.rs::ambiguous_demote_keeps_prepared_journal
+delegate | 2.2 |  | crates/yadorilink-daemon/tests/it/role_loss_saga.rs::ambiguous_demote_keeps_prepared_journal
 # ---- 2.3 garbage collection ----
 delegate | 2.3 |  | crates/yadorilink-daemon/src/gc/tests.rs::gc_must_not_delete_old_deduplicated_block_adopted_after_live_snapshot
 # ---- 2.4 materialization, journal and startup repair ----
@@ -32,8 +32,10 @@ delegate | 2.4 | seam:set_test_namespace_refusal,UnavailableReason::Unsupported 
 delegate | 2.4 | Failpoint::BeforeCapture,Failpoint::AfterCapture,Failpoint::AfterTargetDurable,Failpoint::AfterRecoveryItem,Failpoint::AfterRemoteOnlyFiles,Failpoint::AfterRemoteOnlyRow,Failpoint::BeforeManifest,Failpoint::AfterManifest,Failpoint::AtPreserved | crates/yadorilink-sync-sqlite/src/native_bootstrap/tests/rebootstrap_crash.rs::a_stop_at_every_failpoint_restarts_clean
 delegate | 2.4 |  | crates/yadorilink-daemon/tests/rewind_crash_failpoints.rs::crash_between_chunks
 # ---- 2.5 conflicts ----
-delegate | 2.5 |  | crates/yadorilink-daemon/tests/conflict_resolution.rs::keep_this_refuses_while_the_original_has_an_unrecorded_edit
+delegate | 2.5 |  | crates/yadorilink-daemon/tests/it/conflict_resolution.rs::keep_this_refuses_while_the_original_has_an_unrecorded_edit
 delegate | 2.5 |  | crates/yadorilink-replica-domain/src/native_fork/tests.rs::a_full_bucket_of_unrelated_equal_heads_refuses_instead_of_dropping
+delegate | 2.5 |  | crates/yadorilink-daemon/tests/it/offline_conflict_refused_flush.rs::a_refused_flush_on_device_a_is_retried_and_both_versions_end_on_both_devices
+delegate | 2.5 |  | crates/yadorilink-daemon/tests/it/offline_conflict_refused_flush.rs::a_refused_flush_on_device_b_is_retried_and_both_versions_end_on_both_devices
 # ---- 2.6 admission and authority ----
 case | path_escape.planted_symlink | 2.6 |  | A write through a planted symlink is refused (PathEscapesRoot); nothing is created outside the root; retry inside the root works
 delegate | 2.6 |  | crates/yadorilink-replica-domain/src/proof_carrying_delta/tests.rs::a_delta_for_another_group_is_refused
@@ -47,6 +49,9 @@ delegate | 2.7 | seam:arm_post_identity_race_hook | crates/yadorilink-local-capt
 delegate | 2.8 |  | crates/yadorilink-daemon/tests/unreadable_file_convergence.rs::an_unreadable_local_file_is_not_overwritten_by_a_same_name_remote_file
 delegate | 2.8 |  | crates/yadorilink-daemon/tests/unreadable_file_convergence.rs::healthy_files_converge_while_an_unreadable_file_sits_in_the_root
 delegate | 2.8 |  | crates/yadorilink-daemon/tests/unreadable_file_attention.rs::an_unreadable_file_shows_up_and_clears_when_permission_is_restored
+delegate | 2.8 |  | crates/yadorilink-sync-sqlite/src/file_index/block_list_tests.rs::a_block_list_that_does_not_add_up_is_refused_and_leaves_no_row
+delegate | 2.8 |  | crates/yadorilink-sync-sqlite/src/file_index/block_list_tests.rs::a_damaged_row_can_be_deleted_and_overwritten
+delegate | 2.8 |  | crates/yadorilink-daemon/tests/index_damaged_attention.rs::a_damaged_record_marks_its_own_folder_and_the_mark_goes_when_it_is_repaired
 # ---- 2.9 restored or copied database, start over, replaced device ----
 case | witness.side_unreadable | 2.9 | Restored::Unverifiable | An unreadable installation witness refuses the open (unverifiable) and is not rewritten; start over records a fresh witness
 case | witness.other_install | 2.9 | Restored::DifferentInstall | A database of another installation is refused (different_install); the side copy is untouched; start over recovers
@@ -104,6 +109,30 @@ case | disk_pressure.hysteresis | 3 |  | The waiting-for-space state does not cl
 case | generation.torn_newest | 3 |  | A torn newest generation is never read as the clean latest record; the older complete generation is kept; the next publish recovers
 case | generation.unreadable_newest | 3 |  | An unreadable newest generation makes the record unproven (Invalid), never a first run; the next publish recovers
 case | generation.resurrected_after_retirement | 3 |  | A retired record stays retired when an old generation comes back; a new publish revives it
+# ---- single-pass receive: content in no durable store until it is placed ----
+# Barrier 1 (the temp's data and directory entry are durable before the rename), the cut around it,
+# repair standing a write down over the previous version, resuming a partly filled temp, and the rule
+# that a pinned or leased path is settled only from the block store.
+delegate | 3 | seam:fail_received_flushes_of | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::a_failed_barrier_one_renames_nothing_and_the_next_pass_places_both_files
+delegate | 3 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::a_temp_is_flushed_with_its_directory_before_it_is_renamed
+delegate | 3 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::the_temp_of_a_large_file_gets_its_directory_flushed_before_the_rename
+delegate | 3 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::a_temp_swapped_after_barrier_one_is_refused_before_the_rename
+delegate | 3 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::a_temp_written_in_place_after_barrier_one_is_flushed_again_by_barrier_two
+delegate | 2.4 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::a_receive_dropped_while_it_waits_for_barrier_one_never_leaves_a_witness_for_a_missing_temp
+delegate | 2.4 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::gate_a_cut_between_barrier_one_and_the_rename_keeps_the_temp_and_the_file_is_fetched_again
+delegate | 2.4 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::gate_a_cut_between_barrier_one_and_the_rename_of_a_replacement_keeps_the_old_version
+delegate | 2.4 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::a_replacement_whose_barrier_one_failed_survives_a_restart_without_a_conflict_copy
+delegate | 2.7 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::a_user_edit_over_the_previous_version_is_kept_by_the_repair_after_a_failed_barrier_one
+delegate | 2.7 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::a_user_edit_after_the_stand_down_is_not_overwritten_by_the_retry
+delegate | 2.7 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::a_block_damaged_in_the_kept_temp_is_fetched_again
+delegate | 2.7 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::a_kept_temp_replaced_by_another_file_is_neither_used_nor_removed
+delegate | 2.7 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::a_kept_temp_that_was_removed_is_replaced_by_a_fresh_one
+delegate | 2.3 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::a_pinned_path_whose_store_commit_failed_is_not_settled_from_a_neighbours_memory_block
+delegate | 2.3 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::a_block_shared_with_an_unpinned_file_still_reaches_the_store_for_a_pinned_one
+delegate | 2.3 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::the_already_fetched_shortcut_does_not_skip_a_block_a_pinned_path_needs_in_the_store
+delegate | 2.3 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::an_old_provenance_row_does_not_stand_in_for_a_store_copy_of_a_pinned_path
+delegate | 2.3 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::a_ready_temp_is_not_taken_for_a_path_pinned_meanwhile
+delegate | 2.3 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::another_groups_memory_block_does_not_satisfy_a_pinned_path
 # ---- injection seams of other gates ----
 delegate | 2.8 | seam:fail_placeholder_reads_for_path | crates/yadorilink-daemon/src/local_convergence/own_head_recapture_tests.rs::an_unreadable_placeholder_generation_stops_all_three_paths
 delegate | 2.8 | seam:fail_state_reads_for_path | crates/yadorilink-daemon/src/local_convergence/own_head_recapture_tests.rs::an_unreadable_materialization_state_never_brings_back_a_deleted_file

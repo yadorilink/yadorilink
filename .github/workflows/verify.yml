@@ -234,7 +234,7 @@ jobs:
         with:
           cache-key: linux-${{ matrix.lane }}
           token: ${{ github.token }}
-      # tests/release_manifest_chain.rs drives the Python manifest verifier.
+      # tests/it/release_manifest_chain.rs drives the Python manifest verifier.
       - if: matrix.python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -267,6 +267,12 @@ jobs:
         with:
           cache-key: linux-simulation
           token: ${{ github.token }}
+      # tests/it/release_manifest_chain.rs drives the Python manifest verifier; the target
+      # is built here for its simulation lint modules.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: python3 -m pip install --quiet --disable-pip-version-check cryptography
       - name: Turmoil scenarios, one seed
         env:
           RUSTFLAGS: --cfg turmoil
@@ -277,10 +283,14 @@ jobs:
           -- --test-threads=1
       - name: Simulation harness lints and conformance
         if: always()
-        run: >-
-          .github/checks/run-logged.sh cargo test -p yadorilink-daemon
-          --test dst_fidelity_lint
-          --test watcher_decompose_conformance
+        run: |
+          # A filter that matches nothing makes cargo pass with zero tests, so each module must
+          # still be listed in the target before it is run.
+          for module in dst_fidelity_lint watcher_decompose_conformance; do
+            cargo test -p yadorilink-daemon --test it -- --list "${module}::" | grep ': test$' >/dev/null \
+              || { echo "no test of it is under ${module}::" >&2; exit 1; }
+          done
+          .github/checks/run-logged.sh cargo test -p yadorilink-daemon --test it -- dst_fidelity_lint:: watcher_decompose_conformance::
       - name: Simulation harness unit tests
         if: always()
         env:
@@ -387,7 +397,7 @@ jobs:
         with:
           cache-key: macos-${{ matrix.lane }}
           token: ${{ github.token }}
-      # tests/release_manifest_chain.rs drives the Python manifest verifier.
+      # tests/it/release_manifest_chain.rs drives the Python manifest verifier.
       - if: matrix.lane == 'daemon integration'
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:

@@ -10,6 +10,7 @@ pub mod feedback;
 pub mod gc;
 pub mod handoff;
 pub mod ignore;
+pub mod kept_installer;
 pub mod limits;
 pub mod link;
 pub mod local_time;

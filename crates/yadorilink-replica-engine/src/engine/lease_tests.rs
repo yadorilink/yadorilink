@@ -23,10 +23,9 @@ fn version() -> FileVersion {
         4,
         FileMeta {
             mtime_unix_nanos: 0,
-            unix_mode: None,
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     )
 }
@@ -34,6 +33,16 @@ fn version() -> FileVersion {
 struct Evidence {
     current: FileVersion,
     blocks_verify: AtomicBool,
+    /// How many times the responder was asked to bring the version into its store, and whether
+    /// the verification that followed came after the last such ask.
+    ensured: AtomicUsize,
+    /// While set, reading a block back does not finish: a version too large to verify within the
+    /// time a requester waits.
+    stall: AtomicBool,
+    /// The version stops being the path's current root after this many reads of the root.
+    root_reads_left: AtomicUsize,
+    /// Full read-backs done.
+    verified: AtomicUsize,
 }
 
 impl DurabilityEvidencePort for Evidence {
@@ -48,6 +57,13 @@ impl DurabilityEvidencePort for Evidence {
         _: &FolderGroupId,
         _: &SyncPath,
     ) -> Result<Option<DurabilityRoot>, ReplicaEngineError> {
+        let left = self.root_reads_left.load(Ordering::SeqCst);
+        if left == 0 {
+            return Ok(None);
+        }
+        if left != usize::MAX {
+            self.root_reads_left.store(left - 1, Ordering::SeqCst);
+        }
         Ok(Some(DurabilityRoot { version: self.current.clone(), deleted: false }))
     }
     fn retained_roots(
@@ -64,7 +80,18 @@ impl DurabilityEvidencePort for Evidence {
     ) -> Result<bool, ReplicaEngineError> {
         Ok(true)
     }
+    fn ensure_version_in_store(&self, _: &FolderGroupId, _: &SyncPath, _: &[VersionBlock]) {
+        self.ensured.fetch_add(1, Ordering::SeqCst);
+    }
+    fn blocks_in_store(&self, _: &[BlockHash]) -> bool {
+        true
+    }
     fn verify_block(&self, _: &BlockHash) -> Result<(), ReplicaEngineError> {
+        while self.stall.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        self.verified.fetch_add(1, Ordering::SeqCst);
+        assert!(self.ensured.load(Ordering::SeqCst) > 0, "verified before the store was asked");
         if self.blocks_verify.load(Ordering::SeqCst) {
             Ok(())
         } else {
@@ -134,6 +161,13 @@ impl CustodyLeasePort for Leases {
 }
 
 fn engine(verifies: bool) -> (PeerReplicaEngine, Arc<Leases>, Arc<Evidence>, DurableVersionQuery) {
+    engine_waiting(verifies, std::time::Duration::from_secs(5))
+}
+
+fn engine_waiting(
+    verifies: bool,
+    wait: std::time::Duration,
+) -> (PeerReplicaEngine, Arc<Leases>, Arc<Evidence>, DurableVersionQuery) {
     let current = version();
     let query = DurableVersionQuery {
         folder_group_id: GROUP.into(),
@@ -143,13 +177,31 @@ fn engine(verifies: bool) -> (PeerReplicaEngine, Arc<Leases>, Arc<Evidence>, Dur
         version_hash: current.version_hash.as_bytes().to_vec(),
         block_sizes: current.blocks.iter().map(|b| b.size).collect(),
     };
-    let evidence = Arc::new(Evidence { current, blocks_verify: AtomicBool::new(verifies) });
-    let leases = Arc::new(Leases::default());
-    let engine = PeerReplicaEngine::new(ReplicaEngineDependencies {
-        durability: evidence.clone(),
-        leases: leases.clone(),
+    let evidence = Arc::new(Evidence {
+        current,
+        blocks_verify: AtomicBool::new(verifies),
+        ensured: AtomicUsize::new(0),
+        stall: AtomicBool::new(false),
+        root_reads_left: AtomicUsize::new(usize::MAX),
+        verified: AtomicUsize::new(0),
     });
+    let leases = Arc::new(Leases::default());
+    let engine = PeerReplicaEngine::with_proof_wait(
+        ReplicaEngineDependencies { durability: evidence.clone(), leases: leases.clone() },
+        wait,
+    );
     (engine, leases, evidence, query)
+}
+
+/// Both custody answers (a handoff check and a lease) first ask the responder to bring the version
+/// into its store, so that a copy that is only a file in its folder is verified from the store.
+#[test]
+fn both_custody_answers_bring_the_version_into_the_store_before_verifying() {
+    let (engine, _, evidence, query) = engine(true);
+    assert!(engine.holds_version_durably(&query).present);
+    assert_eq!(evidence.ensured.load(Ordering::SeqCst), 1);
+    assert!(engine.acquire_custody_lease(REQUESTER, &query, 1, TOKEN).present);
+    assert_eq!(evidence.ensured.load(Ordering::SeqCst), 2);
 }
 
 /// A responder that cannot commit the lease row (a crash or a failed write
@@ -224,4 +276,106 @@ fn an_acquire_the_lease_store_refuses_is_not_acknowledged() {
     leases.refuse.store(true, Ordering::SeqCst);
     assert!(!engine.acquire_custody_lease(REQUESTER, &query, 1, TOKEN).present);
     assert!(leases.held.lock().unwrap().is_empty());
+}
+
+/// A proof that outlasts the wait does not time every retry out: the requests that arrive while
+/// it runs answer "not held" without starting a second one, and the retry after it finished is
+/// handed its result once.
+#[test]
+fn a_proof_slower_than_the_wait_runs_once_and_the_retry_gets_its_result() {
+    let (engine, leases, evidence, query) =
+        engine_waiting(true, std::time::Duration::from_millis(40));
+    evidence.stall.store(true, Ordering::SeqCst);
+    // Still being proved: not held yet, and said to be in progress rather than refused.
+    for answer in [
+        engine.holds_version_durably(&query),
+        engine.holds_version_durably(&query),
+        engine.acquire_custody_lease(REQUESTER, &query, 1, TOKEN),
+    ] {
+        assert!(!answer.present);
+        assert!(answer.in_progress);
+    }
+    assert_eq!(evidence.ensured.load(Ordering::SeqCst), 1, "one proof for all three requests");
+    assert!(leases.held.lock().unwrap().is_empty());
+
+    evidence.stall.store(false, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    while !engine.holds_version_durably(&query).present {
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "proof never finished");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(evidence.ensured.load(Ordering::SeqCst), 1, "the retry took the finished proof");
+    assert_eq!(evidence.verified.load(Ordering::SeqCst), 1);
+
+    // That result was delivered. The next check reads the bytes again.
+    assert!(engine.acquire_custody_lease(REQUESTER, &query, 1, TOKEN).present);
+    assert_eq!(evidence.ensured.load(Ordering::SeqCst), 2);
+    assert_eq!(leases.held.lock().unwrap().len(), 1);
+    assert_eq!(leases.guards.load(Ordering::SeqCst), 0);
+}
+
+/// Only a positive proof is kept: a version that failed is proved again by the next request.
+#[test]
+fn a_failed_proof_is_not_kept() {
+    let (engine, _, evidence, query) = engine(false);
+    assert!(!engine.holds_version_durably(&query).present);
+    evidence.blocks_verify.store(true, Ordering::SeqCst);
+    assert!(engine.holds_version_durably(&query).present);
+    assert_eq!(evidence.ensured.load(Ordering::SeqCst), 2);
+}
+
+/// A proof that finished after its requester stopped waiting is handed out once: of two retries
+/// that arrive after it, only one is answered from it, the other proves afresh.
+#[test]
+fn a_finished_proof_nobody_received_is_handed_to_one_retry_only() {
+    let (engine, _, evidence, query) = engine_waiting(true, std::time::Duration::from_millis(20));
+    evidence.stall.store(true, Ordering::SeqCst);
+    assert!(!engine.holds_version_durably(&query).present);
+    evidence.stall.store(false, Ordering::SeqCst);
+    // Let the proof finish with nobody waiting.
+    let started = std::time::Instant::now();
+    while evidence.verified.load(Ordering::SeqCst) == 0 {
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let engine2 = engine.clone();
+    let query2 = query.clone();
+    let other = std::thread::spawn(move || engine2.holds_version_durably(&query2).present);
+    let mine = engine.holds_version_durably(&query).present;
+    let theirs = other.join().unwrap();
+    assert!(mine && theirs, "both are answered");
+    assert_eq!(
+        evidence.ensured.load(Ordering::SeqCst),
+        2,
+        "one took the finished proof, the other proved afresh"
+    );
+}
+
+/// A handoff whose root went away while the proof ran is refused, even though the blocks are
+/// still there.
+#[test]
+fn a_handoff_for_a_root_that_is_gone_after_the_proof_is_refused() {
+    let (engine, _, evidence, query) = engine_waiting(true, std::time::Duration::from_millis(20));
+    evidence.stall.store(true, Ordering::SeqCst);
+    assert!(!engine.holds_version_durably(&query).present);
+    evidence.stall.store(false, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    while evidence.verified.load(Ordering::SeqCst) == 0 {
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    // The retry reads the root before it takes the finished proof (1) and again afterwards (2).
+    evidence.root_reads_left.store(1, Ordering::SeqCst);
+    assert!(!engine.holds_version_durably(&query).present);
+}
+
+/// A refusal is not "in progress": a version that failed its proof is answered as plainly not held.
+#[test]
+fn a_failed_proof_is_not_reported_as_in_progress() {
+    let (engine, _, _, query) = engine(false);
+    let answer = engine.holds_version_durably(&query);
+    assert!(!answer.present && !answer.in_progress);
 }

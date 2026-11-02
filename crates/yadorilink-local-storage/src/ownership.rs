@@ -157,6 +157,30 @@ pub fn is_windows_store_path(exe: &Path) -> bool {
     exe.components().any(|c| c.as_os_str() == "WindowsApps")
 }
 
+/// The package family of the Store package directory `path` lies in, lower-cased, as
+/// `<name>_<publisher id>`: the directory under `WindowsApps` is `<name>_<version>_<arch>_<resource id>_<publisher id>`.
+/// `None` for any path outside `WindowsApps` (or without such a directory). `WindowsApps` is writable by the
+/// system only, so a path under it proves which package the program belongs to.
+#[must_use]
+pub fn store_package_family(path: &str) -> Option<String> {
+    let mut parts = path.split(['/', '\\']).filter(|c| !c.is_empty());
+    parts.find(|c| c.eq_ignore_ascii_case("WindowsApps"))?;
+    let dir = parts.next()?;
+    let fields: Vec<&str> = dir.split('_').collect();
+    if fields.len() < 5 || fields[0].is_empty() || fields[fields.len() - 1].is_empty() {
+        return None;
+    }
+    Some(format!("{}_{}", fields[0], fields[fields.len() - 1]).to_ascii_lowercase())
+}
+
+/// Whether `new_root` is where the Store package that `recorded_root` names runs after an update:
+/// both lie in `WindowsApps` and name the same package family. Nothing else moves a recorded root.
+#[must_use]
+pub fn is_same_store_package(recorded_root: &str, new_root: &str) -> bool {
+    matches!((store_package_family(recorded_root), store_package_family(new_root)),
+        (Some(a), Some(b)) if a == b)
+}
+
 /// What the owner's installer (or a migration) recorded.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnershipRecord {

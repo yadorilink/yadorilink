@@ -99,6 +99,113 @@ impl LocallyHashedBlock {
     }
 }
 
+/// Why bytes are not the block they were taken for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockMismatch {
+    /// The bytes are not as long as the block they were requested as.
+    Size { expected: u32, actual: usize },
+    /// The bytes do not hash to the block they were requested as.
+    Hash,
+}
+
+/// Bytes shown to be a block that was asked for: exactly as long as the block's declared size and
+/// hashing to its hash.
+///
+/// The only way to build one is [`VerifiedBlock::check`], which hashes the bytes (once, here) and
+/// compares the result with the hash that was requested. A stage that is handed a `VerifiedBlock`
+/// (the commit of fetched blocks, the write of a large file's block) therefore does not hash the
+/// bytes again to learn whether they are the block, and cannot be handed bytes that nobody checked:
+/// there is no other constructor and the fields are private. It is not a statement about the bytes
+/// at rest. A read from the block store verifies what it reads, and a file written from these
+/// bytes is read back and checked against its record before it is renamed in; those are checks of
+/// a different thing (the medium, our own write path) and stay.
+#[derive(Clone)]
+pub struct VerifiedBlock {
+    hashed: LocallyHashedBlock,
+}
+
+impl VerifiedBlock {
+    /// `bytes` as the block with `expected_hash` and `expected_size`, if they are. Copies `bytes`
+    /// once into the allocation the block keeps, and hashes them once.
+    pub fn check(
+        bytes: &[u8],
+        expected_hash: &[u8],
+        expected_size: u32,
+    ) -> Result<Self, BlockMismatch> {
+        if bytes.len() != expected_size as usize {
+            return Err(BlockMismatch::Size { expected: expected_size, actual: bytes.len() });
+        }
+        let hashed = LocallyHashedBlock::from_arc_bytes(Arc::from(bytes));
+        if hashed.hash().as_bytes() != hex::encode(expected_hash).as_bytes() {
+            return Err(BlockMismatch::Hash);
+        }
+        Ok(Self { hashed })
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        self.hashed.bytes()
+    }
+
+    /// The block's hash, as the raw bytes it was requested by.
+    pub fn raw_hash(&self) -> Vec<u8> {
+        hex::decode(self.hashed.hash().as_bytes()).expect("a content hash is hex")
+    }
+
+    /// The block as the store takes it, with no further hashing.
+    pub fn into_hashed(self) -> LocallyHashedBlock {
+        self.hashed
+    }
+
+    /// A handle to the same bytes (a reference count, not a copy).
+    pub fn bytes_arc(&self) -> Arc<[u8]> {
+        self.hashed.bytes_arc()
+    }
+}
+
+#[cfg(test)]
+mod verified_block_tests {
+    use super::*;
+
+    fn hash_of(bytes: &[u8]) -> Vec<u8> {
+        hex::decode(hash_block_bytes(bytes).as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn bytes_that_are_the_block_asked_for_are_accepted_and_carry_their_hash() {
+        let bytes = b"the block that was asked for".to_vec();
+        let hash = hash_of(&bytes);
+
+        let verified = VerifiedBlock::check(&bytes, &hash, bytes.len() as u32).unwrap();
+
+        assert_eq!(verified.bytes(), bytes.as_slice());
+        assert_eq!(verified.raw_hash(), hash);
+        let hashed = verified.clone().into_hashed();
+        assert_eq!(hashed.hash().as_bytes(), hex::encode(&hash).as_bytes());
+        assert_eq!(hashed.bytes(), bytes.as_slice());
+    }
+
+    #[test]
+    fn bytes_of_another_hash_or_another_length_are_refused() {
+        let bytes = b"the block that was asked for".to_vec();
+        let hash = hash_of(&bytes);
+
+        let other = b"a different block, same length!".to_vec();
+        assert!(matches!(
+            VerifiedBlock::check(&other, &hash, other.len() as u32),
+            Err(BlockMismatch::Hash)
+        ));
+        assert!(matches!(
+            VerifiedBlock::check(&bytes, &hash, bytes.len() as u32 + 1),
+            Err(BlockMismatch::Size { .. })
+        ));
+        assert!(matches!(
+            VerifiedBlock::check(&bytes[..bytes.len() - 1], &hash, bytes.len() as u32),
+            Err(BlockMismatch::Size { .. })
+        ));
+        assert!(matches!(VerifiedBlock::check(b"", &hash, 0), Err(BlockMismatch::Hash),));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StorageUsage {
     pub block_count: u64,

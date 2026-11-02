@@ -2,9 +2,10 @@
 
 use super::{about, existing_directory, offering_force, ClientCore};
 use crate::dto::{
-    self, ConflictSummary, EvictOutcome, FileAvailability, FileRetention, FileVersion, FolderMode,
-    FolderRestoreOutcome, LinkOutcome, PauseDuration, PinOutcome, PreflightResult,
-    ProviderFolderOutcome, StorageModeOutcome, TrashedFile, UnlinkOutcome,
+    self, ActivityFilter, ActivityPage, ConflictSummary, EvictOutcome, FileAvailability,
+    FileRetention, FileVersion, FolderMode, FolderRestoreOutcome, LinkOutcome, PauseDuration,
+    PinOutcome, PreflightResult, ProviderFolderOutcome, StorageModeOutcome, TrashedFile,
+    UnlinkOutcome,
 };
 use crate::error::DesktopError;
 use crate::ops;
@@ -192,6 +193,31 @@ impl ClientCore {
         Ok(files.iter().map(dto::conflict_summary).collect())
     }
 
+    /// Recent file events (added, updated, deleted, conflict, restored) across every
+    /// linked folder, newest first: the Activity page. `limit` is clamped to 1..=500;
+    /// `before_cursor` is the previous page's `next_cursor`. Each event names the device
+    /// that made the change; names come from the account's device list and are `None`
+    /// when it cannot be read.
+    ///
+    /// # Errors
+    /// Daemon failures.
+    pub async fn list_activity(
+        &self,
+        limit: u32,
+        before_cursor: Option<i64>,
+        filter: Option<ActivityFilter>,
+    ) -> Result<ActivityPage, DesktopError> {
+        let request = dto::activity_request(limit, before_cursor, filter.as_ref());
+        let events = ops::files::list_activity(request).await?;
+        let mut names = std::collections::HashMap::new();
+        if events.iter().any(|e| !e.origin_device_id.is_empty()) {
+            if let Ok(devices) = ops::devices::list_devices().await {
+                names.extend(devices.into_iter().map(|d| (d.device_id, d.device_name)));
+            }
+        }
+        Ok(dto::activity_page(limit.clamp(1, 500), &events, &names))
+    }
+
     /// # Errors
     /// Daemon failures.
     pub async fn list_trash(
@@ -294,10 +320,17 @@ impl ClientCore {
     /// Daemon failures.
     pub async fn evict_file(&self, absolute_path: String) -> Result<EvictOutcome, DesktopError> {
         let evict = ops::files::evict(absolute_path).await?;
+        let not_freed =
+            (!evict.not_freed_reason.is_empty()).then(|| evict.not_freed_reason.clone());
+        // Only a moment that passes by itself: a reason that needs the person (close a program, wait for a sync) is not
+        // "later" on its own. These are the codes of `NotFreed::passes_by_itself`.
+        let retry_later = matches!(not_freed.as_deref(), Some("path_changing" | "not_present"));
         Ok(EvictOutcome {
             evicted: evict.dehydrated,
             blocks_reclaimed: evict.blocks_reclaimed,
             bytes_reclaimed: evict.bytes_reclaimed,
+            not_freed_reason: not_freed,
+            retry_later,
         })
     }
 

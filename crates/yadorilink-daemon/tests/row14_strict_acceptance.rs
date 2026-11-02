@@ -9,8 +9,7 @@
 //! This is deliberately a *stricter* bar than "the row-14 test passed":
 //!
 //! 1. The periodic 90s materialization-repair sweep is disabled for the
-//!    whole run (`set_default_materialization_repair_sweep_interval_for_
-//!    tests`), so a pass can only be attributed to the Convergence
+//!    whole run (every device is built with `NO_REPAIR_SWEEP`), so a pass can only be attributed to the Convergence
 //!    Engine's own per-tick reconciliation -- never the old sweep quietly
 //!    rescuing it, which would make it impossible to tell which mechanism
 //!    actually converged the run.
@@ -42,10 +41,17 @@ use std::time::{Duration, Instant};
 
 use support::{open_file_backed_replica_coordinator, real_entry_names, TestAccount};
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
-use yadorilink_daemon::daemon_state::{
-    set_default_materialization_repair_sweep_interval_for_tests, DaemonState,
-};
+use yadorilink_daemon::daemon_state::{DaemonState, StateIntervals};
 use yadorilink_local_storage::SegmentBlockStore;
+
+/// Criterion 1: the periodic repair sweep must not be able to help this run at all, so it is
+/// given an hour. It is given at construction because the scheduler has already started by the
+/// time the constructor returns, and `set_materialization_repair_sweep_interval` alone only takes
+/// effect on its next sleep.
+const NO_REPAIR_SWEEP: StateIntervals = StateIntervals {
+    materialization_repair_sweep: Some(Duration::from_secs(3600)),
+    custody_confirmation_sweep: None,
+};
 
 const ABSOLUTE_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(900);
 const STALL_TIMEOUT: Duration = Duration::from_secs(90);
@@ -68,7 +74,13 @@ async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
     let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let sync_state = Arc::new(sync_state);
-    let state = DaemonState::new(device_id.clone(), sync_state, store);
+    let state = yadorilink_daemon::test_support::isolated_daemon_state_with(
+        NO_REPAIR_SWEEP,
+        None,
+        device_id.clone(),
+        sync_state,
+        store,
+    );
     support::ensure_device_signing_key(&state);
     TestDevice {
         device_id,
@@ -131,7 +143,15 @@ const PAIR_RECONNECT_BACKOFF: yadorilink_daemon::supervise::BackoffConfig =
 /// (fully sequential handshakes, never more than one in flight at a time)
 /// rather than extending timeouts, since initial-connection speed is not
 /// what this test is evaluating.
-const MAX_CONCURRENT_HANDSHAKES: usize = 1;
+///
+/// Three again, because one permit made the harness stall by itself: the product has NO such permit (each peer
+/// is kept by its own keeper, `peer_connectivity_runtime::peer_sessions`), so a burst of failed handshakes under load
+/// queued up behind the one permit here -- five pairs cut together, each failing twice, took 121 s to be back (see
+/// `reconnect_recovery_model.rs`), longer than this test's 90 s no-progress bound, without any defect in convergence.
+/// The reason for limiting at all is real (CPU contention of a debug build on a loaded runner), so the limit stays,
+/// at the round concurrency the initial mesh is known to form cleanly with: the same five pairs are back in 51 s,
+/// inside 60 s. A run that still stalls now prints which pairs had no live session (`session_matrix`).
+const MAX_CONCURRENT_HANDSHAKES: usize = 3;
 
 /// Connects one pair and blocks until it is genuinely ready
 /// ([`wait_pair_ready`]), holding `handshake_semaphore` for the whole
@@ -429,6 +449,43 @@ fn snapshot(root: &std::path::Path) -> std::collections::HashMap<String, String>
         .collect()
 }
 
+/// Diagnostic-only: which pairs have a live session at this instant. A stall with a pair that has NO session is a
+/// reconnect wait (the harness's supervisor backs off up to 45 s per failed generation, one handshake at a time), not
+/// a convergence defect; a stall with every pair up and still different disks is the defect case. The two look the
+/// same on disk, so the stall report says which one it is.
+fn session_matrix(devices: &[TestDevice]) -> String {
+    let mut out = String::from(
+        "sessions (row = device, column = peer; 1 = live session, 0 = none, . = itself):\n",
+    );
+    let mut missing = Vec::new();
+    for (i, a) in devices.iter().enumerate() {
+        let mut row = String::new();
+        for (j, b) in devices.iter().enumerate() {
+            if i == j {
+                row.push('.');
+            } else if a.state.peers.session(&b.device_id).is_some() {
+                row.push('1');
+            } else {
+                row.push('0');
+                if i < j {
+                    missing.push(format!("device-{i}<->device-{j}"));
+                }
+            }
+            row.push(' ');
+        }
+        out.push_str(&format!("  device-{i}: {row}\n"));
+    }
+    out.push_str(&if missing.is_empty() {
+        "every pair has a live session: a stall here is not a reconnect wait\n".to_string()
+    } else {
+        format!(
+            "pairs without a live session (a reconnect wait, not necessarily a defect): {}\n",
+            missing.join(", ")
+        )
+    });
+    out
+}
+
 /// Diagnostic-only three-layer snapshot that classifies a stall on a specific conflict-copy path into one of:
 ///
 /// A. The winner or loser Change itself is genuinely UNKNOWN to a device
@@ -515,11 +572,8 @@ async fn row14_strict_acceptance() {
             .try_init();
     });
 
-    // Criterion 1: the old periodic repair sweep must not be able to help
-    // this run at all -- set the override BEFORE any `DaemonState::new`
-    // call, closing the race `set_materialization_repair_sweep_interval`
-    // alone cannot (see that function's own doc comment).
-    set_default_materialization_repair_sweep_interval_for_tests(Duration::from_secs(3600));
+    // Criterion 1: the old periodic repair sweep must not be able to help this run at all; every
+    // device is built with `NO_REPAIR_SWEEP` (see its doc comment).
 
     // Diagnostic-only: a runtime heartbeat, independent of any device's own
     // work. If this keeps ticking every ~1s throughout a run that
@@ -668,8 +722,9 @@ async fn row14_strict_acceptance() {
                     });
                 panic!(
                     "row14_strict_acceptance: convergence stalled: no progress for over \
-                     {STALL_TIMEOUT:?} ({:?} elapsed): {entries}\n{diagnostic}",
-                    started.elapsed()
+                     {STALL_TIMEOUT:?} ({:?} elapsed): {entries}\n{}{diagnostic}",
+                    started.elapsed(),
+                    session_matrix(&devices)
                 );
             }
         }

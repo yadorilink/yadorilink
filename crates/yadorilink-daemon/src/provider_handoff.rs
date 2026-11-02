@@ -336,6 +336,14 @@ impl HandoffRoot {
         })
     }
 
+    /// A new name for a file staged in `ingest/` by the engine itself (`provider_stage`): never
+    /// issued twice, one plain path component that [`crate::provider_stage::is_staged_name`]
+    /// accepts and that no extension's own name collides with by construction.
+    pub(crate) fn new_upload_name(&self) -> String {
+        let sequence = self.sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        format!("up-{:x}-{sequence:x}", self.nonce)
+    }
+
     /// Where the assembly of `name` is built (a temp file next to it carries the bytes).
     pub(crate) fn staging_file(&self, name: &str) -> PathBuf {
         self.staging.join(format!("{name}.partial"))

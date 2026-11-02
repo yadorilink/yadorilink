@@ -76,11 +76,22 @@ fn corrupt_schema(state: &Arc<DaemonState>, sql: &str) {
 }
 
 async fn list_folder_files(state: &Arc<DaemonState>, local_path: &str) -> ListFolderFilesResponse {
+    list_folder_files_page(state, local_path, 0, "").await
+}
+
+async fn list_folder_files_page(
+    state: &Arc<DaemonState>,
+    local_path: &str,
+    max_entries: u32,
+    after_path: &str,
+) -> ListFolderFilesResponse {
     let response = handle_message(
         &ShellContext::from_state(state.clone()),
         ShellIpcMessage {
             payload: Some(Payload::ListFolderFilesRequest(ListFolderFilesRequest {
                 local_path: local_path.to_string(),
+                max_entries,
+                after_path: after_path.to_string(),
             })),
         },
     )
@@ -238,4 +249,53 @@ async fn list_folder_files_reports_explicit_directory_as_directory() {
             ("album/latest".to_string(), EntryKind::Symlink),
         ]
     );
+}
+
+/// A paged walk returns every entry exactly once, in path order, and the last page has no
+/// cursor; the unpaged request still returns the whole listing with no cursor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paged_listing_walks_every_entry_once_in_order() {
+    let state = test_state();
+    let root = tempfile::tempdir().unwrap();
+    let local_path = root.path().to_string_lossy().to_string();
+    let names: Vec<String> = (0..25).map(|i| format!("f{i:02}.txt")).collect();
+    for name in &names {
+        std::fs::write(root.path().join(name), b"x").unwrap();
+    }
+    state.replica_coordinator.link_repository().add_link(&local_path, "group-1").unwrap();
+    start_watch_and_await_scan(&state, root.path(), "group-1").await;
+
+    let mut seen = Vec::new();
+    let mut after = String::new();
+    let mut pages = 0;
+    loop {
+        let page = list_folder_files_page(&state, &local_path, 10, &after).await;
+        assert!(page.snapshot_available);
+        assert!(page.entries.len() <= 10);
+        seen.extend(page.entries.iter().map(|e| e.relative_path.clone()));
+        pages += 1;
+        if page.next_after_path.is_empty() {
+            break;
+        }
+        assert_eq!(&page.next_after_path, &page.entries.last().unwrap().relative_path);
+        after = page.next_after_path;
+    }
+    assert_eq!(pages, 3);
+    assert_eq!(seen, names);
+
+    let whole = list_folder_files(&state, &local_path).await;
+    assert_eq!(whole.entries.len(), 25);
+    assert!(whole.next_after_path.is_empty());
+}
+
+/// A page's byte budget plus the largest possible single entry stays under the frame limit, and
+/// the unpaged refusal threshold is under it too.
+#[test]
+fn the_page_budget_leaves_room_in_the_frame() {
+    const LONGEST_PATH: usize = 8 * 1024;
+    assert!(
+        LIST_FOLDER_FILES_PAGE_BYTES + LONGEST_PATH + LIST_FOLDER_FILE_ENTRY_OVERHEAD
+            < yadorilink_ipc_proto::framing::MAX_FRAME_LEN as usize
+    );
+    assert!(LIST_FOLDER_FILES_FRAME_BYTES < yadorilink_ipc_proto::framing::MAX_FRAME_LEN as usize);
 }

@@ -116,6 +116,38 @@ pub fn has_unattempted(conn: &Connection, group_id: &str) -> Result<bool, SyncSq
         .exists([group_id])?)
 }
 
+/// The paths a fork pass has not looked at yet.
+pub fn unattempted_paths(
+    conn: &Connection,
+    group_id: &str,
+) -> Result<Vec<String>, SyncSqliteError> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT path FROM native_contest_candidate \
+             WHERE group_id = ?1 AND attempted = 0 ORDER BY path",
+        )?
+        .query_map([group_id], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()?)
+}
+
+/// What this device's index holds at `path` right now (size, time, blocks, deleted flag), or
+/// `None` when it has no current row. A caller that settled the version at a contested path
+/// compares it again where the fork is authored: a different row is another version.
+pub fn local_row_fingerprint(
+    conn: &Connection,
+    group_id: &str,
+    path: &str,
+) -> Result<Option<String>, SyncSqliteError> {
+    use rusqlite::OptionalExtension as _;
+    Ok(conn
+        .prepare_cached(
+            "SELECT size || ':' || mtime_unix_nanos || ':' || blocks_json || ':' || deleted \
+             FROM files WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
+        )?
+        .query_row(rusqlite::params![group_id, path], |row| row.get(0))
+        .optional()?)
+}
+
 /// Ends a fork pass: the candidates that are no longer contested go, and the
 /// rest are marked as looked at.
 pub fn finish_attempt(conn: &Connection, group_id: &str) -> Result<(), SyncSqliteError> {
@@ -178,10 +210,9 @@ mod tests {
             0,
             FileMeta {
                 mtime_unix_nanos: mtime,
-                unix_mode: Some(0o644),
+                exec: false,
                 symlink_target: None,
                 record_kind: RecordKind::File,
-                xattrs: Vec::new(),
             },
         )
     }

@@ -290,3 +290,24 @@ fn a_case_folded_spelling_is_the_same_folder() {
     assert_eq!(conflicts.len(), 1);
     assert_eq!(conflicts[0].relation, NestedLinkRelation::Ancestor);
 }
+
+/// A folder whose filesystem cannot prove object identity gets one note (what happens and what
+/// to do), and it does not make the link risky: it never needs an acknowledgement.
+#[test]
+fn a_filesystem_that_cannot_prove_identity_is_a_note_not_a_risk() {
+    let dir = tempdir();
+    let unproven = run_preflight_with_identity_probe(dir.path(), &[], Some(0), None, |_| false);
+    assert!(unproven.volume_identity_unproven);
+    assert!(!unproven.is_risky(), "an empty folder stays unrisky");
+    let notes = unproven.notes();
+    assert_eq!(notes.len(), 1);
+    assert!(
+        notes[0].contains("will not be applied") && notes[0].contains("disk-backed"),
+        "{notes:?}"
+    );
+    assert!(unproven.warnings().is_empty());
+
+    let proven = run_preflight_with_identity_probe(dir.path(), &[], Some(0), None, |_| true);
+    assert!(!proven.volume_identity_unproven);
+    assert!(proven.notes().is_empty());
+}

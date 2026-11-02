@@ -11,6 +11,43 @@ prerelease suffix (e.g. `v0.1.0-beta.1`).
 
 ## [Unreleased]
 
+## [v0.1.0-beta.9] - 2026-11-03
+
+### Added
+- Send links: send files or folders to another account with a one-time link. The receiver can preview it before accepting.
+- Recent activity: see which files were added, changed, deleted, restored or had a conflict.
+- Older versions are kept: a version replaced or deleted by sync can be restored for 30 days, and while there are no more than 10 newer versions. `yadorilink versions` shows which ones this device still has.
+- In Finder folders, conflict copies offer "Keep this" and "Keep both".
+- Sign in without a browser: `yadorilink login --code`.
+- Hand over a shared folder to another account.
+- `yadorilink self-update` updates to the latest verified release; `install.sh --rollback` goes back one version.
+- NAS: a ready-to-use container image with a health check.
+
+### Changed
+- `yadorilink status` is simpler: one line for the overall state, one for whether your files are available, one for whether they are safely on another device, then a numbered list of anything you need to fix. `--details` shows the full view.
+- Faster sync on macOS and Linux: received files go straight into your folder, and large files you edit start sending sooner and use less disk.
+- Faster sign-in and quicker reconnection after the network comes back.
+- Uses less power when idle.
+- Only the "executable" permission is synced. Other permissions and file attributes stay as your computer sets them.
+- When the disk is full, older versions are not kept, but sync keeps going. Pinned files always keep their versions.
+
+### Fixed
+- Pinning a file that is only on this device no longer fails.
+- A file no one changed no longer gets a new version.
+- Edits made offline are sent when you reconnect.
+- A deleted file stays deleted after a power cut.
+
+### Known limitations
+- Older versions stay only on devices that had the file. A device that never opened a file has no older versions of it.
+- Versions replaced by your own edits may not be kept.
+- History has no size limit yet; a long history of large files uses more disk.
+- Mac: macOS 27 only.
+
+### Before you update
+- Update all your devices: different versions do not sync with each other.
+- First run `yadorilink preserved list` and resolve anything it shows.
+- If a device will not start after the update, remove YadoriLink's local data and set it up again. Your synced files are not deleted.
+
 ## [v0.1.0-beta.8] - 2026-10-28
 
 ### Fixed

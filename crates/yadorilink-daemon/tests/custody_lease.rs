@@ -32,7 +32,11 @@ fn new_daemon(device_id: &str) -> Daemon {
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
-    let state = DaemonState::new(device_id.to_string(), Arc::new(sync_state), store);
+    let state = yadorilink_daemon::test_support::isolated_daemon_state(
+        device_id.to_string(),
+        Arc::new(sync_state),
+        store,
+    );
     ensure_device_signing_key(&state);
     let root = tempfile::tempdir().unwrap();
     state
@@ -78,10 +82,9 @@ fn version_and_blocks(hash_bytes: Vec<u8>, size: u64) -> (VersionHash, Vec<Versi
     let blocks = vec![VersionBlock { hash: BlockHash(hash_bytes), size: size as u32 }];
     let meta = FileMeta {
         mtime_unix_nanos: 0,
-        unix_mode: None,
+        exec: false,
         symlink_target: None,
         record_kind: RecordKind::File,
-        xattrs: Vec::new(),
     };
     (FileVersion::new(blocks.clone(), size, meta).version_hash, blocks)
 }
@@ -292,10 +295,9 @@ async fn custody_acquire_cost() {
         }
         let meta = FileMeta {
             mtime_unix_nanos: 0,
-            unix_mode: None,
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         };
         let vh = FileVersion::new(blocks.clone(), total as u64, meta).version_hash;
         connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
@@ -636,12 +638,15 @@ async fn a_late_acquire_after_its_release_commits_nothing() {
         "a release for an attempt the responder never saw is still acknowledged"
     );
     assert!(
-        !session.request_custody_acquire(GROUP, PATH, vh, &blocks, epoch, attempt).await,
+        !session.request_custody_acquire(GROUP, PATH, vh, &blocks, epoch, attempt).await.is_held(),
         "the late acquire of the released attempt is refused"
     );
     assert_eq!(lease_count(&a), 0);
 
-    assert!(session.request_custody_acquire(GROUP, PATH, vh, &blocks, epoch, [0x22; 16]).await);
+    assert!(session
+        .request_custody_acquire(GROUP, PATH, vh, &blocks, epoch, [0x22; 16])
+        .await
+        .is_held());
     assert_eq!(lease_count(&a), 1, "the next attempt commits normally");
 }
 
@@ -652,7 +657,10 @@ async fn a_release_of_another_attempt_leaves_the_lease_in_place() {
     let (a, b, _hash_bytes, vh, blocks) = connected_pair().await;
     let session = session_to(&b, "device-a");
     let epoch = b.state.authority.membership_generation();
-    assert!(session.request_custody_acquire(GROUP, PATH, vh, &blocks, epoch, [1; 16]).await);
+    assert!(session
+        .request_custody_acquire(GROUP, PATH, vh, &blocks, epoch, [1; 16])
+        .await
+        .is_held());
 
     assert!(session.request_custody_release(GROUP, PATH, vh, [2; 16]).await);
     assert_eq!(lease_count(&a), 1, "an unrelated attempt's release does not end it");
@@ -668,7 +676,7 @@ async fn an_authorized_requester_with_an_older_generation_still_acquires() {
     let (a, b, _hash_bytes, vh, blocks) = connected_pair().await;
     let session = session_to(&b, "device-a");
     let epoch = b.state.authority.membership_generation();
-    assert!(session.request_custody_acquire(GROUP, PATH, vh, &blocks, 0, [1; 16]).await);
+    assert!(session.request_custody_acquire(GROUP, PATH, vh, &blocks, 0, [1; 16]).await.is_held());
     let leases =
         a.state.replica_coordinator.remote_custody_lease_repository().list_active().unwrap();
     assert_eq!(leases[0].membership_generation, 0);
@@ -749,11 +757,17 @@ async fn a_group_being_handed_off_takes_no_new_lease_until_the_guard_drops() {
     let session = session_to(&b, "device-a");
     let epoch = b.state.authority.membership_generation();
 
-    assert!(!session.request_custody_acquire(GROUP, PATH, vh, &blocks, epoch, [5; 16]).await);
+    assert!(!session
+        .request_custody_acquire(GROUP, PATH, vh, &blocks, epoch, [5; 16])
+        .await
+        .is_held());
     assert_eq!(lease_count(&a), 0);
 
     drop(closed);
-    assert!(session.request_custody_acquire(GROUP, PATH, vh, &blocks, epoch, [5; 16]).await);
+    assert!(session
+        .request_custody_acquire(GROUP, PATH, vh, &blocks, epoch, [5; 16])
+        .await
+        .is_held());
     assert_eq!(lease_count(&a), 1);
 }
 

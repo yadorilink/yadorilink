@@ -6,8 +6,7 @@ use sha2::{Digest, Sha256};
 use crate::codec::{put_i64, put_len_bytes, put_u32, ChangeError, Reader};
 use crate::ids::{BlockHash, VersionHash};
 use crate::limits::{
-    MAX_BLOCKS, MAX_BLOCK_SIZE_BYTES, MAX_ENCODED_VERSION_BYTES, MAX_XATTRS,
-    VERSION_BLOCK_ENCODED_BYTES,
+    MAX_BLOCKS, MAX_BLOCK_SIZE_BYTES, MAX_ENCODED_VERSION_BYTES, VERSION_BLOCK_ENCODED_BYTES,
 };
 
 /// Domain tag of [`FileVersion::content_identity`], distinct from the version
@@ -19,36 +18,11 @@ const CONTENT_DOMAIN_TAG: &[u8; 8] = b"YLNKcnt\x01";
 /// same content are distinct byte strings and distinct hashes. Version 3
 /// replaced the single owner-exec bit with the full `unix_mode` permission
 /// word (see `FileMeta::unix_mode`), so v2 and v3 encodings of otherwise
-/// identical metadata are also distinct. Version 4 added `xattrs`
-/// (see `FileMeta::xattrs`), so v3 and v4 encodings of otherwise identical
-/// metadata are also distinct.
-const VERSION_DOMAIN_TAG: &[u8; 8] = b"YLNKver\x04";
-
-/// The only `st_mode` bits this sync tool replicates: owner/group/other
-/// read-write-execute (`chmod`'s familiar 3-digit form). Deliberately
-/// excludes setuid/setgid/sticky (`0o7000`) and the higher file-type bits --
-/// replicating a setuid bit onto another device is a privilege-escalation
-/// vector, not a filesystem-fidelity feature, and file type is already
-/// carried by `RecordKind`. A mode value is always masked through this
-/// before it enters a `FileMeta`, so `unix_mode`'s own range invariant
-/// (`0..=0o777`) cannot be violated by a caller forgetting to mask.
-pub const REPLICATED_MODE_MASK: u32 = 0o777;
-
-/// The only extended-attribute namespace this sync tool ever replicates,
-/// on any platform -- mirrors `yadorilink-local-storage::chunker`'s own
-/// capture/apply-side allow-list (Linux's `user.` prefix; every other
-/// platform allow-lists nothing at all today). Kept as an independent
-/// constant here rather than a shared dependency because this crate
-/// cannot depend on `yadorilink-local-storage` (wrong layering direction
-/// -- this is the lower-level protocol crate), and `FileMeta::decode`'s
-/// own enforcement of it must hold regardless of what any platform's
-/// local capture/apply code does: decode is the one place every
-/// hand-crafted, signed-but-untrusted `FileVersion` from any peer is
-/// forced through before this device trusts any of its fields. If a
-/// future platform ever earns its own allow-listed namespace, this
-/// constant (and `yadorilink-local-storage`'s matching one) both need
-/// updating together.
-const REPLICATED_XATTR_ALLOWED_PREFIX: &str = "user.";
+/// identical metadata are also distinct. Version 4 added `xattrs`, so v3
+/// and v4 encodings of otherwise identical metadata are also distinct. Version 5 replaced the permission
+/// word by the execute flag (`FileMeta::exec`) and dropped `xattrs`: neither extended attributes nor the
+/// permission bits other than execute are replicated.
+const VERSION_DOMAIN_TAG: &[u8; 8] = b"YLNKver\x05";
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockInfo {
@@ -109,15 +83,12 @@ pub struct FileRecord {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct FileMeta {
     pub mtime_unix_nanos: i64,
-    /// The replicated permission bits (`REPLICATED_MODE_MASK`, i.e.
-    /// `0..=0o777`), or `None` when the authoring device has no Unix
-    /// permission model to report (a Windows peer). `None` is a genuine,
-    /// distinct identity state, not a stand-in for "unknown" collapsing to
-    /// some fake default -- a peer that cannot represent Unix mode does not
-    /// fabricate one (see this field's callers in `yadorilink-daemon` for
-    /// how a `None`-authored version is handled when merged with a peer
-    /// that does carry a mode).
-    pub unix_mode: Option<u32>,
+    /// Whether the file is executable: the only part of the permission model this sync tool replicates.
+    /// A platform that cannot express it (Windows, iOS) authors `false` for what it creates and carries the
+    /// previous version's value over when it edits a file; a receiver gives the file the mode its own
+    /// environment gives a new file and adds `x` where this is set. Always `false` for a directory or a
+    /// symlink (the encoder writes it, the decoder and `validate_structure` refuse anything else).
+    pub exec: bool,
     /// The symlink's raw, unresolved target, as the *exact* bytes the
     /// platform's own symlink target representation holds — never lossily
     /// converted to/from UTF-8. On Unix this is the target's raw OS bytes
@@ -131,27 +102,6 @@ pub struct FileMeta {
     /// rather than a string field.
     pub symlink_target: Option<Vec<u8>>,
     pub record_kind: RecordKind,
-    /// Extended attributes this sync tool replicates, sorted by name --
-    /// never in the OS's own `listxattr` return order, which is not
-    /// guaranteed stable even across two calls on the same unmodified
-    /// file, let alone between the two independent capture paths
-    /// (`single_pass_capture.rs`/`local_change.rs`) that must derive
-    /// identical `FileMeta` for the same file. Deliberately NOT every
-    /// xattr a file happens to carry -- only an explicit per-platform
-    /// allow-list (`REPLICATED_XATTR_NAMESPACES`-equivalent capture-side
-    /// filter) passes through, the same reasoning `REPLICATED_MODE_MASK`
-    /// already applies to permission bits: a security-context or
-    /// OS-internal attribute (Linux `security.*`/`system.*`/`trusted.*`,
-    /// macOS `com.apple.quarantine`/`com.apple.ResourceFork`/
-    /// `com.apple.metadata:*`) is either meaningless or actively
-    /// dangerous to replicate onto a different device, never a
-    /// filesystem-fidelity feature. Empty for a platform/backend with no
-    /// xattr capability, a directory or symlink (not scanned), or a file
-    /// with no allow-listed attributes -- there is no distinct "not
-    /// applicable" state to preserve here the way `unix_mode: None` needs
-    /// one, since an empty set already means exactly the same thing in
-    /// every one of those cases.
-    pub xattrs: Vec<(String, Vec<u8>)>,
 }
 
 /// One block of a file: its content hash and its exact byte length. The size
@@ -196,13 +146,7 @@ fn record_kind_from_byte(b: u8) -> Result<RecordKind, ChangeError> {
 impl FileMeta {
     fn encode_into(&self, buf: &mut Vec<u8>) {
         buf.push(record_kind_byte(self.record_kind));
-        match self.unix_mode {
-            None => buf.push(0),
-            Some(mode) => {
-                buf.push(1);
-                put_u32(buf, mode);
-            }
-        }
+        buf.push(u8::from(self.exec));
         put_i64(buf, self.mtime_unix_nanos);
         // Raw length-prefixed bytes, not a string put — a symlink target is
         // not required to be valid UTF-8 (see `FileMeta::symlink_target`'s
@@ -216,32 +160,14 @@ impl FileMeta {
                 put_len_bytes(buf, target);
             }
         }
-        // `self.xattrs` is required to already be sorted by name -- this
-        // encoding trusts that invariant rather than re-sorting here, so
-        // a caller that failed to sort would produce a version hash that
-        // silently disagrees with the other capture path's for the
-        // identical file, which is exactly the failure mode this field's
-        // own doc comment warns about. Both `single_pass_capture.rs` and
-        // `local_change.rs` sort before constructing a `FileMeta`.
-        put_u32(buf, self.xattrs.len() as u32);
-        for (name, value) in &self.xattrs {
-            put_len_bytes(buf, name.as_bytes());
-            put_len_bytes(buf, value);
-        }
     }
 
     fn decode(r: &mut Reader<'_>) -> Result<Self, ChangeError> {
         let record_kind = record_kind_from_byte(r.u8()?)?;
-        let unix_mode = match r.u8()? {
-            0 => None,
-            1 => {
-                let mode = r.u32()?;
-                if mode > REPLICATED_MODE_MASK {
-                    return Err(ChangeError::Encoding(format!("unix mode {mode:#o} out of range")));
-                }
-                Some(mode)
-            }
-            other => return Err(ChangeError::Encoding(format!("bad unix mode flag {other}"))),
+        let exec = match r.u8()? {
+            0 => false,
+            1 => true,
+            other => return Err(ChangeError::Encoding(format!("bad exec flag {other}"))),
         };
         let mtime_unix_nanos = r.i64()?;
         let symlink_target = match r.u8()? {
@@ -249,53 +175,53 @@ impl FileMeta {
             1 => Some(r.len_bytes()?),
             other => return Err(ChangeError::Encoding(format!("bad symlink flag {other}"))),
         };
-        let xattr_count = r.bounded_count(8, MAX_XATTRS)?;
-        let mut xattrs = Vec::with_capacity(xattr_count);
-        let mut previous_name: Option<Vec<u8>> = None;
-        for _ in 0..xattr_count {
-            let name_bytes = r.len_bytes()?;
-            let value = r.len_bytes()?;
-            // Sortedness is a canonical-encoding invariant, not merely a
-            // house style: two logically-identical xattr sets encoded in
-            // different orders would hash differently, so a decoder that
-            // didn't enforce this could accept a byte string no honest
-            // encoder would ever produce -- the same "no ambiguous
-            // canonical form" reasoning `expect_end` already enforces
-            // for trailing bytes.
-            if let Some(previous) = &previous_name {
-                if name_bytes.as_slice() <= previous.as_slice() {
-                    return Err(ChangeError::Encoding(
-                        "xattr names are not in strictly sorted order".into(),
-                    ));
-                }
-            }
-            previous_name = Some(name_bytes.clone());
-            let name = String::from_utf8(name_bytes)
-                .map_err(|_| ChangeError::Encoding("xattr name is not valid UTF-8".into()))?;
-            // Defense against a signed-but-untrusted `FileVersion`: every
-            // capture path this codebase has (`single_pass_capture.rs`/
-            // `local_change.rs`, and every platform's own read filter in
-            // `yadorilink-local-storage::chunker`) already restricts what
-            // it PRODUCES to this same allow-list, but decode is the one
-            // place that constrains what this device will ever ACCEPT --
-            // an authorized peer is still untrusted content, so a
-            // hand-crafted `FileVersion` carrying a security-relevant
-            // name (Linux `security.*`/`system.*`/`trusted.*`, or
-            // anything else outside the allow-list) must never reach
-            // `apply_xattrs` at all, regardless of what permissions this
-            // receiving process happens to hold. `apply_xattrs` itself
-            // also refuses a non-allow-listed name on the write side, as
-            // a second, independent layer.
-            if !name.starts_with(REPLICATED_XATTR_ALLOWED_PREFIX) {
-                return Err(ChangeError::Encoding(format!(
-                    "xattr name {name:?} is outside the replicated-xattr allow-list (only \
-                     names starting with {REPLICATED_XATTR_ALLOWED_PREFIX:?} are ever replicated)"
-                )));
-            }
-            xattrs.push((name, value));
-        }
-        Ok(FileMeta { record_kind, unix_mode, mtime_unix_nanos, symlink_target, xattrs })
+        Ok(FileMeta { record_kind, exec, mtime_unix_nanos, symlink_target })
     }
+}
+
+/// What a stored block list must satisfy whatever the record kind is: at most `MAX_BLOCKS` blocks,
+/// none of zero length or over `MAX_BLOCK_SIZE_BYTES`, and, when there are blocks, sizes that add
+/// up to the file size. An empty list passes (a directory, a symlink, an empty file); the rules that
+/// depend on the kind stay in `FileVersion::validate_structure`.
+///
+/// Run on every row written to the ledger and by the audit that re-reads stored rows, so a row that
+/// fails is refused at commit and a row damaged afterwards is found.
+///
+/// # Errors
+/// [`ChangeError::Malformed`] for a count or a block out of bounds, [`ChangeError::BlockSizeMismatch`]
+/// when the sizes do not add up.
+pub fn check_block_list(size: u64, blocks: &[BlockInfo]) -> Result<(), ChangeError> {
+    check_block_sizes(size, blocks.len(), blocks.iter().map(|b| b.size))
+}
+
+/// [`check_block_list`] over the block sizes alone, so a version's own block type shares it.
+///
+/// # Errors
+/// As [`check_block_list`].
+pub fn check_block_sizes(
+    size: u64,
+    count: usize,
+    block_sizes: impl Iterator<Item = u32>,
+) -> Result<(), ChangeError> {
+    if count > MAX_BLOCKS {
+        return Err(ChangeError::Malformed(format!("block count {count} exceeds {MAX_BLOCKS}")));
+    }
+    let mut sum: u64 = 0;
+    for block_size in block_sizes {
+        if block_size == 0 {
+            return Err(ChangeError::Malformed("zero-length block".into()));
+        }
+        if block_size > MAX_BLOCK_SIZE_BYTES {
+            return Err(ChangeError::Malformed(format!(
+                "block size {block_size} exceeds {MAX_BLOCK_SIZE_BYTES}"
+            )));
+        }
+        sum += u64::from(block_size);
+    }
+    if count > 0 && sum != size {
+        return Err(ChangeError::BlockSizeMismatch);
+    }
+    Ok(())
 }
 
 impl FileVersion {
@@ -307,18 +233,14 @@ impl FileVersion {
         v
     }
 
-    /// The canonical version of a directory: no blocks, size 0, mtime 0,
-    /// no symlink target, no xattrs. Its identity is its kind plus
-    /// `unix_mode`, which is replicated exactly as a file's is (a `chmod`
-    /// is an explicit change; `None` from a device with no Unix mode model
-    /// is a distinct version, never a fabricated mode).
-    pub fn directory(unix_mode: Option<u32>) -> FileVersion {
+    /// The canonical version of a directory: no blocks, size 0, mtime 0, no symlink target, not
+    /// executable. A directory's mode is not replicated at all, so every directory has this one version.
+    pub fn directory() -> FileVersion {
         let meta = FileMeta {
             mtime_unix_nanos: 0,
-            unix_mode,
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::Directory,
-            xattrs: Vec::new(),
         };
         FileVersion::new(Vec::new(), 0, meta)
     }
@@ -362,22 +284,11 @@ impl FileVersion {
                             .into(),
                     ));
                 }
-                let mut sum: u64 = 0;
-                for b in &self.blocks {
-                    if b.size == 0 {
-                        return Err(ChangeError::Malformed("zero-length block".into()));
-                    }
-                    if b.size > MAX_BLOCK_SIZE_BYTES {
-                        return Err(ChangeError::Malformed(format!(
-                            "block size {} exceeds {MAX_BLOCK_SIZE_BYTES}",
-                            b.size
-                        )));
-                    }
-                    sum += b.size as u64;
-                }
-                if sum != self.size {
-                    return Err(ChangeError::BlockSizeMismatch);
-                }
+                check_block_sizes(
+                    self.size,
+                    self.blocks.len(),
+                    self.blocks.iter().map(|b| b.size),
+                )?;
             }
             RecordKind::Symlink | RecordKind::Directory => {
                 if !self.blocks.is_empty() {
@@ -417,27 +328,13 @@ impl FileVersion {
                 }
             }
         }
-        // Same shape as the symlink_target check just above:
-        // `FileMeta::xattrs`'s own doc comment already says a
-        // symlink or directory is "not scanned" for xattrs (always
-        // empty for those kinds on the capture side), but nothing
-        // enforced it here -- and `exact_object_evidence_after_write`
-        // deliberately skips xattr verification for every kind but
-        // `File` (xattrs are exact-required on Linux only for `File`;
-        // see `SettlementEvidence::ExactObject`'s own doc comment for
-        // the full target-projection-contract model). A hand-crafted
-        // Symlink/Directory version carrying nonempty `xattrs` would
-        // otherwise still bake those bytes into `version_hash` while
-        // nothing downstream ever verifies, applies, or even LOOKS at
-        // them for those kinds -- a logical-identity claim no
-        // completion proof for that path could ever actually attest to,
-        // for any target.
+        // Execute is a property of a regular file only; for a directory or a symlink the one honest
+        // encoding is `false`, so two devices cannot author different versions of the same thing.
         if matches!(self.meta.record_kind, RecordKind::Symlink | RecordKind::Directory)
-            && !self.meta.xattrs.is_empty()
+            && self.meta.exec
         {
             return Err(ChangeError::Malformed(
-                "a symlink or directory version must carry no replicated extended attributes"
-                    .into(),
+                "a symlink or directory version must not be marked executable".into(),
             ));
         }
         Ok(())
@@ -490,7 +387,7 @@ impl FileVersion {
     /// The identity of what this version holds, apart from its modification
     /// time: the hash of the canonical encoding with `mtime` zeroed under a
     /// domain tag of its own. It is a function of the verified block list and
-    /// the replicated metadata (kind, size, mode, symlink target, xattrs), so
+    /// the replicated metadata (kind, size, exec, symlink target), so
     /// two versions with equal identities hold the same bytes and the same
     /// replicated metadata and differ at most in `mtime`. A size, a name or an
     /// mtime never stands in for it.
@@ -501,28 +398,6 @@ impl FileVersion {
         hasher.update(CONTENT_DOMAIN_TAG);
         hasher.update(zeroed.canonical_encoding());
         crate::ids::ContentIdentity(hasher.finalize().into())
-    }
-
-    /// The cross-platform view of this version's mode for fork planning, for a
-    /// regular file only: `modeless` when no mode is recorded (a device
-    /// without unix permissions), not modeless when the mode is a plain
-    /// non-executable read/write word (no bit outside `0o666`, so no exec,
-    /// setuid, setgid or sticky bit). `base` is the content identity with the
-    /// mode removed. `None` for anything else, including every executable
-    /// file, which is therefore never equal to a mode-less one. Computed
-    /// locally from the stored record; never persisted or sent.
-    pub fn mode_bridge(&self) -> Option<crate::native_fork::ModeBridge> {
-        if self.meta.record_kind != RecordKind::File {
-            return None;
-        }
-        let modeless = match self.meta.unix_mode {
-            None => true,
-            Some(mode) if mode & !0o666 == 0 => false,
-            Some(_) => return None,
-        };
-        let mut base = self.clone();
-        base.meta.unix_mode = None;
-        Some(crate::native_fork::ModeBridge { base: base.content_identity(), modeless })
     }
 
     pub fn compute_hash(&self) -> VersionHash {
@@ -553,9 +428,8 @@ impl FileVersion {
         size: u64,
         mtime_unix_nanos: i64,
         record_kind: RecordKind,
-        unix_mode: Option<u32>,
+        exec: bool,
         symlink_target: Option<Vec<u8>>,
-        xattrs: Vec<(String, Vec<u8>)>,
     ) -> FileVersion {
         // A directory's row can still hold what the file before it at the
         // same path held; none of it is state of the directory.
@@ -565,7 +439,8 @@ impl FileVersion {
             .map(|b| VersionBlock { hash: BlockHash(b.hash), size: b.size })
             .collect();
         let (size, mtime_unix_nanos) = if directory { (0, 0) } else { (size, mtime_unix_nanos) };
-        let meta = FileMeta { mtime_unix_nanos, unix_mode, symlink_target, record_kind, xattrs };
+        let exec = exec && record_kind == RecordKind::File;
+        let meta = FileMeta { mtime_unix_nanos, exec, symlink_target, record_kind };
         FileVersion::new(blocks, size, meta)
     }
 

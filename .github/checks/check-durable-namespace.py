@@ -77,6 +77,10 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     # The instance nonce publish: the temp file is removed when the durable publish fails; a lost
     # removal leaves an unreferenced `.tmp` that no reader opens.
     C + "yadorilink-daemon/src/instance_nonce.rs": {"fs::remove_file": 1},
+    # The CLI's cache of device names (`device-names.json`): written by temp file and rename, the
+    # temp removed when the rename fails. A lost or torn file is read as no cache and costs one
+    # lookup of the account's device list; nothing is published to a peer or depends on it.
+    C + "yadorilink-cli/src/commands/device_names.rs": {"fs::remove_file": 1, "fs::rename": 1},
     C + "yadorilink-fs-platform/src/generation.rs": {"fs::remove_file": 3},
     C + "yadorilink-fs-platform/src/durable_dir/raw.rs": {"MoveFileExW": 1, "fs::rename": 1},
     C + "yadorilink-fs-platform/src/durable_dir/probe.rs": {"fs::remove_dir_all": 1},
@@ -89,7 +93,7 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     # next sweep removes again, and nothing is published.
     C
     + "yadorilink-fs-platform/src/fs_capabilities.rs": {
-        "fs::remove_file": 21,
+        "fs::remove_file": 22,
         "fs::remove_dir_all": 1,
         "fs::rename": 1,
     },
@@ -147,6 +151,11 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     # Configuration, logs, counters and caches whose loss or reversion
     # costs nothing that a restart does not redo.
     C + "yadorilink-daemon/src/governance_config.rs": {"fs::rename": 1},
+    # The sender's list of created links: a convenience, since the service holds every link.
+    C + "yadorilink-daemon/src/send_transfer/link_book.rs": {"fs::rename": 1},
+    # The receiver's list of redeemed links: a convenience; losing it only means an offer waits
+    # for an explicit receive after a restart.
+    C + "yadorilink-daemon/src/send_transfer/redeem_book.rs": {"fs::rename": 1},
     C + "yadorilink-daemon/src/space_management_config.rs": {"fs::rename": 1},
     C + "yadorilink-daemon/src/log_roll.rs": {"fs::rename": 1},
     C + "yadorilink-daemon/src/reporting/counters.rs": {"fs::rename": 1},
@@ -167,6 +176,12 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     # whose replacement was published durably is only garbage.
     C + "yadorilink-daemon/src/provider_handoff.rs": {"fs::remove_dir_all": 1, "fs::remove_file": 1},
     C + "yadorilink-daemon/src/shell_ipc/provider_apply.rs": {"fs::remove_file": 7},
+    # The staging spool of an app's upload: the file is renamed in, or its partial copy is renamed to
+    # its name, and the file and its directory are flushed BEFORE the stage is acknowledged (the
+    # caller removes its own copy only after that). The removals are the discard of a staged file
+    # nothing will use, and the undo of a stage that failed: a lost removal leaves an unclaimed
+    # copy the ingest sweep removes by age, and nothing is published.
+    C + "yadorilink-daemon/src/provider_stage.rs": {"fs::remove_file": 5, "fs::rename": 3},
     C + "yadorilink-daemon/src/shell_ipc/provider_materialize.rs": {"fs::remove_file": 6},
     # The Windows shell crate: the cleanup of its own temporary and ingest copies,
     # the host's unregistration, and an old placeholder that is removed so it

@@ -40,7 +40,11 @@ mod unix_socket_tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SegmentBlockStore::new(dir.path().join("blocks")).unwrap());
         let state_db = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
-        let state = DaemonState::new("device-under-test".into(), state_db, store);
+        let state = yadorilink_daemon::test_support::isolated_daemon_state(
+            "device-under-test".into(),
+            state_db,
+            store,
+        );
         // A registered (non-empty device_id) device with no change-signing
         // key is fail-closed (`ensure_initial_change_history`):
         // linking a folder refuses index-only sync rather than leave
@@ -115,6 +119,8 @@ mod unix_socket_tests {
         assert_eq!(list.links.len(), 1);
         assert_eq!(list.links[0].group_id, "group-1");
         assert!(!list.links[0].paused);
+        // The listing carries the folder's state, so `links` and `status` use the same words.
+        assert!(list.links[0].product.is_some(), "a listed folder has its product status");
     }
 
     /// The daemon refuses linking a folder that overlaps an already-linked
@@ -604,7 +610,7 @@ mod unix_socket_tests {
         let resp = send(
             &socket_path,
             ReqPayload::SendFile(yadorilink_ipc_proto::daemonctl::SendFileRequest {
-                source_path: "notes.txt".into(),
+                source_paths: vec!["notes.txt".into()],
                 target_device: "laptop".into(),
             }),
         )
@@ -911,10 +917,9 @@ mod unix_socket_tests {
             size,
             FileMeta {
                 mtime_unix_nanos,
-                unix_mode: None,
+                exec: false,
                 symlink_target: None,
                 record_kind: RecordKind::File,
-                xattrs: Vec::new(),
             },
         );
         let record = FileRecord {
@@ -1068,6 +1073,11 @@ mod unix_socket_tests {
             &permit,
         )
         .unwrap();
+
+        // A write made straight through the engine, not through a request, reaches status when
+        // the builder next collects; saying the write has finished makes the next status wait
+        // for that.
+        state.telemetry.command_completed();
 
         // Deleted: both surfaces agree it's gone -- neither still counts it.
         let resp = send(&socket_path, ReqPayload::ListConflicts(ListConflictsRequest {})).await;
@@ -2484,7 +2494,6 @@ mod windows_pipe_tests {
     use std::sync::Arc;
 
     use tokio::net::windows::named_pipe::ClientOptions;
-    use yadorilink_daemon::daemon_state::DaemonState;
     use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
     use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
     use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
@@ -2506,7 +2515,11 @@ mod windows_pipe_tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SegmentBlockStore::new(dir.path().join("blocks")).unwrap());
         let state_db = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
-        let state = DaemonState::new("device-under-test".into(), state_db, store);
+        let state = yadorilink_daemon::test_support::isolated_daemon_state(
+            "device-under-test".into(),
+            state_db,
+            store,
+        );
         // See the identical comment in the Unix `start_daemon_with_state` above.
         state
             .set_device_signing_key(yadorilink_transport::DeviceSigningKeyPair::generate().signing);
@@ -2529,8 +2542,7 @@ mod windows_pipe_tests {
             .await;
         });
 
-        // Give the listener a moment to create the first pipe instance.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        yadorilink_daemon::control_socket::windows_transport::wait_until_bound(&pipe_name).await;
         (pipe_name, dir)
     }
 

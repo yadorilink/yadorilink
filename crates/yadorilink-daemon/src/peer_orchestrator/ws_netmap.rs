@@ -59,6 +59,7 @@ impl WsNetmapMessage {
         use crate::daemon_state::AccountDeletionState as S;
         match self.self_account.as_ref()?.get("accountDeletionState")?.as_str()? {
             "none" => Some(S::None),
+            "requested" => Some(S::Requested),
             "pending" => Some(S::Pending),
             "urgent" => Some(S::Urgent),
             _ => None,
@@ -295,6 +296,42 @@ pub(super) fn spawn_flush_pending_checkpoints(state: &Arc<DaemonState>, only: Op
 
         for group_id in group_ids {
             state.flush_pending_native_checkpoint_for_group(&group_id).await;
+        }
+        Ok(())
+    });
+}
+
+/// Re-drives the dirty-path journal of every running link in `groups`, once.
+///
+/// A scan or an edit that finds the group's policy not yet loaded journals its
+/// change instead of emitting it, and only the periodic backstop (every few
+/// seconds) picks it up again. The policy loading is the event that ends the
+/// wait, so it triggers the redrive itself: a file already in a folder when
+/// it is shared reached the peer one backstop tick late (about 4.5 s of the
+/// 26 s from setup to first file) before this.
+pub(super) fn spawn_redrive_dirty_journals(state: &Arc<DaemonState>, groups: Vec<String>) {
+    if groups.is_empty() {
+        return;
+    }
+    let state = Arc::clone(state);
+    spawn_one_shot("dirty-journal-redrive", async move {
+        let links = match state.replica_coordinator.link_repository().list_links() {
+            Ok(links) => links,
+            Err(e) => {
+                tracing::debug!(error = %e, "dirty journal redrive: could not list links");
+                return Ok(());
+            }
+        };
+        for link in links.into_iter().filter(|l| !l.paused && !l.orphaned) {
+            if !groups.contains(&link.group_id) {
+                continue;
+            }
+            // A link that is not running (stopped, starting) has its own startup redrive.
+            let Some(local_path) = link.folder_path().map(str::to_string) else { continue };
+            let Some(runtime) = state.links.runtime(&local_path) else { continue };
+            if let Err(e) = runtime.redrive_dirty_journal(&link.group_id).await {
+                tracing::debug!(error = %e, group_id = %link.group_id, "dirty journal redrive after policy load failed");
+            }
         }
         Ok(())
     });

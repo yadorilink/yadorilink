@@ -41,17 +41,30 @@ pub(crate) fn locate(
     config_dir: &std::path::Path,
     absolute_path: &str,
 ) -> Option<(String, String)> {
-    locate_at(&registry_file(config_dir), absolute_path)
+    locate_at(&registry_file(config_dir), absolute_path, false)
+}
+
+/// Like [`locate`], but a path that names a sync root itself is that root (with an empty relative
+/// path): for a command that takes a whole folder.
+pub(crate) fn locate_folder(
+    config_dir: &std::path::Path,
+    absolute_path: &str,
+) -> Option<(String, String)> {
+    locate_at(&registry_file(config_dir), absolute_path, true)
 }
 
 /// Reads the registry the way the host does: the newest complete generation. Anything that
 /// leaves the record unproven (no generation, unreadable, none complete, or a newer generation
 /// that is torn so the one read may predate a root) finds no root, never a guess.
-fn locate_at(base: &std::path::Path, absolute_path: &str) -> Option<(String, String)> {
+fn locate_at(
+    base: &std::path::Path,
+    absolute_path: &str,
+    include_root: bool,
+) -> Option<(String, String)> {
     match generation::read_latest(base, |text| generation::unseal(text).map(str::to_string)) {
-        generation::Latest::Loaded { value, skipped_newer: false, .. } => {
-            well_formed(&value).then(|| locate_in(&value, absolute_path)).flatten()
-        }
+        generation::Latest::Loaded { value, skipped_newer: false, .. } => well_formed(&value)
+            .then(|| locate_in_with(&value, absolute_path, include_root))
+            .flatten(),
         _ => None,
     }
 }
@@ -82,14 +95,27 @@ fn components_keeping_case(path: &str) -> Vec<String> {
     path.split(['\\', '/']).filter(|c| !c.is_empty()).map(str::to_string).collect()
 }
 
+#[cfg(test)]
 pub(crate) fn locate_in(registry: &str, absolute_path: &str) -> Option<(String, String)> {
+    locate_in_with(registry, absolute_path, false)
+}
+
+pub(crate) fn locate_in_with(
+    registry: &str,
+    absolute_path: &str,
+    include_root: bool,
+) -> Option<(String, String)> {
     let wanted = components(absolute_path);
     let original = components_keeping_case(absolute_path);
     let mut best: Option<(&str, usize)> = None;
     for line in registry.lines() {
         let Some((root_id, root_path)) = line.split_once('\t') else { continue };
         let root = components(root_path.trim());
-        if root.is_empty() || root.len() >= wanted.len() || wanted[..root.len()] != root[..] {
+        if root.is_empty()
+            || root.len() > wanted.len()
+            || (root.len() == wanted.len() && !include_root)
+            || wanted[..root.len()] != root[..]
+        {
             continue;
         }
         if best.is_none_or(|(_, depth)| root.len() > depth) {
@@ -119,7 +145,7 @@ mod tests {
         generation::publish_next(&base(dir.path()), &generation::seal("zzzz\tD:\\old\n")).unwrap();
         generation::publish_next(&base(dir.path()), &generation::seal(REGISTRY_BODY)).unwrap();
         assert_eq!(
-            locate_at(&base(dir.path()), r"C:\Users\me\YadoriLink\Photos\docs\a.txt"),
+            locate_at(&base(dir.path()), r"C:\Users\me\YadoriLink\Photos\docs\a.txt", false),
             Some((ID_A.into(), "docs/a.txt".into()))
         );
     }
@@ -139,8 +165,8 @@ mod tests {
         ] {
             let base = base(&tempfile::tempdir_in(dir.path()).unwrap().keep());
             generation::publish_next(&base, &generation::seal(&body)).unwrap();
-            assert_eq!(locate_at(&base, p), None, "{body}");
-            assert_eq!(locate_at(&base, sigma), None, "{body}");
+            assert_eq!(locate_at(&base, p, false), None, "{body}");
+            assert_eq!(locate_at(&base, sigma, false), None, "{body}");
         }
     }
 
@@ -148,9 +174,9 @@ mod tests {
     fn the_unsuffixed_file_and_a_missing_record_are_not_a_registry() {
         let dir = tempfile::tempdir().unwrap();
         let p = r"C:\Users\me\YadoriLink\Photos\a.txt";
-        assert_eq!(locate_at(&base(dir.path()), p), None);
+        assert_eq!(locate_at(&base(dir.path()), p, false), None);
         std::fs::write(base(dir.path()), REGISTRY_BODY).unwrap();
-        assert_eq!(locate_at(&base(dir.path()), p), None);
+        assert_eq!(locate_at(&base(dir.path()), p, false), None);
     }
 
     #[test]
@@ -159,7 +185,7 @@ mod tests {
         let p = r"C:\Users\me\YadoriLink\Photos\a.txt";
         generation::publish_next(&base(dir.path()), &generation::seal(REGISTRY_BODY)).unwrap();
         std::fs::write(dir.path().join("cfapi_sync_roots.txt.2"), "aaaa\tC:\\torn").unwrap();
-        assert_eq!(locate_at(&base(dir.path()), p), None);
+        assert_eq!(locate_at(&base(dir.path()), p, false), None);
     }
 
     #[test]
@@ -209,5 +235,21 @@ mod tests {
     fn the_root_itself_and_unrelated_paths_are_not_items() {
         assert_eq!(locate_in(REGISTRY, r"C:\Users\me\YadoriLink\Photos"), None);
         assert_eq!(locate_in(REGISTRY, r"C:\Users\me\Documents\a.txt"), None);
+    }
+
+    /// A command that takes a whole folder resolves the root itself; the item lookup does not.
+    #[test]
+    fn a_sync_root_names_itself_only_for_the_folder_lookup() {
+        let root = r"C:\Users\me\YadoriLink\Photos";
+        assert_eq!(locate_in(REGISTRY_BODY, root), None);
+        assert_eq!(
+            locate_in_with(REGISTRY_BODY, root, true),
+            Some((ID_A.to_string(), String::new()))
+        );
+        assert_eq!(
+            locate_in_with(REGISTRY_BODY, &format!(r"{root}\trips"), true),
+            Some((ID_A.to_string(), "trips".to_string()))
+        );
+        assert_eq!(locate_in_with(REGISTRY_BODY, r"C:\Users\me\YadoriLink", true), None);
     }
 }

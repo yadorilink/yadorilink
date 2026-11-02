@@ -45,6 +45,17 @@ use crate::shell_status::{resolve_materialization_state, resolve_status_detail};
 #[cfg(not(target_os = "ios"))]
 const MAX_SHELL_IPC_CONNECTIONS: usize = 64;
 
+/// `ListFolderFiles` paging: the most entries a page may carry whatever the caller asks.
+const LIST_FOLDER_FILES_MAX_ENTRIES: usize = 5000;
+/// A page stops once its entries are estimated at this many encoded bytes (half the 1 MiB
+/// frame, so long paths cannot push a page over it).
+const LIST_FOLDER_FILES_PAGE_BYTES: usize = 512 * 1024;
+/// What an unpaged listing may reach before it is refused (fail closed) rather than written as
+/// an oversized frame.
+const LIST_FOLDER_FILES_FRAME_BYTES: usize = 900 * 1024;
+/// Encoded size of an entry beyond its path (sizes, times, state, kind, generation, tags).
+const LIST_FOLDER_FILE_ENTRY_OVERHEAD: usize = 64;
+
 fn shell_entry_kind(
     kind: yadorilink_replica_domain::file::RecordKind,
 ) -> yadorilink_ipc_proto::shellipc::EntryKind {
@@ -220,12 +231,19 @@ where
                         if let Some(Payload::ExtensionHandshake(handshake)) = &msg.payload {
                             handshakes.note(&handshake.root_id);
                         }
+                        // Counted when handled, unless it is one of the reads shells poll: a
+                        // status after the answer to a state-changing message shows it. (A
+                        // provider apply finishes in its own task and counts there.)
+                        let changes_state = !is_polled_read(&msg.payload);
                         if materialize_message(&context, &materializations, &reply_tx, &msg)
                             || provider_apply::apply_message(
                                 &context, &materializations, &handshakes, &reply_tx, &msg,
                             )
                             || provider_channel_message(&context, &host_tx, &msg).await
                         {
+                            if changes_state {
+                                context.telemetry.command_completed();
+                            }
                             continue;
                         }
                         if let Some(response) =
@@ -234,7 +252,11 @@ where
                             write_message(&mut write_half, &response).await?;
                             continue;
                         }
-                        if let Some(response) = handle_message(&context, msg).await {
+                        let response = handle_message(&context, msg).await;
+                        if changes_state {
+                            context.telemetry.command_completed();
+                        }
+                        if let Some(response) = response {
                             write_message(&mut write_half, &response).await?;
                         }
                     }
@@ -265,6 +287,20 @@ where
             }
         }
     }
+}
+
+/// The messages that only read, and that the shell extensions send over and over.
+fn is_polled_read(payload: &Option<Payload>) -> bool {
+    matches!(
+        payload,
+        Some(
+            Payload::StatusQuery(_)
+                | Payload::ListProviderFoldersRequest(_)
+                | Payload::ListLinkedRootsRequest(_)
+                | Payload::ListFolderFilesRequest(_)
+                | Payload::NextProviderDownloadsRequest(_)
+        )
+    )
 }
 
 /// Detaches the host and forgets what it reported when the connection that was the host ends.
@@ -724,7 +760,8 @@ async fn handle_message(context: &ShellContext, msg: ShellIpcMessage) -> Option<
         // could not be read would tell it the folder has zero files. Same
         // contract as `ListOnDemandFoldersRequest` above.
         Some(Payload::ListFolderFilesRequest(req)) => {
-            let listing: Result<Vec<FolderFileEntry>, String> = 'listing: {
+            let mut next_after_path = String::new();
+            let listing: Result<(Vec<FolderFileEntry>, String), String> = 'listing: {
                 let links = match context.replica_coordinator.link_repository().list_links() {
                     Ok(links) => links,
                     Err(e) => break 'listing Err(format!("failed to list links: {e}")),
@@ -755,8 +792,33 @@ async fn handle_message(context: &ShellContext, msg: ShellIpcMessage) -> Option<
                 // ready to create, retry next poll", so this degrades
                 // to a delayed placeholder creation, never a wrong one.
                 let runtime = context.links.runtime(&req.local_path);
+                let mut files: Vec<_> = files.into_iter().filter(|(f, _)| !f.deleted).collect();
+                let paged = req.max_entries > 0;
+                if paged {
+                    // A stable order is what makes `after_path` a cursor.
+                    files.sort_unstable_by(|a, b| a.0.path.cmp(&b.0.path));
+                    if !req.after_path.is_empty() {
+                        let start = files.partition_point(|(f, _)| f.path <= req.after_path);
+                        files.drain(..start);
+                    }
+                }
+                let max_entries =
+                    (req.max_entries as usize).clamp(1, LIST_FOLDER_FILES_MAX_ENTRIES);
                 let mut entries = Vec::new();
-                for (f, record_kind) in files.into_iter().filter(|(f, _)| !f.deleted) {
+                let mut encoded_estimate = 0usize;
+                for (f, record_kind) in files {
+                    if paged
+                        && (entries.len() >= max_entries
+                            || (!entries.is_empty()
+                                && encoded_estimate >= LIST_FOLDER_FILES_PAGE_BYTES))
+                    {
+                        next_after_path = entries
+                            .last()
+                            .map(|e: &FolderFileEntry| e.relative_path.clone())
+                            .unwrap_or_default();
+                        break;
+                    }
+                    encoded_estimate += f.path.len() + LIST_FOLDER_FILE_ENTRY_OVERHEAD;
                     let local_state = match context
                         .replica_coordinator
                         .materialization_state_repository()
@@ -813,10 +875,18 @@ async fn handle_message(context: &ShellContext, msg: ShellIpcMessage) -> Option<
                         item_id: Vec::new(),
                     });
                 }
-                Ok(entries)
+                if !paged && encoded_estimate > LIST_FOLDER_FILES_FRAME_BYTES {
+                    break 'listing Err(format!(
+                        "the listing (about {encoded_estimate} bytes) does not fit one frame; \
+                         the caller must page (max_entries)"
+                    ));
+                }
+                Ok((entries, next_after_path))
             };
             let response = match listing {
-                Ok(entries) => ListFolderFilesResponse { entries, snapshot_available: true },
+                Ok((entries, next_after_path)) => {
+                    ListFolderFilesResponse { entries, snapshot_available: true, next_after_path }
+                }
                 Err(error) => {
                     tracing::warn!(
                         local_path = %req.local_path,
@@ -824,7 +894,11 @@ async fn handle_message(context: &ShellContext, msg: ShellIpcMessage) -> Option<
                         "ListFolderFilesRequest could not confirm the folder's listing; \
                          reporting snapshot_available=false rather than an empty listing"
                     );
-                    ListFolderFilesResponse { entries: Vec::new(), snapshot_available: false }
+                    ListFolderFilesResponse {
+                        entries: Vec::new(),
+                        snapshot_available: false,
+                        next_after_path: String::new(),
+                    }
                 }
             };
             Some(ShellIpcMessage { payload: Some(Payload::ListFolderFilesResponse(response)) })
@@ -948,6 +1022,7 @@ mod local_write_tests;
 mod provider_tests;
 
 mod provider_apply;
+pub(crate) use provider_apply::apply_for_app;
 mod provider_enumerate;
 mod provider_materialize;
 use provider_materialize::{materialize_message, Delivery, MaterializeRequests};

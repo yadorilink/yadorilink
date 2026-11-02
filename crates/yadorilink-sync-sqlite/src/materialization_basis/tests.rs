@@ -27,10 +27,9 @@ fn file(mtime: i64) -> FileVersion {
         0,
         FileMeta {
             mtime_unix_nanos: mtime,
-            unix_mode: Some(0o644),
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     )
 }

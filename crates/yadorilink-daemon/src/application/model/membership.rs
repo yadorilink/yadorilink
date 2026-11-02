@@ -158,6 +158,15 @@ pub(crate) enum MembershipCommitOutcome {
     TermsConsentRequired(String),
 }
 
+/// A definite refusal learned from a revoke authorization check, before
+/// anything was attempted.
+#[derive(Debug, Clone)]
+pub(crate) enum RevokeRefusal {
+    Rejected(String),
+    /// `403 terms_consent_required`.
+    TermsConsentRequired(String),
+}
+
 /// Structured payload of a `Committed` outcome. `handoff` is only ever
 /// `Some` for a single-group guarded revoke (the one mode whose Worker
 /// response carries a real `membershipGeneration`); every other mode's

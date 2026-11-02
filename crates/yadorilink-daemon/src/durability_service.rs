@@ -226,6 +226,11 @@ pub struct DurabilityFacts {
     /// before the very first sweep has even had a chance to run (most
     /// visible right after daemon startup).
     pub ever_confirmation_swept: bool,
+    /// Exactly one sweep round has run and it confirmed nothing. A device that has just
+    /// joined or linked a folder is usually still connecting to its peers and receiving the
+    /// folder's index, so that first negative says little; it is shown as "checking" until a
+    /// second round has had its chance (see [`first_check_pending`]).
+    pub provisional_first_round: bool,
     /// Positively confirmed,
     /// not merely inferred from connectivity/timing, that at least one
     /// currently-required path's content has NO obtainable/durable holder
@@ -317,12 +322,15 @@ fn evidence_distrusted(facts: &DurabilityFacts) -> bool {
         || facts.materialization.is_err()
 }
 
-/// Whether `classify` answers `Unknown` only because this daemon has not run
-/// its first custody check for the group yet: no fact makes the evidence
-/// untrustworthy, nothing has confirmed custody, and no check round has
-/// happened. Transient by construction -- the first round clears it.
+/// Whether `classify` answers `Unknown` only because this daemon has not yet had a fair
+/// custody check for the group: no fact makes the evidence untrustworthy, nothing has
+/// confirmed custody, and either no check round has happened or only the first one has (a
+/// folder is typically still connecting to its peers and receiving its index then).
+/// Transient by construction -- the second round settles it.
 pub fn first_check_pending(facts: &DurabilityFacts) -> bool {
-    !evidence_distrusted(facts) && !facts.peer_confirmed_custody && !facts.ever_confirmation_swept
+    !evidence_distrusted(facts)
+        && !facts.peer_confirmed_custody
+        && (!facts.ever_confirmation_swept || facts.provisional_first_round)
 }
 
 /// Confirms whether a full replica durably holds an exact file version — bound
@@ -380,24 +388,14 @@ impl<F: Fn(&str, &str, &VersionHash, &[VersionBlock]) -> bool + Send + Sync> Cus
 /// `MATERIALIZATION_REPAIR_SWEEP_INTERVAL` — a whole-group custody check is
 /// the same order of cost (one round-trip per group) as a materialization
 /// repair pass, so there's no reason for it to run on a different clock.
-const CUSTODY_CONFIRMATION_SWEEP_INTERVAL: Duration = Duration::from_secs(90);
-
-static CUSTODY_CONFIRMATION_SWEEP_INTERVAL_OVERRIDE_FOR_TESTS: std::sync::OnceLock<
-    Mutex<Option<Duration>>,
-> = std::sync::OnceLock::new();
-
-pub fn set_default_custody_confirmation_sweep_interval_for_tests(interval: Duration) {
-    *CUSTODY_CONFIRMATION_SWEEP_INTERVAL_OVERRIDE_FOR_TESTS
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner()) = Some(interval);
-}
+pub(crate) const CUSTODY_CONFIRMATION_SWEEP_INTERVAL: Duration = Duration::from_secs(90);
 
 fn default_custody_confirmation_sweep_interval() -> Duration {
-    CUSTODY_CONFIRMATION_SWEEP_INTERVAL_OVERRIDE_FOR_TESTS
-        .get()
-        .and_then(|m| *m.lock().unwrap_or_else(|p| p.into_inner()))
-        .unwrap_or(CUSTODY_CONFIRMATION_SWEEP_INTERVAL)
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(interval) = crate::daemon_state::construction_custody_confirmation_sweep() {
+        return interval;
+    }
+    CUSTODY_CONFIRMATION_SWEEP_INTERVAL
 }
 
 /// How stale a `custody_confirmation_cache` entry may be before
@@ -449,6 +447,9 @@ struct CustodyConfirmationRecord {
 #[derive(Debug, Clone, Default)]
 struct CustodyCacheEntry {
     record: Option<CustodyConfirmationRecord>,
+    /// How many sweep rounds have written a record since the entry was created (cleared with
+    /// it on unlink).
+    rounds: u32,
     epoch: u64,
     /// When a real `StrongHandoffProof` last succeeded for this group,
     /// and the whole-root-set digest it covered.
@@ -664,6 +665,7 @@ impl DurabilityService {
             confirmed_at: std::time::Instant::now(),
             membership_generation,
         });
+        entry.rounds = entry.rounds.saturating_add(1);
         true
     }
 
@@ -709,6 +711,16 @@ impl DurabilityService {
             .unwrap_or_else(|p| p.into_inner())
             .get(group_id)
             .is_some_and(|entry| entry.record.is_some())
+    }
+
+    /// Whether exactly one sweep round has run for `group_id` (see
+    /// [`DurabilityFacts::provisional_first_round`]).
+    pub(crate) fn first_round_is_provisional(&self, group_id: &str) -> bool {
+        self.custody_confirmation_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(group_id)
+            .is_some_and(|entry| entry.rounds == 1)
     }
 
     /// Current epoch counter for `group_id`'s custody-confirmation cache
@@ -803,7 +815,7 @@ impl DurabilityService {
                 return Some(*memoised);
             }
         }
-        let summary = repository.group_root_set_summary(group_id).ok()?;
+        let summary = repository.group_root_set_summary(group_id, &|_| true).ok()?;
         self.root_set_summary_memo
             .lock()
             .unwrap_or_else(|p| p.into_inner())

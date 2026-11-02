@@ -163,8 +163,17 @@ impl PeerSyncSession {
                 return;
             }
         };
-        if let Err(error) = self.handle_block_request(&mut *stream, req, examination_permits).await
-        {
+        let request_started =
+            yadorilink_local_storage::io_diag::enabled().then(std::time::Instant::now);
+        let handled = self.handle_block_request(&mut *stream, req, examination_permits).await;
+        if let Some(started) = request_started {
+            yadorilink_local_storage::io_diag::record(
+                yadorilink_local_storage::io_diag::Op::ServeRequest,
+                started.elapsed().as_nanos() as u64,
+                0,
+            );
+        }
+        if let Err(error) = handled {
             tracing::warn!(%error, peer = %self.peer_device_id, "error handling block request");
         }
     }
@@ -256,7 +265,17 @@ impl PeerSyncSession {
                 .reject_block_request(stream, "requester is not authorized for this folder group")
                 .await;
         }
-        let declared_size = match self.block_request_checks_off_runtime(&req).await? {
+        let authorize_started =
+            yadorilink_local_storage::io_diag::enabled().then(std::time::Instant::now);
+        let checked = self.block_request_checks_off_runtime(&req).await;
+        if let Some(started) = authorize_started {
+            yadorilink_local_storage::io_diag::record(
+                yadorilink_local_storage::io_diag::Op::ServeAuthorize,
+                started.elapsed().as_nanos() as u64,
+                0,
+            );
+        }
+        let declared_size = match checked? {
             BlockRequestCheckOutcome::Ok { declared_size } => declared_size,
             BlockRequestCheckOutcome::NotReferenced => {
                 tracing::warn!(
@@ -385,6 +404,8 @@ impl PeerSyncSession {
         // here does not reintroduce "credit held hostage while merely
         // waiting a turn" (see `acquire_dispatch_turn`'s own doc comment).
         let reserve_bytes = declared_size.map(u64::from).unwrap_or(MAX_BLOCK_SIZE as u64);
+        let dispatch_started =
+            yadorilink_local_storage::io_diag::enabled().then(std::time::Instant::now);
         // Waits for a fair turn BEFORE reserving any byte credit -- see
         // `acquire_dispatch_turn`'s own doc comment for why this ordering
         // matters: byte credit must never be held hostage while a request
@@ -449,6 +470,13 @@ impl PeerSyncSession {
                 Ok(guard) => guard,
                 Err(busy) => return self.respond_block_busy(stream, busy).await,
             };
+        if let Some(started) = dispatch_started {
+            yadorilink_local_storage::io_diag::record(
+                yadorilink_local_storage::io_diag::Op::ServeDispatchWait,
+                started.elapsed().as_nanos() as u64,
+                0,
+            );
+        }
 
         // `Some(exact)` when `authorize_block_serve` found a real
         // declared size (the common case) -- the stored bytes must match
@@ -473,7 +501,21 @@ impl PeerSyncSession {
         // clone), not its own copy of the read/verify/compress work.
         let result = cell
             .get_or_init(|| async move {
+                let queued_at =
+                    yadorilink_local_storage::io_diag::enabled().then(std::time::Instant::now);
                 let read_result = spawn_blocking(move || {
+                    if let Some(queued_at) = queued_at {
+                        yadorilink_local_storage::io_diag::record(
+                            yadorilink_local_storage::io_diag::Op::ServeReadQueue,
+                            queued_at.elapsed().as_nanos() as u64,
+                            0,
+                        );
+                    }
+                    if yadorilink_local_storage::io_diag::serve_constant() {
+                        return Ok(yadorilink_local_storage::io_diag::constant_block(
+                            expected_size.unwrap_or(0) as usize,
+                        ));
+                    }
                     let _reads = yadorilink_local_storage::io_diag::attribute_reads(
                         yadorilink_local_storage::io_diag::ReadReason::PeerServe,
                     );
@@ -528,7 +570,17 @@ impl PeerSyncSession {
                 // `compress_block` still returns the raw bytes whenever
                 // compressing them would make them larger, which is a
                 // property of this payload, not of this peer.
-                match spawn_blocking(move || compress_block(&data)).await {
+                let compress_started =
+                    yadorilink_local_storage::io_diag::enabled().then(std::time::Instant::now);
+                let compressed = spawn_blocking(move || compress_block(&data)).await;
+                if let Some(started) = compress_started {
+                    yadorilink_local_storage::io_diag::record(
+                        yadorilink_local_storage::io_diag::Op::ServeCompress,
+                        started.elapsed().as_nanos() as u64,
+                        0,
+                    );
+                }
+                match compressed {
                     Ok((data, compression)) => Ok((Bytes::from(data), compression)),
                     Err(join_err) => {
                         Err(crate::block_serve::CoalesceFailure::ReadFailed(join_err.to_string()))
@@ -537,6 +589,7 @@ impl PeerSyncSession {
             })
             .await
             .clone();
+        let result = self.fall_back_to_file(result, &req, expected_size).await;
 
         let send_result = match result {
             Ok((data, compression)) => {
@@ -544,21 +597,41 @@ impl PeerSyncSession {
                 // send proceeds -- consumes tokens for the actual bytes
                 // about to be transmitted, awaiting bucket refill rather
                 // than dropping.
+                let upload_started =
+                    yadorilink_local_storage::io_diag::enabled().then(std::time::Instant::now);
                 self.rate_limiters().upload.acquire(data.len() as u64).await;
+                if let Some(started) = upload_started {
+                    yadorilink_local_storage::io_diag::record(
+                        yadorilink_local_storage::io_diag::Op::ServeUploadWait,
+                        started.elapsed().as_nanos() as u64,
+                        0,
+                    );
+                }
+                let send_started =
+                    yadorilink_local_storage::io_diag::enabled().then(std::time::Instant::now);
                 // The body goes onto the stream exactly as it sits in the
                 // coalesced buffer: one copy into the transport, and none
                 // into an intermediate encoding. `size` is what is on the
                 // wire, so it is the post-compression length.
-                self.respond_to_block_request(
-                    stream,
-                    yadorilink_sync_wire::BlockResponseOutcomeFrame::Found {
-                        size: data.len() as u64,
-                        hash: req.block_hash,
-                        compression,
-                    },
-                    &data,
-                )
-                .await
+                let sent = self
+                    .respond_to_block_request(
+                        stream,
+                        yadorilink_sync_wire::BlockResponseOutcomeFrame::Found {
+                            size: data.len() as u64,
+                            hash: req.block_hash,
+                            compression,
+                        },
+                        &data,
+                    )
+                    .await;
+                if let Some(started) = send_started {
+                    yadorilink_local_storage::io_diag::record(
+                        yadorilink_local_storage::io_diag::Op::ServeSend,
+                        started.elapsed().as_nanos() as u64,
+                        data.len() as u64,
+                    );
+                }
+                sent
             }
             Err(crate::block_serve::CoalesceFailure::Absent(read_error)) => {
                 // Referenced and provenance-verified, but the bytes are not
@@ -610,6 +683,78 @@ impl PeerSyncSession {
         };
         drop(credit_guard);
         send_result
+    }
+
+    /// The store does not hold the block: when a file can supply it, the user's file is read for
+    /// this request alone (the shared read is path-independent and stays so: another path's file
+    /// must never answer for this one) and checked against the hash. Any other outcome is kept.
+    async fn fall_back_to_file(
+        &self,
+        result: Result<(Bytes, i32), crate::block_serve::CoalesceFailure>,
+        req: &yadorilink_sync_wire::BlockRequestHeaderFrame,
+        expected_size: Option<u64>,
+    ) -> Result<(Bytes, i32), crate::block_serve::CoalesceFailure> {
+        match result {
+            Err(crate::block_serve::CoalesceFailure::Absent(reason))
+                if self.block_file_source.is_some() =>
+            {
+                match self.serve_block_from_file(req, expected_size).await {
+                    Some(served) => served,
+                    None => Err(crate::block_serve::CoalesceFailure::Absent(reason)),
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// Reads the block of `req` from the user's file, for a block the store does not hold, and
+    /// prepares it for the wire. `None`: the file cannot supply it (nothing to report beyond the
+    /// store's own miss); `Some(Err(..))`: the file supplied bytes that cannot be sent.
+    async fn serve_block_from_file(
+        &self,
+        req: &yadorilink_sync_wire::BlockRequestHeaderFrame,
+        expected_size: Option<u64>,
+    ) -> Option<Result<(Bytes, i32), crate::block_serve::CoalesceFailure>> {
+        let source = Arc::clone(self.block_file_source.as_ref()?);
+        let (group_id, path, hash) =
+            (req.folder_group_id.clone(), req.file_path.clone(), req.block_hash.clone());
+        let read = spawn_blocking(move || source.read_block(&group_id, &path, &hash)).await;
+        let data = match read {
+            Ok(Ok(crate::ports::FileBlockRead::Found(data))) => {
+                tracing::debug!(peer = %self.peer_device_id, path = %req.file_path, "block served from the file");
+                data
+            }
+            Ok(Ok(other)) => {
+                tracing::debug!(peer = %self.peer_device_id, path = %req.file_path, outcome = ?other, "block not served from the file");
+                return None;
+            }
+            // The file could not be read (an I/O error, as opposed to a file that is not a source):
+            // a failure to read, as for the store, and not an answer that the block is not held.
+            Ok(Err(error)) => {
+                return Some(Err(crate::block_serve::CoalesceFailure::ReadFailed(
+                    error.to_string(),
+                )))
+            }
+            Err(join_error) => {
+                return Some(Err(crate::block_serve::CoalesceFailure::ReadFailed(
+                    join_error.to_string(),
+                )))
+            }
+        };
+        // The same invariant as for a block read from the store: the length is the declared one.
+        let size_ok = match expected_size {
+            Some(expected) => data.len() as u64 == expected,
+            None => data.len() <= MAX_BLOCK_SIZE,
+        };
+        if !size_ok {
+            return None;
+        }
+        Some(match spawn_blocking(move || compress_block(&data)).await {
+            Ok((data, compression)) => Ok((Bytes::from(data), compression)),
+            Err(join_error) => {
+                Err(crate::block_serve::CoalesceFailure::ReadFailed(join_error.to_string()))
+            }
+        })
     }
 
     /// Answers `Busy`: this device's serve queue is at its in-flight credit

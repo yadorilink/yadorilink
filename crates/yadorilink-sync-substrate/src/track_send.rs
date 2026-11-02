@@ -255,20 +255,63 @@ pub(crate) async fn connect(
     let id = iroh::EndpointId::from_bytes(address.peer().as_bytes())
         .map_err(|err| SubstrateError::Connect(err.to_string()))?;
     let mut target = iroh::EndpointAddr::new(id);
-    for direct in address.direct_addrs() {
-        target = target.with_ip_addr(*direct);
+    let own = endpoint.addr();
+    let own_public: std::collections::HashSet<std::net::IpAddr> = own
+        .ip_addrs()
+        .map(std::net::SocketAddr::ip)
+        .filter(|ip| crate::directory::is_public(*ip))
+        .collect();
+    let has_relay = address.relay_urls().next().is_some() || own.relay_urls().next().is_some();
+    let direct = crate::directory::without_hairpin(
+        address.direct_addrs().copied().collect(),
+        has_relay,
+        &own_public,
+    );
+    for direct in direct {
+        target = target.with_ip_addr(direct);
     }
+    let mut relays = 0usize;
     for relay in address.relay_urls() {
         match relay.parse::<iroh::RelayUrl>() {
-            Ok(url) => target = target.with_relay_url(url),
+            Ok(url) => {
+                target = target.with_relay_url(url);
+                relays += 1;
+            }
             Err(_) => tracing::debug!(%relay, "dropping an unparseable relay URL"),
         }
     }
-    let connection = endpoint
-        .connect(target, YADORI_SEND_ALPN)
-        .await
-        .map_err(|err| SubstrateError::Connect(err.to_string()))?;
+    if relays == 0 {
+        // Nothing says where the peer is homed on the relay network. Most devices use the same
+        // relay as this one, and a relay path is the one that does not depend on either side's
+        // LAN, NAT hairpin or choice of network interface, so offer ours as a hint: iroh runs
+        // it alongside every direct address and keeps whichever completes the handshake first.
+        for url in endpoint.addr().relay_urls() {
+            target = target.with_relay_url(url.clone());
+        }
+    }
+    let connection = endpoint.connect(target, YADORI_SEND_ALPN).await.map_err(|err| {
+        SubstrateError::TrackSendDial {
+            failure: crate::node::dial_failure(&err),
+            message: error_chain(&err),
+        }
+    })?;
     let connection = TrackSendConnection::new(connection);
     open.hold(&connection);
     Ok(connection)
+}
+
+/// An error and every cause under it on one line, so what the operating system said (for
+/// instance "No route to host") is not lost behind the outermost description.
+fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !text.contains(&cause_text) {
+            text.push_str(": ");
+            text.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    text
 }

@@ -12,11 +12,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use yadorilink_ipc_proto::daemonctl::EntryKind as WireEntryKind;
 use yadorilink_ipc_proto::daemonctl::{
-    self as wire, ConflictedFileInfo, FileVersionInfo, GcResponse, HandoffResult, InboxTransfer,
-    LinkStatus, MaterializationStatusResponse, MintedInviteInfo, PeerStatus,
-    ReceiveTransferResponse, ReplicaMembershipCommandOutcome, RestoreTrashOperationResponse,
-    SendFileResponse, StatusResponse, TrashedFileInfo, UpdateConfigResponse, UpdateInstallResponse,
-    UpdateStatusResponse, UpdateVerifiedEntryResponse, VolumeFreeSpace,
+    self as wire, ConflictedFileInfo, CreateSendLinkResponse, FileVersionInfo, GcResponse,
+    HandoffResult, InboxTransfer, LinkStatus, MaterializationStatusResponse, MintedInviteInfo,
+    PeerStatus, ReceiveTransferResponse, ReplicaMembershipCommandOutcome,
+    RestoreTrashOperationResponse, SendFileResponse, StatusResponse, TrashedFileInfo,
+    UpdateConfigResponse, UpdateInstallResponse, UpdateStatusResponse, UpdateVerifiedEntryResponse,
+    VolumeFreeSpace,
 };
 use yadorilink_local_storage::free_space::FreeSpaceState as LocalFreeSpace;
 use yadorilink_local_storage::link_preflight::{self, LinkPreflightReport, RiskyLocation};
@@ -115,7 +116,7 @@ pub fn status_snapshot(
     captured_at: SystemTime,
 ) -> StatusSnapshot {
     let links = &response.links;
-    let product = view::ProductStatusSummary::global(links);
+    let product = device_product(response);
     StatusSnapshot {
         captured_at,
         overall: match response.overall_state.as_str() {
@@ -220,6 +221,7 @@ fn peer_summary(peer: &PeerStatus) -> PeerSummary {
             wire::UnreachableCategory::Unspecified => None,
         },
         route: route(Some(peer)),
+        last_connected: unix_secs(peer.last_connected_unix),
     }
 }
 
@@ -280,6 +282,18 @@ pub fn attention_reason(
         },
         identity,
     }
+}
+
+/// The product status of the whole device, as the daemon computed it. A reply that carries none
+/// (never the case between a daemon and a client of the same protocol version) reads as needing
+/// attention rather than as healthy.
+fn device_product(response: &StatusResponse) -> view::ProductStatusSummary {
+    view::ProductStatusSummary::from_wire(&response.product.clone().unwrap_or_default())
+}
+
+/// The product status of one folder, as the daemon computed it (see [`device_product`]).
+fn folder_product(link: &LinkStatus) -> view::ProductStatusSummary {
+    view::ProductStatusSummary::from_wire(&link.product.clone().unwrap_or_default())
 }
 
 /// The product state, counts and next action, as the shells receive them.
@@ -385,11 +399,14 @@ fn attention_category(item: view::AttentionItem) -> AttentionCategory {
         | I::ReplacementSignInRequired
         | I::TermsConsentRequired
         | I::SignInRequired
+        | I::AccountDeletionRequested
         | I::AccountDeletionPending
         | I::AccountDeletionUrgent
         | I::NotJoined
         | I::FileWatchLimit
         | I::UnreadableFiles
+        | I::IndexDamaged
+        | I::RebuildNeeded
         | I::UnsupportedFilename
         | I::FileNotReadable
         | I::Unrecognized => AttentionCategory::Unrecognized,
@@ -438,6 +455,8 @@ pub fn folder_summary(
         hydrating_file_count: derived.files_hydrating,
         held_file_count: derived.held_file_count,
         skipped_symlink_count: derived.skipped_symlink_count,
+        total_bytes: link.total_bytes,
+        online_only_bytes: link.online_only_bytes,
         transfer: derived.transfer.map(|t| FolderTransferProgress {
             bytes_done: t.bytes_done,
             bytes_total: t.bytes_total,
@@ -475,7 +494,7 @@ pub fn folder_summary(
         },
         availability: availability_summary(view::AvailabilitySummary::from_link(link)),
         protection: protection_summary(view::ProtectionSummary::from_link(link)),
-        product: product_summary(&view::ProductStatusSummary::for_folder(link)),
+        product: product_summary(&folder_product(link)),
         full_replica_device_ids: derived.full_replica_device_ids,
         policy_stale: derived.policy_stale,
         ambiguous: derived.ambiguous,
@@ -599,7 +618,7 @@ pub fn status_dimensions_json(response: &StatusResponse) -> serde_json::Value {
         })
     }
 
-    let overall = view::ProductStatusSummary::global(&response.links);
+    let overall = device_product(response);
     let folders: Vec<_> = response
         .links
         .iter()
@@ -708,6 +727,73 @@ pub fn conflict_summary(file: &ConflictedFileInfo) -> ConflictSummary {
     }
 }
 
+pub fn activity_request(
+    limit: u32,
+    before_cursor: Option<i64>,
+    filter: Option<&ActivityFilter>,
+) -> wire::ListActivityRequest {
+    let default = ActivityFilter::default();
+    let filter = filter.unwrap_or(&default);
+    wire::ListActivityRequest {
+        limit,
+        before_cursor: before_cursor.unwrap_or(0),
+        kinds: filter
+            .kinds
+            .iter()
+            .map(|kind| match kind {
+                ActivityKind::Added => wire::ActivityKind::Added,
+                ActivityKind::Updated => wire::ActivityKind::Updated,
+                ActivityKind::Deleted => wire::ActivityKind::Deleted,
+                ActivityKind::Conflict => wire::ActivityKind::Conflict,
+                ActivityKind::Restored => wire::ActivityKind::Restored,
+            } as i32)
+            .collect(),
+        origin: match filter.origin {
+            ActivityOrigin::Any => wire::ActivityOrigin::Any,
+            ActivityOrigin::ThisDevice => wire::ActivityOrigin::ThisDevice,
+            ActivityOrigin::OtherDevices => wire::ActivityOrigin::OtherDevices,
+        } as i32,
+    }
+}
+
+/// A page from the daemon's events; `device_names` maps device ids to names (best effort).
+pub fn activity_page(
+    limit: u32,
+    events: &[wire::ActivityEventInfo],
+    device_names: &std::collections::HashMap<String, String>,
+) -> ActivityPage {
+    let events: Vec<ActivityEvent> = events
+        .iter()
+        .filter_map(|event| {
+            let kind = match event.kind() {
+                wire::ActivityKind::Unspecified => return None,
+                wire::ActivityKind::Added => ActivityKind::Added,
+                wire::ActivityKind::Updated => ActivityKind::Updated,
+                wire::ActivityKind::Deleted => ActivityKind::Deleted,
+                wire::ActivityKind::Conflict => ActivityKind::Conflict,
+                wire::ActivityKind::Restored => ActivityKind::Restored,
+            };
+            let origin_device_id = text(&event.origin_device_id);
+            Some(ActivityEvent {
+                cursor: event.cursor,
+                local_path: event.local_path.clone(),
+                path: event.path.clone(),
+                kind,
+                origin_device_name: origin_device_id
+                    .as_deref()
+                    .and_then(|id| device_names.get(id).cloned()),
+                origin_device_id,
+                is_this_device: event.is_this_device,
+                at: unix_nanos(event.at_unix_nanos),
+            })
+        })
+        .collect();
+    let next_cursor = (events.len() >= limit as usize && limit > 0)
+        .then(|| events.last().map(|e| e.cursor))
+        .flatten();
+    ActivityPage { events, next_cursor }
+}
+
 /// The identity of one conflict: a copy is identified by its own path under its folder's root (its
 /// name carries the conflict's timestamp, so a later conflict of the same file is another one).
 /// The root's length keeps two different splits of the same text apart.
@@ -760,9 +846,18 @@ pub fn file_version(version: &FileVersionInfo, is_current: bool) -> FileVersion 
         modified_at: unix_nanos(version.mtime_unix_nanos),
         state: version.state.clone(),
         origin_device_id: text(&version.origin_device_id),
-        unix_mode: version.unix_mode,
+        exec: version.exec,
         is_current,
         kind: entry_kind(version.kind()),
+        content: version_content(version.content()),
+    }
+}
+
+fn version_content(content: wire::VersionContent) -> VersionContent {
+    match content {
+        wire::VersionContent::NotApplicable => VersionContent::NotApplicable,
+        wire::VersionContent::Kept => VersionContent::Kept,
+        wire::VersionContent::NotKept => VersionContent::NotKept,
     }
 }
 
@@ -821,6 +916,8 @@ pub fn pin_outcome(response: &wire::PinItemResponse) -> PinOutcome {
     PinOutcome {
         retention: file_retention(response.retention.as_ref()),
         download_error: Some(response.download_error.clone()).filter(|e| !e.is_empty()),
+        history_not_kept_reason: Some(response.history_not_kept_reason.clone())
+            .filter(|reason| !reason.is_empty()),
     }
 }
 
@@ -885,6 +982,42 @@ pub fn pending_approval_summary(pending: &PendingApproval) -> PendingApprovalSum
         group_name: pending.group_name.clone(),
         device_id: pending.device_id.clone(),
         requested_role: pending.role.as_deref().map(share_role),
+    }
+}
+
+pub fn primary_transfer_summary(
+    transfer: &crate::ops::primary_transfer::PrimaryTransfer,
+) -> PrimaryTransferSummary {
+    use crate::ops::primary_transfer::TransferDirection;
+    PrimaryTransferSummary {
+        transfer_id: transfer.transfer_id.clone(),
+        group_id: transfer.group_id.clone(),
+        group_name: transfer.group_name.clone(),
+        direction: match transfer.direction {
+            TransferDirection::Outgoing => PrimaryTransferDirection::Outgoing,
+            TransferDirection::Incoming => PrimaryTransferDirection::Incoming,
+            TransferDirection::Unrecognized => PrimaryTransferDirection::Unrecognized,
+        },
+        status: match transfer.status.as_str() {
+            "pending" => PrimaryTransferStatus::Pending,
+            "accepted" => PrimaryTransferStatus::Accepted,
+            "cancelled" => PrimaryTransferStatus::Cancelled,
+            "declined" => PrimaryTransferStatus::Declined,
+            other => PrimaryTransferStatus::Other { raw: other.to_owned() },
+        },
+        to_device_id: transfer.to_device_id.clone(),
+        created_at: unix_secs(transfer.created_at).unwrap_or(UNIX_EPOCH),
+        expires_at: unix_secs(transfer.expires_at).unwrap_or(UNIX_EPOCH),
+    }
+}
+
+pub fn primary_transfer_accepted(
+    accepted: &crate::ops::primary_transfer::PrimaryTransferAccepted,
+) -> PrimaryTransferAccepted {
+    PrimaryTransferAccepted {
+        transfer_id: accepted.transfer_id.clone(),
+        group_id: accepted.group_id.clone(),
+        membership_generation: accepted.membership_generation,
     }
 }
 
@@ -1017,6 +1150,52 @@ pub fn sent_transfer(sent: SendFileResponse) -> SentTransfer {
     }
 }
 
+pub fn send_link(created: CreateSendLinkResponse) -> SendLink {
+    SendLink {
+        link_id: created.link_id,
+        code: created.code,
+        expires_at: unix_secs(created.expires_at_unix),
+    }
+}
+
+pub fn send_link_preview(preview: wire::PreviewSendLinkResponse) -> SendLinkPreview {
+    let files: Vec<IncomingFile> = preview
+        .files
+        .into_iter()
+        .map(|f| IncomingFile { relative_path: f.name, size: f.size })
+        .collect();
+    SendLinkPreview {
+        sender_name: preview.sender_name,
+        total_size: files.iter().map(|f| f.size).sum(),
+        files,
+        expires_at: unix_secs(preview.expires_at_unix),
+    }
+}
+
+/// `None` for a state this client does not know (a newer engine's).
+pub fn send_link_status(
+    link_id: String,
+    status: yadorilink_ipc_proto::daemonctl::SendLinkStatusResponse,
+) -> Option<SendLinkStatus> {
+    use yadorilink_ipc_proto::daemonctl::SendLinkState as Wire;
+    let state = match Wire::try_from(status.state).ok()? {
+        Wire::Unspecified => return None,
+        Wire::Waiting => SendLinkState::Waiting,
+        Wire::Redeemed => SendLinkState::Redeemed,
+        Wire::Transferring => SendLinkState::Transferring,
+        Wire::Done => SendLinkState::Done,
+        Wire::Cancelled => SendLinkState::Cancelled,
+        Wire::Expired => SendLinkState::Expired,
+        Wire::Interrupted => SendLinkState::Interrupted,
+    };
+    Some(SendLinkStatus {
+        link_id,
+        state,
+        receiver_device_name: Some(status.receiver_device_name).filter(|n| !n.is_empty()),
+        transfer_id: Some(status.transfer_id).filter(|id| !id.is_empty()),
+    })
+}
+
 pub fn incoming_transfer(transfer: &InboxTransfer) -> IncomingTransfer {
     IncomingTransfer {
         transfer_id: transfer.transfer_id.clone(),
@@ -1038,6 +1217,10 @@ pub fn incoming_transfer(transfer: &InboxTransfer) -> IncomingTransfer {
         },
         failure: transfer_failure(&transfer.failure),
         can_retry: matches!(transfer.status.as_str(), "failed" | "canceled"),
+        link_id: (!transfer.link_id.is_empty()).then(|| transfer.link_id.clone()),
+        received_bytes: transfer.received_bytes,
+        destination_dir: (!transfer.destination_dir.is_empty())
+            .then(|| transfer.destination_dir.clone()),
     }
 }
 
@@ -1051,8 +1234,13 @@ fn transfer_failure(code: &str) -> Option<TransferFailure> {
         "rejected" => TransferFailure::Rejected,
         "verification_failed" => TransferFailure::VerificationFailed,
         "local_storage" => TransferFailure::LocalStorage,
+        "no_space" => TransferFailure::NoSpace,
         "stalled" => TransferFailure::Stalled,
         "interrupted" => TransferFailure::Interrupted,
+        "local_network_blocked" => TransferFailure::LocalNetworkBlocked,
+        "sender_gone" => TransferFailure::SenderGone,
+        "receiver_canceled" => TransferFailure::ReceiverCanceled,
+        "receiver_stopped" => TransferFailure::ReceiverStopped,
         other => TransferFailure::Other { raw: other.to_owned() },
     })
 }
@@ -1229,6 +1417,7 @@ pub fn daemon_identity(identity: &wire::IdentifyResponse) -> DaemonIdentity {
         ownership,
         pid: identity.pid,
         started_at: unix_secs(identity.started_at_unix as i64),
+        data_dir: text(&identity.data_dir),
     }
 }
 

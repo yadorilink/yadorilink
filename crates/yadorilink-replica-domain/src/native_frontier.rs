@@ -670,7 +670,7 @@ mod tests {
         ]);
         assert_eq!(
             hex::encode(author_state_root(&fixed)),
-            "0950d4644c25416aa1e7bbbda95e006af0aca4880f8ce906bf1c67e799601dc0"
+            "8a0ee2e37eb992eec7c525e431ee5d05d43423a6abd837b420b5f7a731fbe4fb"
         );
     }
 

@@ -30,6 +30,7 @@ use yadorilink_peer_session::peer_session::PendingLocalFlushOutcome;
 use yadorilink_peer_session::PeerSessionError;
 use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_sync_sqlite::desired_state::DesiredPathState;
+use yadorilink_sync_sqlite::retention::{Retention, RetentionProofs};
 use yadorilink_sync_sqlite::structural_origin::{
     StructuralOriginStatus, RETAINED_UNTRACKED_CONTENT,
 };
@@ -59,7 +60,57 @@ pub(crate) enum DirectoryVerdict {
     Kept,
 }
 
+/// The record a sync's removal of `path` writes: a deletion of whatever stands there.
+fn given_up_name_record(path: &str) -> yadorilink_replica_domain::file::FileRecord {
+    yadorilink_replica_domain::file::FileRecord {
+        path: path.to_owned(),
+        size: 0,
+        mtime_unix_nanos: 0,
+        blocks: Vec::new(),
+        deleted: true,
+    }
+}
+
 impl super::LocalConvergenceExecutor {
+    /// Settles a name this device gives up so that descendants can have a directory there (the
+    /// object at it is already gone from the disk).
+    ///
+    /// A row that carries replicated history is settled as a removal by a sync is: the row it
+    /// replaces is kept as history (`trashed`) and a current tombstone inheriting its identity
+    /// takes its place, so the version stays restorable and the path is still in the index for the
+    /// rewind planner. It names no authoring of its own and is a record of this device's state,
+    /// not a change anyone is sent. A row without a native head is a purely local artifact and is
+    /// erased, as before.
+    fn settle_given_up_name(
+        &self,
+        intent: Box<dyn yadorilink_peer_session::ports::OpenMaterializationIntent + Send + '_>,
+        group_id: &str,
+        path: &str,
+        proofs: &RetentionProofs,
+        permit: &yadorilink_root_authority::root_commit::RootCommitPermit<'_>,
+    ) -> Result<(), PeerSessionError> {
+        if self.state.row_authoring(group_id, path)?.is_some() {
+            self.state.settle_tombstone_delete(
+                intent,
+                group_id,
+                &given_up_name_record(path),
+                &self.local_device_id,
+                None,
+                &|| self.root_lease_for(group_id),
+                Retention::Proofs(proofs),
+            )
+        } else {
+            // No native head: a purely local artifact, which has no replicated history to keep.
+            self.state.settle_retired_copy_erase(
+                intent,
+                group_id,
+                path,
+                yadorilink_sync_sqlite::file_index::ErasureReason::LocalOnlyArtifact,
+                permit,
+            )
+        }
+    }
+
     /// What the namespace requires at `path` on its own account.
     pub(crate) fn desired_own_state(
         &self,
@@ -140,13 +191,26 @@ impl super::LocalConvergenceExecutor {
         let permit = authority_op.permit();
         let (intent, _mutation_generation) =
             self.state.open_tombstone_delete(group_id, path, &permit)?;
-        self.state.settle_retired_copy_erase(intent, group_id, path, &permit)?;
+        // A directory entry has no bytes to keep, so there is nothing to prove; the rows behind it
+        // (an earlier file at this name that a sync replaced) are kept, not erased.
+        self.settle_given_up_name(intent, group_id, path, &RetentionProofs::new(), &permit)?;
         tracing::debug!(
             group_id,
             path,
             "a superseded directory entry stays on disk only for its live descendants"
         );
         Ok(())
+    }
+
+    /// [`Self::displace_leaf_for_directory`] for the end-to-end tests of other crates' scale: two
+    /// real daemons, one of which gives up a name.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn give_up_name_for_tests(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, PeerSessionError> {
+        self.displace_leaf_for_directory(group_id, path).await
     }
 
     /// Clears a File or Symlink out of `path`, which has to become a
@@ -204,6 +268,14 @@ impl super::LocalConvergenceExecutor {
         if !self.displacement_allowed(group_id, path, None).await? {
             return Ok(false);
         }
+        // The version this name gives up is accounted for before the leaf leaves the disk: its
+        // bytes are in the store (read from the file now, if they are only there), or this device
+        // never had them. After the removal below there would be nothing left to read.
+        let Some(proofs) =
+            self.proofs_before_removing(group_id, &given_up_name_record(path), &out_path).await?
+        else {
+            return Ok(false);
+        };
         let authority = self.root_lease_for(group_id)?;
         let authority_op = authority.begin_operation()?;
         let permit = authority_op.permit();
@@ -216,7 +288,7 @@ impl super::LocalConvergenceExecutor {
         }
         #[cfg(test)]
         super::removal_ordering_probe::fire(&out_path);
-        self.state.settle_retired_copy_erase(intent, group_id, path, &permit)?;
+        self.settle_given_up_name(intent, group_id, path, &proofs, &permit)?;
         tracing::debug!(group_id, path, "moved a file out of a name its live descendants need");
         Ok(true)
     }

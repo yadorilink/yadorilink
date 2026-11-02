@@ -46,6 +46,10 @@ pub(crate) enum Retained {
     /// No block was freed: every cached block is still referenced by other content of this
     /// device, or the lease no longer backed the reclaim.
     NothingFreed,
+    /// No block was freed because an older version of the same file, which this device keeps as
+    /// history, names the same blocks. Nothing is wrong: the space comes back when that history
+    /// is no longer kept.
+    HeldAsHistory,
     /// Nothing of this version is cached on this device: the item is already not downloaded.
     NotDownloaded,
     /// A process holds the file open; the OS copy and the blocks stay.
@@ -70,6 +74,7 @@ impl Retained {
             Self::Busy => "busy",
             Self::VersionMoved => "version_moved",
             Self::NothingFreed => "nothing_freed",
+            Self::HeldAsHistory => "held_as_history",
             Self::NotDownloaded => "not_downloaded",
             Self::HostBusy => "host_busy",
             Self::CustodyRequired => "custody_required",
@@ -93,6 +98,7 @@ impl Retained {
             Self::CustodyUnsupported
             | Self::FullReplica
             | Self::NothingFreed
+            | Self::HeldAsHistory
             | Self::NotDownloaded => false,
         }
     }
@@ -508,6 +514,17 @@ impl ProviderReclaim {
             .ok()??;
         (!record.deleted && record.record_kind == RecordKind::File)
             .then(|| record.to_file_version())
+    }
+
+    /// Whether an older version of the file, kept as history, names a block of its current
+    /// version: such a block is not freed by an eviction, whatever the lease says.
+    pub(crate) fn history_holds_blocks(&self, group_id: &str, path: &str) -> bool {
+        let Some(version) = self.current_file_version(group_id, path) else { return false };
+        self.state
+            .replica_coordinator
+            .file_index_repository()
+            .history_names_any_block(group_id, path, &version.blocks)
+            .unwrap_or(false)
     }
 
     /// Whether some block of the item's current version is in the local block store.

@@ -109,9 +109,11 @@ mod device_grant;
 mod discovery;
 mod dpop;
 mod error;
+mod headless;
 mod jws;
 mod key;
 mod manager;
+mod pairing;
 mod pkce;
 pub mod store;
 #[cfg(any(test, feature = "test-support"))]
@@ -149,5 +151,6 @@ pub use dpop::dpop_proof;
 pub use error::{Error, OauthError, Result};
 pub use key::{Es256Key, PublicJwk};
 pub use manager::{CredentialManager, Detach, DEFAULT_LOCK_TIMEOUT, DEFAULT_REFRESH_SKEW};
+pub use pairing::{MalformedPairingCode, PairingCode};
 pub use pkce::Pkce;
 pub use store::{Backend, CredentialStore, Credentials, StoreError};

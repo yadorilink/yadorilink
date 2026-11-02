@@ -82,6 +82,21 @@ impl<L: AddressLookup> AddressLookup for LanLookup<L> {
     }
 }
 
+/// How often mDNS asks the LAN for peers.
+///
+/// The library default is 700 ms, which keeps an otherwise idle daemon
+/// waking about 20 times a second on mDNS work alone. A synced, idle pair
+/// has nothing to discover, and every other path to a peer (the coordination
+/// plane's addresses, relays) does not depend on this rate, so the query is
+/// slower. Measured with 10k synced files, idle, per pair on macOS: 41
+/// process wakeups per second at 700 ms, 30 at 1.5 s, 25 at 3 s. The cost is
+/// on the reconnect path: a peer found by mDNS waits about one cadence for
+/// the first query. At 1.5 s a reconnect after a restart completes in about
+/// the same time as at 700 ms (median 2.3 s against 2.15 s, worst 3.2 s
+/// against 2.8 s); at 3 s the worst case grows to 4.8 s, so 3 s is too slow.
+/// The lookup deadline, max(10 s, cadence * 1.2 + 5 s), stays 10 s.
+const DISCOVERY_CADENCE: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// The mDNS source for the endpoint `local`, or `None` when this host's
 /// network cannot run it.
 ///
@@ -91,6 +106,7 @@ impl<L: AddressLookup> AddressLookup for LanLookup<L> {
 pub(crate) fn mdns(local: iroh::EndpointId) -> Option<iroh_mdns_address_lookup::MdnsAddressLookup> {
     match iroh_mdns_address_lookup::MdnsAddressLookup::builder()
         .service_name(SERVICE_NAME)
+        .discovery_cadence(DISCOVERY_CADENCE)
         .build(local)
     {
         Ok(mdns) => Some(mdns),

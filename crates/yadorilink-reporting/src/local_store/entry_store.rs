@@ -38,7 +38,9 @@ pub struct EntryStore {
 
 impl EntryStore {
     pub fn new(dir: impl Into<PathBuf>, policy: RetentionPolicy) -> Self {
-        EntryStore { dir: dir.into(), policy }
+        let dir = dir.into();
+        super::private_fs::tighten_existing(&dir);
+        EntryStore { dir, policy }
     }
 
     /// `id` reaches this store directly from IPC/CLI input
@@ -64,7 +66,7 @@ impl EntryStore {
     /// as `consent_store::new_reporter_id`), applies the retention policy
     /// immediately afterward, and returns the new entry's metadata.
     pub fn insert(&self, envelope: ReportEnvelope) -> ReportingResult<QueuedReportMetadata> {
-        yadorilink_fs_platform::durable_dir::create_dir_all_durably(&self.dir)?;
+        super::private_fs::create_private_dir(&self.dir)?;
         let report_id = uuid::Uuid::new_v4().to_string();
         let size_bytes = serde_json::to_vec(&envelope)?.len();
         let metadata = QueuedReportMetadata {
@@ -79,7 +81,7 @@ impl EntryStore {
         // Always a freshly-generated UUID above -- never fails validation.
         let path = self.entry_path(&report_id)?;
         let tmp_path = path.with_extension("json.tmp");
-        std::fs::write(&tmp_path, json)?;
+        super::private_fs::write_private_file(&tmp_path, json.as_bytes())?;
         std::fs::rename(&tmp_path, &path)?;
         // Best-effort: a retention-eviction failure shouldn't fail the
         // insert that triggered it. The freshly-inserted entry itself is
@@ -210,7 +212,7 @@ impl EntryStore {
         let new_count = stored.metadata.submit_attempts;
         let json = serde_json::to_string_pretty(&stored)?;
         let tmp_path = path.with_extension("json.tmp");
-        std::fs::write(&tmp_path, json)?;
+        super::private_fs::write_private_file(&tmp_path, json.as_bytes())?;
         std::fs::rename(&tmp_path, &path)?;
         Ok(Some(new_count))
     }

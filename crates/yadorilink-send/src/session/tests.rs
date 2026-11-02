@@ -239,6 +239,7 @@ impl DeviceDirectory for GrantingDirectory {
             grant_nonce,
             // Effectively never expires within a test's lifetime.
             expires_at_unix: i64::MAX,
+            link_id: None,
         })
     }
 }
@@ -264,6 +265,7 @@ async fn raw_offer(
             files: vec![],
             total_size: 0,
             offered_at_unix_nanos: 0,
+            ..Default::default()
         },
         grant_id,
         grant_nonce,
@@ -753,7 +755,7 @@ async fn pull_file_rejects_a_chunk_whose_declared_size_disagrees_with_the_manife
 
     let error = tokio::time::timeout(
         Duration::from_secs(15),
-        receiver_service.pull_file(&sender, "t1", 0, &entry, 0),
+        receiver_service.pull_file(&sender, "t1", 0, &entry, 0, &mut tokio::time::Instant::now()),
     )
     .await
     .expect("pull_file must not hang on an oversized declared chunk size")
@@ -777,7 +779,7 @@ async fn pull_file_rejects_a_chunk_that_fails_hash_verification() {
 
     let error = tokio::time::timeout(
         Duration::from_secs(15),
-        receiver_service.pull_file(&sender, "t1", 0, &entry, 0),
+        receiver_service.pull_file(&sender, "t1", 0, &entry, 0, &mut tokio::time::Instant::now()),
     )
     .await
     .expect("pull_file must not hang on a hash-mismatched chunk")
@@ -811,7 +813,7 @@ async fn a_connection_that_ends_inside_a_chunk_is_reported_as_unreachable() {
 
     let error = tokio::time::timeout(
         Duration::from_secs(15),
-        receiver_service.pull_file(&sender, "t1", 0, &entry, 0),
+        receiver_service.pull_file(&sender, "t1", 0, &entry, 0, &mut tokio::time::Instant::now()),
     )
     .await
     .expect("pull_file must not hang on a body cut short")
@@ -853,7 +855,7 @@ async fn pull_file_stops_at_the_manifests_chunk_count_regardless_of_last_chunk()
 
     tokio::time::timeout(
         Duration::from_secs(15),
-        receiver_service.pull_file(&sender, "t1", 0, &entry, 0),
+        receiver_service.pull_file(&sender, "t1", 0, &entry, 0, &mut tokio::time::Instant::now()),
     )
     .await
     .expect("pull_file must not hang")
@@ -1008,6 +1010,7 @@ async fn a_granted_offer_with_an_inconsistent_manifest_is_rejected_and_not_recor
         files: vec![entry],
         total_size: total,
         offered_at_unix_nanos: 0,
+        ..Default::default()
     };
     let mut bad_hash = entry(1024, 2048, 2);
     bad_hash.chunk_hashes[1] = vec![1u8; 5];
@@ -1033,6 +1036,7 @@ async fn a_granted_offer_with_an_inconsistent_manifest_is_rejected_and_not_recor
         files: vec![entry(1024, 2048, 2)],
         total_size: 2048,
         offered_at_unix_nanos: 0,
+        ..Default::default()
     };
     let ack = raw_offer_manifest(&dialer, &acceptor, good, "grant-ok", "nonce-ok").await;
     assert!(ack.accepted, "a consistent manifest is still accepted: {}", ack.reason);
@@ -1269,8 +1273,10 @@ async fn retry_revalidates_before_changing_anything() {
         .unwrap();
     pair.receiver.cancel_transfer(&pair.transfer_id).unwrap();
 
-    // The sender is no longer a known device: retry refuses and the transfer stays canceled.
+    // The sender is no longer a known device and nothing remembers how to reach it: retry
+    // refuses and the transfer stays canceled.
     pair.sender_known.store(false, std::sync::atomic::Ordering::SeqCst);
+    pair.receiver.store.delete_sender_address_for_tests(&pair.transfer_id);
     let error = pair.receiver.retry_transfer(&pair.transfer_id).await.unwrap_err();
     assert!(matches!(error, SendError::NoKnownAddress(_)), "got {error:?}");
     assert_eq!(inbox_status(&pair.receiver, &pair.transfer_id), "canceled");
@@ -1292,6 +1298,7 @@ async fn retry_revalidates_before_changing_anything() {
 async fn a_receive_that_errors_is_failed_not_in_progress() {
     let pair = offered_pair().await;
     pair.sender_known.store(false, std::sync::atomic::Ordering::SeqCst);
+    pair.receiver.store.delete_sender_address_for_tests(&pair.transfer_id);
     assert!(pair.receiver.receive_transfer(&pair.transfer_id, None).await.is_err());
     assert_eq!(inbox_status(&pair.receiver, &pair.transfer_id), "failed");
 
@@ -1508,6 +1515,7 @@ async fn the_history_of_finished_sent_transfers_is_bounded() {
         files: vec![],
         total_size: 0,
         offered_at_unix_nanos: 0,
+        ..Default::default()
     };
     for n in 0..130i64 {
         let id = format!("t{n:03}");
@@ -1563,6 +1571,8 @@ async fn a_receiver_that_stops_reading_ends_the_serve_and_the_sender_keeps_why()
     let pair = offered_pair().await;
     pair.sender.test_set_serve_write_timeout(Duration::from_millis(300));
     pair.sender.test_stall_next_serve_write();
+    // This receiver gives up at the first break instead of resuming (which would finish it).
+    pair.receiver.set_timing(Timing { pull_no_progress: Duration::ZERO, ..Timing::default() });
 
     let first = tokio::time::timeout(
         Duration::from_secs(20),
@@ -1683,6 +1693,7 @@ async fn canceling_keeps_the_finished_history_within_its_bound() {
         files: vec![],
         total_size: 0,
         offered_at_unix_nanos: 0,
+        ..Default::default()
     };
     for n in 0..(FINISHED_RETAINED_LIMIT as i64 + 30) {
         let id = format!("old-{n:03}");
@@ -1693,9 +1704,9 @@ async fn canceling_keeps_the_finished_history_within_its_bound() {
         pair.sender.store.cancel_outbound(&id).unwrap();
         pair.receiver
             .store
-            .insert_inbound_if_new(&format!("in-{n:03}"), "s", &manifest("x"), -1000 + n)
+            .insert_inbound_if_new(&format!("in-{n:03}"), "s", "", &manifest("x"), -1000 + n)
             .unwrap();
-        pair.receiver.store.cancel_inbound(&format!("in-{n:03}")).unwrap();
+        pair.receiver.store.cancel_inbound(&format!("in-{n:03}"), 0).unwrap();
     }
     // Through the service, as a person does.
     pair.sender.cancel_transfer(&pair.transfer_id).unwrap();
@@ -1730,6 +1741,7 @@ async fn canceling_an_old_transfer_does_not_make_it_vanish() {
         files: vec![],
         total_size: 0,
         offered_at_unix_nanos: 0,
+        ..Default::default()
     };
     for n in 0..(FINISHED_RETAINED_LIMIT as i64 + 5) {
         let id = format!("new-{n:03}");
@@ -1798,7 +1810,7 @@ async fn a_completion_that_beats_the_acceptance_still_completes_the_transfer() {
     assert!(raw_done(&pair._endpoints.1, &pair._endpoints.0, &pair.transfer_id).await);
     assert_eq!(sent_status(&pair.sender, &pair.transfer_id).status, "completed");
     // The acceptance arriving afterwards does not take it back.
-    assert!(!pair.sender.store.mark_outbound_acked(&pair.transfer_id).unwrap());
+    assert!(!pair.sender.store.mark_outbound_acked(&pair.transfer_id, 0).unwrap());
     assert_eq!(sent_status(&pair.sender, &pair.transfer_id).status, "completed");
 }
 
@@ -1830,70 +1842,121 @@ fn old() -> std::time::SystemTime {
     std::time::SystemTime::now() - Duration::from_secs(3 * 24 * 60 * 60)
 }
 
-/// A block no transfer references goes once it is past the grace, and not before it: an offer
-/// writes its blocks before its transfer is recorded.
+/// A block no transfer references goes, whatever its age: nothing is in flight while a reap runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unreferenced_block_is_reaped_only_after_the_grace() {
+async fn an_unreferenced_block_is_reaped() {
     let pair = offered_pair().await;
     let stray = bs_put(&pair.sender.block_store, b"never offered");
-    pair.sender.reap_blocks(BLOCK_REAP_GRACE).unwrap();
-    assert!(bs_exists(&pair.sender.block_store, &stray), "a fresh block stays");
-
-    pair.sender.block_store.backdate_block_for_tests(&stray, old()).unwrap();
-    pair.sender.reap_blocks(BLOCK_REAP_GRACE).unwrap();
-    assert!(!bs_exists(&pair.sender.block_store, &stray), "an old unreferenced block goes");
+    pair.sender.reap_blocks().unwrap();
+    assert!(!bs_exists(&pair.sender.block_store, &stray));
 }
 
-/// Everything a sent transfer on record can serve or retry keeps its blocks, in every state
-/// (negative control: with no grace at all, nothing it needs is reaped).
+/// A sent transfer that is going keeps its blocks; one that has finished (canceled, completed)
+/// releases them at once, and a retry stores the content again and is served.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn blocks_of_a_sent_transfer_on_record_are_never_reaped() {
+async fn a_sent_transfer_releases_its_blocks_when_it_finishes_and_a_retry_restores_them() {
     let pair = offered_pair().await;
     let chunks = sent_chunks(&pair.sender, &pair.transfer_id);
     assert!(chunks.len() > 1);
-    let stray = bs_put(&pair.sender.block_store, b"stray");
+    pair.sender.reap_blocks().unwrap();
+    assert!(all_present(&pair.sender, &chunks), "accepted: being served");
 
-    // Accepted.
-    pair.sender.reap_blocks(Duration::ZERO).unwrap();
-    assert!(all_present(&pair.sender, &chunks), "accepted");
-    assert!(!bs_exists(&pair.sender.block_store, &stray), "the control does reap");
-
-    // Canceled: retryable, and a retry stores no content.
     pair.sender.cancel_transfer(&pair.transfer_id).unwrap();
-    pair.sender.reap_blocks(Duration::ZERO).unwrap();
-    assert!(all_present(&pair.sender, &chunks), "canceled");
-    pair.sender.retry_sent_transfer(&pair.transfer_id).await.unwrap();
-    pair.sender.reap_blocks(Duration::ZERO).unwrap();
+    assert!(none_present(&pair.sender, &chunks), "canceled: released");
 
-    // The receiver still gets every chunk, and the completed transfer keeps serving.
+    pair.sender.retry_sent_transfer(&pair.transfer_id).await.unwrap();
+    assert!(all_present(&pair.sender, &chunks), "retried: stored again");
+
     pair.receiver.receive_transfer(&pair.transfer_id, None).await.unwrap();
     wait_for_sent_status(&pair.sender, &pair.transfer_id, "completed").await;
-    pair.sender.reap_blocks(Duration::ZERO).unwrap();
-    assert!(all_present(&pair.sender, &chunks), "completed");
+    assert!(
+        eventually(20, || none_present(&pair.sender, &chunks)).await,
+        "completed: released, the sender's internal store is empty"
+    );
 }
 
-/// Received blocks: a finished receive no longer needs them, one that can still resume does, and
-/// the received files are untouched either way.
+/// Receive end states: the store is empty after success and after cancel; a receive that fails
+/// or is cut off keeps what it pulled and resumes from it; the received file is untouched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn received_blocks_go_when_the_receive_completes_and_stay_while_it_can_resume() {
+async fn received_blocks_go_on_success_and_cancel_and_stay_while_a_receive_can_resume() {
     let pair = offered_pair().await;
     let chunks = sent_chunks(&pair.sender, &pair.transfer_id);
 
-    // Pending (offered, nothing pulled) and canceled (retryable) keep what they hold.
-    pair.receiver.reap_blocks(Duration::ZERO).unwrap();
-    pair.receiver.cancel_transfer(&pair.transfer_id).unwrap();
-    pair.receiver.reap_blocks(Duration::ZERO).unwrap();
-    let outcome = pair.receiver.retry_transfer(&pair.transfer_id).await.unwrap();
-    assert!(all_present(&pair.receiver, &chunks), "pulled blocks stay until the receive is done");
-    assert_eq!(inbox_status(&pair.receiver, &pair.transfer_id), "completed");
+    // Offered, nothing pulled yet: still pending.
+    pair.receiver.reap_blocks().unwrap();
 
-    pair.receiver.reap_blocks(Duration::ZERO).unwrap();
-    assert!(none_present(&pair.receiver, &chunks), "a completed receive keeps no blocks");
-    let written = std::fs::read(outcome.destination_dir.join("big.bin")).unwrap();
-    assert_eq!(written, pair.content, "the received file is untouched");
-    // The sender's copy, still serving, is unaffected.
-    pair.sender.reap_blocks(Duration::ZERO).unwrap();
-    assert!(all_present(&pair.sender, &chunks));
+    // Cut off after the first confirmed chunk: it resumes from what it pulled.
+    let parked = pair.receiver.test_abort_after_n_chunks(1);
+    let destination = tempfile::tempdir().unwrap();
+    let dest_path = destination.path().join("out");
+    let receiver = pair.receiver.clone();
+    let (id, dest) = (pair.transfer_id.clone(), dest_path.clone());
+    let running = tokio::spawn(async move { receiver.receive_transfer(&id, Some(&dest)).await });
+    tokio::time::timeout(Duration::from_secs(20), parked.notified()).await.unwrap();
+    running.abort();
+    let _ = running.await;
+    pair.receiver.store.interrupt_in_progress_inbound(now_unix_nanos()).unwrap();
+    pair.receiver.reap_blocks().unwrap();
+    let held = chunks.iter().filter(|h| bs_exists(&pair.receiver.block_store, h)).count();
+    assert!(held >= 1, "an interrupted receive keeps what it pulled");
+
+    // A cancel is final until retried: the pulled blocks go.
+    pair.receiver.cancel_transfer(&pair.transfer_id).unwrap();
+    assert!(none_present(&pair.receiver, &chunks), "canceled: released");
+
+    // Retried, it pulls everything again, saves the file and leaves the store empty.
+    pair.receiver.retry_transfer(&pair.transfer_id).await.unwrap();
+    assert_eq!(inbox_status(&pair.receiver, &pair.transfer_id), "completed");
+    assert_eq!(std::fs::read(dest_path.join("big.bin")).unwrap(), pair.content);
+    assert!(none_present(&pair.receiver, &chunks), "completed: released");
+}
+
+/// A resume after an interruption pulls only what is missing and ends with an empty store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_interrupted_receive_resumes_from_its_blocks_then_releases_them() {
+    let pair = offered_pair().await;
+    let chunks = sent_chunks(&pair.sender, &pair.transfer_id);
+    let parked = pair.receiver.test_abort_after_n_chunks(1);
+    let destination = tempfile::tempdir().unwrap();
+    let dest_path = destination.path().join("out");
+    let receiver = pair.receiver.clone();
+    let (id, dest) = (pair.transfer_id.clone(), dest_path.clone());
+    let running = tokio::spawn(async move { receiver.receive_transfer(&id, Some(&dest)).await });
+    tokio::time::timeout(Duration::from_secs(20), parked.notified()).await.unwrap();
+    running.abort();
+    let _ = running.await;
+    pair.receiver.store.interrupt_in_progress_inbound(now_unix_nanos()).unwrap();
+    assert!(chunks.iter().any(|h| bs_exists(&pair.receiver.block_store, h)));
+
+    // What a restart does: reap. The interrupted receive's blocks must survive it.
+    pair.receiver.reap_blocks().unwrap();
+    assert!(chunks.iter().any(|h| bs_exists(&pair.receiver.block_store, h)));
+
+    pair.receiver.receive_transfer(&pair.transfer_id, None).await.unwrap();
+    assert_eq!(std::fs::read(dest_path.join("big.bin")).unwrap(), pair.content);
+    assert!(none_present(&pair.receiver, &chunks));
+}
+
+/// A crash after the file is saved and the transfer recorded complete, but before the blocks were
+/// reaped, loses nothing and leaves nothing: the reap a restart runs reclaims them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crash_between_save_and_reap_loses_no_file_and_the_next_reap_reclaims_the_blocks() {
+    let pair = offered_pair().await;
+    let chunks = sent_chunks(&pair.sender, &pair.transfer_id);
+    let destination = tempfile::tempdir().unwrap();
+    pair.receiver.receive_transfer(&pair.transfer_id, Some(destination.path())).await.unwrap();
+    // The crash: the blocks are back, as if the reap after completion never ran.
+    let chunk_size =
+        pair.sender.store.get_outbound(&pair.transfer_id).unwrap().unwrap().manifest.files[0]
+            .chunk_size as usize;
+    for body in pair.content.chunks(chunk_size) {
+        bs_put(&pair.receiver.block_store, body);
+    }
+    assert!(!none_present(&pair.receiver, &chunks), "the leftover is there");
+
+    pair.receiver.reap_blocks().unwrap();
+    assert!(none_present(&pair.receiver, &chunks), "reclaimed");
+    assert_eq!(std::fs::read(destination.path().join("big.bin")).unwrap(), pair.content);
 }
 
 /// Content two transfers share stays while either of them is on record.
@@ -1908,24 +1971,18 @@ async fn a_block_shared_by_two_transfers_stays_until_both_are_gone() {
         .store
         .insert_outbound_offered("twin", "d", &[1; 32], "/twin", &manifest, 5)
         .unwrap();
-    for hash in &chunks {
-        pair.sender.block_store.backdate_block_for_tests(hash, old()).unwrap();
-    }
 
-    // Push the original out of the bounded history; the twin still references the blocks.
+    // The original finishes; the twin is still going and needs the blocks.
     pair.sender.cancel_transfer(&pair.transfer_id).unwrap();
-    pair.sender.store.cancel_outbound("twin").unwrap();
-    pair.sender.store.delete_outbound_for_tests(&pair.transfer_id);
-    pair.sender.reap_blocks(BLOCK_REAP_GRACE).unwrap();
+    pair.sender.reap_blocks().unwrap();
     assert!(all_present(&pair.sender, &chunks), "the twin still needs them");
 
-    pair.sender.store.delete_outbound_for_tests("twin");
-    pair.sender.reap_blocks(BLOCK_REAP_GRACE).unwrap();
+    pair.sender.store.cancel_outbound("twin").unwrap();
+    pair.sender.reap_blocks().unwrap();
     assert!(none_present(&pair.sender, &chunks), "nothing needs them now");
 }
 
-/// A transfer pushed out of the bounded history takes its blocks with it, through the service's
-/// own pruning; the ones inside the bound keep theirs.
+/// A finished transfer holds no blocks, inside the bounded history or out of it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pruning_a_finished_transfer_reaps_its_blocks() {
     let pair = offered_pair().await;
@@ -1944,6 +2001,7 @@ async fn pruning_a_finished_transfer_reaps_its_blocks() {
             }],
             total_size: 1,
             offered_at_unix_nanos: 0,
+            ..Default::default()
         };
         pair.sender
             .store
@@ -1955,7 +2013,440 @@ async fn pruning_a_finished_transfer_reaps_its_blocks() {
     let live = sent_chunks(&pair.sender, &pair.transfer_id);
     pair.sender.cancel_transfer(&pair.transfer_id).unwrap();
 
-    assert!(none_present(&pair.sender, &kept_probe[..6]), "the six oldest were pruned");
-    assert!(all_present(&pair.sender, &kept_probe[6..]), "the rest are inside the bound");
-    assert!(all_present(&pair.sender, &live), "the canceled transfer is retryable");
+    assert!(none_present(&pair.sender, &kept_probe), "finished transfers hold no blocks");
+    assert!(none_present(&pair.sender, &live), "the canceled transfer released its blocks");
+}
+
+// ---- how the sender follows the receiver's outcome ---------------------------------------
+
+/// Polls `check` for up to `secs` seconds.
+async fn eventually(secs: u64, mut check: impl FnMut() -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    while tokio::time::Instant::now() < deadline {
+        if check() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    check()
+}
+
+/// A receiver that cancels is reported to the sender: the sender's list says why instead of
+/// still reading as waiting for the device, and the receiver's retry clears it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_receiver_cancel_is_reported_to_the_sender_and_a_retry_clears_it() {
+    let pair = offered_pair().await;
+    pair.receiver.cancel_transfer(&pair.transfer_id).unwrap();
+    assert!(
+        eventually(20, || {
+            sent_status(&pair.sender, &pair.transfer_id).failure.as_deref()
+                == Some(failure::RECEIVER_CANCELED)
+        })
+        .await,
+        "the sender is told the receiver canceled"
+    );
+    // The offer itself still stands for the receiver, which may retry what it canceled.
+    assert_eq!(sent_status(&pair.sender, &pair.transfer_id).status, "accepted");
+
+    pair.receiver.retry_transfer(&pair.transfer_id).await.unwrap();
+    assert!(
+        eventually(20, || {
+            let entry = sent_status(&pair.sender, &pair.transfer_id);
+            entry.status == "completed" && entry.failure.is_none()
+        })
+        .await,
+        "a finished retry reads as completed"
+    );
+}
+
+/// A receive that fails is reported to the sender with a stopped reason, and the receiver's
+/// owed notice is gone once the sender answered it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_receive_is_reported_to_the_sender() {
+    let pair = offered_pair().await;
+    // The destination is a file, so the receive stops on this device.
+    let blocker = tempfile::NamedTempFile::new().unwrap();
+    let error =
+        pair.receiver.receive_transfer(&pair.transfer_id, Some(blocker.path())).await.unwrap_err();
+    assert_eq!(error.failure_code(), failure::LOCAL_STORAGE, "{error:?}");
+    assert!(
+        eventually(20, || {
+            sent_status(&pair.sender, &pair.transfer_id).failure.as_deref()
+                == Some(failure::RECEIVER_STOPPED)
+        })
+        .await
+    );
+    assert!(
+        eventually(20, || pair.receiver.store.pending_notices(0).unwrap().is_empty()).await,
+        "an answered notice is not owed any more"
+    );
+}
+
+/// A completion notice that could not be delivered stays owed and is sent again, so the
+/// sender converges on the receiver's success instead of reading it as going forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_completion_notice_that_was_lost_is_sent_again() {
+    let pair = offered_pair().await;
+    let (sender_endpoint, receiver_endpoint) = (&pair._endpoints.0, &pair._endpoints.1);
+    // The pull is admitted and parked at its first chunk; the sender then stops admitting new
+    // connections from the receiver, so the completion notice has nowhere to go.
+    let (reached, proceed) = pair.sender.test_park_next_serve();
+    let receiver = pair.receiver.clone();
+    let id = pair.transfer_id.clone();
+    let receiving = tokio::spawn(async move { receiver.receive_transfer(&id, None).await });
+    tokio::time::timeout(Duration::from_secs(20), reached.notified()).await.unwrap();
+    sender_endpoint.admitted.lock().unwrap().remove(&receiver_endpoint.key);
+    proceed.notify_one();
+    tokio::time::timeout(Duration::from_secs(20), receiving).await.unwrap().unwrap().unwrap();
+
+    assert_eq!(inbox_status(&pair.receiver, &pair.transfer_id), "completed");
+    assert!(
+        eventually(30, || {
+            pair.receiver.notices_in_flight.lock().unwrap().is_empty()
+                && !pair.receiver.notice_backoff.lock().unwrap().is_empty()
+                && !pair.receiver.store.pending_notices(0).unwrap().is_empty()
+        })
+        .await,
+        "the failed delivery leaves the notice owed"
+    );
+    assert_eq!(sent_status(&pair.sender, &pair.transfer_id).status, "accepted");
+
+    sender_endpoint.admit(receiver_endpoint.key);
+    // The failed try put the notice on a pause; the periodic loop would wait it out.
+    pair.receiver.notice_backoff.lock().unwrap().clear();
+    pair.receiver.deliver_pending_notices();
+    assert!(
+        eventually(30, || sent_status(&pair.sender, &pair.transfer_id).status == "completed").await,
+        "the notice is delivered once the sender can be reached"
+    );
+    assert!(eventually(20, || pair.receiver.store.pending_notices(0).unwrap().is_empty()).await);
+}
+
+/// A receiver restarted after being killed mid-receive owes its sender a notice of the
+/// interrupted receive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_receive_cut_off_by_a_restart_is_reported_to_the_sender() {
+    let pair = offered_pair().await;
+    let destination = tempfile::tempdir().unwrap();
+    pair.receiver
+        .store
+        .claim_inbound_destination(&pair.transfer_id, destination.path().to_str().unwrap())
+        .unwrap();
+    assert_eq!(inbox_status(&pair.receiver, &pair.transfer_id), "in_progress");
+    // What opening the store again after the process died does.
+    assert_eq!(pair.receiver.store.interrupt_in_progress_inbound(now_unix_nanos()).unwrap(), 1);
+    assert_eq!(
+        inbox_failure(&pair.receiver, &pair.transfer_id).as_deref(),
+        Some(failure::INTERRUPTED)
+    );
+    pair.receiver.deliver_pending_notices();
+    assert!(
+        eventually(20, || {
+            sent_status(&pair.sender, &pair.transfer_id).failure.as_deref()
+                == Some(failure::RECEIVER_STOPPED)
+        })
+        .await
+    );
+}
+
+/// A notice for a transfer the sender never offered to this device changes nothing there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_notice_from_a_device_the_transfer_was_not_offered_to_is_ignored() {
+    let pair = offered_pair().await;
+    let stranger = raw_endpoint().await;
+    pair._endpoints.0.admit(stranger.key);
+    let connection = stranger
+        .node
+        .connect_track_send(&pair._endpoints.0.resolved("sender-device").address())
+        .await
+        .unwrap();
+    for payload in [
+        send_envelope::Payload::Ended(TransferEnded {
+            transfer_id: pair.transfer_id.clone(),
+            outcome: transfer_ended::Outcome::Canceled as i32,
+            failure: String::new(),
+        }),
+        send_envelope::Payload::Done(TransferDone { transfer_id: pair.transfer_id.clone() }),
+    ] {
+        let (mut send, mut recv) = connection.open_stream().await.unwrap();
+        write_message(
+            &mut send,
+            &SendEnvelope {
+                payload: Some(payload),
+                grant_id: String::new(),
+                grant_nonce: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        send.finish().ok();
+        let answer: SendManifestAck = read_message(&mut recv).await.unwrap();
+        assert!(!answer.accepted);
+    }
+    let entry = sent_status(&pair.sender, &pair.transfer_id);
+    assert_eq!((entry.status, entry.failure), ("accepted", None));
+}
+
+// ---- resuming a broken pull, and giving up on a sender that is gone --------------------------
+
+/// A pull the sender's serve breaks part way is resumed from the first missing chunk rather than
+/// failing the receive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pull_that_breaks_part_way_is_resumed() {
+    let pair = offered_pair().await;
+    pair.sender.test_set_serve_write_timeout(Duration::from_millis(300));
+    pair.sender.test_stall_next_serve_write();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        pair.receiver.receive_transfer(&pair.transfer_id, None),
+    )
+    .await
+    .expect("the receive finishes")
+    .expect("the receive resumes the broken pull and completes");
+    assert_eq!(outcome.bytes_received, pair.content.len() as u64);
+    assert_eq!(inbox_status(&pair.receiver, &pair.transfer_id), "completed");
+}
+
+/// A sender that stays unreachable ends the receive as failed with its own reason, within the
+/// bound, and the destination is not left claimed as in progress.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sender_that_never_answers_again_fails_the_receive_as_gone() {
+    let pair = offered_pair().await;
+    // The sender stops admitting the receiver, as when it was killed and came back without the
+    // grant the receiver came in with.
+    pair._endpoints.0.admitted.lock().unwrap().remove(&pair._endpoints.1.key);
+    pair.receiver.set_timing(Timing {
+        dial_attempt: Duration::from_millis(500),
+        dial_deadline: Duration::from_secs(2),
+        pull_idle: Duration::from_secs(2),
+        pull_no_progress: Duration::from_secs(2),
+        ..Timing::default()
+    });
+    let started = tokio::time::Instant::now();
+    let error = pair.receiver.receive_transfer(&pair.transfer_id, None).await.unwrap_err();
+    assert!(matches!(error, SendError::SenderGone(_)), "got {error:?}");
+    assert!(started.elapsed() < Duration::from_secs(20), "bounded: {:?}", started.elapsed());
+    assert_eq!(inbox_status(&pair.receiver, &pair.transfer_id), "failed");
+    assert_eq!(
+        inbox_failure(&pair.receiver, &pair.transfer_id).as_deref(),
+        Some(failure::SENDER_GONE)
+    );
+}
+
+/// The way to reach a sender is kept with the offer, so a resume after the grant is gone (or the
+/// process restarted) still knows whom to pull from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_receive_resumes_from_the_sender_address_kept_with_the_offer() {
+    let pair = offered_pair().await;
+    pair.sender_known.store(false, std::sync::atomic::Ordering::SeqCst);
+    let outcome = pair.receiver.receive_transfer(&pair.transfer_id, None).await.unwrap();
+    assert_eq!(outcome.bytes_received, pair.content.len() as u64);
+}
+
+// ---- dialing -----------------------------------------------------------------------------------
+
+/// A dial that gets no answer is retried within the deadline, and the error says what was tried
+/// instead of only that time ran out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dial_that_gets_no_answer_retries_until_the_deadline_and_says_what_was_tried() {
+    let dialer = raw_endpoint().await;
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let device = ResolvedDevice {
+        device_id: "nobody".into(),
+        signing_key: *raw_endpoint().await.node.peer_id().as_bytes(),
+        direct_addresses: vec![silent.local_addr().unwrap()],
+        relay_urls: Vec::new(),
+    };
+    let timing = Timing {
+        dial_attempt: Duration::from_millis(300),
+        dial_deadline: Duration::from_millis(2500),
+        ..Timing::default()
+    };
+    let started = tokio::time::Instant::now();
+    let error = dial_send(&dialer.node, &device, &timing).await.unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(1500), "retried until near the deadline: {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(10), "and no longer: {elapsed:?}");
+    match &error {
+        SendError::DialFailed { reason, detail, .. } => {
+            assert_eq!(*reason, DialReason::NoResponse, "{detail}");
+            assert!(detail.contains("attempt"), "{detail}");
+            assert!(detail.contains("1 direct address"), "{detail}");
+        }
+        other => panic!("got {other:?}"),
+    }
+    assert_eq!(error.failure_code(), failure::UNREACHABLE);
+}
+
+#[test]
+fn host_unreachable_is_told_from_other_send_errors_and_only_private_addresses_are_probed() {
+    let unreachable = |code| std::io::Error::from_raw_os_error(code);
+    assert!(is_host_unreachable(&unreachable(65)));
+    assert!(is_host_unreachable(&unreachable(113)));
+    assert!(is_host_unreachable(&std::io::Error::from(std::io::ErrorKind::HostUnreachable)));
+    assert!(!is_host_unreachable(&unreachable(13)), "permission denied is another thing");
+    assert!(!is_host_unreachable(&std::io::Error::from(std::io::ErrorKind::TimedOut)));
+    for private in ["192.168.0.5", "10.1.2.3", "172.16.0.9", "169.254.1.1", "fd00::1", "fe80::1"] {
+        assert!(is_local_network(private.parse().unwrap()), "{private}");
+    }
+    for public in ["130.62.15.117", "8.8.8.8", "2001:db8::1"] {
+        assert!(!is_local_network(public.parse().unwrap()), "{public}");
+    }
+    // Loopback always works, so a probe of it never reports a blocked local network.
+    assert!(!local_network_refused(&["127.0.0.1:9".parse().unwrap()]));
+}
+
+// ---- links: admission, idleness, one transfer per link ---------------------------------------
+
+fn link_manifest(transfer_id: &str, link_id: &str) -> SendManifest {
+    SendManifest {
+        transfer_id: transfer_id.into(),
+        files: vec![],
+        total_size: 0,
+        offered_at_unix_nanos: 0,
+        link_id: link_id.into(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_links_recipient_is_expected_back_but_a_plain_offers_is_not_admitted_this_way() {
+    let endpoint = raw_endpoint().await;
+    let (service, _guard) = make_service(
+        &endpoint,
+        Arc::new(TestDirectory { grants: None, device_labels: HashMap::new() }),
+    );
+    let (link_key, plain_key) = ([1u8; 32], [2u8; 32]);
+    let now = now_unix_nanos();
+    service
+        .store
+        .insert_outbound_offered(
+            "t-link",
+            "r1",
+            &link_key,
+            "/s",
+            &link_manifest("t-link", "L"),
+            now,
+        )
+        .unwrap();
+    service
+        .store
+        .insert_outbound_offered(
+            "t-plain",
+            "r2",
+            &plain_key,
+            "/s",
+            &link_manifest("t-plain", ""),
+            now,
+        )
+        .unwrap();
+    assert!(service.expects_link_recipient(&link_key));
+    assert!(!service.expects_link_recipient(&plain_key));
+    assert!(!service.expects_link_recipient(&[3u8; 32]));
+    // A day later the offer no longer admits anyone.
+    service
+        .store
+        .insert_outbound_offered(
+            "t-old",
+            "r3",
+            &[4u8; 32],
+            "/s",
+            &link_manifest("t-old", "L2"),
+            now - 25 * 60 * 60 * 1_000_000_000,
+        )
+        .unwrap();
+    assert!(!service.expects_link_recipient(&[4u8; 32]));
+}
+
+/// A link's receiver fetches by itself, so one that has fetched nothing for long enough reads as
+/// stopped; a plain offer waits for its person for as long as it takes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_accepted_link_transfer_whose_receiver_went_quiet_reads_as_stopped() {
+    let endpoint = raw_endpoint().await;
+    let (service, _guard) = make_service(
+        &endpoint,
+        Arc::new(TestDirectory { grants: None, device_labels: HashMap::new() }),
+    );
+    service.set_timing(Timing { receiver_idle: Duration::from_secs(60), ..Timing::default() });
+    let long_ago = now_unix_nanos() - 10 * 60 * 1_000_000_000;
+    for (id, link) in [("t-link", "L"), ("t-plain", "")] {
+        service
+            .store
+            .insert_outbound_offered(id, "r", &[1u8; 32], id, &link_manifest(id, link), long_ago)
+            .unwrap();
+        service.store.mark_outbound_acked(id, long_ago).unwrap();
+    }
+    let sent = |id: &str| sent_status(&service, id);
+    assert_eq!(sent("t-link").failure.as_deref(), Some(failure::RECEIVER_STOPPED));
+    assert!(!sent("t-link").can_retry, "a link's one grant is spent: a new link, not a retry");
+    assert_eq!(sent("t-plain").failure, None);
+    // A pull being served is activity.
+    service.store.touch_outbound_activity("t-link", now_unix_nanos()).unwrap();
+    assert_eq!(sent("t-link").failure, None);
+}
+
+/// Two links carrying the same files to the same device are two transfers, however they are
+/// offered; re-driving one link's offer finds that link's transfer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_links_to_one_device_with_the_same_files_are_two_transfers() {
+    let endpoint = raw_endpoint().await;
+    let (service, _guard) = make_service(
+        &endpoint,
+        Arc::new(TestDirectory { grants: None, device_labels: HashMap::new() }),
+    );
+    for (id, link) in [("t-a", "A"), ("t-b", "B")] {
+        service
+            .store
+            .insert_outbound_offered(id, "r", &[1u8; 32], "/same", &link_manifest(id, link), 1)
+            .unwrap();
+    }
+    let found = |link: &str| {
+        service
+            .store
+            .find_outbound_by_source_and_target("/same", "r", link)
+            .unwrap()
+            .map(|t| t.transfer_id)
+    };
+    assert_eq!(found("A").as_deref(), Some("t-a"));
+    assert_eq!(found("B").as_deref(), Some("t-b"));
+    assert_eq!(found("C"), None);
+    assert_eq!(found(""), None);
+}
+
+/// A candidate address that answers nothing (a NAT hairpin that drops the packet, a LAN the
+/// operating system will not send on) must not keep the dial from the address that works: every
+/// candidate is tried at once and the first handshake to complete wins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dial_is_not_held_up_by_a_blackholed_direct_address() {
+    let dialer = raw_endpoint().await;
+    let target = raw_endpoint().await;
+    target.admit(dialer.key);
+    let blackhole = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut device = target.resolved("target");
+    device.direct_addresses.insert(0, blackhole.local_addr().unwrap());
+    let (_service, _guard) = serving_service(
+        &target,
+        Arc::new(TestDirectory { grants: None, device_labels: HashMap::new() }),
+    );
+    let started = tokio::time::Instant::now();
+    let connection = dial_send(&dialer.node, &device, &Timing::default())
+        .await
+        .expect("the working address carries the handshake");
+    assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+    connection.close(close_code::DONE, b"test");
+}
+
+/// A failed receive is retried after a restart, when only the address kept with the offer says how
+/// to reach the sender.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_finds_the_sender_from_the_address_kept_with_the_offer() {
+    let pair = offered_pair().await;
+    pair.sender_known.store(false, std::sync::atomic::Ordering::SeqCst);
+    let destination = tempfile::tempdir().unwrap();
+    pair.receiver
+        .store
+        .claim_inbound_destination(&pair.transfer_id, destination.path().to_str().unwrap())
+        .unwrap();
+    pair.receiver.store.interrupt_in_progress_inbound(now_unix_nanos()).unwrap();
+    pair.receiver.retry_transfer(&pair.transfer_id).await.unwrap();
+    assert_eq!(inbox_status(&pair.receiver, &pair.transfer_id), "completed");
 }

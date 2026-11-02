@@ -42,9 +42,14 @@
 # Exit status: 0 ok or already current, 1 other failure, 2 usage, 3 network,
 # 4 signature, hash, replay or withdrawal refusal, 5 unsupported platform,
 # 6 downgrade refused, 7 prefix not writable, 19 managed elsewhere (the app or a
-# package manager owns this machine's YadoriLink data; nothing is installed).
+# package manager owns this machine's YadoriLink data; nothing is installed),
+# 20 the data on this machine was written by a newer YadoriLink than this bundle
+# reads, 21 whether the data is usable by this bundle could not be established (20
+# and 21 come from the bundle's own `yadorilink-daemon.exe --check-data-compat`, which
+# reads the data without changing it; nothing is installed).
 # It never asks for elevation, never runs anything from the bundle before the
-# checks pass (then only `yadorilink.exe --version`), and never starts the daemon.
+# checks pass (then only `yadorilink.exe --version` and the data check above), and never
+# starts the daemon.
 
 $ErrorActionPreference = 'Stop'
 
@@ -59,7 +64,7 @@ $ErrorActionPreference = 'Stop'
 #   MinManifestGeneratedAt  the oldest channel manifest this installer accepts
 #             (a replay floor for a first install; empty = none).
 # >>> PINS >>>
-$script:TrustSet = @('yadorilink-release-2026-10:cdaf6fbf36a6fa5c8c894fc5012a80bb6c6a73407c9285ac8623d572e9894bd8')
+$script:TrustSet = @('yadorilink-release-2026-10:cdaf6fbf36a6fa5c8c894fc5012a80bb6c6a73407c9285ac8623d572e9894bd8', 'yadorilink-release-spare-2026-10:c678beb39cff5e2cf8c4b9530eb8fee31c808dff7dfcf3b4d908221480dad2ad')
 $script:MinManifestGeneratedAt = '2026-10-25T03:57:34Z'
 # <<< PINS <<<
 $script:ManifestBase = 'https://yadori.link/dl'
@@ -242,7 +247,10 @@ function Get-Sha256([string]$Path) {
 
 function Initialize-Verifier {
     if (-not ('YadoriEd25519' -as [type])) {
-        try { Add-Type -TypeDefinition $script:Ed25519Source -ReferencedAssemblies 'System.Numerics' }
+        # BigInteger lives in System.Numerics on Windows PowerShell (.NET Framework) and in
+        # System.Runtime.Numerics on PowerShell 7 (.NET), where a reference to System.Numerics alone fails to compile.
+        $numerics = if ($PSVersionTable.PSEdition -eq 'Core') { @('System.Runtime.Numerics', 'System.Runtime', 'System.Security.Cryptography') } else { @('System.Numerics') }
+        try { Add-Type -TypeDefinition $script:Ed25519Source -ReferencedAssemblies $numerics }
         catch { Fail ('cannot compile the Ed25519 verifier (is PowerShell in Constrained Language Mode?): ' + $_.Exception.Message + ' Nothing was installed.') }
     }
     # RFC 8032 test vector 2, plus a corrupted signature that must fail.
@@ -770,6 +778,28 @@ function Invoke-Install($Opt) {
         }
         & (Join-Path $extract 'yadorilink.exe') --version *> $null
         if ($LASTEXITCODE -ne 0) { Fail 'the new yadorilink.exe does not run on this system (--version failed). Nothing was changed.' }
+
+        # The data already on this machine must be readable by what is about to be installed. Only
+        # the bundle's own daemon knows its state versions, and the database is the only record of
+        # the data's version, so it is asked to read it (read-only; nothing is created or changed).
+        # Status 2 is a bundle from before the check existed: its daemon refuses newer data itself.
+        # The daemon is a GUI-subsystem program, so it is started with Start-Process and waited for,
+        # with its error output in a file.
+        $compatErr = Join-Path $stage 'data-compat.err'
+        $compatOut = Join-Path $stage 'data-compat.out'
+        $compat = Start-Process -FilePath (Join-Path $extract 'yadorilink-daemon.exe') -ArgumentList '--check-data-compat' `
+            -Wait -PassThru -WindowStyle Hidden -RedirectStandardError $compatErr -RedirectStandardOutput $compatOut
+        $compatMsg = ''
+        if (Test-Path -LiteralPath $compatErr) { $compatMsg = (Get-Content -LiteralPath $compatErr -Raw -ErrorAction SilentlyContinue) }
+        if ($null -eq $compatMsg) { $compatMsg = '' }
+        $compatMsg = $compatMsg.Trim()
+        switch ([int]$compat.ExitCode) {
+            0 { if ($compatMsg) { [Console]::Error.WriteLine("yadorilink-install: $compatMsg") } }
+            2 { Write-Host 'note: this release does not check the existing data before installing' }
+            20 { Refuse 20 "$compatMsg Nothing was installed." }
+            21 { Refuse 21 "$compatMsg Nothing was installed." }
+            default { Refuse 21 "the data check of the new daemon failed unexpectedly (status $($compat.ExitCode)): $compatMsg Nothing was installed." }
+        }
 
         # The daemon recognises a script install by this file beside its binaries
         # (crates/yadorilink-daemon/src/update/install_source.rs). It lives in the version

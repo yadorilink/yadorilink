@@ -88,9 +88,8 @@ impl DurabilityEvidencePort for DurabilityEvidenceAdapter {
                     record.size,
                     record.mtime_unix_nanos,
                     record.record_kind,
-                    record.unix_mode,
+                    record.exec,
                     record.symlink_target,
-                    record.xattrs,
                 ),
             })
             .collect())
@@ -116,7 +115,10 @@ impl DurabilityEvidencePort for DurabilityEvidenceAdapter {
         let mut summary = self
             .coordinator
             .file_index_repository()
-            .group_root_set_summary(group.as_str())
+            .group_root_set_summary(group.as_str(), &|hash| {
+                // An unreadable store is not a store that holds the block.
+                self.store.present_blocks(&[hex::encode(hash)]).is_ok_and(|held| held == [true])
+            })
             .map_err(crate::sync_error::SyncError::from)
             .map_err(PeerSessionError::from)
             .map_err(storage_err)?;
@@ -129,6 +131,55 @@ impl DurabilityEvidencePort for DurabilityEvidenceAdapter {
             summary.unmaterialized_current_count = summary.current_count;
         }
         Ok(summary)
+    }
+
+    fn ensure_version_in_store(
+        &self,
+        group: &FolderGroupId,
+        path: &yadorilink_replica_domain::ids::SyncPath,
+        blocks: &[yadorilink_replica_domain::file::VersionBlock],
+    ) {
+        // Only the current version can be in the folder's file. Anything unreadable, changed or
+        // missing is left to the checks that follow, which then answer "not held".
+        let Ok(Some(record)) =
+            self.coordinator.file_index_repository().get_file(group.as_str(), path.as_str())
+        else {
+            return;
+        };
+        let same_blocks = record.blocks.len() == blocks.len()
+            && record
+                .blocks
+                .iter()
+                .zip(blocks)
+                .all(|(have, asked)| have.hash == asked.hash.0 && have.size == asked.size);
+        if record.deleted || !same_blocks {
+            return;
+        }
+        let Ok(Some(local)) =
+            self.coordinator.link_repository().live_link_local_path_for_group(group.as_str())
+        else {
+            return;
+        };
+        let Ok(file) = yadorilink_local_storage::resolve_read_path_without_traversal(
+            std::path::Path::new(&local),
+            std::path::Path::new(path.as_str()),
+        ) else {
+            return;
+        };
+        let _ = crate::store_residency::ensure_file_in_store(
+            &self.coordinator,
+            self.store.as_ref(),
+            group.as_str(),
+            path.as_str(),
+            &file,
+            &record.blocks,
+        );
+    }
+
+    fn blocks_in_store(&self, blocks: &[BlockHash]) -> bool {
+        let ids: Vec<String> = blocks.iter().map(|block| hex::encode(&block.0)).collect();
+        // An unreadable store is not a store that holds the blocks.
+        self.store.present_blocks(&ids).is_ok_and(|held| held.iter().all(|present| *present))
     }
 
     fn verify_block(&self, block: &BlockHash) -> Result<(), ReplicaEngineError> {

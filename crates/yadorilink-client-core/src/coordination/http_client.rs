@@ -278,8 +278,18 @@ fn is_loopback_host(url: &url::Url) -> bool {
     }
 }
 
-/// How long connecting to the coordination plane may take.
-const CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long connecting to the coordination plane may take. The client counts the name lookup
+/// against it as well as the TCP and TLS handshakes. On Unix the two address families are looked
+/// up separately (see `name_lookup`), which removes the usual cause of a slow lookup, a router
+/// that answers only one of two simultaneous queries. A lookup can still be slow without anything
+/// being wrong (a resolver's own first timeout is five seconds, and the other platforms use the
+/// system lookup as it is), so the budget stays above that: ten seconds costs nothing when the
+/// network works and only delays the report on a dead one, inside [`REQUEST_BUDGET`].
+const CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+const _: () = assert!(
+    CONNECT_BUDGET.as_secs() > 5,
+    "the connect budget must outlast the system resolver's first timeout (5 s)"
+);
 
 /// How long one coordination request may take, answer included. Every
 /// request here moves a small JSON body, so a longer wait is a stalled
@@ -307,11 +317,19 @@ async fn bounded<T>(
 /// The HTTP client for every coordination request this crate makes, sign-in
 /// included, with [`CONNECT_BUDGET`] and [`REQUEST_BUDGET`].
 pub(crate) fn client() -> Result<reqwest::Client, CoreError> {
-    reqwest::Client::builder()
-        .connect_timeout(CONNECT_BUDGET)
-        .timeout(REQUEST_BUDGET)
+    client_builder(CONNECT_BUDGET)
         .build()
         .map_err(|e| CoreError::CoordinationPlaneUnreachable(e.to_string()))
+}
+
+/// The builder behind [`client`], with the connect budget chosen (a test shortens it).
+fn client_builder(connect_budget: std::time::Duration) -> reqwest::ClientBuilder {
+    let builder =
+        reqwest::Client::builder().connect_timeout(connect_budget).timeout(REQUEST_BUDGET);
+    // The two address families are looked up separately (see `name_lookup`).
+    #[cfg(unix)]
+    let builder = builder.dns_resolver(std::sync::Arc::new(super::name_lookup::SplitResolver));
+    builder
 }
 
 async fn handle_response<Resp: DeserializeOwned>(
@@ -438,6 +456,11 @@ impl ApiFailure {
     pub(crate) fn from_parts(status: u16, body: serde_json::Value) -> Self {
         let code = body.get("code").and_then(|v| v.as_str()).map(str::to_owned);
         Self { status, code, body }
+    }
+
+    /// The failure body, for a caller that reads a typed refusal out of it.
+    pub(crate) fn body(&self) -> &serde_json::Value {
+        &self.body
     }
 
     /// The generic classification, for every failure the caller does not handle itself.

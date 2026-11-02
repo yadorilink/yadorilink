@@ -36,6 +36,7 @@ pub struct ConsentStore {
 
 impl ConsentStore {
     pub fn new(reporting_dir: impl AsRef<Path>) -> Self {
+        super::private_fs::tighten_existing(reporting_dir.as_ref());
         ConsentStore { path: reporting_dir.as_ref().join("consent.json") }
     }
 
@@ -77,13 +78,13 @@ impl ConsentStore {
     /// hard error), and a withdrawn consent can't come back after a power loss.
     pub fn save(&self, state: &ConsentState) -> ReportingResult<()> {
         if let Some(parent) = self.path.parent() {
-            yadorilink_fs_platform::durable_dir::create_dir_all_durably(parent)?;
+            super::private_fs::create_private_dir(parent)?;
         }
         let json = serde_json::to_string_pretty(state)?;
         let tmp_path = self.path.with_extension("json.tmp");
         let flushed = (|| -> std::io::Result<()> {
             use std::io::Write;
-            let mut file = std::fs::File::create(&tmp_path)?;
+            let mut file = super::private_fs::create_private_file(&tmp_path)?;
             file.write_all(json.as_bytes())?;
             yadorilink_fs_platform::flush::sync_file(&file)
         })();

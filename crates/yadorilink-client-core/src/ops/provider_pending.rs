@@ -106,6 +106,12 @@ impl PendingStore {
         })
     }
 
+    /// The signatures of every pending request, for a caller that looks for the ones it left
+    /// unsettled (a lost reply) by their prefix.
+    pub(crate) fn signatures(&self) -> io::Result<Vec<String>> {
+        self.locked(|| Ok(self.load()?.into_keys().collect()))
+    }
+
     /// The request reached a terminal outcome: forget its identity. A failure leaves the identity in
     /// place, which is safe (a repeat of the same request is answered with what it already made).
     pub(crate) fn clear(&self, signature: &str) {

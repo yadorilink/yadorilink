@@ -50,6 +50,13 @@ fn every_core_error_maps_to_the_historical_message_and_exit_code() {
         ),
         (CoreError::DaemonRejected("rejected".into()), "rejected", 1),
         (CoreError::ManagedElsewhere("the app owns it".into()), "the app owns it", 19),
+        (
+            CoreError::PrimaryTransferRefused(
+                yadorilink_client_core::PrimaryTransferRefusal::OfferExpired,
+            ),
+            "the ownership offer has expired",
+            20,
+        ),
         (command(ApplicationErrorCode::ActivationAmbiguous), "daemon says no", 8),
         (command(ApplicationErrorCode::ReplicaNotReady), "daemon says no", 1),
         (command(ApplicationErrorCode::TargetNotFound), "daemon says no", 1),
@@ -59,14 +66,6 @@ fn every_core_error_maps_to_the_historical_message_and_exit_code() {
             command(ApplicationErrorCode::DiskFull),
             "there is not enough free disk space to do this; free some space and try again \
              (daemon says no)",
-            1,
-        ),
-        (
-            command(ApplicationErrorCode::AccessDenied),
-            "the system has not allowed YadoriLink to access this folder, so nothing was \
-             linked. On macOS, allow it in System Settings > Privacy & Security > Files and \
-             Folders (or Full Disk Access); on Windows, give your account access to the folder. \
-             Then run the command again, or choose another folder (daemon says no)",
             1,
         ),
         (
@@ -261,4 +260,32 @@ fn the_credential_cleanup_advice_keeps_its_old_wording() {
         crate::error::CREDENTIAL_CLEANUP_ADVICE,
         "Run `yadorilink credentials purge` to try again"
     );
+}
+
+/// A folder the system refused access to reports the daemon's own text first and only the
+/// remedy of the operating system it runs on.
+#[test]
+fn access_denied_names_the_cause_and_only_this_systems_remedy() {
+    let detail =
+        "failed to open sync-root lock sidecar /srv/x/.yadorilink-root.lock: Permission denied";
+    let cli = CliError::from(CoreError::DaemonCommand {
+        code: ApplicationErrorCode::AccessDenied,
+        message: detail.into(),
+        group_ids: Vec::new(),
+        operation_id: None,
+    });
+    let text = cli.to_string();
+    assert!(text.contains(detail), "{text}");
+    assert_eq!(cli.exit_code(), 1);
+    if cfg!(target_vendor = "apple") {
+        assert!(text.contains("Privacy & Security"), "{text}");
+        assert!(!text.contains("Windows"), "{text}");
+    } else if cfg!(windows) {
+        assert!(text.contains("Give your account access"), "{text}");
+        assert!(!text.contains("macOS"), "{text}");
+    } else {
+        assert!(text.starts_with("permission denied: "), "{text}");
+        assert!(text.contains("PUID") && text.contains("chown"), "{text}");
+        assert!(!text.contains("macOS") && !text.contains("Windows"), "{text}");
+    }
 }

@@ -69,3 +69,35 @@ fn disable_all_submission_keeps_the_reporter_id() {
     assert!(disabled.is_fully_disabled());
     assert_eq!(disabled.anonymous_reporter_id, Some(id));
 }
+
+#[cfg(unix)]
+fn mode_of(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+/// The reporting directory and the consent file are owner-only from creation (not by luck of the
+/// umask), no temp file is left, and a wider one left by an older version is tightened when the
+/// store is opened.
+#[cfg(unix)]
+#[test]
+fn consent_is_stored_owner_only_and_an_old_wide_open_one_is_tightened_on_open() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let reporting = root.path().join("reporting");
+    let store = ConsentStore::new(&reporting);
+    store.opt_in_usage().unwrap();
+    assert_eq!(mode_of(&reporting), 0o700);
+    assert_eq!(mode_of(&reporting.join("consent.json")), 0o600);
+    assert!(!reporting.join("consent.json.tmp").exists());
+
+    std::fs::set_permissions(&reporting, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(
+        reporting.join("consent.json"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let _reopened = ConsentStore::new(&reporting);
+    assert_eq!(mode_of(&reporting), 0o700);
+    assert_eq!(mode_of(&reporting.join("consent.json")), 0o600);
+}

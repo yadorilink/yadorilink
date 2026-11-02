@@ -166,7 +166,7 @@ pub async fn versions(
                 "mtime_unix_nanos": v.mtime_unix_nanos,
                 "state": v.state,
                 "origin_device_id": v.origin_device_id,
-                "unix_mode": v.unix_mode,
+                "exec": v.exec,
                 "kind": v.kind().as_str_name(),
             })
         })

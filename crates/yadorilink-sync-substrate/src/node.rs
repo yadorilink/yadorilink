@@ -159,6 +159,10 @@ pub struct NetworkConfig {
     lan_peers: Option<Arc<dyn crate::PeerAdmission>>,
     /// Told about every connection the node dials or accepts. See `observe`.
     link_observer: Option<crate::observe::LinkObserver>,
+    /// A transport configuration for the endpoint's QUIC connections, for the throughput probe
+    /// (windows, segmentation offload). Absent: the library defaults, as in production.
+    #[cfg(feature = "test-support")]
+    quic_transport_config: Option<iroh::endpoint::QuicTransportConfig>,
     /// What stands in for mDNS, for a test that has to exercise the LAN path
     /// on a host that may not deliver multicast.
     #[cfg(feature = "test-support")]
@@ -254,6 +258,16 @@ impl NetworkConfig {
         self
     }
 
+    /// Runs the endpoint's QUIC connections with `config` instead of the library defaults.
+    #[cfg(feature = "test-support")]
+    pub fn with_quic_transport_config(
+        mut self,
+        config: iroh::endpoint::QuicTransportConfig,
+    ) -> Self {
+        self.quic_transport_config = Some(config);
+        self
+    }
+
     /// Also answer Track Send's ALPN on this node's router.
     ///
     /// `admission` decides who may open a Track Send connection and is the
@@ -339,6 +353,8 @@ impl NetworkConfig {
             lan_discovery: false,
             lan_peers: None,
             link_observer: None,
+            #[cfg(feature = "test-support")]
+            quic_transport_config: None,
             #[cfg(feature = "test-support")]
             lan_source_for_tests: None,
             track_send: None,
@@ -529,6 +545,13 @@ pub struct SubstrateNode {
     /// device's reachability has to react to that rather than sample it once,
     /// and polling for it would be a timer wearing an event's clothes.
     address: tokio::sync::watch::Receiver<PeerAddress>,
+    /// Counts the moments this node gained a way to be reached that it did not
+    /// have a moment before (an interface came back, a new local address, a new
+    /// home relay). See [`SubstrateNode::watch_arrivals`].
+    arrivals: tokio::sync::watch::Receiver<u64>,
+    /// Counts the arrivals that followed a loss of addresses: the network went away and came
+    /// back. See [`SubstrateNode::watch_restored`].
+    restored: tokio::sync::watch::Receiver<u64>,
     /// Told about every connection this node dials; the accept side holds
     /// its own clone.
     observer: Option<crate::observe::LinkObserver>,
@@ -592,10 +615,13 @@ impl SubstrateNode {
         // in from it. See `directory`'s own module doc for why addresses are
         // no longer an input to this node.
         if let Some(directory) = config.directory() {
-            builder = builder.address_lookup(crate::directory::DirectoryLookup::new(
-                directory,
-                crate::peer::PeerId::from_bytes(*secret_key.public().as_bytes()),
-            ));
+            builder = builder.address_lookup(
+                crate::directory::DirectoryLookup::new(
+                    directory,
+                    crate::peer::PeerId::from_bytes(*secret_key.public().as_bytes()),
+                )
+                .waiting_for_records(config.lan_discovery),
+            );
         }
         if config.lan_discovery {
             builder = with_lan_lookup(builder, &config, secret_key.public());
@@ -614,6 +640,9 @@ impl SubstrateNode {
             }
             if let Some(lookup) = config.address_lookup_override.clone() {
                 builder = builder.address_lookup(lookup);
+            }
+            if let Some(transport) = config.quic_transport_config.clone() {
+                builder = builder.transport_config(transport);
             }
         }
         let endpoint =
@@ -653,12 +682,14 @@ impl SubstrateNode {
         }
         let router = router.spawn();
 
-        let address = spawn_address_watch(router_endpoint_of(&router));
+        let (address, arrivals, restored) = spawn_address_watch(router_endpoint_of(&router));
 
         Ok((
             Self {
                 router,
                 address,
+                arrivals,
+                restored,
                 observer: config.link_observer,
                 track_send_open,
                 native_replication_open,
@@ -689,6 +720,62 @@ impl SubstrateNode {
     /// every peer that cannot reach it directly.
     pub fn watch_local_address(&self) -> tokio::sync::watch::Receiver<PeerAddress> {
         self.address.clone()
+    }
+
+    /// Whether the home relay is connected right now, updated as that changes.
+    ///
+    /// Choosing a home relay is not connecting to it: the address (see
+    /// [`Self::watch_local_address`]) names the relay as soon as it is chosen,
+    /// while the connection behind it may keep failing and retrying for a long
+    /// time. A relay path can only work once this is `true`.
+    pub fn watch_home_relay_connected(&self) -> tokio::sync::watch::Receiver<bool> {
+        use iroh::Watcher as _;
+
+        let mut status = self.router.endpoint().home_relay_status();
+        let connected =
+            |statuses: &[iroh::endpoint::RelayStatus]| statuses.iter().any(|s| s.is_connected());
+        let (tx, rx) = tokio::sync::watch::channel(connected(&status.get()));
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = tx.closed() => return,
+                    update = status.updated() => match update {
+                        Ok(statuses) => {
+                            // iroh reports every failed attempt too (a new error each retry);
+                            // only a change of the answer is worth waking anyone for.
+                            let now = connected(&statuses);
+                            tx.send_if_modified(|current| {
+                                let changed = *current != now;
+                                *current = now;
+                                changed
+                            });
+                        }
+                        Err(_) => return,
+                    },
+                }
+            }
+        });
+        rx
+    }
+
+    /// A counter that moves each time this node gains an address it did not
+    /// have (see [`gained_address`]): the network came back, or changed.
+    ///
+    /// Event-driven, never periodic. A redial that is waiting out a backoff
+    /// uses it to try again at once instead of sleeping on for a link that
+    /// is, by this signal, likely to work now. Losing an address does not
+    /// move it: a network going away is not a reason to dial.
+    pub fn watch_arrivals(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.arrivals.clone()
+    }
+
+    /// A counter that moves when an address arrives after addresses were lost: the network
+    /// went away and came back, or moved. Connections made before that may be on paths that
+    /// no longer work and that QUIC does not give up on for as long as a minute (they are
+    /// kept alive by a one-way trickle), so what holds them closes them on this event and
+    /// redials, instead of waiting to find out.
+    pub fn watch_restored(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.restored.clone()
     }
 
     /// Dial a peer on the Yadori sync ALPN, using address information the
@@ -778,7 +865,7 @@ impl SubstrateNode {
 }
 
 /// What a failed dial says about the peer, in the terms a user is shown.
-fn dial_failure(err: &iroh::endpoint::ConnectError) -> crate::observe::DialFailure {
+pub(crate) fn dial_failure(err: &iroh::endpoint::ConnectError) -> crate::observe::DialFailure {
     use crate::observe::DialFailure;
     use iroh::endpoint::{ConnectError, ConnectWithOptsError, ConnectingError, ConnectionError};
     match err {
@@ -804,23 +891,86 @@ fn router_endpoint_of(router: &Router) -> iroh::Endpoint {
 /// Turns iroh's own address watcher into a plain tokio watch of
 /// [`PeerAddress`], so nothing above this crate has to name an iroh type or
 /// drive an iroh-specific watcher.
-fn spawn_address_watch(endpoint: iroh::Endpoint) -> tokio::sync::watch::Receiver<PeerAddress> {
+fn spawn_address_watch(
+    endpoint: iroh::Endpoint,
+) -> (
+    tokio::sync::watch::Receiver<PeerAddress>,
+    tokio::sync::watch::Receiver<u64>,
+    tokio::sync::watch::Receiver<u64>,
+) {
     let (tx, rx) = tokio::sync::watch::channel(peer_address_of(&endpoint));
+    let (arrivals_tx, arrivals_rx) = tokio::sync::watch::channel(0u64);
+    let (restored_tx, restored_rx) = tokio::sync::watch::channel(0u64);
     tokio::spawn(async move {
         use iroh::Watcher as _;
         let mut watcher = endpoint.watch_addr();
+        // A direct address went away and has not come back yet.
+        let mut lost = false;
         loop {
             // Ends when the endpoint stops, which is when there is nothing
             // left to publish an address for.
             if watcher.updated().await.is_err() {
                 return;
             }
-            if tx.send(peer_address_of(&endpoint)).is_err() {
+            let now = peer_address_of(&endpoint);
+            let before = tx.borrow().clone();
+            let arrived = gained_address(&before, &now);
+            let (lost_now, restored) = network_trend(&before, &now, lost);
+            let grew = now.direct_addrs().count() > before.direct_addrs().count();
+            lost |= lost_now;
+            tracing::debug!(
+                direct = now.direct_addrs().count(),
+                relays = now.relay_urls().count(),
+                arrived,
+                lost_now,
+                restored,
+                "local address changed"
+            );
+            // Published first, so whoever reacts to a counter reads the new address.
+            if tx.send(now).is_err() {
                 return;
+            }
+            if arrived {
+                arrivals_tx.send_modify(|n| *n += 1);
+            }
+            if restored {
+                restored_tx.send_modify(|n| *n += 1);
+                // A returning interface settles the loss; a replacement does not.
+                if grew {
+                    lost = false;
+                }
             }
         }
     });
-    rx
+    (rx, arrivals_rx, restored_rx)
+}
+
+/// How the direct addresses moved between two publications, given whether a loss is still
+/// waiting to be made good: `(lost, restored)`.
+///
+/// Fewer addresses than a moment ago is the network going; more, after that, is it coming back.
+/// An update that keeps the number but replaces an address (a wired link taking over from a
+/// wireless one, a new public mapping) is the paths changing under every connection, and counts
+/// as restored too, loss or no loss. The set is noisy, so a loss is never read off a comparison
+/// of individual addresses, only off the count; a first discovery of addresses at start-up is
+/// more addresses with no loss before it, which restores nothing.
+pub(crate) fn network_trend(
+    before: &PeerAddress,
+    now: &PeerAddress,
+    loss_pending: bool,
+) -> (bool, bool) {
+    let (had, has) = (before.direct_addrs().count(), now.direct_addrs().count());
+    let replaced =
+        has == had && has > 0 && now.direct_addrs().any(|a| !before.direct_addrs().any(|b| b == a));
+    (has < had, (loss_pending && has > had) || replaced)
+}
+
+/// Whether `now` has an address `before` did not: a direct address that was
+/// not there, or a relay that was not there. Losing addresses is not an
+/// arrival.
+pub(crate) fn gained_address(before: &PeerAddress, now: &PeerAddress) -> bool {
+    now.direct_addrs().any(|a| !before.direct_addrs().any(|b| b == a))
+        || now.relay_urls().any(|r| !before.relay_urls().any(|b| b == r))
 }
 
 /// Splits an iroh address into the direct and relay halves a peer records.
@@ -970,5 +1120,86 @@ mod connection_cap_tests {
         assert!(counts.try_acquire(peer(2)).is_some(), "another peer has its own allowance");
         drop(held);
         assert!(counts.try_acquire(peer(1)).is_some(), "closed connections free their slots");
+    }
+}
+
+#[cfg(test)]
+mod arrival_tests {
+    use super::*;
+
+    fn addr(direct: &[&str], relays: &[&str]) -> PeerAddress {
+        PeerAddress::new(PeerId::from_bytes([1; 32]))
+            .with_direct(direct.iter().map(|d| d.parse().unwrap()).collect::<Vec<_>>())
+            .with_relays(relays.iter().map(ToString::to_string).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn a_new_direct_address_is_an_arrival() {
+        assert!(gained_address(&addr(&[], &[]), &addr(&["10.0.0.2:1"], &[])));
+        assert!(gained_address(
+            &addr(&["10.0.0.2:1"], &[]),
+            &addr(&["10.0.0.2:1", "10.0.0.3:1"], &[])
+        ));
+    }
+
+    #[test]
+    fn a_new_relay_is_an_arrival() {
+        assert!(gained_address(&addr(&[], &[]), &addr(&[], &["https://r.example/"])));
+    }
+
+    #[test]
+    fn a_cut_and_its_return_restore_once_and_start_up_restores_nothing() {
+        let a = |n: usize| {
+            let direct: Vec<String> = (0..n).map(|i| format!("10.0.0.{}:1", i + 2)).collect();
+            addr(&direct.iter().map(String::as_str).collect::<Vec<_>>(), &["https://r.example/"])
+        };
+        // Start-up: addresses appear one after another, nothing was lost.
+        let mut lost = false;
+        let restored_count = std::cell::Cell::new(0);
+        let step = |before: &PeerAddress, now: &PeerAddress, lost: &mut bool| {
+            let (l, r) = network_trend(before, now, *lost);
+            let grew = now.direct_addrs().count() > before.direct_addrs().count();
+            *lost |= l;
+            if r {
+                restored_count.set(restored_count.get() + 1);
+                if grew {
+                    *lost = false;
+                }
+            }
+        };
+        step(&a(0), &a(2), &mut lost);
+        step(&a(2), &a(3), &mut lost);
+        assert!(!lost);
+        // The cut: three become two. A swap of addresses at the same count is noise.
+        step(&a(3), &a(2), &mut lost);
+        assert!(lost);
+        let swapped = addr(&["10.9.9.9:1", "10.0.0.3:1"], &["https://r.example/"]);
+        step(&a(2), &swapped, &mut lost);
+        assert!(lost, "a replacement does not end the loss");
+        assert_eq!(restored_count.get(), 1, "but it is a change of paths");
+        // The return.
+        step(&swapped, &a(3), &mut lost);
+        assert!(!lost);
+        step(&a(3), &a(3), &mut lost);
+        assert_eq!(restored_count.get(), 2);
+    }
+
+    #[test]
+    fn a_same_count_replacement_is_a_restore_with_or_without_a_loss() {
+        let one = addr(&["10.0.0.2:1", "10.0.0.3:1"], &[]);
+        let moved = addr(&["10.0.0.2:1", "192.168.1.9:1"], &[]);
+        assert_eq!(network_trend(&one, &moved, false), (false, true));
+        // Nothing moved: nothing restored.
+        assert_eq!(network_trend(&one, &one, false), (false, false));
+        // A shrink is a loss, even when it also swaps an address.
+        let shrunk = addr(&["192.168.1.9:1"], &[]);
+        assert_eq!(network_trend(&one, &shrunk, false), (true, false));
+    }
+
+    #[test]
+    fn losing_or_keeping_addresses_is_not() {
+        assert!(!gained_address(&addr(&["10.0.0.2:1"], &["https://r.example/"]), &addr(&[], &[])));
+        assert!(!gained_address(&addr(&["10.0.0.2:1"], &[]), &addr(&["10.0.0.2:1"], &[])));
+        assert!(!gained_address(&addr(&[], &[]), &addr(&[], &[])));
     }
 }

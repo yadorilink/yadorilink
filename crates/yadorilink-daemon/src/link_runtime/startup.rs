@@ -38,7 +38,8 @@ pub(crate) fn build_change_processor(
         deps.device_id.clone(),
         root_lease,
     )
-    .with_unreadable_ledger(deps.telemetry.unreadable_files_handle());
+    .with_unreadable_ledger(deps.telemetry.unreadable_files_handle())
+    .with_ingest_policy(crate::ingest_policy::ingest_policy_for(&deps.replica_coordinator));
     // Emission needs a stable device id to attribute deltas to. A device
     // with no identity leaves emission off. A registered device with no signing
     // key is NOT handled here: `open_group_author` below fails

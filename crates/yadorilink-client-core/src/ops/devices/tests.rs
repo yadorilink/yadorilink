@@ -18,8 +18,10 @@ fn register_device_request_serializes_camelcase_for_the_coordination_plane() {
     let body = serde_json::to_value(RegisterDeviceRequest {
         device_name: "my-laptop",
         signing_public_key_base64: "sign-key".to_string(),
+        platform: Some("macos"),
     })
     .unwrap();
+    assert_eq!(body["platform"], "macos");
     assert_eq!(body["deviceName"], "my-laptop");
     assert_eq!(body["signingPublicKeyBase64"], "sign-key");
     assert!(body.get("device_name").is_none());
@@ -115,4 +117,19 @@ fn no_start_step_is_invented_where_starting_cannot_help() {
         None,
     );
     assert_eq!(elsewhere.hint(), None);
+}
+
+/// The platform names are the coordination plane's closed set, and an unknown target omits the
+/// field (an old plane ignores it; a new one stores NULL).
+#[test]
+fn device_platform_is_one_of_the_coordination_planes_names_and_is_omitted_when_absent() {
+    let platform = device_platform().expect("every supported build target has a platform");
+    assert!(["windows", "macos", "ios", "linux"].contains(&platform));
+    let body = serde_json::to_value(RegisterDeviceRequest {
+        device_name: "d",
+        signing_public_key_base64: "k".to_string(),
+        platform: None,
+    })
+    .unwrap();
+    assert!(body.get("platform").is_none());
 }

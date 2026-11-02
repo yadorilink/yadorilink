@@ -121,6 +121,8 @@ yadorilink-replica-engine = { path = "../yadorilink-replica-engine" }
 yadorilink-transport = { path = "../yadorilink-transport" }
 yadorilink-local-storage = { path = "../yadorilink-local-storage" }
 yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
+# The pure product model: the daemon computes the product status once and sends it on the wire.
+yadorilink-product-view = { path = "../yadorilink-product-view" }
 # Track Send: `crate::send_transfer` builds and holds this device's
 # `yadorilink_send::SendService`. This crate never gains a reverse
 # dependency the other way -- `yadorilink-send` does not, and must not,
@@ -215,8 +217,6 @@ tokio.workspace = true
 turmoil = "0.7.2"
 
 [dev-dependencies]
-# The canonical product summary the daemon's status rollup must agree with (a test pins it).
-yadorilink-product-view = { path = "../yadorilink-product-view" }
 # The offline `CoordinationAuth` the tests below build. Enabling the feature
 # here rather than in `[dependencies]` keeps it out of the shipped binary: it
 # is a composition of the crate's public API (see its `test_support` module),
@@ -263,7 +263,7 @@ yadorilink-lane-ports = { path = "../yadorilink-lane-ports", features = ["test-s
 # `Case`'s device indices onto the simulated carrier's endpoints. Already in
 # the lockfile as `yadorilink-sync-substrate`'s own dependency, so this adds
 # one edge and no versions.
-iroh = "1.1"
+iroh = "1.4"
 # Track Send's real crash-recovery test needs the deterministic
 # mid-transfer abort seam (`SendService::test_abort_after_n_chunks`), same
 # override shape as the two entries above.

@@ -50,15 +50,32 @@ fn hydrate_report(local_path: &str, downloaded: bool) -> String {
 pub async fn evict(local_path: String) -> Result<(), CliError> {
     let absolute_path = absolute_path(&local_path)?;
     let response = files::evict(absolute_path).await?;
-    println!("{}", evict_report(&local_path, &response));
+    println!("{}", evict_outcome(&local_path, &response)?);
     Ok(())
+}
+
+/// The report of an eviction that happened; an eviction that freed nothing is an error, so the
+/// exit status tells a script (and the shell) whether the item was evicted.
+fn evict_outcome(local_path: &str, response: &EvictResponse) -> Result<String, CliError> {
+    let report = evict_report(local_path, response);
+    if response.dehydrated {
+        Ok(report)
+    } else {
+        Err(CliError::Other(report))
+    }
 }
 
 /// What one eviction did, in the user's words. The daemon keeps its cached blocks of a file
 /// whenever no full replica took a durable lease on the version, even though the OS copy was
 /// dropped; saying only "Evicted" then hides that no disk space was freed and why.
 fn evict_report(local_path: &str, response: &EvictResponse) -> String {
-    let refusal = files::evict_refusal(&response.retained_reason);
+    // Why a successful call freed nothing is the more specific answer when the daemon gives it.
+    let code = if response.dehydrated || response.not_freed_reason.is_empty() {
+        &response.retained_reason
+    } else {
+        &response.not_freed_reason
+    };
+    let refusal = files::evict_refusal(code);
     let next = |refusal: &files::EvictRefusal| {
         if refusal.hint.is_empty() {
             String::new()
@@ -75,12 +92,9 @@ fn evict_report(local_path: &str, response: &EvictResponse) -> String {
             next(&why),
             response.retained_reason
         ),
-        (false, Some(why)) => format!(
-            "{local_path} was not evicted: {}.{} [{}]",
-            why.why,
-            next(&why),
-            response.retained_reason
-        ),
+        (false, Some(why)) => {
+            format!("{local_path} was not evicted: {}.{} [{}]", why.why, next(&why), code)
+        }
         (false, None) => format!(
             "{local_path} was not evicted and nothing was freed. If the file was only just \
              downloaded or edited, try again in a few seconds."
@@ -111,8 +125,22 @@ pub async fn status(local_path: String) -> Result<(), CliError> {
 /// here yet is downloaded. A download that fails does not undo the choice.
 pub async fn pin(local_path: String) -> Result<(), CliError> {
     let response = files::pin(absolute_path(&local_path)?).await?;
-    println!("{}", pin_report(&local_path, &response));
+    println!("{}", pin_outcome(&local_path, &response)?);
     Ok(())
+}
+
+/// The report of a pin that kept everything it promises. The pin itself is recorded either way,
+/// but nothing downloads a kept item later on a folder the daemon hydrates itself (and the
+/// operating system's own download is not asked for on other platforms), and a version that is
+/// not yet in the store is only kept by pinning again: a script must see that the request needs
+/// another run, so such a pin is an error carrying the same message.
+fn pin_outcome(local_path: &str, response: &PinItemResponse) -> Result<String, CliError> {
+    let report = pin_report(local_path, response);
+    if response.download_error.is_empty() && response.history_not_kept_reason.is_empty() {
+        Ok(report)
+    } else {
+        Err(CliError::Other(report))
+    }
 }
 
 /// Stops keeping a file or folder. Nothing is removed; its space can be freed again.
@@ -136,7 +164,7 @@ fn retention_suffix(retention: Option<&RetentionState>) -> &'static str {
 }
 
 fn pin_report(local_path: &str, response: &PinItemResponse) -> String {
-    if response.download_error.is_empty() {
+    let mut report = if response.download_error.is_empty() {
         format!("{local_path} is always kept on this device")
     } else {
         format!(
@@ -144,7 +172,20 @@ fn pin_report(local_path: &str, response: &PinItemResponse) -> String {
              Run `yadorilink pin {local_path}` again to retry.",
             response.download_error
         )
+    };
+    let history = match response.history_not_kept_reason.as_str() {
+        "" => None,
+        "changing_retry" => Some(
+            "Some files were changing, so their previous versions are not safely kept yet; run \
+             the pin again once they settle.",
+        ),
+        _ => Some("The previous versions of its files could not be checked; run the pin again."),
+    };
+    if let Some(history) = history {
+        report.push_str(". ");
+        report.push_str(history);
     }
+    report
 }
 
 fn unpin_report(local_path: &str, response: &UnpinItemResponse) -> String {
@@ -173,7 +214,38 @@ mod evict_report_tests {
             blocks_reclaimed: 0,
             bytes_reclaimed: 0,
             retained_reason: reason.to_owned(),
+            not_freed_reason: String::new(),
         }
+    }
+
+    #[test]
+    fn an_eviction_that_freed_nothing_is_an_error() {
+        let refused = evict_outcome("a.txt", &response(false, "")).unwrap_err();
+        assert!(refused.to_string().contains("was not evicted"), "{refused}");
+        assert!(evict_outcome("a.txt", &not_freed("busy")).is_err());
+        assert!(evict_outcome("a.txt", &response(true, "")).unwrap().starts_with("Evicted"));
+    }
+
+    fn not_freed(reason: &str) -> EvictResponse {
+        EvictResponse { not_freed_reason: reason.to_owned(), ..response(false, "") }
+    }
+
+    #[test]
+    fn a_call_that_freed_nothing_says_why_in_the_users_words() {
+        let text = evict_report("a.bin", &not_freed("path_changing"));
+        assert!(text.contains("being changed or was only just downloaded"), "{text}");
+        assert!(text.contains("Try again") && text.contains("path_changing"), "{text}");
+        let text = evict_report("a.bin", &not_freed("differs_from_synced"));
+        assert!(
+            text.contains("not synced yet") && text.contains("Wait until it has synced"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_reason_that_needs_the_person_is_not_called_retryable() {
+        let text = evict_report("a.bin", &not_freed("volume_not_durable"));
+        assert!(!text.contains("Try again"), "{text}");
     }
 
     #[test]
@@ -212,6 +284,7 @@ mod evict_report_tests {
             "host_busy",
             "version_moved",
             "nothing_freed",
+            "held_as_history",
             "not_downloaded",
             "not_confirmed",
             "host_refused",

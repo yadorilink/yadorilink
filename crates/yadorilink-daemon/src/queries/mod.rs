@@ -43,7 +43,6 @@ pub(crate) struct QueryServices {
     pub(crate) update_status: Arc<update_status::UpdateStatusQueryService>,
     /// Track Send's `inbox` command -- see `crate::send_transfer`'s own
     /// module doc comment.
-    #[cfg(feature = "process-model")]
     pub(crate) inbox: Arc<crate::send_transfer::InboxQueries>,
     /// Folder Rewind's read-only preview -- see `crate::rewind`'s own
     /// module doc comment.

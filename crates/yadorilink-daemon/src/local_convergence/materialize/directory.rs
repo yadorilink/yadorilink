@@ -1,4 +1,4 @@
-use yadorilink_local_storage::{apply_unix_mode, create_explicit_directory};
+use yadorilink_local_storage::create_explicit_directory;
 use yadorilink_peer_session::PeerSessionError;
 use yadorilink_replica_domain::file::RecordKind;
 
@@ -19,6 +19,7 @@ impl super::super::LocalConvergenceExecutor {
     pub(super) fn materialize_directory_lane(
         &self,
         plan: &MaterializationPlan<'_>,
+        proofs: &yadorilink_sync_sqlite::retention::RetentionProofs,
     ) -> Result<LocalMaterializeOutcome, PeerSessionError> {
         let MaterializationPlan {
             group_id,
@@ -30,7 +31,7 @@ impl super::super::LocalConvergenceExecutor {
             ..
         } = *plan;
         if let Some(reason) = &plan.hazard_reason {
-            return self.hold_for_hazard(plan, reason);
+            return self.hold_for_hazard(plan, reason, proofs);
         }
         // A path that was held and no longer is: release the hold under an
         // intent, so the row is never unprotected between the two -- the
@@ -55,10 +56,26 @@ impl super::super::LocalConvergenceExecutor {
             origin_device_id,
             authoring,
             &plan.columns,
+            yadorilink_sync_sqlite::retention::Retention::Proofs(proofs),
             root_commit_permit,
         )?;
-        create_explicit_directory(&out_path, &canonical_root, &self.structural_ledger(group_id))?;
-        apply_unix_mode(&out_path, written.meta.unix_mode)?;
+        let created = create_explicit_directory(
+            &out_path,
+            &canonical_root,
+            &self.structural_ledger(group_id),
+        )?;
+        // A directory this call created is durable with its entry: a missing name from here is
+        // the user's. One that was already there was not made durable by this call (its name may
+        // be an unflushed one), so it is not marked. A mark that cannot be recorded fails the
+        // attempt and leaves the intent open.
+        if created == yadorilink_local_storage::ExplicitDirectoryCreation::Created {
+            self.state
+                .materialization_intent_repository()
+                .mark_write_landed(group_id, &record.path, mutation_generation, root_commit_permit)
+                .map_err(crate::sync_error::SyncError::from)?;
+        }
+        #[cfg(test)]
+        crate::local_convergence::placed_hook::run(&out_path);
         // The commit clears the intent; dropping the guard uncleared is
         // inert, and on a refused commit it is what keeps the intent open.
         drop(intent_guard);
@@ -78,7 +95,6 @@ impl super::super::LocalConvergenceExecutor {
             RecordKind::Directory,
             written,
             mutation_generation,
-            &super::super::types::XattrEvidence::ReproveFromDisk,
         )? {
             Some(evidence) => Ok(MaterializeResult::Settled(evidence).into()),
             None => Ok(MaterializeResult::RetryRequired.into()),

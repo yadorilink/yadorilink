@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Print the comma-separated Docker tags for a git ref.
 #
-# Usage: docker-image-tags.sh IMAGE REF      e.g. ghcr.io/o/yadorilink-daemon refs/tags/v0.1.0-beta.1
+# Usage: docker-image-tags.sh IMAGE REF      e.g. ghcr.io/o/yadorilink refs/tags/v0.1.0-beta.1
 #        docker-image-tags.sh --self-test
 #
 # refs/tags/vX.Y.Z          -> IMAGE:X.Y.Z,IMAGE:latest   (stable only)
@@ -30,7 +30,7 @@ if [ "${1:-}" = "--self-test" ]; then
     if [ "$got" != "$2" ]; then echo "FAIL $1: got '$got', want '$2'" >&2; fail=1; fi
   }
   expect refs/tags/v0.1.0 "img:0.1.0,img:latest"
-  expect refs/tags/v0.1.0-beta.8 "img:0.1.0-beta.8"
+  expect refs/tags/v0.1.0-beta.9 "img:0.1.0-beta.9"
   expect refs/tags/v1.2.3-rc.2 "img:1.2.3-rc.2"
   expect refs/heads/main "img:nightly"
   [ "$fail" -eq 0 ] || exit 1

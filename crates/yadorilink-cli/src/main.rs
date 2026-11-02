@@ -28,7 +28,8 @@ use yadorilink_cli::error::CliError;
 16  rewind: not started or stopped before any change (see the message)\n  \
 17  rewind: you declined the confirmation; nothing was changed\n  \
 18  rewind: confirmation needs a terminal (or --yes with --plan)\n  \
-19  managed elsewhere: the app or another install owns YadoriLink on this machine"
+19  managed elsewhere: the app or another install owns YadoriLink on this machine\n  \
+20  folder ownership hand-over refused by the service (see the message)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -79,8 +80,22 @@ enum Command {
     /// Log in with your Google account in a browser; the first login creates your account.
     Login {
         /// Print a URL and short code to enter on any device, for hosts with no usable browser.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "code")]
         device: bool,
+        /// Add this computer with a pairing code instead of signing in here: make the code on
+        /// your account's web page (Devices > Add device), then pass it (`XXXX-XXXX-XXXX`, any
+        /// case, hyphens optional). It is valid for 10 minutes and works once. Use `--code -`
+        /// (or just `--code`) to read it from standard input, or set YADORILINK_PAIRING_CODE,
+        /// so it does not appear in the process list.
+        #[arg(
+            long,
+            value_name = "CODE",
+            env = "YADORILINK_PAIRING_CODE",
+            hide_env_values = true,
+            num_args = 0..=1,
+            default_missing_value = "-"
+        )]
+        code: Option<String>,
     },
     /// Sign out and revoke this computer's access. This cannot be undone.
     Logout {
@@ -165,8 +180,17 @@ enum Command {
         #[command(subcommand)]
         action: ConflictsAction,
     },
-    /// Send a file or directory to another device on your account.
-    Send { source_path: String, target_device: String },
+    /// Send files and/or folders (one transfer) to your device, or to a `link:<id>` send link.
+    Send {
+        /// One or more paths, then the target device (or `link:<id>`).
+        #[arg(required = true, num_args = 2.., value_name = "PATH... TARGET")]
+        args: Vec<String>,
+    },
+    /// One-use, expiring links for sending a file to someone on another account.
+    SendLink {
+        #[command(subcommand)]
+        action: SendLinkAction,
+    },
     /// List transfers other devices have sent to this device.
     Inbox,
     /// List transfers this device has sent, including recent finished ones.
@@ -282,6 +306,9 @@ enum Command {
         /// Pin this version instead of the channel's current one.
         #[arg(long)]
         version: Option<String>,
+        /// Go back to the previous version this install had (no download; its files are checked again).
+        #[arg(long, conflicts_with = "version")]
+        rollback: bool,
     },
     /// Remove a command-line install; your folders and data stay.
     Uninstall {
@@ -657,6 +684,38 @@ enum ProviderFolderAction {
 }
 
 #[derive(Subcommand)]
+enum OwnershipAction {
+    /// Offer a folder group you own to another person's account.
+    ///
+    /// The target is one of the folder's member devices. Nothing changes until that account
+    /// accepts; the offer lasts 7 days.
+    Offer {
+        group_name: String,
+        /// A device id from `share members` that belongs to another person's account.
+        device_id: String,
+    },
+    /// Withdraw an offer you made.
+    Cancel {
+        /// The folder group (name or id) or the offer id from `share transfer list`.
+        offer: String,
+    },
+    /// Accept an offer made to you and become the folder's primary owner.
+    ///
+    /// The folder moves onto your account and its limits.
+    Accept {
+        /// The folder group (name or id) or the offer id from `share transfer list`.
+        offer: String,
+    },
+    /// Turn down an offer made to you.
+    Decline {
+        /// The folder group (name or id) or the offer id from `share transfer list`.
+        offer: String,
+    },
+    /// List the pending offers you made and received.
+    List,
+}
+
+#[derive(Subcommand)]
 enum ShareAction {
     /// Create a folder group and link a local folder to it.
     Create {
@@ -681,9 +740,14 @@ enum ShareAction {
         group_name: String,
         /// A device id from `share members`.
         device_id: String,
-        /// The new role: `viewer` or `editor`.
+        /// The new role: `viewer`, `editor` or `owner` (delegated folder administrator).
         #[arg(long)]
         role: String,
+    },
+    /// Hand a folder group's primary ownership to another person (they must accept).
+    Transfer {
+        #[command(subcommand)]
+        action: OwnershipAction,
     },
     /// Revoke a device's access to a folder group, or revoke a share listed by `share list`.
     Revoke {
@@ -736,7 +800,7 @@ enum ShareAction {
     /// Create a one-use invite for a folder group you own, for someone on another account.
     Invite {
         group_name: String,
-        /// The invited device's role: `viewer` or `editor` (default `viewer`).
+        /// The invited device's role: `viewer`, `editor` or `owner` (default `viewer`).
         #[arg(long)]
         role: Option<String>,
         /// How long the invite stays valid, in seconds (default 7 days).
@@ -780,6 +844,33 @@ enum ShareAction {
         /// A device id from `share pending`.
         device_id: String,
     },
+}
+
+#[derive(Subcommand)]
+enum SendLinkAction {
+    /// Create a link; give the printed code to the recipient, then `send <paths...> link:<link-id>`.
+    Create {
+        /// Files and/or folders the link will carry; the recipient previews all of them.
+        paths: Vec<String>,
+        /// Seconds the link stays redeemable (default one hour, at most seven days).
+        #[arg(long)]
+        ttl: Option<u32>,
+    },
+    /// Redeem a code someone gave you, choosing which of your devices receives the file.
+    Redeem {
+        code: String,
+        /// One of your devices; this device when omitted.
+        #[arg(long)]
+        device: Option<String>,
+        /// Folder to receive the files into (absolute); a folder of the engine's choosing when omitted.
+        #[arg(long)]
+        to: Option<String>,
+    },
+    /// Cancel a link you created; an unused authorization it issued is revoked too.
+    Cancel { link_id: String },
+    /// Show where a link you created stands: waiting, redeemed, transferring, done, canceled,
+    /// expired or interrupted.
+    Status { link_id: String },
 }
 
 #[derive(Subcommand)]
@@ -888,8 +979,32 @@ impl From<ConflictsAction> for commands::version_history::ConflictsCommand {
     }
 }
 
-#[tokio::main]
-async fn main() {
+/// The stack the command line runs on. clap builds the whole command tree (every subcommand and
+/// argument) in generated functions whose frames, in an unoptimized build, are each over a megabyte:
+/// on Windows, where the main thread has 1 MB, even `yadorilink --version` overflowed it. The work
+/// runs on a thread with a stack large enough for that; the memory is reserved address space, not
+/// committed until used.
+const MAIN_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+fn main() {
+    let worker = std::thread::Builder::new()
+        .name("yadorilink-main".into())
+        .stack_size(MAIN_STACK_BYTES)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("the command line could not start its runtime")
+                .block_on(async_main());
+        })
+        .expect("the command line could not start its main thread");
+    // A panic has already been reported by the panic hook; the exit status is the usual one.
+    if worker.join().is_err() {
+        std::process::exit(101);
+    }
+}
+
+async fn async_main() {
     // Best-effort: installs a stderr subscriber so `tracing::warn!` audit
     // lines (e.g. a `--force` durability-gate override on
     // `unlink`/`share revoke`/`device remove`) are actually visible, rather
@@ -1023,9 +1138,88 @@ async fn run_report(action: ReportAction) -> Result<(), CliError> {
     }
 }
 
+async fn run_share(action: ShareAction) -> Result<(), CliError> {
+    match action {
+        ShareAction::Create { group_name, path, yes } => {
+            commands::share::create(group_name, path, yes).await
+        }
+        ShareAction::Grant { group_name, device_id, role } => {
+            commands::share::grant(group_name, device_id, role).await
+        }
+        ShareAction::ChangeRole { group_name, device_id, role } => {
+            commands::share::change_role(group_name, device_id, role).await
+        }
+        ShareAction::Transfer { action } => run_share_transfer(action).await,
+        ShareAction::Revoke { group_name_or_edge, device_id, force, yes } => match device_id {
+            Some(device_id) => {
+                commands::share::revoke(group_name_or_edge, device_id, force, yes).await
+            }
+            None => commands::share::revoke_edge(group_name_or_edge, force, yes).await,
+        },
+        ShareAction::Delete { group_name, acknowledge_cross_account_members, yes } => {
+            commands::share::delete_group(group_name, acknowledge_cross_account_members, yes).await
+        }
+        ShareAction::List => commands::share::list_shares().await,
+        ShareAction::Members { group_name } => commands::share::members(group_name).await,
+        ShareAction::Joinable => commands::share::list_joinable().await,
+        ShareAction::Join { group_name, path, storage_mode, yes } => {
+            commands::share::join(group_name, path, storage_mode, yes).await
+        }
+        ShareAction::SetStorageMode { group_name, mode } => {
+            commands::share::set_storage_mode(group_name, mode).await
+        }
+        ShareAction::Invite { group_name, role, ttl_secs, require_approval } => {
+            commands::share::invite(group_name, role, ttl_secs, require_approval).await
+        }
+        ShareAction::Accept { code_or_url, path, storage_mode, yes } => {
+            commands::share::accept(code_or_url, path, storage_mode, yes).await
+        }
+        ShareAction::Invites => commands::share::list_invites().await,
+        ShareAction::Pending => commands::share::list_pending_approvals().await,
+        ShareAction::Approve { group_name, device_id } => {
+            commands::share::approve(group_name, device_id).await
+        }
+        ShareAction::Deny { group_name, device_id } => {
+            commands::share::deny(group_name, device_id).await
+        }
+        ShareAction::CancelInvite { invite_id } => commands::share::cancel_invite(invite_id).await,
+    }
+}
+
+async fn run_share_transfer(action: OwnershipAction) -> Result<(), CliError> {
+    match action {
+        OwnershipAction::Offer { group_name, device_id } => {
+            commands::share::transfer::offer(group_name, device_id).await
+        }
+        OwnershipAction::Cancel { offer } => commands::share::transfer::cancel(offer).await,
+        OwnershipAction::Accept { offer } => commands::share::transfer::accept(offer).await,
+        OwnershipAction::Decline { offer } => commands::share::transfer::decline(offer).await,
+        OwnershipAction::List => commands::share::transfer::list().await,
+    }
+}
+
+async fn run_transfer(action: TransferAction) -> Result<(), CliError> {
+    match action {
+        TransferAction::Cancel { transfer_id } => commands::send::cancel(transfer_id).await,
+        TransferAction::Retry { transfer_id } => commands::send::retry(transfer_id).await,
+    }
+}
+
+async fn run_send_link(action: SendLinkAction) -> Result<(), CliError> {
+    match action {
+        SendLinkAction::Create { ttl, paths } => commands::send::link_create(ttl, paths).await,
+        SendLinkAction::Redeem { code, device, to } => {
+            commands::send::link_redeem(code, device, to).await
+        }
+        SendLinkAction::Cancel { link_id } => commands::send::link_cancel(link_id).await,
+        SendLinkAction::Status { link_id } => commands::send::link_status(link_id).await,
+    }
+}
+
 async fn run(command: Command) -> Result<(), CliError> {
     match command {
-        Command::Login { device } => commands::auth::login(device).await,
+        Command::Login { code: Some(code), .. } => commands::auth::login_with_code(&code).await,
+        Command::Login { device, code: None } => commands::auth::login(device).await,
         Command::Logout { yes } => commands::auth::logout(yes).await,
         Command::ForgetLocalCredentials => commands::auth::forget_local_credentials().await,
         Command::Credentials { action: CredentialsAction::Purge } => {
@@ -1049,53 +1243,7 @@ async fn run(command: Command) -> Result<(), CliError> {
                 commands::recovery::show(domain.as_str(), operation_id, json).await
             }
         },
-        Command::Share { action } => match action {
-            ShareAction::Create { group_name, path, yes } => {
-                commands::share::create(group_name, path, yes).await
-            }
-            ShareAction::Grant { group_name, device_id, role } => {
-                commands::share::grant(group_name, device_id, role).await
-            }
-            ShareAction::ChangeRole { group_name, device_id, role } => {
-                commands::share::change_role(group_name, device_id, role).await
-            }
-            ShareAction::Revoke { group_name_or_edge, device_id, force, yes } => match device_id {
-                Some(device_id) => {
-                    commands::share::revoke(group_name_or_edge, device_id, force, yes).await
-                }
-                None => commands::share::revoke_edge(group_name_or_edge, force, yes).await,
-            },
-            ShareAction::Delete { group_name, acknowledge_cross_account_members, yes } => {
-                commands::share::delete_group(group_name, acknowledge_cross_account_members, yes)
-                    .await
-            }
-            ShareAction::List => commands::share::list_shares().await,
-            ShareAction::Members { group_name } => commands::share::members(group_name).await,
-            ShareAction::Joinable => commands::share::list_joinable().await,
-            ShareAction::Join { group_name, path, storage_mode, yes } => {
-                commands::share::join(group_name, path, storage_mode, yes).await
-            }
-            ShareAction::SetStorageMode { group_name, mode } => {
-                commands::share::set_storage_mode(group_name, mode).await
-            }
-            ShareAction::Invite { group_name, role, ttl_secs, require_approval } => {
-                commands::share::invite(group_name, role, ttl_secs, require_approval).await
-            }
-            ShareAction::Accept { code_or_url, path, storage_mode, yes } => {
-                commands::share::accept(code_or_url, path, storage_mode, yes).await
-            }
-            ShareAction::Invites => commands::share::list_invites().await,
-            ShareAction::Pending => commands::share::list_pending_approvals().await,
-            ShareAction::Approve { group_name, device_id } => {
-                commands::share::approve(group_name, device_id).await
-            }
-            ShareAction::Deny { group_name, device_id } => {
-                commands::share::deny(group_name, device_id).await
-            }
-            ShareAction::CancelInvite { invite_id } => {
-                commands::share::cancel_invite(invite_id).await
-            }
-        },
+        Command::Share { action } => run_share(action).await,
         Command::ProviderFolder { action } => run_provider_folder(action).await,
         Command::Link { local_path, group_name, on_demand, dry_run, yes } => {
             commands::link::link(local_path, group_name, on_demand, dry_run, yes).await
@@ -1117,15 +1265,14 @@ async fn run(command: Command) -> Result<(), CliError> {
             }
         },
         Command::Conflicts { action } => commands::version_history::conflicts(action.into()).await,
-        Command::Send { source_path, target_device } => {
-            commands::send::send(source_path, target_device).await
+        Command::Send { mut args } => {
+            let target_device = args.pop().expect("clap requires at least two arguments");
+            commands::send::send(args, target_device).await
         }
+        Command::SendLink { action } => run_send_link(action).await,
         Command::Inbox => commands::send::inbox().await,
         Command::Outbox => commands::send::outbox().await,
-        Command::Transfer { action } => match action {
-            TransferAction::Cancel { transfer_id } => commands::send::cancel(transfer_id).await,
-            TransferAction::Retry { transfer_id } => commands::send::retry(transfer_id).await,
-        },
+        Command::Transfer { action } => run_transfer(action).await,
         Command::Receive { transfer_id, to } => commands::send::receive(transfer_id, to).await,
         Command::Hydrate { local_path } => commands::materialization::hydrate(local_path).await,
         Command::Evict { local_path } => commands::materialization::evict(local_path).await,
@@ -1217,7 +1364,9 @@ async fn run(command: Command) -> Result<(), CliError> {
         Command::Uninstall { dry_run, yes, purge_data } => {
             commands::uninstall::uninstall(dry_run, yes, purge_data).await
         }
-        Command::SelfUpdate { version } => commands::update::self_update(version).await,
+        Command::SelfUpdate { version, rollback } => {
+            commands::update::self_update(version, rollback).await
+        }
         Command::Web { action: WebAction::Status } => commands::web::status().await,
         Command::Doctor => commands::connection_ops::doctor().await,
         Command::Connections { peer } => commands::connection_ops::traces(peer).await,

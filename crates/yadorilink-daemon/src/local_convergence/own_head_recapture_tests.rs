@@ -231,8 +231,7 @@ async fn restore_of_an_older_own_version_still_materializes() {
             record_kind: older_version.meta.record_kind,
             symlink_target: older_version.meta.symlink_target.clone(),
             symlink_out_of_root: false,
-            unix_mode: older_version.meta.unix_mode,
-            xattrs: older_version.meta.xattrs.clone(),
+            exec: older_version.meta.exec,
         },
     };
     h.state
@@ -597,7 +596,13 @@ async fn a_recapture_that_finds_nothing_newer_does_not_leave_the_path_retrying()
     let mut row = h.state.get_file(GROUP, "scratch.bin").unwrap().unwrap();
     row.path = "notes.txt".to_string();
     h.state
-        .upsert_file_with_origin(GROUP, &row, LOCAL_DEVICE, &RootCommitPermit::for_tests())
+        .upsert_file_with_origin(
+            GROUP,
+            &row,
+            LOCAL_DEVICE,
+            yadorilink_sync_sqlite::retention::Retention::OwnEdit,
+            &RootCommitPermit::for_tests(),
+        )
         .unwrap();
     std::fs::write(&file, b"what the row says").unwrap();
     std::fs::File::options()

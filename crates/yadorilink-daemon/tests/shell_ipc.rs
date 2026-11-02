@@ -37,7 +37,11 @@ mod unix_socket_tests {
             .unwrap();
         std::fs::create_dir_all(dir.path().join("photos")).unwrap();
 
-        let state = DaemonState::new("device-a".into(), sync_state, store);
+        let state = yadorilink_daemon::test_support::isolated_daemon_state(
+            "device-a".into(),
+            sync_state,
+            store,
+        );
         let socket_path = dir.path().join("shell.sock");
         let serve_path = socket_path.clone();
         let serve_state =
@@ -623,7 +627,11 @@ mod windows_pipe_tests {
             .unwrap();
         std::fs::create_dir_all(dir.path().join("photos")).unwrap();
 
-        let state = DaemonState::new("device-a".into(), sync_state, store);
+        let state = yadorilink_daemon::test_support::isolated_daemon_state(
+            "device-a".into(),
+            sync_state,
+            store,
+        );
         let pipe_name = unique_pipe_name();
         let serve_name = pipe_name.clone();
         let serve_state =
@@ -633,7 +641,7 @@ mod windows_pipe_tests {
                 yadorilink_daemon::shell_ipc::windows_transport::serve(&serve_name, serve_state)
                     .await;
         });
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        yadorilink_daemon::control_socket::windows_transport::wait_until_bound(&pipe_name).await;
         (pipe_name, state, dir)
     }
 

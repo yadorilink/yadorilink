@@ -64,6 +64,18 @@ pub enum CoreError {
     )]
     AccountMismatch,
 
+    /// The service did not accept the pairing code of "add this device with a code": it was
+    /// never issued, has expired (ten minutes) or was used already. The service answers all
+    /// three alike, so this does too. Nothing was changed; a new code is made on the account's
+    /// web page.
+    #[error("The code is invalid, expired or already used: create a new code on the web page")]
+    PairingCodeRefused,
+
+    /// The coordination plane refused a primary-ownership transfer call with a typed reason
+    /// (`primary_transfer_refused`), or answered 404 for the group or offer. Nothing changed.
+    #[error("{0}")]
+    PrimaryTransferRefused(PrimaryTransferRefusal),
+
     /// The coordination plane answered 403: the session is valid but not
     /// allowed to do this.
     #[error("{0}")]
@@ -169,6 +181,78 @@ pub enum CoreError {
     Hinted { error: Box<CoreError>, hint: Hint },
 }
 
+/// Why the coordination plane refused a primary-ownership transfer call. Typed by the plane's
+/// `reason`, never matched by text; the text here is host-neutral diagnostic English.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimaryTransferRefusal {
+    /// The caller's account is not the folder's primary owner.
+    NotPrimary,
+    /// The chosen device is not an active member of the folder.
+    TargetNotMember,
+    /// The chosen device belongs to the caller's own account: nothing to hand over.
+    TargetSameAccount,
+    /// The offer lapsed (offers last seven days).
+    OfferExpired,
+    /// The folder is being created, handed off or deleted right now.
+    GroupNotActive,
+    /// The offer was already settled or replaced, another offer is pending, the folder changed
+    /// owner, or the folder kept changing while the call ran.
+    Conflict,
+    /// No such folder or offer, or the caller is not a party to it.
+    NotFound,
+}
+
+impl PrimaryTransferRefusal {
+    /// The refusal the plane's `reason` names; `None` for a reason this build does not know.
+    #[must_use]
+    pub fn from_reason(reason: &str) -> Option<Self> {
+        Some(match reason {
+            "not_primary" => Self::NotPrimary,
+            "target_not_member" => Self::TargetNotMember,
+            "target_same_account" => Self::TargetSameAccount,
+            "offer_expired" => Self::OfferExpired,
+            "group_not_active" => Self::GroupNotActive,
+            "conflict" | "operation_conflict" => Self::Conflict,
+            _ => return None,
+        })
+    }
+
+    /// The plane's `reason` word (`not_found` for the 404 case).
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::NotPrimary => "not_primary",
+            Self::TargetNotMember => "target_not_member",
+            Self::TargetSameAccount => "target_same_account",
+            Self::OfferExpired => "offer_expired",
+            Self::GroupNotActive => "group_not_active",
+            Self::Conflict => "conflict",
+            Self::NotFound => "not_found",
+        }
+    }
+}
+
+impl std::fmt::Display for PrimaryTransferRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotPrimary => "only the folder's primary owner can do this",
+            Self::TargetNotMember => "that device is not an active member of this folder",
+            Self::TargetSameAccount => {
+                "that device is on your own account: choose a device of another person"
+            }
+            Self::OfferExpired => "the ownership offer has expired",
+            Self::GroupNotActive => {
+                "the folder is being set up, handed off or removed right now; try again shortly"
+            }
+            Self::Conflict => {
+                "an ownership offer is already pending, this one was already settled or replaced, or \
+                 the folder changed while this ran; check the pending offers and try again"
+            }
+            Self::NotFound => "no such folder or ownership offer for this account",
+        })
+    }
+}
+
 /// An argument value refused before any request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InvalidArgument {
@@ -195,11 +279,9 @@ impl std::fmt::Display for InvalidArgument {
             InvalidArgument::StorageMode(value) => {
                 write!(f, "invalid storage mode {value:?} (expected eager or on-demand)")
             }
-            InvalidArgument::Role(value) => write!(
-                f,
-                "invalid role {value:?} (expected viewer or editor); owner is not available \
-                 here yet"
-            ),
+            InvalidArgument::Role(value) => {
+                write!(f, "invalid role {value:?} (expected viewer, editor or owner)")
+            }
         }
     }
 }
@@ -404,6 +486,18 @@ impl From<yadorilink_fapi_client::Error> for CoreError {
             FapiError::Response { status: 400 | 401 | 403, .. } => {
                 CoreError::AuthFailed(e.to_string())
             }
+            // The abuse budget: wait (the service's own number when it gave one) and retry.
+            FapiError::RateLimited { retry_after, .. } => CoreError::LimitExceeded {
+                message: match retry_after {
+                    Some(wait) => format!(
+                        "Too many attempts from this network; wait {} seconds and try again",
+                        wait.as_secs().max(1)
+                    ),
+                    None => "Too many attempts from this network; wait a minute and try again"
+                        .to_owned(),
+                },
+                kind: LimitKind::RateLimited,
+            },
             FapiError::Response { status: 429 | 500..=599, .. } => {
                 CoreError::CoordinationPlaneUnreachable(e.to_string())
             }
@@ -584,6 +678,51 @@ pub enum RefusalReason {
     /// A start over already finished on this embedded engine, which still reports the old state
     /// until the host restarts it; starting over again is refused until then. Nothing changed.
     StartOverRestartRequired,
+    /// The send link is past its expiry. Only the link's sender can learn this (the service
+    /// answers a redeemer's refusal alike for every cause; see `SendLinkInvalid`).
+    SendLinkExpired,
+    /// The send link was already used; a link works once. A sender learns this when sending
+    /// under it.
+    SendLinkAlreadyUsed,
+    /// The sender cancelled the send link.
+    SendLinkCancelled,
+    /// The code is not accepted: mistyped, unknown, expired, used or cancelled. The service does
+    /// not say which to someone redeeming, so a redeem refusal is always this one.
+    SendLinkInvalid,
+    /// The other device of a send could not be reached (when receiving: the sender's device).
+    /// Trying again once it is online can succeed.
+    SendPeerUnreachable,
+    /// This device has no room for what is being received. Free space or pick another device.
+    SendNoSpace,
+    /// The send stopped part way: the connection was lost or it stopped without a clearer reason.
+    SendInterrupted,
+    /// The service has Send links switched off: none can be created, previewed or redeemed
+    /// until it turns them on. Nothing was changed.
+    SendLinksDisabled,
+    /// This device's operating system refused to send to the local network (the macOS Local
+    /// Network privacy setting, a firewall or a VPN), so a device on the same network could not
+    /// be reached. A device reachable over the internet still can be; allowing the app in the
+    /// system's local network settings fixes the rest.
+    SendLocalNetworkBlocked,
+    /// The pairing code of "add this device with a code" is not accepted: never issued, expired
+    /// or already used (the service does not say which). Make a new code on the web page.
+    /// Declared last so the other reasons keep their wire order.
+    PairingCodeInvalid,
+    /// Primary-ownership transfer refused by the service, one reason each (nothing changed): the
+    /// caller is not the primary owner.
+    PrimaryTransferNotPrimary,
+    /// The chosen device is not an active member of the folder.
+    PrimaryTransferTargetNotMember,
+    /// The chosen device is on the caller's own account.
+    PrimaryTransferTargetSameAccount,
+    /// The offer lapsed.
+    PrimaryTransferOfferExpired,
+    /// The folder is being created, handed off or deleted.
+    PrimaryTransferGroupNotActive,
+    /// The offer was settled or replaced, or the folder changed owner or kept changing.
+    PrimaryTransferConflict,
+    /// No such folder or offer for this account.
+    PrimaryTransferNotFound,
 }
 
 /// The one error a desktop front end sees. Eight cases, each with a typed
@@ -692,6 +831,29 @@ impl DesktopError {
                     StartOverRefusal::RestartRequired => RefusalReason::StartOverRestartRequired,
                 },
             },
+            CoreError::PairingCodeRefused => {
+                DesktopError::Refused { message, reason: RefusalReason::PairingCodeInvalid }
+            }
+            CoreError::PrimaryTransferRefused(refusal) => DesktopError::Refused {
+                message,
+                reason: match refusal {
+                    PrimaryTransferRefusal::NotPrimary => RefusalReason::PrimaryTransferNotPrimary,
+                    PrimaryTransferRefusal::TargetNotMember => {
+                        RefusalReason::PrimaryTransferTargetNotMember
+                    }
+                    PrimaryTransferRefusal::TargetSameAccount => {
+                        RefusalReason::PrimaryTransferTargetSameAccount
+                    }
+                    PrimaryTransferRefusal::OfferExpired => {
+                        RefusalReason::PrimaryTransferOfferExpired
+                    }
+                    PrimaryTransferRefusal::GroupNotActive => {
+                        RefusalReason::PrimaryTransferGroupNotActive
+                    }
+                    PrimaryTransferRefusal::Conflict => RefusalReason::PrimaryTransferConflict,
+                    PrimaryTransferRefusal::NotFound => RefusalReason::PrimaryTransferNotFound,
+                },
+            },
             CoreError::InvalidInput(_) => DesktopError::InvalidInput { message, field: None },
             CoreError::InvalidArgument(argument) => {
                 DesktopError::InvalidInput { message, field: Some(argument.field().to_owned()) }
@@ -793,6 +955,31 @@ fn from_command(
         }
         Code::InviteAlreadyUsed => {
             DesktopError::Refused { message, reason: RefusalReason::InviteAlreadyUsed }
+        }
+        Code::SendLinkExpired => {
+            DesktopError::Refused { message, reason: RefusalReason::SendLinkExpired }
+        }
+        Code::SendLinkAlreadyUsed => {
+            DesktopError::Refused { message, reason: RefusalReason::SendLinkAlreadyUsed }
+        }
+        Code::SendLinkCancelled => {
+            DesktopError::Refused { message, reason: RefusalReason::SendLinkCancelled }
+        }
+        Code::SendLinkInvalid => {
+            DesktopError::Refused { message, reason: RefusalReason::SendLinkInvalid }
+        }
+        Code::SendPeerUnreachable => {
+            DesktopError::Refused { message, reason: RefusalReason::SendPeerUnreachable }
+        }
+        Code::SendNoSpace => DesktopError::Refused { message, reason: RefusalReason::SendNoSpace },
+        Code::SendInterrupted => {
+            DesktopError::Refused { message, reason: RefusalReason::SendInterrupted }
+        }
+        Code::SendLinksDisabled => {
+            DesktopError::Refused { message, reason: RefusalReason::SendLinksDisabled }
+        }
+        Code::SendLocalNetworkBlocked => {
+            DesktopError::Refused { message, reason: RefusalReason::SendLocalNetworkBlocked }
         }
         Code::TermsConsentRequired => denied(message, PermissionDeniedReason::TermsConsentRequired),
         Code::TargetNotFound => DesktopError::InvalidInput { message, field: None },

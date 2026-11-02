@@ -31,6 +31,29 @@ impl ClientCore {
         self.inner.engine_api_version()
     }
 
+    /// Why the daemon last refused to start because the other Mac build is running or set up here.
+    pub fn mac_claim_refusal(&self) -> Option<MacClaimRefusal> {
+        self.inner.mac_claim_refusal()
+    }
+
+    /// Switches this Mac to `this` build after the person confirmed it; `None` is done.
+    pub fn take_over_mac_claim(
+        &self,
+        container_path: String,
+        this: MacBuild,
+    ) -> Option<MacClaimRefusal> {
+        self.inner.take_over_mac_claim(container_path, this)
+    }
+
+    /// `this` build gives the Mac up; `None` is done.
+    pub fn release_mac_claim(
+        &self,
+        container_path: String,
+        this: MacBuild,
+    ) -> Option<MacClaimRefusal> {
+        self.inner.release_mac_claim(container_path, this)
+    }
+
     /// Sign-in, registration and linked-folder state; never fails. Should
     /// the call itself fail unexpectedly, it reads as signed out with the
     /// daemon's answer unknown.
@@ -52,6 +75,28 @@ impl ClientCore {
     /// A sign-in that has not started yet.
     pub fn new_login_session(&self, options: LoginOptions) -> Arc<LoginSession> {
         LoginSession::wrap(self.inner.new_login_session(options))
+    }
+
+    /// A sign-in with a pairing code from the account's web page ("add this device with a
+    /// code"); no browser. Read like a login session: `Enrolling`, then `SignedIn`.
+    ///
+    /// # Errors
+    /// `InvalidInput` (field `pairing_code`) for a code that cannot be one. Beginning the
+    /// session reports the rest: `Refused(PairingCodeInvalid)` for a code the service does not
+    /// accept (never issued, expired, used), `Network(RateLimited)` when the service asks to
+    /// wait.
+    pub fn login_with_pairing_code(
+        &self,
+        code: String,
+        options: LoginOptions,
+    ) -> Result<Arc<LoginSession>, DesktopError> {
+        Ok(LoginSession::wrap(self.inner.login_with_pairing_code(code, options)?))
+    }
+
+    /// The pairing code in what was typed or a QR scan read, as `XXXX-XXXX-XXXX`; `None` when
+    /// it cannot be one.
+    pub fn normalize_pairing_code(&self, input: String) -> Option<String> {
+        self.inner.normalize_pairing_code(input)
     }
 
     /// A sign-in of this installation for an action refused with
@@ -204,6 +249,15 @@ impl ClientCore {
         let core = self.inner.clone();
         bridge(async move { core.list_conflicts(local_path).await }).await
     }
+    pub async fn list_activity(
+        &self,
+        limit: u32,
+        before_cursor: Option<i64>,
+        filter: Option<ActivityFilter>,
+    ) -> Result<ActivityPage, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.list_activity(limit, before_cursor, filter).await }).await
+    }
     pub async fn list_trash(
         &self,
         local_path: Option<String>,
@@ -348,6 +402,51 @@ impl ClientCore {
     ) -> Result<SentTransfer, DesktopError> {
         let core = self.inner.clone();
         bridge(async move { core.send_to_device(source_path, target_device_id).await }).await
+    }
+    pub async fn create_send_link(
+        &self,
+        ttl: SendLinkTtl,
+        source_paths: Vec<String>,
+    ) -> Result<SendLink, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.create_send_link(ttl, source_paths).await }).await
+    }
+    pub async fn preview_send_link(&self, code: String) -> Result<SendLinkPreview, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.preview_send_link(code).await }).await
+    }
+    pub async fn send_to_link(
+        &self,
+        link_id: String,
+        source_paths: Vec<String>,
+    ) -> Result<SentTransfer, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.send_to_link(link_id, source_paths).await }).await
+    }
+    pub async fn redeem_send_link(
+        &self,
+        code: String,
+        receiving_device_id: String,
+        receive_dir: Option<String>,
+    ) -> Result<String, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.redeem_send_link(code, receiving_device_id, receive_dir).await })
+            .await
+    }
+    pub async fn cancel_send_link(&self, link_id: String) -> Result<(), DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.cancel_send_link(link_id).await }).await
+    }
+    pub async fn send_link_status(&self, link_id: String) -> Result<SendLinkStatus, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.send_link_status(link_id).await }).await
+    }
+    pub async fn list_send_links(
+        &self,
+        link_ids: Vec<String>,
+    ) -> Result<Vec<SendLinkStatus>, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.list_send_links(link_ids).await }).await
     }
     pub async fn list_inbox(&self) -> Result<Vec<IncomingTransfer>, DesktopError> {
         let core = self.inner.clone();
@@ -530,6 +629,44 @@ impl ClientCore {
     ) -> Result<(), DesktopError> {
         let core = self.inner.clone();
         bridge(async move { core.change_member_role(group_id, device_id, role).await }).await
+    }
+    pub async fn offer_primary_transfer(
+        &self,
+        group_id: String,
+        target_device_id: String,
+    ) -> Result<PrimaryTransferSummary, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.offer_primary_transfer(group_id, target_device_id).await }).await
+    }
+    pub async fn cancel_primary_transfer(
+        &self,
+        group_id: String,
+        transfer_id: String,
+    ) -> Result<PrimaryTransferSummary, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.cancel_primary_transfer(group_id, transfer_id).await }).await
+    }
+    pub async fn accept_primary_transfer(
+        &self,
+        group_id: String,
+        transfer_id: String,
+    ) -> Result<PrimaryTransferAccepted, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.accept_primary_transfer(group_id, transfer_id).await }).await
+    }
+    pub async fn decline_primary_transfer(
+        &self,
+        group_id: String,
+        transfer_id: String,
+    ) -> Result<PrimaryTransferSummary, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.decline_primary_transfer(group_id, transfer_id).await }).await
+    }
+    pub async fn list_primary_transfers(
+        &self,
+    ) -> Result<Vec<PrimaryTransferSummary>, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.list_primary_transfers().await }).await
     }
     pub async fn revoke_member(
         &self,

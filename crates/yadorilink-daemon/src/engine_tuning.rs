@@ -29,6 +29,7 @@ pub mod vars {
     pub const UPDATE_MANIFEST_URL: &str = "YADORILINK_UPDATE_MANIFEST_URL";
     pub const INSTALL_SOURCE: &str = "YADORILINK_INSTALL_SOURCE";
     pub const NAS_ADMIN_OFFER: &str = "YADORILINK_NAS_ADMIN";
+    pub const SUPERVISED: &str = yadorilink_local_storage::daemon_lock::SUPERVISED_ENV;
 }
 
 /// The relay selection of a tuning. A test build is kept off public relay infrastructure unless
@@ -76,6 +77,10 @@ pub struct EngineTuning {
     pub batch_completion: bool,
     /// Whether the open of a file's write is batched.
     pub batch_open: bool,
+    /// Whether the blocks of small received files are held in memory for the pass instead of
+    /// being committed to the block store (default on; a setting for tests and embedded hosts, not
+    /// a variable).
+    pub single_pass: bool,
     /// How received files are flushed when not one by one.
     pub deferred_flush: Option<ReceivedFlushMode>,
     /// Whether the receive path's commits run on the blocking pool.
@@ -89,6 +94,10 @@ pub struct EngineTuning {
     pub sync_relays: Option<String>,
     /// Block fetches in flight at once while a file is made present.
     pub block_fetch_concurrency: usize,
+    /// Whether a block the store does not hold is served from the user's file instead, checked
+    /// against its hash before it is sent. Always on where `single_pass` is, which is the default:
+    /// see [`EngineTuning::coherent`].
+    pub file_block_source: bool,
     /// Where the installation witness lives. The desktop daemon resolves the platform's
     /// location; an embedded host must name a directory outside the data area and outside what a
     /// backup restores and the system does not purge (`Persistent`), or opt into `BesideDatabase`. The default is
@@ -107,7 +116,18 @@ pub struct EngineTuning {
     pub install_source: Option<String>,
     /// Desktop only: whether this device offers management over the NAS admin service.
     pub offer_nas_admin: bool,
+    /// Desktop only: something starts the daemon again whenever it exits for a restart (the
+    /// container image's supervisor). A shutdown request that asks for a restart is honoured only
+    /// then: where nothing restarts it, the restart status would end the daemon for good.
+    pub supervised: bool,
 }
+
+/// Whether a device receives in a single pass, and so keeps received files out of the block store
+/// and serves blocks from the user's files, unless its tuning says otherwise. Unix hosts do. On
+/// Windows large files go through the block store: the capture barrier has no directory flush there
+/// to rely on, and the single-pass receive measured slower. This is the one place the platform
+/// decides; file serving and file-only capture follow it through [`EngineTuning::coherent`].
+pub const SINGLE_PASS_DEFAULT: bool = cfg!(unix);
 
 impl Default for EngineTuning {
     /// The production behaviour: what an unset environment selects.
@@ -117,6 +137,17 @@ impl Default for EngineTuning {
 }
 
 impl EngineTuning {
+    /// This tuning with the combinations that cannot work removed. A single-pass receive keeps a
+    /// received large file only in the user's folder, so a device that receives that way must also
+    /// serve blocks from files, or it cannot forward what it received; the pair is one setting,
+    /// and the engine applies this wherever it takes a tuning, so there is no way to run the
+    /// receive without the serving.
+    #[must_use]
+    pub fn coherent(mut self) -> Self {
+        self.file_block_source |= self.single_pass;
+        self
+    }
+
     /// The tuning `lookup` selects, a setting it does not name staying at its default. Values
     /// that do not parse fall back to the default, as the variables always did.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
@@ -151,6 +182,8 @@ impl EngineTuning {
             batch_open: crate::local_convergence::parse_batch_completion(
                 text(vars::BATCH_OPEN).as_deref(),
             ),
+            single_pass: SINGLE_PASS_DEFAULT,
+            file_block_source: SINGLE_PASS_DEFAULT,
             deferred_flush,
             receive_async_commit: text(vars::ASYNC_COMMIT).as_deref().map(str::trim) != Some("0"),
             provider_projector_batch: crate::provider_projector::batch_from(
@@ -175,7 +208,9 @@ impl EngineTuning {
                 let v = v.trim();
                 v == "1" || v.eq_ignore_ascii_case("true")
             }),
+            supervised: text(vars::SUPERVISED).is_some_and(|v| !v.is_empty()),
         }
+        .coherent()
     }
 }
 
@@ -201,6 +236,12 @@ mod tests {
         assert_eq!(defaults.receive_write_permits, crate::local_convergence::parse_permits(None));
         assert!(defaults.batch_completion);
         assert!(defaults.batch_open);
+        assert_eq!(defaults.single_pass, cfg!(unix), "single-pass receive is the Unix default");
+        assert_eq!(
+            defaults.file_block_source,
+            cfg!(unix),
+            "and a device that receives that way serves from files"
+        );
         assert!(defaults.receive_async_commit);
         // A test build is kept off public relays; a production build has no override.
         assert_eq!(
@@ -224,11 +265,43 @@ mod tests {
             }
         );
         assert!(!defaults.offer_nas_admin);
+        assert!(!defaults.supervised);
         assert_eq!(defaults.update_manifest_url, None);
         assert_eq!(defaults.install_source, None);
         assert_eq!(defaults.home_dir, None);
         // No placement is guessed: a host names one (or opts into beside-the-database).
         assert_eq!(defaults.witness, crate::install_witness::WitnessPlacement::Unset);
+    }
+
+    /// Single-pass receive keeps a received large file only in the user's folder, so it cannot run
+    /// without serving blocks from files: the pair is one setting, however it is configured.
+    #[test]
+    fn single_pass_receive_always_serves_from_files() {
+        let by_default = EngineTuning::default();
+        assert_eq!(by_default.single_pass, by_default.file_block_source);
+
+        let by_hand =
+            EngineTuning { single_pass: true, file_block_source: false, ..EngineTuning::default() };
+        assert!(!by_hand.file_block_source, "fixture: the pair as a caller can write it");
+        assert!(by_hand.coherent().file_block_source);
+
+        let only_serving =
+            EngineTuning { single_pass: false, file_block_source: true, ..EngineTuning::default() }
+                .coherent();
+        assert!(!only_serving.single_pass && only_serving.file_block_source, "serving alone stays");
+    }
+
+    /// Whatever tuning an engine is built with, the engine runs the coherent one.
+    #[test]
+    fn an_engine_built_with_single_pass_alone_serves_from_files() {
+        let coordinator =
+            crate::replica_coordinator::ReplicaCoordinator::open_in_memory_with(EngineTuning {
+                single_pass: true,
+                ..EngineTuning::default()
+            })
+            .unwrap();
+        assert!(coordinator.tuning().single_pass);
+        assert!(coordinator.tuning().file_block_source);
     }
 
     /// Each variable the desktop daemon always honoured selects its setting.
@@ -249,6 +322,7 @@ mod tests {
             (vars::UPDATE_MANIFEST_URL, "https://updates.example.test/manifest.json"),
             (vars::INSTALL_SOURCE, "container"),
             (vars::NAS_ADMIN_OFFER, "true"),
+            (vars::SUPERVISED, "1"),
             ("HOME", "/home/someone"),
         ]);
         assert_eq!(t.reconcile_paths_per_attempt, 24);
@@ -268,6 +342,7 @@ mod tests {
         );
         assert_eq!(t.install_source.as_deref(), Some("container"));
         assert!(t.offer_nas_admin);
+        assert!(t.supervised);
         assert_eq!(t.home_dir, Some(std::path::PathBuf::from("/home/someone")));
     }
 

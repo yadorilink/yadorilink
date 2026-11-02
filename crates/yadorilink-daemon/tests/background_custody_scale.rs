@@ -91,7 +91,11 @@ fn new_daemon(device_id: &str) -> Daemon {
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
-    let state = DaemonState::new(device_id.to_string(), Arc::new(sync_state), store);
+    let state = yadorilink_daemon::test_support::isolated_daemon_state(
+        device_id.to_string(),
+        Arc::new(sync_state),
+        store,
+    );
     ensure_device_signing_key(&state);
     let root = tempfile::tempdir().unwrap();
     state

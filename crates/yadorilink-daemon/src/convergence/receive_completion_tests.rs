@@ -548,7 +548,7 @@ fn admit_window(f: &Fixture, prefix: &str, count: usize, len: usize) -> Window {
     // With the mode the written file has, so a watcher that looks at it while the
     // window waits finds nothing of its own to author.
     let versions: Vec<FileVersion> =
-        contents.iter().map(|c| f.content_version_with_mode(c, 1000, Some(0o644))).collect();
+        contents.iter().map(|c| f.content_version_with_mode(c, 1000, false)).collect();
     for (name, version) in names.iter().zip(&versions) {
         f.admit(name, version);
     }
@@ -896,7 +896,7 @@ fn rows_of(f: &Fixture, name: &str) -> Vec<(i64, i64, i64, String)> {
         .database()
         .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT version_seq, unix_mode, size, state FROM files \
+                "SELECT version_seq, exec, size, state FROM files \
                  WHERE group_id = ?1 AND path = ?2 ORDER BY version_seq",
             )?;
             let rows = stmt

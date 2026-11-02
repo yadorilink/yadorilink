@@ -171,7 +171,9 @@ async fn an_unauthorized_group_is_refused_on_the_spot_not_dropped() {
         assert_eq!(request.group_id(), "not-shared");
         stream
             .send_response(&yadorilink_peer_session::service_rpc::encode_response(
-                &ServiceResponse::VersionPresent { present: false },
+                &ServiceResponse::VersionPresent {
+                    answer: yadorilink_peer_session::service_rpc::ProofAnswer::NotHeld,
+                },
             ))
             .await
             .unwrap();
@@ -195,7 +197,9 @@ async fn an_unauthorized_group_is_refused_on_the_spot_not_dropped() {
         .expect("an unauthorized request must be answered, not left to time out");
     assert_eq!(
         decode_response(&answered.unwrap()).unwrap(),
-        ServiceResponse::VersionPresent { present: false }
+        ServiceResponse::VersionPresent {
+            answer: yadorilink_peer_session::service_rpc::ProofAnswer::NotHeld
+        }
     );
 
     serving.await.unwrap();

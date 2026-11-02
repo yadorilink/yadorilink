@@ -77,6 +77,7 @@ installing the `.deb`:
 ```bash
 sudo /usr/share/yadorilink/headless/install-headless.sh        # account, directories, unit; starts nothing
 sudo yadorilink-svc login --device                             # approve the printed code on another device
+# or: sudo yadorilink-svc login --code                         # a code from your account's Devices page (Add device)
 sudo yadorilink-svc device register --name my-nas
 sudo systemctl start yadorilink-headless
 sudo install -d -o yadorilink -g yadorilink -m 0750 /srv/yadorilink/<group>   # the folder must exist first
@@ -108,6 +109,39 @@ signed out of the account is refused. If the box cannot reach the
 coordination service, the devices it last saw keep access for up to 24
 hours, after which everyone is refused until it reconnects (use the SSH
 route below meanwhile).
+
+#### Unattended operation
+
+- The system unit restarts the daemon on any exit (`Restart=always`, 5 s
+  apart, no start limit) and starts at boot. `sudo yadorilink-svc health`
+  exits 0 only when the daemon answers a status request: use it from a
+  monitor or cron (`yadorilink-daemon --healthcheck` is the same probe).
+- Docker: `packaging/docker/compose.yaml` (`restart: unless-stopped`, the
+  image's `HEALTHCHECK`, a named state volume). See `packaging/docker/README.md`.
+- Recovery check on a real box: `sudo kill -9 $(systemctl show -p MainPID
+  --value yadorilink-headless)`, wait about 10 s, `sudo yadorilink-svc health`
+  must exit 0 again.
+
+#### Remote administration of the dashboard (opt-in)
+
+The dashboard is loopback-only by default and the Manage button needs no
+open port. The daemon never terminates TLS or binds beyond loopback. To use
+a browser from another machine without SSH, run a reverse proxy or
+authenticated tunnel on the box (it terminates TLS and forwards to
+`127.0.0.1:18484`) and declare it in `headless.env`:
+
+```
+YADORILINK_HTTP_API_PUBLIC_HOST=nas.example.net
+YADORILINK_HTTP_API_TRUST_REVERSE_PROXY=1
+```
+
+Nothing new is bound; the loopback listener additionally accepts exactly
+that `Host` and the `https://nas.example.net` `Origin` (no wildcards). A
+public name without the proxy declaration, the declaration without a name,
+or a malformed name is refused (logged) and changes nothing. The per-run
+bearer token is still required for `/api/*`; read it over SSH from
+`/var/lib/yadorilink/http-api-token` (it changes at every daemon start). The
+proxy must forward the original `Host` header and speak TLS to browsers.
 
 #### Advanced / Troubleshooting: dashboard over SSH
 

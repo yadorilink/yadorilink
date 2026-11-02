@@ -38,12 +38,20 @@
 #   --yes, -y          do not ask for confirmation
 #   --force            reinstall even if this version is already installed
 #   --uninstall        remove what this script installed
+#   --rollback         switch back to the previous version this script installed, if its
+#                      files are still intact (no network; nothing is downloaded)
 #   --help, -h         show this text
 #
 # Exit status: 0 ok or already current, 1 other failure, 2 usage, 3 network,
 # 4 signature, hash, replay or withdrawal refusal, 5 unsupported platform,
 # 6 downgrade refused, 7 prefix not writable, 19 managed elsewhere (the app or a
-# package manager owns this machine's YadoriLink data; nothing is installed).
+# package manager owns this machine's YadoriLink data; nothing is installed),
+# 20 the data on this machine was written by a newer YadoriLink than this bundle
+# reads, 21 whether the data is usable by this bundle could not be established (20
+# and 21 come from the bundle's own `yadorilink-daemon --check-data-compat`, which
+# reads the data without changing it; nothing is installed), 22 the live manifest is signed
+# with a key this installer does not pin (this installation is too far behind to update
+# itself; run the one-liner again to get an installer with the current keys).
 #
 # Needs: curl, unzip, awk, and sha256sum or shasum. The Ed25519 signature is
 # checked by a small pinned verifier program the script downloads and hash-checks
@@ -65,7 +73,7 @@ set -eu
 #   MIN_MANIFEST_GENERATED_AT  the oldest channel manifest this installer
 #              accepts (a replay floor for a first install; empty = none).
 # >>> PINS >>>
-TRUST_SET="yadorilink-release-2026-10:cdaf6fbf36a6fa5c8c894fc5012a80bb6c6a73407c9285ac8623d572e9894bd8"
+TRUST_SET="yadorilink-release-2026-10:cdaf6fbf36a6fa5c8c894fc5012a80bb6c6a73407c9285ac8623d572e9894bd8 yadorilink-release-spare-2026-10:c678beb39cff5e2cf8c4b9530eb8fee31c808dff7dfcf3b4d908221480dad2ad"
 VERIFIER_SHA_macos_aarch64="6f116f81a2735c49baba41e89b93b5573bce8fc19d2c9c7a8d0278812df4ee56"
 VERIFIER_SHA_linux_x86_64="75d60676afc6797e0f60f93b16ac663218c14f6e3763a17e7fa03168fb0def75"
 VERIFIER_BASE="https://github.com/yadorilink/yadorilink/releases/download/verifier-1"
@@ -80,6 +88,7 @@ CURL_PROTO="=https"
 TEST_MODE=0
 TEST_OS=""
 TEST_ARCH=""
+TEST_LOADER=""
 TEST_VERIFIER_SHA=""
 TEST_FAIL_RECEIPT=0
 TEST_NOW=""
@@ -96,6 +105,7 @@ if [ "${YADORILINK_INSTALL_TEST:-}" = "1" ]; then
     TEST_NOW=${YADORILINK_INSTALL_NOW:-}
     TEST_OS=${YADORILINK_INSTALL_OS:-}
     TEST_ARCH=${YADORILINK_INSTALL_ARCH:-}
+    TEST_LOADER=${YADORILINK_INSTALL_LOADER:-}
     TEST_FAIL_RECEIPT=${YADORILINK_INSTALL_FAIL_RECEIPT:-0}
     CURL_PROTO="=http,https"
     printf 'yadorilink-install: TEST MODE (trust root and endpoints overridden)\n' >&2
@@ -141,6 +151,7 @@ setup() {
             --yes|-y) ASSUME_YES=1; shift ;;
             --force) FORCE=1; shift ;;
             --uninstall) ACTION=uninstall; shift ;;
+            --rollback) ACTION=rollback; shift ;;
             --help|-h) usage; exit 0 ;;
             *) refuse 2 "unknown option: $1 (try --help)" ;;
         esac
@@ -227,6 +238,8 @@ confirm() { # PROMPT; true when ok to continue
 # Nothing else needs to be trusted for the manifest signature check.
 
 WORK=""
+# The installer carried by the verified bundle, kept for `yadorilink self-update` (see write_receipt).
+KEPT_INSTALLER_SHA=""
 VERIFIER=""
 
 # fetch_verifier: get the pinned verifier for $TARGET into $WORK (downloaded, or for
@@ -487,6 +500,12 @@ detect_target() {
         macos-aarch64|linux-x86_64) ;;
         *) refuse 5 "no YadoriLink engine bundle for $TARGET yet (available: macos-aarch64, linux-x86_64, windows-x86_64). Nothing was installed." ;;
     esac
+    # The Linux bundle is built for glibc. Without glibc's dynamic loader (Alpine and other musl
+    # systems, NixOS) it cannot run, so refuse before downloading ~70 MB for nothing.
+    if [ "$TARGET" = linux-x86_64 ] && { [ -z "$TEST_OS" ] || [ -n "$TEST_LOADER" ]; }; then
+        [ -e "${TEST_LOADER:-/lib64/ld-linux-x86-64.so.2}" ] ||
+            refuse 5 "this Linux has no glibc dynamic loader (/lib64/ld-linux-x86-64.so.2), so the engine bundle would not run (Alpine and other musl-based systems are not supported by this installer). For a NAS or server, use the container image ghcr.io/yadorilink/yadorilink instead. Nothing was installed."
+    fi
     if [ "$PLATFORM" = macos ]; then BIN_SUBDIR=bin/; else BIN_SUBDIR=""; fi
 }
 
@@ -535,12 +554,35 @@ write_receipt() {
         printf 'version=%s\n' "$VERSION"
         printf 'dir=%s\n' "$SHARE/$VDIR"
         printf 'previous_dir=%s\n' "$old_dir"
+        printf 'previous_version=%s\n' "$old_version"
         printf 'channel=%s\n' "$CHANNEL"
         printf 'target=%s\n' "$TARGET"
         printf 'engine_api_version=%s\n' "$id_api"
         printf 'install_source=script\n'
         printf 'path_profile=%s\n' "$(receipt_get path_profile || true)"
-    } > "$SHARE/receipt.new.$$" && mv -f "$SHARE/receipt.new.$$" "$RECEIPT"
+        # The installer a self-update runs: the copy that came in the verified bundle, proven by the
+        # same SHA256SUMS chain as everything else, and the hash it was proven to have. A bundle
+        # without one records nothing, and a self-update then only prints the command.
+        if [ -n "$KEPT_INSTALLER_SHA" ]; then
+            printf 'installer=%s\n' "$SHARE/installer/install.sh"
+            printf 'installer_sha256=%s\n' "$KEPT_INSTALLER_SHA"
+        fi
+    } > "$SHARE/receipt.new.$$" || return 1
+    if [ -n "$KEPT_INSTALLER_SHA" ]; then
+        if ! {
+            mkdir -p "$SHARE/installer" &&
+                cp "$SHARE/$VDIR/install.sh" "$SHARE/installer/install.sh.new.$$" &&
+                chmod 755 "$SHARE/installer/install.sh.new.$$" &&
+                [ "$(sha256_of "$SHARE/installer/install.sh.new.$$")" = "$KEPT_INSTALLER_SHA" ] &&
+                mv -f "$SHARE/installer/install.sh.new.$$" "$SHARE/installer/install.sh"
+        }; then
+            rm -f "$SHARE/installer/install.sh.new.$$"
+            return 1
+        fi
+    else
+        rm -f "$SHARE/installer/install.sh"
+    fi
+    mv -f "$SHARE/receipt.new.$$" "$RECEIPT"
 }
 
 # is_ours LINK: true when LINK is a symlink into $SHARE.
@@ -609,14 +651,17 @@ fetch_envelope() {
 }
 
 # verify_envelope ENVFILE BODYFILE: check the key id and the Ed25519 signature against the
-# pinned trust set and write the signed body to BODYFILE, or refuse (4).
+# pinned trust set and write the signed body to BODYFILE, or refuse (4). A key that is not pinned
+# is status $UNPINNED_STATUS: 22 only while the LIVE channel manifest is being checked ("this
+# installer is too far behind the keys now in use"); any other manifest is a plain refusal (4).
+UNPINNED_STATUS=4
 verify_envelope() {
     env_key=$(envelope_field "$1" key_id) || refuse 4 "update manifest is malformed (key_id)"
     KEY_HEX=""
     for pair in $TRUST_SET; do
         [ "${pair%%:*}" = "$env_key" ] && KEY_HEX=${pair#*:}
     done
-    [ -n "$KEY_HEX" ] || refuse 4 "update manifest is signed with key '$env_key', which is not one of the pinned release keys. Refusing. Nothing was installed."
+    [ -n "$KEY_HEX" ] || refuse "$UNPINNED_STATUS" "update manifest is signed with key '$env_key', which is not one of the pinned release keys. Nothing was installed.$( [ "$UNPINNED_STATUS" != 22 ] || printf ' This installer is older than the keys now in use: run the one-line installer again (curl -fsSL https://yadori.link/install.sh | sh) to get one that pins them.')"
     envelope_field "$1" manifest_json > "$2" || refuse 4 "update manifest is malformed (manifest_json)"
     sig_b64=$(envelope_field "$1" signature_base64) || refuse 4 "update manifest is malformed (signature_base64)"
     b64_to_file "$sig_b64" "$WORK/manifest.sig" || refuse 4 "update manifest signature is not valid base64"
@@ -769,7 +814,9 @@ do_install() {
         # The live manifest is checked when it can be reached; otherwise say so loudly.
         fetch_envelope "$live_url" "$WORK/envelope.json" && live_rc=0 || live_rc=$?
         if [ "$live_rc" = 0 ]; then
+            UNPINNED_STATUS=22
             verify_envelope "$WORK/envelope.json" "$WORK/manifest.json"
+            UNPINNED_STATUS=4
             read_manifest "$WORK/manifest.json" lenient
             check_replay_floor
             check_not_expired
@@ -790,7 +837,9 @@ do_install() {
             3) refuse 3 "could not reach $live_url. Check your network connection. Nothing was installed." ;;
             *) refuse 3 "unexpected HTTP status $HTTP_CODE from $live_url. Nothing was installed." ;;
         esac
+        UNPINNED_STATUS=22
         verify_envelope "$WORK/envelope.json" "$WORK/manifest.json"
+        UNPINNED_STATUS=4
         say "Manifest signature verified (key $ENV_KEY)."
         read_manifest "$WORK/manifest.json" lenient
         check_replay_floor
@@ -915,6 +964,25 @@ do_install() {
     "$EXTRACT/${BIN_SUBDIR}yadorilink" --version >/dev/null 2>&1 ||
         die "the new yadorilink does not run on this system (--version failed). Nothing was changed."
 
+    # The installer in the bundle was listed in SHA256SUMS and hashed above with everything else, so
+    # this is the hash the signed chain vouches for.
+    KEPT_INSTALLER_SHA=""
+    if [ -f "$EXTRACT/install.sh" ]; then KEPT_INSTALLER_SHA=$(sha256_of "$EXTRACT/install.sh"); fi
+
+    # The data already on this machine must be readable by what is about to be installed. Only the
+    # bundle's own daemon knows its state versions, and the database is the only record of the
+    # data's version, so it is asked to read it (read-only; nothing is created or changed).
+    # Status 2 is a bundle from before the check existed: its daemon refuses newer data itself.
+    compat_rc=0
+    compat_out=$("$EXTRACT/${BIN_SUBDIR}yadorilink-daemon" --check-data-compat 2>&1 >/dev/null) || compat_rc=$?
+    case $compat_rc in
+        0) [ -z "$compat_out" ] || printf 'yadorilink-install: %s\n' "$compat_out" >&2 ;;
+        2) say "note: this release does not check the existing data before installing" ;;
+        20) refuse 20 "$compat_out Nothing was installed." ;;
+        21) refuse 21 "$compat_out Nothing was installed." ;;
+        *) refuse 21 "the data check of the new daemon failed unexpectedly (status $compat_rc): $compat_out Nothing was installed." ;;
+    esac
+
     # The daemon recognises a script install by this file beside its binaries
     # (crates/yadorilink-daemon/src/update/install_source.rs). It lives in the
     # version tree, so it follows the binaries and is removed with them. Written
@@ -927,6 +995,7 @@ do_install() {
     mkdir -p "$SHARE/versions"
     mv "$EXTRACT" "$SHARE/$VDIR" || die "cannot move the verified bundle into place. Nothing was changed."
     old_dir=$(receipt_get dir || true)
+    old_version=$(receipt_get version || true)
     old_prev=$(receipt_get previous_dir || true)
 
     # Switch the daemon link, then the CLI link; if a later step fails, put
@@ -1003,6 +1072,93 @@ setup_path() {
     say "  export PATH=\"$BIN:\$PATH\""
 }
 
+# do_rollback: switch back to the previous version this script installed. No network and no
+# manifest: that tree was verified when it was installed, and here its files are checked against its
+# own SHA256SUMS again (a changed file refuses). Nothing is deleted; the receipt's current and
+# previous entries trade places, so a second rollback goes forward again.
+do_rollback() {
+    [ -f "$RECEIPT" ] || refuse 1 "nothing to roll back: no install receipt under $SHARE (this is not a script install). Nothing was changed."
+    detect_target
+    check_not_managed_elsewhere
+    cur_dir=$(receipt_get dir || true)
+    prev_dir=$(receipt_get previous_dir || true)
+    cur_version=$(receipt_get version || true)
+    prev_version=$(receipt_get previous_version || true)
+    [ -n "$prev_dir" ] && [ -n "$prev_version" ] ||
+        refuse 1 "there is no previous version to go back to (the receipt records none). Nothing was changed."
+    # Exactly one name under versions/: no separator, no dot components, and neither versions/ nor the
+    # tree is a link, so the tree cannot be elsewhere.
+    case $prev_dir in
+        "$SHARE"/versions/?*) ;;
+        *) refuse 1 "the receipt's previous version is not under $SHARE/versions. Nothing was changed." ;;
+    esac
+    prev_name=${prev_dir#"$SHARE"/versions/}
+    case $prev_name in
+        */*|.|..) refuse 1 "the receipt's previous version is not a plain directory under $SHARE/versions. Nothing was changed." ;;
+    esac
+    { [ -d "$SHARE/versions" ] && [ ! -L "$SHARE/versions" ]; } ||
+        refuse 1 "$SHARE/versions is not a plain directory. Nothing was changed."
+    { [ -d "$prev_dir" ] && [ ! -L "$prev_dir" ]; } ||
+        refuse 1 "the previous version's files ($prev_dir) are gone. Nothing was changed. Run the one-line installer to install a version."
+    [ "$prev_dir" != "$cur_dir" ] || refuse 1 "the previous and the current version are the same tree. Nothing was changed."
+    [ -f "$prev_dir/SHA256SUMS" ] || refuse 4 "the previous version has no SHA256SUMS to check it by. Refusing. Nothing was changed."
+    # Every file the previous tree's SHA256SUMS lists must still match it, and the programs must be there.
+    # The list must be whole: tied to the engine identity the install verified, naming both programs,
+    # and every file it lists must still match. A truncated list cannot vouch for anything.
+    [ -f "$prev_dir/engine-identity.json" ] ||
+        refuse 4 "the previous version has no engine identity to check its file list by. Refusing. Nothing was changed."
+    id_sums=$(id_field "$prev_dir/engine-identity.json" bundle_sha256) ||
+        refuse 4 "the previous version's engine identity is malformed. Refusing. Nothing was changed."
+    [ "$(sha256_of "$prev_dir/SHA256SUMS")" = "$id_sums" ] ||
+        refuse 4 "the previous version's SHA256SUMS no longer matches its engine identity. Refusing. Nothing was changed."
+    bin_sub=""
+    [ -f "$prev_dir/yadorilink" ] || { [ -f "$prev_dir/bin/yadorilink" ] && bin_sub=bin/; }
+    for prog in yadorilink yadorilink-daemon; do
+        grep -q "^[0-9a-f]\{64\}  ${bin_sub}${prog}\$" "$prev_dir/SHA256SUMS" ||
+            refuse 4 "the previous version's file list does not name ${bin_sub}${prog}. Refusing. Nothing was changed."
+    done
+    checked=0
+    while IFS= read -r line; do
+        h=${line%%  *}
+        p=${line#*  }
+        [ "$(sha256_of "$prev_dir/$p" 2>/dev/null)" = "$h" ] ||
+            refuse 4 "the previous version's file $p no longer matches its SHA256SUMS. Refusing. Nothing was changed."
+        checked=$((checked + 1))
+    done < "$prev_dir/SHA256SUMS"
+    [ "$checked" -gt 0 ] || refuse 4 "the previous version's SHA256SUMS lists nothing. Refusing. Nothing was changed."
+    { [ -f "$prev_dir/${bin_sub}yadorilink" ] && [ -f "$prev_dir/${bin_sub}yadorilink-daemon" ]; } ||
+        refuse 4 "the previous version lacks its programs. Refusing. Nothing was changed."
+
+    take_lock
+    daemon_old=""
+    if [ -L "$BIN/yadorilink-daemon" ]; then daemon_old=$(readlink "$BIN/yadorilink-daemon"); fi
+    cli_old=""
+    if [ -L "$BIN/yadorilink" ]; then cli_old=$(readlink "$BIN/yadorilink"); fi
+    set_link "$prev_dir/${bin_sub}yadorilink-daemon" "$BIN/yadorilink-daemon" ||
+        die "could not switch $BIN/yadorilink-daemon. Nothing was changed."
+    if ! set_link "$prev_dir/${bin_sub}yadorilink" "$BIN/yadorilink"; then
+        if [ -n "$daemon_old" ]; then set_link "$daemon_old" "$BIN/yadorilink-daemon" || true; fi
+        die "could not switch $BIN/yadorilink. The current version was restored."
+    fi
+    # The values go in through the environment so a path with awk-special characters stays literal.
+    if ! {
+        YL_V=$prev_version YL_D=$prev_dir YL_PD=$cur_dir YL_PV=$cur_version \
+            awk 'BEGIN { FS = OFS = "=" }
+                 $1 == "version" { print "version=" ENVIRON["YL_V"]; next }
+                 $1 == "dir" { print "dir=" ENVIRON["YL_D"]; next }
+                 $1 == "previous_dir" { print "previous_dir=" ENVIRON["YL_PD"]; next }
+                 $1 == "previous_version" { print "previous_version=" ENVIRON["YL_PV"]; next }
+                 { print }' "$RECEIPT" > "$SHARE/receipt.new.$$" && mv -f "$SHARE/receipt.new.$$" "$RECEIPT"
+    }; then
+        rm -f "$SHARE/receipt.new.$$"
+        if [ -n "$daemon_old" ]; then set_link "$daemon_old" "$BIN/yadorilink-daemon" || true; fi
+        if [ -n "$cli_old" ]; then set_link "$cli_old" "$BIN/yadorilink" || true; fi
+        die "could not write the install receipt. The current version was restored."
+    fi
+    say "Rolled back to YadoriLink $prev_version (from $cur_version)."
+    say "A running daemon keeps running the old program until it is restarted: yadorilink daemon stop, then yadorilink daemon start."
+}
+
 main() {
     setup "$@"
     trap cleanup EXIT
@@ -1012,6 +1168,7 @@ main() {
     case $ACTION in
         install) do_install ;;
         uninstall) do_uninstall ;;
+        rollback) do_rollback ;;
     esac
 }
 

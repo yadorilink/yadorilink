@@ -25,6 +25,7 @@
 //! become (or be mistaken for) the production authority path.
 
 use rusqlite::{Connection, OptionalExtension};
+use yadorilink_sqlite_runtime::CachedStatements as _;
 
 use yadorilink_namespace::v2::{self, PathEditV2};
 use yadorilink_namespace::{empty_digest, MemoryNodeStore, NodeDigest};
@@ -266,7 +267,7 @@ pub fn fetch_delta_body(
     author: &AuthorId,
     seq: AuthorSeq,
 ) -> Result<Option<Vec<u8>>, SyncSqliteError> {
-    conn.query_row(
+    conn.query_row_cached(
         "SELECT encoded_delta FROM native_delta_bodies \
          WHERE group_id = ?1 AND author = ?2 AND incarnation = ?3 AND seq = ?4",
         (
@@ -289,7 +290,7 @@ pub fn fetch_delta_body_by_hash(
     group_id: &FolderGroupId,
     delta_hash: &DeltaHash,
 ) -> Result<Option<Vec<u8>>, SyncSqliteError> {
-    conn.query_row(
+    conn.query_row_cached(
         "SELECT encoded_delta FROM native_delta_bodies WHERE group_id = ?1 AND delta_hash = ?2",
         (group_id.as_str(), delta_hash.0.as_slice()),
         |row| row.get(0),
@@ -322,7 +323,7 @@ pub fn load_state(
 ) -> Result<NativeState, SyncSqliteError> {
     let mut state = NativeState::new();
 
-    let mut context_stmt = conn.prepare(
+    let mut context_stmt = conn.prepare_cached(
         "SELECT author, incarnation, seq FROM native_author_context WHERE group_id = ?1",
     )?;
     let mut rows = context_stmt.query([group_id.as_str()])?;
@@ -338,8 +339,7 @@ pub fn load_state(
     drop(rows);
     drop(context_stmt);
 
-    let mut heads_stmt = conn.prepare(
-        "SELECT path, author, incarnation, seq, version, provenance FROM native_heads WHERE group_id = ?1",
+    let mut heads_stmt = conn.prepare_cached("SELECT path, author, incarnation, seq, version, provenance FROM native_heads WHERE group_id = ?1",
     )?;
     let mut rows = heads_stmt.query([group_id.as_str()])?;
     while let Some(row) = rows.next()? {
@@ -581,7 +581,7 @@ pub fn load_frontier(
     group_id: &FolderGroupId,
 ) -> Result<NativeAuthorFrontier, SyncSqliteError> {
     let mut frontier = NativeAuthorFrontier::new();
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT author, incarnation, seq, tip FROM native_author_frontier WHERE group_id = ?1",
     )?;
     let mut rows = stmt.query([group_id.as_str()])?;
@@ -614,8 +614,7 @@ pub fn frontier_entry_get(
     group_id: &FolderGroupId,
     author: &AuthorId,
 ) -> Result<Option<NativeAuthorFrontierEntry>, SyncSqliteError> {
-    conn.query_row(
-        "SELECT seq, tip FROM native_author_frontier WHERE group_id = ?1 AND author = ?2 AND incarnation = ?3",
+    conn.query_row_cached("SELECT seq, tip FROM native_author_frontier WHERE group_id = ?1 AND author = ?2 AND incarnation = ?3",
         (group_id.as_str(), author.device.as_str(), author.incarnation.0.as_slice()),
         |row| {
             let seq: i64 = row.get(0)?;
@@ -642,8 +641,7 @@ pub fn author_context_seq(
     group_id: &FolderGroupId,
     author: &AuthorId,
 ) -> Result<Option<AuthorSeq>, SyncSqliteError> {
-    conn.query_row(
-        "SELECT seq FROM native_author_context WHERE group_id = ?1 AND author = ?2 AND incarnation = ?3",
+    conn.query_row_cached("SELECT seq FROM native_author_context WHERE group_id = ?1 AND author = ?2 AND incarnation = ?3",
         (group_id.as_str(), author.device.as_str(), author.incarnation.0.as_slice()),
         |row| row.get::<_, i64>(0),
     )
@@ -661,8 +659,7 @@ pub fn frontier_entry_upsert(
     author: &AuthorId,
     entry: &NativeAuthorFrontierEntry,
 ) -> Result<(), SyncSqliteError> {
-    conn.execute(
-        "INSERT INTO native_author_frontier (group_id, author, incarnation, seq, tip) VALUES (?1, ?2, ?3, ?4, ?5) \
+    conn.execute_cached("INSERT INTO native_author_frontier (group_id, author, incarnation, seq, tip) VALUES (?1, ?2, ?3, ?4, ?5) \
          ON CONFLICT (group_id, author, incarnation) DO UPDATE SET seq = excluded.seq, tip = excluded.tip",
         (
             group_id.as_str(),
@@ -684,9 +681,11 @@ pub fn install_frontier(
     group_id: &FolderGroupId,
     frontier: &NativeAuthorFrontier,
 ) -> Result<(), SyncSqliteError> {
-    conn.execute("DELETE FROM native_author_frontier WHERE group_id = ?1", [group_id.as_str()])?;
-    let mut insert = conn.prepare(
-        "INSERT INTO native_author_frontier (group_id, author, incarnation, seq, tip) VALUES (?1, ?2, ?3, ?4, ?5)",
+    conn.execute_cached(
+        "DELETE FROM native_author_frontier WHERE group_id = ?1",
+        [group_id.as_str()],
+    )?;
+    let mut insert = conn.prepare_cached("INSERT INTO native_author_frontier (group_id, author, incarnation, seq, tip) VALUES (?1, ?2, ?3, ?4, ?5)",
     )?;
     for (author, entry) in frontier {
         insert.execute((
@@ -1269,8 +1268,7 @@ fn record_delta_body(
     delta_hash: DeltaHash,
     encoded_delta: &[u8],
 ) -> Result<(), SyncSqliteError> {
-    conn.execute(
-        "INSERT OR IGNORE INTO native_delta_bodies (group_id, author, incarnation, seq, delta_hash, encoded_delta) \
+    conn.execute_cached("INSERT OR IGNORE INTO native_delta_bodies (group_id, author, incarnation, seq, delta_hash, encoded_delta) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         (
             group_id.as_str(),
@@ -1302,8 +1300,7 @@ pub(crate) fn record_delta_log(
     seq: AuthorSeq,
     hash: DeltaHash,
 ) -> Result<(), SyncSqliteError> {
-    conn.execute(
-        "INSERT INTO native_delta_log (group_id, author, incarnation, seq, delta_hash) VALUES (?1, ?2, ?3, ?4, ?5)",
+    conn.execute_cached("INSERT INTO native_delta_log (group_id, author, incarnation, seq, delta_hash) VALUES (?1, ?2, ?3, ?4, ?5)",
         (group_id.as_str(), author.device.as_str(), author.incarnation.0.as_slice(), seq.get() as i64, hash.0.as_slice()),
     )?;
     Ok(())
@@ -1317,8 +1314,7 @@ pub(crate) fn delta_log_hash(
     author: &AuthorId,
     seq: AuthorSeq,
 ) -> Result<Option<DeltaHash>, SyncSqliteError> {
-    conn.query_row(
-        "SELECT delta_hash FROM native_delta_log WHERE group_id = ?1 AND author = ?2 AND incarnation = ?3 AND seq = ?4",
+    conn.query_row_cached("SELECT delta_hash FROM native_delta_log WHERE group_id = ?1 AND author = ?2 AND incarnation = ?3 AND seq = ?4",
         (group_id.as_str(), author.device.as_str(), author.incarnation.0.as_slice(), seq.get() as i64),
         |row| row.get::<_, Vec<u8>>(0),
     )
@@ -1336,8 +1332,7 @@ pub(crate) fn unpublished_delta_log_entries(
     group_id: &FolderGroupId,
     author: &AuthorId,
 ) -> Result<Vec<(AuthorSeq, DeltaHash)>, SyncSqliteError> {
-    let mut stmt = conn.prepare(
-        "SELECT l.seq, l.delta_hash FROM native_delta_log l \
+    let mut stmt = conn.prepare_cached("SELECT l.seq, l.delta_hash FROM native_delta_log l \
          WHERE l.group_id = ?1 AND l.author = ?2 AND l.incarnation = ?3 \
          AND NOT EXISTS (SELECT 1 FROM native_delta_authorization a WHERE a.delta_hash = l.delta_hash) \
          ORDER BY l.seq",
@@ -1365,13 +1360,15 @@ pub fn install_state(
     group_id: &FolderGroupId,
     state: &NativeState,
 ) -> Result<(), SyncSqliteError> {
-    conn.execute("DELETE FROM native_author_context WHERE group_id = ?1", [group_id.as_str()])?;
+    conn.execute_cached(
+        "DELETE FROM native_author_context WHERE group_id = ?1",
+        [group_id.as_str()],
+    )?;
     let deleted =
-        conn.execute("DELETE FROM native_heads WHERE group_id = ?1", [group_id.as_str()])?;
+        conn.execute_cached("DELETE FROM native_heads WHERE group_id = ?1", [group_id.as_str()])?;
     count_head_rows_written(deleted);
 
-    let mut insert_context = conn.prepare(
-        "INSERT INTO native_author_context (group_id, author, incarnation, seq) VALUES (?1, ?2, ?3, ?4)",
+    let mut insert_context = conn.prepare_cached("INSERT INTO native_author_context (group_id, author, incarnation, seq) VALUES (?1, ?2, ?3, ?4)",
     )?;
     for (author, seq) in &state.context {
         insert_context.execute((
@@ -1383,7 +1380,7 @@ pub fn install_state(
     }
     drop(insert_context);
 
-    let mut insert_head = conn.prepare(
+    let mut insert_head = conn.prepare_cached(
         "INSERT INTO native_heads (group_id, path, author, incarnation, seq, version, provenance) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )?;
@@ -1462,7 +1459,7 @@ pub fn install_checkpoint(
     }
 
     let hash = checkpoint.checkpoint_hash();
-    conn.execute(
+    conn.execute_cached(
         "INSERT OR IGNORE INTO native_checkpoints \
          (group_id, checkpoint_hash, namespace_root, author_state_root, \
           signature, installed_at_unixtime) \
@@ -1486,7 +1483,7 @@ pub(crate) fn stored_checkpoint_hashes(
     group_id: &FolderGroupId,
 ) -> Vec<[u8; 32]> {
     let mut stmt = conn
-        .prepare(
+        .prepare_cached(
             "SELECT checkpoint_hash FROM native_checkpoints WHERE group_id = ?1 ORDER BY rowid",
         )
         .unwrap();

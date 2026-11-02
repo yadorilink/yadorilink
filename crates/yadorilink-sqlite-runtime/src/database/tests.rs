@@ -204,10 +204,38 @@ fn split_stats_record_body_and_commit_for_an_armed_write_immediate() {
     let stat = find(on_line).expect("armed write_immediate records its call site");
     assert_eq!(stat.calls, 1);
     assert_eq!(stat.commit_calls, 1);
+    assert_eq!(stat.changed_calls, 1, "an insert changes a row");
     assert!(stat.commit_nanos > 0, "the commit is timed separately from the body");
     assert!(stat.body_nanos > 0);
     let (_, commit_p99) = writer_gate_stats::split_percentile_nanos(0.99);
     assert!(commit_p99 > 0);
+}
+
+/// A write that changes no row is counted as a call but not as a changing one: under
+/// `synchronous = FULL` it writes no log frame, so it costs no fsync.
+#[test]
+fn split_stats_tell_a_write_that_changed_a_row_from_one_that_did_not() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let database = open_test_db(&dir.path().join("split-changed.sqlite3"));
+    database
+        .write::<_, DatabaseError>(|conn| Ok(conn.execute_batch("CREATE TABLE c (id INTEGER)")?))
+        .expect("create");
+    let find = |line: u32| {
+        writer_gate_stats::split_site_stats().into_iter().find(|s| {
+            s.site
+                .rsplit_once("tests.rs:")
+                .and_then(|(_, n)| n.parse::<u32>().ok())
+                .is_some_and(|n| (line..line + 4).contains(&n))
+        })
+    };
+    writer_gate_stats::set_split_enabled(true);
+    let line = line!() + 1;
+    database
+        .write_immediate::<_, DatabaseError>(|tx| Ok(tx.execute("DELETE FROM c WHERE id = 7", [])?))
+        .expect("empty delete");
+    writer_gate_stats::set_split_enabled(false);
+    let stat = find(line).expect("recorded");
+    assert_eq!((stat.calls, stat.changed_calls), (1, 0));
 }
 
 // -- `write_immediate_offloaded` and its job fence ---------------------------
@@ -544,4 +572,25 @@ mod writer_generation {
         );
         assert_eq!(db.recorded_writer_generation().unwrap(), Some(7));
     }
+}
+
+/// A connection returned to the pool inside an open transaction (a failed rollback leaves it so)
+/// is discarded, not reused: reusing it fails every later write with "cannot start a transaction
+/// within a transaction".
+#[test]
+fn a_connection_returned_inside_a_transaction_is_not_reused() {
+    let database = SyncDatabase::open_in_memory(|conn| {
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")?;
+        Ok(())
+    })
+    .expect("open");
+    database
+        .write::<_, DatabaseError>(|conn: &mut Connection| Ok(conn.execute_batch("BEGIN")?))
+        .expect("leave a transaction open");
+    database
+        .write_immediate::<_, DatabaseError>(|tx| {
+            tx.execute("INSERT INTO t (id) VALUES (1)", [])?;
+            Ok(())
+        })
+        .expect("the next write gets a usable connection");
 }

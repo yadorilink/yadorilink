@@ -21,7 +21,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
-use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_storage::SegmentBlockStore;
 
@@ -110,7 +109,11 @@ async fn converged_linked_folder_stays_idle() {
     let db_dir = tempfile::tempdir().unwrap();
     let db_path = db_dir.path().join("sync.db");
     let sync_state = Arc::new(ReplicaCoordinator::open(&db_path).unwrap());
-    let state = DaemonState::new("device-idle".into(), sync_state.clone(), store);
+    let state = yadorilink_daemon::test_support::isolated_daemon_state(
+        "device-idle".into(),
+        sync_state.clone(),
+        store,
+    );
     support::ensure_device_signing_key(&state);
     // A linked group with no verified policy head withholds every write.
     sync_state.set_local_policy_head_provider(Arc::new(|_| Ok([0u8; 32])));

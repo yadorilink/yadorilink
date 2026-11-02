@@ -323,16 +323,21 @@ async fn register_a_client(addr: &str, subject: &str, client_name: &str) -> Regi
         &http,
         addr,
         &client_key,
-        &EnrolmentRequest { redirect_uris: &redirect_uris, client_name: Some(client_name) },
+        &EnrolmentRequest {
+            redirect_uris: &redirect_uris,
+            client_name: Some(client_name),
+            pairing_code: None,
+        },
     )
     .await
     .expect("opening a bootstrap transaction");
-    saw.push(pending.approval_uri.clone());
+    let approval_uri =
+        pending.approval_uri.clone().expect("an ordinary start has an approval link");
+    saw.push(approval_uri.clone());
 
     // 2. The human's browser: the interstitial, the approval, the upstream.
     let browser = browser();
-    let page =
-        browser.get(&pending.approval_uri).send().await.expect("the approval page is reachable");
+    let page = browser.get(&approval_uri).send().await.expect("the approval page is reachable");
     assert_eq!(page.status(), 200, "the approval page should render a form");
     let page_html = page.text().await.expect("the approval page has a body");
     assert!(page_html.contains("<form"), "approval must be a POST, not a link: {page_html}");

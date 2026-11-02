@@ -59,6 +59,12 @@ fn windows_move(from: &Path, to: &Path, replace: Replace) -> io::Result<()> {
     let (from, to) =
         (wide(&crate::long_path::for_win32(from))?, wide(&crate::long_path::for_win32(to))?);
     let flags = windows_move_flags(replace);
+    // What the replaced file's owner set on it travels to the staged file first (see `windows_keep`).
+    let kept = if replace == Replace::Yes {
+        super::windows_keep::Kept::prepare(&from, &to)?
+    } else {
+        None
+    };
     // A replacing move onto a name that another handle has open (a concurrent reader, a virus
     // scanner, the search indexer) is refused with ACCESS_DENIED / SHARING_VIOLATION, even when
     // that handle shares DELETE; the refusal ends with the handle. Retry for a bounded time, then
@@ -75,6 +81,9 @@ fn windows_move(from: &Path, to: &Path, replace: Replace) -> io::Result<()> {
             Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)
         );
         if replace == Replace::No || !busy || attempt == REPLACE_RETRY_LIMIT {
+            if let Some(kept) = &kept {
+                kept.undo();
+            }
             return Err(error);
         }
         std::thread::sleep(delay);

@@ -5,12 +5,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use yadorilink_sqlite_runtime::CachedStatements as _;
 
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::dag_store;
 use crate::error::SyncSqliteError;
 use crate::materialized_generation::MaterializedObjectKind;
+use crate::retention::Retention;
 use yadorilink_fs_platform::fs_identity::FileIdentity;
 use yadorilink_replica_domain::file::FileVersion;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
@@ -77,12 +79,17 @@ impl FileIndexRepository {
         Self { database }
     }
 
+    pub(crate) fn database(&self) -> &Arc<SyncDatabase> {
+        &self.database
+    }
+
     /// Plain, origin-agnostic upsert — delegates to
     /// `upsert_file_with_origin` with an empty (unknown) origin. Kept for
     /// every existing caller (overwhelmingly test fixtures that don't care
     /// who "wrote" a record) so this signature never needed to change; see
     /// `upsert_file_with_origin`'s doc comment for the real semantics and
     /// which two production call sites use it directly instead.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn upsert_file(
         &self,
         group_id: &str,
@@ -99,6 +106,10 @@ impl FileIndexRepository {
     /// remote version; an empty string means "unknown" (`upsert_file`'s
     /// default), recorded as SQL `NULL` rather than the literal empty
     /// string.
+    ///
+    /// For fixtures: the replaced version is this device's own, so nothing is asked of it. Code that
+    /// writes on a sync's behalf uses [`Self::upsert_file_with_origin_retaining`].
+    #[cfg(any(test, feature = "test-support"))]
     pub fn upsert_file_with_origin(
         &self,
         group_id: &str,
@@ -106,8 +117,26 @@ impl FileIndexRepository {
         origin_device_id: &str,
         permit: &RootCommitPermit,
     ) -> Result<(), SyncSqliteError> {
+        self.upsert_file_with_origin_retaining(
+            group_id,
+            record,
+            origin_device_id,
+            Retention::OwnEdit,
+            permit,
+        )
+    }
+
+    /// [`Self::upsert_file_with_origin`] with what the write says about the version it replaces.
+    pub fn upsert_file_with_origin_retaining(
+        &self,
+        group_id: &str,
+        record: &FileRecord,
+        origin_device_id: &str,
+        retention: Retention<'_>,
+        permit: &RootCommitPermit,
+    ) -> Result<(), SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            upsert_file_in_tx(tx, group_id, record, origin_device_id)?;
+            upsert_file_in_tx(tx, group_id, record, origin_device_id, retention)?;
             permit.verify()?;
             Ok(())
         })
@@ -117,6 +146,7 @@ impl FileIndexRepository {
     /// `authoring` is the native head the row shows (see
     /// [`upsert_file_with_authoring_in_tx`]). With none it is the plain
     /// [`Self::upsert_file_with_origin`].
+    #[allow(clippy::too_many_arguments)] // one argument per input of the persisted row
     pub fn upsert_file_with_origin_and_authoring(
         &self,
         group_id: &str,
@@ -124,6 +154,7 @@ impl FileIndexRepository {
         origin_device_id: &str,
         authoring: Option<&yadorilink_replica_domain::native_plan::NativeRowIdentity>,
         meta: Option<&LocalFileMetaColumns>,
+        retention: Retention<'_>,
         permit: &RootCommitPermit,
     ) -> Result<(), SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
@@ -134,6 +165,7 @@ impl FileIndexRepository {
                 origin_device_id,
                 authoring,
                 meta,
+                retention,
             )?;
             permit.verify()?;
             Ok(())
@@ -150,8 +182,17 @@ impl FileIndexRepository {
         origin_device_id: &str,
         authoring: Option<&yadorilink_replica_domain::native_plan::NativeRowIdentity>,
         meta: Option<&LocalFileMetaColumns>,
+        retention: Retention<'_>,
     ) -> Result<(), SyncSqliteError> {
-        upsert_file_with_meta_in_tx(tx, group_id, record, origin_device_id, authoring, meta)?;
+        upsert_file_with_meta_in_tx(
+            tx,
+            group_id,
+            record,
+            origin_device_id,
+            authoring,
+            meta,
+            retention,
+        )?;
         require_row_shows_native_head(tx, group_id, &record.path, authoring)
     }
 
@@ -218,7 +259,7 @@ impl FileIndexRepository {
         }
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
             for (idx, record) in records.iter().enumerate() {
-                upsert_file_in_tx(tx, group_id, record, origin_device_id)?;
+                upsert_file_in_tx(tx, group_id, record, origin_device_id, Retention::OwnEdit)?;
                 // After the row exists: these columns are an `UPDATE`
                 // against the just-written `current` row.
                 if let Some(Some(meta)) = metas.get(idx) {
@@ -338,7 +379,7 @@ impl FileIndexRepository {
         // tombstone inherits from the row it supersedes -- must not
         // survive the write that says the file is gone.
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            upsert_file_in_tx(tx, group_id, &record, device_id)?;
+            upsert_file_in_tx(tx, group_id, &record, device_id, Retention::OwnEdit)?;
             retire_unproven_actual_state_in_tx(tx, group_id, path)?;
             permit.verify()?;
             Ok(())
@@ -461,10 +502,18 @@ impl FileIndexRepository {
     }
 
     /// Deletes every version row for one path -- not a tombstone, an
-    /// erasure of this device's local index entry. Its one production
-    /// caller is the ignore sweep, for a path that has just become
-    /// `.yadorilinkignore`d: sync must stop considering it, but nothing
-    /// about it is deleted for anyone else.
+    /// erasure of this device's local index entry. Every caller says why
+    /// ([`ErasureReason`]): the ignore sweep, for a path that has just become
+    /// `.yadorilinkignore`d (sync must stop considering it, but nothing about
+    /// it is deleted for anyone else), or the retirement of a purely local
+    /// artifact that no admitted change ever touched.
+    ///
+    /// A path with a native authoring head has replicated history, which a
+    /// sync's replacement keeps for a while (a version that a sync replaces
+    /// is kept for up to 10 versions and 30 days): erasing it as a "local
+    /// artifact" is refused, and such a path goes through the supersede path
+    /// instead. The ignore sweep is the user's own act, and a namespace
+    /// displacement keeps today's behaviour; neither is refused.
     ///
     /// The erasure takes the path's admission history with it, and
     /// un-ignoring it later re-indexes it from `version_seq = 1`. So the
@@ -478,18 +527,32 @@ impl FileIndexRepository {
         &self,
         group_id: &str,
         path: &str,
+        reason: ErasureReason,
         permit: &RootCommitPermit,
     ) -> Result<bool, SyncSqliteError> {
         permit.verify()?;
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
             // A row of a frozen group stays until the rebootstrap has finished.
             crate::native_rebootstrap::refuse_materialization_if_frozen(tx, group_id)?;
-            let newest_admission: Option<i64> = tx.query_row(
+            if reason == ErasureReason::LocalOnlyArtifact {
+                let has_native_history: bool = tx.query_row_cached(
+                    "SELECT EXISTS(SELECT 1 FROM files WHERE group_id = ?1 AND path = ?2 \
+                     AND native_authoring_identity IS NOT NULL)",
+                    rusqlite::params![group_id, path],
+                    |row| row.get(0),
+                )?;
+                if has_native_history {
+                    return Err(SyncSqliteError::InvalidInput(format!(
+                        "{path:?} has replicated history; it is not a local-only artifact"
+                    )));
+                }
+            }
+            let newest_admission: Option<i64> = tx.query_row_cached(
                 "SELECT MAX(admitted_at_unix_nanos) FROM files WHERE group_id = ?1 AND path = ?2",
                 rusqlite::params![group_id, path],
                 |row| row.get(0),
             )?;
-            let removed = tx.execute(
+            let removed = tx.execute_cached(
                 "DELETE FROM files WHERE group_id = ?1 AND path = ?2",
                 rusqlite::params![group_id, path],
             )? > 0;
@@ -519,7 +582,7 @@ impl FileIndexRepository {
         // real `PeerSyncSession::run()` loop writes) must retry a read here too.
         self.database.read::<_, SyncSqliteError>(|conn| {
             let row: Option<(u64, i64, String, i64)> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT size, mtime_unix_nanos, blocks_json, deleted
                      FROM files WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
                     rusqlite::params![group_id, path],
@@ -549,7 +612,7 @@ impl FileIndexRepository {
         // See `get_file`'s comment: retried for the same read-vs-writer
         // `DatabaseLocked` reason.
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT path, size, mtime_unix_nanos, blocks_json, deleted FROM \
                  files WHERE group_id = ?1 AND state = 'current'",
             )?;
@@ -584,7 +647,7 @@ impl FileIndexRepository {
         group_id: &str,
     ) -> Result<Vec<CurrentEntry>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT path, blocks_json, record_kind, symlink_target FROM files \
                  WHERE group_id = ?1 AND state = 'current' AND deleted = 0 ORDER BY path",
             )?;
@@ -665,7 +728,7 @@ impl FileIndexRepository {
         group_id: &str,
     ) -> Result<Vec<(FileRecord, RecordKind)>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT path, size, mtime_unix_nanos, blocks_json, deleted, record_kind \
                  FROM files WHERE group_id = ?1 AND state = 'current'",
             )?;
@@ -965,6 +1028,93 @@ impl FileIndexRepository {
         })
     }
 
+    /// What the kept history holds that nothing current needs, from the file index: the unique
+    /// stored size of blocks named only by non-current rows (superseded or trashed, with bytes),
+    /// and how many such versions there are (a version counts when at least one of its blocks is
+    /// named by no current row). Across all groups, as the block store is shared.
+    ///
+    /// Only blocks this device holds (`is_held`) count: a version kept without its bytes (this
+    /// device never had them, so only its row is history) takes no space and frees none.
+    pub fn kept_history_usage(
+        &self,
+        is_held: &dyn Fn(&[u8]) -> bool,
+    ) -> Result<(u64, u64), SyncSqliteError> {
+        const CURRENT_BLOCKS: &str = "SELECT json_extract(c.value, '$.hash') \
+             FROM files cur, json_each(cur.blocks_json) c \
+             WHERE cur.state = 'current' AND cur.deleted = 0";
+        let rows: Vec<(String, String, i64, i64)> =
+            self.database.read::<_, SyncSqliteError>(|conn| {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT f.group_id || '/' || f.path || '#' || f.version_seq, \
+                            json_extract(j.value, '$.hash'), json_extract(j.value, '$.size'), 0 \
+                     FROM files f, json_each(f.blocks_json) j \
+                     WHERE f.state IN ('superseded', 'trashed') AND f.deleted = 0 \
+                       AND json_extract(j.value, '$.hash') NOT IN ({CURRENT_BLOCKS})"
+                ))?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })?;
+        let mut held_hashes: HashSet<String> = HashSet::new();
+        let mut versions: HashSet<String> = HashSet::new();
+        let mut bytes: u64 = 0;
+        let mut checked: HashMap<String, bool> = HashMap::new();
+        for (version, hash_json, size, _) in rows {
+            let held = *checked.entry(hash_json.clone()).or_insert_with(|| {
+                serde_json::from_str::<Vec<u8>>(&hash_json).is_ok_and(|hash| is_held(&hash))
+            });
+            if !held {
+                continue;
+            }
+            versions.insert(version);
+            if held_hashes.insert(hash_json) {
+                bytes += size.max(0) as u64;
+            }
+        }
+        Ok((bytes, versions.len() as u64))
+    }
+
+    /// Whether a retained older version of `path` (superseded or trashed, with bytes) names any of
+    /// `blocks`.
+    pub fn history_names_any_block(
+        &self,
+        group_id: &str,
+        path: &str,
+        blocks: &[yadorilink_replica_domain::file::VersionBlock],
+    ) -> Result<bool, SyncSqliteError> {
+        let wanted: HashSet<Vec<u8>> = blocks.iter().map(|b| b.hash.0.clone()).collect();
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT blocks_json FROM files WHERE group_id = ?1 AND path = ?2 \
+                 AND state IN ('superseded', 'trashed') AND deleted = 0",
+            )?;
+            let rows =
+                stmt.query_map(rusqlite::params![group_id, path], |r| r.get::<_, String>(0))?;
+            for row in rows {
+                let blocks: Vec<BlockInfo> = serde_json::from_str(&row?)?;
+                if blocks.iter().any(|block| wanted.contains(&block.hash)) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+    }
+
+    /// The recorded event that dropped version number `version_seq` of `path`, when
+    /// [`Self::get_version`] finds nothing: it says why the version is gone. No event covering the
+    /// number means the version never existed here.
+    pub fn version_not_kept(
+        &self,
+        group_id: &str,
+        path: &str,
+        version_seq: i64,
+    ) -> Result<Option<crate::history_freed::FreedSpan>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::history_freed::span_covering_seq(conn, group_id, path, version_seq)
+        })
+    }
+
     /// A single retained version by its exact `version_seq` — the restore
     /// engine's lookup for `yadorilink restore <path> --version
     /// <id>`. `None` if no row exists at all for this exact
@@ -987,11 +1137,10 @@ impl FileIndexRepository {
                 String,
                 Option<Vec<u8>>,
                 i64,
-                String,
             )> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT size, mtime_unix_nanos, blocks_json, deleted, state, \
-                            origin_device_id, record_kind, symlink_target, unix_mode, xattrs_json \
+                            origin_device_id, record_kind, symlink_target, exec \
                      FROM files WHERE group_id = ?1 AND path = ?2 AND version_seq = ?3",
                     rusqlite::params![group_id, path, version_seq],
                     |r| {
@@ -1005,7 +1154,6 @@ impl FileIndexRepository {
                             r.get(6)?,
                             r.get(7)?,
                             r.get(8)?,
-                            r.get(9)?,
                         ))
                     },
                 )
@@ -1020,8 +1168,7 @@ impl FileIndexRepository {
                     origin_device_id,
                     record_kind,
                     symlink_target,
-                    unix_mode,
-                    xattrs_json,
+                    exec,
                 )| {
                     version_record(
                         path.to_string(),
@@ -1034,8 +1181,7 @@ impl FileIndexRepository {
                         origin_device_id,
                         &record_kind,
                         symlink_target,
-                        unix_mode,
-                        &xattrs_json,
+                        exec,
                     )
                 },
             )
@@ -1056,7 +1202,7 @@ impl FileIndexRepository {
     /// is the place for full history).
     pub fn list_trashed(&self, group_id: &str) -> Result<Vec<TrashedFile>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT t.path, t.version_seq, t.size, t.mtime_unix_nanos, t.origin_device_id, \
                         c.mtime_unix_nanos, t.trashed_by_operation_author, \
                         t.trashed_by_operation_id, t.record_kind
@@ -1092,7 +1238,7 @@ impl FileIndexRepository {
         operation: &RecursiveOperationRef,
     ) -> Result<Vec<TrashedFile>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT t.path, t.version_seq, t.size, t.mtime_unix_nanos, t.origin_device_id, \
                         c.mtime_unix_nanos, t.trashed_by_operation_author, \
                         t.trashed_by_operation_id, t.record_kind
@@ -1145,7 +1291,7 @@ impl FileIndexRepository {
         group_id: &str,
     ) -> Result<Vec<ConflictCopyFile>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT path, size, mtime_unix_nanos, record_kind FROM files \
                  WHERE group_id = ?1 AND state = 'current' AND deleted = 0 \
                  AND path LIKE '%(conflicted copy, %'",
@@ -1237,7 +1383,7 @@ impl FileIndexRepository {
         path: &str,
     ) -> Result<bool, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            conn.query_row(
+            conn.query_row_cached(
                 "SELECT 1 FROM files WHERE group_id = ?1 AND path = ?2 AND state = 'current' \
                  AND version_seq > 0 LIMIT 1",
                 rusqlite::params![group_id, path],
@@ -1296,8 +1442,7 @@ impl FileIndexRepository {
         // rewind purposes rather than merely imprecise.
         let (case_key, canonical_key) = name_fold_keys(path);
         self.database.write::<_, SyncSqliteError>(|conn| {
-            conn.execute(
-                "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, deleted, version_seq, state, origin_device_id, admitted_at_unix_nanos, case_fold_key, canonical_fold_key)
+            conn.execute_cached("INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, deleted, version_seq, state, origin_device_id, admitted_at_unix_nanos, case_fold_key, canonical_fold_key)
                  SELECT ?1, ?2, 0, 0, '[]', 0, 0, 'current', NULL, ?3, ?4, ?5
                   WHERE NOT EXISTS (SELECT 1 FROM files WHERE group_id = ?1 AND path = ?2 AND state = 'current')",
                 rusqlite::params![group_id, path, now_unix_nanos_checked(), case_key, canonical_key],
@@ -1319,7 +1464,7 @@ impl FileIndexRepository {
         permit.verify()?;
         self.database.write::<_, SyncSqliteError>(|conn| {
             crate::native_rebootstrap::refuse_materialization_if_frozen(conn, group_id)?;
-            Ok(conn.execute(
+            Ok(conn.execute_cached(
                 "DELETE FROM files WHERE group_id = ?1 AND path = ?2 \
                  AND state = 'current' AND version_seq = 0",
                 rusqlite::params![group_id, path],
@@ -1338,7 +1483,7 @@ impl FileIndexRepository {
     ) -> Result<Option<RecordKind>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             let kind: Option<String> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT record_kind FROM files WHERE group_id = ?1 AND path = ?2 AND \
                      state = 'current'",
                     rusqlite::params![group_id, path],
@@ -1346,6 +1491,100 @@ impl FileIndexRepository {
                 )
                 .optional()?;
             Ok(kind.as_deref().map(RecordKind::from_db_str))
+        })
+    }
+
+    /// Fails closed when a live current row of `group_id` stores a block list that is not valid
+    /// JSON, naming one such path: one statement inside SQLite, no decoding. For a caller that
+    /// decides something from the answer; a status is served by the audit, which also judges
+    /// whether a list decodes and adds up, and marks only the folder it finds (so a gate is not
+    /// stopped by a record the audit merely reports).
+    pub fn verify_live_block_lists(&self, group_id: &str) -> Result<(), SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            let corrupt: Option<String> = conn
+                .query_row_cached(
+                    "SELECT path FROM files WHERE group_id = ?1 AND state = 'current' \
+                     AND deleted = 0 AND NOT json_valid(blocks_json) LIMIT 1",
+                    rusqlite::params![group_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match corrupt {
+                Some(path) => {
+                    tracing::warn!(path = %path, "stored block list is corrupt; failing closed");
+                    Err(SyncSqliteError::CorruptState(format!(
+                        "stored block list for {path} is corrupt"
+                    )))
+                }
+                None => Ok(()),
+            }
+        })
+    }
+
+    /// One bounded step of the audit that re-reads stored block lists: up to `limit` live current
+    /// rows after `after_rowid`, in rowid order, each checked as a write checks it. Reads only.
+    /// `next_rowid` is where the next step resumes, `None` once the table's end was reached.
+    pub fn audit_live_block_lists(
+        &self,
+        after_rowid: i64,
+        limit: usize,
+    ) -> Result<BlockListAudit, SyncSqliteError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT rowid, group_id, path, size, blocks_json FROM files \
+                 WHERE rowid > ?1 AND state = 'current' AND deleted = 0 ORDER BY rowid LIMIT ?2",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![after_rowid, limit])?;
+            let (mut damaged, mut last, mut seen) = (Vec::new(), after_rowid, 0_i64);
+            while let Some(row) = rows.next()? {
+                // Read without trusting the columns' types: a value the database cannot hand back
+                // as the type it should be is itself the damage, and must not stop the walk.
+                let rowid: i64 = row.get(0)?;
+                if stored_block_list_is_damaged(row.get_ref(3)?, row.get_ref(4)?) {
+                    let (group_id, path) =
+                        (lossy_text(row.get_ref(1)?), lossy_text(row.get_ref(2)?));
+                    tracing::warn!(%path, "a stored block list cannot be read back");
+                    damaged.push(DamagedRow { rowid, group_id, path });
+                }
+                last = rowid;
+                seen += 1;
+            }
+            Ok(BlockListAudit { damaged, next_rowid: (seen == limit).then_some(last) })
+        })
+    }
+
+    /// Whether `damaged` is still a live current row whose block list cannot be read back; false
+    /// when it is no longer one (a write replaces a row by inserting a new one). The row is found
+    /// by its rowid, not by a name a damaged value might not give back faithfully; a rowid that now
+    /// holds a row of another group or path (SQLite reuses the rowid of a deleted row) is not the
+    /// row, and the audit records that one under its own name.
+    pub fn live_block_list_damaged(&self, damaged: &DamagedRow) -> Result<bool, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT group_id, path, size, blocks_json FROM files WHERE rowid = ?1 \
+                 AND state = 'current' AND deleted = 0",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![damaged.rowid])?;
+            match rows.next()? {
+                Some(row) => Ok(lossy_text(row.get_ref(0)?) == damaged.group_id
+                    && lossy_text(row.get_ref(1)?) == damaged.path
+                    && stored_block_list_is_damaged(row.get_ref(2)?, row.get_ref(3)?)),
+                None => Ok(false),
+            }
+        })
+    }
+
+    /// How many live current rows of `group_id` are symlinks, from one statement.
+    pub fn count_live_symlinks(&self, group_id: &str) -> Result<u64, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            let count: i64 = conn.query_row_cached(
+                "SELECT COUNT(*) FROM files WHERE group_id = ?1 AND state = 'current' \
+                 AND deleted = 0 AND record_kind = 'symlink'",
+                rusqlite::params![group_id],
+                |r| r.get(0),
+            )?;
+            Ok(count.max(0) as u64)
         })
     }
 
@@ -1361,12 +1600,17 @@ impl FileIndexRepository {
     ) -> Result<(), SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
             permit.verify()?;
-            let affected = conn.execute(
-                "UPDATE files SET record_kind = ?1 WHERE group_id = ?2 AND path = ?3 AND state = 'current'",
+            let affected = conn.execute_cached("UPDATE files SET record_kind = ?1 WHERE group_id = ?2 AND path = ?3 AND state = 'current'",
                 rusqlite::params![kind.as_db_str(), group_id, path],
             )?;
             if affected == 0 {
                 return Err(SyncSqliteError::NotFound(format!("file {group_id}/{path}")));
+            }
+            if kind == RecordKind::Directory {
+                conn.execute_cached("DELETE FROM activity_events WHERE group_id = ?1 AND path = ?2 AND version_seq = \
+                     (SELECT version_seq FROM files WHERE group_id = ?1 AND path = ?2 AND state = 'current')",
+                    rusqlite::params![group_id, path],
+                )?;
             }
             Ok(())
         })
@@ -1382,7 +1626,7 @@ impl FileIndexRepository {
     ) -> Result<Option<Vec<u8>>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             let target: Option<Option<Vec<u8>>> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT symlink_target FROM files WHERE group_id = ?1 AND path = ?2 AND \
                      state = 'current'",
                     rusqlite::params![group_id, path],
@@ -1402,8 +1646,7 @@ impl FileIndexRepository {
         target: Option<&[u8]>,
     ) -> Result<(), SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
-            let affected = conn.execute(
-                "UPDATE files SET symlink_target = ?1 WHERE group_id = ?2 AND path = ?3 AND state = 'current'",
+            let affected = conn.execute_cached("UPDATE files SET symlink_target = ?1 WHERE group_id = ?2 AND path = ?3 AND state = 'current'",
                 rusqlite::params![target, group_id, path],
             )?;
             if affected == 0 {
@@ -1430,7 +1673,7 @@ impl FileIndexRepository {
     ) -> Result<bool, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             let flag: Option<i64> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT symlink_out_of_root FROM files WHERE group_id = ?1 AND path = ?2 \
                      AND state = 'current'",
                     rusqlite::params![group_id, path],
@@ -1441,92 +1684,35 @@ impl FileIndexRepository {
         })
     }
 
-    /// The replicated extended attributes currently recorded for `path`
-    /// sorted by name -- empty for any row with none recorded,
-    /// including every pre-existing row from before this column existed.
-    pub fn get_xattrs(
-        &self,
-        group_id: &str,
-        path: &str,
-    ) -> Result<Vec<(String, Vec<u8>)>, SyncSqliteError> {
+    /// Whether the row for `path` is executable. `false` for a path with no row and for every row of a
+    /// directory or a symlink.
+    pub fn get_exec(&self, group_id: &str, path: &str) -> Result<bool, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let xattrs_json: Option<String> = conn
-                .query_row(
-                    "SELECT xattrs_json FROM files WHERE group_id = ?1 AND path = ?2 AND \
+            let exec: Option<i64> = conn
+                .query_row_cached(
+                    "SELECT exec FROM files WHERE group_id = ?1 AND path = ?2 AND \
                      state = 'current'",
                     rusqlite::params![group_id, path],
                     |r| r.get(0),
                 )
                 .optional()?;
-            match xattrs_json {
-                Some(json) => decode_xattrs_column(&json),
-                None => Ok(Vec::new()),
-            }
+            Ok(exec.unwrap_or(0) != 0)
         })
     }
 
     // Retry-wrapped, same reason as
     // `ensure_bootstrap_row_for_metadata`.
-    pub fn set_xattrs(
+    pub fn set_exec(
         &self,
         group_id: &str,
         path: &str,
-        xattrs: &[(String, Vec<u8>)],
+        exec: bool,
         permit: &RootCommitPermit,
     ) -> Result<(), SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
             permit.verify()?;
-            let stored = encode_xattrs_column(xattrs);
-            let affected = conn.execute(
-                "UPDATE files SET xattrs_json = ?1 WHERE group_id = ?2 AND path = ?3 AND state = 'current'",
-                rusqlite::params![stored, group_id, path],
-            )?;
-            if affected == 0 {
-                return Err(SyncSqliteError::NotFound(format!("file {group_id}/{path}")));
-            }
-            Ok(())
-        })
-    }
-
-    /// The replicated Unix permission bits, or `None` for any row with no
-    /// info recorded — including every pre-existing one from before this
-    /// column existed (stored as `-1`, see `SCHEMA_VERSION` v23's own doc
-    /// comment) and any row genuinely authored with no Unix mode (a
-    /// Windows peer). Never a stand-in for "unknown collapses to zero
-    /// permissions" — `Some(0)` is a real, distinct value (mode `0o000`).
-    pub fn get_unix_mode(
-        &self,
-        group_id: &str,
-        path: &str,
-    ) -> Result<Option<u32>, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| {
-            let unix_mode: Option<i64> = conn
-                .query_row(
-                    "SELECT unix_mode FROM files WHERE group_id = ?1 AND path = ?2 AND \
-                     state = 'current'",
-                    rusqlite::params![group_id, path],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            Ok(decode_unix_mode_column(unix_mode.unwrap_or(-1)))
-        })
-    }
-
-    // Retry-wrapped, same reason as
-    // `ensure_bootstrap_row_for_metadata`.
-    pub fn set_unix_mode(
-        &self,
-        group_id: &str,
-        path: &str,
-        unix_mode: Option<u32>,
-        permit: &RootCommitPermit,
-    ) -> Result<(), SyncSqliteError> {
-        self.database.write::<_, SyncSqliteError>(|conn| {
-            permit.verify()?;
-            let stored: i64 = encode_unix_mode_column(unix_mode);
-            let affected = conn.execute(
-                "UPDATE files SET unix_mode = ?1 WHERE group_id = ?2 AND path = ?3 AND state = 'current'",
-                rusqlite::params![stored, group_id, path],
+            let affected = conn.execute_cached("UPDATE files SET exec = ?1 WHERE group_id = ?2 AND path = ?3 AND state = 'current'",
+                rusqlite::params![i64::from(exec), group_id, path],
             )?;
             if affected == 0 {
                 return Err(SyncSqliteError::NotFound(format!("file {group_id}/{path}")));
@@ -1545,6 +1731,7 @@ impl FileIndexRepository {
     /// metadata`), each its own `writer_gate` acquisition, even though
     /// nothing about this case needs two commits. `authoring` is the native
     /// head the row shows, if any.
+    #[allow(clippy::too_many_arguments)] // one argument per input of the persisted row
     pub fn apply_projected_row_with_authoring_atomic(
         &self,
         group_id: &str,
@@ -1552,10 +1739,18 @@ impl FileIndexRepository {
         origin_device_id: &str,
         authoring: Option<&yadorilink_replica_domain::native_plan::NativeRowIdentity>,
         meta: &LocalFileMetaColumns,
+        retention: Retention<'_>,
         permit: &RootCommitPermit,
     ) -> Result<(), SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            upsert_file_with_authoring_in_tx(tx, group_id, record, origin_device_id, authoring)?;
+            upsert_file_with_authoring_in_tx(
+                tx,
+                group_id,
+                record,
+                origin_device_id,
+                authoring,
+                retention,
+            )?;
             apply_local_meta_columns_in_tx(tx, group_id, &record.path, meta)?;
             require_row_shows_native_head(tx, group_id, &record.path, authoring)?;
             permit.verify()?;
@@ -1593,7 +1788,7 @@ impl FileIndexRepository {
     ) -> Result<Option<String>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             let origin: Option<String> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT origin_device_id FROM files WHERE group_id = ?1 AND path = ?2 AND \
                      state = 'current'",
                     rusqlite::params![group_id, path],
@@ -1614,7 +1809,7 @@ impl FileIndexRepository {
         prefix: &str,
     ) -> Result<Vec<String>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT path FROM files WHERE group_id = ?1 AND state = 'current' AND \
                  deleted = 0 AND record_kind = 'file' AND \
                  (?2 = '' OR substr(path, 1, length(?2) + 1) = ?2 || '/') ORDER BY path",
@@ -1719,13 +1914,19 @@ impl FileIndexRepository {
     /// moved generation and recomputes. Reading it afterwards would stamp a
     /// possibly-torn summary as current, which is the one ordering that can
     /// cache a digest the table does not support.
+    ///
+    /// `block_in_store` answers whether this device's block store holds a block (raw hash): a
+    /// materialized row counts as backed by the store only where the group's provenance names every
+    /// block AND the store still has it (provenance outlives a block that was swept or lost). A
+    /// caller that does not use `file_only_current_count` passes `&|_| true`.
     pub fn group_root_set_summary(
         &self,
         group_id: &str,
+        block_in_store: &dyn Fn(&[u8]) -> bool,
     ) -> Result<RootSetSummary, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             let generation = root_set_generation_on_conn(conn, group_id)?;
-            group_root_set_summary_on_conn(conn, group_id, generation)
+            group_root_set_summary_on_conn(conn, group_id, generation, block_in_store)
         })
     }
 
@@ -1809,7 +2010,7 @@ pub(crate) fn expire_superseded_and_trashed_versions_in_tx(
         // version's own admission is used. A NULL own stamp (admission
         // time unknown) is bounded by the count axis alone, so such rows
         // cannot pile up.
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "SELECT path, version_seq FROM (
             SELECT path, version_seq, admitted_at_unix_nanos, next_admitted,
                    ROW_NUMBER() OVER (PARTITION BY path ORDER BY version_seq DESC) AS rnk
@@ -1840,12 +2041,40 @@ pub(crate) fn expire_superseded_and_trashed_versions_in_tx(
             .filter(|key| !pinned.contains(key))
             .collect()
     };
+    // What is dropped is recorded first, in this transaction, so a version the index no longer
+    // holds is never without its record (see `history_freed`).
+    let mut dropped_by_path: HashMap<&str, HashSet<i64>> = HashMap::new();
     for (path, version_seq) in &candidates {
-        tx.execute(
+        dropped_by_path.entry(path.as_str()).or_default().insert(*version_seq);
+    }
+    for (path, dropped) in &dropped_by_path {
+        let rows: Vec<crate::history_freed::Member> = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT version_seq, admitted_at_unix_nanos FROM files \
+                 WHERE group_id = ?1 AND path = ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![group_id, path], |r| {
+                Ok(crate::history_freed::Member { seq: r.get(0)?, admitted: r.get(1)? })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        crate::history_freed::record(
+            tx,
+            group_id,
+            path,
+            &rows,
+            dropped,
+            crate::history_freed::FreedReason::Expired,
+            now_unix_nanos,
+        )?;
+    }
+    for (path, version_seq) in &candidates {
+        tx.execute_cached(
             "DELETE FROM files WHERE group_id = ?1 AND path = ?2 AND version_seq = ?3",
             rusqlite::params![group_id, path, version_seq],
         )?;
     }
+    crate::history_freed::prune(tx, group_id, now_unix_nanos)?;
     Ok(candidates.len())
 }
 
@@ -1947,7 +2176,14 @@ fn apply_local_mutation_stored_in_tx(
     match mutation {
         PreparedLocalMutation::Upsert { record, version, meta, .. } => {
             // The row shows the native head the edit put.
-            upsert_file_with_authoring_in_tx(tx, group_id, record, origin_device_id, native)?;
+            upsert_file_with_authoring_in_tx(
+                tx,
+                group_id,
+                record,
+                origin_device_id,
+                native,
+                Retention::OwnEdit,
+            )?;
             if let Some(meta) = meta {
                 apply_local_meta_columns_in_tx(tx, group_id, &record.path, meta)?;
             }
@@ -1982,7 +2218,7 @@ fn apply_local_mutation_stored_in_tx(
             }
         }
         PreparedLocalMutation::Delete { record, .. } => {
-            upsert_file_in_tx(tx, group_id, record, origin_device_id)?;
+            upsert_file_in_tx(tx, group_id, record, origin_device_id, Retention::OwnEdit)?;
             if matches!(evidence, Some(LocalCaptureActualStateEvidence::Absent)) {
                 adopt_local_capture_absent_state(tx, group_id, &record.path)?;
                 // The resolved close, not the absence one: a delete leaves
@@ -2526,7 +2762,7 @@ fn stamp_trashed_row_operation(
     let Some(operation) = operation else {
         return Ok(());
     };
-    tx.execute(
+    tx.execute_cached(
         "UPDATE files SET trashed_by_operation_author = ?1, trashed_by_operation_id = ?2 \
          WHERE group_id = ?3 AND path = ?4 AND version_seq = ?5 AND state = 'trashed'",
         rusqlite::params![
@@ -2611,8 +2847,9 @@ pub fn upsert_file_in_tx(
     group_id: &str,
     record: &FileRecord,
     origin_device_id: &str,
+    retention: Retention<'_>,
 ) -> Result<(), SyncSqliteError> {
-    upsert_file_with_authoring_in_tx(tx, group_id, record, origin_device_id, None)
+    upsert_file_with_authoring_in_tx(tx, group_id, record, origin_device_id, None, retention)
 }
 
 /// Records the evidence behind a row's native identity: the identity is good
@@ -2723,8 +2960,77 @@ pub fn upsert_file_with_authoring_in_tx(
     record: &FileRecord,
     origin_device_id: &str,
     authoring: Option<&yadorilink_replica_domain::native_plan::NativeRowIdentity>,
+    retention: Retention<'_>,
 ) -> Result<(), SyncSqliteError> {
-    upsert_file_with_meta_in_tx(tx, group_id, record, origin_device_id, authoring, None)
+    upsert_file_with_meta_in_tx(tx, group_id, record, origin_device_id, authoring, None, retention)
+}
+
+/// A live current row whose block list cannot be read back. `group_id` and `path` are for display
+/// and for matching a folder; the row is identified by `rowid`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DamagedRow {
+    pub rowid: i64,
+    pub group_id: String,
+    pub path: String,
+}
+
+/// What one step of [`FileIndexRepository::audit_live_block_lists`] found.
+#[derive(Debug, Default)]
+pub struct BlockListAudit {
+    /// Every live current row whose block list cannot be read back.
+    pub damaged: Vec<DamagedRow>,
+    pub next_rowid: Option<i64>,
+}
+
+/// A stored block list that is not valid JSON, does not decode to blocks, or fails the check a
+/// write applies.
+fn block_list_is_damaged(size: i64, blocks_json: &str) -> bool {
+    match serde_json::from_str::<Vec<yadorilink_replica_domain::file::BlockInfo>>(blocks_json) {
+        Ok(blocks) => u64::try_from(size).map_or(true, |size| {
+            yadorilink_replica_domain::file::check_block_list(size, &blocks).is_err()
+        }),
+        Err(_) => true,
+    }
+}
+
+/// A stored `size` and `blocks_json`, judged without trusting the columns' types: anything but an
+/// integer size and a UTF-8 text block list that [`block_list_is_damaged`] accepts is damaged.
+fn stored_block_list_is_damaged(
+    size: rusqlite::types::ValueRef<'_>,
+    blocks_json: rusqlite::types::ValueRef<'_>,
+) -> bool {
+    match (size, blocks_json) {
+        (rusqlite::types::ValueRef::Integer(size), rusqlite::types::ValueRef::Text(bytes)) => {
+            std::str::from_utf8(bytes).map_or(true, |json| block_list_is_damaged(size, json))
+        }
+        _ => true,
+    }
+}
+
+fn lossy_text(value: rusqlite::types::ValueRef<'_>) -> String {
+    match value {
+        rusqlite::types::ValueRef::Text(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        _ => String::new(),
+    }
+}
+
+/// Refuses, before anything is written, a record whose block list could not be read back (see
+/// [`yadorilink_replica_domain::file::check_block_list`]). Every `files.blocks_json` write goes
+/// through here, so a row that fails never reaches the ledger.
+///
+/// Only the row about to be written is judged. A tombstone is let through: it records a deletion,
+/// and refusing it would keep a damaged row from being removed. Overwriting a damaged row with a
+/// correct record passes the check as any correct record does.
+pub(crate) fn refuse_unreadable_block_list(record: &FileRecord) -> Result<(), SyncSqliteError> {
+    if record.deleted {
+        return Ok(());
+    }
+    yadorilink_replica_domain::file::check_block_list(record.size, &record.blocks).map_err(|e| {
+        SyncSqliteError::InvalidInput(format!(
+            "refusing to store the block list of {}: {e}",
+            record.path
+        ))
+    })
 }
 
 /// [`upsert_file_with_authoring_in_tx`] for a version whose metadata columns
@@ -2741,7 +3047,18 @@ pub fn upsert_file_with_meta_in_tx(
     origin_device_id: &str,
     authoring: Option<&yadorilink_replica_domain::native_plan::NativeRowIdentity>,
     meta: Option<&LocalFileMetaColumns>,
+    retention: Retention<'_>,
 ) -> Result<(), SyncSqliteError> {
+    refuse_unreadable_block_list(record)?;
+    // Before the row stops being current: a sync may not replace a version that has bytes to keep
+    // without the proof that they are kept.
+    let supersede = crate::retention::check_before_supersede(
+        tx,
+        group_id,
+        &record.path,
+        &record.blocks,
+        retention,
+    )?;
     let native_blob: Option<Vec<u8>> = authoring.map(|identity| identity.to_bytes());
     if let Some(identity) = authoring {
         record_native_authoring_witness(tx, group_id, identity)?;
@@ -2768,16 +3085,16 @@ pub fn upsert_file_with_meta_in_tx(
         Option<String>,
         Option<i64>,
         i64,
-        String,
         Option<Vec<u8>>,
+        String,
     )> = tx
         .prepare_cached(
             "UPDATE files SET state = CASE WHEN deleted = 0 AND ?3 = 1 THEN 'trashed' ELSE 'superseded' END
              WHERE group_id = ?1 AND path = ?2 AND state = 'current'
              RETURNING version_seq, deleted, materialization_state, record_kind,
-                       symlink_target, unix_mode, held_reason, held_since_unix_nanos,
-                       symlink_out_of_root, xattrs_json,
-                       native_authoring_identity",
+                       symlink_target, exec, held_reason, held_since_unix_nanos,
+                       symlink_out_of_root,
+                       native_authoring_identity, blocks_json",
         )?
         .query_row(
             rusqlite::params![group_id, record.path, record.deleted as i64],
@@ -2799,6 +3116,14 @@ pub fn upsert_file_with_meta_in_tx(
         )
         .optional()?;
 
+    // A scaffold (`version_seq = 0`) was never a genuine version, so it is no
+    // previous row for the activity log.
+    let previous =
+        flipped.as_ref().filter(|row| row.0 != 0).map(|row| crate::activity::PreviousRow {
+            deleted: row.1 != 0,
+            record_kind: row.3.clone(),
+            blocks_json: row.10.clone(),
+        });
     match flipped {
         None => {
             // No current row: a brand new path, or one whose rows are all
@@ -2845,7 +3170,7 @@ pub fn upsert_file_with_meta_in_tx(
         // own creation and this call), so the extra round trip here
         // doesn't cost the common case anything.
         Some((0, ..)) => {
-            tx.execute(
+            tx.execute_cached(
                 "UPDATE files SET size = ?1, mtime_unix_nanos = ?2, blocks_json = ?3, deleted = ?4,
                         version_seq = (SELECT COALESCE(MAX(version_seq), 0) + 1 FROM files
                                         WHERE group_id = ?7 AND path = ?8),
@@ -2871,12 +3196,12 @@ pub fn upsert_file_with_meta_in_tx(
             materialization_state,
             record_kind,
             symlink_target,
-            unix_mode,
+            exec,
             held_reason,
             held_since_unix_nanos,
             symlink_out_of_root,
-            xattrs_json_carried,
             native_carried,
+            _,
         )) => {
             // Every per-file column `FileRecord` doesn't carry
             // (materialization state, record kind, symlink target,
@@ -2914,7 +3239,9 @@ pub fn upsert_file_with_meta_in_tx(
             // existing row for content it has not itself verified is
             // already on disk MUST perform the same explicit correction;
             // this carry-forward alone is not a safe default for it.
-            if record.deleted && old_deleted == 0 {
+            let gives_up = matches!(supersede, crate::retention::Supersede::GiveUp(_));
+            // A row that is not kept needs no mark of the operation that trashed it.
+            if record.deleted && old_deleted == 0 && !gives_up {
                 stamp_trashed_row_operation(
                     tx,
                     group_id,
@@ -2923,16 +3250,15 @@ pub fn upsert_file_with_meta_in_tx(
                     native_carried.as_deref(),
                 )?;
             }
-            tx.execute(
-                "INSERT INTO files (
+            tx.execute_cached("INSERT INTO files (
                     group_id, path, size, mtime_unix_nanos, blocks_json, deleted,
                     version_seq, state, origin_device_id,
                     materialization_state, record_kind,
-                    symlink_target, unix_mode, held_reason, held_since_unix_nanos,
-                    symlink_out_of_root, xattrs_json,
+                    symlink_target, exec, held_reason, held_since_unix_nanos,
+                    symlink_out_of_root,
                     admitted_at_unix_nanos, native_authoring_identity,
                     case_fold_key, canonical_fold_key
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'current', ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'current', ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
                 rusqlite::params![
                     group_id,
                     record.path,
@@ -2945,11 +3271,10 @@ pub fn upsert_file_with_meta_in_tx(
                     materialization_state,
                     record_kind,
                     symlink_target,
-                    unix_mode,
+                    exec,
                     held_reason,
                     held_since_unix_nanos,
                     symlink_out_of_root,
-                    xattrs_json_carried,
                     // NOT carried forward from the row just superseded --
                     // this is a NEW admission of a NEW version, and its
                     // admission time is now, not the previous version's.
@@ -2961,11 +3286,69 @@ pub fn upsert_file_with_meta_in_tx(
                     canonical_key,
                 ],
             )?;
+            if let crate::retention::Supersede::GiveUp(reason) = supersede {
+                give_up_replaced_row(
+                    tx,
+                    group_id,
+                    &record.path,
+                    old_seq,
+                    reason,
+                    admitted_at_unix_nanos.unwrap_or(0),
+                )?;
+            }
         }
     }
+    crate::activity::record_version_in_tx(
+        tx,
+        group_id,
+        &record.path,
+        record.deleted,
+        &blocks_json,
+        origin,
+        previous.as_ref(),
+    )?;
     if let Some(meta) = meta {
         apply_local_meta_columns_in_tx(tx, group_id, &record.path, meta)?;
     }
+    Ok(())
+}
+
+/// A supersede that gives up the version it replaces (a `Skipped` retention proof): records the
+/// gap the missing version leaves, then removes the row, in the caller's transaction. The new
+/// current row (the successor, numbered after the old one) is already written, so the recorded
+/// span ends at its admission. Nothing else is removed: older versions stay as they are.
+fn give_up_replaced_row(
+    tx: &rusqlite::Transaction,
+    group_id: &str,
+    path: &str,
+    old_seq: i64,
+    reason: crate::retention::SkipReason,
+    now_unix_nanos: i64,
+) -> Result<(), SyncSqliteError> {
+    let rows: Vec<crate::history_freed::Member> = {
+        let mut stmt = tx.prepare_cached(
+            "SELECT version_seq, admitted_at_unix_nanos FROM files \
+             WHERE group_id = ?1 AND path = ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![group_id, path], |r| {
+            Ok(crate::history_freed::Member { seq: r.get(0)?, admitted: r.get(1)? })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let crate::retention::SkipReason::LowSpace = reason;
+    crate::history_freed::record(
+        tx,
+        group_id,
+        path,
+        &rows,
+        &HashSet::from([old_seq]),
+        crate::history_freed::FreedReason::LowSpace,
+        now_unix_nanos,
+    )?;
+    tx.execute_cached(
+        "DELETE FROM files WHERE group_id = ?1 AND path = ?2 AND version_seq = ?3",
+        rusqlite::params![group_id, path, old_seq],
+    )?;
     Ok(())
 }
 
@@ -3021,7 +3404,7 @@ pub(crate) fn name_fold_matches_on(
 /// out-of-root flag, exec bit) inside `tx`, the SAME transaction that just
 /// wrote its `current` row via [`upsert_file_in_tx`]. This is the atomic,
 /// in-transaction counterpart to the standalone `set_record_kind`/
-/// `set_symlink_target`/`set_symlink_out_of_root`/`set_unix_mode` setters — it
+/// `set_symlink_target`/`set_symlink_out_of_root`/`set_exec` setters — it
 /// must run strictly after `upsert_file_in_tx` (these are `UPDATE`s and need
 /// the row to already exist), so the index columns and the emitted change's
 /// `FileVersion` commit as one unit.
@@ -3031,21 +3414,21 @@ pub fn apply_local_meta_columns_in_tx(
     path: &str,
     meta: &LocalFileMetaColumns,
 ) -> Result<(), SyncSqliteError> {
-    let unix_mode_stored: i64 = encode_unix_mode_column(meta.unix_mode);
-    let xattrs_json = encode_xattrs_column(&meta.xattrs);
     tx.prepare_cached(
-        "UPDATE files SET record_kind = ?1, symlink_target = ?2, symlink_out_of_root = ?3, unix_mode = ?4, xattrs_json = ?5
-         WHERE group_id = ?6 AND path = ?7 AND state = 'current'",
+        "UPDATE files SET record_kind = ?1, symlink_target = ?2, symlink_out_of_root = ?3, exec = ?4
+         WHERE group_id = ?5 AND path = ?6 AND state = 'current'",
     )?
     .execute(rusqlite::params![
         meta.record_kind.as_db_str(),
         meta.symlink_target,
         meta.symlink_out_of_root as i64,
-        unix_mode_stored,
-        xattrs_json,
+        i64::from(meta.exec),
         group_id,
         path,
     ])?;
+    if meta.record_kind == RecordKind::Directory {
+        crate::activity::forget_directory_event_in_tx(tx, group_id, path)?;
+    }
     Ok(())
 }
 
@@ -3065,7 +3448,7 @@ pub fn stamp_hydrated_after_local_emission_in_tx(
     group_id: &str,
     path: &str,
 ) -> Result<(), SyncSqliteError> {
-    tx.execute(
+    tx.execute_cached(
         "UPDATE files SET materialization_state = ?1 \
          WHERE group_id = ?2 AND path = ?3 AND state = 'current'",
         rusqlite::params![MaterializationState::Present.as_db_str(), group_id, path],
@@ -3395,8 +3778,7 @@ pub fn ensure_bootstrap_row_for_metadata_in_tx(
     path: &str,
 ) -> Result<(), SyncSqliteError> {
     let (case_key, canonical_key) = name_fold_keys(path);
-    tx.execute(
-        "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, deleted, version_seq, state, origin_device_id, admitted_at_unix_nanos, case_fold_key, canonical_fold_key)
+    tx.execute_cached("INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, deleted, version_seq, state, origin_device_id, admitted_at_unix_nanos, case_fold_key, canonical_fold_key)
          SELECT ?1, ?2, 0, 0, '[]', 0, 0, 'current', NULL, ?3, ?4, ?5
           WHERE NOT EXISTS (SELECT 1 FROM files WHERE group_id = ?1 AND path = ?2 AND state = 'current')",
         rusqlite::params![group_id, path, now_unix_nanos_checked(), case_key, canonical_key],
@@ -3424,8 +3806,8 @@ pub fn enumerate_group_durability_roots_on_conn(
     // these roots reconstructs its own version from the column it actually
     // has. Reading it here rather than assuming `None` is what keeps the two
     // reconstructions of one row from disagreeing about its identity.
-    let mut stmt = conn.prepare(
-        "SELECT path, size, mtime_unix_nanos, blocks_json, unix_mode, xattrs_json, \
+    let mut stmt = conn.prepare_cached(
+        "SELECT path, size, mtime_unix_nanos, blocks_json, exec, \
                 symlink_target FROM files \
          WHERE group_id = ?1 AND deleted = 0 AND record_kind = 'file' \
            AND state IN ('current', 'superseded', 'trashed') \
@@ -3438,14 +3820,12 @@ pub fn enumerate_group_durability_roots_on_conn(
             r.get::<_, i64>(2)?,
             r.get::<_, String>(3)?,
             r.get::<_, i64>(4)?,
-            r.get::<_, String>(5)?,
-            r.get::<_, Option<Vec<u8>>>(6)?,
+            r.get::<_, Option<Vec<u8>>>(5)?,
         ))
     })?;
     let mut roots = Vec::new();
     for row in rows {
-        let (path, size, mtime_unix_nanos, blocks_json, unix_mode, xattrs_json, symlink_target) =
-            row?;
+        let (path, size, mtime_unix_nanos, blocks_json, exec, symlink_target) = row?;
         // A malformed stored block list is locally-corrupt state — report it as
         // `CorruptState` (like every other malformed-block-list path) rather
         // than letting the bare `?` classify it as a generic `Json`/protocol
@@ -3463,9 +3843,8 @@ pub fn enumerate_group_durability_roots_on_conn(
             size,
             mtime_unix_nanos,
             RecordKind::File,
-            decode_unix_mode_column(unix_mode),
+            exec != 0,
             symlink_target,
-            decode_xattrs_column(&xattrs_json)?,
         );
         roots.push(DurabilityRoot {
             path,
@@ -3483,7 +3862,7 @@ pub fn root_set_generation_on_conn(
     group_id: &str,
 ) -> Result<u64, SyncSqliteError> {
     let generation: Option<i64> = conn
-        .query_row(
+        .query_row_cached(
             "SELECT generation FROM file_root_set_generation WHERE group_id = ?1",
             [group_id],
             |r| r.get(0),
@@ -3508,9 +3887,10 @@ pub fn group_root_set_summary_on_conn(
     conn: &Connection,
     group_id: &str,
     generation: u64,
+    block_in_store: &dyn Fn(&[u8]) -> bool,
 ) -> Result<RootSetSummary, SyncSqliteError> {
-    let mut stmt = conn.prepare(
-        "SELECT path, size, mtime_unix_nanos, blocks_json, unix_mode, xattrs_json, \
+    let mut stmt = conn.prepare_cached(
+        "SELECT path, size, mtime_unix_nanos, blocks_json, exec, \
                 symlink_target, state, materialization_state FROM files \
          WHERE group_id = ?1 AND deleted = 0 AND record_kind = 'file' \
            AND state IN ('current', 'superseded', 'trashed') \
@@ -3523,10 +3903,9 @@ pub fn group_root_set_summary_on_conn(
             r.get::<_, i64>(2)?,
             r.get::<_, String>(3)?,
             r.get::<_, i64>(4)?,
-            r.get::<_, String>(5)?,
-            r.get::<_, Option<Vec<u8>>>(6)?,
+            r.get::<_, Option<Vec<u8>>>(5)?,
+            r.get::<_, String>(6)?,
             r.get::<_, String>(7)?,
-            r.get::<_, String>(8)?,
         ))
     })?;
     // `Present` says only that an object exists at the path, never that it
@@ -3536,14 +3915,19 @@ pub fn group_root_set_summary_on_conn(
     let mut roots = Vec::new();
     let mut current = Vec::new();
     let mut unmaterialized_current_count = 0u64;
+    let mut file_only_current_count = 0u64;
+    let mut provenance = conn.prepare_cached(
+        "SELECT 1 FROM group_block_provenance WHERE group_id = ?1 AND block_hash = ?2",
+    )?;
+    let mut stored: std::collections::HashSet<yadorilink_replica_domain::ids::BlockHash> =
+        std::collections::HashSet::new();
     for row in rows {
         let (
             path,
             size,
             mtime_unix_nanos,
             blocks_json,
-            unix_mode,
-            xattrs_json,
+            exec,
             symlink_target,
             state,
             materialization_state,
@@ -3558,9 +3942,8 @@ pub fn group_root_set_summary_on_conn(
             size,
             mtime_unix_nanos,
             RecordKind::File,
-            decode_unix_mode_column(unix_mode),
+            exec != 0,
             symlink_target,
-            decode_xattrs_column(&xattrs_json)?,
         );
         let proven_current_version = proven_versions.get(&path) == Some(&version.version_hash.0);
         let root =
@@ -3576,6 +3959,26 @@ pub fn group_root_set_summary_on_conn(
             let proven = proven_current_version;
             if materialization_state != MaterializationState::Present.as_db_str() || !proven {
                 unmaterialized_current_count += 1;
+            } else {
+                // Materialized: is it also in the block store? A block without the group's
+                // provenance was never put there, and provenance alone outlives a swept block.
+                let mut in_store = true;
+                for block in &root.blocks {
+                    if stored.contains(&block.hash) {
+                        continue;
+                    }
+                    if provenance.exists(rusqlite::params![group_id, &block.hash.0])?
+                        && block_in_store(&block.hash.0)
+                    {
+                        stored.insert(block.hash.clone());
+                    } else {
+                        in_store = false;
+                        break;
+                    }
+                }
+                if !in_store {
+                    file_only_current_count += 1;
+                }
             }
             current.push(root.clone());
         }
@@ -3585,6 +3988,7 @@ pub fn group_root_set_summary_on_conn(
         current_digest: durability_roots_digest(&current),
         current_count: current.len() as u64,
         unmaterialized_current_count,
+        file_only_current_count,
         roots_digest: durability_roots_digest(&roots),
         roots_count: roots.len() as u64,
         generation,
@@ -3599,7 +4003,7 @@ fn usable_proof_versions_by_path(
     conn: &Connection,
     group_id: &str,
 ) -> Result<std::collections::HashMap<String, [u8; 32]>, SyncSqliteError> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT g.path, g.version_hash \
            FROM path_materialized_generations g \
            JOIN path_actual_mutation_fences f \
@@ -3628,47 +4032,26 @@ fn usable_proof_versions_by_path(
 /// bound and expired only once it exceeds *both* (union-retain, intersection-
 /// expire). The current/live version is never subject to retention. Retention
 /// is not per-link configurable.
-pub(crate) const RETENTION_MAX_VERSIONS: i64 = 10;
+pub const RETENTION_MAX_VERSIONS: i64 = 10;
 
-pub(crate) const RETENTION_MAX_AGE_DAYS: i64 = 30;
+pub const RETENTION_MAX_AGE_DAYS: i64 = 30;
 
-#[allow(clippy::too_many_arguments)]
-/// Decodes the raw `unix_mode` column value: `-1` (or anything negative) is
-/// "no Unix permission info" (see `SCHEMA_VERSION` v23's own doc comment),
-/// everything else is masked into the replicated permission bits. Shared
-/// between every site that reads this column so a stray sign-handling typo
-/// can't diverge between them.
-pub(crate) fn decode_unix_mode_column(raw: i64) -> Option<u32> {
-    if raw < 0 {
-        None
-    } else {
-        Some(raw as u32 & yadorilink_replica_domain::file::REPLICATED_MODE_MASK)
-    }
-}
-
-/// The inverse of [`decode_unix_mode_column`].
-pub(crate) fn encode_unix_mode_column(unix_mode: Option<u32>) -> i64 {
-    match unix_mode {
-        None => -1,
-        Some(mode) => (mode & yadorilink_replica_domain::file::REPLICATED_MODE_MASK) as i64,
-    }
-}
-
-/// `files.xattrs_json`'s decoding -- fails closed on a corrupt
-/// column (same reasoning as `blocks_json`, see `version_record`'s own
-/// comment) rather than silently reading it back as "no attributes,"
-/// which would be indistinguishable from a genuinely-empty set.
-pub(crate) fn decode_xattrs_column(raw: &str) -> Result<Vec<(String, Vec<u8>)>, SyncSqliteError> {
-    serde_json::from_str(raw).map_err(|error| {
-        SyncSqliteError::CorruptState(format!("stored xattrs are corrupt: {error}"))
-    })
-}
-
-/// The inverse of [`decode_xattrs_column`]. Callers are responsible for
-/// `xattrs` already being sorted by name (see `FileMeta::xattrs`'s own
-/// doc comment) -- this is a plain encode, not a place that re-sorts.
-pub(crate) fn encode_xattrs_column(xattrs: &[(String, Vec<u8>)]) -> String {
-    serde_json::to_string(xattrs).expect("xattr list is always representable as JSON")
+/// Why a path's rows are erased rather than superseded or tombstoned. Required by
+/// [`FileIndexRepository::remove_file`], so that a new caller has to say which it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErasureReason {
+    /// A purely local artifact that no admitted change ever touched (a displaced leaf with no
+    /// native authoring head): there is no replicated history to lose. Refused for a path that
+    /// has or ever had a native head.
+    LocalOnlyArtifact,
+    /// A sync gives up the name so that another entry can take it: a file standing where
+    /// descendants of the path need a directory, or an explicit directory entry the path no longer
+    /// is. The row may well carry replicated history, and it is erased with it, as it always has
+    /// been; keeping that history is a separate piece of work that needs the supersede path.
+    DisplacedByNamespace,
+    /// The path has become ignored: its rows go (history included), the file stays on disk. The
+    /// user's own act, not a sync overwriting, deleting or evicting a version.
+    IgnoreSweep,
 }
 
 // One parameter per SQLite row column this constructs from; grouping into
@@ -3685,8 +4068,7 @@ pub(crate) fn version_record(
     origin_device_id: Option<String>,
     record_kind: &str,
     symlink_target: Option<Vec<u8>>,
-    unix_mode: i64,
-    xattrs_json: &str,
+    exec: i64,
 ) -> Result<VersionRecord, SyncSqliteError> {
     // Fail closed on a corrupt `blocks_json` column rather than coercing it to
     // an empty block list. A silent default would mask genuine index/DB
@@ -3698,8 +4080,7 @@ pub(crate) fn version_record(
         SyncSqliteError::CorruptState(format!("stored block list for {path} is corrupt: {error}"))
     })?;
     let record_kind = RecordKind::from_db_str(record_kind);
-    let unix_mode = decode_unix_mode_column(unix_mode);
-    let xattrs = decode_xattrs_column(xattrs_json)?;
+    let exec = exec != 0;
     // Derive this exact row's `version_hash` the same way the durability-root
     // enumeration does — reconstruct the `FileVersion` this row describes and
     // hash it via `compute_hash()` — so a caller comparing a peer's queried
@@ -3710,9 +4091,8 @@ pub(crate) fn version_record(
         size,
         mtime_unix_nanos,
         record_kind,
-        unix_mode,
+        exec,
         symlink_target.clone(),
-        xattrs.clone(),
     )
     .version_hash;
     let state = VersionState::try_from_db_str(state)
@@ -3728,8 +4108,7 @@ pub(crate) fn version_record(
         origin_device_id,
         record_kind,
         symlink_target,
-        unix_mode,
-        xattrs,
+        exec,
         version_hash,
     })
 }
@@ -3785,3 +4164,7 @@ mod row_authoring_tests;
 /// A version's metadata columns land on its own row only.
 #[cfg(test)]
 mod version_meta_tests;
+
+/// A block list that cannot be read back is refused at write and found by the audit.
+#[cfg(test)]
+mod block_list_tests;

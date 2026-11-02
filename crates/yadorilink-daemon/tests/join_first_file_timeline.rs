@@ -184,7 +184,11 @@ async fn one_join(files: usize, run: usize, avail_delay: Option<Duration>) -> (R
         let store_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
         let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
-        let state = DaemonState::new(device_id.to_string(), sync_state, store);
+        let state = yadorilink_daemon::test_support::isolated_daemon_state(
+            device_id.to_string(),
+            sync_state,
+            store,
+        );
         support::ensure_device_signing_key(&state);
         (state, store_dir)
     };

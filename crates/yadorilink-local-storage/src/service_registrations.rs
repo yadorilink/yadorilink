@@ -46,7 +46,11 @@ pub struct Registration {
 
 /// The launchd label of the macOS background service: the daemon helper inside YadoriLink.app,
 /// registered by the app with `SMAppService`.
-pub const MACOS_DAEMON_AGENT_LABEL: &str = "com.juntaki.yadorilink.daemon";
+// A build may name other ids through the build-time environment variable below; unset, these are the product's ids.
+pub const MACOS_DAEMON_AGENT_LABEL: &str = match option_env!("YADORILINK_DAEMON_LABEL") {
+    Some(id) => id,
+    None => "com.juntaki.yadorilink.daemon",
+};
 
 pub const TABLE: &[Registration] = &[
     Registration {
@@ -217,6 +221,14 @@ pub fn removal_hint(registration: &Registration) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn macos_daemon_agent_label_follows_the_build_identity() {
+        assert_eq!(
+            super::MACOS_DAEMON_AGENT_LABEL,
+            option_env!("YADORILINK_DAEMON_LABEL").unwrap_or("com.juntaki.yadorilink.daemon")
+        );
+    }
+
     use super::*;
     use std::path::Path;
 

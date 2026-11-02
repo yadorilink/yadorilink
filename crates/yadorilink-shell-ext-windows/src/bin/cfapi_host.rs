@@ -129,6 +129,27 @@ fn unregister_recorded_roots(file: &Path, which: Unregister) -> bool {
     gone
 }
 
+/// One line of the guardian's own record, `<state dir>\host\guardian.log` (it has no console; the
+/// file is what tells why a root stayed registered after an uninstall). Kept
+/// short: it restarts when it grows past 16 KiB. Best effort.
+fn guardian_log(line: &str) {
+    use std::io::Write;
+    let file = host_paths::container().join("guardian.log");
+    let keep = std::fs::metadata(&file).is_ok_and(|m| m.len() < 16 * 1024);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    if let Ok(mut out) = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(keep)
+        .truncate(!keep)
+        .open(&file)
+    {
+        let _ = writeln!(out, "{stamp} {line}");
+    }
+}
+
 /// The guardian the running host starts (see `package_removal`): it has no package identity and
 /// outlives the package. Once the host has ended it watches the package family; if the package was
 /// uninstalled it unregisters the roots.
@@ -137,14 +158,23 @@ fn guard_package_removal(family: &str, host_pid: u32) -> bool {
         family_installed, removal_confirmed, remove_helper, wait_for_exit, GRACE, POLL, STABLE,
     };
     wait_for_exit(host_pid);
+    guardian_log(&format!("host {host_pid} ended; watching {family} for {GRACE:?}"));
     let removed =
         removal_confirmed(&mut || family_installed(family), POLL, GRACE, STABLE, &mut || {
             std::thread::sleep(POLL)
         });
     let clean = if removed {
         println!("yadorilink-cfapi-host: {family} was uninstalled; unregistering its sync roots");
-        unregister_recorded_roots(&host_paths::roots_registry_file(), Unregister::AfterUninstall)
+        let clean = unregister_recorded_roots(
+            &host_paths::roots_registry_file(),
+            Unregister::AfterUninstall,
+        );
+        guardian_log(&format!("{family} was uninstalled; roots unregistered cleanly: {clean}"));
+        clean
     } else {
+        guardian_log(&format!(
+            "{family} is still installed after the grace period; nothing touched"
+        ));
         true
     };
     if let Ok(exe) = std::env::current_exe() {

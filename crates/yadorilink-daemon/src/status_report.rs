@@ -138,6 +138,7 @@ pub(crate) fn encode_runtime_status(
                 route_kind: route_kind as i32,
                 version_incompatible: peer.version_incompatible,
                 replaced_by_device_id: peer.replaced_by_device_id.unwrap_or_default(),
+                last_connected_unix: peer.last_connected_unix,
             }
         })
         .collect();
@@ -191,6 +192,7 @@ pub(crate) fn encode_runtime_status(
         update_available_version: update.available_version,
         update_mandatory: update.mandatory,
         update_required: update.update_required,
+        snapshot_age_ms: 0,
         update_last_error_category: update.last_error_category,
         update_channel: update.channel,
         update_install_source: update.install_source,
@@ -206,6 +208,7 @@ pub(crate) fn encode_runtime_status(
         recent_errors,
         overall_state: String::new(),
         attention_reasons: Vec::new(),
+        product: None,
         preserved: None,
         rebootstrapping_groups: Vec::new(),
         undecided_uploads: 0,
@@ -234,8 +237,15 @@ pub(crate) fn encode_link_status(view: crate::queries::link_status::LinkStatusVi
     let held_file_count = held_files.len() as u64;
     let durability_status = durability_status_to_proto(view.durability_status);
     let durability_evidence = durability_evidence_to_proto(view.durability_evidence);
+    // A provider-backed root is not a plain folder the daemon writes itself.
     let (provider_root_id, provider_display_name) = view.provider.unwrap_or_default();
     LinkStatus {
+        root_access_warning: view.root_access_warning,
+        index_damaged_path: view.index_damaged_path,
+        rebuild_needed: view.rebuild_needed,
+        product: None,
+        history_skipped_last_day: view.history_skipped_last_day,
+        history_skipped_last_30_days: view.history_skipped_last_30_days,
         provider_root_id,
         provider_display_name,
         local_path: view.local_path,
@@ -248,6 +258,8 @@ pub(crate) fn encode_link_status(view: crate::queries::link_status::LinkStatusVi
         hydrated_count: view.hydrated_count,
         placeholder_count: view.placeholder_count,
         hydrating_count: view.hydrating_count,
+        total_bytes: Some(view.total_bytes),
+        online_only_bytes: Some(view.online_only_bytes),
         requested_content_count: view.requested_content_count,
         held_file_count,
         held_files,
@@ -374,6 +386,7 @@ pub(crate) fn apply_account_deletion(
     use crate::daemon_state::AccountDeletionState;
     let reason = match state {
         AccountDeletionState::None => return,
+        AccountDeletionState::Requested => "account_deletion_requested",
         AccountDeletionState::Pending => "account_deletion_pending",
         AccountDeletionState::Urgent => "account_deletion_urgent",
     };
@@ -460,33 +473,105 @@ pub(crate) fn replacement_unconfirmed_pending(dir: Option<&std::path::Path>) -> 
     dir.is_some_and(yadorilink_local_storage::replacement_unconfirmed::pending)
 }
 
-/// The whole status of the engine behind `context`, as the wire type: the runtime view, the
-/// provider roots, space that could be reclaimed, the preserved-items summary and the
-/// attention rollup. `state_dir` is where the replacement records live (`None`: there is none).
+/// The parts of the control context a status reads, as shared handles: the status builder holds
+/// them, so a status can be collected without the control context itself.
+pub(crate) struct StatusSources {
+    pub(crate) queries: std::sync::Arc<crate::queries::QueryServices>,
+    pub(crate) application: std::sync::Arc<crate::application::ApplicationServices>,
+    pub(crate) provider_status: std::sync::Arc<crate::provider_status::ProviderStatusSource>,
+    pub(crate) auto_reclaim: std::sync::Arc<crate::provider_auto_reclaim::AutoReclaimSlot>,
+    /// Where the replacement records live.
+    pub(crate) config_dir: std::path::PathBuf,
+}
+
+/// What a status reads from the ledger, the block index, the filesystem and shell-installed
+/// closures, collected in one pass off the request path.
+pub(crate) struct CollectedStatus {
+    pub(crate) runtime: crate::queries::runtime_status::RuntimeFacts,
+    provider_roots: Vec<yadorilink_ipc_proto::daemonctl::ProviderRootStatus>,
+    provider_removals: Vec<yadorilink_ipc_proto::daemonctl::ProviderRemovalStatus>,
+    orphan_domains: Vec<String>,
+    provider_registry_restored: bool,
+    reclaimable: std::collections::HashMap<String, u64>,
+    /// The volume entries that share the block store's physical volume.
+    shares_block_store_volume: std::collections::HashSet<String>,
+    replacement_pending: bool,
+    replacement_sign_in: bool,
+    replacement_acknowledgement: bool,
+    replacement_waiting: Option<String>,
+    preserved: crate::preserved_items::PreservedSummary,
+    rebootstrapping_groups: Vec<String>,
+    undecided_uploads: (u64, u64),
+}
+
+/// Reads everything a status needs that is not in memory.
 ///
 /// # Errors
 /// The message of the failure to read the runtime view.
-pub(crate) fn build_status(
-    context: &crate::control_context::ControlContext,
-    state_dir: Option<&std::path::Path>,
-) -> Result<StatusResponse, String> {
-    let view = context.queries.runtime_status.snapshot().map_err(|e| e.to_string())?;
+pub(crate) fn collect_status(sources: &StatusSources) -> Result<CollectedStatus, String> {
+    let runtime = sources.queries.runtime_status.collect().map_err(|e| e.to_string())?;
+    let dir = Some(sources.config_dir.as_path());
+    let (provider_removals, orphan_domains) = sources.provider_status.extras();
+    let reclaimable = sources.auto_reclaim.reclaimable_by_group();
+    let shares_block_store_volume = runtime
+        .volume_paths()
+        .filter(|path| sources.queries.runtime_status.shares_block_store_volume(path))
+        .map(str::to_owned)
+        .collect();
+    Ok(CollectedStatus {
+        runtime,
+        provider_roots: sources.provider_status.snapshot(),
+        provider_removals,
+        orphan_domains,
+        provider_registry_restored: crate::windows_sync_roots::registry_restored(
+            &sources.config_dir,
+        ),
+        reclaimable,
+        shares_block_store_volume,
+        replacement_pending: replacement_unconfirmed_pending(dir),
+        replacement_sign_in: replacement_sign_in_required(dir),
+        replacement_acknowledgement: replacement_acknowledgement_required(dir),
+        replacement_waiting: replacement_waiting_reason(dir),
+        preserved: sources.application.preserved.summary(),
+        rebootstrapping_groups: sources.application.preserved.rebootstrapping_groups(),
+        undecided_uploads: sources.application.preserved.undecided_uploads(),
+    })
+}
+
+/// Collects and composes in place: for a caller that decides something from the answer, or has
+/// no builder; a status request is answered from the builder's facts (`crate::status_facts`).
+///
+/// # Errors
+/// The message of the failure to read the runtime view.
+pub(crate) fn build_status(sources: &StatusSources) -> Result<StatusResponse, String> {
+    Ok(compose_status(sources, &collect_status(sources)?, false))
+}
+
+/// The whole status of the engine, as the wire type: the runtime view, the provider roots,
+/// space that could be reclaimed, the preserved-items summary and the attention rollup, from
+/// collected facts and what the daemon holds in memory now. Reads no ledger, file or block
+/// index. `stale` withholds every positive claim (see `RuntimeStatusQueryService::snapshot_from`).
+pub(crate) fn compose_status(
+    sources: &StatusSources,
+    collected: &CollectedStatus,
+    stale: bool,
+) -> StatusResponse {
+    let view = sources.queries.runtime_status.snapshot_from(&collected.runtime, stale);
     let database_restored = view.database_restored;
     let author_unavailable = view.author_unavailable;
     let coordination_block = view.coordination_block.clone();
     let account_deletion = view.account_deletion;
     let mut response = encode_runtime_status(view);
-    response.provider_roots = context.provider_status.snapshot();
-    (response.provider_removals, response.orphan_domains) = context.provider_status.extras();
-    response.provider_registry_restored =
-        crate::windows_sync_roots::registry_restored(&context.config_dir);
+    response.provider_roots = collected.provider_roots.clone();
+    response.provider_removals = collected.provider_removals.clone();
+    response.orphan_domains = collected.orphan_domains.clone();
+    response.provider_registry_restored = collected.provider_registry_restored;
     crate::status_dimensions::fill_link_dimensions(&mut response);
-    let reclaimable = context.auto_reclaim.reclaimable_by_group();
     for link in &mut response.links {
-        link.reclaimable_bytes = reclaimable.get(&link.group_id).copied().unwrap_or(0);
+        link.reclaimable_bytes = collected.reclaimable.get(&link.group_id).copied().unwrap_or(0);
     }
-    attribute_reclaimable(&mut response.volumes, &reclaimable, |path| {
-        context.queries.runtime_status.shares_block_store_volume(path)
+    attribute_reclaimable(&mut response.volumes, &collected.reclaimable, |path| {
+        collected.shares_block_store_volume.contains(path)
     });
     let (mut overall_state, mut attention_reasons) = overall_status(&response);
     if let Some(category) = database_restored {
@@ -510,19 +595,20 @@ pub(crate) fn build_status(
     );
     apply_account_deletion(account_deletion, &mut overall_state, &mut attention_reasons);
     apply_replacement_unconfirmed(
-        replacement_unconfirmed_pending(state_dir),
+        collected.replacement_pending,
         &mut overall_state,
         &mut attention_reasons,
     );
-    apply_replacement_sign_in(replacement_sign_in_required(state_dir), &mut attention_reasons);
+    apply_replacement_sign_in(collected.replacement_sign_in, &mut attention_reasons);
     apply_replacement_acknowledgement(
-        replacement_acknowledgement_required(state_dir),
+        collected.replacement_acknowledgement,
         &mut attention_reasons,
     );
-    apply_replacement_waiting(replacement_waiting_reason(state_dir), &mut attention_reasons);
+    apply_replacement_waiting(collected.replacement_waiting.clone(), &mut attention_reasons);
     response.overall_state = overall_state.as_str().to_string();
     response.attention_reasons = attention_reasons;
-    let preserved = context.application.preserved.summary();
+    yadorilink_product_view::wire::fill_product_status(&mut response);
+    let preserved = &collected.preserved;
     response.preserved = Some(yadorilink_ipc_proto::daemonctl::PreservedSummary {
         total: preserved.total,
         content_unavailable: preserved.content_unavailable,
@@ -533,10 +619,10 @@ pub(crate) fn build_status(
         warn: preserved.warn,
         retained_originals: preserved.retained_originals,
     });
-    response.rebootstrapping_groups = context.application.preserved.rebootstrapping_groups();
+    response.rebootstrapping_groups = collected.rebootstrapping_groups.clone();
     (response.undecided_uploads, response.undecided_uploads_oldest_ms) =
-        context.application.preserved.undecided_uploads();
-    Ok(response)
+        collected.undecided_uploads;
+    response
 }
 
 /// Rolls up every already-populated field on `response` into one
@@ -557,15 +643,13 @@ pub(crate) fn build_status(
 /// low-disk condition on a linked folder needs attention; a *critical*
 /// one is actively blocking sync, same severity split
 /// `VolumeFreeSpace.state`'s own `"low"` vs `"critical"` already draws).
-/// Otherwise any conflict, held file, a `"low"` volume, a disconnected
-/// peer, a link whose `durability_status` cannot currently be confirmed
-/// (`UNKNOWN`/`UNSPECIFIED`) or whose `fetch_availability` is
-/// `UNAVAILABLE_NOW`/`UNKNOWN`/`UNSPECIFIED` (an unconfirmed fetch
-/// availability must never silently read as `AVAILABLE_NOW` any more than
-/// an unconfirmed durability status may silently read as `PROTECTED` --
-/// same fail-safe discipline, applied to both axes uniformly), a
-/// non-empty recent-error feed, or a recorded update failure ->
-/// `Attention`. A merely-`paused` link is *not* by itself
+/// Otherwise any conflict, held file, a `"low"` volume, a disconnected peer,
+/// a peer on another version, a link whose `durability_status` cannot currently be confirmed
+/// (`UNKNOWN`/`UNSPECIFIED`), a non-empty recent-error feed, or a recorded
+/// update failure -> `Attention`. Content that cannot be fetched now is not a
+/// reason (availability; the product state is Waiting while content is
+/// wanted), and a folder only this device holds is a configuration
+/// (protection says so), not a fault. A merely-`paused` link is *not* by itself
 /// attention-worthy (spec's "Sync is healthy" scenario: "caught up or idle
 /// *without errors*" says nothing about pause being an error state --
 /// pausing is a deliberate user action, matching `status.rs`'s own
@@ -587,7 +671,7 @@ pub(crate) fn attention_reasons_for_tests(response: &StatusResponse) -> Vec<Stri
 pub(crate) const UNREADABLE_FILES_LISTED: usize = 50;
 
 pub(crate) fn overall_status(response: &StatusResponse) -> (OverallState, Vec<String>) {
-    use yadorilink_ipc_proto::daemonctl::{FetchAvailability, GroupDurabilityStatus};
+    use yadorilink_ipc_proto::daemonctl::GroupDurabilityStatus;
 
     let mut degraded_reasons = Vec::new();
     let mut attention_reasons = Vec::new();
@@ -622,37 +706,33 @@ pub(crate) fn overall_status(response: &StatusResponse) -> (OverallState, Vec<St
         if link.capture_volume_unconfirmed {
             attention_reasons.push(format!("volume_unconfirmed:{}", link.group_id));
         }
+        if link.rebuild_needed {
+            attention_reasons.push(format!("rebuild_needed:{}", link.group_id));
+        }
+        if !link.index_damaged_path.is_empty() {
+            attention_reasons.push(format!("index_damaged:{}", link.group_id));
+        }
         match link.durability_status() {
+            // One device holding the folder is a standing configuration, not a fault (the protection
+            // dimension says "only on this device"); nothing the person must do is wrong.
+            // (The same predicate as the product view's `is_single_copy`; a test pins them.)
+            GroupDurabilityStatus::AtRisk if link.full_replica_device_ids.is_empty() => {}
             GroupDurabilityStatus::AtRisk => {
                 degraded_reasons.push(format!("durability_at_risk:{}", link.group_id));
             }
-            // Not asked yet is "checking" (see `LinkStatus.durability_check_pending`):
-            // transient, and nothing a user could act on.
-            GroupDurabilityStatus::Unknown if link.durability_check_pending => {}
-            GroupDurabilityStatus::Unknown | GroupDurabilityStatus::Unspecified => {
-                attention_reasons.push(format!("durability_unknown:{}", link.group_id));
-            }
-            GroupDurabilityStatus::Protected | GroupDurabilityStatus::Protecting => {}
+            // A copy that is not confirmed yet is the protection dimension ("Not confirmed
+            // yet", or "Checking" before the first round), never a reason: there is nothing the
+            // person can do about it, and a first sync passes through it.
+            GroupDurabilityStatus::Unknown
+            | GroupDurabilityStatus::Unspecified
+            | GroupDurabilityStatus::Protected
+            | GroupDurabilityStatus::Protecting => {}
         }
-        let wants_content = link.requested_content_count > 0;
-        // Fetch availability matters only while content is wanted; an idle On-Demand folder's
-        // remote placeholders are its normal steady state (the same predicate as the product
-        // summary's `wants_content`; the rollup/summary agreement test pins the two together).
-        match link.fetch_availability() {
-            _ if !wants_content => {}
-            FetchAvailability::UnavailableNow => {
-                attention_reasons.push(format!("fetch_unavailable:{}", link.group_id));
-            }
-            FetchAvailability::Unknown | FetchAvailability::Unspecified => {
-                attention_reasons.push(format!("fetch_availability_unknown:{}", link.group_id));
-            }
-            FetchAvailability::AvailableNow => {}
-        }
-        if link.conflict_count > 0 {
+        // Fetch availability is a wait, not a problem: it is reported as the folder's availability
+        // (and the product state Waiting while content is wanted), never as a reason here.
+        // Conflicts in the folder and conflicts still being resolved are one reason.
+        if link.conflict_count > 0 || link.conflicts_pending > 0 {
             attention_reasons.push(format!("conflict:{}", link.group_id));
-        }
-        if link.conflicts_pending > 0 {
-            attention_reasons.push(format!("conflict_pending:{}", link.group_id));
         }
         if link.held_file_count > 0 {
             attention_reasons.push(format!("held:{}", link.group_id));
@@ -699,22 +779,28 @@ pub(crate) fn overall_status(response: &StatusResponse) -> (OverallState, Vec<St
         }
     }
     for peer in &response.peers {
-        // A peer still racing candidates ("connecting") is transient and
-        // not yet attention; only one that genuinely cannot be connected is.
+        // Only a device on another version is a reason (the person updates it). A device that is
+        // away or still connecting is availability, shown with when it was last seen, at any
+        // duration; a device whose own history cannot catch up says so itself (`rebuild_needed`).
         if peer.version_incompatible {
-            // Online but on another version: the user updates, nothing is waiting to come back.
             attention_reasons.push(format!("peer_update_required:{}", peer.device_id));
-        } else if peer.reachability()
-            == yadorilink_ipc_proto::daemonctl::PeerReachability::Unreachable
-            // A replaced device is gone for good and has its own reason; nothing to reconnect.
-            && peer.unreachable_category()
-                != yadorilink_ipc_proto::daemonctl::UnreachableCategory::DeviceReplaced
-        {
-            attention_reasons.push(format!("peer_disconnected:{}", peer.device_id));
         }
     }
     for error in &response.recent_errors {
-        attention_reasons.push(format!("recent_error:{}", error.category));
+        // A failure another reason already explains is not a second item.
+        let explained = |codes: &[&str]| {
+            degraded_reasons.iter().chain(attention_reasons.iter()).any(|reason| {
+                let code = reason.split_once(':').map_or(reason.as_str(), |(code, _)| code);
+                codes.contains(&code)
+            })
+        };
+        // Only disk pressure is explained this way: the other categories carry no folder, so
+        // another folder's reason cannot be shown to explain them.
+        let covered = error.category == "disk_pressure"
+            && explained(&["waiting_for_disk_space", "low_disk", "low_disk_critical"]);
+        if !covered {
+            attention_reasons.push(format!("recent_error:{}", error.category));
+        }
     }
     if response.update_required {
         // This device is below the signed minimum supported version: it cannot sync with

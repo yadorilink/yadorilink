@@ -398,6 +398,63 @@ async fn fully_hydrated_locally_is_available_now_even_when_latched_unknown() {
     assert_eq!(views[0].fetch_availability, FetchAvailability::AvailableNow);
 }
 
+/// A path with a pending local edit or delete is not claimed `AvailableNow`: its row still reads
+/// `Present` but the bytes it names may already be gone (a received copy that lives only in the
+/// folder has no store copy). A new file with no row claims nothing and does not count; the
+/// claim returns when capture clears the journal entry.
+#[tokio::test]
+async fn a_path_in_the_dirty_journal_is_not_available_now() {
+    let state = test_state();
+    state.replica_coordinator.link_repository().add_link(PATH, GROUP).unwrap();
+    upsert_file(&state, "a.bin", true);
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+    let journal = state.replica_coordinator.dirty_path_repository();
+
+    journal.record_dirty_path(GROUP, "new-file.bin", "create", 1, &permit).unwrap();
+    let views = reader_for(state.clone()).list_links().unwrap();
+    assert_eq!(views[0].fetch_availability, FetchAvailability::AvailableNow);
+
+    journal.record_dirty_path(GROUP, "a.bin", "modify", 2, &permit).unwrap();
+    let views = reader_for(state.clone()).list_links().unwrap();
+    assert_eq!(views[0].fetch_availability, FetchAvailability::UnavailableNow);
+
+    journal
+        .clear_dirty_paths_conditional_batch(GROUP, &[("a.bin".to_string(), 2)], &permit)
+        .unwrap();
+    let views = reader_for(state.clone()).list_links().unwrap();
+    assert_eq!(views[0].fetch_availability, FetchAvailability::AvailableNow);
+
+    // A journaled directory above a present file withdraws the claim; a sibling that only
+    // shares the name prefix is not below it.
+    upsert_file(&state, "dir/inner.bin", true);
+    journal.record_dirty_path(GROUP, "dir", "remove", 3, &permit).unwrap();
+    let views = reader_for(state.clone()).list_links().unwrap();
+    assert_eq!(views[0].fetch_availability, FetchAvailability::UnavailableNow);
+    journal.clear_dirty_paths_conditional_batch(GROUP, &[("dir".to_string(), 3)], &permit).unwrap();
+    journal.record_dirty_path(GROUP, "di", "remove", 4, &permit).unwrap();
+    let views = reader_for(state.clone()).list_links().unwrap();
+    assert_eq!(views[0].fetch_availability, FetchAvailability::AvailableNow);
+    journal.clear_dirty_paths_conditional_batch(GROUP, &[("di".to_string(), 4)], &permit).unwrap();
+
+    // A present file replaced by a directory whose child is journaled first.
+    journal.record_dirty_path(GROUP, "a.bin/child", "create", 6, &permit).unwrap();
+    let views = reader_for(state.clone()).list_links().unwrap();
+    assert_eq!(views[0].fetch_availability, FetchAvailability::UnavailableNow);
+    journal
+        .clear_dirty_paths_conditional_batch(GROUP, &[("a.bin/child".to_string(), 6)], &permit)
+        .unwrap();
+
+    // A placeholder whose blocks are held locally does not bring the claim back.
+    let held = store_block(&state, b"data");
+    state.replica_coordinator.record_block_provenance(GROUP, std::slice::from_ref(&held)).unwrap();
+    upsert_placeholder_with_block(&state, "p.bin", &held);
+    let views = reader_for(state.clone()).list_links().unwrap();
+    assert_eq!(views[0].fetch_availability, FetchAvailability::AvailableNow);
+    journal.record_dirty_path(GROUP, "a.bin", "modify", 5, &permit).unwrap();
+    let views = reader_for(state).list_links().unwrap();
+    assert_eq!(views[0].fetch_availability, FetchAvailability::UnavailableNow);
+}
+
 /// A REACHABLE peer that is NOT a full-replica writer for this group
 /// proves nothing about fetchability -- `FetchAvailability` must not
 /// degrade into a bare alias for `PeerReachability`.
@@ -580,4 +637,23 @@ async fn each_degraded_state_reports_its_own_typed_cause() {
     state.links.record_watch_limit_startup_failure(PATH);
     state.mark_link_waiting_for_disk_space(PATH, "x".into());
     assert_eq!(cause_of(&state), (true, Wire::FileWatchLimit, false));
+}
+
+/// A plain folder on a filesystem that cannot prove object identity carries one warning in its
+/// status (what happens, what to do) for as long as that stays true; one that can has none. The
+/// filesystem answer is supplied, so the test is the same on every host.
+#[tokio::test]
+async fn a_folder_that_cannot_prove_identity_carries_one_status_warning() {
+    let state = test_state();
+    let dir = tempfile::tempdir().unwrap();
+
+    state.set_volume_identity_probe(Arc::new(|_| true));
+    assert_eq!(folder_warning(&state, dir.path()), "");
+
+    state.set_volume_identity_probe(Arc::new(|_| false));
+    let warning = folder_warning(&state, dir.path());
+    assert!(warning.contains("will not be applied"), "{warning}");
+    assert!(warning.contains("disk-backed"), "{warning}");
+    // The same text every read: one line while the state lasts, not one per start.
+    assert_eq!(folder_warning(&state, dir.path()), warning);
 }

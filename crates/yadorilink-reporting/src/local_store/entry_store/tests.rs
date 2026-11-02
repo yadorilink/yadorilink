@@ -135,3 +135,22 @@ fn apply_retention_evicts_oversized_entries() {
     // have already evicted it.
     assert!(store.show(&meta.report_id).unwrap().is_none());
 }
+
+/// Queued reports are owner-only from creation and stay so when an entry is rewritten.
+#[cfg(unix)]
+#[test]
+fn entries_are_stored_owner_only_including_after_a_rewrite() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("queue");
+    let store = EntryStore::new(&dir, RetentionPolicy::default());
+    let meta = store.insert(sample_envelope()).unwrap();
+    let entry = dir.join(format!("{}.json", meta.report_id));
+    assert_eq!(mode(&dir), 0o700);
+    assert_eq!(mode(&entry), 0o600);
+
+    store.increment_submit_attempts(&meta.report_id).unwrap();
+    assert_eq!(mode(&entry), 0o600);
+    assert!(!dir.join(format!("{}.json.tmp", meta.report_id)).exists());
+}

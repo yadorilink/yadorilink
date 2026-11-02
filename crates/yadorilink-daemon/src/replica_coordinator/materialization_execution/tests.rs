@@ -3,7 +3,9 @@
 use super::*;
 use std::path::Path;
 use yadorilink_filesystem_sync::block_liveness::BlockLivenessGate;
-use yadorilink_filesystem_sync::materialization_eviction::{evict_file, MaterializationContext};
+use yadorilink_filesystem_sync::materialization_eviction::{
+    evict_file, MaterializationContext, NotFreed,
+};
 use yadorilink_filesystem_sync::materialization_repair::{
     repair_interrupted_materializations, RepairMode,
 };
@@ -198,6 +200,11 @@ fn evict_on_a_sync_root_volume_that_is_not_known_durable_touches_nothing() {
 
     assert!(!outcome.dehydrated, "no bytes may be removed without a positive verdict");
     assert!(outcome.blocks_retained);
+    assert_eq!(
+        outcome.not_freed,
+        Some(NotFreed::VolumeNotDurable),
+        "the call says why it freed nothing"
+    );
     assert!(store.exists(&hash).unwrap());
     assert_eq!(std::fs::read(root.path().join("a.bin")).unwrap(), content);
     assert_eq!(
@@ -403,7 +410,11 @@ impl CustodyProbeFixture {
         Self { state, root, store, _store_dir: store_dir, seen, _probe: probe }
     }
 
-    fn evict(&self, is_full_replica: bool, custody: &dyn FullReplicaCustody) {
+    fn evict(
+        &self,
+        is_full_replica: bool,
+        custody: &dyn FullReplicaCustody,
+    ) -> yadorilink_filesystem_sync::materialization_eviction::EvictionOutcome {
         evict_file(
             MaterializationContext {
                 state: &*self.state,
@@ -417,7 +428,7 @@ impl CustodyProbeFixture {
             is_full_replica,
             custody,
         )
-        .unwrap();
+        .unwrap()
     }
 }
 
@@ -441,8 +452,13 @@ fn a_dirty_path_never_asks_for_custody() {
         .dirty_path_repository()
         .record_dirty_path("group-a", "a.bin", "created_or_modified", 1, &permit)
         .unwrap();
-    fixture.evict(false, &NeverConfirms);
+    let outcome = fixture.evict(false, &NeverConfirms);
     assert!(fixture.seen.borrow().is_empty());
+    // The quiet bail-out: `Ok`, nothing freed, and now the reason (a change is being worked through), which
+    // passes by itself, so a caller may ask again.
+    assert!(!outcome.dehydrated);
+    assert_eq!(outcome.not_freed, Some(NotFreed::PathChanging));
+    assert!(NotFreed::PathChanging.passes_by_itself());
 }
 
 #[cfg(not(windows))]
@@ -496,6 +512,11 @@ fn evict_aborts_when_disk_content_diverges_from_the_indexed_version() {
 
     assert!(!outcome.dehydrated, "eviction must abort, not silently discard the local edit");
     assert!(outcome.blocks_retained);
+    assert_eq!(
+        outcome.not_freed,
+        Some(NotFreed::DiffersFromSynced),
+        "a successful call that freed nothing names the reason instead of answering a bare Ok"
+    );
     assert!(
         store.exists(&hash).unwrap(),
         "the aborted eviction must not touch the block store either"
@@ -1299,7 +1320,6 @@ fn repair_recreates_a_symlink_after_a_simulated_crash_before_the_write() {
 #[cfg(unix)]
 #[test]
 fn repair_recreates_missing_explicit_directory() {
-    use std::os::unix::fs::PermissionsExt as _;
     let store_dir = tempfile::tempdir().unwrap();
     let store = SegmentBlockStore::new(store_dir.path()).unwrap();
     let state = ReplicaCoordinator::open_in_memory().unwrap();
@@ -1319,10 +1339,6 @@ fn repair_recreates_missing_explicit_directory() {
         .set_record_kind("group-1", "nested/docs", RecordKind::Directory, &permit)
         .unwrap();
     state
-        .file_index_repository()
-        .set_unix_mode("group-1", "nested/docs", Some(0o750), &permit)
-        .unwrap();
-    state
         .materialization_intent_repository()
         .begin_materialization_intent("group-1", "nested/docs", &[0; 32], &permit)
         .unwrap();
@@ -1340,7 +1356,7 @@ fn repair_recreates_missing_explicit_directory() {
     assert_eq!(report.reconstructed, vec!["nested/docs"]);
     let metadata = std::fs::symlink_metadata(root.path().join("nested/docs")).unwrap();
     assert!(metadata.is_dir(), "repair must recreate a real directory");
-    assert_eq!(metadata.permissions().mode() & 0o777, 0o750);
+    // A directory's mode is not replicated: it keeps the mode the platform gave the new directory.
     assert!(
         MaterializationExecutionPort::materialization_intent_kind(&state, "group-1", "nested/docs")
             .unwrap()
@@ -2492,14 +2508,13 @@ fn open_optimistic_row(
     group_id: &str,
     rel_path: &str,
     record: &FileRecord,
-    unix_mode: Option<u32>,
+    exec: bool,
 ) {
     let metadata = LocalFileMetaColumns {
         record_kind: RecordKind::File,
         symlink_target: None,
         symlink_out_of_root: false,
-        unix_mode,
-        xattrs: Vec::new(),
+        exec,
     };
     let target = yadorilink_local_storage::intent_target_hash(&record.blocks);
     state
@@ -2508,7 +2523,7 @@ fn open_optimistic_row(
             yadorilink_sync_sqlite::MaterializationIntentRepository::begin_materialization_intent_in_tx(
                 tx, group_id, rel_path, &target, 0,
             )?;
-            yadorilink_sync_sqlite::file_index::upsert_file_in_tx(tx, group_id, record, "device-b")?;
+            yadorilink_sync_sqlite::file_index::upsert_file_in_tx(tx, group_id, record, "device-b", yadorilink_sync_sqlite::retention::Retention::OwnEdit)?;
             yadorilink_sync_sqlite::MaterializationStateRepository::set_materialization_state_in_tx(
                 tx,
                 group_id,
@@ -2547,7 +2562,7 @@ fn a_crash_after_the_batch_commits_a_rows_intent_but_before_its_disk_publish_is_
     adopt_root(&state, "group-1", root.path());
     let permit = RootCommitPermit::for_tests();
 
-    open_optimistic_row(&state, "group-1", "batched.txt", &record, None);
+    open_optimistic_row(&state, "group-1", "batched.txt", &record, false);
     assert!(
         !root.path().join("batched.txt").exists(),
         "sanity: this test's whole point is that the disk publish never happened"
@@ -2600,7 +2615,7 @@ fn a_crash_after_the_batchs_disk_publish_but_before_finalize_only_clears_the_sta
     adopt_root(&state, "group-1", root.path());
     let permit = RootCommitPermit::for_tests();
 
-    open_optimistic_row(&state, "group-1", "batched2.txt", &record, None);
+    open_optimistic_row(&state, "group-1", "batched2.txt", &record, false);
     state
         .sqlite()
         .dag_bump_projection_obligations_for_touched_paths("group-1", &["batched2.txt"], 0)
@@ -2693,6 +2708,19 @@ fn a_crash_after_the_batchs_disk_publish_but_before_finalize_only_clears_the_sta
 /// leaves the row's intent open over the right bytes
 /// with the old mode. Repair's disk-matches arm used to prove the version
 /// on the bytes alone, publishing an exact proof of a mode disk never got.
+/// The mode a file this crate creates in `dir` gets before any execute flag is applied: the
+/// platform's creation mode with the process umask removed (a received file's expected mode must
+/// not assume a umask).
+#[cfg(unix)]
+fn default_new_file_mode(dir: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    let probe = dir.join(".mode-probe");
+    std::fs::write(&probe, b"").unwrap();
+    let mode = std::fs::metadata(&probe).unwrap().permissions().mode() & 0o777;
+    std::fs::remove_file(&probe).unwrap();
+    mode
+}
+
 #[cfg(unix)]
 #[test]
 fn repair_does_not_prove_a_version_whose_mode_disk_never_got() {
@@ -2706,7 +2734,7 @@ fn repair_does_not_prove_a_version_whose_mode_disk_never_got() {
     let root = tempfile::tempdir().unwrap();
     adopt_root(&state, GROUP, root.path());
     let permit = RootCommitPermit::for_tests();
-    open_optimistic_row(&state, GROUP, "run.sh", &record, Some(0o755));
+    open_optimistic_row(&state, GROUP, "run.sh", &record, true);
     // The crash: the bytes landed, the exec bit never did.
     let out_path = root.path().join("run.sh");
     std::fs::write(&out_path, content).unwrap();
@@ -2727,11 +2755,15 @@ fn repair_does_not_prove_a_version_whose_mode_disk_never_got() {
         MaterializationExecutionPort::has_usable_materialized_generation(&state, GROUP, "run.sh")
             .unwrap();
     assert!(
-        !(proven && disk_mode != 0o755),
-        "repair proved a version whose mode is 0o755 over a file whose mode is {disk_mode:o}"
+        !(proven && disk_mode & 0o100 == 0),
+        "repair proved an executable version over a file whose mode is {disk_mode:o}"
     );
     assert_eq!(std::fs::read(&out_path).unwrap(), content);
-    assert_eq!(disk_mode, 0o755, "repair finishes the write by applying the version's mode");
+    assert_eq!(
+        disk_mode,
+        yadorilink_local_storage::mode_with_exec(default_new_file_mode(root.path()), true, false),
+        "repair finishes the write by applying the version's execute flag"
+    );
     assert!(proven, "and then proves what it wrote");
 }
 
@@ -3641,166 +3673,6 @@ mod path_local_failure_tests {
     }
 }
 
-/// Runs a startup repair over one Hydrated row with an open intent, carrying
-/// `mode` and `xattrs`, and reports what it reconstructed.
-#[cfg(target_os = "linux")]
-fn repair_one_with_metadata(
-    mode: u32,
-    xattrs: &[(String, Vec<u8>)],
-) -> (ReplicaCoordinator, tempfile::TempDir, Vec<String>) {
-    let store_dir = tempfile::tempdir().unwrap();
-    let store = SegmentBlockStore::new(store_dir.path()).unwrap();
-    let content = b"rebuilt with replicated metadata";
-    let hash = hex::decode(store.put(content).unwrap()).unwrap();
-    let state = ReplicaCoordinator::open_in_memory().unwrap();
-    let root = tempfile::tempdir().unwrap();
-    adopt_root(&state, "group-1", root.path());
-    let permit = RootCommitPermit::for_tests();
-    upsert_hydrated_file(&state, "group-1", &record_with_blocks("doc.txt", content, hash), &permit);
-    state.file_index_repository().set_unix_mode("group-1", "doc.txt", Some(mode), &permit).unwrap();
-    state.file_index_repository().set_xattrs("group-1", "doc.txt", xattrs, &permit).unwrap();
-    state
-        .materialization_intent_repository()
-        .begin_materialization_intent("group-1", "doc.txt", &[0; 32], &permit)
-        .unwrap();
-    let report = repair_interrupted_materializations(
-        &state,
-        &store,
-        root.path(),
-        "group-1",
-        RepairMode::Startup,
-        &permit,
-    )
-    .unwrap();
-    (state, root, report.reconstructed)
-}
-
-/// Repair's reconstruct must not publish an exact proof when the replicated
-/// attributes it set cannot be confirmed (a name the kernel rejects makes the
-/// set fail silently), even though its bytes and mode landed.
-#[cfg(target_os = "linux")]
-#[test]
-fn a_repair_reconstruct_publishes_no_proof_when_its_xattrs_cannot_be_confirmed() {
-    let unsettable = vec![(format!("user.{}", "a".repeat(300)), b"v".to_vec())];
-
-    let (state, _root, reconstructed) = repair_one_with_metadata(0o644, &unsettable);
-
-    assert!(reconstructed.is_empty(), "an unproven reconstruct must not be reported as done");
-    assert!(!MaterializationExecutionPort::has_usable_materialized_generation(
-        &state, "group-1", "doc.txt"
-    )
-    .unwrap());
-}
-
-/// The positive half: valid attributes with a final owner-unreadable mode
-/// reach the proof, on the check taken before the mode was applied.
-#[cfg(target_os = "linux")]
-#[test]
-fn a_repair_reconstruct_to_an_owner_unreadable_mode_reaches_a_proof_with_its_xattr() {
-    use std::os::unix::fs::PermissionsExt;
-    let xattrs = vec![("user.test".to_string(), b"value".to_vec())];
-
-    let (state, root, reconstructed) = repair_one_with_metadata(0o200, &xattrs);
-
-    assert_eq!(reconstructed, vec!["doc.txt"]);
-    assert!(MaterializationExecutionPort::has_usable_materialized_generation(
-        &state, "group-1", "doc.txt"
-    )
-    .unwrap());
-    let out_path = root.path().join("doc.txt");
-    assert_eq!(std::fs::metadata(&out_path).unwrap().permissions().mode() & 0o777, 0o200);
-    std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    assert_eq!(
-        yadorilink_local_storage::read_replicated_xattrs(&std::fs::File::open(&out_path).unwrap()),
-        xattrs
-    );
-}
-
-/// Journals a restore of `doc.txt` whose version carries `mode` and
-/// `xattrs`, leaves only its bytes on disk (as a process that died after
-/// the rename and before applying the metadata would), then lets `prepare`
-/// adjust the file and runs startup restore recovery.
-#[cfg(target_os = "linux")]
-fn recover_restore_with_metadata(
-    mode: u32,
-    xattrs: &[(String, Vec<u8>)],
-    prepare: impl FnOnce(&Path),
-) -> ReplicaCoordinator {
-    let content = b"restored bytes left behind by a crash";
-    let hash = <sha2::Sha256 as sha2::Digest>::digest(content).to_vec();
-    let state = ReplicaCoordinator::open_in_memory().unwrap();
-    let root = tempfile::tempdir().unwrap();
-    adopt_root(&state, "group-1", root.path());
-    let permit = RootCommitPermit::for_tests();
-    state
-        .restore_operation_repository()
-        .record_restore_operation(&yadorilink_replica_domain::session_state::RestoreOperation {
-            operation_id: "op-1".to_string(),
-            group_id: "group-1".to_string(),
-            path: "doc.txt".to_string(),
-            target_version_seq: 1,
-            expected_current_version_seq: None,
-            state: yadorilink_replica_domain::session_state::RestoreOperationState::DiskCommitted,
-            record: record_with_blocks("doc.txt", content, hash),
-            origin_device_id: "device-a".to_string(),
-            meta: LocalFileMetaColumns {
-                record_kind: RecordKind::File,
-                symlink_target: None,
-                symlink_out_of_root: false,
-                unix_mode: Some(mode),
-                xattrs: xattrs.to_vec(),
-            },
-        })
-        .unwrap();
-    let out_path = root.path().join("doc.txt");
-    std::fs::write(&out_path, content).unwrap();
-    prepare(&out_path);
-
-    yadorilink_filesystem_sync::materialization_repair::reconcile_restore_operations(
-        &state,
-        root.path(),
-        "group-1",
-        &permit,
-    )
-    .unwrap();
-    state
-}
-
-/// Recovery re-verified only the bytes, then published an exact proof for a
-/// version whose mode and xattrs were never applied. It must re-prove them
-/// from disk and publish nothing when they do not match.
-#[cfg(target_os = "linux")]
-#[test]
-fn restore_recovery_publishes_no_proof_for_metadata_it_cannot_prove() {
-    let xattrs = vec![("user.test".to_string(), b"value".to_vec())];
-
-    let state = recover_restore_with_metadata(0o640, &xattrs, |_| {});
-
-    assert!(!MaterializationExecutionPort::has_usable_materialized_generation(
-        &state, "group-1", "doc.txt"
-    )
-    .unwrap());
-}
-
-/// The positive half: when the bytes, the mode and the xattrs on disk are
-/// all the journaled version's, recovery publishes its proof.
-#[cfg(target_os = "linux")]
-#[test]
-fn restore_recovery_proves_a_file_whose_metadata_matches() {
-    use std::os::unix::fs::PermissionsExt;
-    let xattrs = vec![("user.test".to_string(), b"value".to_vec())];
-
-    let state = recover_restore_with_metadata(0o640, &xattrs, |out_path| {
-        yadorilink_local_storage::apply_xattrs(out_path, &xattrs).unwrap();
-        std::fs::set_permissions(out_path, std::fs::Permissions::from_mode(0o640)).unwrap();
-    });
-
-    assert!(MaterializationExecutionPort::has_usable_materialized_generation(
-        &state, "group-1", "doc.txt"
-    )
-    .unwrap());
-}
-
 /// Eviction's removal races a user. The hook acts after eviction's last check
 /// of the object and before it detaches it.
 #[cfg(not(windows))]
@@ -4307,6 +4179,113 @@ fn a_repair_reconstruct_that_fails_after_its_rename_keeps_the_object_and_the_int
             .unwrap(),
         "the intent must stay open so the next pass retries the metadata"
     );
+}
+
+/// A repair that rebuilt a file and then failed before proving it leaves the intent open over
+/// bytes that are really there. The rebuild recorded its placement, so a user who deletes the
+/// file and restarts keeps their delete: the next repair must not rebuild it again.
+#[cfg(unix)]
+#[test]
+fn a_delete_after_a_repair_reconstructs_placement_stands_across_a_restart() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = SegmentBlockStore::new(store_dir.path()).unwrap();
+    let content = b"rebuilt by repair, then deleted by the user";
+    let hash = hex::decode(store.put(content).unwrap()).unwrap();
+    let state = ReplicaCoordinator::open_in_memory().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    adopt_root(&state, "group-1", root.path());
+    let permit = RootCommitPermit::for_tests();
+    upsert_hydrated_file(&state, "group-1", &record_with_blocks("doc.txt", content, hash), &permit);
+    state
+        .materialization_intent_repository()
+        .begin_materialization_intent("group-1", "doc.txt", &[0; 32], &permit)
+        .unwrap();
+
+    yadorilink_filesystem_sync::materialization_repair::set_fail_after_rename_for_test(true);
+    let _ = repair_interrupted_materializations(
+        &state,
+        &store,
+        root.path(),
+        "group-1",
+        RepairMode::Startup,
+        &permit,
+    )
+    .unwrap();
+    yadorilink_filesystem_sync::materialization_repair::set_fail_after_rename_for_test(false);
+    assert!(root.path().join("doc.txt").exists(), "setup: the rebuild placed the bytes");
+    assert!(
+        state
+            .materialization_intent_repository()
+            .has_materialization_intent("group-1", "doc.txt")
+            .unwrap(),
+        "setup: the intent is still open"
+    );
+
+    std::fs::remove_file(root.path().join("doc.txt")).unwrap();
+    let report = repair_interrupted_materializations(
+        &state,
+        &store,
+        root.path(),
+        "group-1",
+        RepairMode::Startup,
+        &permit,
+    )
+    .unwrap();
+
+    assert!(!root.path().join("doc.txt").exists(), "the user's delete was undone: {report:?}");
+    assert!(report.reconstructed.is_empty(), "{report:?}");
+}
+
+/// A symlink or explicit directory whose repair rebuild recorded its placement, or whose write
+/// did, and which the user then removed, is not rebuilt by the next repair.
+#[cfg(unix)]
+#[test]
+fn a_removed_symlink_under_a_landed_write_is_not_rebuilt() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = SegmentBlockStore::new(store_dir.path()).unwrap();
+    let state = ReplicaCoordinator::open_in_memory().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    adopt_root(&state, "group-1", root.path());
+    let permit = RootCommitPermit::for_tests();
+    let record = FileRecord {
+        path: "link".to_string(),
+        size: 0,
+        mtime_unix_nanos: 0,
+        blocks: vec![],
+        deleted: false,
+    };
+    upsert_hydrated_file(&state, "group-1", &record, &permit);
+    state
+        .file_index_repository()
+        .set_record_kind("group-1", "link", RecordKind::Symlink, &permit)
+        .unwrap();
+    state.file_index_repository().set_symlink_target("group-1", "link", Some(b"target")).unwrap();
+    state
+        .materialization_intent_repository()
+        .begin_materialization_intent("group-1", "link", &[0; 32], &permit)
+        .unwrap();
+    let generation = state.dag_bump_mutation_fence("group-1", "link", "test_write").unwrap();
+    state
+        .materialization_intent_repository()
+        .mark_write_landed("group-1", "link", generation, &permit)
+        .unwrap();
+    // The link was placed and then removed by the user: nothing is on disk.
+
+    let report = repair_interrupted_materializations(
+        &state,
+        &store,
+        root.path(),
+        "group-1",
+        RepairMode::Startup,
+        &permit,
+    )
+    .unwrap();
+
+    assert!(
+        std::fs::symlink_metadata(root.path().join("link")).is_err(),
+        "the removed symlink was rebuilt: {report:?}"
+    );
+    assert!(report.reconstructed.is_empty(), "{report:?}");
 }
 
 /// A block store whose first read takes the root's marker away: the volume

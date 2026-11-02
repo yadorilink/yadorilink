@@ -48,10 +48,9 @@ fn version_for(seed: i64) -> FileVersion {
         0,
         FileMeta {
             mtime_unix_nanos: seed + 1,
-            unix_mode: None,
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     )
 }
@@ -111,7 +110,7 @@ fn open_in_tx(
         &record,
         "device-peer",
         None,
-        None,
+        None, yadorilink_sync_sqlite::retention::Retention::OwnEdit,
     )?;
     yadorilink_sync_sqlite::MaterializationStateRepository::set_materialization_state_in_tx(
         tx,

@@ -4,6 +4,7 @@
 #
 #   sudo yadorilink-svc login --device
 #   sudo yadorilink-svc status
+#   sudo yadorilink-svc health     # exit 0 only if the daemon answers (monitoring)
 #
 # Needed because the daemon's control socket and credentials are owner-only
 # (the `yadorilink` account), and the CLI must use the same state directory
@@ -52,11 +53,17 @@ case "${1:-} ${2:-}" in
     ;;
 esac
 
+BIN=${YADORILINK_BIN:-/usr/bin/yadorilink}
+if [ "${1:-}" = "health" ] && [ "$#" -eq 1 ]; then
+    BIN=${YADORILINK_DAEMON_BIN:-/usr/bin/yadorilink-daemon}
+    set -- --healthcheck
+fi
+
 # Well-formed YADORILINK_* assignments from the env file, one per line.
 vars=$(grep -E '^YADORILINK_[A-Z_]+=[^[:space:]]*$' "$ENV_FILE" || true)
 set -f
 # shellcheck disable=SC2086  # one assignment per line, intentional word splitting
-set -- $vars HOME=/nonexistent "${YADORILINK_BIN:-/usr/bin/yadorilink}" "$@"
+set -- $vars HOME=/nonexistent "$BIN" "$@"
 set +f
 
 if [ "$(id -un)" = "$SERVICE_USER" ]; then

@@ -23,6 +23,7 @@
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
+use yadorilink_peer_session::service_rpc::ProofAnswer;
 
 use yadorilink_filesystem_sync::materialization_execution::MaterializationExecutionPort;
 use yadorilink_replica_domain::file::VersionBlock;
@@ -60,6 +61,12 @@ fn next_pass_after(unfinished: bool, holds_remaining: bool) -> Option<Duration> 
     } else {
         None
     }
+}
+
+enum GrantRecord {
+    Granted,
+    Untrusted,
+    Failed,
 }
 
 impl DaemonState {
@@ -134,7 +141,7 @@ impl DaemonState {
                                 )
                                 .await
                         }
-                        None => false,
+                        None => ProofAnswer::NotHeld,
                     }
                 }
             },
@@ -155,52 +162,102 @@ impl DaemonState {
     ) -> Option<CustodyStamp>
     where
         F: Fn(&str, AttemptToken) -> Fut,
-        Fut: Future<Output = bool>,
+        Fut: Future<Output = ProofAnswer>,
     {
         let holds = self.replica_coordinator.remote_custody_hold_repository();
-        tokio::time::timeout(VERSION_PRESENT_QUERY_OVERALL_TIMEOUT, async {
-            let deadline = tokio::time::Instant::now() + VERSION_PRESENT_QUERY_OVERALL_TIMEOUT;
-            let count = peers.len();
-            for (index, peer_id) in peers.into_iter().enumerate() {
-                let hold = HoldKey {
-                    group_id: group_id.to_string(),
-                    path: path.to_string(),
-                    version_hash: version_hash.0,
-                    peer_id: peer_id.clone(),
-                };
-                // A new attempt gets a new token; a hold that already exists keeps
-                // the token of its first attempt, which is the one a release names.
-                let token = match holds.record_requested(&hold, epoch, rand::random()) {
-                    Ok(token) => token,
-                    Err(error) => {
-                        tracing::warn!(%error, "could not record a custody hold; not asking for custody");
-                        return None;
+        tokio::time::timeout(crate::custody_wait::WAIT_OUTER_BOUND, async {
+            let first_window = tokio::time::Instant::now() + VERSION_PRESENT_QUERY_OVERALL_TIMEOUT;
+            let mut candidates = peers;
+            let mut pause = crate::custody_wait::FIRST_PAUSE;
+            let mut in_progress: std::collections::HashSet<String> = Default::default();
+            let mut _shown = None;
+            // Rounds: every candidate is asked once per round, so a peer that is still checking
+            // its copy does not keep a peer that would grant at once from being asked. Only the
+            // peers that answered "in progress" are asked again, after a growing pause.
+            loop {
+                let count = candidates.len();
+                for (index, peer_id) in std::mem::take(&mut candidates).into_iter().enumerate() {
+                    let hold = HoldKey {
+                        group_id: group_id.to_string(),
+                        path: path.to_string(),
+                        version_hash: version_hash.0,
+                        peer_id: peer_id.clone(),
+                    };
+                    // A new attempt gets a new token; a hold that already exists keeps
+                    // the token of its first attempt, which is the one a release names, and
+                    // which every repeat of the ask carries: acquiring is idempotent per token.
+                    let token = match holds.record_requested(&hold, epoch, rand::random()) {
+                        Ok(token) => token,
+                        Err(error) => {
+                            tracing::warn!(%error, "could not record a custody hold; not asking for custody");
+                            return None;
+                        }
+                    };
+                    // A candidate that times out may still have committed; its `requested` row
+                    // is what lets the reconciler release that. Each candidate gets an equal
+                    // share of what remains of the first window, so a silent one cannot use up
+                    // the time the later ones need, with a short ask of its own at the least.
+                    let budget = (first_window
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        / (count - index) as u32)
+                        .max(std::time::Duration::from_secs(2));
+                    let answer =
+                        match tokio::time::timeout(budget, send_acquire(&peer_id, token)).await {
+                            Ok(answer) => answer,
+                            // It said it was checking and a later reply was lost: still checking.
+                            Err(_) if in_progress.contains(&peer_id) => ProofAnswer::InProgress,
+                            Err(_) => ProofAnswer::NotHeld,
+                        };
+                    match answer {
+                        // A grant from a peer that may no longer be trusted is not custody.
+                        ProofAnswer::Held => match self.record_grant(&hold, epoch) {
+                            GrantRecord::Granted => {
+                                return Some(CustodyStamp::new(peer_id, epoch));
+                            }
+                            GrantRecord::Untrusted => {}
+                            GrantRecord::Failed => return None,
+                        },
+                        ProofAnswer::InProgress => {
+                            in_progress.insert(peer_id.clone());
+                            candidates.push(peer_id);
+                        }
+                        ProofAnswer::NotHeld => {}
                     }
-                };
-                // A candidate that times out may still have committed; its
-                // `requested` row is what lets the reconciler release that.
-                // Each candidate gets an equal share of what remains, so a
-                // silent one cannot use up the time the later ones need, and
-                // the last gets all that is left.
-                let budget = deadline.saturating_duration_since(tokio::time::Instant::now())
-                    / (count - index) as u32;
-                let granted =
-                    tokio::time::timeout(budget, send_acquire(&peer_id, token)).await.unwrap_or(false);
-                if granted
-                    && self.authority.membership_generation() == epoch
-                    && self.peer_may_hold_custody(&peer_id, group_id)
-                {
-                    if let Err(error) = holds.mark_granted(&hold) {
-                        tracing::warn!(%error, "could not record a granted custody hold");
-                        return None;
-                    }
-                    return Some(CustodyStamp::new(peer_id, epoch));
                 }
+                if candidates.is_empty() {
+                    return None;
+                }
+                if _shown.is_none() {
+                    _shown = Some(self.telemetry.begin_transfer(
+                        group_id,
+                        format!("checking copies on {}", candidates.join(", ")),
+                        0,
+                        0,
+                    ));
+                }
+                tokio::time::sleep(pause).await;
+                pause = crate::custody_wait::longer_pause(pause);
             }
-            None
         })
         .await
         .unwrap_or(None)
+    }
+
+    /// Records a peer's grant as `granted` if the peer is still trusted for the group and the
+    /// membership has not changed since the ask was made.
+    fn record_grant(&self, hold: &HoldKey, epoch: u64) -> GrantRecord {
+        if self.authority.membership_generation() != epoch
+            || !self.peer_may_hold_custody(&hold.peer_id, &hold.group_id)
+        {
+            return GrantRecord::Untrusted;
+        }
+        match self.replica_coordinator.remote_custody_hold_repository().mark_granted(hold) {
+            Ok(()) => GrantRecord::Granted,
+            Err(error) => {
+                tracing::warn!(%error, "could not record a granted custody hold");
+                GrantRecord::Failed
+            }
+        }
     }
 
     /// One reconciler pass over every hold. Returns whether some hold could

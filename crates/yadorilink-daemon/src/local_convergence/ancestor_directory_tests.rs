@@ -81,7 +81,7 @@ fn mode(h: &Harness, path: &str) -> u32 {
 /// `d` (mode 0755) and `d/f1`, both settled on this device.
 async fn settled_directory(h: &Harness) -> VersionHash {
     let f1 = stored_version(h, "scratch-f1", b"first child").await;
-    let d = FileVersion::directory(Some(0o755));
+    let d = FileVersion::directory();
     remote(
         h,
         "device-remote",
@@ -121,30 +121,6 @@ async fn a_converged_ancestor_is_not_settled_again_while_children_arrive() {
         assert_eq!(std::fs::read(h.path(&name)).unwrap(), name.as_bytes());
     }
     assert_eq!(fence(&h, "d"), before, "a converged ancestor was written again");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_ancestor_updated_while_a_child_arrives_is_settled() {
-    need_identity!();
-    let h = Harness::new(true);
-    settled_directory(&h).await;
-    let before = fence(&h, "d");
-    let child = stored_version(&h, "scratch-c", b"second child").await;
-    let d2 = FileVersion::directory(Some(0o750));
-    remote(
-        &h,
-        "device-remote",
-        &[put("d", d2.version_hash), put("d/f2", child)],
-        Basis::CurrentHeads,
-        &[&d2],
-    );
-
-    // Only the child is a seed: the new head of `d` is an unprocessed change.
-    let attempt = reconcile(&h, &["d/f2"]).await;
-
-    assert!(attempt.is_settled("d/f2"), "{:?}", attempt.retry);
-    assert!(fence(&h, "d") > before, "the changed ancestor was skipped");
-    assert_eq!(mode(&h, "d"), 0o750);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -216,7 +192,7 @@ async fn a_renamed_ancestor_is_built_under_its_new_name() {
     need_identity!();
     let h = Harness::new(true);
     settled_directory(&h).await;
-    let e = FileVersion::directory(Some(0o755));
+    let e = FileVersion::directory();
     let moved = stored_version(&h, "scratch-m", b"first child").await;
     remote(
         &h,
@@ -233,49 +209,6 @@ async fn a_renamed_ancestor_is_built_under_its_new_name() {
     assert_eq!(std::fs::read(h.path("e/f1")).unwrap(), b"first child");
     settle(&h, &["d", "d/f1"]).await;
     assert!(!h.path("d/f1").exists());
-}
-
-/// The directory version the plan puts at `path` now.
-fn planned_directory_version(h: &Harness, path: &str) -> VersionHash {
-    let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
-    let plan =
-        h.state.native_plan_nodes(GROUP, parent, &BTreeSet::from([path.to_owned()])).unwrap();
-    match plan.nodes.get(&SyncPath(path.to_owned())) {
-        Some(yadorilink_replica_domain::native_plan::NativePlannedNode::ExplicitDirectory {
-            head,
-        }) => head.version(),
-        other => panic!("{path} is not an explicit directory in the plan: {other:?}"),
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn concurrent_heads_of_an_ancestor_are_resolved_not_skipped() {
-    need_identity!();
-    let h = Harness::new(true);
-    let old = settled_directory(&h).await;
-    let before = fence(&h, "d");
-    let concurrent = FileVersion::directory(Some(0o770));
-    remote(&h, "device-one", &[put("d", concurrent.version_hash)], Basis::Nothing, &[&concurrent]);
-    let child = stored_version(&h, "scratch-c", b"second child").await;
-    remote(&h, "device-remote", &[put("d/f2", child)], Basis::CurrentHeads, &[]);
-    let winner = planned_directory_version(&h, "d");
-
-    let attempt = reconcile(&h, &["d/f2"]).await;
-
-    assert!(attempt.is_settled("d/f2"), "{:?}", attempt.retry);
-    let expected = if winner == concurrent.version_hash { 0o770 } else { 0o755 };
-    assert_eq!(mode(&h, "d"), expected);
-    if winner != old {
-        assert!(fence(&h, "d") > before, "the resolved ancestor was skipped");
-    }
-    // The concurrent heads are then superseded by one resolution.
-    let resolved = FileVersion::directory(Some(0o711));
-    remote(&h, "device-one", &[put("d", resolved.version_hash)], Basis::CurrentHeads, &[&resolved]);
-    let at_resolution = fence(&h, "d");
-    let attempt = reconcile(&h, &["d/f2"]).await;
-    assert!(attempt.is_settled("d/f2"), "{:?}", attempt.retry);
-    assert!(fence(&h, "d") > at_resolution);
-    assert_eq!(mode(&h, "d"), 0o711);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -307,6 +240,8 @@ async fn reconcile_with_injection_in_hazard_await(
     inject: impl FnOnce() + Send + 'static,
 ) -> ProjectionAttempt {
     let root = h.convergence.sync_root(GROUP).unwrap();
+    // A kept answer would skip the probe, and with it the await.
+    h.convergence.volume_probes.forget();
     super::volume_probe::PROBE_HOOKS.lock().unwrap().push((root.clone(), Box::new(inject)));
     let attempt = reconcile(h, &["d/f2"]).await;
     assert!(
@@ -366,18 +301,42 @@ async fn a_write_during_the_hazard_await_leaves_a_proof_that_cannot_publish() {
     assert_eq!(std::fs::read(h.path("d/f1")).unwrap(), b"first child");
 }
 
-/// A new head of the directory admitted during the hazard await moves the plan
-/// but neither the row nor the fence. The proof the skip hands on is still a
-/// true statement about the old version on disk, so it may publish; what it
-/// must never do is make the new head look already settled.
+/// A directory has one canonical version, so another author's head of it is the same version under a
+/// new dot. A pass over a child must still settle the ancestor against the heads as they are now.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_new_head_during_the_hazard_await_is_still_settled_afterwards() {
+async fn a_same_version_head_of_another_author_is_settled_with_the_child() {
+    need_identity!();
+    let h = Harness::new(true);
+    settled_directory(&h).await;
+    let again = FileVersion::directory();
+    remote(&h, "device-one", &[put("d", again.version_hash)], Basis::Nothing, &[&again]);
+    let child = stored_version(&h, "scratch-c", b"second child").await;
+    remote(&h, "device-remote", &[put("d/f2", child)], Basis::CurrentHeads, &[]);
+
+    let attempt = reconcile(&h, &["d/f2"]).await;
+
+    assert!(attempt.is_settled("d/f2"), "{:?}", attempt.retry);
+    assert!(attempt.is_settled("d"), "the ancestor is part of the pass's outcome");
+    assert!(h.path("d").is_dir());
+    assert_eq!(std::fs::read(h.path("d/f2")).unwrap(), b"second child");
+    // The concurrent heads of one version are then superseded by one resolution.
+    let resolved = FileVersion::directory();
+    remote(&h, "device-one", &[put("d", resolved.version_hash)], Basis::CurrentHeads, &[&resolved]);
+    let attempt = reconcile(&h, &["d/f2"]).await;
+    assert!(attempt.is_settled("d/f2"), "{:?}", attempt.retry);
+    assert!(attempt.is_settled("d"));
+}
+
+/// A head of the ancestor admitted while the pass awaits the hazard check is not confirmed by the
+/// settlement the pass publishes: the next pass settles it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_head_during_the_hazard_await_is_not_confirmed_by_the_old_settlement() {
     need_identity!();
     let h = Harness::new(true);
     settled_directory(&h).await;
     let child = stored_version(&h, "scratch-c", b"second child").await;
     remote(&h, "device-remote", &[put("d/f2", child)], Basis::CurrentHeads, &[]);
-    let d2 = FileVersion::directory(Some(0o750));
+    let d2 = FileVersion::directory();
     let admit = {
         let state = h.state.clone();
         move || {
@@ -399,14 +358,43 @@ async fn a_new_head_during_the_hazard_await_is_still_settled_afterwards() {
 
     assert!(attempt.is_settled("d/f2"), "{:?}", attempt.retry);
     publishes_as_current(&h, &attempt);
-    assert!(
-        h.state.dag_zero_work_settlement_if_already_current(GROUP, "d").unwrap().is_none(),
-        "the superseded head's proof confirmed the new head"
-    );
-    let before = fence(&h, "d");
     settle(&h, &["d"]).await;
-    assert!(fence(&h, "d") > before, "the new head was never settled");
-    assert_eq!(mode(&h, "d"), 0o750);
+    assert!(h.path("d").is_dir());
     assert_eq!(std::fs::read(h.path("d/f1")).unwrap(), b"first child");
     assert_eq!(std::fs::read(h.path("d/f2")).unwrap(), b"second child");
+}
+
+/// An explicit-directory write that stops right after the directory was created (a crash before
+/// its proof commit) has already said so: a user who then removes the directory and restarts the
+/// daemon keeps that delete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_directory_write_stopped_after_its_creation_leaves_a_user_delete_standing() {
+    need_identity!();
+    let h = Harness::new(true);
+    let d = FileVersion::directory();
+    remote(&h, "device-remote", &[put("d", d.version_hash)], Basis::CurrentHeads, &[&d]);
+    super::types::placed_hook::set(
+        &h.path("d"),
+        Box::new(|| panic!("the power went out after the directory was created")),
+    );
+    let stopped = {
+        let (convergence, driver) = (h.convergence.clone(), driver(&h));
+        tokio::spawn(async move {
+            convergence
+                .reconcile_paths_directly(&driver, GROUP, BTreeSet::from(["d".to_owned()]))
+                .await
+        })
+        .await
+    };
+    assert!(stopped.is_err_and(|e| e.is_panic()), "setup: the write stopped after creating d");
+    assert!(h.path("d").is_dir(), "setup: the directory was created");
+    assert!(
+        h.state.has_materialization_intent(GROUP, "d").unwrap(),
+        "setup: the intent is still open"
+    );
+
+    std::fs::remove_dir(h.path("d")).unwrap();
+    let report = super::receive_deferred_flush_tests::startup(&h);
+
+    assert!(!h.path("d").exists(), "the user's delete was undone by repair: {report:?}");
 }

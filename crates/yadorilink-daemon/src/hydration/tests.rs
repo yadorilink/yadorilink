@@ -881,7 +881,6 @@ async fn hydrate_of_an_already_hydrated_path_is_a_no_op_and_never_touches_disk()
 #[cfg(unix)]
 #[tokio::test]
 async fn a_proof_healed_over_matching_disk_reports_no_download() {
-    use std::os::unix::fs::PermissionsExt;
     let (state, _store_dir) = test_state();
     let root = tempfile::tempdir().unwrap();
     state
@@ -913,14 +912,14 @@ async fn a_proof_healed_over_matching_disk_reports_no_download() {
         &root.path().join(PATH),
         &permit,
     );
-    // The bump records the mode disk already has, so only the version moves.
-    let disk_mode =
-        std::fs::metadata(root.path().join(PATH)).unwrap().permissions().mode() & 0o7777;
-    state
-        .replica_coordinator
-        .file_index_repository()
-        .set_unix_mode(GROUP, PATH, Some(disk_mode), &permit)
-        .unwrap();
+    // The bump records the execute flag disk already has, so only the version moves. The flag
+    // starts out not set on a freshly written file, so it is recorded as set on the file with `x`.
+    state.replica_coordinator.file_index_repository().set_exec(GROUP, PATH, true, &permit).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(root.path().join(PATH), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
     assert_ne!(current_version_hash(&state, PATH), stale_version);
 
     let fetched = hydrate_inner(&state, GROUP, PATH, Some(&test_stall())).await.unwrap();
@@ -1252,10 +1251,7 @@ async fn hydrate_applies_the_recorded_unix_mode_after_reconstruct() {
             &permit,
         )
         .unwrap();
-    sync_state
-        .file_index_repository()
-        .set_unix_mode("group-1", "run.sh", Some(0o755), &permit)
-        .unwrap();
+    sync_state.file_index_repository().set_exec("group-1", "run.sh", true, &permit).unwrap();
     sync_state
         .materialization_state_repository()
         .set_materialization_state("group-1", "run.sh", MaterializationState::Remote, &permit)
@@ -1428,11 +1424,6 @@ async fn a_crash_between_the_rename_and_the_commit_settles_on_the_next_attempt()
     );
 }
 
-/// The crash-recovery arm accepts a file whose bytes are the ones the row
-/// names only when its mode is too: an interrupted attempt's leftover that
-/// the user has since `chmod`ed carries a local change, and the attempt's
-/// own metadata apply would revert it. The control, a leftover whose mode
-/// still matches the row, settles as before.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_mode_change_on_a_crash_leftover_is_not_reverted() {
@@ -1440,10 +1431,7 @@ async fn a_mode_change_on_a_crash_leftover_is_not_reverted() {
     for chmodded in [false, true] {
         let (state, sync_state, root_dir, content) = setup_remote_doc().await;
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
-        sync_state
-            .file_index_repository()
-            .set_unix_mode("group-1", "doc.txt", Some(0o644), &permit)
-            .unwrap();
+        sync_state.file_index_repository().set_exec("group-1", "doc.txt", false, &permit).unwrap();
         let out_path = root_dir.path().join("doc.txt");
         let tmp = root_dir.path().join(".doc.txt.hydrating");
         std::fs::write(&tmp, content).unwrap();
@@ -1469,7 +1457,7 @@ async fn a_mode_change_on_a_crash_leftover_is_not_reverted() {
             assert!(dirty, "the refused mode change must be journalled for local capture");
         } else {
             result.unwrap();
-            assert_eq!(mode, 0o644);
+            assert_eq!(mode, 0o644, "the replaced leftover's mode is kept");
             assert!(hydrated);
             assert!(!dirty);
         }
@@ -2488,11 +2476,7 @@ async fn hydrate_reproves_a_row_whose_proof_names_a_superseded_version() {
     // A metadata-only bump: same bytes, new version. Nothing physical
     // happened, so the fence never moved and the old proof is still
     // usable -- it simply describes a version the row has left.
-    state
-        .replica_coordinator
-        .file_index_repository()
-        .set_unix_mode(GROUP, PATH, Some(0o755), &permit)
-        .unwrap();
+    state.replica_coordinator.file_index_repository().set_exec(GROUP, PATH, true, &permit).unwrap();
     let current_version = current_version_hash(&state, PATH);
     assert_ne!(current_version, stale_version, "the bump must move the derived version");
     assert!(
@@ -2532,8 +2516,8 @@ async fn hydrate_reproves_a_row_whose_proof_names_a_superseded_version() {
     {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
-            std::fs::metadata(root.path().join(PATH)).unwrap().permissions().mode() & 0o777,
-            0o755,
+            std::fs::metadata(root.path().join(PATH)).unwrap().permissions().mode() & 0o100,
+            0o100,
             "a proof naming this version claims this mode is on disk, so hydrate has to \
              have put it there"
         );
@@ -2705,6 +2689,69 @@ async fn a_restart_reconciles_stranded_transient_rows_against_the_disk() {
             );
         }
     }
+}
+
+/// A hydration that dies while it fetches blocks has flipped the row to `Hydrating` but has not
+/// yet opened its write intent or bumped the fence: the older version's object and its proof are
+/// untouched. The restart promotes the row to `Present` over that object (the object stands), and
+/// neither repair nor local capture may then treat the older bytes as the user's edit or move them
+/// aside: they are the daemon's own earlier write.
+#[tokio::test]
+async fn a_hydration_that_died_before_its_intent_does_not_turn_the_older_bytes_into_an_edit() {
+    let (state, root, _store_dir) = superseded_proof_fixture().await;
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+    let coordinator = state.replica_coordinator.clone();
+    let on_disk = root.path().join(PATH);
+    let older = std::fs::read(&on_disk).unwrap();
+    coordinator
+        .materialization_state_repository()
+        .set_materialization_state(GROUP, PATH, MaterializationState::Hydrating, &permit)
+        .unwrap();
+    assert!(!coordinator.has_materialization_intent(GROUP, PATH).unwrap(), "setup: no intent");
+
+    let (hydrating, evicting) = coordinator.reset_stale_transient_states();
+    hydrating.unwrap();
+    evicting.unwrap();
+    assert_eq!(
+        coordinator
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, PATH)
+            .unwrap(),
+        Some(MaterializationState::Present),
+        "setup: the object stands, so the row is promoted"
+    );
+
+    let canonical_root = root.path().canonicalize().unwrap();
+    yadorilink_filesystem_sync::materialization_repair::repair_interrupted_materializations(
+        coordinator.as_ref(),
+        &crate::adapters::block_store_ports::BlockStorePortsAdapter::new(state.block_store.clone()),
+        &canonical_root,
+        GROUP,
+        yadorilink_filesystem_sync::materialization_repair::RepairMode::Startup,
+        &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+    )
+    .unwrap();
+    let processor = yadorilink_local_capture::LocalChangeProcessor::new(
+        coordinator.clone(),
+        Arc::new(crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
+            state.block_store.clone(),
+        )),
+        "device-under-test".to_string(),
+        Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
+    );
+    let authored = processor.scan_existing_files(GROUP, &canonical_root).unwrap();
+
+    assert!(
+        !authored.iter().any(|record| record.path == PATH),
+        "capture authored the older bytes over the newer version: {authored:?}"
+    );
+    assert_eq!(std::fs::read(&on_disk).unwrap(), older, "the older object is untouched");
+    let entries: Vec<_> = std::fs::read_dir(root.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.starts_with('.'))
+        .collect();
+    assert_eq!(entries, vec![PATH.to_string()], "repair fabricated a conflict copy");
 }
 
 /// An eviction that crashed after detaching the object leaves it under its
@@ -3110,7 +3157,7 @@ async fn restoring_a_symlink_version_recreates_a_real_symlink_not_an_empty_regul
 
     // Version 2: an ordinary regular file, superseding the symlink.
     let v2_block = put_block(&state, GROUP, b"version two content");
-    let v2 = record_with_blocks(PATH, vec![v2_block], 20);
+    let v2 = record_with_blocks(PATH, vec![v2_block], 19);
     state
         .replica_coordinator
         .file_index_repository()
@@ -3210,7 +3257,7 @@ async fn restoring_a_targetless_symlink_version_fails_before_any_write_or_stamp(
     // Version 2: an ordinary file, to supersede version 1 so restoring
     // back to it is a genuine restore, not a same-version no-op.
     let v2_block = put_block(&state, GROUP, b"version two content");
-    let v2 = record_with_blocks(PATH, vec![v2_block], 20);
+    let v2 = record_with_blocks(PATH, vec![v2_block], 19);
     state
         .replica_coordinator
         .file_index_repository()
@@ -3296,7 +3343,7 @@ async fn hydrate_after_a_symlink_restore_does_not_destroy_it() {
         .unwrap();
 
     let v2_block = put_block(&state, GROUP, b"version two content");
-    let v2 = record_with_blocks(PATH, vec![v2_block], 20);
+    let v2 = record_with_blocks(PATH, vec![v2_block], 19);
     state
         .replica_coordinator
         .file_index_repository()
@@ -3775,11 +3822,7 @@ async fn a_crash_mid_access_hydration_from_hydrated_keeps_an_offline_edit_protec
         &permit,
     );
     // Metadata-only bump: the proof is still usable, about the old version.
-    state
-        .replica_coordinator
-        .file_index_repository()
-        .set_unix_mode(GROUP, PATH, Some(0o755), &permit)
-        .unwrap();
+    state.replica_coordinator.file_index_repository().set_exec(GROUP, PATH, true, &permit).unwrap();
     assert_eq!(
         state
             .replica_coordinator
@@ -3916,206 +3959,6 @@ async fn a_convergence_rehydration_that_fails_after_its_fence_bump_leaves_presen
     assert!(sqlite.dag_usable_proof_names_current_version(GROUP, PATH).unwrap());
 }
 
-/// Seeds one Placeholder row with `mode` and `xattrs`, and hydrates it.
-#[cfg(target_os = "linux")]
-async fn hydrate_one_with_metadata(
-    mode: u32,
-    xattrs: &[(String, Vec<u8>)],
-) -> (Arc<ReplicaCoordinator>, tempfile::TempDir, Result<bool, SyncError>) {
-    let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
-    let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
-    let root_dir = tempfile::tempdir().unwrap();
-    sync_state.link_repository().add_link(&root_dir.path().to_string_lossy(), "group-1").unwrap();
-    yadorilink_root_authority::root_identity::VerifiedRoot::open(
-        root_dir.path(),
-        "group-1",
-        sync_state.as_ref(),
-    )
-    .unwrap();
-    let content = b"hydrated with replicated metadata";
-    let hash = Sha256::digest(content).to_vec();
-    store.put(content).unwrap();
-    sync_state.record_block_provenance("group-1", std::slice::from_ref(&hash)).unwrap();
-    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
-    sync_state
-        .file_index_repository()
-        .upsert_file(
-            "group-1",
-            &yadorilink_replica_domain::file::FileRecord {
-                path: "doc.txt".into(),
-                size: content.len() as u64,
-                mtime_unix_nanos: 0,
-                blocks: vec![BlockInfo { hash, offset: 0, size: content.len() as u32 }],
-                deleted: false,
-            },
-            &permit,
-        )
-        .unwrap();
-    sync_state
-        .file_index_repository()
-        .set_unix_mode("group-1", "doc.txt", Some(mode), &permit)
-        .unwrap();
-    sync_state.file_index_repository().set_xattrs("group-1", "doc.txt", xattrs, &permit).unwrap();
-    sync_state
-        .materialization_state_repository()
-        .set_materialization_state("group-1", "doc.txt", MaterializationState::Remote, &permit)
-        .unwrap();
-    let state = DaemonState::new("device-a".into(), sync_state.clone(), store);
-    state.install_test_root_commit_authority("group-1");
-    let result = hydrate_inner(&state, "group-1", "doc.txt", Some(&test_stall())).await;
-    (sync_state, root_dir, result)
-}
-
-/// Access hydration must not publish an exact proof when the replicated
-/// attributes it set cannot be confirmed, even though the bytes and the mode
-/// landed. A name longer than the kernel accepts makes the set fail silently,
-/// which is exactly the failure the strict in-attempt check exists to catch.
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn hydration_publishes_no_proof_when_its_xattrs_cannot_be_confirmed() {
-    use yadorilink_filesystem_sync::materialization_execution::MaterializationExecutionPort;
-    let unsettable = vec![(format!("user.{}", "a".repeat(300)), b"v".to_vec())];
-
-    let (sync_state, _root, result) = hydrate_one_with_metadata(0o644, &unsettable).await;
-
-    assert!(result.is_err(), "an unconfirmed attribute set must fail the attempt: {result:?}");
-    assert!(
-        !MaterializationExecutionPort::has_usable_materialized_generation(
-            sync_state.as_ref(),
-            "group-1",
-            "doc.txt"
-        )
-        .unwrap(),
-        "no proof may be published for attributes that were not confirmed"
-    );
-}
-
-/// The positive half: valid attributes with a final owner-unreadable mode
-/// reach a proof, on the check taken before the mode was applied.
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn hydration_to_an_owner_unreadable_mode_reaches_a_proof_with_its_xattr() {
-    use std::os::unix::fs::PermissionsExt;
-    use yadorilink_filesystem_sync::materialization_execution::MaterializationExecutionPort;
-    let xattrs = vec![("user.test".to_string(), b"value".to_vec())];
-
-    let (sync_state, root, result) = hydrate_one_with_metadata(0o200, &xattrs).await;
-
-    result.expect("valid attributes and a write-only mode must hydrate");
-    assert!(MaterializationExecutionPort::has_usable_materialized_generation(
-        sync_state.as_ref(),
-        "group-1",
-        "doc.txt"
-    )
-    .unwrap());
-    let out_path = root.path().join("doc.txt");
-    assert_eq!(std::fs::metadata(&out_path).unwrap().permissions().mode() & 0o777, 0o200);
-    std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    assert_eq!(
-        yadorilink_local_storage::read_replicated_xattrs(&std::fs::File::open(&out_path).unwrap()),
-        xattrs
-    );
-}
-
-/// Restores version 1 of `PATH`, whose row carried `mode` and `xattrs`
-/// while it was current, and returns the state for inspection.
-#[cfg(target_os = "linux")]
-async fn restore_v1_with_metadata(
-    mode: u32,
-    xattrs: &[(String, Vec<u8>)],
-) -> (Arc<DaemonState>, tempfile::TempDir, tempfile::TempDir) {
-    let (state, store_dir) = test_state();
-    state.set_device_signing_key(ed25519_dalek::SigningKey::from_bytes(&[23u8; 32]));
-    state.replica_coordinator.set_local_policy_head_provider(Arc::new(|_| Ok([0u8; 32])));
-    let root = tempfile::tempdir().unwrap();
-    let local_path = root.path().to_string_lossy().to_string();
-    state.replica_coordinator.link_repository().add_link(&local_path, GROUP).unwrap();
-    state.install_test_root_commit_authority(GROUP);
-    yadorilink_root_authority::root_identity::VerifiedRoot::open(
-        root.path(),
-        GROUP,
-        state.replica_coordinator.as_ref(),
-    )
-    .unwrap();
-    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
-    let v1_block = put_block(&state, GROUP, b"version one content");
-    let v1 = record_with_blocks(PATH, vec![v1_block], 19);
-    let index = state.replica_coordinator.file_index_repository();
-    index.upsert_file_with_origin(GROUP, &v1, "device-a", &permit).unwrap();
-    index.set_unix_mode(GROUP, PATH, Some(mode), &permit).unwrap();
-    index.set_xattrs(GROUP, PATH, xattrs, &permit).unwrap();
-    let v2_block = put_block(&state, GROUP, b"version two content!!");
-    let v2 = record_with_blocks(PATH, vec![v2_block], 21);
-    index.upsert_file_with_origin(GROUP, &v2, "device-a", &permit).unwrap();
-
-    restore_to_version(&state, GROUP, PATH, 1).await.unwrap();
-    (state, store_dir, root)
-}
-
-/// A restore whose replicated attributes cannot be confirmed (a name the
-/// kernel rejects makes the set fail silently) still happens, but it must
-/// not publish an exact proof or claim to hold the content.
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn a_restore_whose_xattrs_cannot_be_confirmed_publishes_no_proof() {
-    let unsettable = vec![(format!("user.{}", "a".repeat(300)), b"v".to_vec())];
-
-    let (state, _store, _root) = restore_v1_with_metadata(0o644, &unsettable).await;
-
-    assert!(
-        state
-            .replica_coordinator
-            .sqlite()
-            .dag_lookup_materialized_generation(GROUP, PATH)
-            .unwrap()
-            .is_none(),
-        "no proof may be published for attributes that were not confirmed"
-    );
-    assert_ne!(
-        state
-            .replica_coordinator
-            .materialization_state_repository()
-            .get_materialization_state(GROUP, PATH)
-            .unwrap(),
-        Some(MaterializationState::Present),
-        "the row must not claim to hold content it has no proof for"
-    );
-}
-
-/// The positive half: valid attributes with a final owner-unreadable mode
-/// reach the versioned proof, on the check taken before the mode.
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn a_restore_to_an_owner_unreadable_mode_reaches_a_proof_with_its_xattr() {
-    use std::os::unix::fs::PermissionsExt;
-    let xattrs = vec![("user.test".to_string(), b"value".to_vec())];
-
-    let (state, _store, root) = restore_v1_with_metadata(0o200, &xattrs).await;
-
-    assert!(state
-        .replica_coordinator
-        .sqlite()
-        .dag_lookup_materialized_generation(GROUP, PATH)
-        .unwrap()
-        .is_some());
-    assert_eq!(
-        state
-            .replica_coordinator
-            .materialization_state_repository()
-            .get_materialization_state(GROUP, PATH)
-            .unwrap(),
-        Some(MaterializationState::Present)
-    );
-    let out_path = root.path().join(PATH);
-    assert_eq!(std::fs::metadata(&out_path).unwrap().permissions().mode() & 0o777, 0o200);
-    std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    assert_eq!(
-        yadorilink_local_storage::read_replicated_xattrs(&std::fs::File::open(&out_path).unwrap()),
-        xattrs
-    );
-}
-
 /// A group a rebootstrap freezes is not hydrated: the entry refuses it before
 /// any block is fetched or any file is written, and the row stays retryable.
 #[tokio::test]
@@ -4206,6 +4049,44 @@ async fn a_restore_in_a_group_a_rebootstrap_freezes_is_refused() {
         restore_to_version(&state, "group-1", "elsewhere.txt", 1).await,
         Err(SyncError::NotFound(_))
     ));
+}
+
+/// A restore of a version number the device recorded as not kept says why; a number that never
+/// existed here is the plain "not found".
+#[tokio::test]
+async fn a_restore_of_a_version_that_was_not_kept_says_why() {
+    let (state, _store_dir) = test_state();
+    state.install_test_root_commit_authority(GROUP);
+    let root = tempfile::tempdir().unwrap();
+    state
+        .replica_coordinator
+        .link_repository()
+        .add_link(&root.path().to_string_lossy(), GROUP)
+        .unwrap();
+    yadorilink_root_authority::root_identity::VerifiedRoot::open(
+        root.path(),
+        GROUP,
+        state.replica_coordinator.as_ref(),
+    )
+    .unwrap();
+    crate::test_support::record_versions_not_kept(
+        &state.replica_coordinator,
+        GROUP,
+        "doc.txt",
+        2,
+        5,
+    );
+
+    let kept_out = restore_to_version(&state, GROUP, "doc.txt", 3).await;
+    assert!(
+        matches!(&kept_out, Err(SyncError::NotFound(why)) if why.contains("was not kept: the retention period ended")),
+        "{kept_out:?}"
+    );
+    let never = restore_to_version(&state, GROUP, "doc.txt", 9).await;
+    assert!(
+        matches!(&never, Err(SyncError::NotFound(why)) if !why.contains("not kept")),
+        "{never:?}"
+    );
 }
 
 /// Hydration claims its space in the account every other write on the volume
@@ -4455,6 +4336,115 @@ async fn a_failure_after_the_placement_keeps_the_write_intent_open() {
     );
 }
 
+/// A failure after the new bytes were placed leaves the write intent open over bytes that are
+/// really there. The placement said so (the landed mark), so a user who then deletes the file and
+/// restarts the daemon keeps their delete: repair must not read the missing name as a crash and
+/// rebuild the file.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_delete_after_a_hydrations_placement_stands_across_a_restart() {
+    delete_after_a_hydrations_placement(false).await;
+}
+
+/// The same, when another mutator (a capture of the fresh bytes, an edit) moved the fence between
+/// the placement and the proof commit, which is what makes that commit lose and leave the intent
+/// open: the placement was durable, so the later fence move does not make the delete a crash.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_delete_after_a_hydrations_placement_stands_when_the_fence_moved_since() {
+    delete_after_a_hydrations_placement(true).await;
+}
+
+#[cfg(unix)]
+async fn delete_after_a_hydrations_placement(another_mutator_moved_the_fence: bool) {
+    if !yadorilink_fs_platform::fs_capabilities::temp_dir_proves_object_identity_for_test() {
+        return;
+    }
+    let (state, sync_state, root_dir, _old) = setup_legitimately_hydrated_doc().await;
+    let newer = b"the newer version's bytes, longer than the old ones";
+    move_doc_to_newer_version(&state, &sync_state, newer);
+    let doc = root_dir.path().join("doc.txt");
+    FAIL_AFTER_PLACE
+        .lock()
+        .unwrap()
+        .get_or_insert_with(Default::default)
+        .insert(doc.display().to_string());
+
+    let result = hydrate_inner(&state, "group-1", "doc.txt", Some(&test_stall())).await;
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(&doc).unwrap(), newer, "setup: the bytes landed");
+    assert!(
+        sync_state
+            .materialization_intent_repository()
+            .has_materialization_intent("group-1", "doc.txt")
+            .unwrap(),
+        "setup: the intent is still open"
+    );
+
+    // The user deletes the file; the daemon restarts and repairs.
+    if another_mutator_moved_the_fence {
+        sync_state.dag_bump_mutation_fence("group-1", "doc.txt", "other_mutator").unwrap();
+    }
+    std::fs::remove_file(&doc).unwrap();
+    let report =
+        yadorilink_filesystem_sync::materialization_repair::repair_interrupted_materializations(
+            sync_state.as_ref(),
+            &crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
+                state.block_store.clone(),
+            ),
+            &root_dir.path().canonicalize().unwrap(),
+            "group-1",
+            yadorilink_filesystem_sync::materialization_repair::RepairMode::Startup,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+
+    assert!(!doc.exists(), "the user's delete was undone by repair: {report:?}");
+    assert!(report.reconstructed.is_empty(), "{report:?}");
+    assert!(
+        sync_state.is_path_dirty("group-1", "doc.txt").unwrap(),
+        "the removal is journaled so capture authors it"
+    );
+}
+
+/// A hydration whose "landed" mark cannot be recorded fails and settles nothing: no `Present`
+/// claim, no proof, the intent still open.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_landed_mark_that_cannot_be_recorded_fails_the_hydration() {
+    if !yadorilink_fs_platform::fs_capabilities::temp_dir_proves_object_identity_for_test() {
+        return;
+    }
+    let (state, sync_state, _root_dir, _old) = setup_legitimately_hydrated_doc().await;
+    move_doc_to_newer_version(
+        &state,
+        &sync_state,
+        b"the newer version's bytes, longer than the old ones",
+    );
+    sync_state
+        .database()
+        .write(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER refuse_landed_mark BEFORE UPDATE OF mutation_generation ON materialization_intents \
+         WHEN OLD.mutation_generation IS NULL AND NEW.mutation_generation IS NOT NULL \
+         BEGIN SELECT RAISE(ABORT, 'landed mark refused'); END;",
+            )?;
+            Ok::<_, yadorilink_sync_sqlite::SyncSqliteError>(())
+        })
+        .unwrap();
+
+    let result = hydrate_inner(&state, "group-1", "doc.txt", Some(&test_stall())).await;
+
+    assert!(result.is_err(), "the hydration settled without recording its placement");
+    assert!(
+        sync_state
+            .materialization_intent_repository()
+            .has_materialization_intent("group-1", "doc.txt")
+            .unwrap(),
+        "the intent stays open"
+    );
+}
+
 /// An editor's atomic save -- new bytes written to a sibling, the original
 /// mtime restored, the sibling renamed over the file -- that lands on the
 /// exact size of the indexed bytes is invisible to a size+mtime comparison
@@ -4636,6 +4626,210 @@ mod pin {
         let result = adapter.evict("group-1", "doc.txt");
 
         assert!(is_pin_refusal(&result), "{result:?}");
+        assert_eq!(std::fs::read(root_dir.path().join("doc.txt")).unwrap(), content);
+        assert_eq!(materialization(&sync_state, "doc.txt"), Some(MaterializationState::Present));
+    }
+
+    /// A received file that exists only in the folder (its blocks were never put in the store) is
+    /// put into the store before Free Up Space drops it, whatever the outcome of the rest of the
+    /// eviction: dropping the file would otherwise drop the only local copy.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn freeing_a_file_only_copy_puts_it_in_the_store_first() {
+        let (state, _store_dir) = test_state();
+        let root = tempfile::tempdir().unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .add_link(&root.path().to_string_lossy(), "group-1")
+            .unwrap();
+        state.install_test_root_commit_authority("group-1");
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            root.path(),
+            "group-1",
+            state.replica_coordinator.as_ref(),
+        )
+        .unwrap();
+        state.set_test_on_demand_allowed(true);
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        let content: &[u8] = b"received into the folder, never copied to the store";
+        let hash = Sha256::digest(content).to_vec();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file_with_origin(
+                "group-1",
+                &yadorilink_replica_domain::file::FileRecord {
+                    path: "doc.txt".into(),
+                    size: content.len() as u64,
+                    mtime_unix_nanos: 0,
+                    blocks: vec![BlockInfo {
+                        hash: hash.clone(),
+                        offset: 0,
+                        size: content.len() as u32,
+                    }],
+                    deleted: false,
+                },
+                "device-seed",
+                &permit,
+            )
+            .unwrap();
+        let file = root.path().join("doc.txt");
+        std::fs::write(&file, content).unwrap();
+        crate::test_support::seed_prior_cycle_proof(
+            &state.replica_coordinator,
+            "group-1",
+            "doc.txt",
+            &file,
+            &permit,
+        );
+        let hex_hash = hex::encode(&hash);
+        assert!(!state.block_store.exists(&hex_hash).unwrap());
+        let adapter = DaemonMaterializationAdapter::new(state.clone());
+
+        let result = adapter.evict("group-1", "doc.txt");
+
+        // The eviction may go on to turn the file into a placeholder (where the platform supports
+        // it) or leave it whole; either way the store now holds the exact bytes.
+        assert!(state.block_store.exists(&hex_hash).unwrap(), "{result:?}");
+        assert_eq!(state.block_store.get(&hex_hash).unwrap(), content, "{result:?}");
+    }
+
+    /// A file that exists only in the folder (its blocks were never put in the store, and nothing
+    /// vouches for it as this device's own write) is pinned from the folder: the pin reads it into
+    /// the store and succeeds with no peer connected, instead of asking peers for content this
+    /// device already holds.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pinning_a_file_only_copy_reads_it_into_the_store_without_a_peer() {
+        let (state, _store_dir) = test_state();
+        let root = tempfile::tempdir().unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .add_link(&root.path().to_string_lossy(), "group-1")
+            .unwrap();
+        state.install_test_root_commit_authority("group-1");
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            root.path(),
+            "group-1",
+            state.replica_coordinator.as_ref(),
+        )
+        .unwrap();
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        let content: &[u8] = b"received into the folder, never copied to the store";
+        let hash = Sha256::digest(content).to_vec();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file(
+                "group-1",
+                &yadorilink_replica_domain::file::FileRecord {
+                    path: "doc.txt".into(),
+                    size: content.len() as u64,
+                    mtime_unix_nanos: 0,
+                    blocks: vec![BlockInfo {
+                        hash: hash.clone(),
+                        offset: 0,
+                        size: content.len() as u32,
+                    }],
+                    deleted: false,
+                },
+                &permit,
+            )
+            .unwrap();
+        std::fs::write(root.path().join("doc.txt"), content).unwrap();
+        state
+            .replica_coordinator
+            .materialization_state_repository()
+            .set_materialization_state("group-1", "doc.txt", MaterializationState::Present, &permit)
+            .unwrap();
+        let hex_hash = hex::encode(&hash);
+        assert!(!state.block_store.exists(&hex_hash).unwrap());
+        let adapter = DaemonMaterializationAdapter::new(state.clone());
+
+        let outcome = adapter.pin("group-1", "doc.txt").await.unwrap();
+
+        assert_eq!(outcome.download_error, None, "{outcome:?}");
+        assert_eq!(outcome.history_not_kept_reason, None, "{outcome:?}");
+        assert_eq!(state.block_store.get(&hex_hash).unwrap(), content);
+        assert_eq!(std::fs::read(root.path().join("doc.txt")).unwrap(), content);
+    }
+
+    /// A custody oracle whose store residency answer is fixed.
+    struct ResidencyIs(yadorilink_replica_engine::custody::StoreResidency);
+
+    impl yadorilink_replica_engine::custody::FullReplicaCustody for ResidencyIs {
+        fn confirm_exact_version(
+            &self,
+            _: &str,
+            _: &str,
+            _: &yadorilink_replica_domain::ids::VersionHash,
+            _: &[yadorilink_replica_domain::file::VersionBlock],
+        ) -> Option<yadorilink_replica_engine::custody::CustodyStamp> {
+            None
+        }
+
+        fn confirmation_still_valid(
+            &self,
+            _: &str,
+            _: &str,
+            _: &yadorilink_replica_domain::ids::VersionHash,
+            _: &yadorilink_replica_engine::custody::CustodyStamp,
+        ) -> bool {
+            false
+        }
+
+        fn ensure_version_in_store(
+            &self,
+            _: &str,
+            _: &str,
+            _: &std::path::Path,
+            _: &[BlockInfo],
+        ) -> yadorilink_replica_engine::custody::StoreResidency {
+            self.0.clone()
+        }
+    }
+
+    /// An eviction whose file could not be put into the store, or is not the version, frees
+    /// nothing: the file stays a present, whole file, and a failure says why.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn freeing_a_file_that_cannot_be_put_in_the_store_leaves_it_whole() {
+        use yadorilink_replica_engine::custody::StoreResidency;
+        let (state, sync_state, root_dir, content) = setup_legitimately_hydrated_doc().await;
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        let reclamation = crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
+            state.block_store.clone(),
+        );
+        let root = root_dir.path().canonicalize().unwrap();
+        let evict_with = |residency: StoreResidency| {
+            evict_file(
+                MaterializationContext {
+                    state: sync_state.as_ref(),
+                    liveness_gate: state.block_liveness_gate(),
+                    store: &reclamation,
+                    root: &root,
+                    permit: &permit,
+                },
+                "group-1",
+                "doc.txt",
+                false,
+                &ResidencyIs(residency),
+            )
+        };
+
+        let failed = evict_with(StoreResidency::Failed("no room".into()));
+        assert!(
+            matches!(&failed, Err(error) if error.to_string().contains("no room")),
+            "{failed:?}"
+        );
+        let different = evict_with(StoreResidency::NotTheVersion).unwrap();
+        assert!(!different.dehydrated);
+        assert_eq!(
+            different.not_freed,
+            Some(yadorilink_filesystem_sync::materialization_eviction::NotFreed::DiffersFromSynced)
+        );
         assert_eq!(std::fs::read(root_dir.path().join("doc.txt")).unwrap(), content);
         assert_eq!(materialization(&sync_state, "doc.txt"), Some(MaterializationState::Present));
     }

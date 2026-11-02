@@ -36,6 +36,10 @@ message SendManifest {
   repeated SendFileEntry files = 2;
   uint64 total_size = 3;
   int64 offered_at_unix_nanos = 4;
+  // The Send link this offer was made under ("link:<id>" sends), empty for a plain device-to-device
+  // send. The sender's claim, like the rest of the manifest: the receiver acts on it only for a
+  // link it redeemed itself and only after the grant was consumed (see the daemon's `send_transfer`).
+  string link_id = 5;
 }
 
 // The receiving device's reply to a `SendManifest`, on the same stream.
@@ -66,6 +70,27 @@ message TransferDone {
   string transfer_id = 1;
 }
 
+// Sent by the receiving device to the sender when a transfer it accepted ended without
+// completing, on its own stream; the sender answers with a `SendManifestAck`. Like
+// `TransferDone` it is informational and grants nothing: it lets the sender's list and its Send
+// link follow what happened at the receiver. A separate message rather than a field of
+// `TransferDone`, so an older sender that does not know it never reads a cancel as a completion.
+message TransferEnded {
+  string transfer_id = 1;
+  Outcome outcome = 2;
+  // For `FAILED`, the closed reason code the receiver recorded (see the daemon's inbox listing);
+  // empty otherwise.
+  string failure = 3;
+
+  enum Outcome {
+    OUTCOME_UNSPECIFIED = 0;
+    // The receiver canceled the transfer; it will not pull it again unless it retries.
+    OUTCOME_CANCELED = 1;
+    // The receive stopped on an error. The receiver may resume it.
+    OUTCOME_FAILED = 2;
+  }
+}
+
 // The very first message an accepting device sends on either kind of
 // stream it can receive -- lets one accept loop dispatch by payload type
 // rather than needing two different framings for the two exchanges.
@@ -74,6 +99,7 @@ message SendEnvelope {
     SendManifest manifest = 1;
     ChunkPullRequest pull = 2;
     TransferDone done = 5;
+    TransferEnded ended = 6;
   }
   // Required (both non-empty) on EVERY `manifest` offer, unconditionally --
   // the coordination plane's short-lived, sender+receiver-bound Track Send

@@ -196,8 +196,9 @@ async fn scenario_e_configured_but_unconfirmed_peer_is_unknown_despite_connectiv
 }
 
 /// A folder linked moments ago has had no custody check yet (the first one
-/// runs on the sweep tick). Its `Unknown` is "checking", not a failure to
-/// confirm; once a round has run, `Unknown`/`AtRisk` stand on their own.
+/// runs on the sweep tick), and the first round usually finds its peers still connecting. Its
+/// `Unknown` is "checking", not a failure to confirm, through that first round; once a second
+/// round has run, `Unknown`/`AtRisk` stand on their own.
 #[tokio::test]
 async fn a_freshly_linked_group_is_checking_until_its_first_custody_round() {
     let state = test_state();
@@ -209,8 +210,12 @@ async fn a_freshly_linked_group_is_checking_until_its_first_custody_round() {
     assert!(views[0].durability_check_pending, "no round has run yet");
 
     state.refresh_custody_confirmation(GROUP).await;
+    let views = reader_for(state.clone()).list_links().unwrap();
+    assert!(views[0].durability_check_pending, "one negative round is still provisional");
+
+    state.refresh_custody_confirmation(GROUP).await;
     let views = reader_for(state).list_links().unwrap();
-    assert!(!views[0].durability_check_pending, "a round ran: nothing is pending any more");
+    assert!(!views[0].durability_check_pending, "two rounds ran: nothing is pending any more");
 }
 
 /// Scenario F: this device itself is a full replica still catching up

@@ -15,8 +15,8 @@ use yadorilink_client_core::dto::{LoginOptions, SignInState};
 use yadorilink_client_core::session::LoginSession;
 use yadorilink_client_core::DesktopError;
 use yadorilink_embedded_host::{
-    AccountCommand, BeginSignIn, CallError, CallOptions, CancelHandle, Command, CommandOutput,
-    EmbeddedHost, LoginEvent, PollSignIn, SignInCancellation, SignInId, SignInStep,
+    AccountCommand, BeginPairingSignIn, BeginSignIn, CallError, CallOptions, CancelHandle, Command,
+    CommandOutput, EmbeddedHost, LoginEvent, PollSignIn, SignInCancellation, SignInId, SignInStep,
 };
 
 mod support;
@@ -213,6 +213,23 @@ fn the_commands_that_need_an_account_say_not_signed_in() {
         AccountCommand::RegisterDevice { name: "phone".into() },
         AccountCommand::DeletionImpact,
         AccountCommand::ListJoinableGroups,
+        AccountCommand::ListPrimaryTransfers,
+        AccountCommand::OfferPrimaryTransfer {
+            group_id: "group".into(),
+            target_device_id: "device".into(),
+        },
+        AccountCommand::CancelPrimaryTransfer {
+            group_id: "group".into(),
+            transfer_id: "transfer".into(),
+        },
+        AccountCommand::AcceptPrimaryTransfer {
+            group_id: "group".into(),
+            transfer_id: "transfer".into(),
+        },
+        AccountCommand::DeclinePrimaryTransfer {
+            group_id: "group".into(),
+            transfer_id: "transfer".into(),
+        },
         AccountCommand::DeletionStatus,
         AccountCommand::RequestDeletion { acknowledge_impact: false },
         AccountCommand::ConfirmDeletion { confirmation_token: "token".into() },
@@ -453,5 +470,48 @@ fn beginning_a_sign_in_stops_the_previous_flow_before_the_new_one_checks() {
         seen_by_precheck.load(Ordering::SeqCst),
         "the new sign-in checked the store while the previous flow could still write"
     );
+    host.stop().unwrap();
+}
+
+/// A code that cannot be one is refused before the running sign-in is touched, names its field
+/// and echoes nothing; and the command never prints the code.
+#[test]
+fn a_malformed_pairing_code_is_refused_and_leaves_the_running_sign_in_alone() {
+    let _serial = serialized();
+    let script = Script::default();
+    let (host, _area) = host_with(&script);
+    let id = begin(&host);
+    assert_eq!(poll(&host, id, 0).unwrap().event, LoginEvent::Enrolling);
+
+    let bad_code = "not-a-code-but-secret".to_owned();
+    let result = account(
+        &host,
+        AccountCommand::BeginPairingSignIn(BeginPairingSignIn {
+            pairing_code: bad_code.clone(),
+            overall_timeout: None,
+        }),
+    );
+    match result {
+        Err(CallError::Account(error)) => match *error {
+            DesktopError::InvalidInput { message, field } => {
+                assert_eq!(field.as_deref(), Some("pairing_code"));
+                assert!(!message.contains("secret"), "{message}");
+            }
+            other => panic!("InvalidInput, got {other:?}"),
+        },
+        other => panic!("a refusal: {other:?}"),
+    }
+    // The first sign-in still runs: releasing it still delivers its next step.
+    script.approve.notify_one();
+    assert!(matches!(poll(&host, id, 1).unwrap().event, LoginEvent::ShowDeviceCode { .. }));
+
+    let rendered = format!(
+        "{:?}",
+        AccountCommand::BeginPairingSignIn(BeginPairingSignIn {
+            pairing_code: "BCDF-GHJK-LMNP".into(),
+            overall_timeout: None,
+        })
+    );
+    assert!(!rendered.contains("BCDF") && !rendered.contains("LMNP"), "{rendered}");
     host.stop().unwrap();
 }

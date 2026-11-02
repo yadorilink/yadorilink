@@ -26,6 +26,7 @@ fn facts(
         any_other_full_replica_peer_configured,
         peer_confirmed_custody,
         ever_confirmation_swept,
+        provisional_first_round: false,
         known_unobtainable_required_content: false,
     }
 }
@@ -61,6 +62,13 @@ fn first_check_pending_only_before_the_first_round_with_trustworthy_facts() {
     let mut swept = fresh.clone();
     swept.ever_confirmation_swept = true;
     assert!(!first_check_pending(&swept), "a round has run: Unknown now stands on its own");
+
+    let mut first_negative = swept.clone();
+    first_negative.provisional_first_round = true;
+    assert!(
+        first_check_pending(&first_negative),
+        "only the first round has run: still connecting, shown as checking"
+    );
 
     let mut confirmed = fresh.clone();
     confirmed.peer_confirmed_custody = true;
@@ -227,6 +235,7 @@ fn on_demand_device_with_confirmed_peer_replica_is_protected() {
         any_other_full_replica_peer_configured: true,
         peer_confirmed_custody: true,
         ever_confirmation_swept: true,
+        provisional_first_round: false,
         known_unobtainable_required_content: false,
     };
     assert_eq!(

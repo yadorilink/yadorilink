@@ -53,7 +53,7 @@ use crate::file_index::version_record;
 /// cannot drift apart in shape.
 const VERSION_ROW_COLUMNS: &str = "path, version_seq, size, mtime_unix_nanos, blocks_json, \
                                    deleted, state, origin_device_id, record_kind, \
-                                   symlink_target, unix_mode, xattrs_json";
+                                   symlink_target, exec";
 
 /// Decodes one `VERSION_ROW_COLUMNS`-shaped row into a [`VersionRecord`],
 /// deriving its `version_hash` through the same
@@ -71,9 +71,8 @@ fn row_to_version_record(row: &rusqlite::Row<'_>) -> Result<VersionRecord, rusql
     let origin_device_id: Option<String> = row.get(7)?;
     let record_kind: String = row.get(8)?;
     let symlink_target: Option<Vec<u8>> = row.get(9)?;
-    let unix_mode: i64 = row.get(10)?;
-    let xattrs_json: String = row.get(11)?;
-    // `version_record` fails closed on a corrupt `blocks_json`/`xattrs_json`
+    let exec: i64 = row.get(10)?;
+    // `version_record` fails closed on a corrupt `blocks_json`
     // column. Surfaced through rusqlite's own callback error channel so a
     // corrupt row aborts the whole listing rather than being skipped -- a
     // plan built from a partially-decoded index would be silently wrong,
@@ -89,8 +88,7 @@ fn row_to_version_record(row: &rusqlite::Row<'_>) -> Result<VersionRecord, rusql
         origin_device_id,
         &record_kind,
         symlink_target,
-        unix_mode,
-        &xattrs_json,
+        exec,
     )
     .map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
@@ -575,6 +573,10 @@ pub fn compute_rewind_plan(
         (HashMap::new(), None)
     };
 
+    // Versions this device recorded as not kept: a time inside such a span is never answered with
+    // the nearest surviving version.
+    let freed = crate::history_freed::spans_by_path(conn, group_id)?;
+
     let mut entries = Vec::with_capacity(now_rows.len());
     // Content of the paths that would go away, and content of the paths that
     // would come back -- the two sides the rename heuristic pairs up. Built
@@ -584,7 +586,21 @@ pub fn compute_rewind_plan(
     let mut created_by_hash: HashMap<VersionHash, Vec<String>> = HashMap::new();
 
     for now in &now_rows {
+        let not_kept = freed
+            .get(now.path.as_str())
+            .and_then(|spans| spans.iter().find(|span| span.covers_time(at_unix_nanos)))
+            .map(|span| match span.reason {
+                crate::history_freed::FreedReason::Expired => {
+                    RewindUnavailableReason::NotKeptExpired
+                }
+                crate::history_freed::FreedReason::LowSpace => {
+                    RewindUnavailableReason::NotKeptLowSpace
+                }
+            });
         let action = match at_t.get(now.path.as_str()) {
+            _ if not_kept.is_some() => {
+                RewindPathAction::Unavailable { reason: not_kept.expect("checked") }
+            }
             Some(then) => classify_with_history(now, then),
             None => classify_without_history(
                 now,

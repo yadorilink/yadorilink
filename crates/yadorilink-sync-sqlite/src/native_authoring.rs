@@ -780,7 +780,6 @@ fn author_forks(
                         .map(|version| VersionInfo {
                             kind: version.meta.record_kind,
                             content: Some(version.content_identity()),
-                            mode_bridge: version.mode_bridge(),
                         });
                 slot.insert(info);
             }
@@ -2157,14 +2156,17 @@ mod tests {
                     1,
                     FileMeta {
                         mtime_unix_nanos: seed,
-                        unix_mode: Some(0o644),
+                        exec: false,
                         symlink_target: None,
                         record_kind: RecordKind::File,
-                        xattrs: Vec::new(),
                     },
                 )
             })
             .collect();
+        // The author holding `versions[0]` must be the loser of every contest, whatever the hashes
+        // of the encoding of the day are.
+        let mut versions = versions;
+        versions.sort_by_key(|version| version.version_hash);
         let (a, b) = (conn(), conn());
         let mut state = NativeState::new();
         for (i, path) in paths.iter().enumerate() {
@@ -2262,7 +2264,7 @@ mod tests {
         c: &Connection,
         content: u8,
         mtime: i64,
-        mode: Option<u32>,
+        exec: bool,
     ) -> yadorilink_replica_domain::file::FileVersion {
         use yadorilink_replica_domain::file::{FileMeta, FileVersion, RecordKind, VersionBlock};
         let version = FileVersion::new(
@@ -2273,10 +2275,9 @@ mod tests {
             1,
             FileMeta {
                 mtime_unix_nanos: mtime,
-                unix_mode: mode,
+                exec,
                 symlink_target: None,
                 record_kind: RecordKind::File,
-                xattrs: Vec::new(),
             },
         );
         crate::dag_store::put_file_version(c, "g1", &version).unwrap();
@@ -2326,8 +2327,8 @@ mod tests {
             let (owned_a, key_a) = author();
             let (owned_b, key_b) = author_b();
             let (a, b) = (owned_a.as_local(&key_a), owned_b.as_local(&key_b));
-            let early = file_version(&c, 7, 1_000, Some(0o644));
-            let late = file_version(&c, 7, 2_000, Some(0o644));
+            let early = file_version(&c, 7, 1_000, false);
+            let late = file_version(&c, 7, 2_000, false);
             assert_ne!(early.version_hash, late.version_hash);
             concurrent_create_version(&c, &a, &SyncPath("x".into()), early.version_hash);
             concurrent_create_version(&c, &b, &SyncPath("x".into()), late.version_hash);
@@ -2353,17 +2354,13 @@ mod tests {
     }
 
     #[test]
-    fn a_difference_in_bytes_or_mode_is_still_a_conflict_with_a_copy() {
-        for (label, other) in [
-            ("bytes", (8u8, Some(0o644u32))),
-            ("mode", (7, Some(0o755))),
-            ("another plain mode", (7, Some(0o600))),
-        ] {
+    fn a_difference_in_bytes_or_exec_is_still_a_conflict_with_a_copy() {
+        for (label, other) in [("bytes", (8u8, false)), ("exec", (7, true))] {
             let c = conn();
             let (owned_a, key_a) = author();
             let (owned_b, key_b) = author_b();
             let (a, b) = (owned_a.as_local(&key_a), owned_b.as_local(&key_b));
-            let first = file_version(&c, 7, 1_000, Some(0o644));
+            let first = file_version(&c, 7, 1_000, false);
             let second = file_version(&c, other.0, 2_000, other.1);
             concurrent_create_version(&c, &a, &SyncPath("x".into()), first.version_hash);
             concurrent_create_version(&c, &b, &SyncPath("x".into()), second.version_hash);
@@ -2381,127 +2378,6 @@ mod tests {
                 "{label}: both versions survive"
             );
         }
-    }
-
-    /// A device without unix modes (device-b records none) and a Unix device
-    /// (device-a, 0644) writing the same bytes converge on the Unix version
-    /// in either hash order and either planning order, with no copy.
-    #[test]
-    fn a_device_without_a_mode_adopts_the_equal_unix_version_in_any_order() {
-        for (unix_time, win_time) in [(1_000, 2_000), (2_000, 1_000)] {
-            for unix_first in [true, false] {
-                let c = conn();
-                let (owned_a, key_a) = author();
-                let (owned_b, key_b) = author_b();
-                let (unix, win) = (owned_a.as_local(&key_a), owned_b.as_local(&key_b));
-                let on_unix = file_version(&c, 7, unix_time, Some(0o644));
-                let on_win = file_version(&c, 7, win_time, None);
-                concurrent_create_version(&c, &unix, &SyncPath("x".into()), on_unix.version_hash);
-                concurrent_create_version(&c, &win, &SyncPath("x".into()), on_win.version_hash);
-                note_x(&c);
-
-                if unix_first {
-                    settle_forks(&c, &[&unix, &win]);
-                } else {
-                    settle_forks(&c, &[&win, &unix]);
-                }
-
-                let live = live_paths(&c);
-                if on_unix.version_hash > on_win.version_hash {
-                    assert_eq!(live.len(), 1, "no conflicted copy: {live:?}");
-                    assert_eq!(
-                        live["x"],
-                        [
-                            ("device-a".to_owned(), on_unix.version_hash),
-                            ("device-b".to_owned(), on_unix.version_hash)
-                        ],
-                        "the Unix mode stands on both"
-                    );
-                } else {
-                    // The largest raw version keeps the path; the mode-less
-                    // head never adopts, so the Unix head is a plain loser
-                    // and its mode survives at the conflicted copy.
-                    assert_eq!(live.len(), 2, "{live:?}");
-                    assert_eq!(live["x"], [("device-b".to_owned(), on_win.version_hash)]);
-                    assert!(live.iter().any(|(path, heads)| path != "x"
-                        && heads == &[("device-a".to_owned(), on_unix.version_hash)]));
-                }
-                assert_eq!(crate::native_contest_candidates::count(&c, "g1").unwrap(), 0);
-            }
-        }
-    }
-
-    /// A Unix head, a head with other bytes and a mode-less head of the Unix
-    /// bytes, planned in every order: whichever hash order the three have, a
-    /// head stays at the original path and no version is lost.
-    #[test]
-    fn a_mode_less_head_beside_a_unix_head_and_other_bytes_always_leaves_a_head_at_the_path() {
-        let orders: [[usize; 3]; 6] =
-            [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
-        for salt in 0..6i64 {
-            for order in orders {
-                let c = conn();
-                let (owned_a, key_a) = author();
-                let (owned_b, key_b) = author_b();
-                let signing_key_c = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
-                let owned_c = LocalAuthorOwned {
-                    author: AuthorId {
-                        device: DeviceId("device-c".into()),
-                        incarnation: IncarnationId([1u8; 16]),
-                    },
-                };
-                let authors = [
-                    owned_a.as_local(&key_a),
-                    owned_b.as_local(&key_b),
-                    owned_c.as_local(&signing_key_c),
-                ];
-                let unix = file_version(&c, 7, 1_000 + salt, Some(0o644));
-                let win = file_version(&c, 7, 2_000 + salt * 3, None);
-                let other = file_version(&c, 9, 3_000 + salt * 7, Some(0o644));
-                concurrent_create_version(
-                    &c,
-                    &authors[0],
-                    &SyncPath("x".into()),
-                    unix.version_hash,
-                );
-                concurrent_create_version(&c, &authors[1], &SyncPath("x".into()), win.version_hash);
-                concurrent_create_version(
-                    &c,
-                    &authors[2],
-                    &SyncPath("x".into()),
-                    other.version_hash,
-                );
-                note_x(&c);
-                settle_forks(&c, &[&authors[order[0]], &authors[order[1]], &authors[order[2]]]);
-
-                let live = live_paths(&c);
-                assert!(live.contains_key("x"), "a head stays at x ({salt}, {order:?}): {live:?}");
-                let versions: std::collections::BTreeSet<VersionHash> =
-                    live.values().flatten().map(|(_, v)| *v).collect();
-                assert!(versions.contains(&unix.version_hash), "unix head lost: {live:?}");
-                assert!(versions.contains(&other.version_hash), "other bytes lost: {live:?}");
-                assert_eq!(crate::native_contest_candidates::count(&c, "g1").unwrap(), 0);
-            }
-        }
-    }
-
-    #[test]
-    fn a_set_exec_bit_against_no_mode_is_still_a_conflict_with_a_copy() {
-        let c = conn();
-        let (owned_a, key_a) = author();
-        let (owned_b, key_b) = author_b();
-        let (unix, win) = (owned_a.as_local(&key_a), owned_b.as_local(&key_b));
-        let exec = file_version(&c, 7, 1_000, Some(0o755));
-        let none = file_version(&c, 7, 2_000, None);
-        concurrent_create_version(&c, &unix, &SyncPath("x".into()), exec.version_hash);
-        concurrent_create_version(&c, &win, &SyncPath("x".into()), none.version_hash);
-        note_x(&c);
-        settle_forks(&c, &[&unix, &win]);
-        let live = live_paths(&c);
-        assert_eq!(live.len(), 2, "{live:?}");
-        let versions: std::collections::BTreeSet<VersionHash> =
-            live.values().flatten().map(|(_, v)| *v).collect();
-        assert_eq!(versions, [exec.version_hash, none.version_hash].into());
     }
 
     /// A and B hold one content (at two times), C another that wins. When the
@@ -2527,9 +2403,18 @@ mod tests {
                 owned_b.as_local(&key_b),
                 owned_c.as_local(&signing_key_c),
             );
-            let x1 = file_version(&c, 7, 1_000, Some(0o644));
-            let x2 = file_version(&c, 7, 2_000, Some(0o644));
-            let y = file_version(&c, 9, 3_000, Some(0o644));
+            // C's content must win the contest whatever the hashes of the encoding of the day
+            // are: pick A's and B's content so that both of their versions hash below C's.
+            let y = file_version(&c, 9, 3_000, false);
+            let (x1, x2) = (10u8..=255)
+                .map(|content| {
+                    (
+                        file_version(&c, content, 1_000, false),
+                        file_version(&c, content, 2_000, false),
+                    )
+                })
+                .find(|(x1, x2)| x1.version_hash.max(x2.version_hash) < y.version_hash)
+                .unwrap_or_else(|| panic!("no content hashes below {:?}", y.version_hash));
             concurrent_create_version(&c, &a, &SyncPath("x".into()), x1.version_hash);
             concurrent_create_version(&c, &b, &SyncPath("x".into()), x2.version_hash);
             concurrent_create_version(&c, &d, &SyncPath("x".into()), y.version_hash);

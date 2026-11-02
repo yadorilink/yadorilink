@@ -1,0 +1,258 @@
+name: Docker image
+
+# Builds and publishes the NAS / server image (daemon plus command line) to GHCR for every
+# release tag, for linux/amd64 and linux/arm64, and attests and verifies it like the other
+# release artifacts:
+#
+#   gate     the tag matches the shipped versions and Verify is green for the commit.
+#   build    one job per architecture, each on a native runner, pushes its image by digest.
+#            Unprivileged: it can write the package but holds no id-token and no attestation
+#            permission.
+#   publish  joins the two digests into one multi-architecture image under the version tag
+#            (and `latest` for a stable release; a pre-release never moves it). It builds and
+#            runs nothing.
+#   attest   the only job with id-token and attestations: it has GitHub sign a build-provenance
+#            attestation for the image digest, stores it next to the image, and verifies it
+#            against this workflow, this commit and this tag before the run can succeed. No
+#            environment, no secrets, no checkout, nothing from the image is executed.
+#   check    pulls the image by digest on each architecture and checks what it contains.
+#
+# .github/release/check-image-workflow.py enforces this shape.
+
+on:
+  push:
+    tags: ['v[0-9]*']
+
+concurrency:
+  group: docker-image-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/yadorilink
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Release tag matches shipped versions
+        run: bash .github/release/check-release-version.sh "$GITHUB_REF_NAME"
+
+      - name: Verify is green for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/release/require-verify.sh "$GITHUB_REPOSITORY" "$GITHUB_SHA"
+
+      - name: Check the release key
+        env:
+          YADORILINK_RELEASE_MANIFEST_KEY_ID: ${{ vars.RELEASE_MANIFEST_KEY_ID }}
+          YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
+        run: python3 .github/release/check-release-gates.py --config
+
+      - name: Check this workflow's shape
+        run: |
+          python3 .github/release/check-image-workflow.py
+          python3 .github/release/check-image-workflow.py --self-test
+          bash .github/release/docker-image-tags.sh --self-test
+
+  build:
+    needs: gate
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: packaging/docker/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          build-args: |
+            YADORILINK_DEFAULT_COORDINATION_ADDR=https://control.yadori.link
+            YADORILINK_RELEASE_MANIFEST_KEY_ID=${{ vars.RELEASE_MANIFEST_KEY_ID }}
+            YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX=${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
+            YADORILINK_VERSION=${{ github.ref_name }}
+            YADORILINK_SOURCE_REF=${{ github.ref_name }}
+            YADORILINK_REVISION=${{ github.sha }}
+          provenance: false
+          sbom: false
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Hand the digest to publish
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "no image digest" >&2; exit 1; }
+          mkdir digests
+          printf '%s\n' "$DIGEST" > "digests/$ARCH"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-digest-${{ matrix.arch }}
+          path: digests/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.index.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: image-digest-*
+          path: digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Join the architectures under the release tags
+        id: index
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          amd64="$(cat digests/amd64)"
+          arm64="$(cat digests/arm64)"
+          tag_args=()
+          IFS=, read -r -a tags <<< "$(bash .github/release/docker-image-tags.sh "$IMAGE" "$REF")"
+          for t in "${tags[@]}"; do tag_args+=(-t "$t"); done
+          docker buildx imagetools create "${tag_args[@]}" "$IMAGE@$amd64" "$IMAGE@$arm64"
+          digest="$(docker buildx imagetools inspect "${tags[0]}" --format '{{json .Manifest}}' | jq -r .digest)"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "no index digest" >&2; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+  attest:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Attest the image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ needs.publish.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify the attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
+        run: |
+          set -euo pipefail
+          gh attestation verify "oci://$IMAGE@$DIGEST" \
+            --repo ${{ github.repository }} \
+            --signer-workflow ${{ github.repository }}/.github/workflows/docker-image.yml \
+            --source-digest ${{ github.sha }} \
+            --source-ref ${{ github.ref }}
+
+  check:
+    needs: [publish, attest]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check the published image
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
+        run: |
+          set -euo pipefail
+          ref="$IMAGE@$DIGEST"
+          docker pull --quiet "$ref"
+          version="${REF_NAME#v}"
+          docker run --rm "$ref" --version | tee /dev/stderr | grep -F "$version"
+          docker run --rm "$ref" yadorilink --version | tee /dev/stderr | grep -F "$version"
+          [ "$(docker image inspect "$ref" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$REF_NAME" ]
+          [ "$(docker image inspect "$ref" --format '{{.Architecture}}')" = "${{ matrix.arch }}" ]
+          # The daemon's account is not root.
+          [ "$(docker run --rm "$ref" id -u)" = 999 ]
+
+      # The behaviour the compose file relies on: the daemon runs as PUID/PGID and never
+      # as root, the healthcheck turns healthy, state survives a restart, SIGTERM stops it
+      # cleanly, and unsafe configurations are refused.
+      - name: Run the image behaviour test
+        env:
+          DIGEST: ${{ needs.publish.outputs.digest }}
+        run: bash packaging/docker/test-image.sh "$IMAGE@$DIGEST"

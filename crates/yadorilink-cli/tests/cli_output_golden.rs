@@ -239,16 +239,14 @@ fn daemon_commands_report_daemon_not_running_with_exit_code_4() {
 }
 
 #[test]
-fn a_role_owner_is_refused_before_any_request() {
+fn an_unknown_role_is_refused_before_any_request() {
     let env = Env::new();
-    let run = env.run_blocking(&["share", "change-role", "photos", "device-1", "--role", "owner"]);
+    let run = env.run_blocking(&["share", "change-role", "photos", "device-1", "--role", "admin"]);
     assert_eq!(run.code, 1);
     assert_eq!(run.stdout, "");
     assert!(
-        run.stderr.starts_with(
-            "error: invalid --role \"owner\" (expected viewer or editor); owner is not available \
-             via this command yet\n"
-        ),
+        run.stderr
+            .starts_with("error: invalid --role \"admin\" (expected viewer, editor or owner)\n"),
         "{run:?}"
     );
 }
@@ -321,7 +319,12 @@ async fn daemon_backed_commands_print_their_results() {
     assert_eq!(env.run(&["conflicts", "list"]).await, Run::new(0, "No conflicted files.\n", ""));
     assert_eq!(
         env.run(&["gc", "--dry-run"]).await,
-        Run::new(0, "Dry run: would delete 0 block(s), reclaiming 0 bytes\n", "")
+        Run::new(
+            0,
+            "Dry run: would delete 0 block(s), reclaiming 0 bytes\nKept history: 0 older \
+             version(s) hold 0 bytes that no current file uses\n",
+            ""
+        )
     );
 }
 
@@ -336,14 +339,14 @@ async fn links_then_unlink_print_the_folder() {
 
     assert_eq!(
         env.run(&["links"]).await,
-        Run::new(0, "<TMP>/photos  group=group-1  syncing\n", "")
+        Run::new(0, "<TMP>/photos  group=group-1  Up to date\n", "")
     );
     assert_eq!(
         env.run(&["daemon", "pause"]).await,
         Run::new(0, "Sync paused.\n", ""),
         "pausing with one link"
     );
-    assert_eq!(env.run(&["links"]).await, Run::new(0, "<TMP>/photos  group=group-1  paused\n", ""));
+    assert_eq!(env.run(&["links"]).await, Run::new(0, "<TMP>/photos  group=group-1  Paused\n", ""));
 
     let canonical = folder.canonicalize().unwrap().to_string_lossy().to_string();
     assert_eq!(

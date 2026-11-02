@@ -6,6 +6,7 @@ use crate::sync_error::SyncError;
 
 use crate::application::ports::{
     BoxFuture, DurabilityCommandPort, HandoffCommandPort, HandoffLeaseGrant, HandoffTicketGrant,
+    LeaseRefusal,
 };
 use crate::daemon_state::DaemonState;
 
@@ -36,10 +37,13 @@ impl DaemonHandoffCommandAdapter {
 }
 
 impl HandoffCommandPort for DaemonHandoffCommandAdapter {
-    fn request_lease<'a>(&'a self, group_id: &'a str) -> BoxFuture<'a, Option<HandoffLeaseGrant>> {
+    fn request_lease<'a>(
+        &'a self,
+        group_id: &'a str,
+    ) -> BoxFuture<'a, Result<HandoffLeaseGrant, LeaseRefusal>> {
         Box::pin(async move {
-            let (grant, _root_digest) = self.state.request_handoff_lease(group_id).await?;
-            Some(HandoffLeaseGrant {
+            let (grant, _root_digest) = self.state.request_handoff_lease_checked(group_id).await?;
+            Ok(HandoffLeaseGrant {
                 lease_id: grant.lease_id,
                 expires_at_unix: grant.expires_at_unix,
             })

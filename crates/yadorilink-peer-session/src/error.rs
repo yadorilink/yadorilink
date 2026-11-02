@@ -61,28 +61,12 @@ pub enum PeerSessionError {
     Decode(#[from] yadorilink_replica_domain::codec::ChangeError),
 
     /// A write this device just performed cannot be proven to hold its
-    /// desired version's replicated extended attributes exactly --
-    /// either a strict on-disk reread confirmed a real mismatch, or this
-    /// backend cannot even attempt the comparison (see
-    /// `yadorilink_local_storage::verify_replicated_xattrs_exact`'s own
-    /// two `Err` cases). Never constructed via `#[from]`: every call
-    /// site gating `SettlementEvidence::ExactObject` on this maps BOTH
-    /// of that function's outcomes (a confirmed `Ok(false)` mismatch,
-    /// and every `Err`) to this one variant on purpose, since both mean
-    /// exactly the same thing to a caller deciding whether to settle --
-    /// leave the obligation outstanding for retry, never let it publish
-    /// a false exactness proof.
-    #[error("replicated extended attributes for {0:?} could not be confirmed to exactly match the desired version")]
-    ReplicatedXattrsNotExact(String),
-
-    /// A write this device just performed cannot be proven to hold its
     /// desired version's claimed object kind (`RecordKind::File`/
     /// `Symlink`/`Directory`) -- either nothing exists at the target path
     /// at all, or what exists there is a different kind of object
     /// entirely. Never constructed via `#[from]`: every call site gating
-    /// `SettlementEvidence::ExactObject` on this treats it exactly like
-    /// `ReplicatedXattrsNotExact` -- leave the obligation outstanding for
-    /// retry, never let it publish a false exactness proof.
+    /// `SettlementEvidence::ExactObject` on this: leave the obligation
+    /// outstanding for retry, never let it publish a false exactness proof.
     #[error(
         "physical object kind at {0:?} does not match the desired version's claimed record kind"
     )]

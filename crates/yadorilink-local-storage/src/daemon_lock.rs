@@ -16,6 +16,13 @@ use std::path::Path;
 /// The lock file's name inside the config directory.
 pub const LOCK_FILE_NAME: &str = ".daemon.lock";
 
+/// The environment variable the container image sets: its entrypoint keeps the daemon running,
+/// starting it again whenever it exits cleanly or for a restart (see
+/// `packaging/docker/yadorilink-entrypoint.sh`). Both the command line (which then waits for the
+/// replacement instead of starting one) and the daemon (which then honours a restart request)
+/// read it, each at its own entry point (the library code takes the value as a setting).
+pub const SUPERVISED_ENV: &str = "YADORILINK_DAEMON_SUPERVISED";
+
 /// Whether a daemon owns the data area.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LockProbe {

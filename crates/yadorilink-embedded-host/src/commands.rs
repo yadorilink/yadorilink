@@ -24,11 +24,20 @@ use std::time::{Duration, Instant};
 use tokio::task::AbortHandle;
 pub use yadorilink_client_core::DesktopError;
 pub use yadorilink_daemon::embedded_host::{
-    ordinary_folder_links_supported, CommandError, CommandErrorKind, CreateShare, DoctorCheck,
-    DoctorStatus, HandoffInfo, JoinGroup, JoinShare, LinkFolder, LinkedFolder, PauseFor, PauseLink,
-    PreservedItem, PreservedKind, PreservedRef, PreservedRefusal, ProviderFolder,
-    ReadoptMarkedFolder, ReadoptOutcome, ReadoptRefusal, RestoreVersion, ResumeLink, ShareFolder,
-    ShareOutcome, SpaceManagement, UnlinkFolder, UnlinkOutcome,
+    ordinary_folder_links_supported, ApplyChange, ApplyResponse, CommandError, CommandErrorKind,
+    CreateShare, DoctorCheck, DoctorStatus, HandoffInfo, JoinGroup, JoinShare, LinkFolder,
+    LinkedFolder, PauseFor, PauseLink, PreservedItem, PreservedKind, PreservedRef,
+    PreservedRefusal, ProviderFolder, ReadoptMarkedFolder, ReadoptOutcome, ReadoptRefusal,
+    RestoreVersion, ResumeLink, ShareFolder, ShareOutcome, SpaceManagement, UnlinkFolder,
+    UnlinkOutcome,
+};
+pub use yadorilink_daemon::embedded_host::{
+    DeletedItem, DeletedItems, DeletedParent, HistoryEntryKind, HistoryVersionState, ItemHistory,
+    ItemVersion, MAX_DELETED_ITEMS,
+};
+pub use yadorilink_daemon::embedded_host::{
+    DeliveryItem, DeliveryReport, DeliveryState, ItemDelivery, StageMode, StageRefused,
+    StageSource, StagedHow, StagedUpload, MAX_DELIVERY_ITEMS,
 };
 
 use crate::account::{
@@ -68,11 +77,96 @@ pub enum Command {
     DiscardPreserved(PreservedRef),
     /// The automatic space management setting.
     SpaceManagement,
+    /// Recent file events across every linked folder, newest first (the Activity page).
+    /// `limit` is clamped to 1..=500; `before_cursor` is the previous page's `next_cursor`.
+    ListActivity {
+        limit: u32,
+        before_cursor: Option<i64>,
+        filter: Option<yadorilink_client_core::dto::ActivityFilter>,
+    },
     SetSpaceManagement {
         enabled: bool,
     },
+    /// Mints a one-use expiring Send link for the files and folders at `source_paths`
+    /// (absolute paths). The code is shown once.
+    CreateSendLink {
+        ttl: yadorilink_client_core::dto::SendLinkTtl,
+        source_paths: Vec<String>,
+    },
+    /// Who sends the link a code names and what it carries; nothing is consumed.
+    PreviewSendLink {
+        code: String,
+    },
+    /// Redeems a code with this device (or `device_id`); answers the link id.
+    RedeemSendLink {
+        code: String,
+        device_id: Option<String>,
+        /// Absolute folder to receive the link's files into; `None` = the engine's own choice.
+        destination_dir: Option<String>,
+    },
+    CancelSendLink {
+        link_id: String,
+    },
+    SendLinkStatus {
+        link_id: String,
+    },
+    /// The links this device created, newest first, each with its status.
+    ListSendLinks,
+    /// Waits for the recipient to redeem the link, then offers the files under it. Cancelling
+    /// the call ends the wait (and an offer in flight, which a new send makes again).
+    SendToLink {
+        link_id: String,
+        source_paths: Vec<String>,
+    },
+    /// Every transfer other devices offered to this device.
+    ListInbox,
+    /// The transfers this device sent.
+    ListSentTransfers,
+    /// Accepts an inbound transfer and pulls it, into `destination_dir` (absolute) or the
+    /// engine's inbox. Resumable. Cancelling the call does not stop the pull: use
+    /// [`Command::CancelTransfer`], or stop or suspend the engine, which records the receive as
+    /// interrupted so that a later receive resumes it.
+    ReceiveTransfer {
+        transfer_id: String,
+        destination_dir: Option<String>,
+    },
+    /// Stops a transfer by id; a running receive ends and the transfer is marked cancelled.
+    CancelTransfer {
+        transfer_id: String,
+    },
     /// Sign-in, device registration, sign-out and account deletion.
     Account(AccountCommand),
+    /// Puts a file into the engine's ingest directory for an [`Command::ApplyChange`] to name:
+    /// moved or cloned where it can be, copied otherwise.
+    StageUpload {
+        source: StageSource,
+        mode: StageMode,
+    },
+    /// Removes a staged file no change will use.
+    DiscardStagedUpload {
+        ingest_name: String,
+    },
+    /// One change to a provider folder: create, modify (new contents, rename, move) or delete.
+    /// Idempotent by its operation identity: asking again with the same `(session_id,
+    /// operation_seq)` returns the stored outcome. Cancelling the call does not stop it (see the
+    /// module docs); ask again to learn the outcome.
+    ApplyChange(Box<ApplyChange>),
+    /// Whether the versions this device authored have reached a device that keeps a full
+    /// replica. Read-only.
+    VersionDelivery {
+        items: Vec<DeliveryItem>,
+    },
+    /// The retained versions of one item of a provider folder. Read-only. A restore
+    /// is an [`Command::ApplyChange`] whose request names `restore_from`.
+    ListItemVersions {
+        root_id: Vec<u8>,
+        item_id: Vec<u8>,
+    },
+    /// The deleted files and folders of a provider folder that can still be brought back.
+    /// Read-only.
+    ListDeletedItems {
+        root_id: Vec<u8>,
+    },
 }
 
 impl Command {
@@ -80,8 +174,20 @@ impl Command {
     fn read_only(&self) -> bool {
         match self {
             Self::ListFolders | Self::Status | Self::Doctor | Self::ListPreserved => true,
+            Self::ListActivity { .. } => true,
             Self::SpaceManagement => true,
+            Self::PreviewSendLink { .. }
+            | Self::SendLinkStatus { .. }
+            | Self::ListSendLinks
+            | Self::ListInbox
+            | Self::ListSentTransfers => true,
+            // Waiting for a redeem and offering are safe to drop: the offer is crash-safe (its
+            // blocks are written before it is recorded) and a new send makes it again.
+            Self::SendToLink { .. } => true,
             Self::Account(account) => account.read_only(),
+            Self::VersionDelivery { .. }
+            | Self::ListItemVersions { .. }
+            | Self::ListDeletedItems { .. } => true,
             Self::LinkFolder(_)
             | Self::RestoreVersion(_)
             | Self::CreateShare(_)
@@ -93,7 +199,15 @@ impl Command {
             | Self::Unlink(_)
             | Self::RestorePreserved(_)
             | Self::DiscardPreserved(_)
-            | Self::SetSpaceManagement { .. } => false,
+            | Self::SetSpaceManagement { .. }
+            | Self::CreateSendLink { .. }
+            | Self::RedeemSendLink { .. }
+            | Self::CancelSendLink { .. }
+            | Self::ReceiveTransfer { .. }
+            | Self::CancelTransfer { .. }
+            | Self::StageUpload { .. }
+            | Self::DiscardStagedUpload { .. }
+            | Self::ApplyChange(_) => false,
         }
     }
 }
@@ -126,11 +240,60 @@ pub enum CommandOutput {
     StartOver(yadorilink_client_core::dto::StartOverProgress),
     /// Whether an acknowledgement was recorded (`false`: no replacement was waiting).
     PossibleLossAcknowledged(bool),
+    /// One page of the Activity list.
+    Activity(yadorilink_client_core::dto::ActivityPage),
     /// The folder groups the account may join: `(group_id, name)` summaries.
     JoinableGroups(Vec<yadorilink_client_core::dto::GroupSummary>),
+    /// The devices of one folder group.
+    GroupDevices(Vec<yadorilink_client_core::dto::MemberSummary>),
+    /// An ownership offer, as just created, cancelled or declined.
+    PrimaryTransfer(yadorilink_client_core::dto::PrimaryTransferSummary),
+    /// An accepted ownership offer: this account is now the folder's primary owner.
+    PrimaryTransferAccepted(yadorilink_client_core::dto::PrimaryTransferAccepted),
+    /// The pending ownership offers this account made or received.
+    PrimaryTransfers(Vec<yadorilink_client_core::dto::PrimaryTransferSummary>),
+    /// A Send link just created.
+    SendLink(yadorilink_client_core::dto::SendLink),
+    SendLinkPreview(yadorilink_client_core::dto::SendLinkPreview),
+    /// The id of the link a redeem bound to a device.
+    SendLinkRedeemed(String),
+    SendLinkStatus(yadorilink_client_core::dto::SendLinkStatus),
+    SendLinks(Vec<SendLinkEntry>),
+    /// A send under a link was offered.
+    SendOffered(yadorilink_client_core::dto::SentTransfer),
+    Inbox(Vec<yadorilink_client_core::dto::IncomingTransfer>),
+    SentTransfers(Vec<yadorilink_client_core::dto::OutgoingTransfer>),
+    Received(yadorilink_client_core::dto::ReceivedTransfer),
     DeletionImpact(AccountDeletionImpact),
     DeletionRequested(AccountDeletionRequest),
     DeletionStatus(AccountDeletionStatus),
+    /// The file was staged, or why it could not be.
+    Staged(Result<StagedUpload, StageRefused>),
+    /// The engine's answer to an apply: the outcome, or a typed refusal.
+    Applied(Box<ApplyResponse>),
+    Delivery(Box<DeliveryOutcome>),
+    /// The retained versions of one item.
+    ItemVersions(Box<HistoryOutcome<ItemHistory>>),
+    /// The deleted items of a provider folder.
+    DeletedItems(Box<HistoryOutcome<DeletedItems>>),
+}
+
+/// A history listing with the names of the devices that authored what it lists (by device id; a
+/// name is missing when the account's device list could not be read).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryOutcome<T> {
+    pub listing: T,
+    pub device_names: std::collections::HashMap<String, String>,
+}
+
+/// One link of the sender's list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendLinkEntry {
+    pub status: yadorilink_client_core::dto::SendLinkStatus,
+    pub created_at_unix: i64,
+    pub expires_at_unix: i64,
+    /// How many files the link was created to carry.
+    pub file_count: u32,
 }
 
 /// Why a call did not return the command's output.
@@ -406,6 +569,27 @@ async fn run_command(
     accounts: &AccountCommands,
     command: Command,
 ) -> Outcome {
+    // Every command counts as changing state unless it is one of the reads a shell polls: a poll
+    // that counted would make the next status wait for a rebuild.
+    let changes_state = !matches!(
+        command,
+        Command::Status
+            | Command::ListFolders
+            | Command::Doctor
+            | Command::Account(AccountCommand::Status)
+    );
+    let outcome = run_command_inner(commands, accounts, command).await;
+    if changes_state {
+        commands.command_completed();
+    }
+    outcome
+}
+
+async fn run_command_inner(
+    commands: &yadorilink_daemon::embedded_host::EngineCommands,
+    accounts: &AccountCommands,
+    command: Command,
+) -> Outcome {
     Ok(match command {
         Command::LinkFolder(link) => {
             commands.link_folder(link).await.map(|()| CommandOutput::Linked)?
@@ -413,7 +597,9 @@ async fn run_command(
         Command::RestoreVersion(restore) => {
             commands.restore_version(restore).await.map(CommandOutput::Restored)?
         }
-        Command::ListFolders => commands.linked_folders().map(CommandOutput::Folders)?,
+        Command::ListFolders => {
+            commands.linked_folders_snapshot().await.map(CommandOutput::Folders)?
+        }
         Command::CreateShare(create) => {
             commands.create_share(create).await.map(CommandOutput::Shared)?
         }
@@ -427,7 +613,7 @@ async fn run_command(
             commands.readopt_marked_folder(readopt).await.map(CommandOutput::Readopted)?
         }
         Command::Unlink(unlink) => commands.unlink(unlink).await.map(CommandOutput::Unlinked)?,
-        Command::Status => status(commands, accounts)?,
+        Command::Status => status(commands, accounts).await?,
         Command::Doctor => CommandOutput::Doctor(commands.doctor()),
         Command::ListPreserved => commands.preserved_items().await.map(CommandOutput::Preserved)?,
         Command::RestorePreserved(item) => {
@@ -440,20 +626,160 @@ async fn run_command(
         Command::SetSpaceManagement { enabled } => {
             commands.set_space_management(enabled).map(CommandOutput::SpaceManagement)?
         }
-        Command::Account(AccountCommand::Status) => CommandOutput::Account(Box::new(
-            accounts.account_status_with(commands.linked_folders().ok().map(|l| !l.is_empty())),
-        )),
+        Command::ListActivity { limit, before_cursor, filter } => {
+            let request = yadorilink_client_core::dto::activity_request(
+                limit,
+                before_cursor,
+                filter.as_ref(),
+            );
+            let events = commands.list_activity(&request)?;
+            // Names are best effort: signed out or offline, the events carry ids only.
+            let names = if events.iter().any(|e| !e.origin_device_id.is_empty()) {
+                accounts.device_names().await
+            } else {
+                std::collections::HashMap::new()
+            };
+            CommandOutput::Activity(yadorilink_client_core::dto::activity_page(
+                limit.clamp(1, 500),
+                &events,
+                &names,
+            ))
+        }
+        Command::CreateSendLink { ttl, source_paths } => {
+            let link = commands.create_send_link(ttl.seconds(), &source_paths).await?;
+            CommandOutput::SendLink(yadorilink_client_core::dto::send_link(link))
+        }
+        Command::PreviewSendLink { code } => {
+            CommandOutput::SendLinkPreview(yadorilink_client_core::dto::send_link_preview(
+                commands.preview_send_link(&code).await?,
+            ))
+        }
+        Command::RedeemSendLink { code, device_id, destination_dir } => {
+            CommandOutput::SendLinkRedeemed(
+                commands
+                    .redeem_send_link(
+                        &code,
+                        device_id.as_deref().unwrap_or_default(),
+                        destination_dir.as_deref().unwrap_or_default(),
+                    )
+                    .await?,
+            )
+        }
+        Command::CancelSendLink { link_id } => {
+            commands.cancel_send_link(&link_id).await.map(|()| CommandOutput::Done)?
+        }
+        Command::SendLinkStatus { link_id } => {
+            let status = commands.send_link_status(&link_id).await?;
+            CommandOutput::SendLinkStatus(link_status(link_id, status)?)
+        }
+        Command::ListSendLinks => {
+            let mut entries = Vec::new();
+            for link in commands.list_send_links().await? {
+                entries.push(SendLinkEntry {
+                    status: link_status(link.link_id, link.status)?,
+                    created_at_unix: link.created_at_unix,
+                    expires_at_unix: link.expires_at_unix,
+                    file_count: link.file_count,
+                });
+            }
+            CommandOutput::SendLinks(entries)
+        }
+        Command::SendToLink { link_id, source_paths } => {
+            CommandOutput::SendOffered(yadorilink_client_core::dto::sent_transfer(
+                commands.send_to_link(&link_id, &source_paths).await?,
+            ))
+        }
+        Command::ListInbox => inbox_output(&commands.list_inbox()?),
+        Command::ListSentTransfers => CommandOutput::SentTransfers(
+            commands
+                .list_sent_transfers()?
+                .iter()
+                .map(yadorilink_client_core::dto::outgoing_transfer)
+                .collect(),
+        ),
+        Command::ReceiveTransfer { transfer_id, destination_dir } => {
+            CommandOutput::Received(yadorilink_client_core::dto::received_transfer(
+                commands.receive_transfer(&transfer_id, destination_dir.as_deref()).await?,
+            ))
+        }
+        Command::CancelTransfer { transfer_id } => {
+            commands.cancel_transfer(&transfer_id).map(|()| CommandOutput::Done)?
+        }
+        Command::Account(AccountCommand::Status) => {
+            CommandOutput::Account(Box::new(accounts.account_status_with(
+                commands.linked_folders_snapshot().await.ok().map(|l| !l.is_empty()),
+            )))
+        }
         Command::Account(account) => accounts.run(commands, account).await?,
+        Command::StageUpload { source, mode } => {
+            CommandOutput::Staged(commands.stage_upload(source, mode).await)
+        }
+        Command::DiscardStagedUpload { ingest_name } => commands
+            .discard_staged_upload(&ingest_name)
+            .map(|()| CommandOutput::Done)
+            .map_err(|refused| CommandError::failed(refused.message))?,
+        Command::ApplyChange(change) => {
+            CommandOutput::Applied(Box::new(commands.apply_change(*change).await))
+        }
+        Command::VersionDelivery { items } => {
+            let report = commands.version_delivery(items).await?;
+            // Names are best effort, and asked for only when some device confirmed.
+            let confirmed = report
+                .items
+                .iter()
+                .any(|entry| matches!(entry.state, DeliveryState::Delivered { .. }));
+            let device_names =
+                if confirmed { accounts.device_names().await } else { Default::default() };
+            CommandOutput::Delivery(Box::new(DeliveryOutcome { report, device_names }))
+        }
+        Command::ListItemVersions { root_id, item_id } => {
+            let listing = commands.list_item_versions(&root_id, &item_id)?;
+            let named = listing.versions.iter().any(|v| v.origin_device_id.is_some());
+            let device_names =
+                if named { accounts.device_names().await } else { Default::default() };
+            CommandOutput::ItemVersions(Box::new(HistoryOutcome { listing, device_names }))
+        }
+        Command::ListDeletedItems { root_id } => {
+            let listing = commands.list_deleted_items(&root_id)?;
+            let named = listing.items.iter().any(|v| v.origin_device_id.is_some());
+            let device_names =
+                if named { accounts.device_names().await } else { Default::default() };
+            CommandOutput::DeletedItems(Box::new(HistoryOutcome { listing, device_names }))
+        }
+    })
+}
+
+/// How far the versions asked about have reached full replicas, with the names of the devices that
+/// confirmed (by device id; a name is missing when the account's device list could not be read).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryOutcome {
+    pub report: DeliveryReport,
+    pub device_names: std::collections::HashMap<String, String>,
+}
+
+/// A link status in the product's type; a state this build does not know is a failure.
+fn inbox_output(entries: &[yadorilink_ipc_proto::daemonctl::InboxTransfer]) -> CommandOutput {
+    CommandOutput::Inbox(
+        entries.iter().map(yadorilink_client_core::dto::incoming_transfer).collect(),
+    )
+}
+
+fn link_status(
+    link_id: String,
+    status: yadorilink_ipc_proto::daemonctl::SendLinkStatusResponse,
+) -> Result<yadorilink_client_core::dto::SendLinkStatus, CommandError> {
+    yadorilink_client_core::dto::send_link_status(link_id, status).ok_or_else(|| {
+        CommandError::failed("the Send link is in a state this version does not know")
     })
 }
 
 /// The status the desktop shows, from the engine's own: the engine's wire status and the account
 /// state go through the client layer's one derivation of the product snapshot.
-fn status(
+async fn status(
     commands: &yadorilink_daemon::embedded_host::EngineCommands,
     accounts: &AccountCommands,
 ) -> Result<CommandOutput, Failure> {
-    let response = commands.status()?;
+    let response = commands.status_snapshot().await?;
     let account = accounts.account_status_with(Some(!response.links.is_empty()));
     Ok(CommandOutput::Status(Box::new(yadorilink_client_core::dto::status_snapshot(
         &response,
@@ -464,8 +790,31 @@ fn status(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_inbox_output_carries_the_link_redeemed_receive_fields() {
+        use yadorilink_ipc_proto::daemonctl::InboxTransfer;
+        let entry = InboxTransfer {
+            transfer_id: "t".into(),
+            status: "in_progress".into(),
+            total_size: 10,
+            link_id: "link-1".into(),
+            received_bytes: 4,
+            destination_dir: "/recv/link-1".into(),
+            ..Default::default()
+        };
+        let plain = InboxTransfer { transfer_id: "u".into(), ..Default::default() };
+        let super::CommandOutput::Inbox(rows) = super::inbox_output(&[entry, plain]) else {
+            panic!("an inbox")
+        };
+        assert_eq!(rows[0].link_id.as_deref(), Some("link-1"));
+        assert_eq!(rows[0].received_bytes, 4);
+        assert_eq!(rows[0].destination_dir.as_deref(), Some("/recv/link-1"));
+        assert_eq!(rows[1].link_id, None);
+        assert_eq!(rows[1].destination_dir, None);
+    }
+
     use super::*;
-    use crate::account::{BeginSignIn, PollSignIn};
+    use crate::account::{BeginPairingSignIn, BeginSignIn, PollSignIn};
 
     /// Which commands only read, so that cancelling them aborts them. A command that changes
     /// state is never on this list: dropping it half-way would leave a half-done saga.
@@ -479,11 +828,24 @@ mod tests {
             Command::Doctor,
             Command::ListPreserved,
             Command::SpaceManagement,
+            Command::ListActivity { limit: 50, before_cursor: None, filter: None },
             Command::Account(AccountCommand::Status),
             Command::Account(AccountCommand::PollSignIn(PollSignIn { id, after: 0 })),
             Command::Account(AccountCommand::DeletionImpact),
             Command::Account(AccountCommand::ListJoinableGroups),
+            Command::Account(AccountCommand::ListGroupDevices { group_id: String::new() }),
+            Command::Account(AccountCommand::ListPrimaryTransfers),
             Command::Account(AccountCommand::DeletionStatus),
+            Command::PreviewSendLink { code: String::new() },
+            Command::SendLinkStatus { link_id: String::new() },
+            Command::ListSendLinks,
+            Command::ListInbox,
+            Command::ListSentTransfers,
+            Command::VersionDelivery { items: Vec::new() },
+            Command::ListItemVersions { root_id: Vec::new(), item_id: Vec::new() },
+            Command::ListDeletedItems { root_id: Vec::new() },
+            // Waiting for a redeem and offering are safe to drop; see the variant.
+            Command::SendToLink { link_id: String::new(), source_paths: Vec::new() },
         ];
         let changes = [
             Command::LinkFolder(LinkFolder {
@@ -541,6 +903,10 @@ mod tests {
             Command::DiscardPreserved(item),
             Command::SetSpaceManagement { enabled: true },
             Command::Account(AccountCommand::BeginSignIn(BeginSignIn::default())),
+            Command::Account(AccountCommand::BeginPairingSignIn(BeginPairingSignIn {
+                pairing_code: String::new(),
+                overall_timeout: None,
+            })),
             Command::Account(AccountCommand::CancelSignIn(id)),
             Command::Account(AccountCommand::CancelCurrentSignIn),
             Command::Account(AccountCommand::RegisterDevice { name: String::new() }),
@@ -550,10 +916,39 @@ mod tests {
                 device_name: String::new(),
             }),
             Command::Account(AccountCommand::AcknowledgePossibleLoss),
+            Command::Account(AccountCommand::OfferPrimaryTransfer {
+                group_id: String::new(),
+                target_device_id: String::new(),
+            }),
+            Command::Account(AccountCommand::CancelPrimaryTransfer {
+                group_id: String::new(),
+                transfer_id: String::new(),
+            }),
+            Command::Account(AccountCommand::AcceptPrimaryTransfer {
+                group_id: String::new(),
+                transfer_id: String::new(),
+            }),
+            Command::Account(AccountCommand::DeclinePrimaryTransfer {
+                group_id: String::new(),
+                transfer_id: String::new(),
+            }),
             Command::Account(AccountCommand::RequestDeletion { acknowledge_impact: false }),
             Command::Account(AccountCommand::ConfirmDeletion { confirmation_token: String::new() }),
             Command::Account(AccountCommand::CancelDeletion),
             Command::Account(AccountCommand::CompleteDeletion),
+            Command::CreateSendLink {
+                ttl: yadorilink_client_core::dto::SendLinkTtl::OneHour,
+                source_paths: Vec::new(),
+            },
+            Command::RedeemSendLink { code: String::new(), device_id: None, destination_dir: None },
+            Command::CancelSendLink { link_id: String::new() },
+            Command::ReceiveTransfer { transfer_id: String::new(), destination_dir: None },
+            Command::CancelTransfer { transfer_id: String::new() },
+            // Writes change state: a cancelled call leaves them running and the caller replays
+            // the same operation identity to learn the outcome.
+            Command::StageUpload { source: StageSource::Descriptor(-1), mode: StageMode::Copy },
+            Command::DiscardStagedUpload { ingest_name: String::new() },
+            Command::ApplyChange(Box::default()),
         ];
         for command in &reads {
             assert!(is_read_only(command), "{command:?} only reads");

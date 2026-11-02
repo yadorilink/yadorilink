@@ -12,7 +12,6 @@
 //! for the unchanged content, even though the wire protocol has no
 //! dedicated "rename" message.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use crate::error::LocalCaptureError;
@@ -37,8 +36,9 @@ pub use semantic_delete::SemanticDelete;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use record_builder::{
-    arm_content_read_race_hook, arm_post_capture_race_hook, arm_post_identity_race_hook,
-    disarm_content_read_race_hook, disarm_post_capture_race_hook, disarm_post_identity_race_hook,
+    arm_content_read_race_hook, arm_flush_failure_hook, arm_post_capture_race_hook,
+    arm_post_identity_race_hook, disarm_content_read_race_hook, disarm_flush_failure_hook,
+    disarm_post_capture_race_hook, disarm_post_identity_race_hook,
 };
 
 // The in-module tests below reach helpers from every submodule through
@@ -96,37 +96,23 @@ pub enum LocalChangeOutcome {
     RetryLater,
 }
 
-/// The mode and replicated attributes a path's current row records, and
-/// whether that row is live: what [`LocalChangeProcessor::captured_unix_mode`]
-/// inherits where the platform cannot observe them.
+/// The execute flag a path's current row records, and whether that row is live: what
+/// [`LocalChangeProcessor::captured_exec`] inherits where the platform cannot observe it.
 pub(super) struct Predecessor {
-    pub(super) unix_mode: Option<u32>,
-    pub(super) xattrs: Vec<(String, Vec<u8>)>,
+    pub(super) exec: bool,
     live: bool,
 }
 
 impl Predecessor {
     pub(super) fn of_row(row: Option<&yadorilink_sync_sqlite::CanonicalCurrentRow>) -> Self {
         match row {
-            Some(row) => Self {
-                unix_mode: row.snapshot.unix_mode,
-                xattrs: row.snapshot.xattrs.clone(),
-                live: !row.snapshot.deleted,
-            },
-            None => Self { unix_mode: None, xattrs: Vec::new(), live: false },
+            Some(row) => Self { exec: row.snapshot.exec, live: !row.snapshot.deleted },
+            None => Self { exec: false, live: false },
         }
     }
 
-    fn inherited_unix_mode(&self) -> Option<u32> {
-        self.live.then_some(self.unix_mode).flatten()
-    }
-
-    fn inherited_xattrs(&self) -> Vec<(String, Vec<u8>)> {
-        if self.live {
-            self.xattrs.clone()
-        } else {
-            Vec::new()
-        }
+    fn inherited_exec(&self) -> bool {
+        self.live && self.exec
     }
 }
 
@@ -172,6 +158,9 @@ pub struct LocalChangeProcessor {
     /// accumulator no longer holds them, so this processor keeps them until a commit succeeds.
     /// See `journal_handed_over_edits` for the ownership invariant.
     retained_handoffs: std::sync::Mutex<Vec<dirty_journal::RetainedHandoff>>,
+    /// Whether a file's blocks are put into the store or only hashed. Every file goes into the
+    /// store unless the owner of the processor supplies another policy.
+    ingest_policy: Arc<dyn crate::ingest::IngestPolicy>,
     /// Test-only: makes every disk observation report no unix mode, as a
     /// platform without permission bits (Windows) always does.
     #[cfg(test)]
@@ -196,9 +185,18 @@ impl LocalChangeProcessor {
             unreadable: Arc::default(),
             retained_handoffs: std::sync::Mutex::default(),
             directory_capture: true,
+            ingest_policy: Arc::new(crate::ingest::AlwaysIngest),
             #[cfg(test)]
             modes_unobservable: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Lets `policy` choose, per file, between putting blocks into the store and only hashing
+    /// them (see [`crate::ingest`]).
+    #[must_use]
+    pub fn with_ingest_policy(mut self, policy: Arc<dyn crate::ingest::IngestPolicy>) -> Self {
+        self.ingest_policy = policy;
+        self
     }
 
     /// Reports unreadable files into `ledger` (the daemon's, so status can read it) instead of a
@@ -218,17 +216,7 @@ impl LocalChangeProcessor {
         &self.unreadable
     }
 
-    /// The unix mode a disk object reports: none on a platform with no
-    /// permission bits.
-    fn observed_unix_mode(&self, metadata: &std::fs::Metadata) -> Option<u32> {
-        #[cfg(test)]
-        if self.modes_unobservable.load(std::sync::atomic::Ordering::Relaxed) {
-            return None;
-        }
-        yadorilink_local_storage::unix_mode_from_metadata(metadata)
-    }
-
-    /// Whether this platform reports a file's unix mode at all.
+    /// Whether this platform reports a file's permission bits at all.
     fn mode_observable(&self) -> bool {
         #[cfg(test)]
         if self.modes_unobservable.load(std::sync::atomic::Ordering::Relaxed) {
@@ -237,55 +225,20 @@ impl LocalChangeProcessor {
         cfg!(unix)
     }
 
-    /// Whether a disk object's mode is still the one captured: always, where
-    /// the platform cannot report it.
-    pub(super) fn mode_unchanged_since(
-        &self,
-        now: &std::fs::Metadata,
-        captured: Option<u32>,
-    ) -> bool {
-        !self.mode_observable() || self.observed_unix_mode(now) == captured
-    }
-
-    /// Whether this platform reports the replicated extended attributes at all.
-    fn xattrs_observable(&self) -> bool {
-        #[cfg(test)]
-        if self.modes_unobservable.load(std::sync::atomic::Ordering::Relaxed) {
-            return false;
-        }
-        cfg!(target_os = "linux")
-    }
-
-    /// THE rule for metadata capture: a field the platform can observe is what
-    /// the disk shows; a field it cannot is inherited from the path's semantic
-    /// predecessor (a live row), and is absent when there is none. Capturing
-    /// "nothing observed" as "removed" would author a new version against the
-    /// very version the file was written from, and strip a POSIX-origin file's
-    /// mode and attributes on every edit made where they cannot be read.
-    pub(super) fn captured_unix_mode(
+    /// THE rule for metadata capture: the execute flag is what the disk shows where the platform
+    /// can observe it; where it cannot (Windows), it is inherited from the path's semantic
+    /// predecessor (a live row) and is `false` when there is none. Capturing "nothing observed" as
+    /// "not executable" would author a new version against the very version the file was written
+    /// from, and strip an executable file's flag on every edit made where it cannot be read.
+    pub(super) fn captured_exec(
         &self,
         metadata: &std::fs::Metadata,
         predecessor: &Predecessor,
-    ) -> Option<u32> {
+    ) -> bool {
         if self.mode_observable() {
-            self.observed_unix_mode(metadata)
+            yadorilink_local_storage::exec_from_metadata(metadata)
         } else {
-            predecessor.inherited_unix_mode()
-        }
-    }
-
-    /// See [`Self::captured_unix_mode`].
-    pub(super) fn captured_xattrs(
-        &self,
-        path: &Path,
-        predecessor: &Predecessor,
-    ) -> Vec<(String, Vec<u8>)> {
-        if self.xattrs_observable() {
-            std::fs::File::open(path)
-                .map(|f| yadorilink_local_storage::read_replicated_xattrs(&f))
-                .unwrap_or_default()
-        } else {
-            predecessor.inherited_xattrs()
+            predecessor.inherited_exec()
         }
     }
 
@@ -544,6 +497,9 @@ mod cfapi_placeholder_untouched_windows_tests {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod file_only_capture_tests;
 
 /// The scan computes a path's version when it reads the bytes, and commits
 /// it later -- unlocked, with every other path's work in between. The

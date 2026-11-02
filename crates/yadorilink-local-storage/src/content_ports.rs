@@ -104,6 +104,24 @@ pub trait BlockContentStore: Send + Sync {
     /// reconstruct (deciding whether every block is already local, so the
     /// reconstruct needs no peer at all).
     fn present_blocks(&self, hashes: &[ContentHash]) -> Result<Vec<bool>, StorageError>;
+
+    /// Reads a block back with the record's own framing checked (the header names this hash, the
+    /// payload matches the checksum written beside it) but without re-deriving its SHA-256: see
+    /// [`BlockStore::get_unchecked`] for what that does and does not establish. The default is the
+    /// fully verified [`get`](Self::get), so a store that cannot do better is never less safe.
+    ///
+    /// For a caller that wants to know a stored block has not been damaged by the medium (torn,
+    /// truncated, rotted) and for which a record that is consistent with itself but is not the block
+    /// is caught later, where the bytes are used and verified.
+    fn get_framing_checked(&self, hash: &str) -> Result<Vec<u8>, StorageError> {
+        self.get(hash)
+    }
+
+    /// The directory this store writes its bytes into, when it has one on a real volume: the
+    /// volume whose free space a write into the store spends. Default `None`.
+    fn data_dir(&self) -> Option<&std::path::Path> {
+        None
+    }
 }
 
 impl<T: BlockStore + ?Sized> BlockContentStore for T {
@@ -125,6 +143,14 @@ impl<T: BlockStore + ?Sized> BlockContentStore for T {
 
     fn present_blocks(&self, hashes: &[ContentHash]) -> Result<Vec<bool>, StorageError> {
         BlockStore::present_blocks(self, hashes)
+    }
+
+    fn get_framing_checked(&self, hash: &str) -> Result<Vec<u8>, StorageError> {
+        BlockStore::get_unchecked(self, hash)
+    }
+
+    fn data_dir(&self) -> Option<&std::path::Path> {
+        BlockStore::data_dir(self)
     }
 }
 

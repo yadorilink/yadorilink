@@ -214,8 +214,7 @@ pub struct VersionRecord {
     pub origin_device_id: Option<String>,
     pub record_kind: RecordKind,
     pub symlink_target: Option<Vec<u8>>,
-    pub unix_mode: Option<u32>,
-    pub xattrs: Vec<(String, Vec<u8>)>,
+    pub exec: bool,
     pub version_hash: VersionHash,
 }
 
@@ -256,8 +255,7 @@ pub struct CurrentVersionRecord {
     pub deleted: bool,
     pub record_kind: RecordKind,
     pub symlink_target: Option<Vec<u8>>,
-    pub unix_mode: Option<u32>,
-    pub xattrs: Vec<(String, Vec<u8>)>,
+    pub exec: bool,
 }
 
 impl CurrentVersionRecord {
@@ -271,9 +269,8 @@ impl CurrentVersionRecord {
             self.size,
             self.mtime_unix_nanos,
             self.record_kind,
-            self.unix_mode,
+            self.exec,
             self.symlink_target.clone(),
-            self.xattrs.clone(),
         )
     }
 }
@@ -371,10 +368,7 @@ pub struct LocalFileMetaColumns {
     pub record_kind: RecordKind,
     pub symlink_target: Option<Vec<u8>>,
     pub symlink_out_of_root: bool,
-    pub unix_mode: Option<u32>,
-    /// See `FileMeta::xattrs`'s own doc comment -- already sorted by
-    /// name and filtered to the capture-side allow-list by the caller.
-    pub xattrs: Vec<(String, Vec<u8>)>,
+    pub exec: bool,
 }
 
 impl LocalFileMetaColumns {
@@ -386,8 +380,7 @@ impl LocalFileMetaColumns {
             record_kind: meta.record_kind,
             symlink_target: meta.symlink_target.clone(),
             symlink_out_of_root: false,
-            unix_mode: meta.unix_mode,
-            xattrs: meta.xattrs.clone(),
+            exec: meta.exec,
         }
     }
 }
@@ -535,6 +528,12 @@ pub struct RootSetSummary {
     /// summary describes does not yet hold all of the group's current
     /// content, whatever its index lists.
     pub unmaterialized_current_count: u64,
+    /// How many `state = 'current'` rows are materialized but held by the working tree alone:
+    /// some block of the version is not in this device's block store (a received or captured
+    /// file is not copied into it). The row is a claim about a file that a later edit or delete
+    /// takes away before capture notices, so it is not payload evidence for a peer's custody
+    /// claim; see [`Self::holds_payload`].
+    pub file_only_current_count: u64,
     /// Over `state IN ('current', 'superseded', 'trashed')`, the full
     /// durability-root set: the same digest function, over the same rows,
     /// that the handoff proof enumerates. An observation, never a
@@ -556,6 +555,12 @@ pub struct RootSetSummary {
 }
 
 impl RootSetSummary {
+    /// Whether every current row is backed by the block store, not only by a file in the folder.
+    /// `Protected` rests on this: a peer whose copy is only a file corroborates nothing.
+    pub fn holds_payload(&self) -> bool {
+        self.file_only_current_count == 0
+    }
+
     /// Whether every current row on the device this describes is
     /// materialized locally.
     pub fn fully_materialized(&self) -> bool {

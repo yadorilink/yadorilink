@@ -110,6 +110,14 @@ impl LinkRuntimeFactory {
         // registry only by the caller's own
         // `link_slot_guard.publish(...)`, once this whole function has
         // already succeeded.
+        // The most common reason the lock below is refused: the daemon's account cannot write the
+        // folder (a NAS bind mount owned by another uid). Say so with the path, the account and
+        // the fix, once per start, instead of leaving only the bare OS error.
+        if let Some(note) =
+            yadorilink_local_storage::root_access::unwritable_root_note(Path::new(&local_path))
+        {
+            tracing::warn!(group_id = %group_id, "{note}");
+        }
         let root_lock = yadorilink_root_authority::sync_root_lock::SyncRootLock::acquire(
             Path::new(&local_path),
         )?;
@@ -134,6 +142,14 @@ impl LinkRuntimeFactory {
         // unlink/relink for the same path. Runs while this link's `LinkSlot` is
         // still `Starting` -- visible (so a racing `stop_link_watch` waits for
         // it via `LinkSlotStartingGuard`) but not yet serving anything.
+        // First, before any step below can create a directory: a witnessed temp vouches for a
+        // missing name only if its directory is there. The order matters (the restore check
+        // below creates missing parents) and is exercised by
+        // `a_lost_parent_directory_is_not_read_as_the_users_delete`, which withdraws, re-creates
+        // the directory and only then repairs.
+        deps.replica_coordinator
+            .withdraw_witnesses_without_their_directory(&group_id, Path::new(&local_path))
+            .map_err(crate::sync_error::SyncError::from)?;
         let stale_root_tmp = deps
             .replica_coordinator
             .remove_recorded_temp_files(&group_id, Path::new(&local_path))
@@ -228,6 +244,13 @@ impl LinkRuntimeFactory {
                 }
             }
         };
+        // The temps the first sweep kept as the witnesses of open write intents: repair has
+        // decided those paths, so the ones whose intent is gone can go now.
+        if let Err(error) =
+            deps.replica_coordinator.remove_recorded_temp_files(&group_id, Path::new(&local_path))
+        {
+            tracing::warn!(%error, group_id = %group_id, "could not remove the temp files kept for repair");
+        }
         // The additive-scan window, read HERE rather than at the caller, and ANDed
         // with whatever the caller already decided.
         //

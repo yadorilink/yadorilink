@@ -50,6 +50,8 @@ mod raw;
 pub mod trace;
 #[cfg(not(any(test, feature = "test-support")))]
 mod trace;
+#[cfg(windows)]
+mod windows_keep;
 
 #[cfg(test)]
 mod tests;
@@ -508,7 +510,8 @@ impl DurableNamespace {
     /// owes the flush of both parents before it relies on the name, and keeps
     /// the stage record in its ledger until then (it is NOT released here: a
     /// crash before the flush may bring the stage name back). A failed rename
-    /// removes the stage, as [`Self::publish`] does.
+    /// removes the stage, as [`Self::publish`] does, unless `keep_stage_on_failure`: the caller
+    /// then owns the stage's removal.
     #[cfg(unix)]
     pub fn publish_without_flush(
         &self,
@@ -516,13 +519,14 @@ impl DurableNamespace {
         target: &Path,
         replace: Replace,
         ledger: &dyn NameLedger,
+        keep_stage_on_failure: bool,
     ) -> Result<(), NsError> {
         let (from_parent, to_parent) = (parent_of(staged)?, parent_of(target)?);
         self.require_validated_volume(&[from_parent, to_parent])?;
         let moved = hit(NsFailpoint::BeforeMove)
             .and_then(|()| ops::move_entry(staged, target, replace).map_err(NsError::from_io));
         if let Err(error) = moved {
-            if !is_crash(&error) {
+            if !is_crash(&error) && !keep_stage_on_failure {
                 abandon(staged, ledger);
             }
             return Err(error);

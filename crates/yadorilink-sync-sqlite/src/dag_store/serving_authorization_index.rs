@@ -10,6 +10,7 @@
 //! [`prune_unjustified_change_file_versions`] guards against.
 
 use rusqlite::{Connection, OptionalExtension};
+use yadorilink_sqlite_runtime::CachedStatements as _;
 
 use crate::error::SyncSqliteError;
 use yadorilink_replica_domain::file::FileVersion;
@@ -67,7 +68,7 @@ pub fn record_group_block_provenance(
     group_id: &str,
     block_hashes: &[Vec<u8>],
 ) -> Result<(), SyncSqliteError> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "INSERT OR IGNORE INTO group_block_provenance (group_id, block_hash) VALUES (?1, ?2)",
     )?;
     for block_hash in block_hashes {
@@ -83,8 +84,7 @@ pub fn group_has_block_provenance(
     group_id: &str,
     block_hash: &[u8],
 ) -> Result<bool, SyncSqliteError> {
-    Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM group_block_provenance WHERE group_id = ?1 AND block_hash = ?2)",
+    Ok(conn.query_row_cached("SELECT EXISTS(SELECT 1 FROM group_block_provenance WHERE group_id = ?1 AND block_hash = ?2)",
         rusqlite::params![group_id, block_hash],
         |row| row.get(0),
     )?)

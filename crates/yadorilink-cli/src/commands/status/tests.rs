@@ -171,7 +171,7 @@ fn degraded_link_shows_its_reason() {
     let mut link = base_link();
     link.degraded = true;
     link.degraded_reason = "insufficient free space to write big.bin".to_string();
-    assert_eq!(degraded_suffix(&link), "  degraded (insufficient free space to write big.bin)");
+    assert_eq!(degraded_suffix(&link), "  stopped (insufficient free space to write big.bin)");
 }
 
 /// `Protected` and `Protecting` are both fine to leave as plain "syncing"
@@ -193,7 +193,7 @@ fn protected_or_protecting_durability_renders_no_new_output() {
 fn durability_unknown_renders_its_own_suffix() {
     let mut link = base_link();
     link.durability_status = GroupDurabilityStatus::Unknown as i32;
-    assert_eq!(durability_suffix(&link), "  durability unknown");
+    assert_eq!(durability_suffix(&link), "  protection unknown");
 }
 
 /// While the first custody check has not run yet the status is "checking",
@@ -203,7 +203,7 @@ fn durability_check_pending_renders_checking_not_unknown() {
     let mut link = base_link();
     link.durability_status = GroupDurabilityStatus::Unknown as i32;
     link.durability_check_pending = true;
-    assert_eq!(durability_suffix(&link), "  durability checking");
+    assert_eq!(durability_suffix(&link), "  getting ready (checking protection)");
 }
 
 /// A group with a confirmed missing durable holder renders its own,
@@ -212,7 +212,7 @@ fn durability_check_pending_renders_checking_not_unknown() {
 fn at_risk_durability_renders_its_own_suffix() {
     let mut link = base_link();
     link.durability_status = GroupDurabilityStatus::AtRisk as i32;
-    assert_eq!(durability_suffix(&link), "  durability: at risk");
+    assert_eq!(durability_suffix(&link), "  protection: at risk");
 }
 
 /// an unset value
@@ -222,7 +222,7 @@ fn at_risk_durability_renders_its_own_suffix() {
 fn unspecified_durability_fails_safe_like_unknown() {
     let mut link = base_link();
     link.durability_status = GroupDurabilityStatus::Unspecified as i32;
-    assert_eq!(durability_suffix(&link), "  durability unknown");
+    assert_eq!(durability_suffix(&link), "  protection unknown");
 }
 
 /// A full copy renders no local-storage suffix at all --
@@ -293,7 +293,7 @@ fn available_now_renders_no_fetch_availability_suffix() {
 fn unavailable_now_renders_its_own_suffix() {
     let mut link = base_link();
     link.fetch_availability = FetchAvailability::UnavailableNow as i32;
-    assert_eq!(fetch_availability_suffix(&link), "  fetch not confirmed");
+    assert_eq!(fetch_availability_suffix(&link), "  waiting for a device");
 }
 
 /// `Unknown`, and an unset value,
@@ -302,9 +302,9 @@ fn unavailable_now_renders_its_own_suffix() {
 fn unknown_fetch_availability_never_reads_as_available() {
     let mut link = base_link();
     link.fetch_availability = FetchAvailability::Unknown as i32;
-    assert_eq!(fetch_availability_suffix(&link), "  fetch availability unknown");
+    assert_eq!(fetch_availability_suffix(&link), "  can't tell right now");
     link.fetch_availability = FetchAvailability::Unspecified as i32;
-    assert_eq!(fetch_availability_suffix(&link), "  fetch availability unknown");
+    assert_eq!(fetch_availability_suffix(&link), "  can't tell right now");
 }
 
 /// `0` reads as "unlimited" — the shared convention
@@ -491,6 +491,7 @@ fn base_peer() -> PeerStatus {
         route_kind: RouteKind::Direct as i32,
         version_incompatible: false,
         replaced_by_device_id: String::new(),
+        last_connected_unix: 0,
     }
 }
 
@@ -708,12 +709,58 @@ fn a_healthy_link_renders_no_ambiguity_suffix() {
     assert_eq!(ambiguous_suffix(&base_link()), "");
 }
 
+/// A linked folder the daemon's account cannot write is called out under its line, with the
+/// daemon's own text; a writable one prints nothing extra.
+#[test]
+fn an_unwritable_root_is_warned_about_under_its_folder() {
+    let note = "/srv/x is not writable by the daemon, which runs as uid 999, gid 999.";
+    let mut status = base_status();
+    status.links = vec![
+        LinkStatus { local_path: "/srv/x".into(), root_access_warning: note.into(), ..base_link() },
+        LinkStatus { local_path: "/srv/ok".into(), ..base_link() },
+    ];
+    let lines = detailed_status_lines(&status, &DeviceNames::default(), false);
+    let warnings: Vec<_> = lines.iter().filter(|l| l.contains("WARNING")).collect();
+    assert_eq!(warnings, vec![&format!("  WARNING: {note}")], "{lines:#?}");
+}
+
+/// A folder that stopped keeping replaced versions for lack of space says so for a day after the
+/// last one and counts the last 30 days; a folder with none prints nothing extra.
+#[test]
+fn versions_not_kept_for_space_are_called_out_under_the_folder() {
+    let mut status = base_status();
+    status.links = vec![
+        LinkStatus {
+            local_path: "/srv/x".into(),
+            history_skipped_last_day: 1,
+            history_skipped_last_30_days: 3,
+            ..base_link()
+        },
+        LinkStatus { local_path: "/srv/y".into(), history_skipped_last_30_days: 1, ..base_link() },
+        LinkStatus { local_path: "/srv/ok".into(), ..base_link() },
+    ];
+    let lines = detailed_status_lines(&status, &DeviceNames::default(), false);
+    let said: Vec<_> = lines
+        .iter()
+        .filter(|l| l.contains("not being kept") || l.contains("not kept for space"))
+        .collect();
+    assert_eq!(
+        said,
+        vec![
+            "  WARNING: older versions are not being kept because the disk is nearly full",
+            "  3 versions were not kept for space in the last 30 days",
+            "  1 version was not kept for space in the last 30 days",
+        ],
+        "{lines:#?}"
+    );
+}
+
 /// One whole `yadorilink status` rendering of an empty daemon, pinned line by
 /// line: no folders, the limits and block-store summaries after a blank line.
 #[test]
 fn status_lines_for_an_empty_daemon_are_pinned_verbatim() {
     assert_eq!(
-        status_lines(&base_status(), &DeviceNames::default(), false),
+        detailed_status_lines(&base_status(), &DeviceNames::default(), false),
         vec![
             "No linked folders.",
             "",
@@ -735,7 +782,7 @@ fn status_lines_for_a_busy_daemon_are_pinned_verbatim() {
         .recent_errors
         .push(RecentSyncError { category: "disk_full".into(), ..Default::default() });
     assert_eq!(
-        status_lines(&status, &DeviceNames::default(), false),
+        detailed_status_lines(&status, &DeviceNames::default(), false),
         vec![
             "/tmp/photos  syncing  conflicts=0",
             "",
@@ -795,7 +842,7 @@ fn retained_originals_render_one_line_naming_the_release_command() {
     assert!(line.contains("2 original(s)"), "{line}");
     assert!(line.contains("yadorilink preserved retained"), "{line}");
     assert!(
-        status_lines(&status, &DeviceNames::default(), false).contains(&line),
+        detailed_status_lines(&status, &DeviceNames::default(), false).contains(&line),
         "shown by status"
     );
 }
@@ -805,7 +852,7 @@ fn retained_originals_render_one_line_naming_the_release_command() {
 fn a_rebootstrapping_group_is_named() {
     let mut status = base_status();
     status.rebootstrapping_groups = vec!["g1".into()];
-    let lines = status_lines(&status, &DeviceNames::default(), false);
+    let lines = detailed_status_lines(&status, &DeviceNames::default(), false);
     assert!(lines.iter().any(|line| line.contains("g1") && line.contains("rebootstrap")));
 }
 
@@ -813,12 +860,12 @@ fn a_rebootstrapping_group_is_named() {
 #[test]
 fn undecided_uploads_are_reported_with_their_age() {
     let mut status = base_status();
-    assert!(!status_lines(&status, &DeviceNames::default(), false)
+    assert!(!detailed_status_lines(&status, &DeviceNames::default(), false)
         .iter()
         .any(|l| l.contains("undecided uploads")));
     status.undecided_uploads = 3;
     status.undecided_uploads_oldest_ms = 5 * 3_600_000;
-    let lines = status_lines(&status, &DeviceNames::default(), false);
+    let lines = detailed_status_lines(&status, &DeviceNames::default(), false);
     assert!(lines.iter().any(|l| l == "undecided uploads: 3, oldest: 5h"), "{lines:?}");
 }
 
@@ -847,17 +894,17 @@ fn provider_roots_are_explained() {
         counters_unreadable: false,
         sync_root_path: String::new(),
     }];
-    let lines = status_lines(&status, &DeviceNames::default(), false);
+    let lines = detailed_status_lines(&status, &DeviceNames::default(), false);
     let has = |needle: &str| lines.iter().any(|l| l.contains(needle));
-    assert!(has("provider folder Photos: enable File Provider"), "{lines:?}");
+    assert!(has("Photos (File Provider): enable File Provider"), "{lines:?}");
     assert!(has("downloading: running, 40 file(s) on this Mac, 7 to fetch, 2 in progress"));
     assert!(has("stuck: a/b.bin (5 failed attempt(s))"));
     assert!(has("edits kept beside the file: 3, oldest: 3h"));
     assert!(has("file in use or release pending): 2, oldest: 90s"), "{lines:?}");
     assert!(has("released but not yet confirmed by the OS: 1, oldest: 5h"));
-    assert!(!status_lines(&base_status(), &DeviceNames::default(), false)
+    assert!(!detailed_status_lines(&base_status(), &DeviceNames::default(), false)
         .iter()
-        .any(|l| l.contains("provider folder")));
+        .any(|l| l.contains("(File Provider)")));
 }
 
 /// A provider folder is named, never shown by its identity key; a removal says where the
@@ -887,12 +934,12 @@ fn provider_folders_removals_and_orphans_are_rendered_without_a_path() {
         },
     ];
     status.orphan_domains = vec!["cccccccc".into()];
-    let lines = status_lines(&status, &DeviceNames::default(), false);
+    let lines = detailed_status_lines(&status, &DeviceNames::default(), false);
     let has = |needle: &str| lines.iter().any(|l| l.contains(needle));
-    assert!(has("provider folder 'Photos'  syncing"), "{lines:?}");
+    assert!(has("Photos (File Provider)  syncing"), "{lines:?}");
     assert!(!has("provider://"), "the identity key leaked into the output: {lines:?}");
     assert!(has("removed; the downloaded files are kept at /Users/u/kept"), "{lines:?}");
-    assert!(has("Going: removing"), "{lines:?}");
+    assert!(has("Going (File Provider): removing"), "{lines:?}");
     assert!(
         has("domain cccccccc belongs to no folder this database knows; it is kept"),
         "{lines:?}"
@@ -912,11 +959,11 @@ fn an_unreadable_removals_list_is_not_rendered_as_a_removal() {
     }];
     status.overall_state = "attention".into();
     status.attention_reasons = vec!["provider_not_ready:removals".into()];
-    let lines = status_lines(&status, &DeviceNames::default(), false);
+    let lines = detailed_status_lines(&status, &DeviceNames::default(), false);
     let has = |needle: &str| lines.iter().any(|l| l.contains(needle));
-    assert!(has("provider folder removals: removals unreadable: boom"), "{lines:?}");
+    assert!(has("File Provider folder removals: removals unreadable: boom"), "{lines:?}");
     assert!(!has("removing"), "{lines:?}");
-    assert!(has("[provider folder removals]"), "{lines:?}");
+    assert!(has("[File Provider folder removals]"), "{lines:?}");
 }
 
 /// The unreadable-file advice must name a fix that exists on this platform: `chmod` does not on
@@ -1064,7 +1111,7 @@ fn unreadable_provider_counters_are_not_rendered_as_zeros() {
         counters_unreadable: true,
         ..Default::default()
     }];
-    let lines = status_lines(&status, &DeviceNames::default(), false);
+    let lines = detailed_status_lines(&status, &DeviceNames::default(), false);
     let has = |needle: &str| lines.iter().any(|l| l.contains(needle));
     assert!(has("counters: unknown"), "{lines:?}");
     assert!(!has("downloading:"), "{lines:?}");
@@ -1153,7 +1200,28 @@ fn named() -> DeviceNames {
         names: [("device-kitchen-0002".to_string(), "Kitchen Mac".to_string())]
             .into_iter()
             .collect(),
+        stale: false,
     }
+}
+
+/// A name read from an earlier list says so in the folder's copy lines too.
+#[test]
+fn a_stale_name_is_labelled_in_the_copy_lines() {
+    let mut names = named();
+    names.stale = true;
+    assert_eq!(device_label(&names, "device-kitchen-0002", false), "Kitchen Mac (last known name)");
+}
+
+/// Copy holders are asked fresh; only a status that names peers alone may reuse a cached list.
+#[test]
+fn copy_holders_are_never_named_from_a_cached_list() {
+    let mut status = base_status();
+    assert!(!names_a_copy_holder(&status));
+    status.links.push(LinkStatus {
+        full_replica_device_ids: vec!["device-kitchen-0002".into()],
+        ..Default::default()
+    });
+    assert!(names_a_copy_holder(&status));
 }
 
 /// Peers, reasons about a device and configured full copies show the name the account gives the
@@ -1181,7 +1249,7 @@ fn devices_are_shown_by_name_and_by_short_id_only_when_unnamed() {
     let mut link = base_link();
     link.full_replica_device_ids = vec!["device-kitchen-0002".into()];
     status.links = vec![link];
-    let lines = status_lines(&status, &names, false);
+    let lines = detailed_status_lines(&status, &names, false);
     let text = lines.join("\n");
     assert!(text.contains("[Kitchen Mac]"), "{text}");
     assert!(text.contains("  Kitchen Mac  connected"), "{text}");
@@ -1280,8 +1348,193 @@ fn details_say_update_required_for_a_reachable_incompatible_holder() {
 fn dimension_lines_appear_only_under_details() {
     let mut status = base_status();
     status.links.push(base_link());
-    let plain = status_lines(&status, &DeviceNames::default(), false);
+    let plain = detailed_status_lines(&status, &DeviceNames::default(), false);
     assert!(!plain.iter().any(|l| l.contains("availability:")));
-    let detailed = status_lines(&status, &DeviceNames::default(), true);
+    let detailed = detailed_status_lines(&status, &DeviceNames::default(), true);
     assert!(detailed.iter().any(|l| l.starts_with("    availability:")));
+}
+
+/// An absence of any length is only information: a device that is away shows when it was last
+/// seen, and one never connected to shows nothing.
+#[test]
+fn an_away_device_shows_when_it_was_last_seen() {
+    assert_eq!(last_seen_suffix(0, 1_000_000), "");
+    assert_eq!(last_seen_suffix(1_000_000 - 3 * 86_400, 1_000_000), ", last seen 3d ago");
+    assert_eq!(last_seen_suffix(1_000_000 - 3 * 86_400 - 90_000, 1_000_000), ", last seen 4d ago");
+    let away = PeerStatus {
+        reachability: PeerReachability::Unreachable as i32,
+        last_connected_unix: 1,
+        ..base_peer()
+    };
+    assert!(peer_connectivity_label(&away).contains("last seen"));
+    assert!(!peer_connectivity_label(&base_peer()).contains("last seen"));
+}
+
+// ---- the default view ------------------------------------------------------------------
+
+/// A reply as the daemon sends it: with the product status computed and stored.
+fn as_sent(mut status: StatusResponse) -> StatusResponse {
+    yadorilink_client_core::attention::wire::fill_product_status(&mut status);
+    status
+}
+
+fn summary_of(status: StatusResponse) -> Vec<String> {
+    status_lines(&as_sent(status), &DeviceNames::default(), false)
+}
+
+#[test]
+fn an_idle_folder_reads_up_to_date_with_availability_and_protection_under_it() {
+    let link = LinkStatus { availability: ProductAvailability::Available as i32, ..base_link() };
+    assert_eq!(
+        summary_of(StatusResponse { links: vec![link], ..base_status() }),
+        vec![
+            "Up to date",
+            "All files available",
+            "Not confirmed yet",
+            "",
+            "  /tmp/photos   Up to date"
+        ]
+    );
+}
+
+/// With nothing known, the answer is "can't tell", never "available".
+#[test]
+fn an_unset_availability_reads_cannot_tell_never_available() {
+    let lines = summary_of(StatusResponse { links: vec![base_link()], ..base_status() });
+    assert_eq!(lines[1], "Can't tell right now");
+}
+
+#[test]
+fn a_device_that_is_away_is_availability_information_never_a_problem() {
+    let offline = "nas".to_string();
+    let mut link = base_link();
+    link.availability = ProductAvailability::Available as i32;
+    link.availability_reachable_device_ids = vec!["mini".into()];
+    link.availability_offline_device_ids = vec![offline.clone()];
+    link.protection = DataProtection::Protected as i32;
+    link.protection_device_ids = vec!["mini".into()];
+    let away = PeerStatus {
+        device_id: offline,
+        reachability: PeerReachability::Unreachable as i32,
+        last_connected_unix: 1,
+        ..base_peer()
+    };
+    let status = StatusResponse { links: vec![link], peers: vec![away], ..base_status() };
+    let lines = summary_of(status);
+    assert_eq!(lines[0], "Up to date");
+    assert_eq!(lines[1], "Available · 2 of 3 devices online");
+    assert_eq!(lines[2], "Protected · also on mini");
+    assert!(lines.iter().all(|l| !l.contains("Needs attention")), "{lines:?}");
+}
+
+#[test]
+fn waiting_for_an_away_device_names_it_and_when_it_was_last_seen() {
+    let mut link = base_link();
+    link.requested_content_count = 1;
+    link.fetch_availability = FetchAvailability::UnavailableNow as i32;
+    link.availability = ProductAvailability::WaitingForPeer as i32;
+    link.availability_offline_device_ids = vec!["nas".into()];
+    let away = PeerStatus {
+        device_id: "nas".into(),
+        reachability: PeerReachability::Unreachable as i32,
+        last_connected_unix: now_unix() - 3 * 86_400,
+        ..base_peer()
+    };
+    let lines =
+        summary_of(StatusResponse { links: vec![link], peers: vec![away], ..base_status() });
+    assert_eq!(lines[0], "Waiting");
+    assert_eq!(lines[1], "Waiting for nas (offline, last seen 3d ago)");
+    assert!(lines.contains(&"  /tmp/photos   Waiting   Waiting for nas".to_string()), "{lines:?}");
+}
+
+#[test]
+fn a_folder_only_this_device_holds_says_so_and_is_not_a_problem() {
+    let mut link = base_link();
+    link.durability_status = GroupDurabilityStatus::AtRisk as i32;
+    link.protection = DataProtection::AtRisk as i32;
+    let lines = summary_of(StatusResponse { links: vec![link], ..base_status() });
+    assert_eq!(lines[0], "Up to date");
+    assert_eq!(lines[2], "Only on this device · Add another device");
+}
+
+#[test]
+fn syncing_counts_the_files_and_the_bytes_left_and_a_first_round_is_getting_ready() {
+    let mut link = base_link();
+    link.has_active_transfer = true;
+    link.transfer_bytes_total = 400;
+    link.transfer_bytes_done = 100;
+    link.durability_status = GroupDurabilityStatus::Unknown as i32;
+    link.durability_check_pending = true;
+    link.protection = DataProtection::Pending as i32;
+    let transfer = ActiveTransferProgress {
+        group_id: "group-1".into(),
+        path: "big.bin".into(),
+        bytes_done: 100,
+        bytes_total: 400,
+        ..Default::default()
+    };
+    let lines = summary_of(StatusResponse {
+        links: vec![link],
+        active_transfers: vec![transfer],
+        ..base_status()
+    });
+    assert_eq!(lines[0], "Syncing 1 file, 300 B left");
+    assert_eq!(lines[2], "Checking");
+    assert!(lines.contains(&"  /tmp/photos   Syncing   (getting ready)".to_string()), "{lines:?}");
+}
+
+#[test]
+fn a_problem_is_a_numbered_row_with_its_command_under_a_counted_heading() {
+    let mut link = base_link();
+    link.conflict_count = 1;
+    let status = StatusResponse {
+        links: vec![link],
+        attention_reasons: vec!["conflict:group-1".into(), "sign_in_required".into()],
+        ..base_status()
+    };
+    let lines = summary_of(status);
+    assert_eq!(lines[0], "Needs attention");
+    assert!(lines.contains(&"  /tmp/photos   Needs attention".to_string()), "{lines:?}");
+    let at = lines.iter().position(|l| l == "Needs attention: 2 items").expect("a heading");
+    assert!(lines[at + 1].starts_with("  1. Some files have conflicting copies."), "{lines:?}");
+    assert!(lines[at + 1].ends_with("Next: yadorilink conflicts list"), "{lines:?}");
+    assert!(lines[at + 2].starts_with("  2. "), "{lines:?}");
+}
+
+#[test]
+fn a_paused_folder_says_until_when() {
+    let mut link = base_link();
+    link.paused = true;
+    link.paused_until_unix = now_unix() + 3600;
+    let lines = summary_of(StatusResponse { links: vec![link], ..base_status() });
+    assert_eq!(lines[0], "Paused");
+    let row = lines.iter().find(|l| l.contains("Paused   Paused until")).expect("a paused row");
+    assert!(row.starts_with("  /tmp/photos   Paused   Paused until "), "{row}");
+}
+
+#[test]
+fn details_keep_the_full_view_and_the_short_view_hides_the_inventory() {
+    let status = as_sent(StatusResponse {
+        links: vec![base_link()],
+        peers: vec![base_peer()],
+        ..base_status()
+    });
+    let short = status_lines(&status, &DeviceNames::default(), false);
+    let full = status_lines(&status, &DeviceNames::default(), true);
+    assert!(
+        short.iter().all(|l| !l.starts_with("Peers:") && !l.starts_with("Limits")),
+        "{short:?}"
+    );
+    assert!(full.iter().any(|l| l == "Peers:"), "{full:?}");
+}
+
+/// A folder that waits for content with no cause named by the daemon says only "Waiting".
+#[test]
+fn a_waiting_folder_with_no_named_cause_claims_none() {
+    let mut link = base_link();
+    link.requested_content_count = 1;
+    link.fetch_availability = FetchAvailability::UnavailableNow as i32;
+    link.availability = ProductAvailability::Unknown as i32;
+    let lines = summary_of(StatusResponse { links: vec![link], ..base_status() });
+    assert!(lines.contains(&"  /tmp/photos   Waiting".to_string()), "{lines:?}");
 }

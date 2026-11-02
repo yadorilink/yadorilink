@@ -17,7 +17,7 @@ fn test_schema(conn: &Connection) -> Result<(), DatabaseError> {
              group_id TEXT NOT NULL, path TEXT NOT NULL, version_seq INTEGER NOT NULL,
              size INTEGER NOT NULL, mtime_unix_nanos INTEGER NOT NULL, blocks_json TEXT NOT NULL,
              deleted INTEGER NOT NULL, state TEXT NOT NULL, origin_device_id TEXT,
-             record_kind TEXT NOT NULL, symlink_target BLOB, unix_mode INTEGER NOT NULL,
+             record_kind TEXT NOT NULL, symlink_target BLOB, exec INTEGER NOT NULL,
              xattrs_json TEXT NOT NULL DEFAULT '[]',
              -- Present in the real schema; the canonical current-row
              -- read returns them alongside the content columns so a
@@ -64,13 +64,13 @@ fn list_versions_orders_newest_first_and_preserves_metadata() {
         .write::<_, SyncSqliteError>(|conn| {
             conn.execute(
                 "INSERT INTO files (group_id, path, version_seq, size, mtime_unix_nanos, \
-                 blocks_json, deleted, state, origin_device_id, record_kind, symlink_target, unix_mode) \
+                 blocks_json, deleted, state, origin_device_id, record_kind, symlink_target, exec) \
                  VALUES ('group-1', 'a.txt', 1, 10, 100, '[]', 0, 'superseded', 'device-a', 'file', NULL, 0)",
                 [],
             )?;
             conn.execute(
                 "INSERT INTO files (group_id, path, version_seq, size, mtime_unix_nanos, \
-                 blocks_json, deleted, state, origin_device_id, record_kind, symlink_target, unix_mode) \
+                 blocks_json, deleted, state, origin_device_id, record_kind, symlink_target, exec) \
                  VALUES ('group-1', 'a.txt', 2, 20, 200, '[]', 0, 'current', 'device-b', 'file', NULL, 1)",
                 [],
             )?;
@@ -84,7 +84,7 @@ fn list_versions_orders_newest_first_and_preserves_metadata() {
     assert_eq!(versions[0].version_seq, 2, "newest (highest version_seq) must come first");
     assert_eq!(versions[0].state, RetainedVersionState::Current);
     assert_eq!(versions[0].origin_device_id.as_deref(), Some("device-b"));
-    assert_eq!(versions[0].unix_mode, Some(1));
+    assert!(versions[0].exec);
     assert_eq!(versions[1].version_seq, 1);
     assert_eq!(versions[1].state, RetainedVersionState::Superseded);
 }
@@ -103,7 +103,7 @@ fn get_current_version_record_distinguishes_missing_from_corrupt() {
         .write::<_, SyncSqliteError>(|conn| {
             conn.execute(
                 "INSERT INTO files (group_id, path, version_seq, size, mtime_unix_nanos, \
-                 blocks_json, deleted, state, origin_device_id, record_kind, symlink_target, unix_mode) \
+                 blocks_json, deleted, state, origin_device_id, record_kind, symlink_target, exec) \
                  VALUES ('group-1', 'corrupt.txt', 1, 1, 1, 'not-json', 0, 'current', NULL, 'file', NULL, 0)",
                 [],
             )?;

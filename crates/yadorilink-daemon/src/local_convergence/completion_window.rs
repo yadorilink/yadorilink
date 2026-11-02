@@ -85,20 +85,40 @@ pub(crate) const DEFAULT_MAX_LATENCY: Duration = Duration::from_millis(20);
 /// How received files are flushed: once per batch instead of once per file.
 /// `1` flushes every file with `F_FULLFSYNC` off the critical path and every
 /// parent directory once; `2` (experimental) issues `fsync(2)` for each and a
-/// single `F_FULLFSYNC`; `0` keeps the per-file flush. Unset means `1` on Apple platforms
-/// and off elsewhere; any other value is off. Every platform but Unix is off.
+/// single `F_FULLFSYNC`; `0` keeps the per-file flush. Unset means `1` on every Unix platform
+/// (on Linux that is `fsync` of each file, concurrently, and of each distinct parent directory
+/// once, the same primitives the per-file path uses); any other value is off. Windows is off.
+///
+/// # Barriers on Windows
+///
+/// Windows never batches: a received file there takes the per-file path, `Durability::Full`.
+/// Its barrier 1 is `FlushFileBuffers` of the temp before the rename; its barrier 2 is the
+/// write-through move of `durable_dir` (the rename and the directory entry are on stable
+/// storage when the move returns), used wherever the volume passes the durable-namespace gate.
+/// There is no directory flush to batch (opening a directory for flushing fails), so a window
+/// there has no barrier 1 queue to join and content held only in memory is flushed by its
+/// writer. A volume that does not pass the gate publishes with a plain rename, as before.
+/// Whether the write-through move holds on a real device is what the Windows device run
+/// checks.
 pub(crate) fn parse_deferred_flush(
     raw: Option<&str>,
 ) -> Option<yadorilink_local_storage::ReceivedFlushMode> {
-    if !cfg!(unix) {
+    parse_deferred_flush_on(cfg!(unix), raw)
+}
+
+/// [`parse_deferred_flush`] for a platform that is given, so the Windows decision is tested on
+/// every host.
+pub(crate) fn parse_deferred_flush_on(
+    unix: bool,
+    raw: Option<&str>,
+) -> Option<yadorilink_local_storage::ReceivedFlushMode> {
+    if !unix {
         return None;
     }
     match raw.map(str::trim) {
         Some("1") => Some(yadorilink_local_storage::ReceivedFlushMode::FullFsyncEach),
         Some("2") => Some(yadorilink_local_storage::ReceivedFlushMode::FsyncThenOneFullFsync),
-        None if cfg!(target_vendor = "apple") => {
-            Some(yadorilink_local_storage::ReceivedFlushMode::FullFsyncEach)
-        }
+        None => Some(yadorilink_local_storage::ReceivedFlushMode::FullFsyncEach),
         _ => None,
     }
 }
@@ -120,6 +140,10 @@ pub(crate) struct PendingFlush {
     /// The fence the file's proof was published under, whose marked intent the
     /// flush clears; `None` when the close was refused and left no marker.
     pub(crate) marked_under: Option<i64>,
+    /// What the writer saw of the file right after flushing its data before the rename (a file whose
+    /// blocks were not durable elsewhere). The barrier flushes the directory, and the file again
+    /// only if it has changed since.
+    pub(crate) data_flushed: Option<yadorilink_local_storage::FlushedStamp>,
 }
 
 /// Whether file completions are batched: on unless the variable is `0`.
@@ -218,6 +242,39 @@ struct Inner {
     open_pending: usize,
     completions: Queue<ContentWriteCloseItem, ContentWriteClose>,
     opens: Queue<OwnedContentWriteOpen, i64>,
+    /// Temp files waiting for barrier 1 (see [`CompletionWindow::submit_temp_flush`]).
+    temp_flushes: Queue<TempFlushItem, Option<yadorilink_local_storage::FlushedStamp>>,
+}
+
+/// A temp file of a received file whose content is held nowhere durable, waiting for the window's
+/// barrier 1: its data and its directory entry are flushed before the file may be renamed over
+/// its target.
+pub(crate) struct TempFlushItem {
+    pub(crate) group_id: String,
+    /// The sync root the temp was written under, proven before and after the flush.
+    pub(crate) root: std::path::PathBuf,
+    pub(crate) tmp_path: std::path::PathBuf,
+    /// The temp as it was created, to be recognised again by the flush.
+    pub(crate) object: Option<yadorilink_local_storage::ObjectKey>,
+    /// Set when the writer already flushed the temp's data (a large file filled while it arrived):
+    /// the barrier then flushes the data again only if the temp changed since.
+    pub(crate) data_flushed: Option<yadorilink_local_storage::FlushedStamp>,
+    /// The temp's content is durable elsewhere (the block store): only its NAME must reach stable
+    /// storage before the rename, not its data.
+    pub(crate) name_only: bool,
+    /// Once the temp's directory entry is flushed, the barrier records
+    /// it on the write's intent, in one transaction for the batch, before any file of the batch
+    /// may be renamed (see `materialization_intents.temp_witness`).
+    pub(crate) witness: Option<TempWitness>,
+}
+
+/// The intent a temp flush is recorded on.
+#[derive(Clone)]
+pub(crate) struct TempWitness {
+    /// The path the temp will be renamed to, relative to the root.
+    pub(crate) path: String,
+    /// The mutation fence the write's open bumped.
+    pub(crate) fence: i64,
 }
 
 /// How long the window's files waited in each collector's queue (summed over
@@ -461,6 +518,38 @@ impl CompletionWindow {
             Arc::new(move |items: &[&ContentWriteCloseItem]| {
                 crate::receive_diag::record_completion_batch(items.len());
                 coordinator.close_content_writes(items)
+            }),
+        )
+        .await
+    }
+
+    /// Queues a temp file for barrier 1 and returns once the window's batch has flushed the
+    /// temp's data and its parent directory (once per distinct directory), with the stamp the
+    /// temp has now. An error means the temp is not known to be durable: the caller discards it
+    /// and does not rename.
+    ///
+    /// The batch runs on the blocking pool with the window's other queues, so a slow flush holds
+    /// only the files that are in it: later arrivals of the window form the next batch, and
+    /// another window's batches are independent. With the commit offload off (a test knob) the
+    /// flush runs in the polling future instead.
+    pub(crate) async fn submit_temp_flush(
+        &self,
+        coordinator: &Arc<ReplicaCoordinator>,
+        item: TempFlushItem,
+    ) -> Result<Option<yadorilink_local_storage::FlushedStamp>, PeerSessionError> {
+        let Some(mode) = self.deferred_flush else {
+            return Err(PeerSessionError::CorruptState(
+                "a temp flush was requested in a window that does not defer its flushes".into(),
+            ));
+        };
+        let coordinator = Arc::clone(coordinator);
+        self.submit_to(
+            |inner| &mut inner.temp_flushes,
+            |inner| inner.participants,
+            item,
+            "temp flush",
+            Arc::new(move |items: &[&TempFlushItem]| {
+                Ok(super::received_flush_barrier::run_temp_flush_barrier(&coordinator, items, mode))
             }),
         )
         .await

@@ -23,6 +23,7 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use yadorilink_sqlite_runtime::CachedStatements as _;
 
 use rusqlite::OptionalExtension;
 use yadorilink_sqlite_runtime::{DatabaseError, SyncDatabase};
@@ -32,7 +33,21 @@ use crate::segment_store::format::{RAW_HASH_LEN, RECORD_HEADER_LEN, SEGMENT_HEAD
 
 /// The store format this build writes. A store stamped with any other
 /// value is refused outright -- there is no migration path, by design.
-pub(crate) const STORE_FORMAT_VERSION: i64 = 2;
+/// Version 3 checksums records with XXH3-64; version 2 used CRC-32.
+pub(crate) const STORE_FORMAT_VERSION: i64 = 3;
+
+/// The refusal of a block store written by another build: what was found, why nothing is read, and
+/// how to keep what is set aside before the store is deleted and the folder imported again.
+pub(crate) fn another_layout_refusal(found: &str) -> String {
+    format!(
+        "{found} is not this build's block store format v{STORE_FORMAT_VERSION}, and pre-release \
+         builds do not migrate old block stores. Before you delete the block store and re-import \
+         the folder, save anything set aside for you: with the previous version run `yadorilink \
+         preserved list`, then `yadorilink preserved restore <item-id>` or `yadorilink preserved \
+         discard <item-id> --yes` for each item. Deleting the block store discards the content of \
+         anything still set aside"
+    )
+}
 
 const META_FORMAT_VERSION: &str = "format_version";
 const META_NEXT_SEGMENT_ID: &str = "next_segment_id";
@@ -257,7 +272,7 @@ impl BlockIndex {
         self.db
             .write_immediate(|tx| {
                 let stamped: Option<String> = tx
-                    .query_row(
+                    .query_row_cached(
                         "SELECT value FROM store_meta WHERE key = ?1",
                         [META_FORMAT_VERSION],
                         |row| row.get(0),
@@ -265,7 +280,7 @@ impl BlockIndex {
                     .optional()?;
                 match stamped {
                     None => {
-                        tx.execute(
+                        tx.execute_cached(
                             "INSERT INTO store_meta (key, value) VALUES (?1, ?2)",
                             rusqlite::params![
                                 META_FORMAT_VERSION,
@@ -277,9 +292,8 @@ impl BlockIndex {
                     Some(raw) if raw.trim().parse::<i64>().ok() == Some(STORE_FORMAT_VERSION) => {
                         Ok(())
                     }
-                    Some(raw) => Err(DatabaseError::CorruptSchema(format!(
-                        "block store format version {raw:?} is not this build's \
-                         v{STORE_FORMAT_VERSION}; this build does not migrate older stores"
+                    Some(raw) => Err(DatabaseError::CorruptSchema(another_layout_refusal(
+                        &format!("block store format version {raw:?}"),
                     ))),
                 }
             })
@@ -299,7 +313,7 @@ impl BlockIndex {
         self.db
             .read(|conn| {
                 let stored: Option<String> = conn
-                    .query_row(
+                    .query_row_cached(
                         "SELECT value FROM store_meta WHERE key = ?1",
                         [META_NEXT_SEGMENT_ID],
                         |row| row.get(0),
@@ -307,7 +321,9 @@ impl BlockIndex {
                     .optional()?;
                 let from_meta = stored.and_then(|raw| raw.trim().parse::<u64>().ok()).unwrap_or(1);
                 let from_rows: Option<i64> =
-                    conn.query_row("SELECT MAX(segment_id) FROM segments", [], |row| row.get(0))?;
+                    conn.query_row_cached("SELECT MAX(segment_id) FROM segments", [], |row| {
+                        row.get(0)
+                    })?;
                 Ok::<u64, DatabaseError>(
                     from_meta.max(from_rows.map(|id| id as u64 + 1).unwrap_or(1)),
                 )
@@ -320,7 +336,7 @@ impl BlockIndex {
         let rows = self
             .db
             .read(|conn| {
-                let mut stmt = conn.prepare(
+                let mut stmt = conn.prepare_cached(
                     "SELECT segment_id, state, durable_end, live_blocks, live_payload_bytes, \
                      live_record_bytes FROM segments ORDER BY segment_id",
                 )?;
@@ -364,7 +380,7 @@ impl BlockIndex {
     ) -> Result<Option<BlockLocation>, StorageError> {
         self.db
             .read(|conn| {
-                conn.query_row(
+                conn.query_row_cached(
                     "SELECT segment_id, record_offset, payload_len FROM blocks WHERE hash = ?1",
                     [&hash[..]],
                     |row| {
@@ -483,7 +499,7 @@ impl BlockIndex {
         self.db
             .write_immediate(|tx| {
                 for segment_id in &plan.sealed {
-                    tx.execute(
+                    tx.execute_cached(
                         "UPDATE segments SET state = ?2 WHERE segment_id = ?1 AND state = ?3",
                         rusqlite::params![
                             *segment_id as i64,
@@ -494,7 +510,7 @@ impl BlockIndex {
                 }
                 for append in &plan.appends {
                     if append.created {
-                        tx.execute(
+                        tx.execute_cached(
                             "INSERT OR IGNORE INTO segments (segment_id, state, durable_end, \
                              live_blocks, live_payload_bytes, live_record_bytes) \
                              VALUES (?1, ?2, ?3, 0, 0, 0)",
@@ -507,7 +523,7 @@ impl BlockIndex {
                     }
                     let (inserted_blocks, inserted_payload, inserted_record) =
                         Self::insert_new_blocks(tx, append)?;
-                    tx.execute(
+                    tx.execute_cached(
                         "UPDATE segments SET durable_end = ?2, \
                          live_blocks = live_blocks + ?3, \
                          live_payload_bytes = live_payload_bytes + ?4, \
@@ -522,7 +538,7 @@ impl BlockIndex {
                         ],
                     )?;
                 }
-                tx.execute(
+                tx.execute_cached(
                     "INSERT INTO store_meta (key, value) VALUES (?1, ?2) \
                      ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                     rusqlite::params![META_NEXT_SEGMENT_ID, plan.next_segment_id.to_string()],
@@ -632,7 +648,7 @@ impl BlockIndex {
                 // later compaction, since compaction never touches the
                 // active segment.
                 for segment_id in &plan.group.sealed {
-                    tx.execute(
+                    tx.execute_cached(
                         "UPDATE segments SET state = ?2 WHERE segment_id = ?1 AND state = ?3",
                         rusqlite::params![
                             *segment_id as i64,
@@ -643,7 +659,7 @@ impl BlockIndex {
                 }
                 for append in &plan.group.appends {
                     if append.created {
-                        tx.execute(
+                        tx.execute_cached(
                             "INSERT OR IGNORE INTO segments (segment_id, state, durable_end, \
                              live_blocks, live_payload_bytes, live_record_bytes) \
                              VALUES (?1, ?2, ?3, 0, 0, 0)",
@@ -656,7 +672,7 @@ impl BlockIndex {
                     }
                     let (moved_blocks, moved_payload, moved_record) =
                         Self::repoint_relocated_blocks(tx, append)?;
-                    tx.execute(
+                    tx.execute_cached(
                         "UPDATE segments SET durable_end = ?2, \
                          live_blocks = live_blocks + ?3, \
                          live_payload_bytes = live_payload_bytes + ?4, \
@@ -675,7 +691,7 @@ impl BlockIndex {
                 // in the same transaction that emptied it -- never in a
                 // later one that a crash could skip.
                 for source in &plan.sources {
-                    tx.execute(
+                    tx.execute_cached(
                         "UPDATE segments SET state = ?2 WHERE segment_id = ?1 \
                          AND live_blocks = 0 AND state != ?3",
                         rusqlite::params![
@@ -685,7 +701,7 @@ impl BlockIndex {
                         ],
                     )?;
                 }
-                tx.execute(
+                tx.execute_cached(
                     "INSERT INTO store_meta (key, value) VALUES (?1, ?2) \
                      ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                     rusqlite::params![META_NEXT_SEGMENT_ID, plan.group.next_segment_id.to_string()],
@@ -709,7 +725,7 @@ impl BlockIndex {
         self.db
             .write_immediate(|tx| {
                 let row: Option<(i64, i64)> = tx
-                    .query_row(
+                    .query_row_cached(
                         "SELECT payload_len, record_len FROM blocks \
                          WHERE hash = ?1 AND segment_id = ?2 AND record_offset = ?3",
                         rusqlite::params![
@@ -721,8 +737,8 @@ impl BlockIndex {
                     )
                     .optional()?;
                 let Some((payload_len, record_len)) = row else { return Ok(false) };
-                tx.execute("DELETE FROM blocks WHERE hash = ?1", [&hash[..]])?;
-                tx.execute(
+                tx.execute_cached("DELETE FROM blocks WHERE hash = ?1", [&hash[..]])?;
+                tx.execute_cached(
                     "UPDATE segments SET live_blocks = live_blocks - 1, \
                      live_payload_bytes = live_payload_bytes - ?2, \
                      live_record_bytes = live_record_bytes - ?3 WHERE segment_id = ?1",
@@ -809,7 +825,7 @@ impl BlockIndex {
         let rows = self
             .db
             .read(|conn| {
-                let mut stmt = conn.prepare(
+                let mut stmt = conn.prepare_cached(
                     "SELECT hash, payload_len FROM blocks WHERE added_at <= ?1 ORDER BY hash",
                 )?;
                 let rows = stmt
@@ -884,7 +900,7 @@ impl BlockIndex {
         let rows = self
             .db
             .read(|conn| {
-                let mut stmt = conn.prepare(
+                let mut stmt = conn.prepare_cached(
                     "SELECT hash FROM blocks WHERE hash >= ?1 AND hash <= ?2 ORDER BY hash",
                 )?;
                 let rows = stmt
@@ -931,7 +947,7 @@ impl BlockIndex {
     ) -> Result<(), StorageError> {
         self.db
             .write(|conn| {
-                conn.execute(
+                conn.execute_cached(
                     "UPDATE blocks SET added_at = ?2 WHERE hash = ?1",
                     rusqlite::params![&hash[..], added_at_nanos],
                 )?;
@@ -948,7 +964,7 @@ impl BlockIndex {
     ) -> Result<(), StorageError> {
         self.db
             .write(|conn| {
-                conn.execute(
+                conn.execute_cached(
                     "UPDATE segments SET state = ?2 WHERE segment_id = ?1",
                     rusqlite::params![segment_id as i64, state.as_str()],
                 )?;
@@ -964,9 +980,11 @@ impl BlockIndex {
     pub(crate) fn drop_segment_mappings(&self, segment_id: u64) -> Result<u64, StorageError> {
         self.db
             .write_immediate(|tx| {
-                let dropped =
-                    tx.execute("DELETE FROM blocks WHERE segment_id = ?1", [segment_id as i64])?;
-                tx.execute(
+                let dropped = tx.execute_cached(
+                    "DELETE FROM blocks WHERE segment_id = ?1",
+                    [segment_id as i64],
+                )?;
+                tx.execute_cached(
                     "UPDATE segments SET live_blocks = 0, live_payload_bytes = 0, \
                      live_record_bytes = 0 WHERE segment_id = ?1",
                     [segment_id as i64],
@@ -991,12 +1009,12 @@ impl BlockIndex {
     ) -> Result<u64, StorageError> {
         self.db
             .write_immediate(|tx| {
-                let dropped = tx.execute(
+                let dropped = tx.execute_cached(
                     "DELETE FROM blocks WHERE segment_id = ?1 \
                      AND record_offset + record_len > ?2",
                     rusqlite::params![segment_id as i64, file_len as i64],
                 )?;
-                let (blocks, payload, record, end): (i64, i64, i64, i64) = tx.query_row(
+                let (blocks, payload, record, end): (i64, i64, i64, i64) = tx.query_row_cached(
                     "SELECT COUNT(*), COALESCE(SUM(payload_len), 0), \
                      COALESCE(SUM(record_len), 0), \
                      COALESCE(MAX(record_offset + record_len), ?2) \
@@ -1004,7 +1022,7 @@ impl BlockIndex {
                     rusqlite::params![segment_id as i64, SEGMENT_HEADER_LEN as i64],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )?;
-                tx.execute(
+                tx.execute_cached(
                     "UPDATE segments SET live_blocks = ?2, live_payload_bytes = ?3, \
                      live_record_bytes = ?4, durable_end = ?5 WHERE segment_id = ?1",
                     rusqlite::params![segment_id as i64, blocks, payload, record, end],
@@ -1020,7 +1038,7 @@ impl BlockIndex {
     pub(crate) fn retire_empty_segment(&self, segment_id: u64) -> Result<(), StorageError> {
         self.db
             .write(|conn| {
-                conn.execute(
+                conn.execute_cached(
                     "UPDATE segments SET state = ?2 WHERE segment_id = ?1 AND live_blocks = 0 \
                      AND state != ?3",
                     rusqlite::params![
@@ -1039,8 +1057,11 @@ impl BlockIndex {
     pub(crate) fn forget_segment(&self, segment_id: u64) -> Result<(), StorageError> {
         self.db
             .write_immediate(|tx| {
-                tx.execute("DELETE FROM blocks WHERE segment_id = ?1", [segment_id as i64])?;
-                tx.execute("DELETE FROM segments WHERE segment_id = ?1", [segment_id as i64])?;
+                tx.execute_cached("DELETE FROM blocks WHERE segment_id = ?1", [segment_id as i64])?;
+                tx.execute_cached(
+                    "DELETE FROM segments WHERE segment_id = ?1",
+                    [segment_id as i64],
+                )?;
                 Ok(())
             })
             .map_err(to_storage)

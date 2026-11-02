@@ -377,6 +377,15 @@ message ListFolderFilesRequest {
   // The linked folder's `local_path` (plain roots; a provider root is addressed by
   // `root_id` in later steps).
   string local_path = 1;
+  // Paging. `max_entries == 0` asks for the whole listing in one frame (the original contract);
+  // the daemon then answers `snapshot_available = false` rather than exceed the frame limit.
+  // A nonzero value (clamped to 1..=5000) asks for the entries after `after_path` in ascending
+  // path order, at most that many and always within the frame budget; the response's
+  // `next_after_path` is the `after_path` of the next page, empty on the last. `after_path`
+  // empty starts at the beginning. A caller of a large folder MUST page: every page of one
+  // listing is read afresh, so a change between pages shows in the later pages only.
+  uint32 max_entries = 2;
+  string after_path = 3;
 }
 
 message FolderFileEntry {
@@ -431,6 +440,8 @@ message ListFolderFilesResponse {
   // rather than reporting an empty folder, and cfapi-host skips that
   // folder's placeholder sync for the poll.
   bool snapshot_available = 2;
+  // Set only on a paged request's non-final page: pass it as `after_path` for the next page.
+  string next_after_path = 3;
 }
 
 enum LocalWriteKind {
@@ -536,6 +547,14 @@ message MaterializeProgress {
   uint64 completed = 2;
   uint64 total = 3;
   bool done = 4;
+  // How many bytes of the content (the covering blocks for a ranged request) this device already
+  // held when the attempt started, so that none of them is fetched again: the blocks an
+  // interrupted earlier attempt of the same version stored (the engine keeps every block it
+  // fetched and verified), or that another version shares. A re-issued request resumes at the
+  // first block not held; `completed` starts above it. Absent until the attempt knows what it has
+  // to fetch (and from a daemon that predates this field); 0 is a fetch from the start; `total`
+  // means nothing is fetched. Constant for the request once present.
+  optional uint64 resumed_from = 5;
 }
 
 enum MaterializeFailure {
@@ -575,6 +594,16 @@ message MaterializeToTempResponse {
   bool ranged = 9;
   uint64 range_offset = 10;
   uint64 range_length = 11;
+  // Set only with MATERIALIZE_FAILURE_UNOBTAINABLE, when the engine can name a device that has
+  // this version and is not connected now: the device that authored the current version, when it
+  // is another device and no session with it is up. Best effort and absent whenever the engine
+  // cannot say; a host must never read the absence as "no device has it". Absent from a daemon
+  // that predates the field.
+  string holder_device_id = 12;
+  // `holder_device_id` as a name a person recognises. The engine knows only ids: a host that
+  // knows the account's device names (the embedded host does) fills this in on the way through,
+  // and leaves it empty when the name cannot be read. Never set by the daemon itself.
+  string holder_device_name = 13;
 }
 
 // Cancels one in-flight request, by request_id only.
@@ -633,18 +662,14 @@ enum ProviderChangeKind {
   PROVIDER_CHANGE_KIND_DELETE = 3;
 }
 
-message ProviderXattr {
-  string name = 1;
-  bytes value = 2;
-}
-
-// Metadata the OS reports. Absent = unchanged (MODIFY) or default (CREATE). Only replicated
-// xattrs are kept; Finder flags and tags are ignored.
+// Metadata the OS reports. Absent = unchanged (MODIFY) or default (CREATE). Only the execute flag
+// and the modification time are replicated; permission bits, extended attributes, Finder flags
+// and tags are ignored.
 message ProviderItemMetadata {
-  optional uint32 unix_mode = 1;           // low 12 bits
+  reserved 1, 3, 4;
+  reserved "unix_mode", "replace_xattrs", "xattrs";
+  optional bool exec = 5;                  // the item is (not) executable
   optional int64 mtime_unix_nanos = 2;     // absent = the daemon's clock
-  bool replace_xattrs = 3;                 // true: `xattrs` is the complete replicated set
-  repeated ProviderXattr xattrs = 4;
 }
 
 // Where the OS-supplied bytes were put by the extension: one file name inside the daemon's fixed
@@ -690,6 +715,23 @@ message ProviderApplyChangeRequest {
   // a stable identity, not a generation-fenced view.
   reserved 17;
   optional uint64 observed_revision = 18;       // the domain version the OS had observed (a hint)
+  // Set by the embedding app only (the File Provider extension never sets it): the new contents
+  // are a version this device retains, not an ingested copy. MODIFY: restore an earlier version
+  // of the item as a new version. CREATE: bring back a deleted file or folder under the name and
+  // parent the request gives. `content` must be unset. A MODIFY applies only on the current view
+  // (the base is the item's current version and generation), else STALE_VIEW; no provenance of
+  // OS-held bytes is asked for. See `ProviderRestoreSource`.
+  optional ProviderRestoreSource restore_from = 19;
+}
+
+// A retained version of a file or folder of the root's group, named by what the daemon listed
+// (`path` and `version_hash` of a version or deleted-item listing). The restore is one ordinary
+// new write decided by the same rules as any other change: a refusal changes nothing and keeps no
+// conflict copy. A file's blocks are fetched from a peer when this device no longer holds them;
+// none obtainable is VERSION_UNAVAILABLE. A symlink is not restorable.
+message ProviderRestoreSource {
+  string path = 1;           // the group-relative path the version was stored at
+  bytes version_hash = 2;    // the 32-byte version hash the listing gave
 }
 
 enum ProviderApplyFailure {
@@ -711,6 +753,8 @@ enum ProviderApplyFailure {
   PROVIDER_APPLY_FAILURE_OPERATION_MISMATCH = 15;
   PROVIDER_APPLY_FAILURE_STALE_OPERATION = 16;
   PROVIDER_APPLY_FAILURE_STALE_VIEW = 17;          // a generation does not match: nothing authored, retry after refresh
+  // A restore's version is not retained any more, or its bytes are held by no reachable device.
+  PROVIDER_APPLY_FAILURE_VERSION_UNAVAILABLE = 18;
 }
 
 enum ProviderApplyOutcome {
@@ -731,10 +775,12 @@ message ProviderAppliedItem {
   bytes metadata_version = 6;
   uint64 size = 7;
   int64 mtime_unix_nanos = 8;
-  uint32 unix_mode = 9;
+  reserved 9;  // was `uint32 unix_mode`
+  reserved "unix_mode";
   bool current = 10;                       // content_version is also the daemon's current version
   uint64 namespace_revision = 11;
   uint64 parent_generation = 12;           // as `ProviderItem.parent_generation`
+  bool exec = 13;                          // the item is executable
 }
 
 message ProviderApplyChangeResponse {
@@ -782,7 +828,8 @@ message ProviderItem {
   EntryKind entry_kind = 4;
   uint64 size = 5;
   int64 mtime_unix_nanos = 6;
-  uint32 unix_mode = 7;                   // low 12 bits
+  reserved 7;  // was `uint32 unix_mode`
+  reserved "unix_mode";
   bytes content_version = 8;              // the shown content version identifier (40 bytes: hash, generation)
   bytes metadata_version = 9;             // the shown metadata version identifier (40 bytes)
   bool content_pending = 10;              // a newer content version is fenced; a signal follows
@@ -799,6 +846,14 @@ message ProviderItem {
   // Decided by the engine each time the item is served; a file the user keeps on this device, or a
   // folder holding one, is never allowed.
   bool eviction_allowed = 14;
+  // What the ENGINE holds of this item on this device (not what the OS holds): `local_object_present`
+  // is set when the item's bytes are held, `current_content_present` when they are the shown
+  // content, `transition` while they are being fetched or freed. A folder is present and current.
+  // Absent means the engine cannot say (a folder that exists only because something lives below
+  // it, an unreadable row, or a daemon that predates the field); a host must read absence as
+  // "unknown", never as "not here". `content_pending` is separate: a newer version is fenced.
+  optional LocalState local_state = 15;
+  bool exec = 16;                         // the item is executable
 }
 
 enum EnumerateFailure {
@@ -844,7 +899,7 @@ message EnumerateChangesRequest {
   bytes root_id = 1;
   ChangeScope scope = 2;
   bytes parent_item_id = 3;               // CONTAINER only
-  uint64 since_anchor = 4;                // an event sequence; 0 never valid
+  uint64 since_anchor = 4;                // an event sequence (0 = a root with no events yet); outside the retained range -> ANCHOR_EXPIRED
   uint32 limit = 5;                       // events scanned per page, clamped to 1..=1000; 0 = 500
 }
 message EnumerateChangesResponse {

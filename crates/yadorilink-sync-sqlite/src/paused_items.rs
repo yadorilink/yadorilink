@@ -27,6 +27,7 @@
 //! the tests below pin the two to each other.
 
 use std::sync::Arc;
+use yadorilink_sqlite_runtime::CachedStatements as _;
 
 use rusqlite::Connection;
 use yadorilink_sqlite_runtime::SyncDatabase;
@@ -106,9 +107,9 @@ pub(crate) fn clear_group_in_tx(
     tx: &rusqlite::Transaction<'_>,
     group_id: &str,
 ) -> Result<(), SyncSqliteError> {
-    let removed = tx.execute("DELETE FROM paused_items WHERE group_id = ?1", [group_id])?;
+    let removed = tx.execute_cached("DELETE FROM paused_items WHERE group_id = ?1", [group_id])?;
     if removed > 0 {
-        tx.execute(
+        tx.execute_cached(
             "UPDATE projection_obligations SET next_attempt_at = 0 \
               WHERE group_id = ?1 AND state = 'pending'",
             [group_id],
@@ -130,7 +131,7 @@ impl PausedItemRepository {
     /// no-op that keeps its original pause time.
     pub fn pause(&self, group_id: &str, path: &str) -> Result<(), SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
-            conn.execute(
+            conn.execute_cached(
                 "INSERT INTO paused_items (group_id, path, paused_at_unix_nanos) \
                  VALUES (?1, ?2, ?3) ON CONFLICT(group_id, path) DO NOTHING",
                 rusqlite::params![group_id, path, now_unix_nanos()],
@@ -149,12 +150,12 @@ impl PausedItemRepository {
     pub fn resume(&self, group_id: &str, path: &str) -> Result<bool, SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
             let tx = conn.transaction()?;
-            let removed = tx.execute(
+            let removed = tx.execute_cached(
                 "DELETE FROM paused_items WHERE group_id = ?1 AND path = ?2",
                 rusqlite::params![group_id, path],
             )?;
             if removed > 0 {
-                tx.execute(
+                tx.execute_cached(
                     "UPDATE projection_obligations SET next_attempt_at = 0 \
                       WHERE group_id = ?1 AND state = 'pending' \
                         AND (?2 = '' OR path = ?2 \
@@ -170,8 +171,9 @@ impl PausedItemRepository {
     /// Every paused item of `group_id`, in path order.
     pub fn list(&self, group_id: &str) -> Result<Vec<String>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn
-                .prepare("SELECT path FROM paused_items WHERE group_id = ?1 ORDER BY path ASC")?;
+            let mut stmt = conn.prepare_cached(
+                "SELECT path FROM paused_items WHERE group_id = ?1 ORDER BY path ASC",
+            )?;
             let rows = stmt.query_map([group_id], |r| r.get::<_, String>(0))?;
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
         })

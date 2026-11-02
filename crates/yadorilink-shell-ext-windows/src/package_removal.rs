@@ -13,7 +13,9 @@
 //!    ([`wait_for_exit`]), then watches the package family for a while ([`removal_confirmed`]).
 //!    If the family disappears and stays gone, the package was uninstalled: it unregisters the
 //!    recorded roots and has itself deleted. If the family is still installed when the grace
-//!    period ends (the host was stopped, or updated), it leaves everything as it is and ends.
+//!    period ends (the host was stopped, or updated), it leaves everything as it is and ends. The
+//!    period must outlast the removal itself: the host is ended first, the family is gone only when
+//!    the removal has finished (about 33 s with the app running, measured).
 //!
 //! The record of the roots is kept (unlike `--unregister-all`), so that a reinstall puts every root
 //! back on the folder where it was instead of starting a second folder next to the user's files.
@@ -49,8 +51,12 @@ const HELPER_FILE: &str = "yadorilink-cfapi-host.exe";
 /// How often the guardian looks at the package family.
 pub const POLL: Duration = Duration::from_millis(250);
 /// How long, after its host ended, the guardian waits for the removal to show before it concludes
-/// that the package stays (the host was stopped, or the package was updated).
-pub const GRACE: Duration = Duration::from_secs(30);
+/// that the package stays (the host was stopped, or the package was updated). The host is ended at
+/// the start of the removal, but the package family only disappears when the removal is done, and
+/// with the app running that took 33 s on a lab PC (the app and daemon are given about 30 s before
+/// they are ended): a 30 s grace gave up 2 s early and left the root registered. Five minutes is nine times the measured time; a guardian that waits for nothing only
+/// holds a few megabytes of temporary files for that long.
+pub const GRACE: Duration = Duration::from_secs(300);
 /// How long the family has to stay gone before it counts as removed (an update replaces the
 /// version without the family ever being absent; this only guards against a moment's gap).
 pub const STABLE: Duration = Duration::from_secs(3);
@@ -359,6 +365,25 @@ mod tests {
     }
 
     #[test]
+    fn a_removal_that_outlasts_the_hosts_exit_by_a_minute_is_still_a_removal() {
+        // The host ends when the removal starts and the family disappears when it ends: 33 s on the lab
+        // PC where a 30 s grace gave up too early. Real constants, so the grace cannot shrink back.
+        let mut calls = 0u32;
+        let polls_until_gone = (Duration::from_secs(60).as_millis() / POLL.as_millis()) as u32;
+        let removed = removal_confirmed(
+            &mut || {
+                calls += 1;
+                calls <= polls_until_gone
+            },
+            POLL,
+            GRACE,
+            STABLE,
+            &mut || {},
+        );
+        assert!(removed);
+    }
+
+    #[test]
     fn a_gap_that_closes_and_a_family_that_stays_are_not_removals() {
         let mut calls = 0;
         // Absent for ten looks (2.5 s), then back for good: an update's moment, not a removal.
@@ -375,7 +400,11 @@ mod tests {
         assert!(!gap);
         let mut pauses = 0;
         assert!(!removal_confirmed(&mut || true, POLLS.0, POLLS.1, POLLS.2, &mut || pauses += 1));
-        assert_eq!(pauses, 121, "it looks for the whole grace period and then gives up");
+        assert_eq!(
+            pauses,
+            GRACE.as_millis() as u32 / POLL.as_millis() as u32 + 1,
+            "it looks for the whole grace period and then gives up"
+        );
     }
 
     #[test]

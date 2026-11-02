@@ -9,10 +9,9 @@ use crate::limits::MAX_ENCODED_VERSION_BYTES;
 fn file_meta() -> FileMeta {
     FileMeta {
         mtime_unix_nanos: 1,
-        unix_mode: None,
+        exec: false,
         symlink_target: None,
         record_kind: RecordKind::File,
-        xattrs: Vec::new(),
     }
 }
 

@@ -110,6 +110,12 @@ impl LinkRuntime {
         self.flush_handle.flush_all_pending_local_changes(group_id).await
     }
 
+    /// Re-drives the dirty-path journal now -- see
+    /// `LinkFlushHandle::redrive_dirty_journal`.
+    pub(crate) async fn redrive_dirty_journal(&self, group_id: &str) -> Result<(), String> {
+        self.flush_handle.redrive_dirty_journal(group_id).await
+    }
+
     /// Folds the whole folder into the index once -- see
     /// `LinkFlushHandle::capture_whole_group`.
     pub(crate) async fn capture_whole_group(&self, group_id: &str) -> Result<(), String> {

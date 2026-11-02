@@ -8,7 +8,7 @@ use yadorilink_replica_domain::file::BlockInfo;
 use crate::error::PeerSessionError;
 
 use super::{
-    block_data_matches, decompress_block, spawn_blocking, PeerSyncSession, MAX_BLOCK_SIZE,
+    decompress_block, spawn_blocking, PeerSyncSession, MAX_BLOCK_SIZE,
     NO_VERIFIED_PROVENANCE_REASON,
 };
 
@@ -39,10 +39,9 @@ use super::{
 /// `record_group_block_provenance` call per invocation, instead of one
 /// `write_immediate` SQLite transaction per block).
 pub(crate) enum BlockFetchOutcome {
-    Fetched {
-        hash: Vec<u8>,
-        data: Bytes,
-    },
+    /// The block, checked against the hash and size it was requested as (the only place a
+    /// [`yadorilink_local_storage::VerifiedBlock`] of a fetched block is made).
+    Fetched(yadorilink_local_storage::VerifiedBlock),
     Missing,
     /// The peer answered `rejected` with `NO_VERIFIED_PROVENANCE_REASON` --
     /// see `BlockFetch::VerifiedRefusal`, which this becomes at the
@@ -197,6 +196,7 @@ impl PeerSyncSession {
         block_hash: Vec<u8>,
         data: Vec<u8>,
         compression: i32,
+        expected_size: Option<u64>,
     ) -> FetchOutcome {
         // Only route through `spawn_blocking` when there's real
         // decompression work to do. `COMPRESSION_NONE` (and any other
@@ -212,7 +212,8 @@ impl PeerSyncSession {
         if compression != yadorilink_sync_wire::COMPRESSION_ZSTD {
             return FetchOutcome::Found(Bytes::from(data));
         }
-        match spawn_blocking(move || decompress_block(&data, compression, MAX_BLOCK_SIZE)).await {
+        let limit = decompression_limit(expected_size);
+        match spawn_blocking(move || decompress_block(&data, compression, limit)).await {
             // `Bytes::from(Vec<u8>)` reuses the existing allocation, no
             // copy. Every waiter beyond the first then gets a cheap
             // refcount `clone` of that same `Bytes` instead of its own full
@@ -256,6 +257,7 @@ impl PeerSyncSession {
         group_id: &str,
         file_path: &str,
         hash: &[u8],
+        expected_size: Option<u64>,
     ) -> FetchOutcome {
         // The substrate's block lane -- the only source of an outbound
         // block request now (see `SessionTransports`'s own doc comment).
@@ -355,6 +357,20 @@ impl PeerSyncSession {
         // (a response that arrived and cannot be used) rather than letting
         // the transport turn a peer's claim into an allocation.
         let Ok(size) = usize::try_from(size) else { return FetchOutcome::Unusable };
+        // The block's declared size bounds its body (a body is only sent compressed when that is
+        // smaller than the raw bytes), so a response larger than the block asked for is refused
+        // before a byte of it is allocated: a request for a small block cannot cost the memory of
+        // a large one.
+        if !body_within_declared_size(size, expected_size) {
+            tracing::warn!(
+                peer = %self.peer_device_id,
+                requested = %hex::encode(hash),
+                declared = size,
+                expected = ?expected_size,
+                "rejecting a block response larger than the block asked for"
+            );
+            return FetchOutcome::Unusable;
+        }
         if size > MAX_BLOCK_SIZE {
             tracing::warn!(
                 peer = %self.peer_device_id,
@@ -378,7 +394,7 @@ impl PeerSyncSession {
         // exact observation point.
         self.content_bytes_received
             .fetch_add(body.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        self.resolve_block_bytes(hash.to_vec(), body, compression).await
+        self.resolve_block_bytes(hash.to_vec(), body, compression, expected_size).await
     }
 
     /// Requests a block from the peer over a stream of its own and awaits
@@ -426,6 +442,7 @@ impl PeerSyncSession {
             file_path,
             hash,
             Self::FETCH_RESPONSE_TIMEOUT,
+            None,
         )
         .await
     }
@@ -451,6 +468,7 @@ impl PeerSyncSession {
             file_path,
             hash,
             Self::fetch_response_timeout_for(expected_size),
+            Some(expected_size),
         )
         .await
     }
@@ -461,9 +479,10 @@ impl PeerSyncSession {
         file_path: &str,
         hash: &[u8],
         response_timeout: std::time::Duration,
+        expected_size: Option<u64>,
     ) -> Result<Option<Bytes>, PeerSessionError> {
         Ok(self
-            .fetch_block_outcome(group_id, file_path, hash, response_timeout)
+            .fetch_block_outcome(group_id, file_path, hash, response_timeout, expected_size)
             .await?
             .into_bytes())
     }
@@ -487,6 +506,7 @@ impl PeerSyncSession {
                 file_path,
                 hash,
                 Self::fetch_response_timeout_for(expected_size),
+                Some(expected_size),
             )
             .await?;
         Ok(match outcome {
@@ -508,11 +528,15 @@ impl PeerSyncSession {
         file_path: &str,
         hash: &[u8],
         response_timeout: std::time::Duration,
+        expected_size: Option<u64>,
     ) -> Result<FetchOutcome, PeerSessionError> {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match self.fetch_block_raw(group_id, file_path, hash, response_timeout).await? {
+            match self
+                .fetch_block_raw(group_id, file_path, hash, response_timeout, expected_size)
+                .await?
+            {
                 FetchOutcome::Busy { retry_after_ms } if attempt < Self::BUSY_RETRY_ATTEMPTS => {
                     let delay = std::time::Duration::from_millis(retry_after_ms.into())
                         .min(Self::BUSY_RETRY_MAX_DELAY);
@@ -623,6 +647,7 @@ impl PeerSyncSession {
         file_path: &str,
         hash: &[u8],
         response_timeout: std::time::Duration,
+        expected_size: Option<u64>,
     ) -> Result<FetchOutcome, PeerSessionError> {
         let (_in_flight_guard, in_flight_at_send) = self.begin_block_fetch();
         // Measured from just before
@@ -647,7 +672,7 @@ impl PeerSyncSession {
         // rather than finishing the read and writing into nothing.
         let result = match tokio::time::timeout(
             response_timeout,
-            self.fetch_block_over_stream(group_id, file_path, hash),
+            self.fetch_block_over_stream(group_id, file_path, hash, expected_size),
         )
         .await
         {
@@ -764,7 +789,13 @@ impl PeerSyncSession {
             attempt += 1;
             let fetch_started = std::time::Instant::now();
             let outcome = self
-                .fetch_block_raw(group_id, file_path, &block.hash, block_response_timeout)
+                .fetch_block_raw(
+                    group_id,
+                    file_path,
+                    &block.hash,
+                    block_response_timeout,
+                    Some(u64::from(block.size)),
+                )
                 .await?;
             // Summed across every attempt for this one block: a retried
             // block legitimately spent that much wall-clock time waiting
@@ -854,15 +885,25 @@ impl PeerSyncSession {
         };
         match fetched {
             Some(data) => {
-                if !block_data_matches(block, &data) {
-                    tracing::warn!(
-                        file_path,
-                        hash = %hex::encode(&block.hash),
-                        peer = %self.peer_device_id,
-                        "peer returned block data that did not match the expected hash/size"
-                    );
-                    return Ok(BlockFetchOutcome::Missing);
-                }
+                // The one place the bytes of a fetched block are shown to be the block asked for:
+                // hashed once, compared with the requested hash and size. Everything after this
+                // takes the verified block and does not hash it again to learn that.
+                let verified = match yadorilink_local_storage::VerifiedBlock::check(
+                    &data,
+                    &block.hash,
+                    block.size,
+                ) {
+                    Ok(verified) => verified,
+                    Err(_) => {
+                        tracing::warn!(
+                            file_path,
+                            hash = %hex::encode(&block.hash),
+                            peer = %self.peer_device_id,
+                            "peer returned block data that did not match the expected hash/size"
+                        );
+                        return Ok(BlockFetchOutcome::Missing);
+                    }
+                };
                 // Durability is deliberately NOT done here any more. This
                 // function used to `spawn_blocking(store.put(&data))` per
                 // block, which made every single block its own durability
@@ -888,7 +929,7 @@ impl PeerSyncSession {
                 // durability commit. `call_timer`'s `add_store_put` is
                 // recorded per COMMITTED BATCH now rather than per block --
                 // see `commit_fetched_batch`.
-                Ok(BlockFetchOutcome::Fetched { hash: block.hash.clone(), data })
+                Ok(BlockFetchOutcome::Fetched(verified))
             }
             None => {
                 if let Some(reason) = verified_refusal {
@@ -905,5 +946,41 @@ impl PeerSyncSession {
                 Ok(BlockFetchOutcome::Missing)
             }
         }
+    }
+}
+
+/// Whether a response body of `size` bytes may be read for a block declared at `expected_size`
+/// (a block of unknown size is bounded by the largest legal block only).
+fn body_within_declared_size(size: usize, expected_size: Option<u64>) -> bool {
+    expected_size.is_none_or(|expected| size as u64 <= expected)
+}
+
+/// The most a decompression may produce for a block declared at `expected_size`.
+fn decompression_limit(expected_size: Option<u64>) -> usize {
+    expected_size
+        .and_then(|expected| usize::try_from(expected).ok())
+        .map_or(MAX_BLOCK_SIZE, |expected| expected.min(MAX_BLOCK_SIZE))
+}
+
+#[cfg(test)]
+mod declared_size_tests {
+    use super::*;
+
+    #[test]
+    fn a_body_may_not_exceed_the_declared_size() {
+        assert!(body_within_declared_size(1024, Some(1024)));
+        assert!(body_within_declared_size(10, Some(1024)));
+        assert!(!body_within_declared_size(1025, Some(1024)));
+        assert!(
+            body_within_declared_size(MAX_BLOCK_SIZE, None),
+            "no declared size: only the maximum"
+        );
+    }
+
+    #[test]
+    fn a_decompression_stops_at_the_declared_size_and_never_above_the_maximum() {
+        assert_eq!(decompression_limit(Some(2048)), 2048);
+        assert_eq!(decompression_limit(None), MAX_BLOCK_SIZE);
+        assert_eq!(decompression_limit(Some(u64::MAX)), MAX_BLOCK_SIZE);
     }
 }

@@ -162,6 +162,77 @@ async fn a_request_the_server_never_answers_gives_up() {
     assert!(answer.unwrap_err().is_timeout());
 }
 
+/// A name resolver that answers correctly, but only after `delay`: a home router that drops one of the
+/// two queries, so the system resolver waits out its first timeout before the answer comes.
+struct SlowResolver {
+    delay: std::time::Duration,
+    addr: std::net::SocketAddr,
+}
+
+impl reqwest::dns::Resolve for SlowResolver {
+    fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let (delay, addr) = (self.delay, self.addr);
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            Ok(Box::new(std::iter::once(addr)) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+async fn tiny_http_server() -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                    )
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
+/// The time a name lookup takes counts against the connect budget. That is why the budget must
+/// outlast the resolver's first timeout (a const assertion next to `CONNECT_BUDGET`): a lookup that
+/// takes `delay` fails a client whose budget is shorter and works for one whose budget is longer.
+#[tokio::test]
+async fn a_slow_name_lookup_is_charged_to_the_connect_budget() {
+    let addr = tiny_http_server().await;
+    let slow =
+        || std::sync::Arc::new(SlowResolver { delay: std::time::Duration::from_millis(600), addr });
+    // No proxy from the environment: the name must be resolved by the resolver under test.
+    let short = client_builder(std::time::Duration::from_millis(200))
+        .no_proxy()
+        .dns_resolver(slow())
+        .build()
+        .unwrap();
+    // The same address and port that the long budget reaches below: only the budget differs.
+    let err =
+        short.get(format!("http://slow.example.test:{}/", addr.port())).send().await.unwrap_err();
+    assert!(err.is_timeout(), "the lookup (600 ms) must run past the 200 ms budget: {err}");
+    let long = client_builder(std::time::Duration::from_secs(5))
+        .no_proxy()
+        .dns_resolver(slow())
+        .build()
+        .unwrap();
+    let body = long
+        .get(format!("http://slow.example.test:{}/", addr.port()))
+        .send()
+        .await
+        .expect("a lookup that finishes inside the budget connects")
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(body, "ok");
+}
+
 #[test]
 fn coordination_addr_env_override_wins_over_compiled_default() {
     assert_eq!(

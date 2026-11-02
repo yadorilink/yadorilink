@@ -10,6 +10,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use yadorilink_fapi_client::PairingCode;
+
 use crate::coordination::credential_store;
 use crate::dto::{
     self, AccountStatus, BrowserPurpose, CoreConfig, FolderDetail, LoginEvent, LoginFlow,
@@ -53,6 +55,36 @@ impl ClientCore {
         yadorilink_ipc_proto::PROVIDER_HOST_API_VERSION
     }
 
+    // ---- one build per Mac ---------------------------------------------------
+
+    /// Why the daemon last refused to start because the other Mac build (direct or Mac App Store) is running or
+    /// is the one set up here; `None` for any other reason.
+    #[must_use]
+    pub fn mac_claim_refusal(&self) -> Option<crate::dto::MacClaimRefusal> {
+        crate::ops::mac_claim::startup_refusal_claim()
+    }
+
+    /// The person confirmed switching this Mac to `this` build. `container_path` is the App Group container.
+    /// `None`: done, start the daemon. `Some`: refused, nothing changed.
+    #[must_use]
+    pub fn take_over_mac_claim(
+        &self,
+        container_path: String,
+        this: crate::dto::MacBuild,
+    ) -> Option<crate::dto::MacClaimRefusal> {
+        crate::ops::mac_claim::take_over(std::path::Path::new(&container_path), this)
+    }
+
+    /// `this` build gives the Mac up (sign-out or removal). `None`: done.
+    #[must_use]
+    pub fn release_mac_claim(
+        &self,
+        container_path: String,
+        this: crate::dto::MacBuild,
+    ) -> Option<crate::dto::MacClaimRefusal> {
+        crate::ops::mac_claim::release(std::path::Path::new(&container_path), this)
+    }
+
     // ---- session and identity ------------------------------------------------
 
     /// Sign-in, registration and linked-folder state, as a value: never fails.
@@ -69,6 +101,41 @@ impl ClientCore {
             Box::new(|| ops::auth::ensure_not_enrolled().map_err(DesktopError::from)),
             Box::new(move |sink| Box::pin(sign_in(device, sink))),
         ))
+    }
+
+    /// A sign-in with a pairing code from the account's web page ("add this device with a
+    /// code"): no browser, the code approves this device. Read and cancelled exactly like
+    /// [`Self::new_login_session`]; its events are `Enrolling` and then `SignedIn`
+    /// (the terminal event), and `options.flow` is ignored.
+    ///
+    /// `code` is what a person typed (any case, with or without hyphens) or what the QR scan
+    /// read (the link the page's QR carries is accepted too).
+    ///
+    /// # Errors
+    /// `InvalidInput` (field `pairing_code`) when `code` cannot be a pairing code; nothing is
+    /// sent. Starting the session reports the rest: `Refused` with `PairingCodeInvalid` (never
+    /// issued, expired or used), `Network` with `RateLimited` (wait, then retry), and the
+    /// ordinary sign-in refusals. Signed in already is refused before the code is sent.
+    pub fn login_with_pairing_code(
+        &self,
+        code: String,
+        options: LoginOptions,
+    ) -> Result<Arc<LoginSession>, DesktopError> {
+        let code = parse_pairing_code(&code)?;
+        Ok(Arc::new(LoginSession::with_flow(
+            options,
+            Box::new(|| ops::auth::ensure_not_enrolled().map_err(DesktopError::from)),
+            Box::new(move |sink| Box::pin(sign_in_with_pairing_code(code, sink))),
+        )))
+    }
+
+    /// The pairing code in what a person typed or a QR scan read, shown as `XXXX-XXXX-XXXX`;
+    /// `None` when it cannot be one (so a front end can enable its button, or reject a scan,
+    /// without a request). Accepts any case, with or without hyphens or spaces, and the link
+    /// the web page's QR carries.
+    #[must_use]
+    pub fn normalize_pairing_code(&self, input: String) -> Option<String> {
+        PairingCode::from_scanned(&input).ok().map(|code| code.formatted())
     }
 
     /// A sign-in of THIS installation, for an action the server refused with
@@ -336,6 +403,45 @@ pub fn new_login_session_in(
     ))
 }
 
+/// A sign-in with a pairing code over the state directory `dir`: the same flow as
+/// [`ClientCore::login_with_pairing_code`], with the credential store and every record it writes
+/// in that directory.
+#[must_use]
+pub fn new_pairing_login_session_in(
+    dir: PathBuf,
+    settings: credential_store::CredentialSettings,
+    code: PairingCode,
+    options: LoginOptions,
+) -> Arc<LoginSession> {
+    let precheck_dir = dir.clone();
+    let precheck_settings = settings.clone();
+    Arc::new(LoginSession::with_flow(
+        options,
+        Box::new(move || {
+            ops::auth::ensure_not_enrolled_in(&precheck_dir, &precheck_settings)
+                .map_err(DesktopError::from)
+        }),
+        Box::new(move |sink| {
+            Box::pin(async move {
+                ops::auth::login_with_pairing_code_in(&dir, &settings, code, |event| {
+                    if let Some(event) = login_event(event) {
+                        sink.send(event);
+                    }
+                })
+                .await?;
+                Ok(account_status_in(&dir, &settings, None))
+            })
+        }),
+    ))
+}
+
+/// What a person typed or a QR scan read, as a pairing code; refused (naming the argument,
+/// echoing nothing of the input) when it cannot be one.
+fn parse_pairing_code(input: &str) -> Result<PairingCode, DesktopError> {
+    PairingCode::from_scanned(input)
+        .map_err(|e| DesktopError::invalid_input(e.to_string(), "pairing_code"))
+}
+
 /// A step-up sign-in over the state directory `dir`: the same flow as
 /// [`ClientCore::new_reauthentication_session`], with the credential store in that directory
 /// and the host's settings.
@@ -381,6 +487,22 @@ pub fn new_reauthentication_session_in(
 async fn sign_in(device: bool, sink: LoginEventSink) -> Result<AccountStatus, DesktopError> {
     let has_linked_folders = linked_folders().await;
     ops::auth::login(device, |event| {
+        if let Some(event) = login_event(event) {
+            sink.send(event);
+        }
+    })
+    .await?;
+    Ok(account_status_with(has_linked_folders))
+}
+
+/// The pairing sign-in: [`ops::auth::login_with_pairing_code`] with each step passed on as a
+/// product event.
+async fn sign_in_with_pairing_code(
+    code: PairingCode,
+    sink: LoginEventSink,
+) -> Result<AccountStatus, DesktopError> {
+    let has_linked_folders = linked_folders().await;
+    ops::auth::login_with_pairing_code(code, |event| {
         if let Some(event) = login_event(event) {
             sink.send(event);
         }

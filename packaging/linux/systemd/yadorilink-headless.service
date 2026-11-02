@@ -44,7 +44,9 @@ Group=yadorilink
 Environment=YADORILINK_NAS_ADMIN=1
 EnvironmentFile=/etc/yadorilink/headless.env
 ExecStart=/usr/bin/yadorilink-daemon
-Restart=on-failure
+# always, not on-failure: an unattended box must also come back from a clean
+# exit (the daemon exits 0 for an in-place update). `systemctl stop` still stops it.
+Restart=always
 RestartSec=5
 TimeoutStopSec=60
 LimitNOFILE=65536

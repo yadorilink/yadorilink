@@ -55,19 +55,18 @@ use super::{LocalChangeOutcome, LocalChangeProcessor};
 /// What capture does with a directory it finds on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DirectoryVerdict {
-    /// Author the directory as an explicit entry with this mode.
-    Author { unix_mode: Option<u32> },
+    /// Author the directory as an explicit entry (a directory's mode is not replicated).
+    Author,
     /// Nothing to author: already current, structural, of unknown origin,
     /// in flight, or not this module's to decide.
     Nothing,
 }
 
 /// The record, op, version and index metadata of an explicit directory
-/// entry at `rel_path` with `unix_mode`: blockless, size and mtime 0, the
-/// canonical directory version.
+/// entry at `rel_path`: blockless, size and mtime 0, the canonical directory
+/// version.
 pub(super) fn directory_entry(
     rel_path: &str,
-    unix_mode: Option<u32>,
 ) -> (FileRecord, Op, FileVersion, LocalFileMetaColumns) {
     let record = FileRecord {
         path: rel_path.to_string(),
@@ -76,29 +75,15 @@ pub(super) fn directory_entry(
         blocks: Vec::new(),
         deleted: false,
     };
-    let version = FileVersion::directory(unix_mode);
+    let version = FileVersion::directory();
     let op = Op::Put { path: SyncPath(rel_path.to_string()), version: version.version_hash };
     let meta = LocalFileMetaColumns {
         record_kind: RecordKind::Directory,
         symlink_target: None,
         symlink_out_of_root: false,
-        unix_mode,
-        xattrs: Vec::new(),
+        exec: false,
     };
     (record, op, version, meta)
-}
-
-/// Whether the directory observed as `lstat` has other permission bits
-/// (`0o777`, the mode a Directory version replicates) than the structural
-/// one recorded as `recorded` had.
-#[cfg(unix)]
-fn permission_bits_changed(recorded: &FileIdentity, lstat: &std::fs::Metadata) -> bool {
-    yadorilink_fs_platform::fs_identity::directory_permission_bits_changed(recorded, lstat)
-}
-
-#[cfg(not(unix))]
-fn permission_bits_changed(_recorded: &FileIdentity, _lstat: &std::fs::Metadata) -> bool {
-    false
 }
 
 /// What [`LocalChangeProcessor::lock_observed_subtree`] found: the locks
@@ -196,12 +181,6 @@ impl LocalChangeProcessor {
             return Ok(DirectoryVerdict::Nothing);
         }
         let row = self.state.canonical_current_row(group_id, rel_path)?;
-        let unix_mode = self.captured_unix_mode(
-            lstat,
-            &super::Predecessor::of_row(
-                row.as_ref().filter(|row| row.snapshot.record_kind == RecordKind::Directory),
-            ),
-        );
         // Only a leaf that was on disk here can have been replaced: a peer's
         // entry still being written, admitted but not yet projected, or
         // held off disk by a name hazard never stood at the path, so the
@@ -214,18 +193,10 @@ impl LocalChangeProcessor {
             && !self.state.has_materialization_intent(group_id, rel_path)?
             && !self.state.has_unsettled_projection_obligation(group_id, rel_path)?
             && !self.state.is_held(group_id, rel_path)?;
-        if let Some(row) = row.as_ref().filter(|row| !row.snapshot.deleted && !leaf_replaced) {
-            // A version with no mode (authored where there is no Unix mode
-            // model) states nothing about the mode, so whatever mode the
-            // directory got here is not a change to it.
-            if row.snapshot.record_kind != RecordKind::Directory
-                || row.snapshot.unix_mode.is_none()
-                || unix_mode == row.snapshot.unix_mode
-                || self.state.has_materialization_intent(group_id, rel_path)?
-            {
-                return Ok(DirectoryVerdict::Nothing);
-            }
-            return Ok(DirectoryVerdict::Author { unix_mode });
+        // A directory's mode is not replicated, so a directory that is already an entry has
+        // nothing to author; a path that holds another kind is not this module's to decide.
+        if row.as_ref().is_some_and(|row| !row.snapshot.deleted) && !leaf_replaced {
+            return Ok(DirectoryVerdict::Nothing);
         }
         // The materializer is placing an entry here (an explicit directory
         // it has not settled yet): its row lands with the settle.
@@ -290,11 +261,11 @@ impl LocalChangeProcessor {
             }
         }
         let verdict = match origin {
-            StructuralDirectoryOrigin::None => DirectoryVerdict::Author { unix_mode },
+            StructuralDirectoryOrigin::None => DirectoryVerdict::Author,
             StructuralDirectoryOrigin::IntentPending => DirectoryVerdict::Nothing,
             StructuralDirectoryOrigin::ProvenanceLost(lost) => {
                 if replaced(&lost) {
-                    DirectoryVerdict::Author { unix_mode }
+                    DirectoryVerdict::Author
                 } else {
                     DirectoryVerdict::Nothing
                 }
@@ -304,18 +275,11 @@ impl LocalChangeProcessor {
                     StructuralOriginStatus::Structural | StructuralOriginStatus::IntentPending => {
                         DirectoryVerdict::Nothing
                     }
-                    // D5: only the replicated Unix mode (the permission
-                    // bits) promotes. A setuid, setgid or sticky bit, or a
-                    // change of attributes a device with no Unix mode model
-                    // tracks, moves the fingerprint but does not.
-                    StructuralOriginStatus::StructuralMetadataChanged
-                        if unix_mode.is_some() && permission_bits_changed(&recorded, lstat) =>
-                    {
-                        DirectoryVerdict::Author { unix_mode }
-                    }
+                    // A directory's permission bits are not replicated, so a change of
+                    // them (or of any attribute) moves the fingerprint but never promotes.
                     StructuralOriginStatus::StructuralMetadataChanged => DirectoryVerdict::Nothing,
                     StructuralOriginStatus::OriginUnknown if replaced(&recorded) => {
-                        DirectoryVerdict::Author { unix_mode }
+                        DirectoryVerdict::Author
                     }
                     StructuralOriginStatus::OriginUnknown => DirectoryVerdict::Nothing,
                 }
@@ -340,18 +304,17 @@ impl LocalChangeProcessor {
         let Ok(lstat) = std::fs::symlink_metadata(event_path) else {
             return Ok(LocalChangeOutcome::None);
         };
-        let DirectoryVerdict::Author { unix_mode } =
+        let DirectoryVerdict::Author =
             self.directory_verdict_replacing(group_id, root, rel_path, &lstat, true)?
         else {
             return Ok(LocalChangeOutcome::None);
         };
-        let (record, op, version, meta) = directory_entry(rel_path, unix_mode);
+        let (record, op, version, meta) = directory_entry(rel_path);
         // The proof names the directory only if it is still the directory
-        // the verdict was taken on, with the mode being authored.
+        // the verdict was taken on.
         let identity = FileIdentity::observe_path(event_path).ok().filter(|identity| {
             identity.object_kind == yadorilink_fs_platform::fs_identity::ObjectKind::Directory
-                && std::fs::symlink_metadata(event_path)
-                    .is_ok_and(|now| now.is_dir() && self.mode_unchanged_since(&now, unix_mode))
+                && std::fs::symlink_metadata(event_path).is_ok_and(|now| now.is_dir())
         });
         let directory = CapturedDirectory { record, op, version, meta, identity };
         self.state.commit_captured_directory(
@@ -674,17 +637,13 @@ impl LocalChangeProcessor {
             if !lstat.is_dir() || !exact_leaf_exists_as_directory(root, dest) {
                 return Ok(None);
             }
-            let unix_mode =
-                self.captured_unix_mode(&lstat, &super::Predecessor::of_row(Some(moved)));
-            let (record, op, version, meta) = directory_entry(dest, unix_mode);
+            let (record, op, version, meta) = directory_entry(dest);
             let proof = FileIdentity::observe_path(&dest_abs)
                 .ok()
                 .filter(|identity| {
                     identity.object_kind
                         == yadorilink_fs_platform::fs_identity::ObjectKind::Directory
-                        && std::fs::symlink_metadata(&dest_abs).is_ok_and(|now| {
-                            now.is_dir() && self.mode_unchanged_since(&now, unix_mode)
-                        })
+                        && std::fs::symlink_metadata(&dest_abs).is_ok_and(|now| now.is_dir())
                 })
                 .map(|filesystem_identity| LocalCaptureActualStateEvidence::Present {
                     filesystem_identity,
@@ -708,7 +667,7 @@ impl LocalChangeProcessor {
             return Ok(None);
         }
         let fingerprint_before = disk_race_fingerprint(&dest_abs);
-        let (outcome, classification, unix_mode) = self.build_record_for_created_or_modified(
+        let (outcome, classification, exec) = self.build_record_for_created_or_modified(
             group_id,
             root,
             dest.to_string(),
@@ -719,26 +678,20 @@ impl LocalChangeProcessor {
             None,
         )?;
         let LocalChangeOutcome::FileChanged(record) = outcome else { return Ok(None) };
-        // The moved entry's predecessor is the row it moved from, for the mode
-        // as for the attributes: the destination has no row of its own.
-        let unix_mode = match (&classification, std::fs::metadata(&dest_abs)) {
+        // The moved entry's predecessor is the row it moved from: the destination has no row of
+        // its own.
+        let exec = match (&classification, std::fs::metadata(&dest_abs)) {
             (None, Ok(now)) => {
-                Some(self.captured_unix_mode(&now, &super::Predecessor::of_row(Some(moved))))
+                Some(self.captured_exec(&now, &super::Predecessor::of_row(Some(moved))))
             }
-            _ => unix_mode,
-        };
-        let xattrs = if classification.is_none() {
-            self.captured_xattrs(&dest_abs, &super::Predecessor::of_row(Some(moved)))
-        } else {
-            Vec::new()
+            _ => exec,
         };
         let (op, version) = self.content_op(
             &record,
-            unix_mode.flatten(),
+            exec.unwrap_or(false),
             classification.as_ref().map(|c| c.target.clone()),
-            xattrs.clone(),
         );
-        let meta = metadata_columns_for(&classification, unix_mode, xattrs);
+        let meta = metadata_columns_for(&classification, exec);
         let proof =
             closed_disk_observation_if_unraced(&dest_abs, fingerprint_before).map(|observation| {
                 LocalCaptureActualStateEvidence::Present {

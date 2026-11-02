@@ -32,13 +32,7 @@ fn version(kind: RecordKind, mtime: i64) -> FileVersion {
     FileVersion::new(
         Vec::new(),
         0,
-        FileMeta {
-            mtime_unix_nanos: mtime,
-            unix_mode: Some(0o644),
-            symlink_target: None,
-            record_kind: kind,
-            xattrs: Vec::new(),
-        },
+        FileMeta { mtime_unix_nanos: mtime, exec: false, symlink_target: None, record_kind: kind },
     )
 }
 
@@ -469,7 +463,14 @@ fn a_planned_entry_with_no_row_is_a_gap_until_its_row_exists() {
             blocks: Vec::new(),
             deleted: false,
         };
-        crate::file_index::upsert_file_in_tx(&tx, "g", &record, "a").unwrap();
+        crate::file_index::upsert_file_in_tx(
+            &tx,
+            "g",
+            &record,
+            "a",
+            crate::retention::Retention::OwnEdit,
+        )
+        .unwrap();
     }
     tx.commit().unwrap();
     assert!(native_plan_gap_paths(&c, "g").unwrap().is_empty());

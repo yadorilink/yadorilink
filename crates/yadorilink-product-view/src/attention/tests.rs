@@ -1,6 +1,6 @@
 use super::*;
 
-const ALL: [AttentionItem; 40] = [
+const ALL: [AttentionItem; 43] = [
     AttentionItem::FolderStopped,
     AttentionItem::WaitingForDiskSpace,
     AttentionItem::LinkedTwice,
@@ -20,6 +20,8 @@ const ALL: [AttentionItem; 40] = [
     AttentionItem::FileNotReadable,
     AttentionItem::StrandedDirectory,
     AttentionItem::UnreadableFiles,
+    AttentionItem::IndexDamaged,
+    AttentionItem::RebuildNeeded,
     AttentionItem::ProviderNotReady,
     AttentionItem::ProviderFilesFailing,
     AttentionItem::EditsKeptBeside,
@@ -38,6 +40,7 @@ const ALL: [AttentionItem; 40] = [
     AttentionItem::ReplacementWaiting,
     AttentionItem::TermsConsentRequired,
     AttentionItem::SignInRequired,
+    AttentionItem::AccountDeletionRequested,
     AttentionItem::AccountDeletionPending,
     AttentionItem::AccountDeletionUrgent,
     AttentionItem::Unrecognized,
@@ -88,6 +91,9 @@ fn ordinal(item: AttentionItem) -> usize {
         I::SignInRequired => 37,
         I::AccountDeletionPending => 38,
         I::AccountDeletionUrgent => 39,
+        I::AccountDeletionRequested => 40,
+        I::IndexDamaged => 41,
+        I::RebuildNeeded => 42,
         I::Unrecognized => 35,
     }
 }
@@ -96,7 +102,7 @@ fn ordinal(item: AttentionItem) -> usize {
 fn all_lists_every_item() {
     let mut seen: Vec<usize> = ALL.iter().map(|i| ordinal(*i)).collect();
     seen.sort_unstable();
-    assert_eq!(seen, (0..40).collect::<Vec<_>>());
+    assert_eq!(seen, (0..43).collect::<Vec<_>>());
 }
 
 #[test]
@@ -114,6 +120,7 @@ fn every_rollup_code_the_daemon_emits_is_recognized() {
         "degraded:g",
         "terms_consent_required",
         "sign_in_required",
+        "account_deletion_requested",
         "account_deletion_pending",
         "account_deletion_urgent",
         "waiting_for_disk_space:g",
@@ -125,6 +132,7 @@ fn every_rollup_code_the_daemon_emits_is_recognized() {
         "volume_unconfirmed:g",
         "durability_at_risk:g",
         "durability_unknown:g",
+        "index_damaged:g",
         "fetch_unavailable:g",
         "fetch_availability_unknown:g",
         "conflict:g",
@@ -428,6 +436,11 @@ fn the_consent_and_sign_in_items_offer_the_sign_in_and_are_permanent() {
 #[test]
 fn account_deletion_items_are_general_permanent_and_urgent_ranks_higher() {
     for (code, item, severity) in [
+        (
+            "account_deletion_requested",
+            AttentionItem::AccountDeletionRequested,
+            AttentionSeverity::Warning,
+        ),
         (
             "account_deletion_pending",
             AttentionItem::AccountDeletionPending,

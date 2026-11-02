@@ -19,6 +19,8 @@
 //! Integrity on the ordinary read path is still the content hash itself --
 //! the payload checksum here is a cheap early-out that says *which* of a
 //! segment's bytes went bad, which a content-hash mismatch alone cannot.
+//!
+//! The checksum is XXH3-64 (see [`checksum64`]).
 
 use crate::error::StorageError;
 
@@ -28,18 +30,21 @@ const SEGMENT_MAGIC: u32 = 0x594c_5347;
 const RECORD_MAGIC: u32 = 0x594c_4252;
 
 /// The only segment layout this build writes or reads. A file stamped with
-/// anything else is refused rather than guessed at.
-pub(crate) const SEGMENT_FORMAT_VERSION: u16 = 1;
+/// anything else is refused rather than guessed at. Version 2 checksums records with XXH3-64
+/// (version 1 used CRC-32), which also made the checksums 8 bytes wide.
+pub(crate) const SEGMENT_FORMAT_VERSION: u16 = 2;
 
 /// Bytes reserved at the start of every segment file. `durable_end` for a
 /// brand-new segment is exactly this.
 pub(crate) const SEGMENT_HEADER_LEN: u64 = 16;
 
 /// Fixed bytes before a record's payload: magic(4) + version(2) + flags(2)
-/// + hash(32) + payload_len(4) + header_crc(4).
-pub(crate) const RECORD_HEADER_LEN: usize = 48;
-/// Fixed bytes after a record's payload: payload_crc(4).
-pub(crate) const RECORD_TRAILER_LEN: usize = 4;
+/// + hash(32) + payload_len(4) + header_checksum(8).
+pub(crate) const RECORD_HEADER_LEN: usize = 52;
+/// Width of a checksum on disk.
+const CHECKSUM_LEN: usize = 8;
+/// Fixed bytes after a record's payload: payload_checksum(8).
+pub(crate) const RECORD_TRAILER_LEN: usize = CHECKSUM_LEN;
 /// What one block costs on top of its own bytes.
 pub(crate) const RECORD_OVERHEAD: usize = RECORD_HEADER_LEN + RECORD_TRAILER_LEN;
 
@@ -85,6 +90,21 @@ pub(crate) fn decode_segment_header(bytes: &[u8]) -> Result<u64, StorageError> {
     Ok(u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes")))
 }
 
+/// The layout version a file's first bytes declare, when they are a segment file's header at all
+/// (right magic); `None` for anything else. A caller that has to tell "a segment of another layout"
+/// from "not a segment" before it decides what may be touched uses this instead of
+/// [`decode_segment_header`], which refuses both alike.
+pub(crate) fn declared_segment_layout(header: &[u8]) -> Option<u16> {
+    if header.len() < SEGMENT_HEADER_LEN as usize {
+        return None;
+    }
+    let magic = u32::from_le_bytes(header[0..4].try_into().expect("4 bytes"));
+    if magic != SEGMENT_MAGIC {
+        return None;
+    }
+    Some(u16::from_le_bytes(header[4..6].try_into().expect("2 bytes")))
+}
+
 /// Builds a record's fixed header for `hash`/`payload`.
 ///
 /// Separate from the payload on purpose: a record is written as header,
@@ -99,14 +119,14 @@ pub(crate) fn frame_header(hash: &[u8; RAW_HASH_LEN], payload_len: u32) -> [u8; 
     // bytes 6..8 are flags, left zero.
     header[8..8 + RAW_HASH_LEN].copy_from_slice(hash);
     header[40..44].copy_from_slice(&payload_len.to_le_bytes());
-    let header_crc = crc32(&header[..RECORD_HEADER_LEN - 4]);
-    header[44..48].copy_from_slice(&header_crc.to_le_bytes());
+    let header_checksum = checksum64(&header[..RECORD_HEADER_LEN - CHECKSUM_LEN]);
+    header[RECORD_HEADER_LEN - CHECKSUM_LEN..].copy_from_slice(&header_checksum.to_le_bytes());
     header
 }
 
 /// The checksum written after a record's payload.
 pub(crate) fn frame_trailer(payload: &[u8]) -> [u8; RECORD_TRAILER_LEN] {
-    crc32(payload).to_le_bytes()
+    checksum64(payload).to_le_bytes()
 }
 
 /// Appends one complete record for `hash`/`payload` to `out` -- the
@@ -165,9 +185,10 @@ pub(crate) fn decode_record_header(
     if magic != RECORD_MAGIC {
         return Err(HeaderReject::BadMagic);
     }
-    let stored_crc =
-        u32::from_le_bytes(bytes[RECORD_HEADER_LEN - 4..RECORD_HEADER_LEN].try_into().expect("4"));
-    if crc32(&bytes[..RECORD_HEADER_LEN - 4]) != stored_crc {
+    let stored_checksum = u64::from_le_bytes(
+        bytes[RECORD_HEADER_LEN - CHECKSUM_LEN..RECORD_HEADER_LEN].try_into().expect("8 bytes"),
+    );
+    if checksum64(&bytes[..RECORD_HEADER_LEN - CHECKSUM_LEN]) != stored_checksum {
         return Err(HeaderReject::BadChecksum);
     }
     let mut hash = [0u8; RAW_HASH_LEN];
@@ -183,31 +204,22 @@ pub(crate) fn decode_record_header(
 /// Whether `payload` matches the trailer checksum that followed it.
 pub(crate) fn payload_checksum_matches(payload: &[u8], trailer: &[u8]) -> bool {
     trailer.len() == RECORD_TRAILER_LEN
-        && crc32(payload) == u32::from_le_bytes(trailer.try_into().expect("4 bytes"))
+        && checksum64(payload) == u64::from_le_bytes(trailer.try_into().expect("8 bytes"))
 }
 
-/// CRC-32 (IEEE 802.3, the zlib polynomial), computed from a lazily built
-/// table. Deliberately not a new dependency: this is 20 lines, it is used
-/// for framing self-description only -- content integrity is the SHA-256
-/// content hash -- and a crate's worth of API surface buys nothing here.
-pub(crate) fn crc32(data: &[u8]) -> u32 {
-    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
-    let table = TABLE.get_or_init(|| {
-        let mut table = [0u32; 256];
-        for (i, slot) in table.iter_mut().enumerate() {
-            let mut value = i as u32;
-            for _ in 0..8 {
-                value = if value & 1 == 1 { 0xEDB8_8320 ^ (value >> 1) } else { value >> 1 };
-            }
-            *slot = value;
-        }
-        table
-    });
-    let mut crc = 0xFFFF_FFFFu32;
-    for byte in data {
-        crc = table[((crc ^ u32::from(*byte)) & 0xFF) as usize] ^ (crc >> 8);
-    }
-    !crc
+/// XXH3-64 (seed 0, no secret), as stored in every record header and trailer.
+///
+/// This is `xxhash-rust`'s pure-Rust XXH3, which uses the CPU's vector instructions where they are
+/// available and gives the same value everywhere. It replaced CRC-32 (itself a replacement for a
+/// hand-written table walk) because it is several times faster per byte on the sizes blocks come
+/// in, every block passes through it three times (the write, the read-back that verifies the
+/// commit, and each read), and a 64-bit check is a much smaller chance of passing damaged bytes
+/// than a 32-bit one. It is not a cryptographic hash and is not used as one: it frames records and
+/// finds damage by the medium. Content integrity is the SHA-256 content hash, and a record that is
+/// consistent with itself but whose bytes are not the block it names is found only where that hash
+/// is checked.
+pub(crate) fn checksum64(data: &[u8]) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(data)
 }
 
 #[cfg(test)]

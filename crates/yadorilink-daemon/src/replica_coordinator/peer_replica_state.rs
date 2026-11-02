@@ -194,8 +194,7 @@ impl ReplicaCoordinator {
                 record_kind: snapshot.record_kind,
                 symlink_target: snapshot.symlink_target,
                 symlink_out_of_root: row.symlink_out_of_root,
-                unix_mode: snapshot.unix_mode,
-                xattrs: snapshot.xattrs,
+                exec: snapshot.exec,
                 origin_device_id: row.origin_device_id,
                 materialization_state: row.materialization_state,
             }
@@ -235,27 +234,9 @@ impl ReplicaCoordinator {
             .map_err(PeerSessionError::from)
     }
 
-    pub fn get_unix_mode(
-        &self,
-        group_id: &str,
-        path: &str,
-    ) -> Result<Option<u32>, PeerSessionError> {
+    pub fn get_exec(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError> {
         self.file_index_repository()
-            .get_unix_mode(group_id, path)
-            .map_err(SyncError::from)
-            .map_err(PeerSessionError::from)
-    }
-
-    /// The replicated extended attributes currently recorded for `path`
-    /// -- sorted by name, already filtered to the capture-side
-    /// allow-list. See `FileMeta::xattrs`'s own doc comment.
-    pub fn get_xattrs(
-        &self,
-        group_id: &str,
-        path: &str,
-    ) -> Result<Vec<(String, Vec<u8>)>, PeerSessionError> {
-        self.file_index_repository()
-            .get_xattrs(group_id, path)
+            .get_exec(group_id, path)
             .map_err(SyncError::from)
             .map_err(PeerSessionError::from)
     }
@@ -375,10 +356,17 @@ impl ReplicaCoordinator {
         group_id: &str,
         record: &FileRecord,
         origin_device_id: &str,
+        retention: yadorilink_sync_sqlite::retention::Retention<'_>,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), PeerSessionError> {
         self.file_index_repository()
-            .upsert_file_with_origin(group_id, record, origin_device_id, permit)
+            .upsert_file_with_origin_retaining(
+                group_id,
+                record,
+                origin_device_id,
+                retention,
+                permit,
+            )
             .map_err(SyncError::from)
             .map_err(PeerSessionError::from)?;
         // After the row has landed: the supersession is inside this
@@ -393,6 +381,7 @@ impl ReplicaCoordinator {
     /// version's metadata columns, written onto the row this call inserts
     /// and never onto the row it supersedes; with none they are carried
     /// forward.
+    #[allow(clippy::too_many_arguments)] // one argument per input of the persisted row
     pub fn upsert_file_with_origin_and_authoring(
         &self,
         group_id: &str,
@@ -400,6 +389,7 @@ impl ReplicaCoordinator {
         origin_device_id: &str,
         authoring: Option<&yadorilink_replica_domain::native_plan::NativeRowIdentity>,
         meta: Option<&yadorilink_replica_domain::session_state::LocalFileMetaColumns>,
+        retention: yadorilink_sync_sqlite::retention::Retention<'_>,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), PeerSessionError> {
         self.file_index_repository()
@@ -409,6 +399,7 @@ impl ReplicaCoordinator {
                 origin_device_id,
                 authoring,
                 meta,
+                retention,
                 permit,
             )
             .map_err(SyncError::from)
@@ -434,17 +425,51 @@ impl ReplicaCoordinator {
     /// FileIndexRepository::remove_file`'s own doc comment (its existing
     /// use is the ignore sweep) for the identical "erasure,
     /// not a tombstone" semantics reused here.
-    pub fn erase_local_only_file(
+    ///
+    /// `reason` says which kind of erasure this is
+    /// ([`ErasureReason`](yadorilink_sync_sqlite::file_index::ErasureReason)); a
+    /// `LocalOnlyArtifact` erasure of a path that has or ever had replicated history is refused.
+    pub fn erase_path_rows(
         &self,
         group_id: &str,
         path: &str,
+        reason: yadorilink_sync_sqlite::file_index::ErasureReason,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), PeerSessionError> {
         self.file_index_repository()
-            .remove_file(group_id, path, permit)
+            .remove_file(group_id, path, reason, permit)
             .map(|_removed| ())
             .map_err(SyncError::from)
             .map_err(PeerSessionError::from)
+    }
+
+    /// The daemon's own record of what it last wrote at `path`, as it stands under the path's
+    /// mutation fence (`None` when it has written nothing there, or the path has moved on since).
+    /// What a sync's replacement of the version at the path reads to tell the daemon's untouched
+    /// write of an older version from anything else.
+    pub fn recorded_write_at(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<
+        Option<yadorilink_sync_sqlite::materialized_generation::DiskGenerationBasis>,
+        PeerSessionError,
+    > {
+        self.sqlite()
+            .dag_lookup_materialized_generation(group_id, path)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
+    }
+
+    /// Records the group's provenance for blocks of a version that were read from the user's own
+    /// file into the store and are durable there: what lets the store's copy be relied on for
+    /// that version (a restore, a custody check). Called only after the blocks are durable.
+    pub fn record_retained_blocks_provenance(
+        &self,
+        group_id: &str,
+        block_hashes: &[Vec<u8>],
+    ) -> Result<(), PeerSessionError> {
+        self.record_group_block_provenance(group_id, block_hashes)
     }
 
     /// Batched form of [`group_has_block_provenance`](Self::group_has_block_provenance)
@@ -526,25 +551,26 @@ impl ReplicaCoordinator {
     }
 
     /// Deletes any refusal previously recorded for `peer_device_id` against
-    /// `path` at `version_hash` -- called on a SUCCESSFUL fetch, so a peer
-    /// that once refused a version but has since obtained it can never be
-    /// read as still refusing it.
-    pub fn clear_block_fetch_refusal(
+    /// each `(path, version_hash)` of `keys` -- called on a SUCCESSFUL fetch,
+    /// so a peer that once refused a version but has since obtained it can
+    /// never be read as still refusing it. One transaction for the batch.
+    pub fn clear_block_fetch_refusals(
         &self,
         group_id: &str,
-        path: &str,
-        version_hash: &str,
+        keys: &[(String, String)],
         peer_device_id: &str,
     ) -> Result<(), PeerSessionError> {
         #[cfg(test)]
-        self.test_observers.note_clear_block_fetch_refusal(
-            group_id,
-            path,
-            version_hash,
-            peer_device_id,
-        );
+        for (path, version_hash) in keys {
+            self.test_observers.note_clear_block_fetch_refusal(
+                group_id,
+                path,
+                version_hash,
+                peer_device_id,
+            );
+        }
         self.materialization_state_repository()
-            .clear_block_fetch_refusal(group_id, path, version_hash, peer_device_id)
+            .clear_block_fetch_refusals(group_id, keys, peer_device_id)
             .map_err(SyncError::from)
             .map_err(PeerSessionError::from)
     }
@@ -1073,6 +1099,36 @@ impl ReplicaCoordinator {
             .map_err(PeerSessionError::from)
     }
 
+    /// Whether the file at `out_path` is the object the path's last proof named, stale or not (see
+    /// `SyncSqliteStore::disk_is_untouched_pre_image_at`). Fail-closed like its sibling.
+    pub fn disk_is_untouched_pre_image_at(
+        &self,
+        group_id: &str,
+        path: &str,
+        out_path: &Path,
+    ) -> Result<bool, PeerSessionError> {
+        let sync_root = match self
+            .link_repository()
+            .link_gate_for_group(group_id)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)?
+        {
+            LinkGate::Live { local_path, .. } | LinkGate::Paused { local_path } => {
+                std::path::PathBuf::from(local_path)
+            }
+            LinkGate::NoLiveLink => return Ok(false),
+        };
+        self.sqlite()
+            .disk_is_untouched_pre_image_at(
+                group_id,
+                path,
+                out_path,
+                cached_birth_time_granularity(&sync_root),
+            )
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
+    }
+
     /// The zero-work-close pre-check: without any block fetch or disk
     /// write, determines whether `path` already, verifiably, holds the
     /// state `resolution`/`winner_version_hash` describes -- a usable
@@ -1422,11 +1478,18 @@ impl ReplicaCoordinator {
                     yadorilink_sync_sqlite::MaterializationStateRepository::clear_held_in_tx(
                         tx, group_id, &d.rel_path,
                     )?;
+                    // No retention proof travels with a prepared delete: the file was removed
+                    // before this commit, so there is nothing left to prove from. A delete of a
+                    // version that has bytes to keep is refused here (nothing is written) rather
+                    // than recorded without them.
                     yadorilink_sync_sqlite::file_index::upsert_file_in_tx(
                         tx,
                         group_id,
                         &d.record,
                         &d.origin_device_id,
+                        yadorilink_sync_sqlite::retention::Retention::Proofs(
+                            &yadorilink_sync_sqlite::retention::RetentionProofs::new(),
+                        ),
                     )?;
                 }
                 permit.verify()?;
@@ -1611,6 +1674,7 @@ impl ReplicaCoordinator {
     /// already matches what's on disk and in the index, but whose row/
     /// metadata/authoring/origin still needs updating, in one
     /// `writer_gate` acquisition.
+    #[allow(clippy::too_many_arguments)] // one argument per input of the persisted row
     pub fn apply_projected_row_atomic(
         &self,
         group_id: &str,
@@ -1618,6 +1682,7 @@ impl ReplicaCoordinator {
         origin_device_id: &str,
         authoring: Option<&yadorilink_replica_domain::native_plan::NativeRowIdentity>,
         meta: &yadorilink_replica_domain::session_state::LocalFileMetaColumns,
+        retention: yadorilink_sync_sqlite::retention::Retention<'_>,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), PeerSessionError> {
         #[cfg(test)]
@@ -1629,10 +1694,43 @@ impl ReplicaCoordinator {
                 origin_device_id,
                 authoring,
                 meta,
+                retention,
                 permit,
             )
             .map_err(SyncError::from)
             .map_err(PeerSessionError::from)
+    }
+}
+
+impl ReplicaCoordinator {
+    /// The size of the block `block_hash` in the current record of `path`, when that record is
+    /// live and the file is present on this device (a placeholder, a file being made or removed
+    /// holds nothing to serve).
+    fn present_file_block_size(
+        &self,
+        group_id: &str,
+        path: &str,
+        block_hash: &[u8],
+    ) -> Result<Option<u32>, PeerSessionError> {
+        let to_session =
+            |e: yadorilink_sync_sqlite::SyncSqliteError| PeerSessionError::from(SyncError::from(e));
+        let Some(record) =
+            self.file_index_repository().get_file(group_id, path).map_err(to_session)?
+        else {
+            return Ok(None);
+        };
+        let Some(size) = (!record.deleted)
+            .then(|| record.blocks.iter().find(|b| b.hash == block_hash).map(|b| b.size))
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        let state = self
+            .materialization_state_repository()
+            .get_materialization_state(group_id, path)
+            .map_err(to_session)?;
+        Ok((state == Some(yadorilink_replica_domain::session_state::MaterializationState::Present))
+            .then_some(size))
     }
 }
 
@@ -1656,6 +1754,14 @@ impl yadorilink_peer_session::ports::BlockServeAuthorizationPort for ReplicaCoor
             .map_err(SyncError::from)
             .map_err(PeerSessionError::from)?;
         if !has_provenance {
+            // Without a store copy this device may still hold the block in the file the current
+            // record of the requested path describes: that record, present on this device, is the
+            // claim (the bytes are checked against the hash before they leave).
+            if self.tuning().file_block_source {
+                if let Some(size) = self.present_file_block_size(group_id, path, block_hash)? {
+                    return Ok(BlockServeAuthorization::Allowed { declared_size: Some(size) });
+                }
+            }
             return Ok(BlockServeAuthorization::NoProvenance);
         }
         let declared_size = self

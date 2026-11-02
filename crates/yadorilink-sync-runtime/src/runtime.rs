@@ -27,6 +27,9 @@ pub enum SyncRuntimeError {
 
 const CONNECT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// One dial attempt within [`CONNECT_DEADLINE`].
+const CONNECT_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(8);
+
 /// Notified with each link this runtime dials, before any lane is
 /// opened on it.
 ///
@@ -159,13 +162,22 @@ impl SyncRuntime {
     /// carried anything.
     pub async fn connect(&self, peer: PeerId) -> Result<PeerLink, SyncRuntimeError> {
         let deadline = self.connect_deadline();
-        let link = match tokio::time::timeout(deadline, self.node.connect(peer)).await {
-            Ok(result) => result?,
-            Err(_) => {
+        let started = tokio::time::Instant::now();
+        // Several shorter attempts rather than one long one: a dial that has not completed in
+        // `CONNECT_ATTEMPT` is usually going down a path that does not work (a connection to the
+        // peer the other end already dropped, a NAT that does not hairpin), and a fresh attempt
+        // starts the path discovery over. The deadline for all of them together is unchanged.
+        let link = loop {
+            let left = deadline.saturating_sub(started.elapsed());
+            if left.is_zero() {
                 return Err(SyncRuntimeError::NetworkTimeout {
                     stage: "connect",
                     seconds: deadline.as_secs(),
-                })
+                });
+            }
+            match tokio::time::timeout(CONNECT_ATTEMPT.min(left), self.node.connect(peer)).await {
+                Ok(result) => break result?,
+                Err(_) => continue,
             }
         };
         let hook = self.dialed.lock().expect("dialed hook poisoned").clone();

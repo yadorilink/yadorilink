@@ -512,6 +512,7 @@ fn record_group_policy_states(
     // checks it against this device's verified chain, so a batch that
     // failed because the chain lagged becomes publishable exactly when the
     // chain catches up. Nothing else would retry it.
+    ws_netmap::spawn_redrive_dirty_journals(state, advanced_groups.clone());
     ws_netmap::spawn_flush_pending_checkpoints(state, Some(advanced_groups));
     // What a fork pass may do depends on the verified policy (the fallback
     // for an author that can no longer act): it looks at the contests again.
@@ -881,8 +882,21 @@ pub async fn run(config: OrchestratorConfig, state: Arc<DaemonState>) -> Result<
             log_block_change(&mut last_block, &blocked);
             let delay = reconnect_delay_after(attempt, blocked.is_some(), failure.as_ref());
             tracing::info!(attempt, ?delay, "waiting before next coordination reconnect attempt");
-            tokio::time::sleep(delay).await;
-            attempt = attempt.saturating_add(1);
+            // The network coming back ends the wait, unless the service refuses
+            // this device (`blocked`/403): that is not a network matter and its
+            // once-a-minute pace stays.
+            let mut arrivals = match state.peer_session_driver() {
+                Some(driver) if !blocked_wait(&blocked, failure.as_ref()) => {
+                    driver.stack().endpoint().arrivals()
+                }
+                _ => crate::redial_pacing::Arrivals::never(),
+            };
+            if arrivals.sleep(delay).await == crate::redial_pacing::Wake::Nudged {
+                tracing::info!("network came back; reconnecting to coordination now");
+                attempt = 0;
+            } else {
+                attempt = attempt.saturating_add(1);
+            }
         }
     };
     tokio::join!(startup, netmap);
@@ -1037,6 +1051,15 @@ fn upgrade_was_forbidden(error: &DaemonError) -> bool {
 /// while the service refuses this device (`blocked`) or answered the upgrade 403 (`failure`).
 fn reconnect_delay_after(attempt: u32, blocked: bool, failure: Option<&DaemonError>) -> Duration {
     reconnect_delay_for(attempt, blocked || failure.is_some_and(upgrade_was_forbidden))
+}
+
+/// Whether the wait that follows a failed attempt is stretched because the service refuses this
+/// device, as opposed to the network being down.
+fn blocked_wait(
+    blocked: &Option<yadorilink_fapi_client::CoordinationBlock>,
+    failure: Option<&DaemonError>,
+) -> bool {
+    blocked.is_some() || failure.is_some_and(upgrade_was_forbidden)
 }
 
 fn reconnect_delay_for(attempt: u32, blocked: bool) -> Duration {
@@ -1403,6 +1426,13 @@ pub(crate) fn peer_sync_session_deps(state: &Arc<DaemonState>) -> PeerSyncSessio
         // move its custody lease elsewhere -- see
         // `DaemonState::rehome_custody_hold`.
         custody_rehome_responder: state.clone(),
+        // Serving a block the store lacks from the user's file, when that is switched on.
+        block_file_source: state.tuning().file_block_source.then(|| {
+            Arc::new(crate::file_block_source::FileBlockSource::new(
+                state.replica_coordinator.clone(),
+                state.clone(),
+            )) as Arc<dyn yadorilink_peer_session::ports::BlockFileSourcePort>
+        }),
     }
 }
 

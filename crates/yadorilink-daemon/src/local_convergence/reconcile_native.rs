@@ -182,13 +182,17 @@ const _: () = assert!(DEFAULT_RECEIVE_WRITE_CONCURRENCY <= MAX_RECEIVE_WRITE_CON
 
 /// Most items one collector batch (open, completion) carries.
 ///
-/// Decoupled from the write concurrency: a full open batch makes two
-/// root-identity filesystem checks per item inside ONE transaction while the
-/// process-wide writer gate is held, so the hold is bounded by this cap times
-/// the per-item checks (16 items: up to 32 observations), not by how many
-/// files are in flight. A slow or network-mounted root would otherwise stall
-/// scans, flushes and other writers, and lengthen `stop()`.
-const DEFAULT_COLLECTOR_FLUSH_CAP: usize = 16;
+/// Decoupled from the write concurrency: a full batch holds the process-wide
+/// writer gate for its statements plus one root-authority check per distinct
+/// root (not per item), so the hold is bounded by this cap times the
+/// statements of one item, not by how many files are in flight. A slow or
+/// network-mounted root would otherwise stall scans, flushes and other
+/// writers, and lengthen `stop()`. The default equals the write concurrency,
+/// the most items a window can have waiting at once: measured on a
+/// 10,000-file receive, 32 instead of 16 halves the open and close waves
+/// (631 and 636 to 316 and 318 transactions) for about 5% less elapsed time.
+const DEFAULT_COLLECTOR_FLUSH_CAP: usize = 32;
+const _: () = assert!(DEFAULT_COLLECTOR_FLUSH_CAP <= MAX_COLLECTOR_FLUSH_CAP);
 const MIN_COLLECTOR_FLUSH_CAP: usize = 1;
 const MAX_COLLECTOR_FLUSH_CAP: usize = 64;
 pub(crate) fn parse_collector_flush_cap(raw: Option<&str>) -> usize {
@@ -543,6 +547,18 @@ impl super::LocalConvergenceExecutor {
         self.state.tuning().batch_completion
     }
 
+    /// Whether the blocks of small received files are held in memory for the pass instead of being
+    /// committed to the block store (the default).
+    pub(crate) fn single_pass(&self) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        match self.single_pass_override.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => return true,
+            2 => return false,
+            _ => {}
+        }
+        self.state.tuning().single_pass
+    }
+
     /// Whether the files of a run queue the open of their write in the same
     /// window. Read fresh per pass, so a measurement can A/B it.
     fn batch_open(&self) -> bool {
@@ -556,8 +572,8 @@ impl super::LocalConvergenceExecutor {
     }
 
     /// How a pass flushes the files it received, when it does not do so one by
-    /// one: `YADORILINK_RECEIVE_DEFERRED_FSYNC` (on by default on macOS, `0`
-    /// opts out; see `completion_window::parse_deferred_flush`). Read
+    /// one: `YADORILINK_RECEIVE_DEFERRED_FSYNC` (on by default on every Unix,
+    /// never on Windows; `0` opts out; see `completion_window::parse_deferred_flush`). Read
     /// fresh per pass, so a measurement can A/B it.
     pub(crate) fn deferred_flush(
         &self,
@@ -1265,6 +1281,10 @@ mod run_tests {
     #[test]
     fn the_collector_flush_cap_defaults_and_clamps() {
         assert_eq!(parse_collector_flush_cap(None), DEFAULT_COLLECTOR_FLUSH_CAP);
+        assert_eq!(
+            DEFAULT_COLLECTOR_FLUSH_CAP, DEFAULT_RECEIVE_WRITE_CONCURRENCY,
+            "a batch never needs to hold more than the items a window has waiting"
+        );
         assert_eq!(parse_collector_flush_cap(Some("0")), DEFAULT_COLLECTOR_FLUSH_CAP);
         assert_eq!(parse_collector_flush_cap(Some("x")), DEFAULT_COLLECTOR_FLUSH_CAP);
         assert_eq!(parse_collector_flush_cap(Some("1")), 1);

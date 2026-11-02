@@ -3,13 +3,7 @@
 use super::*;
 
 fn meta(record_kind: RecordKind, symlink_target: Option<Vec<u8>>) -> FileMeta {
-    FileMeta {
-        mtime_unix_nanos: 0,
-        unix_mode: None,
-        symlink_target,
-        record_kind,
-        xattrs: Vec::new(),
-    }
+    FileMeta { mtime_unix_nanos: 0, exec: false, symlink_target, record_kind }
 }
 
 #[test]
@@ -56,27 +50,17 @@ fn a_file_or_directory_with_a_symlink_target_is_rejected() {
     assert!(matches!(err, ChangeError::Malformed(_)), "got {err:?}");
 }
 
-/// Regression: `FileMeta::xattrs`'s own doc comment says a symlink or
-/// directory is "not scanned" for xattrs, and decode enforces it -- a
-/// hand-crafted Symlink/Directory version carrying nonempty `xattrs`
-/// would otherwise bake them into `version_hash` while no completion
-/// proof for that path ever verifies, applies, or even looks at them
-/// for those kinds.
-/// Confirmed genuinely RED by temporarily removing this specific
-/// check from `validate_structure` (leaving every other check in
-/// place): both versions below verified successfully instead of
-/// being rejected.
+/// Execute is a property of a regular file: a hand-crafted Symlink/Directory version marked
+/// executable is refused, so two devices cannot author different versions of the same thing.
 #[test]
-fn a_symlink_or_directory_with_nonempty_xattrs_is_rejected() {
-    let xattrs = vec![("user.a".to_string(), b"1".to_vec())];
-
+fn a_symlink_or_directory_marked_executable_is_rejected() {
     let mut symlink_meta = meta(RecordKind::Symlink, Some(b"target".to_vec()));
-    symlink_meta.xattrs = xattrs.clone();
+    symlink_meta.exec = true;
     let err = FileVersion::new(vec![], 0, symlink_meta).verify_hash().unwrap_err();
     assert!(matches!(err, ChangeError::Malformed(_)), "got {err:?}");
 
     let mut directory_meta = meta(RecordKind::Directory, None);
-    directory_meta.xattrs = xattrs;
+    directory_meta.exec = true;
     let err = FileVersion::new(vec![], 0, directory_meta).verify_hash().unwrap_err();
     assert!(matches!(err, ChangeError::Malformed(_)), "got {err:?}");
 }

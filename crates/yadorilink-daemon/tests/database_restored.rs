@@ -74,7 +74,13 @@ mod unix_tests {
         let coordinator = Arc::new(
             ReplicaCoordinator::open_with(data.join("sync.sqlite3"), outside_witness()).unwrap(),
         );
-        let state = DaemonState::new(device_id.into(), coordinator, store);
+        // The state directory lives with the data, so a restart over the same data reloads it.
+        let state = yadorilink_daemon::test_support::isolated_daemon_state_in(
+            data.join("state"),
+            device_id.into(),
+            coordinator,
+            store,
+        );
         state.set_device_signing_key(ed25519_dalek::SigningKey::from_bytes(&[key_byte; 32]));
         let serve_state = state.clone();
         let serve_socket = socket.to_path_buf();

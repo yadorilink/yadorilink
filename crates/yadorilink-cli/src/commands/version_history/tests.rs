@@ -8,10 +8,11 @@ fn devices() -> DeviceNames {
     DeviceNames {
         own_device_id: Some("device-self".into()),
         names: [("device-a".to_string(), "Kitchen Mac".to_string())].into_iter().collect(),
+        stale: false,
     }
 }
 use crate::commands::local_time::format_with_offset;
-use yadorilink_ipc_proto::daemonctl::EntryKind;
+use yadorilink_ipc_proto::daemonctl::{EntryKind, VersionContent};
 
 /// `versions` output shape — one line per version, newest
 /// first is the daemon's own ordering contract (`SyncState::list_versions`'s
@@ -24,12 +25,13 @@ fn version_line_renders_every_field() {
         mtime_unix_nanos: 12345,
         state: "superseded".into(),
         origin_device_id: "device-a".into(),
-        unix_mode: Some(0o755),
+        exec: true,
         kind: EntryKind::File as i32,
+        ..Default::default()
     };
     assert_eq!(
         version_line(&v, &devices()),
-        "v3  12345  size=42  from Kitchen Mac  state=superseded  mode=0o755"
+        "v3  12345  size=42  from Kitchen Mac  state=superseded  exec=yes"
     );
 }
 
@@ -44,26 +46,27 @@ fn version_line_renders_unknown_origin() {
         mtime_unix_nanos: 0,
         state: "current".into(),
         origin_device_id: String::new(),
-        unix_mode: Some(0o644),
+        exec: false,
         kind: EntryKind::File as i32,
+        ..Default::default()
     };
     assert!(version_line(&v, &devices()).contains("from an unknown device"));
 }
 
-/// No Unix permission info (a version authored on Windows) renders as
-/// `-`, never a fabricated octal value.
+/// A version that is not executable (every version authored on Windows) renders `exec=no`.
 #[test]
-fn version_line_renders_absent_unix_mode() {
+fn version_line_renders_a_non_executable_version() {
     let v = FileVersionInfo {
         version_seq: 1,
         size: 0,
         mtime_unix_nanos: 0,
         state: "current".into(),
         origin_device_id: "device-a".into(),
-        unix_mode: None,
+        exec: false,
         kind: EntryKind::File as i32,
+        ..Default::default()
     };
-    assert!(version_line(&v, &devices()).contains("mode=-"));
+    assert!(version_line(&v, &devices()).contains("exec=no"));
 }
 
 #[test]
@@ -119,12 +122,13 @@ fn directory_version_line_does_not_print_size() {
         mtime_unix_nanos: 0,
         state: "current".into(),
         origin_device_id: "device-a".into(),
-        unix_mode: Some(0o755),
+        exec: true,
         kind: EntryKind::Directory as i32,
+        ..Default::default()
     };
     assert_eq!(
         version_line(&v, &devices()),
-        "v4  directory  from Kitchen Mac  state=current  mode=0o755"
+        "v4  directory  from Kitchen Mac  state=current  exec=yes"
     );
 }
 
@@ -227,4 +231,59 @@ fn device_labels_never_show_an_id() {
     assert_eq!(devices.label("device-b"), "another device");
     assert_eq!(devices.label(""), "an unknown device");
     assert_eq!(DeviceNames::default().label("device-a"), "another device");
+}
+
+/// An older file version says whether this device holds its bytes; the current version, a
+/// deletion and a directory say nothing about bytes.
+#[test]
+fn version_line_says_whether_an_older_version_is_held() {
+    let version = |content: VersionContent| FileVersionInfo {
+        version_seq: 2,
+        size: 7,
+        mtime_unix_nanos: 9,
+        state: "superseded".into(),
+        origin_device_id: "device-a".into(),
+        exec: false,
+        kind: EntryKind::File as i32,
+        content: content as i32,
+    };
+    let line = |content| version_line(&version(content), &devices());
+    assert_eq!(
+        line(VersionContent::Kept),
+        "v2  9  size=7  from Kitchen Mac  state=superseded  content=kept  exec=no"
+    );
+    assert_eq!(
+        line(VersionContent::NotKept),
+        "v2  9  size=7  from Kitchen Mac  state=superseded  content=not-kept  exec=no"
+    );
+    assert!(!line(VersionContent::NotApplicable).contains("content="));
+}
+
+fn span(from: Option<i64>, to: Option<i64>, reason: &str) -> NotKeptSpan {
+    NotKeptSpan {
+        from_unix_nanos: from,
+        to_unix_nanos: to,
+        from_seq: 1,
+        to_seq: 2,
+        reason: reason.into(),
+    }
+}
+
+/// Events are listed as they are stored; the display joins adjacent or overlapping ones and names
+/// every reason present, and a span that is open on a side says so.
+#[test]
+fn not_kept_lines_join_adjacent_events_and_name_each_reason() {
+    const S: i64 = 1_000_000_000;
+    let lines = not_kept_lines(&[
+        span(Some(200 * S), Some(300 * S), "Expired"),
+        span(Some(100 * S), Some(200 * S), "LowSpace"),
+        span(Some(900 * S), None, "LowSpace"),
+    ]);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[0].ends_with("are not kept (the disk was nearly full; the retention period ended)")
+    );
+    assert!(lines[1].contains(" to now are not kept (the disk was nearly full)"), "{lines:?}");
+    assert!(not_kept_lines(&[]).is_empty());
+    assert!(not_kept_lines(&[span(Some(1), Some(2), "SomethingNew")]).is_empty());
 }

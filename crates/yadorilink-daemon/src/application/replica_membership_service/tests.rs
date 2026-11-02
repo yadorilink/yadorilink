@@ -182,6 +182,8 @@ struct FakeCoordination {
     edge_state: Mutex<Result<Option<String>, String>>,
     edge_state_calls: Mutex<u32>,
     audit_calls: Mutex<u32>,
+    /// What `check_revoke_authority` answers; `None` is "no refusal learned".
+    revoke_refusal: Mutex<Option<RevokeRefusal>>,
 }
 
 type ResolveEdgeResults = VecDeque<Result<Option<(String, String)>, String>>;
@@ -198,6 +200,7 @@ impl Default for FakeCoordination {
             edge_state: Mutex::new(Ok(None)),
             edge_state_calls: Mutex::default(),
             audit_calls: Mutex::default(),
+            revoke_refusal: Mutex::default(),
         }
     }
 }
@@ -271,6 +274,14 @@ impl MembershipCoordination for FakeCoordination {
             *self.edge_state_calls.lock().unwrap() += 1;
             self.edge_state.lock().unwrap().clone()
         })
+    }
+
+    fn check_revoke_authority<'a>(
+        &'a self,
+        _group_id: &'a str,
+        _device_id: &'a str,
+    ) -> BoxFuture<'a, Option<RevokeRefusal>> {
+        Box::pin(async move { self.revoke_refusal.lock().unwrap().clone() })
     }
 
     fn record_force_override_audit<'a>(
@@ -487,6 +498,39 @@ async fn ticket_bound_guarded_revoke_reports_the_real_membership_generation() {
     assert_eq!(outcome.handoffs.len(), 1);
     assert_eq!(outcome.handoffs[0].membership_generation, 7);
     assert_eq!(outcome.handoffs[0].lease_id, "lease-1");
+}
+
+/// The coordination plane's authorization refusal is the reason a revoke is
+/// reported, whether or not the durability gate would also have stopped it:
+/// here no ticket is available and nothing is ready, and the
+/// refusal is still the Forbidden one -- reached before any ticket is asked.
+#[tokio::test]
+async fn an_authorization_refusal_is_reported_before_the_durability_gate() {
+    let repository = Arc::new(FakeRepository::default());
+    let coordination = Arc::new(FakeCoordination::configured());
+    *coordination.revoke_refusal.lock().unwrap() = Some(RevokeRefusal::Rejected(
+        "revoke device returned HTTP 403 Forbidden: the primary owner's access cannot be changed"
+            .to_string(),
+    ));
+    let tickets = Arc::new(FakeTickets::default());
+    let readiness = Arc::new(FakeReadiness::default());
+
+    let result = service(repository, coordination.clone(), tickets.clone(), readiness)
+        .revoke_device(RevokeDeviceCommand {
+            group_id: "group-1".to_string(),
+            device_id: "device-b".to_string(),
+            force: false,
+        })
+        .await;
+
+    match result {
+        Err(ReplicaMembershipError::CoordinationRejected { detail }) => {
+            assert!(detail.contains("403 Forbidden"), "{detail}");
+        }
+        other => panic!("expected the Forbidden refusal, got {other:?}"),
+    }
+    assert!(tickets.grants.lock().unwrap().is_empty());
+    assert_eq!(*coordination.dispatch_calls.lock().unwrap(), 0);
 }
 
 #[tokio::test]

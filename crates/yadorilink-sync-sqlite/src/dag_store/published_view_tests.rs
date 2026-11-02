@@ -39,10 +39,9 @@ fn version(blocks: &[u8], tag: i64) -> FileVersion {
         blocks.len() as u64,
         FileMeta {
             mtime_unix_nanos: tag,
-            unix_mode: Some(0o644),
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     )
 }
@@ -255,10 +254,9 @@ fn observe_lookup_and_store_cost() {
                 4,
                 FileMeta {
                     mtime_unix_nanos: i as i64,
-                    unix_mode: Some(0o644),
+                    exec: false,
                     symlink_target: None,
                     record_kind: RecordKind::File,
-                    xattrs: Vec::new(),
                 },
             );
             c.execute(
@@ -312,10 +310,9 @@ fn observe_lookup_and_store_cost() {
                 blocks as u64,
                 FileMeta {
                     mtime_unix_nanos: i,
-                    unix_mode: Some(0o644),
+                    exec: false,
                     symlink_target: None,
                     record_kind: RecordKind::File,
-                    xattrs: Vec::new(),
                 },
             )
         };
@@ -415,10 +412,9 @@ fn observe_index_size() {
                 blocks as u64,
                 FileMeta {
                     mtime_unix_nanos: i as i64,
-                    unix_mode: Some(0o644),
+                    exec: false,
                     symlink_target: None,
                     record_kind: RecordKind::File,
-                    xattrs: Vec::new(),
                 },
             );
             chunk.push(v);

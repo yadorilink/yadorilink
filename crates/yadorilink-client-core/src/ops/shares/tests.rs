@@ -234,27 +234,27 @@ fn group_member_info_deserializes_the_coordination_planes_camelcase_response() {
     assert!(!member.online);
 }
 
-/// A live role change may request viewer or editor, never owner -- checked
+/// A live role change may request viewer, editor or owner -- checked
 /// locally as well as server-side, so a mistyped role fails before a network
 /// round trip.
 #[test]
-fn a_role_change_accepts_viewer_and_editor_and_refuses_owner() {
+fn a_role_change_accepts_viewer_editor_and_owner_and_refuses_the_rest() {
     assert!(validate_changeable_role("viewer").is_ok());
     assert!(validate_changeable_role("editor").is_ok());
+    assert!(validate_changeable_role("owner").is_ok());
 
-    let refused = validate_changeable_role("owner").unwrap_err();
+    let refused = validate_changeable_role("admin").unwrap_err();
     assert!(matches!(refused, CoreError::InvalidArgument(_)), "{refused:?}");
     assert!(!refused.to_string().contains("--"), "{refused}");
     let refused = refused.to_string();
-    assert!(refused.contains("owner"), "{refused}");
-    assert!(refused.contains("viewer or editor"), "{refused}");
+    assert!(refused.contains("viewer, editor or owner"), "{refused}");
 
-    assert_eq!(CHANGEABLE_ROLES, ["viewer", "editor"]);
+    assert_eq!(CHANGEABLE_ROLES, ["viewer", "editor", "owner"]);
 }
 
 #[test]
 fn a_role_change_refuses_a_role_the_coordination_plane_would_refuse() {
-    for role in ["", "Viewer", "EDITOR", "owner ", "admin", "read-only"] {
+    for role in ["", "Viewer", "EDITOR", "Owner", "owner ", "admin", "read-only"] {
         assert!(validate_changeable_role(role).is_err(), "{role:?} must be refused locally");
     }
 }
@@ -688,4 +688,27 @@ async fn resolve_joinable_group_id_names_the_missing_group_and_its_next_step() {
     let error = resolve_joinable_group_id_with(&auth, "docs").await.unwrap_err();
     assert_eq!(error.hint(), Some(Hint::ListJoinableShares));
     assert_eq!(error.to_string(), "no joinable folder group named \"docs\"");
+}
+
+/// A delegated Owner decides on requests in the groups it holds an Owner
+/// seat in; an Editor seat, a pending seat or someone else's device grants
+/// nothing.
+#[test]
+fn delegated_owner_group_ids_come_only_from_own_active_owner_edges() {
+    let mine: HashSet<String> = ["my-dev".to_string()].into_iter().collect();
+    let edge = |group: &str, device: &str, state: &str, role: &str| ShareEdgeInfo {
+        group_id: group.into(),
+        device_id: device.into(),
+        state: state.into(),
+        role: Some(role.into()),
+        ..base_edge()
+    };
+    let edges = vec![
+        edge("g-owner", "my-dev", "active", "owner"),
+        edge("g-editor", "my-dev", "active", "editor"),
+        edge("g-pending", "my-dev", STATE_PENDING_APPROVAL, "owner"),
+        edge("g-other", "their-dev", "active", "owner"),
+    ];
+    let ids = delegated_owner_group_ids(&edges, &mine);
+    assert_eq!(ids, ["g-owner".to_string()].into_iter().collect());
 }

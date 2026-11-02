@@ -643,7 +643,7 @@ impl LocalChangeProcessor {
                     // exactly as before.
                     None,
                 );
-                let (outcome, classification, unix_mode) = match built {
+                let (outcome, classification, exec) = match built {
                     Ok(built) => built,
                     Err(error) => {
                         // The failure is returned exactly as before (the flush retries it and
@@ -693,35 +693,13 @@ impl LocalChangeProcessor {
                     // commit), alongside the daemon's lifecycle-fence check
                     // the standalone call never covered.
                     // A local edit's origin is this device itself.
-                    // A fresh open, not the same handle
-                    // `build_record_for_created_or_modified` chunked
-                    // through above -- a weaker same-bytes guarantee
-                    // than `single_pass_capture.rs`'s own xattr read,
-                    // but xattrs are a best-effort metadata capture
-                    // (see `read_replicated_xattrs`'s own doc
-                    // comment), not content integrity, so a rare
-                    // race here reads as "no attributes this time,"
-                    // never a corrupt result. Never scanned for a
-                    // symlink, matching `unix_mode`'s own `None`
-                    // there.
-                    let xattrs = if classification.is_none() && !record.deleted {
-                        self.captured_xattrs(
-                            &event.path,
-                            &super::Predecessor::of_row(
-                                self.state.canonical_current_row(group_id, &record.path)?.as_ref(),
-                            ),
-                        )
-                    } else {
-                        Vec::new()
-                    };
                     match &self.change_emitter {
                         Some(emitter) => {
                             let symlink_target = classification.as_ref().map(|c| c.target.clone());
                             let (op, version) = self.content_op(
                                 record,
-                                unix_mode.flatten(),
+                                exec.unwrap_or(false),
                                 symlink_target.clone(),
-                                xattrs.clone(),
                             );
                             // The record kind / symlink target / out-of-root
                             // flag / exec bit are written in the SAME
@@ -732,7 +710,7 @@ impl LocalChangeProcessor {
                             // leave the index row's metadata columns lagging
                             // the change's `FileVersion` — the old post-commit
                             // `set_*` setters are gone from this emit path.
-                            let meta = metadata_columns_for(&classification, unix_mode, xattrs);
+                            let meta = metadata_columns_for(&classification, exec);
                             // The simple, common create/modify case: not a
                             // symlink, a real emitter -- eligible to defer
                             // into a shared batch commit instead of
@@ -833,8 +811,7 @@ impl LocalChangeProcessor {
                             // this device's own disk to build it, so the
                             // identity observed here describes what a reader
                             // would find.
-                            let meta =
-                                metadata_columns_for(&classification, unix_mode, xattrs.clone());
+                            let meta = metadata_columns_for(&classification, exec);
                             // The version these bytes hash to, built from
                             // the same record and the same metadata the row
                             // beside it is getting -- so the proof names
@@ -844,9 +821,8 @@ impl LocalChangeProcessor {
                             // key, so nothing else in this arm computes one.
                             let (_, version) = self.content_op(
                                 record,
-                                unix_mode.flatten(),
+                                exec.unwrap_or(false),
                                 classification.as_ref().map(|c| c.target.clone()),
-                                xattrs,
                             );
                             let observed = if record.deleted {
                                 None

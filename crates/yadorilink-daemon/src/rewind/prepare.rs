@@ -276,6 +276,13 @@ impl BegunRewind {
     pub async fn prefetch(self) -> Result<PreparedRewind, RewindPrepareError> {
         let BegunRewind { state, run, plan, required, retention } = self;
         let group_id = plan.group_id.clone();
+        // A version this device holds only as a file in the folder is read into the store first.
+        let local_failure = rewind_prefetch::read_local_files_into_store(
+            &state,
+            &group_id,
+            required.versions.clone(),
+        )
+        .await;
         let verdict =
             match rewind_prefetch::prefetch_rewind_content(&state, &group_id, &required.blocks)
                 .await
@@ -287,6 +294,16 @@ impl BegunRewind {
                     return Err(RewindPrepareError::Local { run_id, message: error.to_string() });
                 }
             };
+        if !verdict.unobtainable.is_empty() && local_failure {
+            // A folder file that may be the version could not be read into the store this time:
+            // the content is not known to be gone.
+            let run_id = run.run_id.clone();
+            run.fail(RewindFailureKind::Transient, 0, &[]);
+            return Err(RewindPrepareError::Local {
+                run_id,
+                message: "a file in the folder could not be read into the store; try again".into(),
+            });
+        }
         if !verdict.unobtainable.is_empty() {
             let files = required.files_holding(&verdict.unobtainable);
             let run_id = run.run_id.clone();
@@ -336,6 +353,8 @@ struct RequiredContent {
     blocks: Vec<BlockInfo>,
     /// Per `Create`/`Replace` entry, the hashes of its version's blocks.
     files: Vec<HashSet<Vec<u8>>>,
+    /// Per `Create`/`Replace` entry, the path and the blocks of the version it restores.
+    versions: Vec<rewind_prefetch::LocalSourceCandidate>,
 }
 
 impl RequiredContent {
@@ -356,6 +375,7 @@ fn required_content(
     let index = state.replica_coordinator.file_index_repository();
     let mut blocks: HashMap<Vec<u8>, BlockInfo> = HashMap::new();
     let mut files = Vec::new();
+    let mut versions = Vec::new();
     for entry in &plan.entries {
         let (version_seq, version_hash) = match &entry.action {
             RewindPathAction::Create { version_seq, version_hash } => (*version_seq, version_hash),
@@ -377,6 +397,12 @@ fn required_content(
                 ))
             })?;
         let mut file = HashSet::new();
+        if version.record_kind == yadorilink_replica_domain::file::RecordKind::File {
+            versions.push(rewind_prefetch::LocalSourceCandidate {
+                path: entry.path.clone(),
+                blocks: version.blocks.clone(),
+            });
+        }
         for block in version.blocks {
             file.insert(block.hash.clone());
             blocks.entry(block.hash.clone()).or_insert(block);
@@ -385,7 +411,7 @@ fn required_content(
     }
     let mut blocks: Vec<BlockInfo> = blocks.into_values().collect();
     blocks.sort_by(|a, b| a.hash.cmp(&b.hash));
-    Ok(RequiredContent { blocks, files })
+    Ok(RequiredContent { blocks, files, versions })
 }
 
 #[cfg(test)]

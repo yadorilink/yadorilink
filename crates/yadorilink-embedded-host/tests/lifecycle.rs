@@ -1,9 +1,8 @@
 //! The embedded host's lifecycle, in one process: start, stop and restart, suspend and
 //! resume, and that stopping leaves nothing behind.
 //!
-//! The engine resolves its state directory from the process environment, so every test runs
-//! under one shared directory, one at a time; each gets its own database and block store
-//! (see `support`).
+//! The tests run one at a time under an in-file lock; each owns its state directory, database
+//! and block store (see `support`), and the engine is given that directory explicitly.
 
 use std::time::Duration;
 
@@ -199,6 +198,19 @@ fn the_database_is_locked_by_the_os_until_the_engine_has_stopped() {
     .expect("stopping releases both locks");
 }
 
+/// Stops a host whose blocking work has just been released. `Draining` means the drain has not
+/// finished within the host's (short, test-set) bound and a later stop completes it, so a slow
+/// machine is asked again rather than failing on how long the release took to be noticed.
+fn stop_once_drained(host: &EmbeddedHost) -> Result<(), HostError> {
+    let give_up = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match host.stop() {
+            Err(HostError::Draining) if std::time::Instant::now() < give_up => {}
+            other => return other,
+        }
+    }
+}
+
 #[test]
 fn locks_are_held_until_blocking_work_ends_and_a_restart_is_refused_meanwhile() {
     let _serial = serialized();
@@ -222,7 +234,7 @@ fn locks_are_held_until_blocking_work_ends_and_a_restart_is_refused_meanwhile() 
     assert!(matches!(other.start(), Err(HostError::Start(_))), "the data area is still locked");
 
     release.send(()).unwrap();
-    host.stop().expect("the drain finishes once the blocking work does");
+    stop_once_drained(&host).expect("the drain finishes once the blocking work does");
     assert_eq!(host.state(), HostState::Stopped);
     other.start().expect("the data area is free after the drain");
     other.stop().unwrap();
@@ -245,7 +257,7 @@ fn a_stop_that_never_finishes_returns_draining_within_the_bound_and_keeps_the_lo
     assert!(matches!(other.start(), Err(HostError::Start(_))), "the data area is still locked");
 
     release.send(()).unwrap();
-    host.stop().expect("the drain finishes once the stall ends");
+    stop_once_drained(&host).expect("the drain finishes once the stall ends");
     other.start().expect("the data area is free after the drain");
     other.stop().unwrap();
 }
@@ -302,7 +314,7 @@ fn the_stop_and_the_drain_share_one_deadline() {
     );
 
     release_work.send(()).unwrap();
-    host.stop().unwrap();
+    stop_once_drained(&host).unwrap();
 }
 
 #[test]

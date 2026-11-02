@@ -10,6 +10,7 @@ mod job_fence;
 mod link_registry;
 mod pool;
 mod schema;
+mod state_stamp;
 
 // Permanent writer-gate observability -- see `database::writer_gate_stats`'s own
 // header comment.
@@ -26,9 +27,10 @@ pub use job_fence::{FenceWait, JobCompletion, JobFence, JobScope, FENCE_WARN_INT
 #[cfg(any(test, feature = "test-support"))]
 pub use link_registry::write_registry_for_test;
 pub use link_registry::{read_link_registry, RegisteredLink};
-pub use pool::{ConnectionPool, BUSY_TIMEOUT, STATEMENT_CACHE_CAPACITY};
+pub use pool::{CachedStatements, ConnectionPool, BUSY_TIMEOUT, STATEMENT_CACHE_CAPACITY};
 pub use schema::{
     authoring_evidence_missing, check_replica_schema_generation, check_schema_version_supported,
     files_authoring_triggers, init_schema, note_child_set_change, note_item_replaced,
     note_retention_changed, reconcile_provider_liveness, table_exists, SCHEMA_VERSION,
 };
+pub use state_stamp::{read_state_stamp, StateStamp};

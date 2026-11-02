@@ -307,6 +307,30 @@ async fn a_user_delete_between_the_write_and_its_proof_is_closed_and_indexed() {
     assert!(h.native_heads("gone.bin").is_empty(), "the delete must reach the native state");
 }
 
+/// A write whose "landed" mark cannot be recorded does not settle: the bytes are in place under
+/// an intent that does not say so, so the path stays unsettled (no proof, intent open) for the
+/// next pass instead of being logged past.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_landed_mark_that_cannot_be_recorded_leaves_the_write_unsettled() {
+    let h = Harness::new(false);
+    admit_received(&h, "unmarked.bin", b"the peer's bytes").await;
+    h.state
+        .database()
+        .write(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER refuse_landed_mark BEFORE UPDATE OF mutation_generation ON materialization_intents \
+         WHEN OLD.mutation_generation IS NULL AND NEW.mutation_generation IS NOT NULL \
+         BEGIN SELECT RAISE(ABORT, 'landed mark refused'); END;",
+            )?;
+            Ok::<_, yadorilink_sync_sqlite::SyncSqliteError>(())
+        })
+        .unwrap();
+
+    project(&h, "unmarked.bin").await;
+
+    assert_published_nothing(&h, "unmarked.bin", "the mark was refused");
+}
+
 /// The untouched path still gets its proof, with no dirty churn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_untouched_write_is_still_proven_and_not_dirty() {

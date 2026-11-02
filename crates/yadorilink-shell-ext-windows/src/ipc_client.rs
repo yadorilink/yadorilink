@@ -311,19 +311,32 @@ async fn list_folder_files_over<S>(stream: &mut S, local_path: &str) -> Option<V
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let msg = ShellIpcMessage {
-        payload: Some(Payload::ListFolderFilesRequest(ListFolderFilesRequest {
-            local_path: local_path.to_string(),
-        })),
-    };
-    write_message(stream, &msg).await.ok()?;
-    match read_message::<ShellIpcMessage>(stream).await {
-        Ok(Some(ShellIpcMessage { payload: Some(Payload::ListFolderFilesResponse(r)) }))
-            if r.snapshot_available =>
-        {
-            Some(r.entries)
+    // Paged, so a large folder never exceeds the IPC frame limit. Any page that cannot be
+    // confirmed makes the whole listing unconfirmed (`None`), never a partial one.
+    const PAGE_ENTRIES: u32 = 2000;
+    let mut entries = Vec::new();
+    let mut after_path = String::new();
+    loop {
+        let msg = ShellIpcMessage {
+            payload: Some(Payload::ListFolderFilesRequest(ListFolderFilesRequest {
+                local_path: local_path.to_string(),
+                max_entries: PAGE_ENTRIES,
+                after_path: std::mem::take(&mut after_path),
+            })),
+        };
+        write_message(stream, &msg).await.ok()?;
+        match read_message::<ShellIpcMessage>(stream).await {
+            Ok(Some(ShellIpcMessage { payload: Some(Payload::ListFolderFilesResponse(r)) }))
+                if r.snapshot_available =>
+            {
+                entries.extend(r.entries);
+                if r.next_after_path.is_empty() {
+                    return Some(entries);
+                }
+                after_path = r.next_after_path;
+            }
+            _ => return None,
         }
-        _ => None,
     }
 }
 
@@ -356,6 +369,7 @@ mod list_folder_files_tests {
                         })
                         .collect(),
                     snapshot_available,
+                    ..Default::default()
                 },
             )),
         }

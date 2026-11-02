@@ -103,6 +103,38 @@ use crate::link_runtime::startup::GroupStartupReadyGuard;
 /// overhead against normal sync traffic.
 const MATERIALIZATION_REPAIR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// When an interval tick of the live materialization repair may be skipped.
+///
+/// A live pass judges the replica database alone for every settled row, so a pass that fixed
+/// nothing, visited no row and left no path held would find the same again until a database
+/// write changes something. Anything only the filesystem can resolve keeps the ticks going: a
+/// visited row (its disk is compared) and a path still held (a user directory removed, a freeze
+/// lifted). Install wakes never skip.
+#[derive(Default)]
+struct RepairSkip {
+    clean_at: Option<u64>,
+}
+
+impl RepairSkip {
+    fn skips(&self, ticked: bool, generation: u64) -> bool {
+        ticked && self.clean_at == Some(generation)
+    }
+
+    fn disarm(&mut self) {
+        self.clean_at = None;
+    }
+
+    fn note_pass(
+        &mut self,
+        generation: u64,
+        report: &yadorilink_filesystem_sync::materialization_repair::MaterializationRepairReport,
+    ) {
+        if report.is_empty() && report.rows_visited == 0 && report.held_paths_remaining == 0 {
+            self.clean_at = Some(generation);
+        }
+    }
+}
+
 pub struct LinkRuntimeController {
     state: Arc<DaemonState>,
 }
@@ -261,11 +293,22 @@ impl LinkRuntimeController {
             // wakes it early (the interval is the backstop), including one
             // that landed while the previous pass was running.
             let mut installs = repair_state.replica_coordinator.subscribe_held_path();
+            // A live pass judges the replica database alone for every settled row, so one that
+            // found nothing to look at (no row visited, nothing fixed) would find the same again
+            // until a database write changes something: the interval tick skips such a pass
+            // instead of re-reading every row of the folder. An install wake never skips.
+            let mut writes = repair_state.replica_coordinator.database().subscribe_data_changes();
+            let mut skip = RepairSkip::default();
             loop {
-                tokio::select! {
-                    _ = ticker.tick() => {}
-                    Ok(()) = installs.changed() => {}
+                let ticked = tokio::select! {
+                    _ = ticker.tick() => true,
+                    Ok(()) = installs.changed() => false,
+                };
+                let generation = *writes.borrow_and_update();
+                if skip.skips(ticked, generation) {
+                    continue;
                 }
+                skip.disarm();
                 let replica_coordinator = repair_state.replica_coordinator.clone();
                 let block_store = repair_state.block_store.clone();
                 let root = repair_root.clone();
@@ -300,7 +343,9 @@ impl LinkRuntimeController {
                 })
                 .await;
                 match repair_result {
-                    Ok(Ok(report)) if report.is_empty() => {}
+                    Ok(Ok(report)) if report.is_empty() => {
+                        skip.note_pass(generation, &report);
+                    }
                     Ok(Ok(report)) => tracing::info!(
                         local_path = %repair_root.display(),
                         reconstructed = report.reconstructed.len(),

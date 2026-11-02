@@ -217,7 +217,7 @@ pub async fn members(group_name: String) -> Result<(), CliError> {
     Ok(())
 }
 
-/// `yadorilink share change-role <group> <device> --role viewer|editor`:
+/// `yadorilink share change-role <group> <device> --role viewer|editor|owner`:
 /// moves a device that ALREADY has access to a folder group to a different
 /// role, without a revoke-and-re-invite round trip.
 pub async fn change_role(
@@ -253,10 +253,15 @@ fn revoke_line(announcement: RevokeAnnouncement, device_id: &str, group_name: &s
     }
 }
 
-/// `yadorilink share revoke <group> <device> [--force]`. The daemon's
-/// durability readiness gate runs before any coordination-plane write;
-/// `--force` bypasses a refusal with a data-loss warning and an audit log
-/// line.
+/// `yadorilink share revoke <group> <device> [--force]`. The coordination
+/// plane's authorization refusal (e.g. a delegated owner touching the primary
+/// owner) is reported first, whatever the durability state. Then the daemon's
+/// durability readiness gate runs before any coordination-plane write: the
+/// leaving device must be able to hand its data to another complete copy, which
+/// may be this device (the last remaining replica revokes the other member
+/// without `--force` when it already holds everything that member has). A
+/// member holding data no other replica has is refused; `--force` bypasses that
+/// refusal with a data-loss warning and an audit log line.
 pub async fn revoke(
     group_name: String,
     device_id: String,
@@ -560,6 +565,8 @@ fn print_lines(lines: &[String]) {
         println!("{line}");
     }
 }
+
+pub mod transfer;
 
 #[cfg(test)]
 mod tests;

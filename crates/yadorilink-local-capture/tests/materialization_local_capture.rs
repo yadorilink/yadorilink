@@ -66,7 +66,7 @@ fn crashed_executable(
         .unwrap();
     state
         .file_index_repository()
-        .set_unix_mode("group-1", path, Some(0o755), &RootCommitPermit::for_tests())
+        .set_exec("group-1", path, true, &RootCommitPermit::for_tests())
         .unwrap();
     // A fresh `upsert_file` row defaults to `Remote` (schema v25's
     // fail-closed default -- see `upsert_file_in_tx`'s own doc comment), not
@@ -143,9 +143,8 @@ fn repair_leaves_disk_unix_mode_agreeing_with_the_index_across_a_scan() {
         "the scan suppresses the repaired file as a self-echo, so it can neither propagate \
          a dropped exec bit nor repair one: {minted:?}"
     );
-    assert_eq!(
-        state.file_index_repository().get_unix_mode("group-1", "tool.sh").unwrap(),
-        Some(0o755),
+    assert!(
+        state.file_index_repository().get_exec("group-1", "tool.sh").unwrap(),
         "the index keeps unix_mode=Some(0o755) across the scan"
     );
     assert!(

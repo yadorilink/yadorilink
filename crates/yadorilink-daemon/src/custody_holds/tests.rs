@@ -11,6 +11,7 @@ use yadorilink_root_authority::root_commit::RootCommitPermit;
 
 use super::*;
 use crate::replica_coordinator::ReplicaCoordinator;
+use yadorilink_peer_session::service_rpc::ProofAnswer;
 
 const GROUP: &str = "g";
 const PATH: &str = "a.bin";
@@ -36,10 +37,9 @@ fn record(block: u8, deleted: bool) -> FileRecord {
 fn version_of(block: u8) -> [u8; 32] {
     let meta = FileMeta {
         mtime_unix_nanos: 0,
-        unix_mode: None,
+        exec: false,
         symlink_target: None,
         record_kind: RecordKind::File,
-        xattrs: Vec::new(),
     };
     FileVersion::new(vec![VersionBlock { hash: BlockHash(vec![block; 32]), size: 4 }], 4, meta)
         .version_hash
@@ -178,8 +178,92 @@ fn full_replica_peer(state: &DaemonState) {
     state.authority.set_peer_group_full_replica("p", GROUP, true);
 }
 
+fn checking_rows(state: &DaemonState) -> usize {
+    state
+        .telemetry
+        .active_transfer_snapshot()
+        .iter()
+        .filter(|row| row.path.starts_with("checking copies on"))
+        .count()
+}
+
 fn hold_state(state: &DaemonState, key: &HoldKey) -> Option<HoldState> {
     state.replica_coordinator.remote_custody_hold_repository().get(key).unwrap().map(|h| h.state)
+}
+
+/// A peer that is still checking its copy answers "in progress": that is not a refusal. The
+/// same acquire (same attempt token) is asked again until the peer's proof lands, and the hold
+/// is granted then. While it waits the hold stays `requested`, and a "checking copies" row shows.
+#[tokio::test(start_paused = true)]
+async fn a_peer_still_checking_its_copy_is_asked_again_until_it_grants() {
+    let state = state();
+    full_replica_peer(&state);
+    let version = version_of(1);
+    let key = key(version);
+    let asked = std::sync::Mutex::new(Vec::new());
+    let epoch = state.authority.membership_generation();
+
+    let stamp = state
+        .acquire_custody_lease_with(
+            vec!["p".into()],
+            epoch,
+            GROUP,
+            PATH,
+            VersionHash(version),
+            |_peer, token| {
+                let mut asked = asked.lock().unwrap();
+                asked.push(token);
+                let answer = if asked.len() < 4 {
+                    assert_eq!(hold_state(&state, &key), Some(HoldState::Requested));
+                    assert_eq!(
+                        checking_rows(&state),
+                        usize::from(asked.len() > 1),
+                        "one checking row once the first answer was in progress"
+                    );
+                    ProofAnswer::InProgress
+                } else {
+                    ProofAnswer::Held
+                };
+                async move { answer }
+            },
+        )
+        .await
+        .expect("granted once the proof landed");
+
+    assert_eq!(stamp.peer_id(), "p");
+    let asked = asked.into_inner().unwrap();
+    assert_eq!(asked.len(), 4);
+    assert!(asked.windows(2).all(|w| w[0] == w[1]), "one attempt token for every ask");
+    assert_eq!(hold_state(&state, &key), Some(HoldState::Granted));
+    assert!(checking_rows(&state) == 0, "the row ends with the wait");
+}
+
+/// A peer that stays "in progress" does not keep a peer that would grant at once from being asked.
+#[tokio::test(start_paused = true)]
+async fn a_peer_that_keeps_checking_does_not_starve_one_that_grants() {
+    let state = state();
+    state.set_peer_group_writer("slow", GROUP, true);
+    state.authority.set_peer_group_full_replica("slow", GROUP, true);
+    state.set_peer_group_writer("quick", GROUP, true);
+    state.authority.set_peer_group_full_replica("quick", GROUP, true);
+    let epoch = state.authority.membership_generation();
+
+    let stamp = state
+        .acquire_custody_lease_with(
+            vec!["slow".into(), "quick".into()],
+            epoch,
+            GROUP,
+            PATH,
+            VersionHash(version_of(1)),
+            |peer, _token| {
+                let answer =
+                    if peer == "slow" { ProofAnswer::InProgress } else { ProofAnswer::Held };
+                async move { answer }
+            },
+        )
+        .await
+        .expect("the quick peer grants");
+    assert_eq!(stamp.peer_id(), "quick");
 }
 
 /// The exact order around the RPC: when the acquire is sent the row is
@@ -203,7 +287,7 @@ async fn the_hold_is_requested_when_the_acquire_is_sent_and_granted_before_the_s
             VersionHash(version),
             |_peer, _token| {
                 *seen_when_sent.lock().unwrap() = Some(hold_state(&state, &key));
-                async { true }
+                async { ProofAnswer::Held }
             },
         )
         .await
@@ -230,7 +314,7 @@ async fn a_denied_or_timed_out_acquire_keeps_its_requested_row() {
             GROUP,
             PATH,
             VersionHash(key.version_hash),
-            |_peer, _token| async { false },
+            |_peer, _token| async { ProofAnswer::NotHeld },
         )
         .await;
     assert!(denied.is_none());
@@ -243,7 +327,7 @@ async fn a_denied_or_timed_out_acquire_keeps_its_requested_row() {
             GROUP,
             PATH,
             VersionHash(key.version_hash),
-            |_peer, _token| std::future::pending::<bool>(),
+            |_peer, _token| std::future::pending::<ProofAnswer>(),
         )
         .await;
     assert!(timed_out.is_none());
@@ -267,7 +351,7 @@ async fn no_stamp_when_the_peer_lost_its_role_during_the_acquire() {
             VersionHash(key.version_hash),
             |_peer, _token| {
                 state.authority.set_peer_group_full_replica("p", GROUP, false);
-                async { true }
+                async { ProofAnswer::Held }
             },
         )
         .await;
@@ -309,7 +393,13 @@ async fn every_attempt_for_a_hold_carries_the_token_stored_on_its_row() {
                 VersionHash(key.version_hash),
                 |_peer, token| {
                     sent.lock().unwrap().push(token);
-                    async move { answer }
+                    async move {
+                        if answer {
+                            ProofAnswer::Held
+                        } else {
+                            ProofAnswer::NotHeld
+                        }
+                    }
                 },
             )
             .await;
@@ -341,7 +431,7 @@ async fn a_new_attempt_after_a_release_has_a_new_token() {
                 VersionHash(key.version_hash),
                 |_peer, token| {
                     sent.lock().unwrap().push(token);
-                    async { false }
+                    async { ProofAnswer::NotHeld }
                 },
             )
             .await;
@@ -513,7 +603,9 @@ mod provider_local_recovery {
         repo.set_domain_registered(&declared, true).unwrap();
         let record = FileRecord {
             path: PATH.into(),
-            size: data.len() as u64,
+            // The record is consistent (the ledger refuses one that is not); what differs from the
+            // payload is the length it declares.
+            size: u64::from(declared_size),
             mtime_unix_nanos: 0,
             blocks: vec![BlockInfo {
                 hash: hex::decode(&hash).unwrap(),
@@ -595,9 +687,9 @@ async fn a_silent_first_candidate_does_not_spend_the_whole_budget() {
                 let silent = peer == "silent";
                 async move {
                     if silent {
-                        std::future::pending::<bool>().await
+                        std::future::pending::<ProofAnswer>().await
                     } else {
-                        true
+                        ProofAnswer::Held
                     }
                 }
             },
@@ -633,9 +725,9 @@ async fn many_silent_candidates_still_leave_the_last_one_an_attempt() {
                 let silent = peer != "healthy";
                 async move {
                     if silent {
-                        std::future::pending::<bool>().await
+                        std::future::pending::<ProofAnswer>().await
                     } else {
-                        true
+                        ProofAnswer::Held
                     }
                 }
             },
@@ -666,7 +758,7 @@ async fn the_first_candidate_that_grants_ends_the_search() {
             VersionHash(version_of(1)),
             |_peer, _token| {
                 asked.fetch_add(1, Ordering::SeqCst);
-                async { true }
+                async { ProofAnswer::Held }
             },
         )
         .await
@@ -727,7 +819,7 @@ async fn asking_the_existing_holder_again_adds_no_hold() {
             VersionHash(version),
             |peer, token| {
                 asked.lock().unwrap().push((peer.to_string(), token));
-                async { true }
+                async { ProofAnswer::Held }
             },
         )
         .await
@@ -820,7 +912,7 @@ async fn a_lone_slow_candidate_may_use_the_whole_budget() {
             VersionHash(version_of(1)),
             |_peer, _token| async {
                 tokio::time::sleep(Duration::from_secs(8)).await;
-                true
+                ProofAnswer::Held
             },
         )
         .await;
@@ -869,7 +961,7 @@ async fn a_retried_move_reuses_the_replacement_it_took_and_never_asks_a_third_pe
                             VersionHash(version),
                             |peer, _token| {
                                 asked.lock().unwrap().push(peer.to_string());
-                                async { true }
+                                async { ProofAnswer::Held }
                             },
                         )
                         .await

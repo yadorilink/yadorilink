@@ -257,3 +257,16 @@ fn guidance_for_app_and_container_installs_names_their_owner() {
     assert_eq!(manual_update_page("app_bundle"), None);
     assert_eq!(manual_update_page("container"), None);
 }
+
+#[test]
+fn a_bundle_with_the_store_receipt_is_an_app_store_install_and_one_without_is_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = dir.path().join("YadoriLink.app");
+    let exe = bundle.join("Contents/MacOS/yadorilink-daemon");
+    std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    assert_eq!(refine("standalone".into(), &exe, None), "app_bundle");
+    std::fs::create_dir_all(bundle.join("Contents/_MASReceipt")).unwrap();
+    std::fs::write(bundle.join("Contents/_MASReceipt/receipt"), b"r").unwrap();
+    assert_eq!(refine("standalone".into(), &exe, None), "app_store");
+    assert_eq!(manual_update_page("app_store"), None);
+}

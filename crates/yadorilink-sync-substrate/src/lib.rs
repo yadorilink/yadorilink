@@ -32,7 +32,7 @@ pub use address::PeerAddress;
 #[cfg(feature = "test-support")]
 pub use admission::AdmitAnyAuthenticated;
 pub use admission::{AdmitNone, AdmitWhen, PeerAdmission};
-pub use directory::AddressDirectory;
+pub use directory::{is_usable_relay_url, AddressDirectory, ChangeStream};
 pub use error::SubstrateError;
 pub use lane::{Lane, LaneLimits};
 pub use link::{

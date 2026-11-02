@@ -47,6 +47,9 @@ fn spawn_daemon(pipe: String, handoff: PathBuf, requests: Arc<AtomicUsize>, size
     spawn_refusing_daemon(pipe, handoff, requests, size, Arc::new(AtomicI32::new(0)));
 }
 
+/// The `refuse` value of a daemon that takes the request and never answers.
+const SILENT: i32 = -1;
+
 /// Like [`spawn_daemon`], but while `refuse` holds a `MaterializeFailure` number other than 0
 /// every request is answered with that failure instead of bytes.
 fn spawn_refusing_daemon(
@@ -97,6 +100,10 @@ async fn serve_connection(
         };
         let n = requests.fetch_add(1, Ordering::SeqCst) + 1;
         let refusal = refuse.load(Ordering::SeqCst);
+        if refusal == SILENT {
+            // Waiting for a device that is away: no answer, no progress.
+            continue;
+        }
         if refusal != 0 {
             let response = MaterializeToTempResponse {
                 request_id: request.request_id,
@@ -118,6 +125,7 @@ async fn serve_connection(
                     completed: step * 25,
                     total: 100,
                     done: step == 4,
+                    resumed_from: None,
                 });
                 let _ =
                     write_message(&mut stream, &ShellIpcMessage { payload: Some(progress) }).await;
@@ -232,6 +240,131 @@ fn a_provider_item_is_fetched_evicted_and_fetched_again() {
     assert_eq!(requests.load(Ordering::SeqCst), 2);
 
     let _ = std::fs::remove_file(&path);
+    let _ = super::unregister(&root);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Renaming a placeholder that was never read is a namespace operation only: the host sends the
+/// daemon a rename without bytes, and the driver is never asked for the file's content, so the
+/// placeholder stays not downloaded.
+#[test]
+#[ignore = "real Cloud Files state; run on a Windows machine"]
+fn renaming_a_never_read_placeholder_does_not_hydrate_it() {
+    use std::collections::BTreeSet;
+    use yadorilink_ipc_proto::shellipc::{
+        EntryKind, ProviderAppliedItem, ProviderApplyChangeRequest, ProviderApplyChangeResponse,
+        ProviderApplyOutcome,
+    };
+    use yadorilink_windows_provider_policy::namespace_policy::{ShownItem, ShownItems};
+
+    /// A daemon that accepts every rename and records what it was sent.
+    struct Recording(std::sync::Mutex<Vec<ProviderApplyChangeRequest>>);
+    impl crate::provider_authoring::Api for Recording {
+        fn apply(
+            &self,
+            _root: &[u8],
+            request: ProviderApplyChangeRequest,
+        ) -> Option<ProviderApplyChangeResponse> {
+            let item = ProviderAppliedItem {
+                item_id: request.item_id.clone(),
+                parent_item_id: Vec::new(),
+                name: request.name.clone().unwrap_or_default(),
+                entry_kind: EntryKind::File as i32,
+                content_version: request.base_version_hash.clone(),
+                size: SIZE as u64,
+                mtime_unix_nanos: 0,
+                parent_generation: 1,
+                ..Default::default()
+            };
+            self.0.lock().unwrap().push(request);
+            Some(ProviderApplyChangeResponse {
+                ok: true,
+                outcome: ProviderApplyOutcome::Applied as i32,
+                item: Some(item),
+                ..Default::default()
+            })
+        }
+        fn save_shown(&self, _root: &[u8], _shown: &ShownItems) -> bool {
+            true
+        }
+    }
+
+    let _serial = one_at_a_time();
+    let tmp = std::env::temp_dir().join(format!("yl-rename-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let (root, handoff) = (tmp.join("root"), tmp.join("provider").join("handoff"));
+    let (ingest, state) = (tmp.join("ingest"), tmp.join("state"));
+    for dir in [&root, &handoff, &ingest, &state] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let pipe = format!(r"\\.\pipe\yl-rename-test-{}", std::process::id());
+    // SAFETY: this test runs alone (`--test-threads=1`); nothing else reads the environment.
+    unsafe {
+        std::env::set_var("YADORILINK_PROVIDER_TEMP_ROOT", tmp.join("provider"));
+        std::env::set_var("YADORILINK_SHELL_IPC_PIPE", &pipe);
+    }
+    super::FETCHES.lock().unwrap().clear();
+    let requests = Arc::new(AtomicUsize::new(0));
+    spawn_daemon(pipe, handoff.clone(), requests.clone(), SIZE);
+
+    let mut content_version = VERSION.to_vec();
+    content_version.extend_from_slice(&1u64.to_le_bytes());
+    crate::provider_client::set_shown_versions(ROOT_ID, [(ITEM_ID, content_version.as_slice())]);
+    super::register_and_connect_provider(ROOT_ID, &root).expect("register and connect");
+    super::create_item_placeholder(
+        &yadorilink_fs_platform::durable_dir::NoLedger,
+        &root,
+        "before.bin",
+        ITEM_ID,
+        SIZE as u64,
+        0,
+        false,
+    )
+    .expect("the placeholder");
+    let (before, after) = (root.join("before.bin"), root.join("after.bin"));
+    assert!(placeholder_info(&before).unwrap().dehydrated);
+
+    std::fs::rename(&before, &after).unwrap();
+    let renamed = placeholder_info(&after).unwrap();
+    println!("after the rename: {renamed:?}");
+
+    let mut shown: ShownItems = [(
+        ITEM_ID.to_vec(),
+        ShownItem {
+            path: before.clone(),
+            parent_item_id: Vec::new(),
+            name: "before.bin".into(),
+            directory: false,
+            size: SIZE as u64,
+            mtime_unix_nanos: 0,
+            content_version: content_version.clone(),
+            parent_generation: 1,
+        },
+    )]
+    .into();
+    let authoring =
+        crate::provider_authoring::Authoring::open(ROOT_ID, &root, &state).expect("authoring");
+    let local = crate::provider_authoring::WindowsLocal { ingest_dir: ingest.clone() };
+    let api = Recording(Default::default());
+    let signals: BTreeSet<PathBuf> = [before.clone(), after.clone()].into();
+    let report = authoring.process(&signals, &mut shown, &local, &api);
+    println!("report: {report:?}");
+
+    let sent = api.0.lock().unwrap();
+    println!(
+        "daemon fetches: {}, placeholder after the pass: {:?}",
+        requests.load(Ordering::SeqCst),
+        placeholder_info(&after)
+    );
+    assert_eq!(sent.len(), 1, "one Modify for the rename: {report:?}");
+    assert_eq!(sent[0].name.as_deref(), Some("after.bin"));
+    assert!(sent[0].content.is_none(), "a rename must not carry bytes");
+    assert_eq!(requests.load(Ordering::SeqCst), 0, "the driver asked for the file's content");
+    assert!(std::fs::read_dir(&ingest).unwrap().next().is_none(), "bytes were copied");
+    let info = placeholder_info(&after).unwrap();
+    assert!(info.dehydrated, "the rename hydrated the placeholder: {info:?}");
+
+    let _ = std::fs::remove_file(&after);
     let _ = super::unregister(&root);
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -652,6 +785,20 @@ fn refused_read_error(failure: i32) -> std::io::Error {
     error
 }
 
+/// A daemon that does not answer in time (it is still waiting for a device that is away) ends the
+/// read with the same error as one that says the device is unreachable: the reader never sees
+/// which of the two came first (0x80070184 in one run, 0x80070185 in the next).
+#[test]
+#[ignore = "real Cloud Files state; takes the 40 s materialization timeout; run on a Windows machine"]
+fn an_unanswered_fetch_fails_the_read_like_an_unreachable_device() {
+    use yadorilink_ipc_proto::shellipc::MaterializeFailure;
+    let silent = refused_read_error(SILENT);
+    let offline = refused_read_error(MaterializeFailure::Unobtainable as i32);
+    println!("silent: {silent:?}\nunobtainable: {offline:?}");
+    assert_eq!(silent.raw_os_error(), offline.raw_os_error());
+    assert_eq!(silent.raw_os_error(), Some(388));
+}
+
 /// Explorer and applications can tell a full disk from an unreachable device: each refusal ends
 /// the read with its own error, not one generic cloud-file failure.
 #[test]
@@ -672,7 +819,9 @@ fn a_refused_fetch_fails_the_read_with_the_reason() {
             assert_ne!(a, b, "{codes:?}");
         }
     }
-    // ERROR_CLOUD_FILE_INSUFFICIENT_RESOURCES, ..._NETWORK_UNAVAILABLE, ..._UNSUCCESSFUL, and
+    // ERROR_CLOUD_FILE_INSUFFICIENT_RESOURCES (the code a full disk gets: the driver turns any
+    // status outside its own STATUS_CLOUD_FILE_* set, STATUS_DISK_FULL included, into
+    // ..._UNSUCCESSFUL), ..._NETWORK_UNAVAILABLE, ..._UNSUCCESSFUL, and
     // ..._NOT_IN_SYNC for a version that is no longer available.
     let not_in_sync = windows::Win32::Foundation::ERROR_CLOUD_FILE_NOT_IN_SYNC.0 as i32;
     assert_eq!(codes, [Some(387), Some(388), Some(389), Some(not_in_sync)]);

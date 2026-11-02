@@ -5,9 +5,11 @@ use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPaylo
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 pub use yadorilink_ipc_proto::daemonctl::RetryDirection;
 use yadorilink_ipc_proto::daemonctl::{
-    CancelTransferRequest, InboxTransfer, ListInboxRequest, ListSentTransfersRequest,
-    ReceiveTransferRequest, ReceiveTransferResponse, RetryTransferRequest, SendFileRequest,
-    SendFileResponse, SentTransferEntry,
+    CancelSendLinkRequest, CancelTransferRequest, CreateSendLinkRequest, CreateSendLinkResponse,
+    InboxTransfer, ListInboxRequest, ListSentTransfersRequest, PreviewSendLinkRequest,
+    PreviewSendLinkResponse, ReceiveTransferRequest, ReceiveTransferResponse,
+    RedeemSendLinkRequest, RedeemSendLinkResponse, RetryTransferRequest, SendFileRequest,
+    SendFileResponse, SendLinkStatusRequest, SendLinkStatusResponse, SentTransferEntry,
 };
 
 use crate::daemon::control;
@@ -18,17 +20,102 @@ fn unexpected() -> CoreError {
     CoreError::Other("unexpected daemon response".into())
 }
 
+fn absolute_all(paths_in: &[String]) -> Result<Vec<String>, CoreError> {
+    paths_in.iter().map(|path| paths::absolute_path(path)).collect()
+}
+
 /// Offers a file or directory to another device on this account.
 pub async fn send_file(
     source_path: String,
     target_device: String,
 ) -> Result<SendFileResponse, CoreError> {
+    send_files(vec![source_path], target_device).await
+}
+
+/// Offers several files and/or folders as one transfer to another device (or a `link:<id>`).
+pub async fn send_files(
+    source_paths: Vec<String>,
+    target_device: String,
+) -> Result<SendFileResponse, CoreError> {
+    if source_paths.is_empty() {
+        return Err(CoreError::Other("name at least one file or folder to send".into()));
+    }
     // The daemon's working directory is not the user's, so it must never see
     // a relative path.
-    let source_path = paths::absolute_path(&source_path)?;
-    let resp =
-        control::send(ReqPayload::SendFile(SendFileRequest { source_path, target_device })).await?;
+    let source_paths = absolute_all(&source_paths)?;
+    let resp = control::send(ReqPayload::SendFile(SendFileRequest { source_paths, target_device }))
+        .await?;
     let Some(RespPayload::SendFile(result)) = resp.payload else {
+        return Err(unexpected());
+    };
+    Ok(result)
+}
+
+/// Mints a one-use expiring Send link for a recipient on any account.
+/// `ttl_seconds` 0 = the service default.
+///
+/// `source_paths` are the files and folders the link will carry, so the recipient can see their
+/// names and sizes (all of them, with the total) before redeeming; empty shows nothing.
+pub async fn create_send_link(
+    ttl_seconds: u32,
+    source_paths: Vec<String>,
+) -> Result<CreateSendLinkResponse, CoreError> {
+    let source_paths = absolute_all(&source_paths)?;
+    let resp = control::send(ReqPayload::CreateSendLink(CreateSendLinkRequest {
+        ttl_seconds,
+        source_paths,
+    }))
+    .await?;
+    let Some(RespPayload::CreateSendLink(result)) = resp.payload else {
+        return Err(unexpected());
+    };
+    Ok(result)
+}
+
+/// Who sends the link a code names and what it carries, without redeeming or consuming it.
+/// Needs a sign-in; every link that is not open is refused alike.
+pub async fn preview_send_link(code: String) -> Result<PreviewSendLinkResponse, CoreError> {
+    let resp = control::send(ReqPayload::PreviewSendLink(PreviewSendLinkRequest { code })).await?;
+    let Some(RespPayload::PreviewSendLink(result)) = resp.payload else {
+        return Err(unexpected());
+    };
+    Ok(result)
+}
+
+/// Redeems a Send link code with one of this account's devices (`None` = this device);
+/// returns the link id and where the files will land. The engine receives the offer that arrives under the link into
+/// `destination_dir` (absolute; `None` = a folder of its own choosing) without another step.
+pub async fn redeem_send_link(
+    code: String,
+    receiver_device_id: Option<String>,
+    destination_dir: Option<String>,
+) -> Result<RedeemSendLinkResponse, CoreError> {
+    let resp = control::send(ReqPayload::RedeemSendLink(RedeemSendLinkRequest {
+        code,
+        receiver_device_id: receiver_device_id.unwrap_or_default(),
+        destination_dir: destination_dir.unwrap_or_default(),
+    }))
+    .await?;
+    let Some(RespPayload::RedeemSendLink(result)) = resp.payload else {
+        return Err(unexpected());
+    };
+    Ok(result)
+}
+
+/// Cancels a Send link; a grant it already issued but nobody used is revoked with it.
+pub async fn cancel_send_link(link_id: String) -> Result<(), CoreError> {
+    let resp = control::send(ReqPayload::CancelSendLink(CancelSendLinkRequest { link_id })).await?;
+    let Some(RespPayload::CancelSendLink(_)) = resp.payload else {
+        return Err(unexpected());
+    };
+    Ok(())
+}
+
+/// The sender's view of a Send link it created: waiting, redeemed, transferring, done, cancelled,
+/// expired or interrupted.
+pub async fn send_link_status(link_id: String) -> Result<SendLinkStatusResponse, CoreError> {
+    let resp = control::send(ReqPayload::SendLinkStatus(SendLinkStatusRequest { link_id })).await?;
+    let Some(RespPayload::SendLinkStatus(result)) = resp.payload else {
         return Err(unexpected());
     };
     Ok(result)

@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 
 use support::{real_entry_names, wait_until_with_context};
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
-use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_storage::SegmentBlockStore;
 
@@ -46,7 +45,7 @@ async fn many_small_files_survive_initial_sync_and_incremental_update() {
     let store_dir_a = tempfile::tempdir().unwrap();
     let store_a = Arc::new(SegmentBlockStore::new(store_dir_a.path()).unwrap());
     let sync_state_a = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
-    let state_a = DaemonState::new(device_a_id.clone(), sync_state_a, store_a);
+    let state_a = support::fast_daemon_state(device_a_id.clone(), sync_state_a, store_a);
     // Give the device a change-signing key before its link watch starts, so
     // the change-DAG emitter is wired and local edits actually propagate.
     support::ensure_device_signing_key(&state_a);
@@ -55,7 +54,7 @@ async fn many_small_files_survive_initial_sync_and_incremental_update() {
     let store_dir_b = tempfile::tempdir().unwrap();
     let store_b = Arc::new(SegmentBlockStore::new(store_dir_b.path()).unwrap());
     let sync_state_b = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
-    let state_b = DaemonState::new(device_b_id.clone(), sync_state_b, store_b);
+    let state_b = support::fast_daemon_state(device_b_id.clone(), sync_state_b, store_b);
     support::ensure_device_signing_key(&state_b);
     let root_b = tempfile::tempdir().unwrap();
 

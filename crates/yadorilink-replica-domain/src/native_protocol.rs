@@ -10,7 +10,7 @@
 use crate::codec::ChangeError;
 
 /// The generation byte closing every native domain tag.
-pub const NATIVE_PROTOCOL_GENERATION: u8 = 9;
+pub const NATIVE_PROTOCOL_GENERATION: u8 = 10;
 
 /// The length of the kind prefix of a native domain tag.
 pub const NATIVE_TAG_PREFIX_LEN: usize = 7;

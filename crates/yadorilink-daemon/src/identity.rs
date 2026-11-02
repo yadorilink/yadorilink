@@ -171,7 +171,27 @@ impl RuntimeIdentity {
             self.owner,
             &self.install_source,
         ) {
-            StartVerdict::Proceed => self.refresh_release(config_dir),
+            StartVerdict::Proceed => {
+                if let RecordState::Present(recorded) = ownership::read(config_dir) {
+                    // A Store package of another family is another installation with its own updater.
+                    let mine = self.install_root.display().to_string();
+                    if let (Some(a), Some(b)) = (
+                        ownership::store_package_family(&recorded.install_root),
+                        ownership::store_package_family(&mine),
+                    ) {
+                        if a != b {
+                            return Err(OwnershipRefused(
+                                Refusal::InstallSourceMismatch {
+                                    recorded: Box::new(recorded),
+                                    mine: self.install_source.clone(),
+                                },
+                                config_dir.to_path_buf(),
+                            ));
+                        }
+                    }
+                }
+                self.refresh_release(config_dir)
+            }
             StartVerdict::Refuse(refusal) => {
                 Err(OwnershipRefused(refusal, config_dir.to_path_buf()))
             }
@@ -189,9 +209,10 @@ impl RuntimeIdentity {
     }
 
     /// The recorded installation is this one and may start; its record says which release it was
-    /// when it was recorded. A self-updating install moves past that release, so the daemon that
-    /// now holds the lock (the descriptor was checked above, the record names its installation)
-    /// states its own release in the record, atomically and keeping everything else, so that
+    /// when it was recorded. A self-updating install moves past that release (and a Store
+    /// package of the same family to another directory), so the daemon that now holds the lock
+    /// (the descriptor was checked above, the record names its installation) states its own
+    /// release, and that install root, in the record, atomically and keeping everything else, so that
     /// `doctor` can compare the record with the running daemon. A hand-off journal in the config
     /// directory means the record belongs to that hand-off: it is left alone. If the record cannot
     /// be rewritten the start is refused, as for a first record.
@@ -203,10 +224,22 @@ impl RuntimeIdentity {
             return Ok(());
         };
         let release_id = self.release_id();
-        if record.release_id == release_id {
+        let install_root = self.install_root.display().to_string();
+        // The root follows an update only when the program proves it is the same installation:
+        // a Store package of the same family (the folder carries the version). Any other
+        // install, however alike, stays what was recorded: the hand-off finds the previous
+        // daemon and the uninstaller checks the install tree by this path, and a second install
+        // must not take them over.
+        let moves_root = record.install_root != install_root
+            && record.install_source == "microsoft_store"
+            && ownership::is_same_store_package(&record.install_root, &install_root);
+        if record.release_id == release_id && !moves_root {
             return Ok(());
         }
         record.release_id = release_id;
+        if moves_root {
+            record.install_root = install_root;
+        }
         record.written_at = now_unix();
         ownership::write(config_dir, &record).map_err(|e| {
             OwnershipRefused(
@@ -250,6 +283,11 @@ impl RuntimeIdentity {
             ownership_detail: detail,
             pid: self.pid,
             started_at_unix: self.started_at_unix,
+            data_dir: self
+                .config_dir
+                .as_deref()
+                .map(|d| d.display().to_string())
+                .unwrap_or_default(),
         }
     }
 }

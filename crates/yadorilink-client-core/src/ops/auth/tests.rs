@@ -723,3 +723,318 @@ async fn login_on_an_enrolled_installation_whose_token_endpoint_is_down_reports_
     let error = login_in(dir.path(), &settings, true, |_| {}).await.expect_err("an error");
     assert!(matches!(error, CoreError::CoordinationPlaneUnreachable(_)), "{error:?}");
 }
+
+// ---- sign-in with a pairing code ------------------------------------------------------------
+
+mod pairing {
+    use std::sync::{Arc, Mutex};
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    use super::*;
+    use crate::error::DesktopError;
+
+    const CLIENT_ID: &str = "ylk-PAIREDPAIREDPAIREDAA";
+
+    /// What the mock service saw, for the assertions.
+    #[derive(Default)]
+    struct Seen {
+        start_bodies: Vec<serde_json::Value>,
+        par_state: Option<String>,
+        par_redirect: Option<String>,
+    }
+
+    /// Where the resumed authorization request ends.
+    #[derive(Clone, Copy)]
+    enum Ends {
+        /// At the registered redirect URI, with the pushed state.
+        Redirect,
+        /// At the identity provider: the pairing handoff ran out.
+        IdentityProvider,
+        /// At the registered redirect URI with another login's state.
+        WrongState,
+    }
+
+    /// A service that answers the pairing flow end to end: discovery, `/bootstrap/start` and
+    /// `/bootstrap/poll`, the pushed request, an authorization endpoint that redirects through
+    /// an interaction page which only answers a request carrying its cookie, and the token
+    /// endpoint.
+    async fn service(start: ResponseTemplate, ends: Ends) -> (MockServer, Arc<Mutex<Seen>>) {
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        let seen = Arc::new(Mutex::new(Seen::default()));
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/auth"),
+                "token_endpoint": format!("{issuer}/token"),
+                "pushed_authorization_request_endpoint": format!("{issuer}/request"),
+                "require_pushed_authorization_requests": true,
+                "code_challenge_methods_supported": ["S256"],
+                "token_endpoint_auth_methods_supported": ["private_key_jwt"],
+                "token_endpoint_auth_signing_alg_values_supported": ["ES256"],
+                "dpop_signing_alg_values_supported": ["ES256"],
+                "grant_types_supported": ["authorization_code", "refresh_token"],
+            })))
+            .mount(&server)
+            .await;
+
+        let recorder = seen.clone();
+        Mock::given(method("POST"))
+            .and(path("/bootstrap/start"))
+            .respond_with(move |request: &Request| {
+                recorder
+                    .lock()
+                    .expect("lock")
+                    .start_bodies
+                    .push(request.body_json().expect("JSON"));
+                start.clone()
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/bootstrap/poll"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "client_id": CLIENT_ID })),
+            )
+            .mount(&server)
+            .await;
+
+        let recorder = seen.clone();
+        Mock::given(method("POST"))
+            .and(path("/request"))
+            .respond_with(move |request: &Request| {
+                let form: std::collections::HashMap<String, String> =
+                    url::form_urlencoded::parse(&request.body).into_owned().collect();
+                let mut seen = recorder.lock().expect("lock");
+                seen.par_state = form.get("state").cloned();
+                seen.par_redirect = form.get("redirect_uri").cloned();
+                ResponseTemplate::new(201).set_body_json(
+                    serde_json::json!({ "request_uri": "urn:par:1", "expires_in": 60 }),
+                )
+            })
+            .mount(&server)
+            .await;
+
+        // authorize -> interaction (cookie set) -> resume (cookie required) -> the end.
+        Mock::given(method("GET"))
+            .and(path("/auth"))
+            .respond_with(
+                ResponseTemplate::new(303)
+                    .insert_header("location", format!("{issuer}/interaction/u1").as_str())
+                    .insert_header("set-cookie", "_interaction=abc; path=/interaction; httponly"),
+            )
+            .mount(&server)
+            .await;
+        let target = issuer.clone();
+        Mock::given(method("GET"))
+            .and(path("/interaction/u1"))
+            .respond_with(move |request: &Request| {
+                if request.headers.get("cookie").and_then(|c| c.to_str().ok())
+                    == Some("_interaction=abc")
+                {
+                    ResponseTemplate::new(303)
+                        .insert_header("location", format!("{target}/resume").as_str())
+                } else {
+                    ResponseTemplate::new(400)
+                }
+            })
+            .mount(&server)
+            .await;
+        let recorder = seen.clone();
+        let issuer_for_end = issuer.clone();
+        Mock::given(method("GET"))
+            .and(path("/resume"))
+            .respond_with(move |_: &Request| {
+                let seen = recorder.lock().expect("lock");
+                let redirect = seen.par_redirect.clone().expect("a pushed request came first");
+                let state = seen.par_state.clone().expect("a state");
+                let location = match ends {
+                    Ends::Redirect => format!(
+                        "{redirect}?code=the-code&state={state}&iss={}",
+                        url::form_urlencoded::byte_serialize(issuer_for_end.as_bytes())
+                            .collect::<String>()
+                    ),
+                    Ends::WrongState => format!(
+                        "{redirect}?code=the-code&state=another&iss={}",
+                        url::form_urlencoded::byte_serialize(issuer_for_end.as_bytes())
+                            .collect::<String>()
+                    ),
+                    Ends::IdentityProvider => {
+                        "https://accounts.google.com/o/oauth2/v2/auth?state=secret".to_owned()
+                    }
+                };
+                ResponseTemplate::new(303).insert_header("location", location.as_str())
+            })
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at-paired", "token_type": "DPoP", "expires_in": 300,
+                "refresh_token": "rt-paired", "scope": "openid offline_access",
+            })))
+            .mount(&server)
+            .await;
+        (server, seen)
+    }
+
+    fn started() -> ResponseTemplate {
+        ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "bootstrap_handle": "h".repeat(64), "expires_in": 600, "poll_interval_seconds": 5,
+        }))
+    }
+
+    fn settings_for(
+        dir: &std::path::Path,
+        server: &MockServer,
+    ) -> credential_store::CredentialSettings {
+        credential_store::CredentialSettings {
+            backend: yadorilink_fapi_client::store::Backend::File(dir.join("credentials.json")),
+            key_mirror: yadorilink_transport::KeyMirror::Disabled,
+            auth_server_addr: None,
+            coordination_addr: Some(server.uri()),
+            host_name: Some("nas".to_owned()),
+        }
+    }
+
+    fn code() -> PairingCode {
+        PairingCode::parse("bcdf ghjk lmnp").expect("a code")
+    }
+
+    #[tokio::test]
+    async fn a_code_enrols_and_signs_in_with_no_browser_and_two_events() {
+        let (server, seen) = service(started(), Ends::Redirect).await;
+        let dir = tempfile::tempdir().expect("dir");
+        let settings = settings_for(dir.path(), &server);
+
+        let mut events = Vec::new();
+        login_with_pairing_code_in(dir.path(), &settings, code(), |e| events.push(e))
+            .await
+            .expect("signed in");
+
+        assert_eq!(
+            events,
+            vec![LoginEvent::Enrolling, LoginEvent::SignedIn { client_id: CLIENT_ID.to_owned() }]
+        );
+        let stored = credential_store::installation_in(dir.path(), &settings)
+            .expect("store")
+            .expect("enrolled");
+        assert_eq!(stored.client_id(), CLIENT_ID);
+        assert_eq!(stored.refresh_token(), "rt-paired");
+        assert_eq!(stored.issuer(), server.uri());
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen.start_bodies.len(), 1);
+        assert_eq!(seen.start_bodies[0]["pairing_code"], "BCDFGHJKLMNP");
+    }
+
+    #[tokio::test]
+    async fn a_refused_code_is_the_typed_refusal_and_stores_nothing() {
+        let refused = ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": "invalid_grant", "error_description": "the pairing code is invalid or has expired",
+        }));
+        let (server, _) = service(refused, Ends::Redirect).await;
+        let dir = tempfile::tempdir().expect("dir");
+        let settings = settings_for(dir.path(), &server);
+
+        let mut events = Vec::new();
+        let error = login_with_pairing_code_in(dir.path(), &settings, code(), |e| events.push(e))
+            .await
+            .expect_err("refused");
+
+        assert!(matches!(error, CoreError::PairingCodeRefused), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "The code is invalid, expired or already used: create a new code on the web page"
+        );
+        assert!(!error.to_string().contains("BCDF"));
+        assert!(credential_store::installation_in(dir.path(), &settings).expect("store").is_none());
+        assert_eq!(events, vec![LoginEvent::Enrolling]);
+        let desktop = DesktopError::from(error);
+        assert!(matches!(
+            desktop,
+            DesktopError::Refused { reason: crate::error::RefusalReason::PairingCodeInvalid, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_abuse_budget_is_a_rate_limit_that_names_the_wait() {
+        let limited = ResponseTemplate::new(429)
+            .insert_header("retry-after", "42")
+            .set_body_json(serde_json::json!({ "error": "rate_limited" }));
+        let (server, _) = service(limited, Ends::Redirect).await;
+        let dir = tempfile::tempdir().expect("dir");
+        let settings = settings_for(dir.path(), &server);
+
+        let error = login_with_pairing_code_in(dir.path(), &settings, code(), |_| {})
+            .await
+            .expect_err("limited");
+
+        let CoreError::LimitExceeded { message, kind: crate::error::LimitKind::RateLimited } =
+            &error
+        else {
+            panic!("a rate limit, got {error:?}")
+        };
+        assert!(message.contains("42 seconds"), "{message}");
+        assert!(matches!(
+            DesktopError::from(error),
+            DesktopError::Network { kind: crate::error::NetworkErrorKind::RateLimited, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_handoff_that_ran_out_sends_the_sign_in_to_the_identity_provider_and_writes_nothing()
+    {
+        let (server, _) = service(started(), Ends::IdentityProvider).await;
+        let dir = tempfile::tempdir().expect("dir");
+        let settings = settings_for(dir.path(), &server);
+
+        let error = login_with_pairing_code_in(dir.path(), &settings, code(), |_| {})
+            .await
+            .expect_err("needs a browser");
+
+        let CoreError::AuthFailed(message) = &error else { panic!("{error:?}") };
+        assert!(message.contains("create a new code"), "{message}");
+        assert!(message.contains("accounts.google.com"), "{message}");
+        assert!(!message.contains("secret"), "the address' state must not be reported: {message}");
+        assert!(credential_store::installation_in(dir.path(), &settings).expect("store").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_redirect_with_another_logins_state_is_refused() {
+        let (server, _) = service(started(), Ends::WrongState).await;
+        let dir = tempfile::tempdir().expect("dir");
+        let settings = settings_for(dir.path(), &server);
+
+        let error = login_with_pairing_code_in(dir.path(), &settings, code(), |_| {})
+            .await
+            .expect_err("state mismatch");
+
+        assert!(matches!(error, CoreError::AuthFailed(_)), "{error:?}");
+        assert!(credential_store::installation_in(dir.path(), &settings).expect("store").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_enrolled_installation_refuses_before_the_code_is_sent() {
+        let (server, seen) = service(started(), Ends::Redirect).await;
+        let dir = tempfile::tempdir().expect("dir");
+        let settings = settings_for(dir.path(), &server);
+        login_with_pairing_code_in(dir.path(), &settings, code(), |_| {}).await.expect("first");
+
+        let error = login_with_pairing_code_in(dir.path(), &settings, code(), |_| {})
+            .await
+            .expect_err("already enrolled");
+
+        assert_eq!(error.hint(), Some(Hint::AlreadyEnrolled));
+        assert_eq!(
+            seen.lock().expect("lock").start_bodies.len(),
+            1,
+            "the second code was not sent"
+        );
+    }
+}

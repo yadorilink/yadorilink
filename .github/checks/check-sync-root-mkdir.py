@@ -63,9 +63,9 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     # The block store's own directories (`create_dir_all_durably`: the store
     # root and its `segments/` directory, never inside a sync root).
     C + "yadorilink-local-storage/src/fs_ops.rs": {"create_dir_all": 2},
-    # The case-sensitivity probe: the root itself, and a probe directory in
-    # the root's reserved namespace, removed again at once.
-    C + "yadorilink-peer-session/src/hazard.rs": {"create_dir": 1, "create_dir_all": 2},
+    # The case-sensitivity probes: the root itself (once per probe entry point),
+    # and a probe directory in the root's reserved namespace, removed again at once.
+    C + "yadorilink-peer-session/src/hazard.rs": {"create_dir": 1, "create_dir_all": 3},
     # Config, state, socket, update and report directories.
     C + "yadorilink-cli/src/commands/diagnose.rs": {"create_dir_all": 1},
     C + "yadorilink-client-core/src/facade/settings.rs": {"create_dir_all": 1},
@@ -73,6 +73,8 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     C + "yadorilink-daemon/src/governance_config.rs": {"create_dir_all": 1},
     C + "yadorilink-daemon/src/peer_orchestrator.rs": {"create_dir_all": 1},
     C + "yadorilink-daemon/src/shell_ipc.rs": {"create_dir_all": 1},
+    C + "yadorilink-daemon/src/send_transfer/link_book.rs": {"create_dir_all": 1},
+    C + "yadorilink-daemon/src/send_transfer/redeem_book.rs": {"create_dir_all": 1},
     C + "yadorilink-daemon/src/space_management_config.rs": {"create_dir_all": 1},
     C + "yadorilink-daemon/src/update/policy.rs": {"create_dir_all": 1},
     C + "yadorilink-http-api/src/token.rs": {"create_dir_all": 2},

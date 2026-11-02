@@ -146,6 +146,8 @@ pub(super) struct Scenario {
     /// The power goes again during the first repair, after it rebuilt files (its
     /// own durable write) and before its database commit lands.
     pub(super) second_cut: bool,
+    /// The received files are zero bytes long: no blocks, nothing for repair to compare.
+    pub(super) empty: bool,
 }
 
 impl Scenario {
@@ -251,7 +253,11 @@ async fn publish_generation(
     let mut ops = Vec::new();
     for file in 0..scenario.files {
         let name = scenario.name(file);
-        let content = format!("{generation} content of {name}, long enough to tear").into_bytes();
+        let content = if scenario.empty {
+            Vec::new()
+        } else {
+            format!("{generation} content of {name}, long enough to tear").into_bytes()
+        };
         let tag = format!("{generation}-{file}");
         let version = source(h, &tag, &content).await;
         // The scratch name only mints the version. Left live, it is a second holder of
@@ -444,12 +450,17 @@ impl Run {
                         self.lose_temp_files();
                     }
                 }
-                _ => apply_cut(
-                    &path,
-                    &self.new[&name],
-                    self.old.get(&name).map(|b| &b[..]),
-                    self.scenario.cuts[file],
-                ),
+                _ => {
+                    let cut = self.scenario.cuts[file];
+                    let old = self.old.get(&name).map(|b| &b[..]);
+                    // A new name whose rename was lost is missing with its witnessed temp still
+                    // there: the temp's directory entry was flushed before the rename.
+                    if old.is_none() && matches!(cut, Cut::Missing | Cut::Old) && path.exists() {
+                        super::receive_deferred_flush_tests::lose_the_rename(&self.h, &name);
+                    } else {
+                        apply_cut(&path, &self.new[&name], old, cut);
+                    }
+                }
             }
         }
     }
@@ -539,7 +550,7 @@ fn check(run: &Run, phase: &str) -> Result<(), String> {
             }
             return Err(format!("{phase}: stray file {name}"));
         }
-        if bytes.is_empty() {
+        if bytes.is_empty() && !s.empty {
             return Err(format!("{phase}: {name} is an empty file"));
         }
     }
@@ -628,6 +639,7 @@ fn base(files: usize, stage: Stage, barrier: Barrier) -> Scenario {
         user_edit: UserEdit::None,
         gc: false,
         second_cut: false,
+        empty: false,
     }
 }
 
@@ -646,6 +658,23 @@ async fn gate_cut_before_the_rename_resumes_the_receive() {
             s.prior = prior;
             s.cuts = vec![cut; 2];
             expect_ok(s).await;
+        }
+    }
+}
+
+/// A zero-byte file has no blocks, so startup repair has no content to compare; its directory
+/// entry lost between the rename and the barrier must still be recreated and its intent cleared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gate_a_zero_byte_file_lost_between_the_rename_and_the_barrier_is_recreated() {
+    for barrier in [Barrier::CutInFiles, Barrier::CutBeforeDirFlush] {
+        for cut in [Cut::Missing, Cut::New, Cut::Zero] {
+            let mut s = base(2, Stage::Committed, barrier);
+            s.empty = true;
+            s.flushed = vec![barrier == Barrier::CutBeforeDirFlush; 2];
+            s.cuts = vec![cut; 2];
+            if s.durable(0).allowed().contains(&cut) {
+                expect_ok(s).await;
+            }
         }
     }
 }
@@ -777,6 +806,7 @@ fn every_scenario(files: usize, prior: bool, extras: bool) -> Vec<Scenario> {
         user_edit: UserEdit::None,
         gc: false,
         second_cut: false,
+        empty: false,
     };
     let mut skeletons = Vec::new();
     for stage in [Stage::BeforeRename, Stage::BeforeCommit] {
@@ -913,6 +943,7 @@ fn scenario_of_seed(seed: u64) -> Scenario {
         user_edit: UserEdit::None,
         gc: false,
         second_cut: false,
+        empty: false,
     };
     scenario.cuts = (0..files)
         .map(|f| {

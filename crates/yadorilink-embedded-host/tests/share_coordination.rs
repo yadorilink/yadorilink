@@ -280,7 +280,7 @@ fn creating_a_provider_share_prepares_activates_and_a_retry_changes_nothing() {
         Command::CreateShare(CreateShare {
             group_name: "Photos".into(),
             folder: provider("Photos", "token-1"),
-            on_demand: true,
+            on_demand: false,
             acknowledge_risks: false,
         })
     };

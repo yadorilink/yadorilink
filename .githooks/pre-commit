@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Formatting check on the Rust files staged for this commit; takes a second or two.
+# Enable once per clone: git config core.hooksPath .githooks
+# Skipping it (git commit --no-verify) is for emergencies only: CI runs the same check.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+export PATH="$HOME/.cargo/bin:$PATH"
+
+staged=()
+while IFS= read -r -d '' f; do staged+=("$f"); done \
+  < <(git diff --cached --name-only --diff-filter=ACM -z -- '*.rs')
+[ "${#staged[@]}" -eq 0 ] && exit 0
+
+# Judges the staged content, not the working tree: a file edited after `git add` is checked as
+# committed. rustfmt reads it from stdin (which does not follow `mod` declarations into files that
+# are not staged) and takes its settings from the repository's rustfmt configuration.
+status=0
+for f in "${staged[@]}"; do
+  # `rustfmt --check` exits 0 on stdin even when it would change something, so compare its output.
+  staged_text="$(git show ":$f")"
+  if ! formatted="$(printf '%s\n' "$staged_text" | rustfmt --edition 2021 --emit stdout 2>/dev/null)" \
+     || [ "$formatted" != "$staged_text" ]; then
+    echo "pre-commit: $f is not formatted as rustfmt would (staged content)." >&2
+    status=1
+  fi
+done
+[ "$status" -eq 0 ] || echo "pre-commit: run cargo fmt, git add the files, and commit again." >&2
+exit "$status"

@@ -322,10 +322,9 @@ fn put_real_version(c: &Connection, mtime: i64) -> yadorilink_replica_domain::fi
         0,
         FileMeta {
             mtime_unix_nanos: mtime,
-            unix_mode: None,
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     );
     crate::dag_store::put_file_version(c, "g", &version).unwrap();
@@ -411,10 +410,9 @@ fn a_version_too_large_to_send_is_refused_by_the_store() {
         .collect();
     let meta = FileMeta {
         mtime_unix_nanos: 1,
-        unix_mode: None,
+        exec: false,
         symlink_target: None,
         record_kind: RecordKind::File,
-        xattrs: Vec::new(),
     };
     let version = FileVersion::new(blocks, count as u64, meta);
     let c = conn();

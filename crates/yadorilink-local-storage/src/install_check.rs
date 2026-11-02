@@ -64,6 +64,9 @@ pub struct Facts<'a> {
     /// The descriptor of the program running this check, or why it cannot be trusted.
     pub local: &'a Result<ReleaseDescriptor, DescriptorProblem>,
     pub roots: &'a Roots,
+    /// Every distinct `yadorilink` program found on the search path, in search order, each the
+    /// real file behind any links. The caller reads the path; this module only judges the list.
+    pub path_copies: &'a [std::path::PathBuf],
 }
 
 /// The `check` name of the rows about OS service registrations.
@@ -114,10 +117,42 @@ fn stale_release_row(
     })
 }
 
+/// The `check` name of the row about more than one copy of the command on the search path.
+pub const CHECK_DUPLICATES: &str = "duplicate installs";
+
+/// One row about the copies of `yadorilink` on the search path: a second installation (a package
+/// manager's, `cargo install`'s, an app's) is shadowed by the first, or shadows it, and updates
+/// and uninstalls then act on the one that is not the one being run.
+fn duplicates_row(copies: &[std::path::PathBuf]) -> Option<Finding> {
+    match copies {
+        [] => None,
+        [only] => Some(finding(
+            Severity::Ok,
+            CHECK_DUPLICATES,
+            format!("one yadorilink on the search path: {}", only.display()),
+        )),
+        [first, others @ ..] => Some(finding(
+            Severity::Warn,
+            CHECK_DUPLICATES,
+            format!(
+                "{} is the yadorilink that runs when you type `yadorilink`; {} more on the search \
+                 path: {}. Updates and uninstalls of the others do not change the one that runs. \
+                 Fix: remove the copies you do not use with the tool that installed them \
+                 (`yadorilink uninstall` for a script install, your package manager's remove \
+                 command otherwise)",
+                first.display(),
+                others.len(),
+                others.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+            ),
+        )),
+    }
+}
+
 /// Runs every check. Read-only.
 #[must_use]
 pub fn check(facts: &Facts<'_>) -> Vec<Finding> {
     let mut rows = Vec::new();
+    rows.extend(duplicates_row(facts.path_copies));
     let record_path = facts.config_dir.join(ownership::FILE_NAME);
 
     rows.push(match facts.lock {

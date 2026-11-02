@@ -50,9 +50,9 @@ use sha2::{Digest, Sha256};
 use yadorilink_fs_platform::fs_identity::{FileIdentity, ObjectKind};
 use yadorilink_fs_platform::reserved_namespace::{artefact_component_name, ArtefactKind};
 use yadorilink_local_storage::{
-    apply_unix_mode, create_dir_all_never_through_a_symlink, create_explicit_directory,
-    intent_target_hash, remove_empty_dir_in, verify_write_target_within_root,
-    EmptyDirectoryRemoval, ExplicitDirectoryCreation, StructuralDirectoryLedger,
+    create_dir_all_never_through_a_symlink, create_explicit_directory, intent_target_hash,
+    remove_empty_dir_in, verify_write_target_within_root, EmptyDirectoryRemoval,
+    ExplicitDirectoryCreation, StructuralDirectoryLedger,
 };
 use yadorilink_replica_domain::conflict::conflict_copy_path;
 use yadorilink_replica_domain::file::RecordKind;
@@ -386,7 +386,6 @@ fn place_installed_directory(
         &canonical_root,
         &GroupStructuralLedger::new(state, group_id),
     )?;
-    apply_unix_mode(out_path, installed.unix_mode)?;
     reached(ReconcileStepForTest::DirectoryPlaced, out_path);
     // The settle below clears the intent; dropping the guard uncleared is
     // inert.

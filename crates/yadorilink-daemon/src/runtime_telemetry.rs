@@ -62,6 +62,10 @@ pub struct RuntimeTelemetry {
     unreadable_files: std::sync::Arc<yadorilink_local_capture::unreadable::UnreadableFileLedger>,
     /// Delta admission outcomes and bytes/messages served to peers, for `/metrics`.
     replication: std::sync::Arc<crate::native_replication_driver::ReplicationCounters>,
+    /// How many state-changing requests have finished, on every entry point (control socket,
+    /// embedded host, shell IPC). A status request waits for facts built after the epoch it
+    /// saw on arrival, so the answer shows a command that returned before it.
+    command_epoch: tokio::sync::watch::Sender<u64>,
 }
 
 impl RuntimeTelemetry {
@@ -74,7 +78,17 @@ impl RuntimeTelemetry {
             recent_errors: crate::recent_errors::RecentErrorLog::new(),
             unreadable_files: std::sync::Arc::default(),
             replication: std::sync::Arc::default(),
+            command_epoch: tokio::sync::watch::channel(0).0,
         }
+    }
+
+    /// Records that a state-changing request has finished.
+    pub fn command_completed(&self) {
+        self.command_epoch.send_modify(|epoch| *epoch += 1);
+    }
+
+    pub fn command_epoch(&self) -> u64 {
+        *self.command_epoch.borrow()
     }
 
     pub fn replication_counters(

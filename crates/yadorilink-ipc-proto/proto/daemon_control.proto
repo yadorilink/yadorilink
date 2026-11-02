@@ -257,6 +257,29 @@ message LinkStatus {
   // and must never be matched by text. The overall-status rollup reports each cause under its own
   // code (`<DegradedCause key>:<group>`). Additive; unspecified from an older daemon.
   DegradedCause degraded_cause = 55;
+  // Set when this folder exists but the account the daemon runs as cannot write it (for example
+  // a NAS bind mount owned by another uid): names the path, the daemon's uid/gid and the
+  // operating system's remedy. Empty when the folder is writable. Re-probed on every status read.
+  string root_access_warning = 56;
+  // Bytes of the content of this folder's live regular files, from the local index (what the
+  // folder holds, whether or not each file is on this disk). Absent on a daemon that predates the
+  // field (0 is a real value: an empty folder).
+  optional uint64 total_bytes = 57;
+  // Of `total_bytes`, the bytes of files held only as online-only placeholders on this device
+  // (not fetched). Absent on a daemon that predates the field.
+  optional uint64 online_only_bytes = 58;
+  // The path of a stored file record of this folder that could not be read back, empty when
+  // none. While set the folder's protection and availability are reported as unknown.
+  string index_damaged_path = 59;
+  // Versions of this folder's files that were not kept because the disk was nearly full when
+  // they were replaced: in the last 24 hours, and in the last 30 days. 0 from an older daemon.
+  uint32 history_skipped_last_day = 60;
+  uint32 history_skipped_last_30_days = 61;
+  // This device's history can no longer catch up by deltas (a verified closure puts the installed
+  // frontier out of step with its peers'); it takes a sealed state from a connected peer.
+  bool rebuild_needed = 62;
+  // The state of this folder alone, computed by the daemon (see `ProductStatus`).
+  ProductStatus product = 63;
 }
 
 // See `LinkStatus.degraded_cause`.
@@ -539,6 +562,9 @@ message PeerStatus {
   // The device that replaced this one, set exactly when `unreachable_category`
   // is `UNREACHABLE_CATEGORY_DEVICE_REPLACED`; empty otherwise.
   string replaced_by_device_id = 10;
+  // The last time a session with this peer was up, as unix seconds (the present while it is
+  // connected); 0 when this device never connected to it. Kept in the daemon's database.
+  int64 last_connected_unix = 11;
 }
 
 // See `PeerStatus.route_kind`'s own doc comment, mirroring
@@ -741,6 +767,18 @@ enum EntryKind {
   ENTRY_KIND_SYMLINK = 3;
 }
 
+// Whether this device still holds the bytes of a retained version, so that a restore
+// of it would not have to wait for a peer.
+enum VersionContent {
+  // Not a statement about bytes: the current version, a deletion, a directory.
+  VERSION_CONTENT_NOT_APPLICABLE = 0;
+  // Every block of the version is in this device's block store.
+  VERSION_CONTENT_KEPT = 1;
+  // This device does not hold the version's bytes: it was replaced by this device's own
+  // edit or delete, or this device never held the content (an on-demand placeholder).
+  VERSION_CONTENT_NOT_KEPT = 2;
+}
+
 // One retained version of a file, as
 // returned by `ListVersionsResponse` — mirrors
 // `yadorilink_sync_core::index::VersionRecord`.
@@ -754,14 +792,15 @@ message FileVersionInfo {
   // a caller that didn't record an origin — see
   // `SyncState::upsert_file`'s doc comment).
   string origin_device_id = 5;
-  // The replicated Unix permission bits (`0..=0o777`), or absent when the
-  // authoring device had no Unix permission model to report (a Windows
-  // peer) — `optional` for real proto3 field presence, since `0` (mode
-  // `0o000`, a real, distinct value) must not be confused with "absent".
-  optional uint32 unix_mode = 6;
+  reserved 6;  // was `optional uint32 unix_mode`: a bool must not reuse a varint field of other meaning
+  reserved "unix_mode";
   // A directory version carries no size or mtime of its own (both are
   // canonically 0), so a surface must not print them as if it were a file.
   EntryKind kind = 7;
+  // Whether the version is executable: the only replicated permission.
+  bool exec = 8;
+  // Whether this device holds the bytes of a superseded or trashed version.
+  VersionContent content = 9;
 }
 
 // `yadorilink versions <path>`. `absolute_path` (not
@@ -776,6 +815,22 @@ message ListVersionsResponse {
   // Newest first, including the current version — see
   // `SyncState::list_versions`'s doc comment.
   repeated FileVersionInfo versions = 1;
+  // Times at which this device no longer has the version that was current,
+  // one entry per recorded event (not merged): the disk was nearly full when
+  // the version was replaced, or the retention period ended.
+  repeated NotKeptSpan not_kept = 2;
+}
+
+// One recorded event of versions this device does not keep. The span is
+// `[from_unix_nanos, to_unix_nanos)`: the time the dropped versions were
+// current. An absent bound is unbounded on that side.
+message NotKeptSpan {
+  optional int64 from_unix_nanos = 1;
+  optional int64 to_unix_nanos = 2;
+  int64 from_seq = 3;
+  int64 to_seq = 4;
+  // "LowSpace" | "Expired".
+  string reason = 5;
 }
 
 // `yadorilink restore <path> [--version <id>]`.
@@ -891,6 +946,55 @@ message ListConflictsResponse {
   repeated ConflictedFileInfo files = 1;
 }
 
+// The recent-activity log (the apps' Activity page): files added, updated,
+// deleted, conflicted or restored, newest first.
+enum ActivityKind {
+  ACTIVITY_KIND_UNSPECIFIED = 0;
+  ACTIVITY_KIND_ADDED = 1;
+  ACTIVITY_KIND_UPDATED = 2;
+  ACTIVITY_KIND_DELETED = 3;
+  ACTIVITY_KIND_CONFLICT = 4;
+  ACTIVITY_KIND_RESTORED = 5;
+}
+
+// Whose change to list.
+enum ActivityOrigin {
+  ACTIVITY_ORIGIN_ANY = 0;
+  // Authored on this device (or with no recorded author).
+  ACTIVITY_ORIGIN_THIS_DEVICE = 1;
+  ACTIVITY_ORIGIN_OTHER_DEVICES = 2;
+}
+
+message ListActivityRequest {
+  // Page size; the daemon clamps it to 1..=500.
+  uint32 limit = 1;
+  // Only events older than this cursor (an earlier event's `cursor`); 0 = from
+  // the newest.
+  int64 before_cursor = 2;
+  // Empty = every kind.
+  repeated ActivityKind kinds = 3;
+  ActivityOrigin origin = 4;
+}
+
+message ActivityEventInfo {
+  // Paging cursor; larger is newer.
+  int64 cursor = 1;
+  // The linked folder's root.
+  string local_path = 2;
+  // Relative to the root.
+  string path = 3;
+  ActivityKind kind = 4;
+  // The device that authored the change; empty when not known here.
+  string origin_device_id = 5;
+  // Whether that is this device (or unknown, i.e. a local write).
+  bool is_this_device = 6;
+  int64 at_unix_nanos = 7;
+}
+
+message ListActivityResponse {
+  repeated ActivityEventInfo events = 1;
+}
+
 // What to do with a conflict copy of a file edited on two devices.
 enum ConflictResolution {
   CONFLICT_RESOLUTION_UNSPECIFIED = 0;
@@ -932,9 +1036,91 @@ message ResolveConflictResponse {
 // already-known same-account device list, the same one `StatusResponse
 // .peers` below reports on -- not a new discovery mechanism.
 message SendFileRequest {
-  string source_path = 1;
+  // Field 1 was `string source_path`; the offer now takes any number of files and folders
+  // (absolute), carried as one transfer.
+  reserved 1;
+  repeated string source_paths = 3;
   string target_device = 2;
 }
+// Cross-account one-shot Send. `create` mints a one-use expiring code this
+// device's user hands to a recipient on ANY account; the recipient's
+// `redeem` names one of their own devices; the sender then runs
+// `SendFileRequest` with `target_device = "link:<link_id>"`, which waits for
+// the redeem and sends under a pair-bound grant. No folder membership.
+message CreateSendLinkRequest {
+  // 0 = the service default (one hour).
+  uint32 ttl_seconds = 1;
+  // Field 2 was `string source_path`.
+  reserved 2;
+  // The files and folders the link will carry (absolute), so a recipient can see what it holds
+  // before redeeming. Empty = no preview. Only names and sizes are sent to the service.
+  repeated string source_paths = 3;
+}
+message SendLinkFile {
+  string name = 1;
+  uint64 size = 2;
+}
+// What a signed-in holder of a code may see before redeeming it. Reads only: the link is not
+// consumed, and every link that is not open answers alike (SEND_LINK_INVALID).
+message PreviewSendLinkRequest {
+  string code = 1;
+}
+message PreviewSendLinkResponse {
+  // The name of the sender's device.
+  string sender_name = 1;
+  repeated SendLinkFile files = 2;
+  int64 expires_at_unix = 3;
+}
+message CreateSendLinkResponse {
+  string link_id = 1;
+  string code = 2;
+  int64 expires_at_unix = 3;
+}
+message RedeemSendLinkRequest {
+  string code = 1;
+  // One of this account's devices; empty = this device.
+  string receiver_device_id = 2;
+  // Absolute folder the link's files are received into. Empty = a folder of the engine's own
+  // choosing, reported back in the response.
+  string destination_dir = 3;
+}
+message RedeemSendLinkResponse {
+  string link_id = 1;
+  // Where the files will land. Redeeming is the one consent: the offer that arrives under this
+  // link is received there without another step, and shows in the inbox with `link_id` set.
+  string destination_dir = 2;
+}
+message CancelSendLinkRequest {
+  string link_id = 1;
+}
+message CancelSendLinkResponse {}
+// The sender's view of one link it created.
+message SendLinkStatusRequest {
+  string link_id = 1;
+}
+enum SendLinkState {
+  SEND_LINK_STATE_UNSPECIFIED = 0;
+  // Created; nobody has redeemed it.
+  SEND_LINK_STATE_WAITING = 1;
+  // Redeemed: the recipient picked a device; nothing has been sent yet.
+  SEND_LINK_STATE_REDEEMED = 2;
+  // The send was authorized and the transfer is going.
+  SEND_LINK_STATE_TRANSFERRING = 3;
+  // The recipient reported that it received everything.
+  SEND_LINK_STATE_DONE = 4;
+  SEND_LINK_STATE_CANCELLED = 5;
+  SEND_LINK_STATE_EXPIRED = 6;
+  // The send was authorized but the transfer stopped before it finished.
+  SEND_LINK_STATE_INTERRUPTED = 7;
+}
+message SendLinkStatusResponse {
+  SendLinkState state = 1;
+  // The name of the device the recipient picked, once redeemed.
+  string receiver_device_name = 2;
+  // The transfer under this link, when this daemon started one since it last restarted.
+  string transfer_id = 3;
+}
+
 message SendFileResponse {
   string transfer_id = 1;
   repeated string files_offered = 2;
@@ -957,9 +1143,17 @@ message InboxTransfer {
   // "pending" | "in_progress" | "completed" | "failed" | "canceled".
   string status = 6;
   // Why a failed transfer stopped, as a closed code: "unreachable" | "sender_canceled" |
-  // "not_accepted" | "rejected" | "verification_failed" | "local_storage" | "interrupted".
+  // "not_accepted" | "rejected" | "verification_failed" | "local_storage" | "no_space" | "stalled" |
+  // "local_network_blocked" | "sender_gone" | "interrupted".
   // Empty when there is no reason on record.
   string failure = 7;
+  // The Send link this offer arrived under, when it did and this device had redeemed that link:
+  // the engine received it by itself. Empty for any other offer, which waits for an explicit receive.
+  string link_id = 8;
+  // Bytes written so far for an "in_progress" transfer; `total_size` once "completed"; 0 otherwise.
+  uint64 received_bytes = 9;
+  // The folder the files are being received into; empty until a receive chose one.
+  string destination_dir = 10;
 }
 
 // The transfers this device sent: every one still going and the most recent finished ones, oldest
@@ -974,10 +1168,14 @@ message SentTransferEntry {
   // "offered" (not answered yet) | "accepted" (the other device may pull it) | "completed" |
   // "declined" | "canceled".
   string status = 6;
-  // Why it stopped, as a closed code: "unreachable" | "declined" | "stalled" | "interrupted".
+  // Why it stopped, as a closed code: "unreachable" | "local_network_blocked" | "declined" |
+  // "stalled" | "receiver_canceled" | "receiver_stopped" | "interrupted".
   // "stalled" is kept on an accepted transfer whose other device stopped reading while it was
   // being served (the serve ended after a write timeout); it clears when a later pull is served
-  // through. Empty when there is no reason on record.
+  // through. "receiver_canceled" is a transfer the receiving device canceled (the transfer is
+  // canceled); "receiver_stopped" is an accepted one whose receiving device reported that its
+  // receive failed, or that has not fetched anything for a long time. Like "stalled" it clears
+  // when a later pull is served through. Empty when there is no reason on record.
   string failure = 7;
   // Whether a retry is offered for it.
   bool can_retry = 8;
@@ -1199,6 +1397,63 @@ message StatusResponse {
   bool provider_registry_restored = 32;
   // Mirrors `UpdateStatusResponse.update_required`.
   bool update_required = 33;
+  // How old the facts behind this answer are: the time since the daemon started reading the
+  // ledger, the block index and the filesystem for them. In-memory parts (peers, transfers,
+  // rates) are read when the request is answered. 0 from a daemon that does not report it.
+  uint64 snapshot_age_ms = 34;
+  // The state of the whole device, computed by the daemon from the folders above and from the
+  // `attention_reasons` that belong to no folder. Front ends show it and do not derive it again.
+  ProductStatus product = 35;
+}
+
+// What a person is told about a folder, or about the whole device: one of five states, the
+// counts behind it, and the one thing to offer. The closed set and its precedence (needs
+// attention, paused, syncing, waiting, up to date) are fixed here by the daemon; availability
+// and protection ride along and never change the state.
+message ProductStatus {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_UP_TO_DATE = 1;
+    STATE_SYNCING = 2;
+    STATE_WAITING = 3;
+    STATE_NEEDS_ATTENTION = 4;
+    STATE_PAUSED = 5;
+  }
+  // What to offer for the state; `ACTION_NONE` when there is nothing to do.
+  enum Action {
+    ACTION_NONE = 0;
+    ACTION_RETRY = 1;
+    ACTION_REVIEW_CONFLICT = 2;
+    ACTION_FREE_UP_SPACE = 3;
+    ACTION_REVEAL_PATH = 4;
+    ACTION_OPEN_SETTINGS = 5;
+    ACTION_DOWNLOAD_UPDATE = 6;
+    ACTION_VIEW_DETAILS = 7;
+    ACTION_REVIEW_APPROVAL = 8;
+    ACTION_CONFIRM_DISK = 9;
+    ACTION_RESUME = 10;
+    ACTION_START_OVER_AS_NEW_DEVICE = 11;
+    ACTION_SIGN_IN = 12;
+  }
+  State state = 1;
+  // Folders (and, for the whole device, reasons that belong to no folder) needing attention,
+  // paused, syncing, waiting. A folder with several conditions counts under each.
+  uint64 attention_count = 2;
+  uint64 paused_count = 3;
+  uint64 syncing_count = 4;
+  uint64 waiting_count = 5;
+  // Bytes left in the active transfers; set only when the figure is known.
+  bool bytes_remaining_known = 6;
+  uint64 bytes_remaining = 7;
+  Action next_action = 8;
+  ProductAvailability availability = 9;
+  // The other devices behind `availability`: reachable, offline, and needing an update.
+  repeated string availability_reachable_device_ids = 10;
+  repeated string availability_offline_device_ids = 11;
+  repeated string availability_update_required_device_ids = 12;
+  // Whether the data survives losing this device, and the devices behind that answer.
+  DataProtection protection = 13;
+  repeated string protection_device_ids = 14;
 }
 
 message ProviderRemovalStatus {
@@ -1371,6 +1626,12 @@ message GcResponse {
   // that *would* be reclaimed by an immediate real run.
   uint64 blocks_deleted = 1;
   uint64 bytes_reclaimed = 2;
+  // Set under `dry_run` only. What the kept version history holds that nothing current needs:
+  // the unique stored bytes of blocks named only by older versions, and how many older versions
+  // that is.
+  // Absent when it could not be read.
+  optional uint64 kept_history_bytes = 3;
+  optional uint64 kept_history_versions = 4;
 }
 
 // `yadorilink share set-storage-mode <group> --mode on-demand`'s read-only
@@ -1492,6 +1753,12 @@ message RequestHandoffLeaseResponse {
   bool requested = 1;
   string lease_id = 2;
   int64 expires_at_unix = 3;
+  // Set when `requested` is false and the daemon can say why it is worth asking again: a stable
+  // machine code. "changing_retry": a file of the group was not in the block store and is being
+  // captured into it now (it had changed since its record, or could not be read right now); the same
+  // request succeeds once that capture has landed. Empty when the daemon does not say. Added after the
+  // fact: the meaning of the other fields is unchanged.
+  string not_requested_reason = 4;
 }
 
 // Removed-device handoff-ticket request (operating-device-side): lifts the
@@ -1575,7 +1842,12 @@ message HandoffResult {
   string lease_id = 4;
 }
 
-message ShutdownRequest {}
+message ShutdownRequest {
+  // The caller knows something starts the daemon again (the image's supervisor): exit with the
+  // restart status (75) instead of 0, so the supervisor restarts it at once. Absent or false: an
+  // ordinary stop.
+  bool restart = 1;
+}
 message ShutdownResponse {}
 
 // Asks the daemon to reach a safe point and exit. Unlike `ShutdownRequest` (stop now, drain
@@ -1671,6 +1943,9 @@ message IdentifyResponse {
   uint32 pid = 10;
   // When this daemon process started, seconds since the Unix epoch.
   uint64 started_at_unix = 11;
+  // The data directory this daemon actually uses (sign-in, device identity, sync state).
+  // Empty when the daemon does not know it.
+  string data_dir = 12;
 }
 
 // Manual hydrate/evict, issued by
@@ -1713,6 +1988,12 @@ message EvictResponse {
   // would have been): a stable machine code naming why, e.g. "custody_not_acquired". Empty when
   // nothing was kept back or the daemon does not say.
   string retained_reason = 4;
+  // Set when `dehydrated` is false and the daemon can say why the call freed nothing: a stable machine
+  // code, e.g. "path_changing" (a change to the path is still being worked through), "not_present",
+  // "no_longer_current", "file_replaced", "differs_from_synced", "volume_not_durable", "in_use".
+  // Empty when the file was freed or the daemon does not say. Added after the fact: the meaning of the
+  // other fields is unchanged, and a client that ignores this one behaves as before.
+  string not_freed_reason = 5;
 }
 
 // One file's current materialization state -- the
@@ -1781,6 +2062,13 @@ message PinItemResponse {
   // Why the content could not be downloaded just now; empty when it was (or needed no download).
   // The pin stands either way.
   string download_error = 2;
+  // Set when the pin stands but a file beneath it is not yet held in this device's block store, so
+  // a later edit of it could still lose the version the pin promises: a stable machine code.
+  // "changing_retry": the file was edited, replaced, removed or could not be read just now; it is
+  // being captured into the store, and pinning again once it settles confirms it. "not_kept_error":
+  // the daemon could not check. Empty when every file beneath the pin is held (or none needs it).
+  // Added after the fact: the meaning of the other fields is unchanged.
+  string history_not_kept_reason = 3;
 }
 
 // Stops keeping a file or folder: content is NOT removed, it only becomes eligible to be freed.
@@ -2343,6 +2631,31 @@ enum ApplicationErrorCode {
   // current Terms (403 terms_consent_required). Nothing was committed; signing in
   // again shows the consent screen, and the installation is kept.
   APPLICATION_ERROR_CODE_TERMS_CONSENT_REQUIRED = 27;
+  // Send links. The service answers a redeem with one uniform refusal for an unknown, expired,
+  // used or cancelled code, so a redeem can only report INVALID; the sender's own view of a
+  // link (status, or a send to it) tells the other three apart.
+  // The link is past its expiry.
+  APPLICATION_ERROR_CODE_SEND_LINK_EXPIRED = 28;
+  // The link was already redeemed and used; links work once.
+  APPLICATION_ERROR_CODE_SEND_LINK_ALREADY_USED = 29;
+  // The sender cancelled the link.
+  APPLICATION_ERROR_CODE_SEND_LINK_CANCELLED = 30;
+  // The code is not one the service accepts (unknown, mistyped, or not distinguishable from
+  // expired or used for the redeemer).
+  APPLICATION_ERROR_CODE_SEND_LINK_INVALID = 31;
+  // The other device of a send could not be reached (the sender's device when receiving).
+  APPLICATION_ERROR_CODE_SEND_PEER_UNREACHABLE = 32;
+  // This device has no room for what is being received.
+  APPLICATION_ERROR_CODE_SEND_NO_SPACE = 33;
+  // The send stopped part way (connection lost, or stopped for no clearer reason).
+  APPLICATION_ERROR_CODE_SEND_INTERRUPTED = 34;
+  // The service has Send links switched off; no link can be created, previewed or redeemed
+  // until it is on. Nothing was changed.
+  APPLICATION_ERROR_CODE_SEND_LINKS_DISABLED = 35;
+  // This device's operating system refused to send to the local network (for example the macOS
+  // Local Network privacy setting, or a firewall), so a device on the same network could not be
+  // reached. A device that is reachable only over the internet still can be.
+  APPLICATION_ERROR_CODE_SEND_LOCAL_NETWORK_BLOCKED = 36;
 }
 
 // What a person can do next about a refusal, as an action rather than a command line. The
@@ -2513,8 +2826,8 @@ message AcceptInviteCommandResponse {
 // Mints a one-use, expiring, device-scoped cross-account invite for
 // group_id, naming the local daemon's own device as the minting device --
 // the CLI never supplies or needs to know its own device id for this.
-// `role` is optional ("viewer"/"editor" -- "owner" is not available via
-// this route yet; empty defaults to Viewer on the coordination plane);
+// `role` is optional ("viewer"/"editor"/"owner" -- owner is the delegated
+// folder administrator; empty defaults to Viewer on the coordination plane);
 // `ttl_secs` is optional (0 means "use the coordination plane's own
 // default"). `requires_approval` makes acceptance a REQUEST: the
 // recipient's own accept still runs, but the resulting membership waits
@@ -2692,6 +3005,18 @@ message ShowRecoveryOperationResponse {
     RecoveryOperationNotFound not_found = 3;
     RecoveryLocalEvidenceChanged local_evidence_changed = 4;
   }
+}
+
+// The folder group a folder named by the person is. The folder is a path to a plain linked folder or to
+// a File Provider folder at its place in the file manager (a path inside it is refused: a command
+// that takes a folder takes the folder itself), resolved by the one resolver every path-taking
+// command uses (`plain folder, then File Provider location`). A refusal is the `error` payload.
+message ResolveFolderRequest {
+  string path = 1;
+}
+
+message ResolveFolderResponse {
+  string group_id = 1;
 }
 
 // `yadorilink rewind <group> --at <timestamp>`: Folder Rewind's read-only
@@ -3051,6 +3376,13 @@ message DaemonControlRequest {
     UpdateVersionCheckRequest update_version_check = 98;
     ListSentTransfersRequest list_sent_transfers = 99;
     UpdateVerifiedEntryRequest update_verified_entry = 100;
+    ListActivityRequest list_activity = 101;
+    CreateSendLinkRequest create_send_link = 102;
+    RedeemSendLinkRequest redeem_send_link = 103;
+    CancelSendLinkRequest cancel_send_link = 104;
+    SendLinkStatusRequest send_link_status = 105;
+    PreviewSendLinkRequest preview_send_link = 106;
+    ResolveFolderRequest resolve_folder = 107;
   }
   // Field numbers 24-26 were the directional-mode requests (set_mode,
   // override, revert); 40-43 were the directional folder-operation requests
@@ -3201,6 +3533,13 @@ message DaemonControlResponse {
     // A plain-text refusal that also says what the person can do next, as a typed step the
     // front end words for itself (`error` carries no such step).
     RefusedWithNextStep refused = 102;
+    ListActivityResponse list_activity = 103;
+    CreateSendLinkResponse create_send_link = 104;
+    RedeemSendLinkResponse redeem_send_link = 105;
+    CancelSendLinkResponse cancel_send_link = 106;
+    SendLinkStatusResponse send_link_status = 107;
+    PreviewSendLinkResponse preview_send_link = 108;
+    ResolveFolderResponse resolve_folder = 109;
   }
   // Field numbers 25-27 were the directional-mode responses (set_mode,
   // override, revert); 40-43 were the directional folder-operation responses

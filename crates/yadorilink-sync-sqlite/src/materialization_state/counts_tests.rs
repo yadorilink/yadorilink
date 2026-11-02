@@ -115,3 +115,84 @@ fn placeholder_block_hashes_fail_closed() {
     seed(&db, "link", RecordKind::Symlink, MaterializationState::Remote);
     assert_eq!(repo.placeholder_block_hashes(GROUP, 8).unwrap(), None, "not a regular file");
 }
+
+/// A folder's size is the content bytes of its live regular files; the online-only part is the
+/// files held only as placeholders. Directories and symlinks add no bytes.
+#[test]
+fn materialization_counts_sum_content_and_online_only_bytes() {
+    let db = open_full_test_db();
+    let seed_sized = |path: &str, kind: RecordKind, state: MaterializationState, size: i64| {
+        db.write::<_, SyncSqliteError>(|conn| {
+            conn.execute(
+                "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, \
+                 deleted, record_kind, materialization_state) \
+                 VALUES (?1, ?2, ?3, 0, '[]', 0, ?4, ?5)",
+                rusqlite::params![GROUP, path, size, kind.as_db_str(), state.as_db_str()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    };
+    seed_sized("a", RecordKind::File, MaterializationState::Present, 100);
+    seed_sized("b", RecordKind::File, MaterializationState::Remote, 40);
+    seed_sized("c", RecordKind::File, MaterializationState::Remote, 2);
+    seed_sized("l", RecordKind::Symlink, MaterializationState::Present, 9);
+    seed_sized("d", RecordKind::Directory, MaterializationState::Present, 4096);
+
+    let counts = MaterializationStateRepository::new(db).materialization_counts(GROUP).unwrap();
+
+    assert_eq!(counts.total_bytes, 142);
+    assert_eq!(counts.online_only_bytes, 42);
+}
+
+/// `Status` lists held files with one statement: live held rows only, in path order.
+#[test]
+fn held_states_are_listed_in_one_statement_for_live_held_rows_only() {
+    let db = open_full_test_db();
+    seed(&db, "b.txt", RecordKind::File, MaterializationState::Present);
+    seed(&db, "a.txt", RecordKind::File, MaterializationState::Present);
+    seed(&db, "c.txt", RecordKind::File, MaterializationState::Present);
+    seed(&db, "gone.txt", RecordKind::File, MaterializationState::Present);
+    let repo = MaterializationStateRepository::new(db.clone());
+    repo.set_held(GROUP, "b.txt", "case_collision", 7).unwrap();
+    repo.set_held(GROUP, "a.txt", "invalid_name", 5).unwrap();
+    repo.set_held(GROUP, "gone.txt", "invalid_name", 9).unwrap();
+    db.write::<_, SyncSqliteError>(|conn| {
+        conn.execute("UPDATE files SET deleted = 1 WHERE path = 'gone.txt'", [])?;
+        Ok(())
+    })
+    .unwrap();
+    let held = repo.list_held_states(GROUP).unwrap();
+    assert_eq!(
+        held.iter()
+            .map(|(p, h)| (p.as_str(), h.reason.as_str(), h.since_unix_nanos))
+            .collect::<Vec<_>>(),
+        [("a.txt", "invalid_name", 5), ("b.txt", "case_collision", 7)]
+    );
+}
+
+/// `Status` no longer decodes every row's block list, so a corrupt one must still fail it closed
+/// (and a symlink count is one statement).
+#[test]
+fn a_corrupt_stored_block_list_fails_the_status_read_closed() {
+    let db = open_full_test_db();
+    seed(&db, "ok.txt", RecordKind::File, MaterializationState::Present);
+    seed(&db, "link", RecordKind::Symlink, MaterializationState::Present);
+    let files = crate::file_index::FileIndexRepository::new(db.clone());
+    files.verify_live_block_lists(GROUP).unwrap();
+    assert_eq!(files.count_live_symlinks(GROUP).unwrap(), 1);
+    db.write::<_, SyncSqliteError>(|conn| {
+        conn.execute("UPDATE files SET blocks_json = '[{\"hash\"' WHERE path = 'ok.txt'", [])?;
+        Ok(())
+    })
+    .unwrap();
+    let error = files.verify_live_block_lists(GROUP).unwrap_err().to_string();
+    assert!(error.contains("ok.txt"), "{error}");
+    // A deleted row's list is not a live one.
+    db.write::<_, SyncSqliteError>(|conn| {
+        conn.execute("UPDATE files SET deleted = 1 WHERE path = 'ok.txt'", [])?;
+        Ok(())
+    })
+    .unwrap();
+    files.verify_live_block_lists(GROUP).unwrap();
+}

@@ -103,7 +103,7 @@ async fn slow_down_twice_then_pending_then_success_only_ever_widens_the_interval
     .await;
     outcome.expect("granted");
     let secs: Vec<u64> = waits.iter().map(Duration::as_secs).collect();
-    assert_eq!(secs, [5, 10, 15, 15], "waits before each poll");
+    assert_eq!(secs, [0, 10, 15, 15], "waits before each poll: the first poll is immediate");
 }
 
 #[tokio::test(start_paused = true)]

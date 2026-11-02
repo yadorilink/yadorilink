@@ -308,12 +308,17 @@ pub enum CommandErrorKind {
     Preserved(PreservedRefusal),
     /// A re-adoption of a marked folder was refused.
     Readopt(ReadoptRefusal),
+    /// A new share created On-Demand would never have a full replica: it has one member (this
+    /// device), which keeps no full copy. Nothing was changed. Create it as a full copy, or
+    /// join a group that already has a full-replica device.
+    NoFullReplica,
     /// Any other failure.
     Failed,
 }
 
 impl CommandError {
-    fn failed(message: impl Into<String>) -> Self {
+    /// A failure with no typed kind, for a host layer that converts the engine's answers.
+    pub fn failed(message: impl Into<String>) -> Self {
         Self {
             kind: CommandErrorKind::Failed,
             message: message.into(),
@@ -333,6 +338,16 @@ impl CommandError {
         Self {
             kind: CommandErrorKind::Readopt(refusal),
             message: message.into(),
+            operation_id: String::new(),
+        }
+    }
+
+    fn no_full_replica() -> Self {
+        Self {
+            kind: CommandErrorKind::NoFullReplica,
+            message: "a new share created On-Demand would have no device that keeps a full copy; \
+                      create it as a full copy, or join a group that already has one"
+                .to_owned(),
             operation_id: String::new(),
         }
     }
@@ -412,6 +427,8 @@ pub struct LinkedFolder {
 #[derive(Clone)]
 pub struct EngineCommands {
     context: Arc<crate::control_context::ControlContext>,
+    /// What the provider write path reaches (see `write_commands`).
+    shell: Arc<ShellContext>,
     /// The engine's state directory, where its settings and replacement records live.
     config_dir: PathBuf,
 }
@@ -463,6 +480,25 @@ impl EngineCommands {
             .map_err(|e| CommandError::failed(e.to_string()))
     }
 
+    /// Recent file events across every linked folder, newest first: the same query the desktop
+    /// control socket answers, with the same wire events.
+    ///
+    /// # Errors
+    /// [`CommandError`] when the index cannot be read.
+    pub fn list_activity(
+        &self,
+        request: &yadorilink_ipc_proto::daemonctl::ListActivityRequest,
+    ) -> Result<Vec<yadorilink_ipc_proto::daemonctl::ActivityEventInfo>, CommandError> {
+        let query = crate::queries::file_history::activity_query_from_proto(request);
+        let events = self
+            .context
+            .queries
+            .file_history
+            .list_activity(query)
+            .map_err(|e| CommandError::failed(e.to_string()))?;
+        Ok(events.into_iter().map(crate::queries::file_history::activity_view_to_proto).collect())
+    }
+
     /// The linked folders and their state.
     ///
     /// # Errors
@@ -474,19 +510,30 @@ impl EngineCommands {
             .link_status
             .list_links()
             .map_err(|e| CommandError::failed(e.to_string()))?;
-        Ok(links
-            .into_iter()
-            .map(|link| LinkedFolder {
-                key: link.local_path,
-                group_id: link.group_id,
-                paused: link.paused,
-                on_demand: link.materialization_policy != "eager",
-                conflict_count: link.conflict_count,
-                hydrated_count: link.hydrated_count,
-                placeholder_count: link.placeholder_count,
-                degraded: link.degraded.map(|d| d.reason),
-            })
-            .collect())
+        Ok(links.into_iter().map(linked_folder).collect())
+    }
+
+    /// The linked folders as the status builder last collected them: for a display. A caller that
+    /// decides something from the list reads [`Self::linked_folders`].
+    ///
+    /// # Errors
+    /// [`CommandError`] when the link table could not be read when the facts were collected.
+    pub async fn linked_folders_snapshot(&self) -> Result<Vec<LinkedFolder>, CommandError> {
+        let links = self.context.status_hub.list_links().await.map_err(CommandError::failed)?;
+        Ok(links.into_iter().map(linked_folder).collect())
+    }
+}
+
+fn linked_folder(link: crate::queries::link_status::LinkStatusView) -> LinkedFolder {
+    LinkedFolder {
+        key: link.local_path,
+        group_id: link.group_id,
+        paused: link.paused,
+        on_demand: link.materialization_policy != "eager",
+        conflict_count: link.conflict_count,
+        hydrated_count: link.hydrated_count,
+        placeholder_count: link.placeholder_count,
+        degraded: link.degraded.map(|d| d.reason),
     }
 }
 
@@ -506,6 +553,35 @@ impl EngineCommands {
             .mark_not_rejoined(key)
             .await
             .map_err(|e| CommandError::failed(e.to_string()))
+    }
+}
+
+impl EngineCommands {
+    /// The commands over an already built `state`, without an engine around it. For tests that
+    /// stand devices up themselves.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn for_state_for_test(state: Arc<DaemonState>) -> Self {
+        let config_dir = state.config_dir().to_path_buf();
+        let context = Arc::new(crate::control_context::ControlContext::from_state(state.clone()));
+        let shell = Arc::new(ShellContext::from_state(state));
+        Self { context, shell, config_dir }
+    }
+
+    /// [`Self::for_state_for_test`] with the provider side started over `temp_root` as the engine
+    /// starts it (the shell context and its background tasks, among them the projector that
+    /// applies peers' edits to a provider folder), so the write commands work. Call it inside the
+    /// test's runtime.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn for_state_with_temp_root_for_test(state: Arc<DaemonState>, temp_root: &Path) -> Self {
+        let mut commands = Self::for_state_for_test(state.clone());
+        commands.shell = crate::engine_startup::start_provider(
+            &state,
+            &commands.context,
+            Some(temp_root.to_path_buf()),
+        );
+        commands
     }
 }
 
@@ -535,6 +611,10 @@ pub struct Held {
 const CHANNEL_BUFFER_BYTES: usize = 256 * 1024;
 
 const TASK_PEER_ORCHESTRATOR: &str = "peer-orchestrator";
+const TASK_SEND_TRANSFER: &str = "send-transfer";
+
+/// How long a stop waits for the receives in flight to record that they were interrupted.
+const SEND_INTERRUPT_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Engine {
     /// Opens the data, brings the engine up and returns it running.
@@ -632,12 +712,16 @@ impl Engine {
             crate::adapters::build_query_services(state.clone()),
             dir.clone(),
         ));
-        let commands = EngineCommands { context: control_context.clone(), config_dir: dir.clone() };
         let shell_context = crate::engine_startup::start_provider(
             &state,
             &control_context,
             config.provider_temp_root,
         );
+        let commands = EngineCommands {
+            context: control_context.clone(),
+            shell: shell_context.clone(),
+            config_dir: dir.clone(),
+        };
 
         let mut background = JoinSet::new();
         let orchestrator_alive = Arc::new(AtomicBool::new(false));
@@ -656,6 +740,17 @@ impl Engine {
                     auth,
                     device_id: cfg.device_id,
                 };
+                // Track Send: serves and receives the one-shot transfers on its own ALPN over the
+                // endpoint the orchestrator's stack binds. Best effort, as on the desktop: it has
+                // no effect on folder sync.
+                let send_state = state.clone();
+                let send_dir = dir.clone();
+                background.spawn(async move {
+                    if let Err(error) = crate::send_transfer::run(send_state, send_dir).await {
+                        tracing::warn!(%error, "Track Send ended");
+                    }
+                    TASK_SEND_TRANSFER
+                });
                 let state = state.clone();
                 state.set_task_alive(TASK_PEER_ORCHESTRATOR, true);
                 orchestrator_alive.store(true, Ordering::SeqCst);
@@ -749,6 +844,11 @@ impl Engine {
             &mut *self.channels.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
         );
         channels.shutdown().await;
+        // Before the substrate closes: a receive in flight is recorded as interrupted (resumable)
+        // while it can still be.
+        if let Some(send) = self.state.send_service() {
+            send.interrupt_receives(SEND_INTERRUPT_BOUND).await;
+        }
         crate::engine_startup::quiesce(&self.state).await;
         crate::engine_startup::close_substrate(&self.state).await;
         self.background.lock().await.shutdown().await;
@@ -797,6 +897,46 @@ impl Engine {
                 )
                 .expect("the policy is set");
         }
+    }
+
+    /// Declares a provider folder for `group_id` the way the app's File Provider link does (an
+    /// On-Demand provider link row and its root, no directory) and returns the root id. For a
+    /// host without a File Provider, which refuses provider folders at enrollment: the write path
+    /// itself is the same. Takes effect at the next start. Idempotent.
+    ///
+    /// # Panics
+    /// When the link cannot be written.
+    #[doc(hidden)]
+    pub fn add_provider_link_for_test(&self, group_id: &str) -> String {
+        use yadorilink_replica_domain::session_state::ProviderKind;
+        use yadorilink_sync_sqlite::provider::{ProviderDeclaration, ProviderLinkSpec};
+        let links = self.state.replica_coordinator.link_repository();
+        let key = format!("provider://test-{group_id}");
+        if links.list_links().expect("links are listed").iter().all(|l| l.group_id != group_id) {
+            links
+                .add_provider_link(
+                    &key,
+                    group_id,
+                    &ProviderLinkSpec {
+                        kind: ProviderKind::MacFileProvider,
+                        display_name: "Phone".into(),
+                        empty_owner: false,
+                        on_demand: true,
+                        creation_digest: "test".into(),
+                    },
+                )
+                .expect("the provider link is written");
+        }
+        let ProviderDeclaration::Provider(root) = self
+            .state
+            .replica_coordinator
+            .provider_repository()
+            .declaration_for_group(group_id)
+            .expect("the declaration is read")
+        else {
+            panic!("the provider link declares its root");
+        };
+        root.root_id
     }
 
     /// Makes [`Self::stop`] wait for `release` first. For tests of a stop that does not finish.
@@ -1032,6 +1172,21 @@ mod claim_tests {
         ));
     }
 }
+
+mod send_commands;
+pub use send_commands::SentLink;
+
+mod history_commands;
+pub use history_commands::{
+    DeletedItem, DeletedItems, DeletedParent, HistoryEntryKind, HistoryVersionState, ItemHistory,
+    ItemVersion, MAX_DELETED_ITEMS,
+};
+
+mod write_commands;
+pub use write_commands::{
+    ApplyChange, ApplyResponse, DeliveryItem, DeliveryReport, DeliveryState, ItemDelivery,
+    StageMode, StageRefused, StageSource, StagedHow, StagedUpload, MAX_DELIVERY_ITEMS,
+};
 
 mod app_commands;
 pub use app_commands::{

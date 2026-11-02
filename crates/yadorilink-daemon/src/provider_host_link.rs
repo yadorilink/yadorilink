@@ -41,6 +41,8 @@ pub(crate) struct ProviderHostLink {
     /// from a readable domain list. The engine's own evidence for a removal: the host reports raw
     /// readings and never decides. In memory on purpose: a restart starts counting again.
     absent: Mutex<HashMap<String, u32>>,
+    /// Woken (all waiters) each time a host attaches, for [`Self::wait_connected`].
+    attached: tokio::sync::Notify,
 }
 
 /// How many consecutive absent readings the engine needs before it treats a domain as removed by
@@ -79,6 +81,7 @@ impl ProviderHostLink {
                 // Readings of the previous host say nothing about this one.
                 self.absent.lock().unwrap_or_else(|p| p.into_inner()).clear();
                 *current = Some(sender);
+                self.attached.notify_waiters();
                 true
             }
         }
@@ -134,6 +137,20 @@ impl ProviderHostLink {
         let mut roots: Vec<String> = orphans.keys().cloned().collect();
         roots.sort();
         roots
+    }
+
+    /// Resolves once a host connection is attached and alive (at once if one is).
+    pub(crate) async fn wait_connected(&self) {
+        loop {
+            let attached = self.attached.notified();
+            tokio::pin!(attached);
+            // Registered before the check: an attach between the two is not missed.
+            attached.as_mut().enable();
+            if self.host_connected() {
+                return;
+            }
+            attached.await;
+        }
     }
 
     /// Whether a host connection is attached and alive.

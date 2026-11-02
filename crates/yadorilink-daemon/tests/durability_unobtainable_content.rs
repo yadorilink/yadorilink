@@ -46,7 +46,8 @@ use std::time::{Duration, Instant};
 use support::fake_coordination::FakeCoordination;
 use support::register_with_fake;
 use support::topology::{
-    fully_connected, link_on_demand, new_node, spawn_orchestrator, stand_up_canonical_topology,
+    fully_connected, link_on_demand, new_node_with, spawn_orchestrator,
+    stand_up_canonical_topology_with,
 };
 use yadorilink_daemon::durability_service::GroupDurabilityStatus;
 
@@ -67,10 +68,16 @@ fn init_tracing() {
 /// would make this test's own bounded waits either impractically long or
 /// racy (see this file's own history: waiting on production's 90s
 /// interval intermittently raced X's departure against the confirmation
-/// job's very first sweep). Set once, before any `DaemonState` in this
-/// test is constructed, per `set_default_..._sweep_interval_for_tests`'s
-/// own doc comment.
+/// job's very first sweep). Given to every daemon at construction (`SWEEPS`).
 const TEST_SWEEP_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Both sweeps at the test interval for every daemon, given at construction: a scheduler has
+/// already started by the time its constructor returns.
+const SWEEPS: yadorilink_daemon::daemon_state::StateIntervals =
+    yadorilink_daemon::daemon_state::StateIntervals {
+        materialization_repair_sweep: Some(TEST_SWEEP_INTERVAL),
+        custody_confirmation_sweep: Some(TEST_SWEEP_INTERVAL),
+    };
 
 /// Generous relative to `TEST_SWEEP_INTERVAL`: needs at least one sweep
 /// for M and W to both be asked and both explicitly refuse (every live
@@ -95,17 +102,12 @@ const CONVERGENCE_BOUND: Duration = Duration::from_secs(60);
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn unobtainable_content_converges_to_at_risk_not_stuck_protecting() {
     init_tracing();
-    yadorilink_daemon::daemon_state::set_default_materialization_repair_sweep_interval_for_tests(
-        TEST_SWEEP_INTERVAL,
-    );
-    yadorilink_daemon::daemon_state::set_default_custody_confirmation_sweep_interval_for_tests(
-        TEST_SWEEP_INTERVAL,
-    );
     support::ensure_isolated_config_dir();
     let fake = FakeCoordination::start().await;
     fake.enable_signed_policy();
     let group_id = "durability-unobtainable-group".to_string();
-    let (n, m, w, mut handles) = stand_up_canonical_topology(&fake, &group_id).await;
+    let (n, m, w, mut handles) =
+        stand_up_canonical_topology_with(&fake, &group_id, None, SWEEPS).await;
 
     // A second full-replica candidate, matching `topology_soak_lane.rs`'s
     // own `op_device_join` reasoning exactly: without this, N is
@@ -118,7 +120,7 @@ async fn unobtainable_content_converges_to_at_risk_not_stuck_protecting() {
     fake.set_full_replica(&w.device_id, &group_id, true);
 
     // X: the sole author of unique content, about to leave.
-    let x = new_node("durability-x-author");
+    let x = new_node_with("durability-x-author", SWEEPS);
     link_on_demand(&x, &group_id);
     register_with_fake(&fake, &x.state, &x.device_id, &[&group_id]).await;
     let x_runtime = spawn_orchestrator(fake.addr(), &x);

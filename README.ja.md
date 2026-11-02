@@ -16,10 +16,10 @@ YadoriLink はデバイス同士の接続を仲介しますが、ファイルは
 
 - デバイス間の直接・暗号化同期
 - アカウント単位の共有、権限管理、アクセスの取り消し
-- バージョン履歴と競合コピーの保持
+- バージョン履歴と競合コピーの保持（[何をどれだけ残すか](docs/VERSION_HISTORY.ja.md)）
 - オンデマンドのローカル容量管理（デスクトップアプリで利用できます。エンジン単体のリリースには含まれません）
 
-対応プラットフォームは、macOS 14 以降（Apple シリコン）、Windows 11 25H2 以降（x64）、Linux x86_64（試験的対応）です。
+対応プラットフォームは、macOS 27（Apple シリコン）、Windows 11 25H2 以降（x64）、Linux x86_64（試験的対応）です。
 
 ### 提供状況
 
@@ -34,7 +34,7 @@ YadoriLink はデバイス同士の接続を仲介しますが、ファイルは
 ## 入手方法
 
 このリポジトリに含まれるのは、**エンジン**（同期デーモンと `yadorilink` コマンドライン）、
-Linux パッケージ、Windows のエクスプローラー連携です。コンテナーイメージは今回のリリースに含まれません。macOS と
+Linux パッケージ、Windows のエクスプローラー連携、NAS やサーバー向けのコンテナーイメージ（「インストール」を参照）です。macOS と
 Windows のデスクトップアプリは、このリポジトリとは別に配布する予定で、まだ公開していません。
 公開時は [yadori.link](https://yadori.link/) でお知らせします。アプリを使う場合、エンジンの設定はアプリが行います。
 
@@ -56,13 +56,18 @@ Windows のデスクトップアプリは、このリポジトリとは別に配
 
 - **Linux（Debian/Ubuntu）:** GitHub Releases から `.deb` をダウンロードし、`.sha256` を
   確認してから `sudo apt install ./yadorilink-linux-amd64.deb` でインストールします。
+- **NAS・サーバー（Docker）:** `ghcr.io/yadorilink/yadorilink:<バージョン>`
+  （`linux/amd64`、`linux/arm64`）。すぐ使える
+  [`compose.yaml`](packaging/docker/compose.yaml) が付いています。
+  [`packaging/docker/README.md`](packaging/docker/README.md) を参照してください。
+  タグにはリリースのバージョンをそのまま指定します。
 - **全プラットフォーム、エンジンのみ:** お使いのプラットフォーム向けのエンジンバンドルを
   展開し、`yadorilink` と `yadorilink-daemon` を `PATH` に置きます。
 - **計画中（未公開）:** コマンドライン用の 1 行インストーラー（macOS と Linux では
   `curl -fsSL https://yadori.link/install.sh | sh`、Windows では PowerShell 版）。
   管理者権限なしでホームディレクトリ配下にインストールし、使う前にすべてのダウンロードを
   署名付きリリースマニフェストと照合します。あわせて、apt リポジトリ、ビルド済みバイナリ
-  の Homebrew formula、WinGet、Docker イメージも代替手段として計画しています。どの方法で
+  の Homebrew formula、WinGet も代替手段として計画しています。どの方法で
   インストールしても、更新はそのツールが行います。これらが公開されるまでは、上の方法を
   使ってください。
 

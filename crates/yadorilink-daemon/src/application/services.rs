@@ -45,7 +45,6 @@ pub(crate) struct ApplicationServices {
     /// Track Send's `send`/`receive` commands -- see `crate::send_transfer`'s
     /// own module doc comment for why this is a thin wrapper rather than a
     /// full ports/adapters service like the fields above.
-    #[cfg(feature = "process-model")]
     pub(crate) send_transfer: Arc<crate::send_transfer::SendTransferService>,
     /// Sessions for managing another device on this account -- see
     /// `crate::nas_admin_bridge`.

@@ -77,6 +77,9 @@ pub const CLEARED_BY_INSTALL: &[&str] = &[
 /// is checked against and that keeps gating admission), and everything that
 /// describes the sync root rather than the native state.
 pub const PRESERVED_BY_INSTALL: &[&str] = &[
+    // The recent-activity log: a record of what already happened here, not
+    // native state the install derives.
+    "activity_events",
     // The verified closures, and the rebootstrap's own bookkeeping.
     "native_author_closure",
     "native_rebootstrap_delta",
@@ -116,6 +119,7 @@ pub const PRESERVED_BY_INSTALL: &[&str] = &[
     "group_block_provenance",
     "group_local_history_floor",
     "group_policy_watermark",
+    "history_freed",
     "handoff_leases",
     "held_paths",
     "links",

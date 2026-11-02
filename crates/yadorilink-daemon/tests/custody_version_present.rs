@@ -30,7 +30,11 @@ fn new_daemon(device_id: &str) -> Daemon {
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
-    let state = DaemonState::new(device_id.to_string(), Arc::new(sync_state), store);
+    let state = yadorilink_daemon::test_support::isolated_daemon_state(
+        device_id.to_string(),
+        Arc::new(sync_state),
+        store,
+    );
     ensure_device_signing_key(&state);
     let root = tempfile::tempdir().unwrap();
     state
@@ -57,7 +61,11 @@ fn new_daemon_with_slow_get(
     let slow = Arc::new(support::DelayedGetBlockStore::new(inner, delay));
     let store: Arc<dyn BlockStore + Send + Sync> = slow.clone();
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
-    let state = DaemonState::new(device_id.to_string(), Arc::new(sync_state), store);
+    let state = yadorilink_daemon::test_support::isolated_daemon_state(
+        device_id.to_string(),
+        Arc::new(sync_state),
+        store,
+    );
     ensure_device_signing_key(&state);
     let root = tempfile::tempdir().unwrap();
     state
@@ -106,10 +114,9 @@ fn version_and_blocks(hash_bytes: Vec<u8>, size: u64) -> (VersionHash, Vec<Versi
     let blocks = vec![VersionBlock { hash: BlockHash(hash_bytes), size: size as u32 }];
     let meta = FileMeta {
         mtime_unix_nanos: 0,
-        unix_mode: None,
+        exec: false,
         symlink_target: None,
         record_kind: RecordKind::File,
-        xattrs: Vec::new(),
     };
     let version = FileVersion::new(blocks.clone(), size, meta);
     (version.version_hash, blocks)
@@ -630,10 +637,9 @@ async fn custody_rejects_a_query_whose_version_hash_differs_despite_matching_blo
     // a DIFFERENT mtime than device-a's real record actually has.
     let wrong_meta = FileMeta {
         mtime_unix_nanos: 999,
-        unix_mode: None,
+        exec: false,
         symlink_target: None,
         record_kind: RecordKind::File,
-        xattrs: Vec::new(),
     };
     let wrong_vh = FileVersion::new(blocks.clone(), content.len() as u64, wrong_meta).version_hash;
     assert_ne!(
@@ -688,10 +694,10 @@ async fn custody_binds_the_unix_mode_from_the_atomic_current_row() {
     a.state
         .replica_coordinator
         .file_index_repository()
-        .set_unix_mode(
+        .set_exec(
             GROUP,
             "script.sh",
-            Some(0o755),
+            true,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -704,12 +710,11 @@ async fn custody_binds_the_unix_mode_from_the_atomic_current_row() {
         vec![VersionBlock { hash: BlockHash(hash_bytes.clone()), size: content.len() as u32 }];
     let meta_with_exec = FileMeta {
         mtime_unix_nanos: 0,
-        unix_mode: Some(0o755),
+        exec: true,
         symlink_target: None,
         record_kind: RecordKind::File,
-        xattrs: Vec::new(),
     };
-    let meta_no_exec = FileMeta { unix_mode: Some(0o644), ..meta_with_exec.clone() };
+    let meta_no_exec = FileMeta { exec: false, ..meta_with_exec.clone() };
     let vh_exec =
         FileVersion::new(blocks.clone(), content.len() as u64, meta_with_exec).version_hash;
     let vh_no_exec =

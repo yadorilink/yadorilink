@@ -193,10 +193,9 @@ fn local_commit_cost(n: usize) -> Cost {
                 0,
                 FileMeta {
                     mtime_unix_nanos: i as i64 + 1,
-                    unix_mode: Some(0o644),
+                    exec: false,
                     symlink_target: None,
                     record_kind: RecordKind::File,
-                    xattrs: Vec::new(),
                 },
             );
             let mutation = PreparedLocalMutation::Upsert {
@@ -212,8 +211,7 @@ fn local_commit_cost(n: usize) -> Cost {
                     record_kind: RecordKind::File,
                     symlink_target: None,
                     symlink_out_of_root: false,
-                    unix_mode: Some(0o644),
-                    xattrs: Vec::new(),
+                    exec: false,
                 }),
                 version,
                 native_witness: None,
@@ -297,10 +295,9 @@ fn new_file_mutation(i: usize) -> yadorilink_replica_domain::session_state::Prep
         0,
         FileMeta {
             mtime_unix_nanos: i as i64 + 1,
-            unix_mode: Some(0o644),
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     );
     PreparedLocalMutation::Upsert {
@@ -316,8 +313,7 @@ fn new_file_mutation(i: usize) -> yadorilink_replica_domain::session_state::Prep
             record_kind: RecordKind::File,
             symlink_target: None,
             symlink_out_of_root: false,
-            unix_mode: Some(0o644),
-            xattrs: Vec::new(),
+            exec: false,
         }),
         version,
         native_witness: None,

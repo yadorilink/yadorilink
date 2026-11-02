@@ -78,6 +78,12 @@ pub fn refine(detected: String, exe: &Path, env_value: Option<&str>) -> String {
     if env_value == Some("container") {
         return "container".to_string();
     }
+    // A Mac App Store build carries the store's receipt in its bundle; it is updated by the store, never by us.
+    if let Some(bundle) = yadorilink_local_storage::ownership::app_bundle_root(exe) {
+        if bundle.join("Contents/_MASReceipt/receipt").is_file() {
+            return "app_store".to_string();
+        }
+    }
     if yadorilink_local_storage::ownership::is_app_bundle_path(exe) {
         return "app_bundle".to_string();
     }

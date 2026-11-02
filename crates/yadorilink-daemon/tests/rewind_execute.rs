@@ -54,7 +54,11 @@ impl Device {
         let store_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
         let (coordinator, index_dir) = open_file_backed_replica_coordinator();
-        let state = DaemonState::new(id.to_string(), Arc::new(coordinator), store);
+        let state = yadorilink_daemon::test_support::isolated_daemon_state(
+            id.to_string(),
+            Arc::new(coordinator),
+            store,
+        );
         support::ensure_device_signing_key(&state);
         state.authority.install_test_group_policy(
             GROUP,

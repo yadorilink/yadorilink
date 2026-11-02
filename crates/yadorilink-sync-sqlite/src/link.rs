@@ -2,6 +2,7 @@
 //! `duplicate_recovery_paths`).
 
 use std::sync::Arc;
+use yadorilink_sqlite_runtime::CachedStatements as _;
 
 use rusqlite::OptionalExtension;
 
@@ -55,8 +56,7 @@ impl LinkRepository {
         self.database.read::<_, SyncSqliteError>(|conn| {
             Self::ensure_unambiguous_group_on_conn(conn, group_id, None)?;
             let policy: Option<String> = conn
-                .query_row(
-                    "SELECT materialization_policy FROM links WHERE group_id = ?1 AND orphaned = 0 \
+                .query_row_cached("SELECT materialization_policy FROM links WHERE group_id = ?1 AND orphaned = 0 \
                      ORDER BY local_path",
                     [group_id],
                     |r| r.get(0),
@@ -113,7 +113,7 @@ impl LinkRepository {
         }
 
         let existing = tx
-            .query_row(
+            .query_row_cached(
                 "SELECT local_path, group_id, paused, materialization_policy, \
                  orphaned, provider_kind, provider_root_id FROM links WHERE local_path = ?1",
                 [local_path],
@@ -138,14 +138,14 @@ impl LinkRepository {
             // materialization policy — leaving the row untouched instead would
             // make re-linking an orphaned folder a silent no-op.
             Some(prior) => {
-                tx.execute(
+                tx.execute_cached(
                     "UPDATE links SET paused = 0, orphaned = 0 WHERE local_path = ?1",
                     [local_path],
                 )?;
                 Ok(LinkRowWrite::Updated(prior))
             }
             None => {
-                tx.execute(
+                tx.execute_cached(
                     "INSERT INTO links (local_path, group_id, paused) VALUES (?1, ?2, 0)",
                     rusqlite::params![local_path, group_id],
                 )?;
@@ -178,19 +178,19 @@ impl LinkRepository {
             LinkRowWrite::Inserted => {
                 // A provider link's root was created in the same transaction as the row and has
                 // no state yet: it goes with the row it was declared on.
-                tx.execute(
+                tx.execute_cached(
                     "DELETE FROM provider_roots WHERE root_id IN (SELECT provider_root_id FROM \
                      links WHERE local_path = ?1 AND group_id = ?2)",
                     rusqlite::params![local_path, group_id],
                 )?;
-                tx.execute(
+                tx.execute_cached(
                     "DELETE FROM links WHERE local_path = ?1 AND group_id = ?2",
                     rusqlite::params![local_path, group_id],
                 )?;
                 Ok("removed the link row this attempt inserted")
             }
             LinkRowWrite::Updated(prior) => {
-                tx.execute(
+                tx.execute_cached(
                     "UPDATE links SET paused = ?3, orphaned = ?4, materialization_policy = ?5 \
                      WHERE local_path = ?1 AND group_id = ?2",
                     rusqlite::params![
@@ -291,7 +291,7 @@ impl LinkRepository {
     pub fn has_live_link_for_group(&self, group_id: &str) -> Result<bool, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             Self::ensure_unambiguous_group_on_conn(conn, group_id, None)?;
-            let live: i64 = conn.query_row(
+            let live: i64 = conn.query_row_cached(
                 "SELECT COUNT(*) FROM links WHERE group_id = ?1 AND orphaned = 0 \
                  AND provider_kind = 'none'",
                 [group_id],
@@ -330,9 +330,11 @@ impl LinkRepository {
         group_id: &str,
     ) -> Result<(), SyncSqliteError> {
         let current: Option<String> = tx
-            .query_row("SELECT group_id FROM links WHERE local_path = ?1", [local_path], |r| {
-                r.get(0)
-            })
+            .query_row_cached(
+                "SELECT group_id FROM links WHERE local_path = ?1",
+                [local_path],
+                |r| r.get(0),
+            )
             .optional()?;
         match current {
             Some(current) if current != group_id => {
@@ -349,24 +351,27 @@ impl LinkRepository {
         local_path: &str,
     ) -> Result<bool, SyncSqliteError> {
         let group: Option<String> = tx
-            .query_row("SELECT group_id FROM links WHERE local_path = ?1", [local_path], |r| {
-                r.get(0)
-            })
+            .query_row_cached(
+                "SELECT group_id FROM links WHERE local_path = ?1",
+                [local_path],
+                |r| r.get(0),
+            )
             .optional()?;
-        let deleted = tx.execute("DELETE FROM links WHERE local_path = ?1", [local_path])?;
+        let deleted = tx.execute_cached("DELETE FROM links WHERE local_path = ?1", [local_path])?;
         // The last link of a provider root removes it: its domain is removed by the host on
         // the strength of a DURABLE intent written here, in this transaction, and its provider
         // state stays until the host acknowledges (so nothing is deleted while the OS may
         // still hold what it describes).
         if let Some(group) = group {
-            let remaining: i64 =
-                tx.query_row("SELECT COUNT(*) FROM links WHERE group_id = ?1", [&group], |r| {
-                    r.get(0)
-                })?;
+            let remaining: i64 = tx.query_row_cached(
+                "SELECT COUNT(*) FROM links WHERE group_id = ?1",
+                [&group],
+                |r| r.get(0),
+            )?;
             if remaining == 0 {
                 crate::paused_items::clear_group_in_tx(tx, &group)?;
                 let root: Option<(String, String)> = tx
-                    .query_row(
+                    .query_row_cached(
                         "SELECT root_id, display_name FROM provider_roots WHERE group_id = ?1",
                         [&group],
                         |r| Ok((r.get(0)?, r.get(1)?)),
@@ -382,7 +387,7 @@ impl LinkRepository {
 
     pub fn list_links(&self) -> Result<Vec<FolderLink>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT local_path, group_id, paused, materialization_policy, \
                  orphaned, provider_kind, provider_root_id FROM links",
             )?;
@@ -442,7 +447,7 @@ impl LinkRepository {
         self.database.read::<_, SyncSqliteError>(|conn| {
             Self::ensure_unambiguous_group_on_conn(conn, group_id, None)?;
             let token = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT root_token FROM links WHERE group_id = ?1 AND orphaned = 0 \
                      ORDER BY local_path",
                     [group_id],
@@ -503,7 +508,7 @@ impl LinkRepository {
         root_token: &str,
     ) -> Result<(), SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            let affected = tx.execute(
+            let affected = tx.execute_cached(
                 "UPDATE links SET root_token = ?2 WHERE group_id = ?1 AND orphaned = 0",
                 rusqlite::params![group_id, root_token],
             )?;
@@ -557,7 +562,7 @@ impl LinkRepository {
                 "DROP TRIGGER links_one_live_root_per_group_insert; \
                  DROP TRIGGER links_one_live_root_per_group_unorphan;",
             )?;
-            conn.execute(
+            conn.execute_cached(
                 "INSERT INTO links (local_path, group_id, paused) VALUES (?1, ?2, 0)",
                 rusqlite::params![local_path, group_id],
             )?;
@@ -573,7 +578,10 @@ impl LinkRepository {
     /// live.
     pub fn mark_link_orphaned(&self, local_path: &str) -> Result<(), SyncSqliteError> {
         let affected = self.database.write::<_, SyncSqliteError>(|conn| {
-            Ok(conn.execute("UPDATE links SET orphaned = 1 WHERE local_path = ?1", [local_path])?)
+            Ok(conn.execute_cached(
+                "UPDATE links SET orphaned = 1 WHERE local_path = ?1",
+                [local_path],
+            )?)
         })?;
         if affected == 0 {
             return Err(SyncSqliteError::NotFound(format!("link {local_path}")));
@@ -595,7 +603,7 @@ impl LinkRepository {
         // write target should be hidden too. A match-less UPDATE surfaces as
         // NotFound, same as an unknown path.
         let affected = self.database.write::<_, SyncSqliteError>(|conn| {
-            Ok(conn.execute(
+            Ok(conn.execute_cached(
                 "UPDATE links SET materialization_policy = ?1 \
                  WHERE local_path = ?2 AND orphaned = 0",
                 rusqlite::params![policy.as_db_str(), local_path],
@@ -632,7 +640,7 @@ impl LinkRepository {
         self.database.read::<_, SyncSqliteError>(|conn| {
             Self::ensure_unambiguous_group_on_conn(conn, group_id, None)?;
             let opt_in: Option<i64> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT windows_symlink_opt_in FROM links \
                      WHERE group_id = ?1 AND orphaned = 0 ORDER BY local_path",
                     [group_id],
@@ -655,7 +663,7 @@ impl LinkRepository {
         opt_in: bool,
     ) -> Result<(), SyncSqliteError> {
         let affected = self.database.write::<_, SyncSqliteError>(|conn| {
-            Ok(conn.execute(
+            Ok(conn.execute_cached(
                 "UPDATE links SET windows_symlink_opt_in = ?1 WHERE local_path = ?2",
                 rusqlite::params![opt_in as i64, local_path],
             )?)
@@ -720,7 +728,7 @@ impl LinkRepository {
         expected_group: Option<&str>,
     ) -> Result<(), SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
-            let affected = conn.execute(
+            let affected = conn.execute_cached(
                 "UPDATE links SET paused = ?1 WHERE local_path = ?2 \
                  AND (?3 IS NULL OR group_id = ?3)",
                 rusqlite::params![value, local_path, expected_group],
@@ -729,7 +737,9 @@ impl LinkRepository {
                 return Ok(());
             }
             let exists = conn
-                .query_row("SELECT 1 FROM links WHERE local_path = ?1", [local_path], |_| Ok(()))
+                .query_row_cached("SELECT 1 FROM links WHERE local_path = ?1", [local_path], |_| {
+                    Ok(())
+                })
                 .optional()?
                 .is_some();
             Err(if exists {
@@ -744,9 +754,11 @@ impl LinkRepository {
     pub fn paused_until(&self, local_path: &str) -> Result<Option<i64>, SyncSqliteError> {
         let value = self.database.read::<_, SyncSqliteError>(|conn| {
             Ok(conn
-                .query_row("SELECT paused FROM links WHERE local_path = ?1", [local_path], |row| {
-                    row.get::<_, i64>(0)
-                })
+                .query_row_cached(
+                    "SELECT paused FROM links WHERE local_path = ?1",
+                    [local_path],
+                    |row| row.get::<_, i64>(0),
+                )
                 .optional()?)
         })?;
         Ok(value.filter(|v| *v > 1))
@@ -761,7 +773,7 @@ impl LinkRepository {
         latest_plausible_unix: i64,
     ) -> Result<Vec<String>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT local_path FROM links
                  WHERE paused > 1 AND orphaned = 0 AND (paused <= ?1 OR paused > ?2)
                  ORDER BY local_path",
@@ -789,7 +801,7 @@ impl LinkRepository {
         self.database.read::<_, SyncSqliteError>(|conn| {
             Self::ensure_unambiguous_group_on_conn(conn, group_id, None)?;
             let flag: Option<i64> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT suppress_tombstones_until_scan FROM links \
                      WHERE group_id = ?1 AND orphaned = 0 ORDER BY local_path",
                     [group_id],
@@ -810,7 +822,7 @@ impl LinkRepository {
         self.database.read::<_, SyncSqliteError>(|conn| {
             Self::ensure_unambiguous_group_on_conn(conn, group_id, None)?;
             Ok(conn
-                .query_row(
+                .query_row_cached(
                     "SELECT capture_volume_identity FROM links \
                      WHERE group_id = ?1 AND orphaned = 0 ORDER BY local_path",
                     [group_id],
@@ -828,7 +840,7 @@ impl LinkRepository {
     ) -> Result<Option<String>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             Ok(conn
-                .query_row(
+                .query_row_cached(
                     "SELECT capture_volume_identity FROM links WHERE local_path = ?1",
                     [local_path],
                     |r| r.get::<_, Option<String>>(0),
@@ -847,7 +859,7 @@ impl LinkRepository {
         identity: &str,
     ) -> Result<(), SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            let affected = tx.execute(
+            let affected = tx.execute_cached(
                 "UPDATE links SET capture_volume_identity = ?2 \
                  WHERE group_id = ?1 AND orphaned = 0",
                 rusqlite::params![group_id, identity],
@@ -874,7 +886,7 @@ impl LinkRepository {
         identity: &str,
     ) -> Result<bool, SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            let affected = tx.execute(
+            let affected = tx.execute_cached(
                 "UPDATE links SET capture_volume_identity = ?3 \
                  WHERE local_path = ?1 AND group_id = ?2 AND orphaned = 0",
                 rusqlite::params![local_path, group_id, identity],
@@ -890,7 +902,7 @@ impl LinkRepository {
         suppress: bool,
     ) -> Result<(), SyncSqliteError> {
         let affected = self.database.write::<_, SyncSqliteError>(|conn| {
-            Ok(conn.execute(
+            Ok(conn.execute_cached(
                 "UPDATE links SET suppress_tombstones_until_scan = ?1 WHERE local_path = ?2",
                 rusqlite::params![suppress as i64, local_path],
             )?)
@@ -905,7 +917,7 @@ impl LinkRepository {
     /// after removing a duplicate root. Re-arming is idempotent.
     pub fn arm_duplicate_recovery_paths(&self, group_id: &str) -> Result<(), SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
-            conn.execute(
+            conn.execute_cached(
                 "INSERT OR IGNORE INTO duplicate_recovery_paths (group_id, path) \
                  SELECT group_id, path FROM files \
                  WHERE group_id = ?1 AND state = 'current' AND deleted = 0",
@@ -921,7 +933,7 @@ impl LinkRepository {
         path: &str,
     ) -> Result<(), SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
-            conn.execute(
+            conn.execute_cached(
                 "DELETE FROM duplicate_recovery_paths WHERE group_id = ?1 AND path = ?2",
                 rusqlite::params![group_id, path],
             )?;
@@ -931,7 +943,7 @@ impl LinkRepository {
 
     pub fn duplicate_recovery_pending(&self, group_id: &str) -> Result<bool, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            Ok(conn.query_row(
+            Ok(conn.query_row_cached(
                 "SELECT EXISTS(SELECT 1 FROM duplicate_recovery_paths WHERE group_id = ?1)",
                 [group_id],
                 |row| row.get(0),
@@ -952,7 +964,7 @@ impl LinkRepository {
         conn: &rusqlite::Connection,
         group_id: &str,
     ) -> Result<Vec<String>, SyncSqliteError> {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT local_path FROM links WHERE group_id = ?1 AND orphaned = 0 ORDER BY local_path",
         )?;
         let rows = stmt.query_map([group_id], |r| r.get::<_, String>(0))?;
@@ -1017,7 +1029,7 @@ impl LinkRepository {
         conn: &rusqlite::Connection,
         group_id: &str,
     ) -> Result<(), SyncSqliteError> {
-        let provider: bool = conn.query_row(
+        let provider: bool = conn.query_row_cached(
             "SELECT EXISTS(SELECT 1 FROM links WHERE group_id = ?1 AND orphaned = 0 \
              AND provider_kind <> 'none')",
             [group_id],
@@ -1033,7 +1045,7 @@ impl LinkRepository {
     pub fn creation_digest(&self, local_path: &str) -> Result<Option<String>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             Ok(conn
-                .query_row(
+                .query_row_cached(
                     "SELECT creation_digest FROM links WHERE local_path = ?1",
                     [local_path],
                     |r| r.get::<_, Option<String>>(0),
@@ -1118,7 +1130,7 @@ impl LinkRepository {
             Self::ensure_unambiguous_group_on_conn(conn, group_id, None)?;
             Self::refuse_provider_group(conn, group_id)?;
             let row: Option<(String, i64, String)> = conn
-                .query_row(
+                .query_row_cached(
                     "SELECT local_path, paused, materialization_policy FROM links \
                      WHERE group_id = ?1 AND orphaned = 0 ORDER BY local_path",
                     [group_id],
@@ -1191,7 +1203,7 @@ impl LinkRepository {
             // `orphaned = 0`: an orphaned link's authorization is permanently
             // gone, so its storage-mode role must not be flippable as if live,
             // even on this digest-guarded path.
-            let affected = tx.execute(
+            let affected = tx.execute_cached(
                 "UPDATE links SET materialization_policy = ?1 \
                  WHERE local_path = ?2 AND orphaned = 0",
                 rusqlite::params![policy.as_db_str(), local_path],
@@ -1254,7 +1266,7 @@ impl LinkRepository {
         root_token: &str,
     ) -> Result<(), SyncSqliteError> {
         let affected = self.database.write::<_, SyncSqliteError>(|conn| {
-            Ok(conn.execute(
+            Ok(conn.execute_cached(
                 "UPDATE links SET root_token = ?2 WHERE local_path = ?1",
                 rusqlite::params![local_path, root_token],
             )?)
@@ -1275,8 +1287,9 @@ impl LinkRepository {
         group_id: &str,
     ) -> Result<Vec<Option<String>>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let mut stmt = conn
-                .prepare("SELECT root_token FROM links WHERE group_id = ?1 ORDER BY local_path")?;
+            let mut stmt = conn.prepare_cached(
+                "SELECT root_token FROM links WHERE group_id = ?1 ORDER BY local_path",
+            )?;
             let rows = stmt.query_map([group_id], |r| r.get::<_, Option<String>>(0))?;
             Ok(rows.collect::<Result<_, _>>()?)
         })

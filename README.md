@@ -16,10 +16,10 @@ YadoriLink coordinates them, but does not store your files.
 
 - Direct encrypted sync between your devices
 - Account-based sharing, permissions, and revocation
-- Versions and conflict copies
+- Versions and conflict copies ([what is kept, and for how long](docs/VERSION_HISTORY.md))
 - On-demand storage, through the desktop apps (not part of the engine-only release)
 
-Supported platforms: macOS 14+ (Apple silicon), Windows 11 25H2+ (x64), and Linux x86_64 (experimental).
+Supported platforms: macOS 27 (Apple silicon), Windows 11 25H2+ (x64), and Linux x86_64 (experimental).
 
 ### What is available
 
@@ -28,14 +28,14 @@ Supported platforms: macOS 14+ (Apple silicon), Windows 11 25H2+ (x64), and Linu
 | Engine (`yadorilink` command line and daemon) for macOS, Windows and Linux | Available in this repository's releases |
 | Linux `.deb` package | Available |
 | macOS desktop app (signed, notarized DMG with in-app updates) | In development, not released yet |
-| Windows desktop app (Microsoft Store; the first version syncs full local copies only, without on-demand files) | In development, not released yet |
+| Windows desktop app (Microsoft Store; on-demand files fetch a whole file when it is opened, never part of one) | In development, not released yet |
 | One-line command-line installer, apt repository, Homebrew, WinGet | Planned |
 
 ## Get YadoriLink
 
 This repository contains the **engine**: the sync daemon and the
 `yadorilink` command line, plus the Linux package and the Windows Explorer
-integration. A container image is not part of this release. The macOS and
+integration, and a container image for a NAS or server (see Installing). The macOS and
 Windows desktop apps are released separately, not from this repository, and
 are not available yet.
 Watch [yadori.link](https://yadori.link/) for their release; the app will set
@@ -64,6 +64,11 @@ reasonably in sync are not affected.
 
 - **Linux (Debian/Ubuntu):** download the `.deb` from GitHub Releases, verify its
   `.sha256`, and install it with `sudo apt install ./yadorilink-linux-amd64.deb`.
+- **NAS or always-on server (Docker):** `ghcr.io/yadorilink/yadorilink:<version>`
+  for `linux/amd64` and `linux/arm64`, with a ready
+  [`compose.yaml`](packaging/docker/compose.yaml); see
+  [`packaging/docker/README.md`](packaging/docker/README.md). Use the exact release
+  version as the tag.
 - **Any platform, engine only:** unpack the engine bundle for your platform and
   put `yadorilink` and `yadorilink-daemon` on your `PATH`.
 - **Planned (not released yet):** a one-line installer for the command line
@@ -71,7 +76,7 @@ reasonably in sync are not affected.
   PowerShell equivalent on Windows) that installs under your home directory
   without administrator rights and checks every download against the signed
   release manifest before using it, and an apt repository, a Homebrew formula
-  with prebuilt binaries, WinGet, and a Docker image as alternatives. Whichever
+  with prebuilt binaries, and WinGet as alternatives. Whichever
   way you install, that tool is the one that updates it. Until these ship, use
   the options above.
 
@@ -133,6 +138,30 @@ Share with someone else:
 yadorilink share invite my-share --role editor
 # the recipient runs:
 yadorilink share accept <code> --path ~/some/folder
+```
+
+Keep older versions and go back in time:
+
+```bash
+yadorilink versions <file>            # every kept version of a file, newest first
+yadorilink restore <file> [--version N]  # restore the previous (or a chosen) version
+yadorilink rewind <folder> --at 2h           # preview rewinding a folder to two hours ago
+yadorilink rewind <folder> --at 2h --execute # confirm the counts, then run exactly that plan
+```
+
+Choose what is not synchronised with a `.yadorilinkignore` file in the folder;
+`yadorilink ignore list|test|explain` shows which patterns apply and why a
+path is ignored.
+
+Send files to another of your devices, or to someone on another account:
+
+```bash
+yadorilink send <paths...> <device>            # one transfer to one of your devices
+yadorilink send-link create <paths...>         # prints a code for the recipient
+yadorilink send-link redeem <code>             # the recipient accepts; add --to <folder>
+yadorilink send <paths...> link:<link-id>      # fill the link
+yadorilink inbox | outbox                      # transfers waiting for you, and ones you sent
+yadorilink receive <transfer-id> --to <folder> # accept an incoming transfer
 ```
 
 The daemon also serves a small web dashboard, on `127.0.0.1` only (port 8484;

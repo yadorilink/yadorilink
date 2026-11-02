@@ -227,10 +227,9 @@ pub fn file_version(size: u32, seed: u8) -> FileVersion {
         size as u64,
         FileMeta {
             mtime_unix_nanos: 1,
-            unix_mode: Some(0o644),
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     )
 }

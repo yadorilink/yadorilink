@@ -110,6 +110,10 @@ pub enum AttentionItem {
     /// Files in the folder cannot be read (permission refused, no longer a regular file): they
     /// are skipped, never read as deleted, and picked up again by the next scan once readable.
     UnreadableFiles,
+    /// A stored file record could not be read back, so the folder's protection and availability
+    /// are not claimed until it is repaired (`index_damaged_path`).
+    IndexDamaged,
+    RebuildNeeded,
     ProviderNotReady,
     ProviderFilesFailing,
     /// Edits kept beside a file instead of replacing it.
@@ -156,6 +160,8 @@ pub enum AttentionItem {
     /// The coordination service refuses to renew this installation's session (`invalid_grant`;
     /// the Terms may have changed). Local state is kept; signing in again is the remedy.
     SignInRequired,
+    /// Deletion of this account was asked for on another device and is not confirmed yet.
+    AccountDeletionRequested,
     /// This account is scheduled for deletion and in its ordinary grace window. Informational for
     /// a device of the account: nothing local changes, and the account's owner can still cancel.
     AccountDeletionPending,
@@ -222,9 +228,12 @@ impl AttentionItem {
             Self::NotJoined => "not_joined",
             Self::TermsConsentRequired => "terms_consent_required",
             Self::SignInRequired => "sign_in_required",
+            Self::AccountDeletionRequested => "account_deletion_requested",
             Self::AccountDeletionPending => "account_deletion_pending",
             Self::AccountDeletionUrgent => "account_deletion_urgent",
             Self::UnreadableFiles => "unreadable_files",
+            Self::IndexDamaged => "index_damaged",
+            Self::RebuildNeeded => "rebuild_needed",
             Self::Unrecognized => "unrecognized",
         }
     }
@@ -257,6 +266,8 @@ impl AttentionItem {
             | Self::FileNotReadable
             | Self::StrandedDirectory
             | Self::UnreadableFiles
+            | Self::IndexDamaged
+            | Self::RebuildNeeded
             | Self::ProviderNotReady
             | Self::ProviderRegistryRestored
             | Self::DatabaseRestored
@@ -264,6 +275,7 @@ impl AttentionItem {
             | Self::ReplacementSignInRequired
             | Self::TermsConsentRequired
             | Self::SignInRequired
+            | Self::AccountDeletionRequested
             | Self::AccountDeletionPending
             | Self::AccountDeletionUrgent
             | Self::EditsKeptBeside
@@ -284,6 +296,7 @@ impl AttentionItem {
             | Self::NotJoined
             | Self::FileWatchLimit
             | Self::NoSafeCopy
+            | Self::IndexDamaged
             | Self::DatabaseRestored
             | Self::AuthorUnavailable
             | Self::AccountDeletionUrgent
@@ -322,6 +335,8 @@ impl AttentionItem {
             | Self::FileHeld
             | Self::StrandedDirectory
             | Self::UnreadableFiles
+            | Self::IndexDamaged
+            | Self::RebuildNeeded
             | Self::ProviderRegistryRestored
             | Self::AuthorUnavailable
             | Self::ReplacementUnconfirmed
@@ -329,6 +344,7 @@ impl AttentionItem {
             | Self::ReplacementSignInRequired
             | Self::EditsKeptBeside
             | Self::PeerUnavailable
+            | Self::AccountDeletionRequested
             | Self::AccountDeletionPending
             | Self::AccountDeletionUrgent
             | Self::Unrecognized => ProductAction::ViewDetails,
@@ -384,6 +400,8 @@ impl Attention {
             "ownership_lost" => folder(AttentionItem::OwnershipLost),
             "not_joined" => folder(AttentionItem::NotJoined),
             "unreadable_files" => folder(AttentionItem::UnreadableFiles),
+            "index_damaged" => folder(AttentionItem::IndexDamaged),
+            "rebuild_needed" => folder(AttentionItem::RebuildNeeded),
             "volume_changed" => folder(AttentionItem::VolumeChanged),
             "volume_unconfirmed" => folder(AttentionItem::VolumeUnconfirmed),
             "durability_at_risk" => folder(AttentionItem::NoSafeCopy),
@@ -400,6 +418,7 @@ impl Attention {
             "provider_orphan_domain" => provider(AttentionItem::ProviderOrphan),
             "low_disk_critical" => (AttentionItem::DiskFull, AttentionScope::Volume(subject)),
             "low_disk" => (AttentionItem::DiskLow, AttentionScope::Volume(subject)),
+            // An older daemon still reports an absent device as a reason; it is read as a wait.
             "peer_disconnected" => {
                 (AttentionItem::PeerUnavailable, AttentionScope::Device(subject))
             }
@@ -426,6 +445,9 @@ impl Attention {
                 (AttentionItem::TermsConsentRequired, AttentionScope::General)
             }
             "sign_in_required" => (AttentionItem::SignInRequired, AttentionScope::General),
+            "account_deletion_requested" => {
+                (AttentionItem::AccountDeletionRequested, AttentionScope::General)
+            }
             "account_deletion_pending" => {
                 (AttentionItem::AccountDeletionPending, AttentionScope::General)
             }

@@ -46,7 +46,49 @@ async fn installation_rows() -> Vec<install_check::Finding> {
         running: running.as_ref(),
         local: &yadorilink_client_core::daemon::control::local_descriptor(),
         roots: &roots,
+        path_copies: &path_copies(),
     })
+}
+
+/// The distinct `yadorilink` programs on the search path, in search order, each shown as the path
+/// the search found it at. Two directories that link to one file are one copy (the real file is
+/// only the key), a file the shell would skip (not executable) is not a copy, and an empty path
+/// entry is not searched.
+fn path_copies() -> Vec<std::path::PathBuf> {
+    let name = if cfg!(windows) { "yadorilink.exe" } else { "yadorilink" };
+    let mut seen: Vec<std::path::PathBuf> = Vec::new();
+    let mut found: Vec<std::path::PathBuf> = Vec::new();
+    for dir in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = dir.join(name);
+        if !is_runnable_file(&candidate) {
+            continue;
+        }
+        let real = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+        if !seen.contains(&real) {
+            seen.push(real);
+            found.push(candidate);
+        }
+    }
+    found
+}
+
+fn is_runnable_file(path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else { return false };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn print_installation_rows(rows: &[install_check::Finding]) {

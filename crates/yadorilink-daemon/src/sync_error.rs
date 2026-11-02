@@ -158,7 +158,9 @@ pub enum SyncError {
     /// <version_seq>"`).
     #[error(
         "restoring {0:?} failed: the chosen version's content is unavailable — required blocks \
-         are missing locally and no reachable, authorized peer holds them"
+         are missing locally and no reachable, authorized peer holds them (a version this \
+         device replaced by its own edit or delete is not kept; `yadorilink versions` shows \
+         content=not-kept for it)"
     )]
     VersionContentUnavailable(String),
 
@@ -469,6 +471,13 @@ impl From<yadorilink_sync_sqlite::SyncSqliteError> for SyncError {
             error @ yadorilink_sync_sqlite::SyncSqliteError::LocalWriteCaptureStale { .. } => {
                 SyncError::InvalidInput(error.to_string())
             }
+            // A write that would replace a version with bytes to keep without the right retention
+            // proof -- see `SyncSqliteError::RetentionProofMissing` and `RetentionProofStale`.
+            // Nothing was written; the caller that made the proof proves the row as it stands.
+            error @ (yadorilink_sync_sqlite::SyncSqliteError::RetentionProofMissing { .. }
+            | yadorilink_sync_sqlite::SyncSqliteError::RetentionProofStale { .. }) => {
+                SyncError::InvalidInput(error.to_string())
+            }
             // A local authoring refused by an authoring rule
             // -- see `SyncSqliteError::AuthoringRefused`. Nothing was
             // written. Flattened to a message for the same reason as the
@@ -661,9 +670,6 @@ impl From<yadorilink_filesystem_sync::materialization_execution::Materialization
             E::CorruptState(msg) => SyncError::CorruptState(msg),
             E::EvictionRejected(msg) => SyncError::EvictionRejected(msg),
             E::EvictionOutcomeAmbiguous(msg) => SyncError::EvictionOutcomeAmbiguous(msg),
-            // The same outcome access hydration reports for attributes it set
-            // but could not confirm: no proof, retry later.
-            E::ReplicatedXattrsNotProven(msg) => SyncError::HydrationFailed(msg),
             E::PolicyUnavailable => SyncError::PolicyUnavailable,
             E::PathEscapesRoot(msg) => SyncError::PathEscapesRoot(msg),
             E::DiskPressure { path, volume, available_bytes, headroom_bytes } => {

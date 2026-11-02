@@ -141,6 +141,7 @@ fn hold_record_upserts_and_marks_held_without_touching_disk() {
         "device-a",
         None,
         &plain_file_columns(),
+        yadorilink_sync_sqlite::retention::Retention::OwnEdit,
         &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
     )
     .unwrap();
@@ -181,6 +182,7 @@ fn hold_record_demotes_to_placeholder_so_repair_never_reads_it_as_an_offline_del
         "device-a",
         None,
         &plain_file_columns(),
+        yadorilink_sync_sqlite::retention::Retention::OwnEdit,
         &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
     )
     .unwrap();
@@ -237,6 +239,7 @@ fn hold_record_never_writes_under_any_alternate_name() {
         "device-a",
         None,
         &plain_file_columns(),
+        yadorilink_sync_sqlite::retention::Retention::OwnEdit,
         &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
     )
     .unwrap();
@@ -259,7 +262,6 @@ fn plain_file_columns() -> yadorilink_replica_domain::session_state::LocalFileMe
         record_kind: yadorilink_replica_domain::file::RecordKind::File,
         symlink_target: None,
         symlink_out_of_root: false,
-        unix_mode: None,
-        xattrs: Vec::new(),
+        exec: false,
     }
 }

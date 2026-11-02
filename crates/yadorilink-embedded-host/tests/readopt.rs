@@ -150,7 +150,10 @@ fn mark_all(host: &EmbeddedHost) {
             false,
             || {},
             move |commands| async move {
-                commands.mark_not_rejoined(&folder.key).await.map(|()| CommandOutput::Done)
+                let marked = commands.mark_not_rejoined(&folder.key).await;
+                // A command run through the dispatcher counts itself; this one is run by hand.
+                commands.command_completed();
+                marked.map(|()| CommandOutput::Done)
             },
             &within(),
         )

@@ -48,6 +48,7 @@
 //! more reliably the path stayed outstanding.
 
 use rusqlite::Transaction;
+use yadorilink_sqlite_runtime::CachedStatements as _;
 
 use yadorilink_fs_platform::fs_identity::FileIdentity;
 use yadorilink_replica_domain::file::RecordKind;
@@ -258,7 +259,7 @@ pub fn commit_internal_materialized_state_with_intent(
     // Checked before anything is written, so a superseded attempt leaves
     // the row exactly as it found it -- including its still-open intent.
     if let Some(guard) = expected_authoring {
-        let still_matches: i64 = tx.query_row(
+        let still_matches: i64 = tx.query_row_cached(
             "SELECT COUNT(*) FROM files \
              WHERE group_id = ?1 AND path = ?2 AND state = 'current' \
                AND materialization_state = ?3",
@@ -297,7 +298,7 @@ pub fn commit_internal_materialized_state_with_intent(
 
     let Some(basis) = published else {
         let live: Option<i64> = tx
-            .query_row(
+            .query_row_cached(
                 "SELECT mutation_generation FROM path_actual_mutation_fences \
                  WHERE group_id = ?1 AND path = ?2",
                 rusqlite::params![group_id, path],
@@ -489,9 +490,11 @@ pub type CloseWriteOutcome = Result<(InternalMaterializedCommit, bool), SyncSqli
 /// same order, against its own row: the authoring and expected-version
 /// guard, the fence-current proof publish, the `Present` stamp, the intent
 /// clear (which clears the replaced targets with it), and the claimed
-/// obligation's completion with the claim's generation and incarnation. Then
-/// `verify(index)` runs for that request, which is where the caller checks
-/// that request's own root permit.
+/// obligation's completion with the claim's generation and incarnation. Once
+/// every request has run, `verify(index)` runs for each request in order, which
+/// is where the caller checks that request's own root permit; it runs after the
+/// last statement and before the caller commits, so a caller whose requests share
+/// a root authority need verify it only once.
 ///
 /// A failing `verify` means the root is no longer this link's, which no
 /// item's commit may outlive: it fails the whole call, so the transaction
@@ -515,9 +518,7 @@ pub fn close_content_writes_in_tx(
     let mut outcomes = Vec::with_capacity(requests.len());
     for (index, request) in requests.iter().enumerate() {
         if !disk_exact(index) {
-            // Nothing is written for this item, but a lost root still fails
-            // the whole call.
-            verify(index)?;
+            // Nothing is written for this item; its root is still checked with the others below.
             outcomes.push(Ok((InternalMaterializedCommit::AuthoringSuperseded, false)));
             continue;
         }
@@ -565,8 +566,6 @@ pub fn close_content_writes_in_tx(
                 ),
             })
         })();
-        // Whatever the statements did, a lost root fails the whole call.
-        verify(index)?;
         // A transient lock is not this item's verdict: it fails the whole call,
         // whose transaction is rolled back and retried by the writer.
         let outcome = match outcome {
@@ -580,6 +579,11 @@ pub fn close_content_writes_in_tx(
         }
         tx.execute_batch("RELEASE close_content_write")?;
         outcomes.push(outcome);
+    }
+    // Whatever the statements did, a lost root fails the whole call. Checked once every statement
+    // has run, right before the caller commits (see `open_content_writes_in_tx`).
+    for index in 0..requests.len() {
+        verify(index)?;
     }
     Ok(outcomes)
 }

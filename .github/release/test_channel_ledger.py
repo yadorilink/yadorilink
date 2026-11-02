@@ -1247,7 +1247,7 @@ class Channels(unittest.TestCase):
                                      promotion_source=src), [])
 
     def test_a_typed_stamp_is_refused(self):
-        """#1383: the stamps come from the publisher's clock; a ledger file may not carry them."""
+        """The stamps come from the publisher's clock; a ledger file may not carry them."""
         recs = records("0.4.2", sources=("script",))
         for name in ("published_at", "full_rollout_at"):
             led = ledger({"script": "0.4.2"})

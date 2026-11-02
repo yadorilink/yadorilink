@@ -447,6 +447,8 @@ async fn preflight<H: Host>(host: &H, ctx: &Context, req: &Request) -> Result<Pl
         running: running.as_ref(),
         local: &local,
         roots: &ctx.roots,
+        // The hand-off judges this installation's own consistency, not other copies on the path.
+        path_copies: &[],
     });
     let failed: Vec<String> = rows
         .iter()

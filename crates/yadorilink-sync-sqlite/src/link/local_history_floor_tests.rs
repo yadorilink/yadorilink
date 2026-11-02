@@ -40,6 +40,7 @@ fn admit_file(db: &Arc<SyncDatabase>, path: &str) {
                 deleted: false,
             },
             "device-that-was-here-first",
+            crate::retention::Retention::OwnEdit,
         )
     })
     .expect("the file admission must succeed");

@@ -26,6 +26,18 @@ pub struct StartupRefusal {
     pub reason: String,
     /// The supported reset, when the data on disk is known to be unusable by this build.
     pub start_over: Option<StartOver>,
+    /// A stable reason a front end can branch on instead of parsing `reason`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<RefusalCode>,
+}
+
+/// Why this Mac refuses the daemon of one build because of the other build (the direct and the Mac App
+/// Store builds are not used on one Mac). `channel` is the other build: `direct` or `store`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "code", content = "channel", rename_all = "snake_case")]
+pub enum RefusalCode {
+    OtherChannelRunning(String),
+    OtherChannelConfigured(String),
 }
 
 /// The supported reset of unusable data: what to delete, with the service stopped.
@@ -40,7 +52,13 @@ impl StartupRefusal {
     /// A refusal with no step of its own.
     #[must_use]
     pub fn plain(reason: impl Into<String>) -> Self {
-        Self { reason: reason.into(), start_over: None }
+        Self { reason: reason.into(), start_over: None, code: None }
+    }
+
+    /// A refusal a front end identifies by `code`.
+    #[must_use]
+    pub fn coded(reason: impl Into<String>, code: RefusalCode) -> Self {
+        Self { reason: reason.into(), start_over: None, code: Some(code) }
     }
 
     /// The whole explanation in host-neutral words.
@@ -104,6 +122,7 @@ mod tests {
     fn the_reset_steps_survive_the_record_and_the_neutral_text_names_no_command() {
         let dir = tempfile::tempdir().unwrap();
         let refusal = StartupRefusal {
+            code: None,
             reason: "cannot open".into(),
             start_over: Some(StartOver {
                 sync_db: "/d/db".into(),
@@ -117,5 +136,21 @@ mod tests {
         let message = read.message();
         assert!(message.contains("/d/db") && message.contains("/d/blocks"), "{message}");
         assert!(!message.contains("yadorilink"), "{message}");
+    }
+
+    #[test]
+    fn a_coded_refusal_keeps_its_code_and_an_old_record_without_one_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let refusal = StartupRefusal::coded(
+            "other build",
+            RefusalCode::OtherChannelConfigured("store".into()),
+        );
+        record(dir.path(), &refusal).unwrap();
+        assert_eq!(
+            read(dir.path()).unwrap().code,
+            Some(RefusalCode::OtherChannelConfigured("store".into()))
+        );
+        std::fs::write(dir.path().join(FILE_NAME), br#"{"reason":"x","start_over":null}"#).unwrap();
+        assert_eq!(read(dir.path()).unwrap().code, None);
     }
 }

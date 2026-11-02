@@ -18,6 +18,7 @@
 //! property of the call graph, not a runtime check.
 
 use rusqlite::{Connection, OptionalExtension};
+use yadorilink_sqlite_runtime::CachedStatements as _;
 
 use crate::error::SyncSqliteError;
 
@@ -214,7 +215,7 @@ pub fn lookup_projection_obligation(
     group_id: &str,
     path: &str,
 ) -> Result<Option<ProjectionObligation>, SyncSqliteError> {
-    conn.query_row(
+    conn.query_row_cached(
         "SELECT invalidation_generation, state, attempt_count, next_attempt_at, created_at,
                 updated_at, obligation_incarnation, origin
            FROM projection_obligations WHERE group_id = ?1 AND path = ?2",
@@ -434,17 +435,45 @@ pub fn claim_runnable_obligations(
     Ok(candidates.into_iter().map(|(_, claimed)| claimed).collect())
 }
 
+/// When the clock next makes a pending obligation runnable: the earliest `next_attempt_at` among
+/// the rows [`claim_runnable_obligations`] could ever claim. `None` when no such row exists.
+///
+/// A row that is parked (`'ignore_blocked'`), covered by a paused item, held, in a frozen group
+/// or in a provider group never becomes runnable with the clock: what unblocks it is a write to
+/// the replica database, so it must not keep the engine on a timer. The value may be in the past
+/// when a row became due after the claim that preceded this read.
+pub fn next_obligation_wake(conn: &Connection) -> Result<Option<i64>, SyncSqliteError> {
+    let filters = runnable_filters_sql();
+    let mut earliest = conn.prepare_cached(&format!(
+        "SELECT next_attempt_at FROM projection_obligations \
+         INDEXED BY idx_projection_obligations_due \
+         WHERE state = 'pending' AND group_id = ?1 {filters} \
+         ORDER BY next_attempt_at ASC LIMIT 1"
+    ))?;
+    let mut wake: Option<i64> = None;
+    for group_id in pending_group_ids(conn)? {
+        if crate::native_rebootstrap::group_frozen(conn, &group_id)?
+            || is_provider_group(conn, &group_id)?
+        {
+            continue;
+        }
+        if let Some(at) = earliest.query_row([&group_id], |r| r.get::<_, i64>(0)).optional()? {
+            wake = Some(wake.map_or(at, |w| w.min(at)));
+        }
+    }
+    Ok(wake)
+}
+
 /// Whether `group_id` has a provider root (a database without the provider tables has none).
 fn is_provider_group(conn: &Connection, group_id: &str) -> Result<bool, SyncSqliteError> {
-    let has_table: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'provider_roots')",
+    let has_table: bool = conn.query_row_cached("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'provider_roots')",
         [],
         |r| r.get(0),
     )?;
     if !has_table {
         return Ok(false);
     }
-    Ok(conn.query_row(
+    Ok(conn.query_row_cached(
         "SELECT EXISTS(SELECT 1 FROM provider_roots WHERE group_id = ?1)",
         [group_id],
         |r| r.get(0),
@@ -687,7 +716,7 @@ pub fn mark_obligation_attempt_failed(
     next_attempt_at: i64,
     now_unix_nanos: i64,
 ) -> Result<bool, SyncSqliteError> {
-    let affected = conn.execute(
+    let affected = conn.execute_cached(
         "UPDATE projection_obligations
             SET attempt_count = attempt_count + 1,
                 next_attempt_at = ?5,
@@ -724,7 +753,7 @@ pub fn defer_obligation_without_penalty(
     next_attempt_at: i64,
     now_unix_nanos: i64,
 ) -> Result<bool, SyncSqliteError> {
-    let affected = conn.execute(
+    let affected = conn.execute_cached(
         "UPDATE projection_obligations
             SET next_attempt_at = ?5,
                 updated_at = ?6
@@ -776,7 +805,7 @@ pub fn complete_obligation_if_exact_proof_current(
     claimed_obligation_incarnation: i64,
     desired_resolved_path_state_hash: &[u8],
 ) -> Result<bool, SyncSqliteError> {
-    let affected = conn.execute(
+    let affected = conn.execute_cached(
         "DELETE FROM projection_obligations
           WHERE group_id = ?1 AND path = ?2
             AND invalidation_generation = ?3
@@ -941,7 +970,7 @@ pub fn complete_obligation_if_non_exact_proof_current(
     proof: NonExactProofKind,
 ) -> Result<bool, SyncSqliteError> {
     let affected = match proof {
-        NonExactProofKind::ContentNotOwed => conn.execute(
+        NonExactProofKind::ContentNotOwed => conn.execute_cached(
             "DELETE FROM projection_obligations
               WHERE group_id = ?1 AND path = ?2
                 AND invalidation_generation = ?3
@@ -958,7 +987,7 @@ pub fn complete_obligation_if_non_exact_proof_current(
                 claimed_obligation_incarnation
             ],
         )?,
-        NonExactProofKind::HazardHeld => conn.execute(
+        NonExactProofKind::HazardHeld => conn.execute_cached(
             "DELETE FROM projection_obligations
               WHERE group_id = ?1 AND path = ?2
                 AND invalidation_generation = ?3
@@ -983,7 +1012,7 @@ pub fn complete_obligation_if_non_exact_proof_current(
         // DIFFERENT, already-deleted incarnation of this same path must
         // never be able to park a brand-new incarnation as ignore-blocked
         // just because the generation numbers happen to coincide.
-        NonExactProofKind::RetainedDirectory => conn.execute(
+        NonExactProofKind::RetainedDirectory => conn.execute_cached(
             "DELETE FROM projection_obligations
               WHERE group_id = ?1 AND path = ?2
                 AND invalidation_generation = ?3
@@ -999,7 +1028,7 @@ pub fn complete_obligation_if_non_exact_proof_current(
                 claimed_obligation_incarnation
             ],
         )?,
-        NonExactProofKind::IgnoreExcluded => conn.execute(
+        NonExactProofKind::IgnoreExcluded => conn.execute_cached(
             "UPDATE projection_obligations
                 SET state = 'ignore_blocked'
               WHERE group_id = ?1 AND path = ?2
@@ -1025,7 +1054,7 @@ pub fn list_ignore_blocked_paths(
     conn: &Connection,
     group_id: &str,
 ) -> Result<Vec<String>, SyncSqliteError> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT path FROM projection_obligations WHERE group_id = ?1 AND state = 'ignore_blocked'",
     )?;
     let rows = stmt.query_map(rusqlite::params![group_id], |r| r.get(0))?;
@@ -1051,7 +1080,7 @@ pub fn rearm_ignore_blocked_obligation(
     path: &str,
     now_unix_nanos: i64,
 ) -> Result<bool, SyncSqliteError> {
-    let affected = conn.execute(
+    let affected = conn.execute_cached(
         "UPDATE projection_obligations
             SET state = 'pending',
                 next_attempt_at = ?3,

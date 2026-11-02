@@ -33,6 +33,17 @@ fn handle_launch_args_or_exit() {
             let _ = out.flush();
             std::process::exit(0);
         }
+        LaunchAction::Healthcheck => {
+            let code = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map(|rt| rt.block_on(yadorilink_daemon::healthcheck::run_from_env()))
+                .unwrap_or(1);
+            std::process::exit(code);
+        }
+        LaunchAction::CheckDataCompat => {
+            std::process::exit(yadorilink_daemon::data_compat::run_from_env());
+        }
         LaunchAction::Version => {
             // The embedded build identity is printed so a release can check that the binary it
             // ships carries the identity it publishes (`check-engine-artifact.py`).
@@ -140,7 +151,10 @@ async fn async_main(arena_cap: yadorilink_daemon::malloc_arenas::ArenaCap) -> an
     if let Ok(end) = &result {
         if let Some(status) = end.exit_status() {
             // The supervisor restarts a daemon that exits with a non-zero status.
-            tracing::info!("executable replaced; restarting");
+            tracing::info!(
+                status,
+                "restart requested; exiting for the supervisor to start the daemon again"
+            );
             std::process::exit(status);
         }
     }

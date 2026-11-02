@@ -12,12 +12,12 @@ use std::collections::HashSet;
 
 use rusqlite::Connection;
 
-use yadorilink_replica_domain::file::FileRecord;
+use yadorilink_replica_domain::file::{FileRecord, RecordKind};
 use yadorilink_replica_domain::native_plan::NativeRowIdentity;
 use yadorilink_replica_domain::session_state::{LocalFileMetaColumns, MaterializationState};
 
 use crate::error::SyncSqliteError;
-use crate::file_index::{encode_unix_mode_column, encode_xattrs_column, now_unix_nanos_checked};
+use crate::file_index::now_unix_nanos_checked;
 use crate::store::PATHS_PER_QUERY;
 
 /// Rows one insert binds: ten parameters each, under SQLite's variable limit.
@@ -104,6 +104,9 @@ pub(crate) fn insert_hydrated_rows(
     if rows.is_empty() {
         return Ok(());
     }
+    for row in rows {
+        crate::file_index::refuse_unreadable_block_list(row.record)?;
+    }
     #[cfg(test)]
     tests_support::ROWS_WRITTEN.with(|n| n.set(n.get() + rows.len()));
     record_witnesses(tx, group_id, rows)?;
@@ -114,10 +117,10 @@ pub(crate) fn insert_hydrated_rows(
     for chunk in rows.chunks(ROWS_PER_INSERT) {
         let values: Vec<String> = (0..chunk.len())
             .map(|i| {
-                let b = 5 + 12 * i;
+                let b = 5 + 11 * i;
                 format!(
                     "(?1, ?{}, ?{}, ?{}, ?{}, 0, 1, 'current', ?2, ?3, ?{}, ?4, ?{}, ?{}, ?{}, \
-                     ?{}, ?{}, ?{}, ?{})",
+                     ?{}, ?{}, ?{})",
                     b,
                     b + 1,
                     b + 2,
@@ -128,8 +131,7 @@ pub(crate) fn insert_hydrated_rows(
                     b + 7,
                     b + 8,
                     b + 9,
-                    b + 10,
-                    b + 11
+                    b + 10
                 )
             })
             .collect();
@@ -137,11 +139,11 @@ pub(crate) fn insert_hydrated_rows(
             "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, deleted, \
              version_seq, state, origin_device_id, admitted_at_unix_nanos, \
              native_authoring_identity, materialization_state, record_kind, symlink_target, \
-             symlink_out_of_root, unix_mode, xattrs_json, case_fold_key, canonical_fold_key) \
+             symlink_out_of_root, exec, case_fold_key, canonical_fold_key) \
              VALUES {}",
             values.join(", ")
         ))?;
-        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(4 + 12 * chunk.len());
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(4 + 11 * chunk.len());
         params.push(group_id.to_owned().into());
         params.push(origin.map(str::to_owned).into());
         params.push(admitted_at_unix_nanos.into());
@@ -157,14 +159,20 @@ pub(crate) fn insert_hydrated_rows(
             params.push(row.meta.record_kind.as_db_str().to_owned().into());
             params.push(row.meta.symlink_target.clone().into());
             params.push((row.meta.symlink_out_of_root as i64).into());
-            params.push(encode_unix_mode_column(row.meta.unix_mode).into());
-            params.push(encode_xattrs_column(&row.meta.xattrs).into());
+            params.push(i64::from(row.meta.exec).into());
             let (case_key, canonical_key) = crate::file_index::name_fold_keys(&row.record.path);
             params.push(case_key.into());
             params.push(canonical_key.into());
         }
         stmt.execute(rusqlite::params_from_iter(params))?;
     }
+    crate::activity::record_new_paths_in_tx(
+        tx,
+        group_id,
+        origin,
+        rows.iter()
+            .map(|row| (row.record.path.as_str(), row.meta.record_kind == RecordKind::Directory)),
+    )?;
     require_rows_show_native_heads(tx, group_id, rows)
 }
 

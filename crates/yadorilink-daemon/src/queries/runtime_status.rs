@@ -26,6 +26,8 @@ pub(crate) struct PeerStatusView {
     pub(crate) version_incompatible: bool,
     /// The device that replaced this one, when the account replaced it.
     pub(crate) replaced_by_device_id: Option<String>,
+    /// The last time a session with this peer was up (now while connected); 0 when never.
+    pub(crate) last_connected_unix: i64,
 }
 
 /// The volume entry for the block store (the volume holding the daemon's data).
@@ -100,6 +102,23 @@ pub(crate) type CoordinationBlockSource =
 pub(crate) type AccountDeletionSource =
     Arc<dyn Fn() -> crate::daemon_state::AccountDeletionState + Send + Sync>;
 
+/// What a status reads from the ledger, the block index and the filesystem, collected by the
+/// status builder (see `crate::status_facts`).
+pub(crate) struct RuntimeFacts {
+    pub(crate) links: Vec<crate::queries::link_status::LinkFacts>,
+    governance: crate::governance_config::ResourceGovernanceConfig,
+    volumes: Vec<VolumeSpaceView>,
+    block_store_usage: yadorilink_local_storage::StorageUsage,
+    #[cfg(feature = "process-model")]
+    update: UpdateStatusView,
+}
+
+impl RuntimeFacts {
+    pub(crate) fn volume_paths(&self) -> impl Iterator<Item = &str> {
+        self.volumes.iter().map(|v| v.path.as_str())
+    }
+}
+
 pub(crate) struct RuntimeStatusQueryService {
     link_status: Arc<LinkStatusQueryService>,
     #[cfg(feature = "process-model")]
@@ -112,6 +131,7 @@ pub(crate) struct RuntimeStatusQueryService {
     gc: Arc<GcState>,
     rate_limiters: Arc<RateLimiters>,
     replica: Arc<crate::replica_coordinator::ReplicaCoordinator>,
+    audit: crate::index_audit::IndexAudit,
     coordination_block: CoordinationBlockSource,
     account_deletion: AccountDeletionSource,
 }
@@ -144,6 +164,7 @@ impl RuntimeStatusQueryService {
             gc,
             rate_limiters,
             replica,
+            audit: crate::index_audit::IndexAudit::default(),
             coordination_block,
             account_deletion,
         }
@@ -159,24 +180,57 @@ impl RuntimeStatusQueryService {
         same_volume(root, std::path::Path::new(path))
     }
 
-    pub(crate) fn snapshot(&self) -> Result<RuntimeStatusView, crate::sync_error::SyncError> {
-        let links = self.link_status.list_links()?;
+    pub(crate) fn telemetry(&self) -> Arc<RuntimeTelemetry> {
+        self.telemetry.clone()
+    }
+
+    /// Signals when a ledger write has changed rows.
+    pub(crate) fn data_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.replica.database().subscribe_data_changes()
+    }
+
+    /// Reads every ledger, block-index, filesystem and file input of a status. The status builder
+    /// calls this off the request path; [`Self::snapshot_from`] answers a request from the result.
+    pub(crate) fn collect(&self) -> Result<RuntimeFacts, crate::sync_error::SyncError> {
+        let mut links = self.link_status.collect_links()?;
+        self.audit.refresh(self.replica.file_index_repository(), &mut links);
+        let governance = self.governance.load_or_default();
+        let volumes = self.volumes_free_space(links.iter().map(|l| l.local_path()), &governance);
+        Ok(RuntimeFacts {
+            links,
+            governance,
+            volumes,
+            #[cfg(feature = "process-model")]
+            update: self.update_status.snapshot(),
+            block_store_usage: self.block_store.usage().unwrap_or_default(),
+        })
+    }
+
+    /// Joins collected facts with the in-memory ones (peers, transfers, rates, errors). Reads no
+    /// ledger, file or block index. `stale`: the facts are older than a positive claim may stand
+    /// on, so every link reports its protection and availability as unknown.
+    pub(crate) fn snapshot_from(&self, facts: &RuntimeFacts, stale: bool) -> RuntimeStatusView {
+        let mut links = self.link_status.compose_links(&facts.links);
+        if stale {
+            for link in &mut links {
+                link.withhold_positive_claims();
+            }
+        }
         let peers = peers_with_replaced(self.peers.every_peer_reachability(), &self.authority)
             .into_iter()
             // A peer of another protocol version connects (the transport has one fixed ALPN) and
             // is refused at the lane hello: it stays reachable and is marked incompatible.
             .map(|(device_id, reachability)| PeerStatusView {
+                last_connected_unix: self.peers.last_connected_unix(&device_id),
                 version_incompatible: self.peers.is_version_incompatible(&device_id),
                 replaced_by_device_id: self.authority.superseded_by(&device_id),
                 device_id,
                 reachability,
             })
             .collect();
-        let governance = self.governance.load_or_default();
-        let volumes = self.volumes_free_space(&links);
-        #[cfg(feature = "process-model")]
-        let update = self.update_status.snapshot();
-        let block_store_usage = self.block_store.usage().unwrap_or_default();
+        let governance = &facts.governance;
+        let volumes = facts.volumes.clone();
+        let block_store_usage = facts.block_store_usage;
         let active_transfers = self
             .telemetry
             .active_transfer_snapshot()
@@ -203,7 +257,7 @@ impl RuntimeStatusQueryService {
             })
             .collect();
 
-        Ok(RuntimeStatusView {
+        RuntimeStatusView {
             links,
             peers,
             upload_limit_bytes_per_sec: governance.upload_limit_bytes_per_sec,
@@ -215,7 +269,7 @@ impl RuntimeStatusQueryService {
                 .current_rate_bytes_per_sec(),
             volumes,
             #[cfg(feature = "process-model")]
-            update,
+            update: facts.update.clone(),
             block_store: BlockStoreUsageView {
                 total_bytes: block_store_usage.total_bytes,
                 block_count: block_store_usage.block_count,
@@ -228,7 +282,7 @@ impl RuntimeStatusQueryService {
             author_unavailable: self.replica.author_unavailable(),
             coordination_block: (self.coordination_block)(),
             account_deletion: (self.account_deletion)(),
-        })
+        }
     }
 
     /// Free-space state for every volume hosting the block store or a
@@ -240,8 +294,12 @@ impl RuntimeStatusQueryService {
     /// currently be queried is silently omitted, matching every other
     /// silent-degrade in this snapshot -- `Status` reports what it can,
     /// never fails wholesale over one unreadable volume.
-    pub(crate) fn volumes_free_space(&self, links: &[LinkStatusView]) -> Vec<VolumeSpaceView> {
-        let headroom_override = self.governance.load_or_default().headroom_override_bytes;
+    pub(crate) fn volumes_free_space<'a>(
+        &self,
+        local_paths: impl Iterator<Item = &'a str>,
+        governance: &crate::governance_config::ResourceGovernanceConfig,
+    ) -> Vec<VolumeSpaceView> {
+        let headroom_override = governance.headroom_override_bytes;
         let mut seen_paths = std::collections::HashSet::new();
         let mut volumes = Vec::new();
 
@@ -255,16 +313,16 @@ impl RuntimeStatusQueryService {
             });
         }
 
-        for link in links {
-            if !seen_paths.insert(link.local_path.clone()) {
+        for local_path in local_paths {
+            if !seen_paths.insert(local_path.to_string()) {
                 continue;
             }
             if let Ok(space) = yadorilink_local_storage::free_space::classify_volume(
-                std::path::Path::new(&link.local_path),
+                std::path::Path::new(local_path),
                 headroom_override,
             ) {
                 volumes.push(VolumeSpaceView {
-                    path: link.local_path.clone(),
+                    path: local_path.to_string(),
                     state: space.classify().as_str().to_string(),
                     available_bytes: space.available_bytes,
                     headroom_bytes: space.headroom_bytes,

@@ -40,10 +40,18 @@ add a line naming the release that first carries the new pair:
 
     - Generation PROTOCOL_VERSION = N, RPC_VERSION = M: first release X.Y.Z
 
-- Generation PROTOCOL_VERSION = 4, RPC_VERSION = 2: first release 0.0.0
+- Generation PROTOCOL_VERSION = 4, RPC_VERSION = 4: first release 0.0.0
 
 The `0.0.0` above is a placeholder for the release tooling, not a release: it
 means this generation sets no floor above the lowest version. The first public
 release carrying generation (4, 2) is v0.1.0-beta.5, and beta.6 and beta.7 carry
-the same generation. The machine-read line is left as is.
+the same generation. The service RPC moved to 3 and then 4 after that, so the line names
+(4, 4); the release that first carries it is set when its release record is written.
+The machine-read line keeps the placeholder until then.
 - SCHEMA_VERSION = 133: adds the ledger of file windows served to the OS (lets a large file read through the OS partial-content API be freed); local state is not migrated before 1.0, so the local state must be recreated.
+- SCHEMA_VERSION = 134: adds the recent-activity log (the Activity view lists added, updated, deleted, conflicted and restored files); local state is not migrated before 1.0, so the local state must be recreated.
+- SCHEMA_VERSION = 135: only the execute bit of a file is synchronised and extended attributes are not (the native protocol generation is now 10, the file version tag changed); the local state of every device is not migrated before 1.0, so it must be recreated, and every device must be updated together. Before updating, save what `yadorilink preserved list` shows.
+- SCHEMA_VERSION = 137: the write-intent journal records the temp file whose directory entry was flushed before a batched receive's rename, so a file the user deletes while that flush is still owed stays deleted after a power cut; local state is not migrated before 1.0, so the local state must be recreated. Before updating, save what `yadorilink preserved list` shows.
+- SCHEMA_VERSION = 138: adds the table that keeps when each peer was last connected (a device that is away shows when it was last seen); local state is not migrated before 1.0, so the local state must be recreated.
+- RPC_VERSION = 3: the group durability summary carries how many current rows the responder holds only in its folder, not in its block store (a peer whose copy is a file alone no longer corroborates `Protected`); a service RPC with any other version is an error, so every device updates together. The generation line above gets its release when the release record names it.
+- RPC_VERSION = 4: the answers to a version-present query and to a custody acquire are three-valued (held, not held, in progress), so a responder that is still reading a large version back is waited for instead of timing out; a service RPC with any other version is an error, so every device updates together.

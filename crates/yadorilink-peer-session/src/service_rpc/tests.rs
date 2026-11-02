@@ -22,8 +22,8 @@ fn a_request_round_trips() {
 
 #[test]
 fn a_response_round_trips() {
-    for present in [true, false] {
-        let response = ServiceResponse::VersionPresent { present };
+    for answer in [ProofAnswer::Held, ProofAnswer::NotHeld, ProofAnswer::InProgress] {
+        let response = ServiceResponse::VersionPresent { answer };
         assert_eq!(decode_response(&encode_response(&response)).unwrap(), response);
     }
 }
@@ -61,7 +61,9 @@ fn custody_messages_round_trip_and_reject_every_truncation() {
     }
     for flag in [true, false] {
         for response in [
-            ServiceResponse::CustodyAcquire { granted: flag },
+            ServiceResponse::CustodyAcquire {
+                answer: if flag { ProofAnswer::Held } else { ProofAnswer::InProgress },
+            },
             ServiceResponse::CustodyRelease { released: flag },
             ServiceResponse::CustodyRehome { moved: flag },
         ] {
@@ -133,7 +135,8 @@ fn the_retired_rebootstrap_kind_is_refused_both_ways() {
 /// all a granting one).
 #[test]
 fn a_response_of_another_generation_or_unknown_kind_never_decodes() {
-    let mut granting = encode_response(&ServiceResponse::CustodyAcquire { granted: true });
+    let mut granting =
+        encode_response(&ServiceResponse::CustodyAcquire { answer: ProofAnswer::Held });
     for version in [RPC_VERSION - 1, RPC_VERSION + 1] {
         granting[0] = version;
         assert!(matches!(
@@ -151,4 +154,46 @@ fn a_response_of_another_generation_or_unknown_kind_never_decodes() {
         decode_response(&[RPC_VERSION, 0xEE, 1]),
         Err(ServiceRpcError::UnknownKind(0xEE))
     ));
+}
+
+/// The durability summary carries how many current rows the responder holds only in its folder; a
+/// response of another version (the layout before that field) is refused, not misread.
+#[test]
+fn a_durability_summary_round_trips_its_file_only_count() {
+    let response = ServiceResponse::GroupDurabilitySummary {
+        summary: Some(GroupDurabilitySummary {
+            eager: true,
+            fully_materialized: true,
+            file_only_current_count: 7,
+            current_digest: [3u8; 32],
+            current_count: 11,
+            roots_digest: [4u8; 32],
+            roots_count: 12,
+            root_set_generation: 13,
+        }),
+    };
+    let bytes = encode_response(&response);
+    assert_eq!(decode_response(&bytes).unwrap(), response);
+
+    let mut older = bytes.clone();
+    older[0] = RPC_VERSION - 1;
+    assert!(matches!(decode_response(&older), Err(ServiceRpcError::UnsupportedVersion(_))));
+}
+
+/// The answer byte is closed: a value that is not one of the three answers is refused, never read
+/// as a grant.
+#[test]
+fn an_unknown_proof_answer_is_refused() {
+    for kind in [KIND_VERSION_PRESENT, KIND_CUSTODY_ACQUIRE] {
+        for byte in [3u8, 0x7f, 0xff] {
+            assert!(matches!(
+                decode_response(&[RPC_VERSION, kind, byte]),
+                Err(ServiceRpcError::BadFlag(b)) if b == byte
+            ));
+        }
+    }
+    assert_eq!(
+        decode_response(&[RPC_VERSION, KIND_VERSION_PRESENT, 2]).unwrap(),
+        ServiceResponse::VersionPresent { answer: ProofAnswer::InProgress }
+    );
 }

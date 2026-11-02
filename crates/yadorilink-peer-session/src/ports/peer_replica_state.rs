@@ -67,8 +67,7 @@ pub struct CurrentRowSnapshot {
     pub record_kind: RecordKind,
     pub symlink_target: Option<Vec<u8>>,
     pub symlink_out_of_root: bool,
-    pub unix_mode: Option<u32>,
-    pub xattrs: Vec<(String, Vec<u8>)>,
+    pub exec: bool,
     pub origin_device_id: Option<String>,
     /// The materialization state this same incarnation carries -- so a
     /// caller that is about to CAS the state forward can name the value
@@ -86,9 +85,8 @@ impl CurrentRowSnapshot {
             self.record.size,
             self.record.mtime_unix_nanos,
             self.record_kind,
-            self.unix_mode,
+            self.exec,
             self.symlink_target.clone(),
-            self.xattrs.clone(),
         )
     }
 }

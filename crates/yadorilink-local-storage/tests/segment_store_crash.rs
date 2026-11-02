@@ -498,8 +498,10 @@ fn store_with_a_compactable_segment(
     dir: &std::path::Path,
 ) -> (SegmentBlockStore, Vec<LocallyHashedBlock>) {
     let store = SegmentBlockStore::with_limits_and_verdict(dir, limits(), |_| true).unwrap();
+    // 192 bytes of payload make a 252-byte record (52 of header, 8 of trailer), so that 16 of them
+    // fill a 4096-byte segment exactly as the layout this fixture was written against did.
     let blocks: Vec<LocallyHashedBlock> =
-        (0..32).map(|i| block(&format!("compaction-source-{i}"), 200)).collect();
+        (0..32).map(|i| block(&format!("compaction-source-{i}"), 192)).collect();
     store.put_durable_batch(&blocks).unwrap();
     store.seal_active_segment().unwrap();
     let mut survivors = Vec::new();

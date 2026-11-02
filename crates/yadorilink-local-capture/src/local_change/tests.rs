@@ -14,7 +14,6 @@ use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind};
 use yadorilink_fs_platform::fs_identity::disk_race_fingerprint;
 use yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet;
-use yadorilink_local_storage::unix_mode_from_metadata;
 use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::ids::SyncPath;
@@ -1319,7 +1318,7 @@ async fn an_unreadable_parent_listing_never_authorizes_an_offline_tombstone() {
 /// tests that hand-construct `FsChangeEvent`s (rather than using a
 /// real `watch_folder`) must build paths from an already-canonical
 /// root to stay consistent, exactly as a real watcher's paths would be.
-fn canonical_root(root_dir: &tempfile::TempDir) -> std::path::PathBuf {
+pub(super) fn canonical_root(root_dir: &tempfile::TempDir) -> std::path::PathBuf {
     root_dir.path().canonicalize().unwrap()
 }
 
@@ -1333,7 +1332,7 @@ fn canonical_root(root_dir: &tempfile::TempDir) -> std::path::PathBuf {
 /// refuse to scan it. Adopting first states the thing those tests actually
 /// assume but cannot otherwise express: the volume is mounted, and the file
 /// really is missing from a folder that really is this link's.
-fn adopt_root(state: &ReplicaCoordinator, group: &str, root: &std::path::Path) {
+pub(super) fn adopt_root(state: &ReplicaCoordinator, group: &str, root: &std::path::Path) {
     adopt_root_without_volume_identity(state, group, root);
     let identity = yadorilink_filesystem_sync::device_boundary::root_volume_identity(root).unwrap();
     state.link_repository().set_capture_volume_identity_for_group(group, &identity).unwrap();
@@ -1356,7 +1355,7 @@ fn adopt_root_without_volume_identity(
     yadorilink_root_authority::root_identity::VerifiedRoot::open(root, group, state).unwrap();
 }
 
-fn expect_file_changed(outcome: LocalChangeOutcome) -> FileRecord {
+pub(super) fn expect_file_changed(outcome: LocalChangeOutcome) -> FileRecord {
     match outcome {
         LocalChangeOutcome::FileChanged(record) => record,
         other => panic!("expected FileChanged, got {other:?}"),
@@ -1755,7 +1754,7 @@ async fn chmod_only_edit_on_a_peer_materialized_file_is_captured() {
         PEER_AUTHORED_MTIME,
     )
     .unwrap();
-    yadorilink_local_storage::apply_unix_mode(&file_path, Some(0o644)).unwrap();
+    yadorilink_local_storage::apply_exec(&file_path, false).unwrap();
 
     let record = FileRecord {
         path: "received.sh".to_string(),
@@ -1774,10 +1773,10 @@ async fn chmod_only_edit_on_a_peer_materialized_file_is_captured() {
         .unwrap();
     state
         .file_index_repository()
-        .set_unix_mode(
+        .set_exec(
             "group-1",
             "received.sh",
-            Some(0o644),
+            false,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -1836,9 +1835,8 @@ async fn chmod_only_edit_on_a_peer_materialized_file_is_captured() {
         "a chmod-only edit on a materialized file must reach the size+mtime fast path (gap 1 \
          fixed), not fall through to a full re-chunk"
     );
-    assert_eq!(
-        state.file_index_repository().get_unix_mode("group-1", "received.sh").unwrap(),
-        Some(0o755),
+    assert!(
+        state.file_index_repository().get_exec("group-1", "received.sh").unwrap(),
         "the real chmod +x must be captured and indexed, not silently dropped"
     );
     assert_eq!(
@@ -1876,11 +1874,7 @@ async fn chmod_only_edit_reaching_the_content_only_self_echo_path_is_still_captu
         .unwrap(),
     );
     assert!(
-        state
-            .file_index_repository()
-            .get_unix_mode("group-1", "script.sh")
-            .unwrap()
-            .is_none_or(|mode| mode & 0o100 == 0),
+        !state.file_index_repository().get_exec("group-1", "script.sh").unwrap(),
         "sanity: a freshly-written file is not executable by default"
     );
 
@@ -1920,9 +1914,8 @@ async fn chmod_only_edit_reaching_the_content_only_self_echo_path_is_still_captu
         record_after_chmod.blocks, record_after_create.blocks,
         "content is genuinely unchanged"
     );
-    assert_eq!(
-        state.file_index_repository().get_unix_mode("group-1", "script.sh").unwrap(),
-        Some(0o755),
+    assert!(
+        state.file_index_repository().get_exec("group-1", "script.sh").unwrap(),
         "the chmod +x reaching the content-only self-echo comparison must still be captured, \
          not silently dropped (gap 2)"
     );
@@ -1950,7 +1943,7 @@ async fn materialize_echo_with_matching_content_and_unix_mode_stays_a_no_op() {
     const PEER_MTIME: i64 = 1_650_000_000_000_000_000;
     yadorilink_local_storage::reconstruct_file(store.as_ref(), &file_path, &blocks, PEER_MTIME)
         .unwrap();
-    yadorilink_local_storage::apply_unix_mode(&file_path, Some(0o755)).unwrap();
+    yadorilink_local_storage::apply_exec(&file_path, true).unwrap();
 
     let record = FileRecord {
         path: "mirrored.txt".to_string(),
@@ -1969,10 +1962,10 @@ async fn materialize_echo_with_matching_content_and_unix_mode_stays_a_no_op() {
         .unwrap();
     state
         .file_index_repository()
-        .set_unix_mode(
+        .set_exec(
             "group-1",
             "mirrored.txt",
-            Some(0o755),
+            true,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -2059,13 +2052,14 @@ async fn projection_fence_suppresses_echo_even_when_the_plain_index_has_not_caug
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
-    let on_disk_mode = unix_mode_from_metadata(&std::fs::metadata(&file_path).unwrap());
+    let on_disk_exec =
+        yadorilink_local_storage::exec_from_metadata(&std::fs::metadata(&file_path).unwrap());
     state
         .file_index_repository()
-        .set_unix_mode(
+        .set_exec(
             "group-1",
             "projected.bin",
-            on_disk_mode,
+            on_disk_exec,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -2212,10 +2206,10 @@ async fn projection_fence_never_swallows_a_real_chmod_racing_matching_content() 
         .unwrap();
     state
         .file_index_repository()
-        .set_unix_mode(
+        .set_exec(
             "group-1",
             "chmodded.bin",
-            Some(0o644),
+            false,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -2235,7 +2229,7 @@ async fn projection_fence_never_swallows_a_real_chmod_racing_matching_content() 
     // 0644 the projection intends.
     let file_path = root.join("chmodded.bin");
     std::fs::write(&file_path, content_a).unwrap();
-    yadorilink_local_storage::apply_unix_mode(&file_path, Some(0o755)).unwrap();
+    yadorilink_local_storage::apply_exec(&file_path, true).unwrap();
 
     let outcome = proc
         .process_event(
@@ -2319,56 +2313,6 @@ async fn an_open_write_of_a_modeless_row_is_not_authored_back_as_a_chmod() {
     );
 }
 
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn projection_fence_never_swallows_a_real_xattr_edit_racing_matching_content() {
-    let (proc, state, store, _store_dir, root_dir) = processor_with_counting_store();
-    let root = canonical_root(&root_dir);
-    adopt_root(&state, "group-1", &root);
-
-    let content_a = b"content A -- the intent's target, and what's genuinely on disk\n";
-    let scratch = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(scratch.path(), content_a).unwrap();
-    let blocks_a = yadorilink_local_storage::chunk_file(store.as_ref(), scratch.path()).unwrap();
-    let target_hash = yadorilink_local_storage::intent_target_hash(&blocks_a);
-
-    // The projection intends content A with NO xattrs (the default,
-    // matching a fresh index row's empty xattr set).
-    state
-        .coordinator()
-        .materialization_intent_repository()
-        .begin_materialization_intent(
-            "group-1",
-            "xattred.bin",
-            &target_hash,
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        )
-        .unwrap();
-
-    let file_path = root.join("xattred.bin");
-    std::fs::write(&file_path, content_a).unwrap();
-    // A real, local xattr edit lands while that intent is still open --
-    // content matches the target exactly, but this device's own
-    // replicated xattr set now genuinely diverges from what's indexed
-    // (none).
-    yadorilink_local_storage::apply_xattrs(
-        &file_path,
-        &[("user.yadorilink-test".to_string(), b"real-local-edit".to_vec())],
-    )
-    .unwrap();
-
-    let outcome = proc
-        .process_event(
-            "group-1",
-            &root,
-            &FsChangeEvent { path: file_path.clone(), kind: FsChangeKind::CreatedOrModified },
-        )
-        .await
-        .unwrap();
-
-    expect_file_changed(outcome);
-}
-
 /// The state a repair reconstruct leaves behind when its row is replaced
 /// by a newer version between the lane's snapshot and its proof commit:
 /// the lane has renamed the OLD version's full bytes into place, its
@@ -2443,10 +2387,11 @@ async fn an_old_versions_bytes_under_a_newer_placeholder_row_are_the_open_intent
     // The lane's write: the old version's full bytes, really on disk.
     let file_path = root.join("superseded.bin");
     std::fs::write(&file_path, old_content).unwrap();
-    let on_disk_mode = unix_mode_from_metadata(&std::fs::metadata(&file_path).unwrap());
+    let on_disk_exec =
+        yadorilink_local_storage::exec_from_metadata(&std::fs::metadata(&file_path).unwrap());
     state
         .file_index_repository()
-        .set_unix_mode("group-1", "superseded.bin", on_disk_mode, &permit)
+        .set_exec("group-1", "superseded.bin", on_disk_exec, &permit)
         .unwrap();
     let versions_before =
         state.sqlite().dag_list_versions("group-1", "superseded.bin").unwrap().len();
@@ -4711,10 +4656,9 @@ fn admit_peer_put_only_into_the_dag(
         size,
         FileMeta {
             mtime_unix_nanos: 1,
-            unix_mode: None,
+            exec: false,
             symlink_target: None,
             record_kind: RecordKind::File,
-            xattrs: Vec::new(),
         },
     );
     let _ = max_parent_lamport;
@@ -7421,7 +7365,7 @@ fn scan_emits_symlink_metadata_atomically_with_its_file_version() {
         Some(b"../outside".to_vec())
     );
     assert!(state.file_index_repository().get_symlink_out_of_root(group, "link").unwrap());
-    assert_eq!(state.file_index_repository().get_unix_mode(group, "link").unwrap(), None);
+    assert!(!state.file_index_repository().get_exec(group, "link").unwrap());
 
     // ...and the `FileVersion` the emitted delta references agrees
     // exactly (same single committed state, not a later reconciliation).
@@ -7432,7 +7376,7 @@ fn scan_emits_symlink_metadata_atomically_with_its_file_version() {
     let version = state.sqlite().dag_get_file_version(group, &vh).unwrap().unwrap();
     assert_eq!(version.meta.record_kind, RecordKind::Symlink);
     assert_eq!(version.meta.symlink_target.as_deref(), Some(b"../outside".as_slice()));
-    assert_eq!(version.meta.unix_mode, None);
+    assert!(!version.meta.exec);
     // The two views are one and the same commit — the whole point of FIX A.
     assert_eq!(
         state.file_index_repository().get_record_kind(group, "link").unwrap(),
@@ -7468,9 +7412,8 @@ fn scan_emits_unix_mode_atomically_with_its_file_version() {
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
 
-    assert_eq!(
-        state.file_index_repository().get_unix_mode(group, "run.sh").unwrap(),
-        Some(0o755),
+    assert!(
+        state.file_index_repository().get_exec(group, "run.sh").unwrap(),
         "exec bit set right after the emit"
     );
     assert_eq!(
@@ -7483,64 +7426,8 @@ fn scan_emits_unix_mode_atomically_with_its_file_version() {
     let chain = linear_chain_back_to(&state, heads_after[0], &heads_before[0]);
     let vh = version_hash_for_path(&chain[chain.len() - 1], "run.sh");
     let version = state.sqlite().dag_get_file_version(group, &vh).unwrap().unwrap();
-    assert_eq!(
-        version.meta.unix_mode,
-        Some(0o755),
-        "the emitted FileVersion carries the exec bit too"
-    );
-    assert_eq!(
-        state.file_index_repository().get_unix_mode(group, "run.sh").unwrap(),
-        version.meta.unix_mode
-    );
-}
-
-/// A metadata-semantics defect worth recording: the
-/// startup reconciliation scan used to emit `Vec::new()` for every
-/// record it re-authored, regardless of whether that path already
-/// carried real xattrs -- so an OFFLINE exec-bit-only change (content
-/// untouched) to a file that separately already had a replicated
-/// xattr silently wiped that attribute the moment the scan picked up
-/// the exec-bit divergence, in both the index and the emitted
-/// `FileVersion`. This proves the fix: the xattr must survive an
-/// unrelated offline metadata change discovered by the same scan.
-#[cfg(target_os = "linux")]
-#[test]
-fn scan_preserves_existing_xattrs_across_an_unrelated_offline_exec_bit_change() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
-    let root = canonical_root(&root_dir);
-    let group = "group-1";
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
-
-    let script = root.join("run.sh");
-    std::fs::write(&script, b"#!/bin/sh\n").unwrap();
-    yadorilink_local_storage::apply_xattrs(
-        &script,
-        &[("user.yadorilink-test".to_string(), b"keep-me".to_vec())],
-    )
-    .unwrap();
-    proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
-    assert_eq!(
-        state.file_index_repository().get_xattrs(group, "run.sh").unwrap(),
-        vec![("user.yadorilink-test".to_string(), b"keep-me".to_vec())],
-        "precondition: the xattr is indexed after the first scan"
-    );
-
-    // Offline: only the exec bit changes; the xattr is untouched.
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
-
-    assert_eq!(
-        state.file_index_repository().get_unix_mode(group, "run.sh").unwrap(),
-        Some(0o755),
-        "the offline exec-bit change was picked up"
-    );
-    assert_eq!(
-        state.file_index_repository().get_xattrs(group, "run.sh").unwrap(),
-        vec![("user.yadorilink-test".to_string(), b"keep-me".to_vec())],
-        "an unrelated offline metadata change must never erase an already-indexed xattr"
-    );
+    assert!(version.meta.exec, "the emitted FileVersion carries the exec bit too");
+    assert_eq!(state.file_index_repository().get_exec(group, "run.sh").unwrap(), version.meta.exec);
 }
 
 /// An offline metadata-only change (mode or xattrs, content
@@ -7642,6 +7529,140 @@ async fn an_offline_metadata_only_change_publishes_a_proof_for_the_version_it_em
          version native state resolves this path to; while they differ the path's projection \
          obligation cannot close and, with no peer, never will"
     );
+}
+
+/// A live capture of `tool.sh` (not executable); returns the processor, the state, the root, the file
+/// and the heads after the capture.
+#[cfg(unix)]
+async fn captured_script() -> (
+    LocalChangeProcessor,
+    Arc<TestReplica>,
+    (tempfile::TempDir, tempfile::TempDir),
+    std::path::PathBuf,
+    std::path::PathBuf,
+    EffectiveIgnoreSet,
+    Vec<yadorilink_replica_domain::ids::DeltaHash>,
+) {
+    let (proc, state, _emitter, store_dir, root_dir) = processor_with_emitter();
+    let root = canonical_root(&root_dir);
+    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+    adopt_root(&state, "group-1", &root);
+    let file = root.join("tool.sh");
+    std::fs::write(&file, b"#!/bin/sh\necho hi\n").unwrap();
+    expect_file_changed(
+        proc.process_event(
+            "group-1",
+            &root,
+            &FsChangeEvent { path: file.clone(), kind: FsChangeKind::CreatedOrModified },
+        )
+        .await
+        .unwrap(),
+    );
+    let heads = crate::test_support::native_group_heads(&state, "group-1");
+    (proc, state, (store_dir, root_dir), root, file, ignore_set, heads)
+}
+
+/// Moves the file's ctime without changing its bytes, mode or attributes: what a backup tool, an
+/// indexer or an archiver does, and what ends an untouched-write proof.
+#[cfg(unix)]
+fn touch_ctime_only(root: &std::path::Path, file: &std::path::Path) {
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let link = root.join(".ctime-touch.link");
+    std::fs::hard_link(file, &link).unwrap();
+    std::fs::remove_file(&link).unwrap();
+}
+
+/// Only the execute flag is replicated, so the file's other permission bits are no part of what a
+/// scan or an event compares: a file whose row says "not executable" stays unchanged whatever its
+/// ctime does and whatever mode bits other than `x` it carries.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ctime_only_touch_or_a_non_exec_chmod_authors_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let (proc, state, _keep, root, file, ignore_set, heads) = captured_script().await;
+    for mode in [0o644, 0o600, 0o664, 0o640, 0o666, 0o444] {
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+        touch_ctime_only(&root, &file);
+        proc.scan_existing_files_with_ignore("group-1", &root, &ignore_set).unwrap();
+        let outcome = proc
+            .process_event(
+                "group-1",
+                &root,
+                &FsChangeEvent { path: file.clone(), kind: FsChangeKind::CreatedOrModified },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, LocalChangeOutcome::None, "{mode:o}");
+        assert_eq!(crate::test_support::native_group_heads(&state, "group-1"), heads, "{mode:o}");
+    }
+}
+
+/// `chmod +x` and `chmod -x` are the edits that propagate, through the scan and through the event path,
+/// whatever the other bits are. A chmod that ends where the row says is no edit.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chmod_plus_x_and_minus_x_are_captured() {
+    use std::os::unix::fs::PermissionsExt;
+    let (proc, state, _keep, root, file, ignore_set, heads) = captured_script().await;
+
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+    proc.scan_existing_files_with_ignore("group-1", &root, &ignore_set).unwrap();
+    let after_plus = crate::test_support::native_group_heads(&state, "group-1");
+    assert_ne!(after_plus, heads, "chmod +x is an edit");
+    assert!(state.file_index_repository().get_exec("group-1", "tool.sh").unwrap());
+
+    // The owner-only form, through the event path.
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    expect_file_changed(
+        proc.process_event(
+            "group-1",
+            &root,
+            &FsChangeEvent { path: file.clone(), kind: FsChangeKind::CreatedOrModified },
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(!state.file_index_repository().get_exec("group-1", "tool.sh").unwrap());
+    assert_ne!(crate::test_support::native_group_heads(&state, "group-1"), after_plus);
+
+    // A chmod that leaves the flag as the row has it, even through other modes: nothing.
+    let settled = crate::test_support::native_group_heads(&state, "group-1");
+    for mode in [0o600, 0o644, 0o664] {
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+        proc.scan_existing_files_with_ignore("group-1", &root, &ignore_set).unwrap();
+    }
+    assert_eq!(crate::test_support::native_group_heads(&state, "group-1"), settled);
+}
+
+/// A device that cannot read the flag (Windows) keeps the previous version's flag when it edits the
+/// file, and a repeated scan with a touched ctime authors nothing for it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_platform_without_the_flag_inherits_it_and_does_not_churn() {
+    use std::os::unix::fs::PermissionsExt;
+    let (proc, state, _keep, root, file, ignore_set, _heads) = captured_script().await;
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+    proc.scan_existing_files_with_ignore("group-1", &root, &ignore_set).unwrap();
+    assert!(state.file_index_repository().get_exec("group-1", "tool.sh").unwrap());
+    let with_exec = crate::test_support::native_group_heads(&state, "group-1");
+
+    proc.simulate_unobservable_modes();
+    for _ in 0..3 {
+        touch_ctime_only(&root, &file);
+        proc.scan_existing_files_with_ignore("group-1", &root, &ignore_set).unwrap();
+        assert_eq!(crate::test_support::native_group_heads(&state, "group-1"), with_exec);
+    }
+    std::fs::write(&file, b"#!/bin/sh\necho edited where the flag is unreadable\n").unwrap();
+    expect_file_changed(
+        proc.process_event(
+            "group-1",
+            &root,
+            &FsChangeEvent { path: file.clone(), kind: FsChangeKind::CreatedOrModified },
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(state.file_index_repository().get_exec("group-1", "tool.sh").unwrap());
 }
 
 /// The first scan of a not-yet-native-backed link must persist each row
@@ -7766,16 +7787,11 @@ fn a_first_scan_commits_each_row_together_with_the_metadata_it_observed() {
         let mode = if i % 2 == 0 { 0o755 } else { 0o644 };
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
-    yadorilink_local_storage::apply_xattrs(
-        &root.join("file00.sh"),
-        &[("user.yadorilink-test".to_string(), b"observed".to_vec())],
-    )
-    .unwrap();
 
     // What the index holds at the exact instant this chunk's rows
     // become durable, read from the scan's own per-chunk commit
     // callback.
-    type Observed = Vec<(String, Option<u32>, Vec<(String, Vec<u8>)>)>;
+    type Observed = Vec<(String, bool)>;
     let at_commit: Arc<Mutex<Observed>> = Arc::new(Mutex::new(Vec::new()));
     {
         let at_commit = at_commit.clone();
@@ -7785,11 +7801,7 @@ fn a_first_scan_commits_each_row_together_with_the_metadata_it_observed() {
             let mut seen = Vec::new();
             for i in 0..20 {
                 let path = format!("file{i:02}.sh");
-                seen.push((
-                    path.clone(),
-                    repo.get_unix_mode(ATOMIC_GROUP, &path).unwrap(),
-                    repo.get_xattrs(ATOMIC_GROUP, &path).unwrap(),
-                ));
+                seen.push((path.clone(), repo.get_exec(ATOMIC_GROUP, &path).unwrap()));
             }
             *at_commit.lock().unwrap_or_else(|p| p.into_inner()) = seen;
             Ok(())
@@ -7810,25 +7822,14 @@ fn a_first_scan_commits_each_row_together_with_the_metadata_it_observed() {
         "sanity: the per-chunk commit callback must have fired with every path's row \
          already durable"
     );
-    for (i, (path, unix_mode, xattrs)) in observed.iter().enumerate() {
-        let expected_mode = if i % 2 == 0 { 0o755 } else { 0o644 };
+    for (i, (path, exec)) in observed.iter().enumerate() {
         assert_eq!(
-            *unix_mode,
-            Some(expected_mode),
-            "{path}: the mode this scan observed must already be committed at the instant \
-             its row is durable -- a restart here comes back to a row whose mode never \
+            *exec,
+            i % 2 == 0,
+            "{path}: the execute flag this scan observed must already be committed at the instant \
+             its row is durable -- a restart here comes back to a row whose flag never \
              landed, and the next scan reads that as an offline chmod and authors a \
              version for content nobody touched"
-        );
-        let expected_xattrs: Vec<(String, Vec<u8>)> = if i == 0 {
-            vec![("user.yadorilink-test".to_string(), b"observed".to_vec())]
-        } else {
-            Vec::new()
-        };
-        assert_eq!(
-            *xattrs, expected_xattrs,
-            "{path}: xattrs must land in the same transaction as the row, for the same \
-             reason the mode must"
         );
     }
 
@@ -7849,7 +7850,7 @@ fn a_first_scan_commits_each_row_together_with_the_metadata_it_observed() {
     assert_eq!(
         crate::test_support::native_group_heads(&state, ATOMIC_GROUP),
         heads_after_scan,
-        "a rescan of an untouched folder must author nothing: every mode and xattr the \
+        "a rescan of an untouched folder must author nothing: every execute flag the \
          first scan observed is already in the index, so there is no divergence to \
          mistake for an offline metadata change"
     );
@@ -7890,8 +7891,8 @@ fn a_scan_with_no_emitter_still_commits_each_row_with_the_metadata_it_observed()
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
-    /// `(path, unix_mode)` as each index-only commit recorded it.
-    type ModesAtCommit = Vec<(String, Option<u32>)>;
+    /// `(path, exec)` as each index-only commit recorded it.
+    type ModesAtCommit = Vec<(String, bool)>;
     let at_commit: Arc<Mutex<ModesAtCommit>> = Arc::new(Mutex::new(Vec::new()));
     let _hook_slot = hold_scan_hook_slot();
     {
@@ -7905,8 +7906,8 @@ fn a_scan_with_no_emitter_still_commits_each_row_with_the_metadata_it_observed()
             let seen = (0..4)
                 .map(|i| {
                     let path = format!("file{i:02}.sh");
-                    let mode = repo.get_unix_mode(NO_EMITTER_GROUP, &path).unwrap();
-                    (path, mode)
+                    let exec = repo.get_exec(NO_EMITTER_GROUP, &path).unwrap();
+                    (path, exec)
                 })
                 .collect();
             *at_commit.lock().unwrap_or_else(|p| p.into_inner()) = seen;
@@ -7923,13 +7924,12 @@ fn a_scan_with_no_emitter_still_commits_each_row_with_the_metadata_it_observed()
     );
     let observed = at_commit.lock().unwrap_or_else(|p| p.into_inner()).clone();
     assert_eq!(observed.len(), 4, "sanity: the index-only commit seam must have fired");
-    for (i, (path, unix_mode)) in observed.iter().enumerate() {
-        let expected_mode = if i % 2 == 0 { 0o755 } else { 0o644 };
+    for (i, (path, exec)) in observed.iter().enumerate() {
         assert_eq!(
-            *unix_mode,
-            Some(expected_mode),
-            "{path}: the mode this scan observed must already be committed at the instant \
-             its row is durable"
+            *exec,
+            i % 2 == 0,
+            "{path}: the execute flag this scan observed must already be committed at the \
+             instant its row is durable"
         );
     }
 }
@@ -8912,7 +8912,7 @@ async fn a_file_with_too_many_blocks_to_sync_is_refused_and_nothing_is_written()
     struct RestoreLimit;
     impl Drop for RestoreLimit {
         fn drop(&mut self) {
-            record_builder::override_syncable_block_limit(usize::MAX);
+            record_builder::override_syncable_block_limit(None);
         }
     }
     let (proc, state, _store_dir, root_dir) = processor();
@@ -8923,7 +8923,7 @@ async fn a_file_with_too_many_blocks_to_sync_is_refused_and_nothing_is_written()
     std::fs::write(&file_path, vec![b'x'; 4 * 128 * 1024]).unwrap();
 
     let _restore = RestoreLimit;
-    record_builder::override_syncable_block_limit(3);
+    record_builder::override_syncable_block_limit(Some(("group-1", "huge.bin", 3)));
     let event = FsChangeEvent { path: file_path.clone(), kind: FsChangeKind::CreatedOrModified };
     let outcome = proc.process_event("group-1", &root, &event).await.unwrap();
 
@@ -8935,7 +8935,7 @@ async fn a_file_with_too_many_blocks_to_sync_is_refused_and_nothing_is_written()
     );
 
     // Within the limit the very same file is captured: the refusal is the limit's doing.
-    record_builder::override_syncable_block_limit(4);
+    record_builder::override_syncable_block_limit(Some(("group-1", "huge.bin", 4)));
     let outcome = proc.process_event("group-1", &root, &event).await.unwrap();
     expect_file_changed(outcome);
 }
@@ -9381,14 +9381,12 @@ async fn a_changed_root_volume_stops_all_tombstoning() {
 /// A platform that cannot observe a file's unix mode and replicated attributes
 /// (Windows; macOS for attributes) inherits them from the path's semantic
 /// predecessor and never captures their absence as a removal.
-const RECEIVED_MODE: u32 = 0o644;
+/// The execute flag of the received version: set, so that inheriting it is distinguishable from
+/// the default.
+const RECEIVED_EXEC: bool = true;
 
-fn received_xattrs() -> Vec<(String, Vec<u8>)> {
-    vec![("user.origin".to_string(), b"linux".to_vec())]
-}
-
-/// A peer-materialized file whose row records `RECEIVED_MODE` and attributes
-/// the capturing platform cannot read.
+/// A peer-materialized file whose row records `RECEIVED_EXEC`, on a platform that cannot read the
+/// execute flag (Windows).
 async fn received_file_on_a_platform_that_reads_no_metadata() -> (
     LocalChangeProcessor,
     Arc<TestReplica>,
@@ -9430,18 +9428,14 @@ async fn received_file_on_a_platform_that_reads_no_metadata() -> (
         .unwrap();
     state
         .file_index_repository()
-        .set_unix_mode("group-1", "received.bin", Some(RECEIVED_MODE), &permit)
-        .unwrap();
-    state
-        .file_index_repository()
-        .set_xattrs("group-1", "received.bin", &received_xattrs(), &permit)
+        .set_exec("group-1", "received.bin", RECEIVED_EXEC, &permit)
         .unwrap();
     proc.simulate_unobservable_modes();
     (proc, state, file_path, store_dir, root_dir, store)
 }
 
 #[tokio::test]
-async fn a_noop_capture_where_no_metadata_is_readable_keeps_the_recorded_mode_and_attributes() {
+async fn a_noop_capture_where_the_exec_flag_is_unreadable_keeps_the_recorded_flag() {
     let (proc, state, file_path, _s, _r, _store) =
         received_file_on_a_platform_that_reads_no_metadata().await;
     let root = file_path.parent().unwrap().to_path_buf();
@@ -9467,13 +9461,13 @@ async fn a_noop_capture_where_no_metadata_is_readable_keeps_the_recorded_mode_an
         versions
     );
     assert_eq!(
-        state.file_index_repository().get_unix_mode("group-1", "received.bin").unwrap(),
-        Some(RECEIVED_MODE)
+        state.file_index_repository().get_exec("group-1", "received.bin").unwrap(),
+        RECEIVED_EXEC
     );
 }
 
 #[tokio::test]
-async fn a_content_edit_where_no_metadata_is_readable_inherits_the_mode_and_attributes() {
+async fn a_content_edit_where_the_exec_flag_is_unreadable_inherits_the_flag() {
     let (proc, state, file_path, _s, _r, _store) =
         received_file_on_a_platform_that_reads_no_metadata().await;
     let root = file_path.parent().unwrap().to_path_buf();
@@ -9489,19 +9483,14 @@ async fn a_content_edit_where_no_metadata_is_readable_inherits_the_mode_and_attr
     expect_file_changed(outcome);
 
     assert_eq!(
-        state.file_index_repository().get_unix_mode("group-1", "received.bin").unwrap(),
-        Some(RECEIVED_MODE),
-        "the edited version must keep the predecessor's mode, not drop it"
-    );
-    assert_eq!(
-        state.file_index_repository().get_xattrs("group-1", "received.bin").unwrap(),
-        received_xattrs(),
-        "the edited version must keep the predecessor's attributes, not drop them"
+        state.file_index_repository().get_exec("group-1", "received.bin").unwrap(),
+        RECEIVED_EXEC,
+        "the edited version must keep the predecessor's execute flag, not drop it"
     );
 }
 
 #[tokio::test]
-async fn a_new_file_where_no_metadata_is_readable_has_no_mode_and_no_attributes() {
+async fn a_new_file_where_the_exec_flag_is_unreadable_is_not_executable() {
     let (proc, state, file_path, _s, _r, _store) =
         received_file_on_a_platform_that_reads_no_metadata().await;
     let root = file_path.parent().unwrap().to_path_buf();
@@ -9517,15 +9506,7 @@ async fn a_new_file_where_no_metadata_is_readable_has_no_mode_and_no_attributes(
         .unwrap();
     expect_file_changed(outcome);
 
-    assert_eq!(
-        state.file_index_repository().get_unix_mode("group-1", "made-here.bin").unwrap(),
-        None
-    );
-    assert!(state
-        .file_index_repository()
-        .get_xattrs("group-1", "made-here.bin")
-        .unwrap()
-        .is_empty());
+    assert!(!state.file_index_repository().get_exec("group-1", "made-here.bin").unwrap());
 }
 
 /// A streaming consumer that reports failure must stop the rescan: the scan

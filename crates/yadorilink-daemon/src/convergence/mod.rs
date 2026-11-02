@@ -2,13 +2,13 @@
 //! fetches, and materializes native-resolved file content independently of
 //! message handling.
 //!
-//! `peer_session.rs`'s `handle_message` does authentication, native admission,
-//! and writes a `materialization_jobs` row (see
-//! `yadorilink_sync_sqlite::materialization_jobs`), then returns — releasing
-//! its bounded `message_slots` permit without ever awaiting network or disk
-//! content I/O. This module is what turns that row into on-disk bytes, on
-//! its own schedule, decoupled from any specific peer's message-processing
-//! capacity.
+//! Native admission records a genuine state transition for a path as a
+//! `projection_obligations` row (see `yadorilink_sync_sqlite`), and the peer
+//! session returns, releasing its bounded `message_slots` permit without
+//! awaiting network or disk content I/O. The scheduler in `engine.rs` claims
+//! the runnable obligations and turns them into on-disk bytes on its own
+//! schedule, decoupled from any peer's message-processing capacity. The old
+//! `materialization_jobs` table is retired and nothing schedules from it.
 
 pub mod backoff;
 #[path = "engine_wrapper.rs"]
@@ -29,6 +29,10 @@ mod receive_cost_tests;
 mod receive_disk_pressure_sequence_tests;
 #[cfg(test)]
 mod receive_kernel_bench;
+#[cfg(test)]
+mod receive_low_space_retention_tests;
+#[cfg(test)]
+mod retention_batch_tests;
 
 // `engine.rs` drives both via `DaemonState`. `availability`/`scheduler` as
 // their own modules are stage-3/stage-2 concerns (block-availability

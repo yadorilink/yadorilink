@@ -185,6 +185,9 @@ pub struct PeerSyncSessionDeps {
     pub handoff_lease_responder: Arc<dyn HandoffLeaseResponder>,
     pub handoff_ticket_responder: Arc<dyn HandoffTicketResponder>,
     pub custody_rehome_responder: Arc<dyn CustodyRehomeResponder>,
+    /// Where a block the store does not hold can be read from the user's file instead, verified.
+    /// `None`: blocks are served from the store only.
+    pub block_file_source: Option<Arc<dyn crate::ports::BlockFileSourcePort>>,
 }
 
 impl Clone for PeerSyncSessionDeps {
@@ -195,6 +198,7 @@ impl Clone for PeerSyncSessionDeps {
             handoff_lease_responder: self.handoff_lease_responder.clone(),
             handoff_ticket_responder: self.handoff_ticket_responder.clone(),
             custody_rehome_responder: self.custody_rehome_responder.clone(),
+            block_file_source: self.block_file_source.clone(),
         }
     }
 }
@@ -218,6 +222,7 @@ impl PeerSyncSessionDeps {
             handoff_lease_responder: Arc::new(DeniedHandoffLeaseResponder),
             handoff_ticket_responder: Arc::new(DeniedHandoffTicketResponder),
             custody_rehome_responder: Arc::new(DeniedCustodyRehomeResponder),
+            block_file_source: None,
         }
     }
 
