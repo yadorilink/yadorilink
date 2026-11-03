@@ -47,8 +47,8 @@ the statement's path and must write `<statement>.sig`; no key material is
 handled here.
 
 `extract-executables` and `resign` are the two halves of code signing (macOS). Both first verify the
-zip by hash; neither runs anything from it. `extract-executables` writes the layout's executables (the
-files to be signed) under DIR at their bundle paths. `resign` writes a new zip in which every executable
+zip by hash; neither runs anything from it. `extract-executables` writes the layout's signable executables (the
+files to be signed; the installer scripts are executable but not signed) under DIR at their bundle paths. `resign` writes a new zip in which every signable executable
 of the layout is replaced by the signed file given for it: nothing else changes, SHA256SUMS and the
 identity's `artifact_sha256`/`bundle_sha256` are recomputed, and a replacement that does not still embed
 the release identity (or equals the original) is refused. A code signature embeds a timestamp, so the
@@ -428,7 +428,14 @@ def build(args) -> int:
 
 
 def executables_of(layout: dict) -> list[str]:
+    """Files that carry the executable mode in the bundle."""
     return [f[0] for f in layout["files"] if f[3]]
+
+
+def signable_of(layout: dict) -> list[str]:
+    """The executables that are code-signed. The installer scripts are executable but are not
+    signed: they are covered by SHA256SUMS and stay byte-identical through signing."""
+    return [f[0] for f in layout["files"] if f[3] and f[1] != "installer"]
 
 
 def extract_executables(args) -> int:
@@ -437,7 +444,7 @@ def extract_executables(args) -> int:
         raise SystemExit("error: " + "; ".join(found))
     z = zipfile.ZipFile(args.zip)
     out = Path(args.out_dir)
-    for name in executables_of(LAYOUTS[args.target]):
+    for name in signable_of(LAYOUTS[args.target]):
         dest = out / name
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(z.read(name))
@@ -454,7 +461,8 @@ def resign(args) -> int:
     z = zipfile.ZipFile(zip_path)
     entries = {i.filename: z.read(i.filename) for i in z.infolist() if not i.is_dir()}
     layout = LAYOUTS[args.target]
-    signable = executables_of(layout)
+    signable = signable_of(layout)
+    executable = set(executables_of(layout))
     replacements = {}
     for item in args.replace:
         name, sep, path = item.partition("=")
@@ -487,7 +495,7 @@ def resign(args) -> int:
         for name in sorted(entries):
             info = zipfile.ZipInfo(name, ZIP_DATE)
             info.compress_type = zipfile.ZIP_DEFLATED
-            info.external_attr = (0o755 if name in signable else 0o644) << 16
+            info.external_attr = (0o755 if name in executable else 0o644) << 16
             w.writestr(info, entries[name])
     problems = verify_zip(signed, None, None, args.target, args.release)
     if problems:
@@ -912,7 +920,9 @@ def self_test() -> int:
             orig = entries_of(src)
             ident = json.loads(orig["engine-identity.json"])
             rid = f"{ident['public_commit_sha']}:{ident['build_config_digest']}"
-            exe = executables_of(LAYOUTS[target])
+            exe = signable_of(LAYOUTS[target])
+            modes = set(executables_of(LAYOUTS[target]))
+            assert "install.sh" in modes and "install.sh" not in exe, "install.sh is executable but must not be signable"
             ex_dir = tmp / f"{target}-ex"
             assert extract_executables(parse(["extract-executables", str(src), "--target", target, "--out-dir", str(ex_dir)])) == 0
             assert sorted(str(p.relative_to(ex_dir)) for p in ex_dir.rglob("*") if p.is_file()) == sorted(exe)
@@ -936,7 +946,7 @@ def self_test() -> int:
             assert {k: v for k, v in nid.items() if k not in ("artifact_sha256", "bundle_sha256")} == {k: v for k, v in ident.items() if k not in ("artifact_sha256", "bundle_sha256")}
             assert (tmp / f"{target}-signed" / f"{src.name}.sha256").read_text(encoding="utf-8").split()[0] == sha256(out_zip.read_bytes())
             for info in zipfile.ZipFile(out_zip).infolist():
-                assert info.external_attr >> 16 == (0o755 if info.filename in exe else 0o644), info.filename
+                assert info.external_attr >> 16 == (0o755 if info.filename in modes else 0o644), info.filename
 
             def refused(mutate_args):
                 try:
@@ -949,6 +959,7 @@ def self_test() -> int:
             assert refused(base + reps[:-2]), "a partly signed bundle was accepted"
             assert refused(base + reps + reps[:2]), "a repeated replacement was accepted"
             assert refused(base + ["--replace", f"LICENSE={signed_dir / exe[0]}"] + reps[2:]), "a non-executable was replaced"
+            assert refused(base + ["--replace", f"install.sh={signed_dir / exe[0]}"] + reps), "the installer script was replaced"
             unchanged = tmp / f"{target}-unchanged"
             unchanged.write_bytes(orig[exe[0]])
             assert refused(base + ["--replace", f"{exe[0]}={unchanged}"] + reps[2:]), "an unsigned (unchanged) file was accepted"
