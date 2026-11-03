@@ -2493,7 +2493,6 @@ mod windows_pipe_tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
 
-    use tokio::net::windows::named_pipe::ClientOptions;
     use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
     use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
     use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
@@ -2546,8 +2545,25 @@ mod windows_pipe_tests {
         (pipe_name, dir)
     }
 
+    /// Opens the pipe the way the real clients do: a burst of concurrent opens can find every instance
+    /// taken before the server has armed the next one, and `ERROR_PIPE_BUSY` means "try again".
+    async fn open_pipe(pipe_name: &str) -> tokio::net::windows::named_pipe::NamedPipeClient {
+        const ERROR_PIPE_BUSY: i32 = 231;
+        let mut attempt = 0;
+        loop {
+            match tokio::net::windows::named_pipe::ClientOptions::new().open(pipe_name) {
+                Ok(client) => return client,
+                Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && attempt < 100 => {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(e) => panic!("cannot open {pipe_name}: {e}"),
+            }
+        }
+    }
+
     async fn send(pipe_name: &str, payload: ReqPayload) -> DaemonControlResponse {
-        let mut stream = ClientOptions::new().open(pipe_name).unwrap();
+        let mut stream = open_pipe(pipe_name).await;
         write_message(
             &mut stream,
             &DaemonControlRequest {

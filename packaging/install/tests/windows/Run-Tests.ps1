@@ -2,7 +2,7 @@
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File Run-Tests.ps1 -Root C:\Temp\lp-install
 #
-# Root holds: install.ps1, build-fixture.py, serve.py (this script's siblings
+# Root holds: install.ps1, build-fixture.py, serve.py, verifier-vectors.ps1 (this script's siblings
 # are copied there). Python 3 must be on PATH. Everything runs under a temp
 # directory with a throw-away prefix; the installer's test hooks work only
 # because this script sets YADORILINK_INSTALL_TEST=1. The user PATH is touched

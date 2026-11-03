@@ -487,6 +487,7 @@ async fn what_the_phone_writes_reaches_the_mac_and_is_saved_only_when_the_mac_ho
 
 /// A reader is refused with a typed refusal and the staged file is left for the app to discard.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(windows, ignore = "the provider write path stages by rename on a Unix host")]
 async fn a_write_refused_by_role_leaves_the_staged_file_to_discard() {
     use yadorilink_ipc_proto::shellipc::ProviderApplyFailure;
     support::ensure_isolated_config_dir();

@@ -1084,8 +1084,9 @@ do_rollback() {
     prev_dir=$(receipt_get previous_dir || true)
     cur_version=$(receipt_get version || true)
     prev_version=$(receipt_get previous_version || true)
-    [ -n "$prev_dir" ] && [ -n "$prev_version" ] ||
+    if [ -z "$prev_dir" ] || [ -z "$prev_version" ]; then
         refuse 1 "there is no previous version to go back to (the receipt records none). Nothing was changed."
+    fi
     # Exactly one name under versions/: no separator, no dot components, and neither versions/ nor the
     # tree is a link, so the tree cannot be elsewhere.
     case $prev_dir in

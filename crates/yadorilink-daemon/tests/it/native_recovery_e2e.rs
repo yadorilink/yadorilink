@@ -663,6 +663,9 @@ async fn bytes_only_in_the_folder_are_read_into_the_store_before_the_rebootstrap
 
     pair(&c, &b, GROUP).await;
     converge_to(&[&b, &c], &[], "the lagging device caught up").await;
+    // The bytes are read from the kept original by the periodic completion pass, which can run
+    // after the rebootstrap ends; run it now instead of racing its timer.
+    preserved_items::complete_unavailable_items(shared(&c), &group()).await;
 
     let items = preserved_items::list(shared(&c)).await.unwrap();
     assert_eq!(items.len(), 1, "{items:?}");

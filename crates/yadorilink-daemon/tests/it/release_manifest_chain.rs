@@ -96,9 +96,9 @@ fn build_stand_in_artifact(dist: &Path) -> PathBuf {
     artifact
 }
 
-const NIGHTLY_VERSION: &str = "0.1.0-nightly.20260101000000";
-const BETA_VERSION: &str = "0.1.0-beta.3";
-const MIN_VERSION: &str = "0.0.5";
+const NIGHTLY_VERSION: &str = "0.2.0-nightly.20260101000000";
+const BETA_VERSION: &str = "0.2.0-beta.3";
+const MIN_VERSION: &str = "0.1.0";
 
 fn build_channel_manifest(dist: &Path, key: &Keypair, out_path: &Path) -> Output {
     build_manifest_for(dist, key, "nightly", NIGHTLY_VERSION, out_path)
@@ -187,7 +187,7 @@ fn signed_body(envelope_path: &Path) -> serde_json::Value {
 
 fn local_context(entry: &manifest::ReleaseEntry, channel: &str) -> manifest::LocalContext {
     manifest::LocalContext {
-        current_version: semver::Version::parse("0.0.6").unwrap(),
+        current_version: semver::Version::parse("0.1.1").unwrap(),
         channel: channel.to_owned(),
         platform: entry.platform.clone(),
         arch: entry.arch.clone(),

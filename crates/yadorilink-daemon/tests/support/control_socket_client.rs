@@ -74,6 +74,24 @@ pub async fn start(state: Arc<DaemonState>) -> ControlSocketHandle {
     }
 }
 
+/// Opens the pipe the way the real clients do: a burst of concurrent opens can find every instance
+/// taken before the server has armed the next one, and `ERROR_PIPE_BUSY` means "try again".
+#[cfg(windows)]
+async fn open_pipe(pipe_name: &str) -> tokio::net::windows::named_pipe::NamedPipeClient {
+    const ERROR_PIPE_BUSY: i32 = 231;
+    let mut attempt = 0;
+    loop {
+        match tokio::net::windows::named_pipe::ClientOptions::new().open(pipe_name) {
+            Ok(client) => return client,
+            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && attempt < 100 => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("cannot open {pipe_name}: {e}"),
+        }
+    }
+}
+
 #[cfg(unix)]
 async fn connect(handle: &ControlSocketHandle) -> tokio::net::UnixStream {
     tokio::net::UnixStream::connect(&handle.socket_path).await.unwrap()
@@ -81,7 +99,7 @@ async fn connect(handle: &ControlSocketHandle) -> tokio::net::UnixStream {
 
 #[cfg(windows)]
 async fn connect(handle: &ControlSocketHandle) -> tokio::net::windows::named_pipe::NamedPipeClient {
-    tokio::net::windows::named_pipe::ClientOptions::new().open(&handle.pipe_name).unwrap()
+    open_pipe(&handle.pipe_name).await
 }
 
 /// Sends one request over a fresh connection to `handle` and returns the

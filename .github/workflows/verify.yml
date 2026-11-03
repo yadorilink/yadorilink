@@ -367,7 +367,7 @@ jobs:
         run: |
           $root = Join-Path $env:RUNNER_TEMP 'lp-install'
           New-Item -ItemType Directory -Force -Path $root | Out-Null
-          Copy-Item packaging/install/install.ps1, packaging/install/tests/build-fixture.py, packaging/install/tests/serve.py, packaging/install/tests/windows/Run-Tests.ps1 $root
+          Copy-Item packaging/install/install.ps1, packaging/install/tests/build-fixture.py, packaging/install/tests/serve.py, packaging/install/tests/windows/Run-Tests.ps1, packaging/install/tests/windows/verifier-vectors.ps1 $root
           powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'Run-Tests.ps1') -Root $root
           exit $LASTEXITCODE
 

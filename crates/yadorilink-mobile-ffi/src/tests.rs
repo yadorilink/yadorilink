@@ -835,6 +835,7 @@ fn running(area: &Area) -> Arc<MobileHost> {
 }
 
 #[test]
+#[cfg_attr(windows, ignore = "the provider write path stages by rename on a Unix host")]
 fn a_file_is_staged_by_move_and_by_clone_and_a_stage_can_be_discarded() {
     let area = area();
     let host = running(&area);

@@ -139,6 +139,18 @@ fn take_mac_claim(
             return Ok(None);
         }
     };
+    // A process holding the group entitlement gets its container created by the system when it asks
+    // for it. For an unentitled one (a script or Homebrew daemon, a bare CLI) the system still returns
+    // a path but creates nothing, and such a process must not create the directory itself: it takes no
+    // claim, like the container-less case above. Only the store build always has the entitlement, so
+    // only it fails closed on a missing directory.
+    if channel != Channel::Store && !container.is_dir() {
+        tracing::warn!(
+            container = %container.display(),
+            "the App Group container does not exist: the one-build-per-Mac claim is not taken"
+        );
+        return Ok(None);
+    }
     match crate::mac_claim::acquire(&container, channel) {
         Ok(claim) => Ok(Some(claim)),
         Err(refusal) => {

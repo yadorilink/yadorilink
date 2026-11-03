@@ -402,7 +402,7 @@ mod tests {
         assert!(!removal_confirmed(&mut || true, POLLS.0, POLLS.1, POLLS.2, &mut || pauses += 1));
         assert_eq!(
             pauses,
-            GRACE.as_millis() as u32 / POLL.as_millis() as u32 + 1,
+            POLLS.1.as_millis() as u32 / POLLS.0.as_millis() as u32 + 1,
             "it looks for the whole grace period and then gives up"
         );
     }

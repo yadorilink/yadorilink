@@ -40,14 +40,12 @@ add a line naming the release that first carries the new pair:
 
     - Generation PROTOCOL_VERSION = N, RPC_VERSION = M: first release X.Y.Z
 
-- Generation PROTOCOL_VERSION = 4, RPC_VERSION = 4: first release 0.0.0
+- Generation PROTOCOL_VERSION = 4, RPC_VERSION = 4: first release 0.1.0-beta.9
 
-The `0.0.0` above is a placeholder for the release tooling, not a release: it
-means this generation sets no floor above the lowest version. The first public
-release carrying generation (4, 2) is v0.1.0-beta.5, and beta.6 and beta.7 carry
-the same generation. The service RPC moved to 3 and then 4 after that, so the line names
-(4, 4); the release that first carries it is set when its release record is written.
-The machine-read line keeps the placeholder until then.
+The first public release carrying generation (4, 2) was v0.1.0-beta.5; beta.6, beta.7 and beta.8 carry
+the same generation. The service RPC then moved to 3 and 4 (and the state schema to 138), so v0.1.0-beta.9
+is the first release of generation (4, 4): a device on an older release cannot synchronise with it, and the
+beta channel's `minimum_supported_version` is set to 0.1.0-beta.9 when it is served.
 - SCHEMA_VERSION = 133: adds the ledger of file windows served to the OS (lets a large file read through the OS partial-content API be freed); local state is not migrated before 1.0, so the local state must be recreated.
 - SCHEMA_VERSION = 134: adds the recent-activity log (the Activity view lists added, updated, deleted, conflicted and restored files); local state is not migrated before 1.0, so the local state must be recreated.
 - SCHEMA_VERSION = 135: only the execute bit of a file is synchronised and extended attributes are not (the native protocol generation is now 10, the file version tag changed); the local state of every device is not migrated before 1.0, so it must be recreated, and every device must be updated together. Before updating, save what `yadorilink preserved list` shows.
