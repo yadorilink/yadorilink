@@ -1,0 +1,6 @@
+# Link the C runtime statically into every Windows binary: a clean Windows (and the Microsoft Store
+# reviewers' machine) has no Visual C++ redistributable, so a binary importing VCRUNTIME140.dll
+# does not start. .github/release/check-pe-imports.py fails the bundle build if that import comes back,
+# and .github/checks/check-crt-static.py fails if this setting disappears.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

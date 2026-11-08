@@ -45,6 +45,8 @@ jobs:
         if: always()
         run: |
           set -e
+          python3 .github/checks/check-crt-static.py --self-test
+          python3 .github/checks/check-crt-static.py
           python3 .github/checks/check-architecture.py --self-test
           python3 .github/checks/check-architecture.py
           python3 .github/checks/check-block-commit-boundary.py
@@ -475,6 +477,10 @@ jobs:
         run: python3 -m pip install --quiet --disable-pip-version-check cryptography
       - if: matrix.lane == 'workspace'
         run: cargo build --workspace --all-targets
+      - name: Windows binaries use the static CRT
+        if: matrix.lane == 'workspace'
+        shell: bash
+        run: .github/checks/check-built-pe-imports.sh root debug
       - name: Workspace tests
         if: matrix.lane == 'workspace' && always()
         run: >-
@@ -511,6 +517,10 @@ jobs:
         if: matrix.lane == 'shell'
         working-directory: crates/yadorilink-shell-ext-windows
         run: cargo build --release
+      - name: Shell extension binaries use the static CRT
+        if: matrix.lane == 'shell'
+        shell: bash
+        run: .github/checks/check-built-pe-imports.sh shell release
       - name: Shell extension tests
         if: matrix.lane == 'shell'
         # The crate is its own workspace, so the manifest is named from the root

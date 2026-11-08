@@ -24,6 +24,8 @@ __pycache__/
 # .gitignore's own directory, so a nested Cargo workspace's own
 # .cargo/config.toml (windows) never matched without it.
 **/.cargo/config.toml
+# The repository's own config (the static-CRT setting Windows builds need) is source, not an override.
+!/.cargo/config.toml
 
 # packaging/linux/build-deb.sh's scratch/output dirs (rebuilt from
 # scratch on every run; the built .deb is a local artifact, not checked
