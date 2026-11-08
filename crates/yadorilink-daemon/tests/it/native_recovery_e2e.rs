@@ -1426,14 +1426,18 @@ async fn state_matches(node: &TopologyNode, peer: &TopologyNode) {
     .await;
 }
 
+#[cfg(unix)]
 use yadorilink_daemon::embedded_host::{ApplyChange, EngineCommands, StageMode, StageSource};
+#[cfg(unix)]
 use yadorilink_ipc_proto::shellipc::{
     EntryKind, ProviderApplyChangeRequest, ProviderChangeKind, ProviderContentSource,
 };
+#[cfg(unix)]
 use yadorilink_sync_sqlite::provider::ProviderDeclaration;
 
 /// The user saves `name` into the provider root of the device through the provider write path,
 /// as the OS's file provider reports it. Returns the answer and the staging directory.
+#[cfg(unix)]
 async fn provider_write(
     state: &Arc<yadorilink_daemon::daemon_state::DaemonState>,
     name: &str,
@@ -1482,11 +1486,16 @@ async fn provider_rebootstrap(
     let stopped = Arc::new(AtomicBool::new(false));
     b.state.set_rebootstrap_hook_for_test(Some({
         let (seen, stopped) = (seen.clone(), stopped.clone());
+        // The write probe needs the provider write path, which stages by rename on a Unix host
+        // only; elsewhere the rebootstrap and its stops are exercised without it.
+        #[cfg(unix)]
         let (state, handle) = (b.state.clone(), tokio::runtime::Handle::current());
+        #[cfg(unix)]
         let (edited, staging) = (AtomicBool::new(false), std::sync::Mutex::new(None));
         Arc::new(move |point| {
             // The user saves a file through the provider the moment the final capture begins:
             // the group is frozen, so the write is refused to be retried, not taken and lost.
+            #[cfg(unix)]
             if point == Point::Begin(Failpoint::BeforeCapture)
                 && !edited.swap(true, Ordering::SeqCst)
             {

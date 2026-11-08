@@ -2711,6 +2711,28 @@ mod windows_pipe_tests {
         assert!(matches!(resp_a.payload, Some(RespPayload::Link(_))));
         assert!(matches!(resp_b.payload, Some(RespPayload::Link(_))));
     }
+    /// Opens the pipe the way the client library does: a busy pipe is retried every 50 ms.
+    /// Returns the client, whether the first attempt met a busy pipe, and the time taken.
+    async fn connect_retrying_busy(
+        pipe_name: &str,
+    ) -> (tokio::net::windows::named_pipe::NamedPipeClient, bool, std::time::Duration) {
+        use tokio::net::windows::named_pipe::ClientOptions;
+        const ERROR_PIPE_BUSY: i32 = 231;
+        let started = std::time::Instant::now();
+        let mut first_attempt_busy = false;
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let error = match ClientOptions::new().open(pipe_name) {
+                Ok(client) => return (client, first_attempt_busy, started.elapsed()),
+                Err(error) => error,
+            };
+            assert_eq!(error.raw_os_error(), Some(ERROR_PIPE_BUSY), "connecting: {error}");
+            first_attempt_busy |= attempts == 1;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     /// A burst of clients connecting at once, with one connection already held open (a request in
     /// flight, as a sharing command is), must find the pipe: the daemon keeps several instances
     /// listening, so a client is not turned away with `ERROR_PIPE_BUSY` for as long as the daemon
@@ -2721,7 +2743,6 @@ mod windows_pipe_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_burst_of_clients_finds_the_pipe_while_a_request_is_in_flight() {
         use tokio::net::windows::named_pipe::ClientOptions;
-        const ERROR_PIPE_BUSY: i32 = 231;
         const BURST: usize = 16;
         let (pipe_name, _dir) = start_daemon().await;
         // One request in flight: connected, nothing sent yet, so its handler is waiting for it.
@@ -2733,20 +2754,7 @@ mod windows_pipe_tests {
             let (pipe_name, barrier) = (pipe_name.clone(), barrier.clone());
             clients.push(tokio::spawn(async move {
                 barrier.wait().await;
-                let started = std::time::Instant::now();
-                let mut first_attempt_busy = false;
-                let mut attempts = 0;
-                loop {
-                    attempts += 1;
-                    match ClientOptions::new().open(&pipe_name) {
-                        Ok(client) => return (client, first_attempt_busy, started.elapsed()),
-                        Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
-                            first_attempt_busy |= attempts == 1;
-                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        }
-                        Err(error) => panic!("connecting: {error}"),
-                    }
-                }
+                connect_retrying_busy(&pipe_name).await
             }));
         }
         let mut busy_first = 0;
