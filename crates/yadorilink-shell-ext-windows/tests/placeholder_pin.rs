@@ -13,7 +13,18 @@ use std::path::{Path, PathBuf};
 use yadorilink_fs_platform::cloud_files::{self, PinMark};
 use yadorilink_fs_platform::durable_dir::NoLedger;
 use yadorilink_shell_ext::cfapi;
-use yadorilink_shell_ext::provider_namespace::{pin, PinOutcome, PinWish};
+use yadorilink_shell_ext::provider_namespace::{
+    pin as pin_now, wait_for_background_fetches, PinOutcome, PinWish,
+};
+
+/// Applies a pin and waits for the fetch a keep starts: with no provider serving content the fetch
+/// fails, and the platform's handling of a fetch that is still running must not be mixed with the
+/// marks the next step reads (the background fetch has its own test in the provider namespace).
+fn pin(path: &Path, item_id: Option<&[u8]>, wish: PinWish) -> PinOutcome {
+    let outcome = pin_now(path, item_id, wish);
+    wait_for_background_fetches();
+    outcome
+}
 
 fn attributes(path: &Path) -> u32 {
     cloud_files::attributes_of(path).expect("stat")

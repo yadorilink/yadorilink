@@ -856,12 +856,34 @@ fn any_wanted_beneath(dir: &Path) -> bool {
     })
 }
 
-/// Removes a path from the set of paths being fetched when its fetch ends, however it ends.
-struct Release<'a>(&'a std::sync::Mutex<Vec<PathBuf>>, PathBuf);
+/// The paths being fetched now: the daemon repeats its pin plan, and a second fetch of the same
+/// path must not start while the first runs (a failed one is tried again by the next plan).
+static FETCHING: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+/// Signalled whenever a path leaves [`FETCHING`].
+static FETCH_ENDED: std::sync::Condvar = std::sync::Condvar::new();
 
-impl Drop for Release<'_> {
+fn end_fetch(path: &Path) {
+    FETCHING.lock().unwrap_or_else(|p| p.into_inner()).retain(|p| p != path);
+    FETCH_ENDED.notify_all();
+}
+
+/// Removes a path from the set of paths being fetched when its fetch ends, however it ends.
+struct Release(PathBuf);
+
+impl Drop for Release {
     fn drop(&mut self) {
-        self.0.lock().unwrap_or_else(|p| p.into_inner()).retain(|p| *p != self.1);
+        end_fetch(&self.0);
+    }
+}
+
+/// Blocks until no background fetch of a kept item is running. A fetch reads and hydrates the item
+/// while it runs, so a caller that inspects the item's marks right after changing them (a test of
+/// the pin itself) waits here first instead of racing the platform's handling of the fetch.
+#[doc(hidden)]
+pub fn wait_for_background_fetches() {
+    let mut fetching = FETCHING.lock().unwrap_or_else(|p| p.into_inner());
+    while !fetching.is_empty() {
+        fetching = FETCH_ENDED.wait(fetching).unwrap_or_else(|p| p.into_inner());
     }
 }
 
@@ -870,9 +892,6 @@ impl Drop for Release<'_> {
 /// than the daemon waits for the pin's answer. A failure is logged and leaves the item as it was
 /// (still remote, still pinned), which is what the local state reports.
 fn hydrate_in_background(path: PathBuf) {
-    /// The paths being fetched now: the daemon repeats its pin plan, and a second fetch of the
-    /// same path must not start while the first runs (a failed one is tried again by the next plan).
-    static FETCHING: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
     {
         let mut fetching = FETCHING.lock().unwrap_or_else(|p| p.into_inner());
         if fetching.contains(&path) {
@@ -884,7 +903,7 @@ fn hydrate_in_background(path: PathBuf) {
     let key_for_failure = path.clone();
     let spawned =
         std::thread::Builder::new().name("yadorilink-pin-hydrate".into()).spawn(move || {
-            let _release = Release(&FETCHING, key);
+            let _release = Release(key);
             let mut pending = vec![path];
             while let Some(path) = pending.pop() {
                 let Ok(metadata) = std::fs::symlink_metadata(&path) else { continue };
@@ -932,7 +951,7 @@ fn hydrate_in_background(path: PathBuf) {
         });
     if let Err(e) = spawned {
         // No thread will release the path: do it here, or no later plan could ever fetch it.
-        FETCHING.lock().unwrap_or_else(|p| p.into_inner()).retain(|p| *p != key_for_failure);
+        end_fetch(&key_for_failure);
         eprintln!("yadorilink-cfapi-host: cannot start the fetch of a kept item: {e}");
     }
 }
