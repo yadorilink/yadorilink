@@ -18,10 +18,7 @@ pub mod vars {
     pub const RECEIVE_WRITE_PERMITS: &str = "YADORILINK_RECEIVE_WRITE_PERMITS";
     pub const RECEIVE_WRITE_CONCURRENCY: &str = "YADORILINK_RECEIVE_WRITE_CONCURRENCY";
     pub const COLLECTOR_FLUSH_CAP: &str = "YADORILINK_RECEIVE_COLLECTOR_CAP";
-    pub const BATCH_COMPLETION: &str = "YADORILINK_RECEIVE_BATCH_COMPLETION";
-    pub const BATCH_OPEN: &str = "YADORILINK_RECEIVE_BATCH_OPEN";
     pub const DEFERRED_FSYNC: &str = "YADORILINK_RECEIVE_DEFERRED_FSYNC";
-    pub const ASYNC_COMMIT: &str = "YADORILINK_RECEIVE_ASYNC_COMMIT";
     pub const PROJECTOR_BATCH: &str = "YADORILINK_PROVIDER_PROJECTOR_BATCH";
     pub const RECOVERY_ITEMS_WARN_BYTES: &str = "YADORILINK_RECOVERY_ITEMS_WARN_BYTES";
     pub const SYNC_RELAYS: &str = "YADORILINK_SYNC_RELAYS";
@@ -29,6 +26,7 @@ pub mod vars {
     pub const UPDATE_MANIFEST_URL: &str = "YADORILINK_UPDATE_MANIFEST_URL";
     pub const INSTALL_SOURCE: &str = "YADORILINK_INSTALL_SOURCE";
     pub const NAS_ADMIN_OFFER: &str = "YADORILINK_NAS_ADMIN";
+    pub const DRIFT_RESCAN_INTERVAL: &str = "YADORILINK_DRIFT_RESCAN_INTERVAL_SECS";
     pub const SUPERVISED: &str = yadorilink_local_storage::daemon_lock::SUPERVISED_ENV;
 }
 
@@ -73,18 +71,11 @@ pub struct EngineTuning {
     pub receive_write_concurrency: usize,
     /// Items a collector batch may carry.
     pub collector_flush_cap: usize,
-    /// Whether file completions are batched.
-    pub batch_completion: bool,
-    /// Whether the open of a file's write is batched.
-    pub batch_open: bool,
-    /// Whether the blocks of small received files are held in memory for the pass instead of
-    /// being committed to the block store (default on; a setting for tests and embedded hosts, not
-    /// a variable).
-    pub single_pass: bool,
+    /// Where received and captured file content lives; see [`FileMode`]. Not a variable: the
+    /// platform default, set by tests and embedded hosts.
+    pub file_mode: FileMode,
     /// How received files are flushed when not one by one.
     pub deferred_flush: Option<ReceivedFlushMode>,
-    /// Whether the receive path's commits run on the blocking pool.
-    pub receive_async_commit: bool,
     /// Obligations the provider projector handles per transaction.
     pub provider_projector_batch: usize,
     /// The total size of recovery items above which status warns.
@@ -94,10 +85,9 @@ pub struct EngineTuning {
     pub sync_relays: Option<String>,
     /// Block fetches in flight at once while a file is made present.
     pub block_fetch_concurrency: usize,
-    /// Whether a block the store does not hold is served from the user's file instead, checked
-    /// against its hash before it is sent. Always on where `single_pass` is, which is the default:
-    /// see [`EngineTuning::coherent`].
-    pub file_block_source: bool,
+    /// The time between two drift checks of a linked folder (a metadata-only comparison with the
+    /// index that finds changes no watcher event reported); `None` switches the check off.
+    pub drift_rescan_interval: Option<std::time::Duration>,
     /// Where the installation witness lives. The desktop daemon resolves the platform's
     /// location; an embedded host must name a directory outside the data area and outside what a
     /// backup restores and the system does not purge (`Persistent`), or opt into `BesideDatabase`. The default is
@@ -122,12 +112,40 @@ pub struct EngineTuning {
     pub supervised: bool,
 }
 
-/// Whether a device receives in a single pass, and so keeps received files out of the block store
-/// and serves blocks from the user's files, unless its tuning says otherwise. Unix hosts do. On
-/// Windows large files go through the block store: the capture barrier has no directory flush there
-/// to rely on, and the single-pass receive measured slower. This is the one place the platform
-/// decides; file serving and file-only capture follow it through [`EngineTuning::coherent`].
-pub const SINGLE_PASS_DEFAULT: bool = cfg!(unix);
+/// How a device keeps file content. The states are the only valid ones: receiving in place keeps
+/// a received large file only in the user's folder, so it implies serving blocks from files, and
+/// that pairing cannot be written wrongly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileMode {
+    /// Every block goes through the block store.
+    Blocks,
+    /// A block the store does not hold is served from the user's file instead, checked against
+    /// its hash before it is sent; large files are captured as a hash only.
+    ServesFromFiles,
+    /// `ServesFromFiles`, and a pass keeps the blocks of small received files in memory and
+    /// writes large received files straight into their own file instead of the block store.
+    ReceivesInPlace,
+}
+
+impl FileMode {
+    /// Unix hosts receive in place. On Windows large files go through the block store: the
+    /// capture barrier has no directory flush there to rely on, and the in-place receive
+    /// measured slower. This is the one place the platform decides.
+    pub const PLATFORM_DEFAULT: Self =
+        if cfg!(unix) { Self::ReceivesInPlace } else { Self::Blocks };
+
+    /// Whether blocks the store lacks are served from the user's files.
+    #[must_use]
+    pub fn serves_from_files(self) -> bool {
+        self != Self::Blocks
+    }
+
+    /// Whether received file content skips the block store.
+    #[must_use]
+    pub fn receives_in_place(self) -> bool {
+        self == Self::ReceivesInPlace
+    }
+}
 
 impl Default for EngineTuning {
     /// The production behaviour: what an unset environment selects.
@@ -137,17 +155,6 @@ impl Default for EngineTuning {
 }
 
 impl EngineTuning {
-    /// This tuning with the combinations that cannot work removed. A single-pass receive keeps a
-    /// received large file only in the user's folder, so a device that receives that way must also
-    /// serve blocks from files, or it cannot forward what it received; the pair is one setting,
-    /// and the engine applies this wherever it takes a tuning, so there is no way to run the
-    /// receive without the serving.
-    #[must_use]
-    pub fn coherent(mut self) -> Self {
-        self.file_block_source |= self.single_pass;
-        self
-    }
-
     /// The tuning `lookup` selects, a setting it does not name staying at its default. Values
     /// that do not parse fall back to the default, as the variables always did.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
@@ -176,16 +183,8 @@ impl EngineTuning {
             collector_flush_cap: crate::local_convergence::parse_collector_flush_cap(
                 text(vars::COLLECTOR_FLUSH_CAP).as_deref(),
             ),
-            batch_completion: crate::local_convergence::parse_batch_completion(
-                text(vars::BATCH_COMPLETION).as_deref(),
-            ),
-            batch_open: crate::local_convergence::parse_batch_completion(
-                text(vars::BATCH_OPEN).as_deref(),
-            ),
-            single_pass: SINGLE_PASS_DEFAULT,
-            file_block_source: SINGLE_PASS_DEFAULT,
+            file_mode: FileMode::PLATFORM_DEFAULT,
             deferred_flush,
-            receive_async_commit: text(vars::ASYNC_COMMIT).as_deref().map(str::trim) != Some("0"),
             provider_projector_batch: crate::provider_projector::batch_from(
                 text(vars::PROJECTOR_BATCH).as_deref(),
             ),
@@ -197,6 +196,9 @@ impl EngineTuning {
                 yadorilink_peer_session::peer_session::parse_block_fetch_concurrency(
                     text(vars::BLOCK_FETCH_CONCURRENCY).as_deref(),
                 ),
+            drift_rescan_interval: crate::maintenance::drift_detector::interval_from(
+                text(vars::DRIFT_RESCAN_INTERVAL).as_deref(),
+            ),
             group_commit: group_commit(&lookup),
             home_dir: text("HOME").or_else(|| text("USERPROFILE")).map(std::path::PathBuf::from),
             witness: crate::install_witness::WitnessPlacement::default(),
@@ -210,7 +212,6 @@ impl EngineTuning {
             }),
             supervised: text(vars::SUPERVISED).is_some_and(|v| !v.is_empty()),
         }
-        .coherent()
     }
 }
 
@@ -234,15 +235,16 @@ mod tests {
             crate::convergence::parse_reconcile_paths(None)
         );
         assert_eq!(defaults.receive_write_permits, crate::local_convergence::parse_permits(None));
-        assert!(defaults.batch_completion);
-        assert!(defaults.batch_open);
-        assert_eq!(defaults.single_pass, cfg!(unix), "single-pass receive is the Unix default");
         assert_eq!(
-            defaults.file_block_source,
+            defaults.file_mode.receives_in_place(),
+            cfg!(unix),
+            "receiving in place is the Unix default"
+        );
+        assert_eq!(
+            defaults.file_mode.serves_from_files(),
             cfg!(unix),
             "and a device that receives that way serves from files"
         );
-        assert!(defaults.receive_async_commit);
         // A test build is kept off public relays; a production build has no override.
         assert_eq!(
             defaults.sync_relays,
@@ -273,35 +275,13 @@ mod tests {
         assert_eq!(defaults.witness, crate::install_witness::WitnessPlacement::Unset);
     }
 
-    /// Single-pass receive keeps a received large file only in the user's folder, so it cannot run
-    /// without serving blocks from files: the pair is one setting, however it is configured.
+    /// Receiving in place implies serving from files, by construction.
     #[test]
-    fn single_pass_receive_always_serves_from_files() {
-        let by_default = EngineTuning::default();
-        assert_eq!(by_default.single_pass, by_default.file_block_source);
-
-        let by_hand =
-            EngineTuning { single_pass: true, file_block_source: false, ..EngineTuning::default() };
-        assert!(!by_hand.file_block_source, "fixture: the pair as a caller can write it");
-        assert!(by_hand.coherent().file_block_source);
-
-        let only_serving =
-            EngineTuning { single_pass: false, file_block_source: true, ..EngineTuning::default() }
-                .coherent();
-        assert!(!only_serving.single_pass && only_serving.file_block_source, "serving alone stays");
-    }
-
-    /// Whatever tuning an engine is built with, the engine runs the coherent one.
-    #[test]
-    fn an_engine_built_with_single_pass_alone_serves_from_files() {
-        let coordinator =
-            crate::replica_coordinator::ReplicaCoordinator::open_in_memory_with(EngineTuning {
-                single_pass: true,
-                ..EngineTuning::default()
-            })
-            .unwrap();
-        assert!(coordinator.tuning().single_pass);
-        assert!(coordinator.tuning().file_block_source);
+    fn receiving_in_place_always_serves_from_files() {
+        assert!(FileMode::ReceivesInPlace.serves_from_files());
+        assert!(FileMode::ServesFromFiles.serves_from_files());
+        assert!(!FileMode::ServesFromFiles.receives_in_place());
+        assert!(!FileMode::Blocks.serves_from_files());
     }
 
     /// Each variable the desktop daemon always honoured selects its setting.
@@ -312,9 +292,6 @@ mod tests {
             (vars::RECEIVE_WRITE_PERMITS, "7"),
             (vars::RECEIVE_WRITE_CONCURRENCY, "3"),
             (vars::COLLECTOR_FLUSH_CAP, "5"),
-            (vars::BATCH_COMPLETION, "0"),
-            (vars::BATCH_OPEN, "0"),
-            (vars::ASYNC_COMMIT, "0"),
             (vars::PROJECTOR_BATCH, "11"),
             (vars::RECOVERY_ITEMS_WARN_BYTES, "4096"),
             (vars::SYNC_RELAYS, "none"),
@@ -329,9 +306,6 @@ mod tests {
         assert_eq!(t.receive_write_permits, 7);
         assert_eq!(t.receive_write_concurrency, 3);
         assert_eq!(t.collector_flush_cap, 5);
-        assert!(!t.batch_completion);
-        assert!(!t.batch_open);
-        assert!(!t.receive_async_commit);
         assert_eq!(t.provider_projector_batch, 11);
         assert_eq!(t.recovery_items_warn_bytes, 4096);
         assert_eq!(t.sync_relays.as_deref(), Some("none"));

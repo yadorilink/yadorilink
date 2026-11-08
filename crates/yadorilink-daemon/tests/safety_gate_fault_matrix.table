@@ -25,12 +25,22 @@ delegate | 2.3 |  | crates/yadorilink-daemon/src/gc/tests.rs::gc_must_not_delete
 case | disk_pressure.preflight | 2.4 |  | A write refused for disk pressure is decided before any temp file exists; retry once space returns
 case | disk_pressure.block_store | 2.4 |  | A block write refused for disk pressure leaves no bytes or files; the retry after space returns is durable and readable
 delegate | 2.4 |  | crates/yadorilink-daemon/src/convergence/receive_disk_pressure_sequence_tests.rs::files_refused_under_disk_pressure_land_by_themselves_when_space_returns
-delegate | 2.4 | seam:set_fail_after_rename_for_test | crates/yadorilink-daemon/src/replica_coordinator/materialization_execution/tests.rs::a_repair_reconstruct_that_fails_after_its_rename_keeps_the_object_and_the_intent
-delegate | 2.4 | seam:set_test_fail_repair_reconstruct_proof_commit | crates/yadorilink-daemon/src/replica_coordinator/materialization_execution/tests.rs::a_repair_reconstruct_whose_proof_commit_fails_keeps_its_intent_open
+delegate | 2.4 | RepairFailpoint::AfterPublish | crates/yadorilink-daemon/src/replica_coordinator/materialization_execution/tests.rs::a_repair_reconstruct_that_fails_after_its_rename_keeps_the_object_and_the_intent
+delegate | 2.4 | RepairFailpoint::AfterRowSnapshot | crates/yadorilink-daemon/src/replica_coordinator/materialization_execution/tests.rs::an_intent_that_finishes_after_the_passs_snapshot_leaves_a_matching_file_alone
+delegate | 2.4 | RepairFailpoint::AfterPrepare,RepairFailpoint::AfterStage,RepairFailpoint::BeforePublish | crates/yadorilink-daemon/src/replica_coordinator/materialization_execution/tests.rs::a_repair_reconstruct_stopped_at_each_transition_loses_nothing_and_leaves_no_temp
+delegate | 2.4 |  | crates/yadorilink-daemon/src/replica_coordinator/materialization_execution/tests.rs::a_repair_reconstruct_whose_proof_commit_fails_keeps_its_intent_open
 delegate | 2.4 | seam:inject_startup_failures | crates/yadorilink-daemon/src/adapters/runtime/link_runtime_controller/tests.rs::a_startup_fault_that_outlasts_the_immediate_attempts_is_retried_until_it_clears
 delegate | 2.4 | seam:set_test_namespace_refusal,UnavailableReason::Unsupported | crates/yadorilink-local-storage/src/materialize_write/tests.rs::a_replacing_publish_keeps_the_old_bytes_and_creates_nothing_by_a_plain_rename
 delegate | 2.4 | Failpoint::BeforeCapture,Failpoint::AfterCapture,Failpoint::AfterTargetDurable,Failpoint::AfterRecoveryItem,Failpoint::AfterRemoteOnlyFiles,Failpoint::AfterRemoteOnlyRow,Failpoint::BeforeManifest,Failpoint::AfterManifest,Failpoint::AtPreserved | crates/yadorilink-sync-sqlite/src/native_bootstrap/tests/rebootstrap_crash.rs::a_stop_at_every_failpoint_restarts_clean
 delegate | 2.4 |  | crates/yadorilink-daemon/tests/rewind_crash_failpoints.rs::crash_between_chunks
+delegate | 2.4 | StageFailpoint::Recorded | crates/yadorilink-shell-ext-windows/src/provider_namespace.rs::a_kill_after_the_record_leaves_only_a_record_the_recovery_drops
+delegate | 2.4 | StageFailpoint::Created | crates/yadorilink-shell-ext-windows/src/provider_namespace.rs::a_walk_retires_the_recorded_stage_placeholder_a_kill_after_the_create_left
+delegate | 2.4 | StageFailpoint::Moved | crates/yadorilink-shell-ext-windows/src/provider_namespace.rs::a_kill_after_the_move_leaves_a_record_of_an_absent_stage
+delegate | 2.4 | WriteOpFailpoint::AfterPrepare,WriteOpFailpoint::AfterStage,WriteOpFailpoint::BeforePublish,WriteOpFailpoint::AfterPublish,WriteOpFailpoint::AfterObserve,WriteOpFailpoint::BeforeProve | crates/yadorilink-daemon/src/local_convergence/write_op_failpoint_tests.rs::a_write_stopped_at_each_transition_before_the_proof_is_finished_by_the_retry
+delegate | 2.4 | WriteOpFailpoint::AfterProve | crates/yadorilink-daemon/src/local_convergence/write_op_failpoint_tests.rs::a_fault_after_the_proof_finds_the_write_closed
+delegate | 2.4 | WriteOpFailpoint::BeforeBarrier2 | crates/yadorilink-daemon/src/local_convergence/write_op_failpoint_tests.rs::a_fault_before_barrier_two_keeps_the_intent_for_startup_repair
+delegate | 2.4 | WriteOpFailpoint::AfterBarrier2 | crates/yadorilink-daemon/src/local_convergence/write_op_failpoint_tests.rs::a_fault_after_barrier_two_finds_the_write_closed
+delegate | 2.4 |  | crates/yadorilink-daemon/src/local_convergence/write_op_matrix_tests.rs::the_matrix_runs_every_filled_power_cut_cell
 # ---- 2.5 conflicts ----
 delegate | 2.5 |  | crates/yadorilink-daemon/tests/it/conflict_resolution.rs::keep_this_refuses_while_the_original_has_an_unrecorded_edit
 delegate | 2.5 |  | crates/yadorilink-replica-domain/src/native_fork/tests.rs::a_full_bucket_of_unrelated_equal_heads_refuses_instead_of_dropping
@@ -67,7 +77,8 @@ delegate | 2.9 |  | crates/yadorilink-client-core/src/ops/device_supersede/tests
 delegate | 2.9 |  | crates/yadorilink-client-core/src/ops/device_supersede/tests.rs::the_same_request_is_refused_as_stale_and_then_accepted_after_a_new_sign_in
 # ---- 2.10 updates, rollout and database generation ----
 case | schema.newer_database | 2.10 |  | A database newer than the build is refused (UnsupportedSchemaDowngrade) and not stamped; accepted when the version matches
-case | schema.older_database | 2.10 |  | An older database is never migrated or adopted (CorruptSchema); a fresh one is accepted
+case | schema.older_database | 2.10 |  | A database an earlier build shipped is never migrated or adopted (typed SchemaTooOld, the reset offer); a fresh one is accepted
+case | schema.older_unshipped_database | 2.10 |  | A stamp below the first shipped one is damage, refused as CorruptSchema (no reset offer); a fresh one is accepted
 case | schema.unstamped_with_tables | 2.10 |  | A database with tables and no version stamp is refused (CorruptSchema); a fresh one is accepted
 case | rollout.InvalidVersion | 2.10 | VersionRefusal::InvalidVersion | an unparseable version is refused; the next manifest or wider rollout allows it; an equal or older version is never offered
 case | rollout.Withdrawn | 2.10 | VersionRefusal::Withdrawn | a withdrawn version is refused; the next manifest or wider rollout allows it; an equal or older version is never offered
@@ -120,7 +131,7 @@ delegate | 3 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap
 delegate | 3 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::a_temp_written_in_place_after_barrier_one_is_flushed_again_by_barrier_two
 delegate | 2.4 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::a_receive_dropped_while_it_waits_for_barrier_one_never_leaves_a_witness_for_a_missing_temp
 delegate | 2.4 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::gate_a_cut_between_barrier_one_and_the_rename_keeps_the_temp_and_the_file_is_fetched_again
-delegate | 2.4 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::gate_a_cut_between_barrier_one_and_the_rename_of_a_replacement_keeps_the_old_version
+delegate | 2.4 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::gate_a_cut_between_barrier_one_and_the_rename_of_a_replacement_is_finished_from_its_temp
 delegate | 2.4 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::a_replacement_whose_barrier_one_failed_survives_a_restart_without_a_conflict_copy
 delegate | 2.7 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::a_user_edit_over_the_previous_version_is_kept_by_the_repair_after_a_failed_barrier_one
 delegate | 2.7 | | crates/yadorilink-daemon/src/local_convergence/prefetch_overlap_tests.rs::a_user_edit_after_the_stand_down_is_not_overwritten_by_the_retry

@@ -52,6 +52,7 @@ PROCESS_MODEL_MODULES = [
     "app",
     "app_group",
     "control_socket",
+    "data_volume_watch",
     "diagnostics_ipc",
     "exe_replaced",
     "exe_watch",

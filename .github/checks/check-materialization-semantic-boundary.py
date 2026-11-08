@@ -289,7 +289,6 @@ ALLOWLIST: dict[str, dict[str, int]] = {
         "dag_usable_proof_names_current_version": 1,
         "commit_restore_operation": 1,
         "discard_restore_operation": 1,
-        "MaterializationIntentGuard::open": 1,
         "bump_mutation_fence": 1,
     },
     # Owner operations for the convergence lanes: the eager content
@@ -312,14 +311,14 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     # commit the symlink write makes (its open shares the symlink write's
     # open half, so it adds no call there).
     D + "replica_coordinator/materialization_owner/lanes.rs": {
-        "open_materialization_intent_guard": 4,
-        "set_materialization_state": 3,
+        "open_materialization_intent_guard": 2,
+        "set_materialization_state": 2,
         "clear_held": 5,
-        "dag_bump_mutation_fence": 2,
-        # The content write's pre-write transaction: intent, row, in-flight
-        # state, hold clear and fence bump in one commit, and the guard of
-        # the intent it opened.
-        "MaterializationIntentGuard::opened": 1,
+        # The content write's and the single-object (symlink, directory)
+        # write's pre-write transactions: intent, row, in-flight state and
+        # fence bump in one commit (and the hold clear, for content), and the
+        # guard of the intent each opened.
+        "MaterializationIntentGuard::opened": 3,
         "dag_snapshot_mutation_fence": 1,
         "set_held": 2,
         "set_held_with_key": 1,
@@ -341,7 +340,8 @@ ALLOWLIST: dict[str, dict[str, int]] = {
         "dag_usable_proof_names_current_version": 2,
         "dag_snapshot_mutation_fence": 3,
         "dag_zero_work_settlement_if_already_current": 1,
-        "MaterializationIntentGuard::open": 2,
+        "MaterializationIntentGuard::open": 1,
+        "MaterializationIntentGuard::opened": 1,
         "clear_held_in_tx": 1,
     },
     # Owner operations for the hydration lanes: convergence
@@ -353,7 +353,6 @@ ALLOWLIST: dict[str, dict[str, int]] = {
         "reprove_verified_hydrated_state": 1,
         "mark_restore_disk_committed": 1,
         "commit_restore_operation": 1,
-        "dag_bump_mutation_fence": 1,
         "commit_internal_materialized_state_if_fence_current": 1,
     },
     # Owner operations for eviction and recovery: eviction's open
@@ -379,10 +378,9 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     # or places anything under a held path; the lane has no raw call.
     D + "replica_coordinator/materialization_owner/repair.rs": {
         "discard_restore_operation": 1,
-        "set_materialization_state": 1,
-        "dag_bump_mutation_fence": 4,
+        "dag_bump_mutation_fence": 1,
+        "MaterializationIntentGuard::opened": 1,
         "transition_materialization_state": 1,
-        "open_materialization_intent_guard": 2,
         "commit_internal_materialized_state_if_fence_current": 1,
         "commit_recovered_materialized_state": 1,
         "set_materialization_state_in_tx": 1,
@@ -427,14 +425,14 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     # and xattrs), offline delete;
     # restore-journal recovery (adopting commit, discards after a disk
     # comparison).
-    # has_usable_materialized_generation 3: the live sweep's settled-row
+    # has_usable_materialized_generation 4: the live sweep's settled-row
     # short-circuit reads the proof before hashing the file (a read of the
-    # same predicate the post-compare branch already uses; no state change).
+    # same predicate the post-compare branch already uses; no state change);
+    # the crash-state shadow comparison reads it once per examined file row.
     F + "materialization_repair.rs": {
-        "has_usable_materialized_generation": 3,
+        "has_usable_materialized_generation": 4,
         "commit_recovered_materialized_state": 1,
-        "open_materialization_intent_guard": 1,
-        "dag_bump_mutation_fence": 3,
+        "dag_bump_mutation_fence": 2,
         "clear_materialization_intent": 2,
         "discard_restore_operation": 2,
         "commit_restore_operation": 1,
@@ -529,10 +527,10 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     # move, held release and fence bump in one transaction); it replaced the
     # same primitives previously called from the owner's lane operations.
     S + "content_write_open.rs": {
-        "begin_materialization_intent_in_tx": 1,
-        "bump_mutation_fence": 1,
+        "begin_materialization_intent_in_tx": 3,
+        "bump_mutation_fence": 5,
         "clear_held_in_tx": 1,
-        "set_materialization_state_in_tx": 1,
+        "set_materialization_state_in_tx": 3,
     },
 }
 
@@ -555,18 +553,18 @@ ALLOWLIST: dict[str, dict[str, int]] = {
 #   L daemon/local_convergence/types.rs                             3
 #   L daemon/materialization_intent.rs                              2
 #   L filesystem-sync/materialization_eviction.rs                   1
-#   L filesystem-sync/materialization_repair.rs                    13
+#   L filesystem-sync/materialization_repair.rs                    11
 #   L local-capture/local_change/event_ingest.rs                    4
 #   L local-capture/local_change/flush.rs                           1
 #   L local-capture/local_change/scan.rs                            2
 #   O daemon/replica_coordinator.rs                                 1
 #   O daemon/replica_coordinator/local_commit.rs                    4
 #   O daemon/replica_coordinator/local_mutation.rs                  6
-#   O daemon/replica_coordinator/materialization_execution.rs       7
+#   O daemon/replica_coordinator/materialization_execution.rs       6
 #   O daemon/replica_coordinator/materialization_owner.rs           3
-#   O daemon/replica_coordinator/materialization_owner/hydration.rs 10
-#   O daemon/replica_coordinator/materialization_owner/lanes.rs    26
-#   O daemon/replica_coordinator/materialization_owner/repair.rs 14
+#   O daemon/replica_coordinator/materialization_owner/hydration.rs  9
+#   O daemon/replica_coordinator/materialization_owner/lanes.rs    23
+#   O daemon/replica_coordinator/materialization_owner/repair.rs  9
 #   O daemon/replica_coordinator/materialization_owner/structural.rs 11
 #   O daemon/replica_coordinator/peer_replica_state.rs             20
 #   R sync-sqlite/exact_materialized_commit.rs                     12
@@ -577,9 +575,9 @@ ALLOWLIST: dict[str, dict[str, int]] = {
 #   R sync-sqlite/store.rs                                         12
 #   R sync-sqlite/structural_origin.rs                              3
 #   ------------------------------------------------------------
-#   total 191 = lane 43 + owner 92 + repository 56 (the per-file rows above are
+#   total 188 = lane 42 + owner 82 + repository 64 (the per-file rows above are
 #   indicative; the pins in ALLOWLIST are authoritative)
-EXPECTED_ALLOWED = 191
+EXPECTED_ALLOWED = 188
 
 # The in-family row mutators outside `FORBIDDEN`. Each also writes
 # materialization-relevant columns (a peer row's version and authoring, the

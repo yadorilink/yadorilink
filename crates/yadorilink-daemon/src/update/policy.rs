@@ -34,6 +34,9 @@ pub enum UpdateState {
     Checking,
     Available,
     HeldBack,
+    /// A newer version exists but cannot open this device's data (its state format is not
+    /// readable by that version), which a staged-rollout hold-back is not.
+    StateIncompatible,
     KillSwitched,
     Failed,
     UpToDate,
@@ -46,6 +49,7 @@ impl UpdateState {
             UpdateState::Checking => "checking",
             UpdateState::Available => "available",
             UpdateState::HeldBack => "held_back",
+            UpdateState::StateIncompatible => "state_incompatible",
             UpdateState::KillSwitched => "kill_switched",
             UpdateState::Failed => "failed",
             UpdateState::UpToDate => "up_to_date",

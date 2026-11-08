@@ -105,6 +105,12 @@ pub(crate) struct LinkTransferView {
 /// One linked folder's full status, as `ListLinks`/`Status` report it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LinkStatusView {
+    /// Labels of every reason the folder is held back (`crate::folder_state`); empty when none.
+    pub(crate) folder_blockers: Vec<crate::folder_state::FolderBlocker>,
+    /// Changes made here that no other device is known to hold yet (`crate::folder_state`).
+    pub(crate) pending_local_changes: u64,
+    /// The device the folder's newest recorded change came from, when it is another device.
+    pub(crate) last_change_origin_device_id: Option<String>,
     /// The link's identity key; for a provider folder (`provider` is `Some`) NOT a path.
     pub(crate) local_path: String,
     /// `(root_id, display_name)` of a provider-backed folder.
@@ -143,6 +149,13 @@ pub(crate) struct LinkStatusView {
     pub(crate) online_only_bytes: u64,
     /// Content fetches requested and not finished (see `LinkStatus.requested_content_count`).
     pub(crate) requested_content_count: u64,
+    /// Pinned items not downloaded yet (already part of `requested_content_count`), the last
+    /// failure, and the seconds until the next attempt.
+    pub(crate) pinned_pending_count: u64,
+    pub(crate) pinned_pending_error: String,
+    pub(crate) pinned_pending_retry_secs: u64,
+    /// The folder's retention rules added up (see `LinkStatus.retention_rule_count`).
+    pub(crate) retention: yadorilink_sync_sqlite::RuleSummary,
     pub(crate) held_files: Vec<HeldFileView>,
     pub(crate) skipped_symlink_count: u64,
     /// Directories a removal moved aside and could not put back; each still
@@ -216,6 +229,8 @@ pub(crate) struct LinkFacts {
     pub(crate) conflict_count: u64,
     pub(crate) conflicts_pending: u64,
     pub(crate) held_files: Vec<HeldFileView>,
+    /// The folder's retention rules added up, read when the facts are collected.
+    pub(crate) retention: yadorilink_sync_sqlite::RuleSummary,
     pub(crate) skipped_symlink_count: u64,
     pub(crate) stranded_directory_count: u64,
     pub(crate) paused_until_unix: i64,
@@ -238,6 +253,11 @@ pub(crate) struct LinkFacts {
     pub(crate) rebuild_needed: bool,
     pub(crate) history_skipped_last_day: u32,
     pub(crate) history_skipped_last_30_days: u32,
+    /// Changes made here that no other device is known to hold: journaled dirty paths plus
+    /// own recorded changes no peer has named. 0 when the group has no other device.
+    pub(crate) pending_local_changes: u64,
+    /// The device the folder's newest recorded change came from, when it is another device.
+    pub(crate) last_change_origin: Option<String>,
 }
 
 impl LinkFacts {

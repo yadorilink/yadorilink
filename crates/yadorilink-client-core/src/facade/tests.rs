@@ -138,3 +138,57 @@ async fn redeeming_a_send_link_requires_a_receiving_device() {
         }
     );
 }
+
+#[test]
+fn an_eviction_that_kept_the_daemons_blocks_says_why_and_a_clean_free_says_nothing() {
+    use yadorilink_ipc_proto::daemonctl::EvictResponse;
+    // The OS copy was dropped, nothing was reclaimed, and the daemon kept its blocks: the reason reaches the front end.
+    let kept = folders::evict_outcome(&EvictResponse {
+        dehydrated: true,
+        retained_reason: "custody_not_acquired".into(),
+        ..Default::default()
+    });
+    assert!(kept.evicted);
+    assert_eq!(kept.bytes_reclaimed, 0);
+    assert_eq!(kept.retained_reason.as_deref(), Some("custody_not_acquired"));
+    assert_eq!(kept.not_freed_reason, None);
+    assert!(!kept.retry_later);
+
+    // A real free carries neither reason.
+    let freed = folders::evict_outcome(&EvictResponse {
+        dehydrated: true,
+        blocks_reclaimed: 3,
+        bytes_reclaimed: 12_288,
+        ..Default::default()
+    });
+    assert_eq!((freed.retained_reason, freed.not_freed_reason), (None, None));
+    assert_eq!(freed.bytes_reclaimed, 12_288);
+
+    // A refusal keeps its own reason and the retry rule, and has no retained reason.
+    let refused = folders::evict_outcome(&EvictResponse {
+        not_freed_reason: "path_changing".into(),
+        ..Default::default()
+    });
+    assert!(!refused.evicted);
+    assert_eq!(refused.not_freed_reason.as_deref(), Some("path_changing"));
+    assert_eq!(refused.retained_reason, None);
+    assert!(refused.retry_later);
+}
+
+/// The account's device names are reused only under the sign-in they were read for, and only while
+/// fresh: another sign-in (another account), or none, never sees them.
+#[test]
+fn device_names_are_reused_only_under_the_sign_in_they_were_read_for() {
+    let names = HashMap::from([("device-b".to_string(), "Studio Mac".to_string())]);
+    let kept = |age: Duration| CachedDeviceNames {
+        at: std::time::Instant::now().checked_sub(age).expect("a monotonic clock"),
+        client_id: "sign-in-1".into(),
+        names: names.clone(),
+    };
+
+    let fresh = kept(Duration::ZERO);
+    assert_eq!(fresh.names_for("sign-in-1"), Some(&names));
+    assert_eq!(fresh.names_for("sign-in-2"), None, "another sign-in reused the names");
+    assert_eq!(fresh.names_for(""), None);
+    assert_eq!(kept(DEVICE_NAMES_TTL + Duration::from_secs(1)).names_for("sign-in-1"), None);
+}

@@ -226,7 +226,7 @@ pub(crate) async fn seal_own_state(
 
     let leaf = native_checkpoint_seal_leaf(group.as_str(), &bundle.checkpoint);
     let request_id = seal_request_id(group.as_str(), &state.device_id, &leaf);
-    let Some((authority_checkpoint, signature)) = source
+    let Ok((authority_checkpoint, signature)) = source
         .request_authorization_checkpoint(
             group.as_str(),
             &state.device_id,

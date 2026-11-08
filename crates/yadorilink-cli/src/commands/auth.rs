@@ -11,21 +11,31 @@ use yadorilink_fapi_client::PairingCode;
 
 use crate::error::CliError;
 
+/// What follows a first sign-in: the one thing left before files sync.
+const FIRST_FOLDER_STEP: &str = "Next: sync a folder with `yadorilink share create <name> --path <folder>` \
+    (on a computer that should get a folder you already share: `yadorilink share join <name> --path <folder>`).";
+
 /// Enrol this installation and sign it in. `device`: sign in with the
 /// device-code grant instead of the loopback redirect.
-pub async fn login(device: bool) -> Result<(), CliError> {
-    ops::login(device, |event| {
-        for line in login_event_lines(&event) {
-            println!("{line}");
-        }
-    })
+pub async fn login(device: bool, device_name: Option<String>) -> Result<(), CliError> {
+    ops::login(
+        device,
+        device_name,
+        &yadorilink_client_core::ops::daemon::default_launch(),
+        |event| {
+            for line in login_event_lines(&event) {
+                println!("{line}");
+            }
+        },
+    )
     .await?;
+    println!("{FIRST_FOLDER_STEP}");
     Ok(())
 }
 
 /// Add this computer with a pairing code from the account's web page: no browser. `code` is the
 /// argument as given: the code itself, or `-` to read it from standard input.
-pub async fn login_with_code(code: &str) -> Result<(), CliError> {
+pub async fn login_with_code(code: &str, device_name: Option<String>) -> Result<(), CliError> {
     use std::io::IsTerminal;
     let code = if code.trim() == "-" {
         if std::io::stdin().is_terminal() {
@@ -35,12 +45,18 @@ pub async fn login_with_code(code: &str) -> Result<(), CliError> {
     } else {
         parse_pairing_code(code)?
     };
-    ops::login_with_pairing_code(code, |event| {
-        for line in login_event_lines(&event) {
-            println!("{line}");
-        }
-    })
+    ops::login_with_pairing_code(
+        code,
+        device_name,
+        &yadorilink_client_core::ops::daemon::default_launch(),
+        |event| {
+            for line in login_event_lines(&event) {
+                println!("{line}");
+            }
+        },
+    )
     .await?;
+    println!("{FIRST_FOLDER_STEP}");
     Ok(())
 }
 
@@ -147,6 +163,13 @@ fn remote_session_without_ssh_variables() -> bool {
     false
 }
 
+/// Whether a person is at a full terminal that nothing is reading from: stdin, stdout and stderr
+/// are a terminal, and it is neither `CI` nor `--json`.
+#[must_use]
+pub fn is_interactive(env: TerminalEnv) -> bool {
+    env.stdin_tty && env.stdout_tty && env.stderr_tty && !env.ci && !env.json
+}
+
 /// Whether the failed command starts the sign-in by itself, and which flow it uses.
 /// Everything the person must see or answer is on a terminal (stdin, stdout and stderr: a piped
 /// `--json` run never starts one, and neither does `--json` on a terminal or `CI`), the command is not itself a sign-in command (no recursion), and
@@ -158,15 +181,15 @@ pub fn auto_sign_in_plan(
     is_sign_in_command: bool,
     env: TerminalEnv,
 ) -> Option<bool> {
-    let interactive = env.stdin_tty && env.stdout_tty && env.stderr_tty && !env.ci && !env.json;
-    (interactive && !is_sign_in_command && error.is_sign_in_required())
+    (is_interactive(env) && !is_sign_in_command && error.is_sign_in_required())
         .then_some(env.ssh || !env.display)
 }
 
 /// The sign-in the failed command starts: the same flow as `yadorilink login`, with every line
 /// on stderr so nothing reaches stdout, and a Ctrl-C ends only the sign-in.
 pub async fn login_on_stderr(device: bool) -> Result<(), CliError> {
-    let flow = ops::login(device, |event| {
+    let launch = yadorilink_client_core::ops::daemon::default_launch();
+    let flow = ops::login(device, None, &launch, |event| {
         for line in login_event_lines(&event) {
             eprintln!("{line}");
         }

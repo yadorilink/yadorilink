@@ -16,9 +16,9 @@ use std::path::{Path, PathBuf};
 use yadorilink_fs_platform::flush::{self, FlushCounts};
 use yadorilink_local_storage::io_diag::{self, Op};
 use yadorilink_local_storage::{
-    flush_received_files, persist_reconstructed_file_durable,
+    flush_received_files, persist_reconstructed_file_checked,
     reconstruct_file_to_temp_observed_durable, BlockStore, Durability, LocallyHashedBlock,
-    NoTempLedger, ReceivedFlushMode, ReceivedFlushOutcome, SegmentBlockStore,
+    NoTempLedger, ReceivedFlushMode, ReceivedFlushOutcome, SegmentBlockStore, TargetExpectation,
 };
 
 const BASELINE: &str = include_str!("../../../.github/checks/perf-baseline.json");
@@ -73,7 +73,9 @@ fn publish_all(
             durability,
         )
         .unwrap();
-        persist_reconstructed_file_durable(&tmp, target, &NoTempLedger, durability).unwrap();
+        let expected = TargetExpectation::observe(target).unwrap();
+        persist_reconstructed_file_checked(&tmp, target, &NoTempLedger, durability, None, expected)
+            .unwrap();
         if extra_flush_per_file {
             // The defect the guard exists for: one more flush per received file.
             io_diag::time(Op::DirFsync, 0, || {

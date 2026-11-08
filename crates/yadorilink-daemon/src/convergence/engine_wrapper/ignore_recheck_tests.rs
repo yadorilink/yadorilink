@@ -100,12 +100,12 @@ fn admit_change(
 
 /// The core regression: a path parked `'ignore_blocked'` (standing in
 /// for a real ignore-policy settlement -- see this module's own doc
-/// comment for why a direct park, not real `.yadorilinkignore`
+/// comment for why a direct park, not real ignore rules
 /// matching, is used here, mirroring `hazard_recheck_tests`' own
 /// direct-`set_held` convention) with an already-admitted, trivially-
 /// materializable native version is re-armed back to `'pending'` by
 /// `run_ignore_recheck_pass` alone -- no new incoming record for this
-/// exact path, and no `.yadorilinkignore` edit for the sweep to react
+/// exact path, and no ignore-rules change for the sweep to react
 /// to -- and then converges for real once the ordinary obligation-
 /// driven scheduler picks it up. RED-confirmed by commenting out the
 /// re-arm loop inside `run_ignore_recheck_pass` (leaving only the

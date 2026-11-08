@@ -18,6 +18,8 @@ use std::time::Duration;
 
 pub(crate) struct DiagnosticsLinkView {
     pub(crate) state_label: &'static str,
+    /// `FolderBlocker` labels: every reason the folder is held back.
+    pub(crate) blockers: Vec<&'static str>,
 }
 
 pub(crate) struct RuntimeDiagnosticsSnapshot {

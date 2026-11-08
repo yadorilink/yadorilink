@@ -22,7 +22,10 @@ pub mod unreadable;
 
 pub use error::LocalCaptureError;
 pub use ingest::{AlwaysIngest, Ingest, IngestPolicy};
-pub use local_change::{FlushOutcome, LocalChangeOutcome, LocalChangeProcessor};
+pub use local_change::{
+    DriftCandidate, DriftKind, DriftOptions, DriftReport, FlushOutcome, LocalChangeOutcome,
+    LocalChangeProcessor,
+};
 
 /// Deterministic race injection for other crates' test builds.
 #[cfg(any(test, feature = "test-support"))]

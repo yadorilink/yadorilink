@@ -104,7 +104,7 @@ async fn wait_for_inbox_status(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_link_goes_from_created_to_received_and_the_sender_keeps_its_record() {
     let _turn = ONE_AT_A_TIME.lock().await;
-    let (_fake, a, b, runtimes, _dirs) = stand_up().await;
+    let (fake, a, b, runtimes, _dirs) = stand_up().await;
     let sender = EngineCommands::for_state_for_test(a.state.clone());
     let recipient = EngineCommands::for_state_for_test(b.state.clone());
 
@@ -127,6 +127,12 @@ async fn a_link_goes_from_created_to_received_and_the_sender_keeps_its_record() 
     let preview = recipient.preview_send_link(&link.code).await.unwrap();
     assert_eq!(preview.files.len(), 1);
     assert_eq!(preview.files[0].name, "gift.txt");
+    // The service saw neither the name nor the secret half of the code: only ciphertext and hashes.
+    let secret = link.code.replace('-', "")[8..].to_string();
+    let bodies = fake.send_link_request_bodies().join("\n");
+    assert!(!bodies.is_empty());
+    assert!(!bodies.contains("gift"), "a file name reached the service: {bodies}");
+    assert!(!bodies.to_uppercase().contains(&secret), "the code's secret reached the service");
     // Redeeming is the one consent: the offer that arrives under the link is received by the engine
     // itself into the folder named at redeem, with no receive call.
     let dest = tempfile::tempdir().unwrap();
@@ -141,6 +147,7 @@ async fn a_link_goes_from_created_to_received_and_the_sender_keeps_its_record() 
     let entry = wait_for_inbox_status(&recipient, &offered.transfer_id, "completed").await;
     assert_eq!(entry.link_id, link.link_id);
     assert_eq!(entry.received_bytes, entry.total_size);
+    assert_eq!((entry.files_done, entry.files_total), (1, 1));
     assert_eq!(entry.destination_dir, dest_path);
     assert_eq!(std::fs::read(dest.path().join("gift.txt")).unwrap(), b"from an iPhone");
 
@@ -236,6 +243,8 @@ async fn a_stop_interrupts_a_receive_cleanly_and_it_resumes() {
     tokio::time::timeout(Duration::from_secs(30), parked.notified()).await.expect("parked");
     let during = wait_for_inbox_status(&recipient, &offered.transfer_id, "in_progress").await;
     assert!(during.received_bytes > 0 && during.received_bytes < during.total_size);
+    // Two chunks of one file landed: the file is not done, and the offer holds one.
+    assert_eq!((during.files_done, during.files_total), (0, 1));
 
     service.interrupt_receives(Duration::from_secs(10)).await;
     let entry = recipient.list_inbox().unwrap().into_iter().next().unwrap();

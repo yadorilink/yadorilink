@@ -1093,7 +1093,7 @@ impl super::LocalConvergenceExecutor {
                 continue;
             }
             if let (true, Some(mut sink)) = (complete, state.sink.take()) {
-                match sink.finalize(self.store.clone(), &planned.requirement.record).await {
+                match sink.finalize(self.store.clone(), &planned.requirement.record, None).await {
                     Ok(()) => {
                         let requirement = &planned.requirement;
                         let (tmp_path, ledger) = sink.staged.keep();

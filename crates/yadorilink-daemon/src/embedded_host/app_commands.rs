@@ -4,29 +4,29 @@
 //! `status_report`; the rest are one port call), and refuses what the control socket refuses,
 //! with the same typed reasons.
 
-use yadorilink_ipc_proto::daemonctl::{ApplicationErrorCode, StatusResponse};
+use yadorilink_ipc_proto::daemonctl::{ApplicationErrorCode, MintedInviteInfo, StatusResponse};
 
 use super::{CommandError, EngineCommands};
 use crate::enrollment_commands::{self, CreateShare as Create, JoinGroup as Join};
+use crate::network_policy::{NetworkCost, PolicyState};
 pub use crate::preserved_items::{PreservedItem, PreservedKind};
 
 /// How long a pause lasts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PauseFor {
     UntilResumed,
-    ThirtyMinutes,
-    OneHour,
-    /// Until the next local midnight.
-    UntilTomorrow,
+    TwoHours,
+    EightHours,
+    TwentyFourHours,
 }
 
 impl From<PauseFor> for crate::pause_deadline::PauseDuration {
     fn from(duration: PauseFor) -> Self {
         match duration {
             PauseFor::UntilResumed => Self::UntilResumed,
-            PauseFor::ThirtyMinutes => Self::ThirtyMinutes,
-            PauseFor::OneHour => Self::OneHour,
-            PauseFor::UntilTomorrow => Self::UntilTomorrow,
+            PauseFor::TwoHours => Self::TwoHours,
+            PauseFor::EightHours => Self::EightHours,
+            PauseFor::TwentyFourHours => Self::TwentyFourHours,
         }
     }
 }
@@ -443,6 +443,45 @@ impl EngineCommands {
         }
     }
 
+    /// Mints a one-use invite to a folder group; `None` role or lifetime takes the service's
+    /// default. The invite describes what the service created, not what was asked.
+    ///
+    /// # Errors
+    /// `TermsConsentRequired` when the service wants the terms accepted first,
+    /// `CoordinationRejected` for any other refusal.
+    pub async fn mint_invite(
+        &self,
+        group_id: &str,
+        role: Option<&str>,
+        ttl_secs: Option<u64>,
+        requires_approval: bool,
+    ) -> Result<MintedInviteInfo, CommandError> {
+        use crate::application::model::MintInviteError;
+        let invite = self
+            .context
+            .application
+            .enrollment
+            .mint_invite(group_id, role, ttl_secs, requires_approval)
+            .await
+            .map_err(|error| {
+                let code = match error {
+                    MintInviteError::TermsConsentRequired(_) => {
+                        ApplicationErrorCode::TermsConsentRequired
+                    }
+                    MintInviteError::Rejected(_) => ApplicationErrorCode::CoordinationRejected,
+                };
+                CommandError::refused(code, error.to_string(), String::new())
+            })?;
+        Ok(MintedInviteInfo {
+            code: invite.code,
+            invite_id: invite.invite_id,
+            group_id: invite.group_id,
+            role: invite.role,
+            expires_at_unix: invite.expires_at_unix,
+            requires_approval: invite.requires_approval,
+        })
+    }
+
     /// Pauses a linked folder.
     ///
     /// # Errors
@@ -472,6 +511,38 @@ impl EngineCommands {
     /// Unlinks a folder.
     ///
     /// # Errors
+    /// Takes a device's access to a folder group away, through the same guarded path as the
+    /// desktop's revoke: without `force` it is refused (`ReplicaNotReady`, nothing changed) when
+    /// the group would be left without another confirmed complete copy.
+    ///
+    /// # Errors
+    /// A refusal with the membership code (`ReplicaNotReady`, `CoordinationRejected`,
+    /// `TermsConsentRequired`, ...); nothing was changed unless the code says an operation is
+    /// pending (`RecoveryPending`, `CoordinationAmbiguous`).
+    pub async fn revoke_member(
+        &self,
+        group_id: String,
+        device_id: String,
+        force: bool,
+    ) -> Result<yadorilink_ipc_proto::daemonctl::ReplicaMembershipCommandOutcome, CommandError>
+    {
+        let result = self
+            .context
+            .application
+            .membership
+            .revoke_device(crate::application::RevokeDeviceCommand { group_id, device_id, force })
+            .await;
+        match result {
+            Ok(outcome) => Ok(crate::membership_wire::membership_outcome_to_proto(outcome)),
+            Err(error) => {
+                let proto = crate::membership_wire::membership_error_to_proto(error);
+                let code = ApplicationErrorCode::try_from(proto.code)
+                    .unwrap_or(ApplicationErrorCode::Unspecified);
+                Err(CommandError::refused(code, proto.message, proto.operation_id))
+            }
+        }
+    }
+
     /// [`ApplicationErrorCode::NotProtected`] when unlinking would leave the group without a
     /// confirmed complete copy elsewhere and `force` is not set; [`ApplicationErrorCode::GroupMismatch`]
     /// when the link no longer belongs to the expected group; otherwise the engine's message.
@@ -606,6 +677,31 @@ impl EngineCommands {
     }
 }
 
+impl EngineCommands {
+    /// The metered-network policy: the stored setting and what the host last reported.
+    #[must_use]
+    pub fn network_policy(&self) -> PolicyState {
+        self.context.network_policy.current()
+    }
+
+    /// Allows or pauses sync on a metered connection.
+    ///
+    /// # Errors
+    /// [`CommandError`] when the setting cannot be saved.
+    pub fn set_sync_on_metered(&self, enabled: bool) -> Result<PolicyState, CommandError> {
+        self.context
+            .network_policy
+            .set_sync_on_metered(enabled)
+            .map_err(|e| failed(format!("could not save the setting: {e}")))
+    }
+
+    /// Records what the host says about the connection (it knows; the engine does not guess).
+    #[must_use]
+    pub fn report_network_cost(&self, cost: NetworkCost) -> PolicyState {
+        self.context.network_policy.report_cost(cost)
+    }
+}
+
 fn group_mismatch(local_path: &str) -> CommandError {
     CommandError::refused(
         ApplicationErrorCode::GroupMismatch,
@@ -621,7 +717,7 @@ fn link_failure(error: crate::sync_error::SyncError) -> CommandError {
     }
 }
 
-fn preserved_failure(error: crate::preserved_items::PreservedError) -> CommandError {
+pub(super) fn preserved_failure(error: crate::preserved_items::PreservedError) -> CommandError {
     use crate::preserved_items::PreservedError as Error;
     let refusal = match &error {
         Error::NotFound => PreservedRefusal::NotFound,

@@ -97,7 +97,7 @@ pub(crate) struct Tick {
 pub(crate) fn tick_root(state: &DaemonState, root: &ProviderRoot, batch: usize) -> Tick {
     let repo = state.replica_coordinator.provider_repository();
     let mut tick = Tick::default();
-    match repo.project_batch(&root.group_id, batch) {
+    match state.replica_coordinator.provider_writes().project_batch(&root.group_id, batch) {
         Ok(n) => tick.projected += n,
         Err(error) => {
             tracing::warn!(root = %root.root_id, %error, "the provider projector failed a batch");
@@ -107,7 +107,11 @@ pub(crate) fn tick_root(state: &DaemonState, root: &ProviderRoot, batch: usize) 
     }
     if !root.namespace_ready {
         match repo.verify_namespace(&root.group_id) {
-            Ok(None) => match repo.set_namespace_ready(&root.root_id, true) {
+            Ok(None) => match state
+                .replica_coordinator
+                .provider_writes()
+                .set_namespace_ready(&root.root_id, true)
+            {
                 Ok(_) => tick.became_ready = true,
                 Err(error) => {
                     tracing::warn!(%error, "could not mark the namespace ready");
@@ -175,6 +179,16 @@ pub(crate) async fn pass(
     Ok(Pass::Done { roots: count, delay, retry })
 }
 
+/// A provider group has no link runtime to continue its recorded rebootstrap when the folder is
+/// watched again, so the projector continues it once at start.
+pub(crate) fn resume_recorded_rebootstraps(state: &Arc<DaemonState>) {
+    if let Ok(roots) = state.replica_coordinator.provider_repository().list_declared_roots() {
+        for root in roots {
+            crate::native_rebootstrap::spawn_resume(state.clone(), root.group_id);
+        }
+    }
+}
+
 /// Runs for the life of the daemon.
 pub(crate) async fn run(
     state: Arc<DaemonState>,
@@ -183,6 +197,7 @@ pub(crate) async fn run(
     let batch = state.tuning().provider_projector_batch;
     let mut writes = state.replica_coordinator.database().subscribe_data_changes();
     let mut backoff = Backoff::new();
+    resume_recorded_rebootstraps(&state);
     loop {
         // Marked before the pass reads anything: a write that lands during the pass wakes the
         // next wait.

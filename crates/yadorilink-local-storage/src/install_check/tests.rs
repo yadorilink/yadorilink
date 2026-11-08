@@ -45,6 +45,7 @@ fn machine() -> Machine {
         home: home.path().to_path_buf(),
         system_root: home.path().join("win"),
         app_bundles: vec![home.path().join("Applications/YadoriLink.app")],
+        store_startup_enabled: false,
     };
     Machine { home, roots }
 }
@@ -229,6 +230,28 @@ fn without_a_record_the_running_daemon_decides_which_registrations_conflict() {
     let daemon = running("apt", "/usr/bin");
     let rows = run(&m, &RecordState::Missing, &LockProbe::Held, Some(&daemon));
     assert_eq!(errors(&rows).len(), 1, "{rows:?}");
+}
+
+#[test]
+fn a_store_package_beside_a_command_line_install_is_a_conflicting_startup_task() {
+    let mut m = machine();
+    let reg =
+        service_registrations::TABLE.iter().find(|r| r.kind == Kind::PackagedStartupTask).unwrap();
+    let off = run(&m, &record(Owner::Cli, "script", "/x"), &LockProbe::Free, None);
+    assert!(errors(&off).is_empty(), "{off:?}");
+    m.roots.store_startup_enabled = true;
+    let rows = run(&m, &record(Owner::Cli, "script", "/x"), &LockProbe::Free, None);
+    let errs = errors(&rows);
+    assert_eq!(errs.len(), 1, "{rows:?}");
+    assert!(errs[0].detail.contains(reg.name), "{}", errs[0].detail);
+    // The same machine is clean for the Store installation itself.
+    let own = run(
+        &m,
+        &record(Owner::Gui, "microsoft_store", "C:/Program Files/WindowsApps/x"),
+        &LockProbe::Free,
+        None,
+    );
+    assert!(errors(&own).is_empty(), "{own:?}");
 }
 
 #[test]

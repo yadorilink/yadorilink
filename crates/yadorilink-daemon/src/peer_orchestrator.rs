@@ -316,10 +316,16 @@ fn apply_authoritative_peer_metadata(
     // policy + retained-history validator positively admits it. Not
     // mirrored to the offline snapshot: the settling call below is what
     // this pass leaves behind, and it is what gets persisted.
-    state.seed_netmap_peer_identity(device_id, signing_key);
+    state.seed_netmap_peer_identity_keeping_settled(
+        device_id,
+        signing_key,
+        authorized_groups,
+        full_replica_groups,
+    );
 
     let effective_groups = crate::change_auth::effective_servable_groups(
         state.clone(),
+        device_id,
         authorized_groups,
         validation_cache,
     );
@@ -1427,7 +1433,7 @@ pub(crate) fn peer_sync_session_deps(state: &Arc<DaemonState>) -> PeerSyncSessio
         // `DaemonState::rehome_custody_hold`.
         custody_rehome_responder: state.clone(),
         // Serving a block the store lacks from the user's file, when that is switched on.
-        block_file_source: state.tuning().file_block_source.then(|| {
+        block_file_source: state.tuning().file_mode.serves_from_files().then(|| {
             Arc::new(crate::file_block_source::FileBlockSource::new(
                 state.replica_coordinator.clone(),
                 state.clone(),

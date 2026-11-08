@@ -365,3 +365,58 @@ fn a_closure_the_checkpoint_carries_is_stored_bound_to_that_checkpoint() {
     assert_eq!(crate::native_closure::closures_for_export(&fresh, &group()).unwrap().len(), 1);
     assert!(crate::native_store::is_closed(&fresh, &group(), &b).unwrap());
 }
+
+// --- the evidence behind the file rows a group keeps ---------------------------------------
+
+#[test]
+fn an_install_keeps_the_evidence_behind_the_file_rows_the_group_keeps() {
+    use yadorilink_replica_domain::native_plan::NativeRowIdentity;
+    let (source, _a, _b) = source();
+    let state = crate::native_store::load_state(&source, &group()).unwrap();
+    let (path, heads) = state.heads.iter().next().expect("the source holds a head");
+    let (dot, payload) = heads.iter().next().unwrap();
+    let identity = |provenance| {
+        NativeRowIdentity { source_path: path.clone(), dot: dot.clone(), provenance }.to_bytes()
+    };
+    let carried = identity(payload.provenance);
+    let superseded = identity(yadorilink_replica_domain::native_state::DeltaHash([9; 32]));
+    let unused = identity(yadorilink_replica_domain::native_state::DeltaHash([8; 32]));
+
+    // The receiver shows two heads it once held, and has the evidence for them and for a
+    // third that no row cites.
+    let receiver = conn();
+    for identity in [&carried, &superseded, &unused] {
+        receiver
+            .execute(
+                "INSERT INTO native_authoring_witness (group_id, identity, version) \
+                 VALUES (?1, ?2, x'00')",
+                rusqlite::params![GROUP, identity],
+            )
+            .unwrap();
+    }
+    for (row_path, identity) in [(path.as_str(), &carried), ("superseded.txt", &superseded)] {
+        receiver
+            .execute(
+                "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, \
+                 version_seq, state, native_authoring_identity) \
+                 VALUES (?1, ?2, 0, 0, '[]', 1, 'current', ?3)",
+                rusqlite::params![GROUP, row_path, identity],
+            )
+            .unwrap();
+    }
+    install_fresh(&source, &receiver).unwrap();
+
+    let sql = format!(
+        "SELECT COUNT(*) FROM files f WHERE f.group_id = ?1 AND {}",
+        yadorilink_sqlite_runtime::authoring_evidence_missing("f")
+    );
+    assert_eq!(receiver.query_row::<i64, _, _>(&sql, [GROUP], |r| r.get(0)).unwrap(), 0);
+    let witnesses: i64 = receiver
+        .query_row(
+            "SELECT COUNT(*) FROM native_authoring_witness WHERE group_id = ?1",
+            [GROUP],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(witnesses, 2, "the evidence no row cites goes with the state");
+}

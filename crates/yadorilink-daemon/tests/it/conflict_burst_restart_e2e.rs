@@ -38,6 +38,7 @@ fn setup() {
 }
 
 fn roots(node: &TopologyNode) -> native_replication::SummaryRoots {
+    flush_namespace(node);
     read(node, |conn| native_replication::summary_roots(conn, &FolderGroupId(GROUP.to_owned())))
 }
 

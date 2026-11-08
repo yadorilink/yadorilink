@@ -118,6 +118,8 @@ pub(crate) struct LinkRuntimeDependencies {
     pub(crate) block_store: Arc<dyn BlockStore + Send + Sync>,
     pub(crate) telemetry: Arc<crate::runtime_telemetry::RuntimeTelemetry>,
     pub(crate) device_id: String,
+    /// Where each group's ignore rules are stored.
+    pub(crate) ignore_rules: yadorilink_fs_platform::ignore_patterns::IgnoreRulesStore,
     /// Reaches the three daemon-wide operations `LinkRuntimeHostPort`
     /// covers -- see that trait's own doc for why they cannot be plain
     /// fields on this bundle.

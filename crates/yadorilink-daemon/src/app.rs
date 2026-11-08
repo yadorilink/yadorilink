@@ -55,6 +55,24 @@ struct DaemonInstanceLock {
     _file: std::fs::File,
 }
 
+/// Another daemon holds this data area's instance lock. The daemon exits with
+/// [`LOCK_HELD_EXIT_CODE`] on it, so a service manager told not to restart that status does not
+/// start a duplicate again and again (a daemon that was started by hand is already running).
+#[derive(Debug)]
+pub struct InstanceLockHeld(pub PathBuf);
+
+impl std::fmt::Display for InstanceLockHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "another YadoriLink daemon is already running for {}", self.0.display())
+    }
+}
+
+impl std::error::Error for InstanceLockHeld {}
+
+/// The status of a daemon that found the data area's lock held (`EX_CONFIG`, as for a refused
+/// owner).
+pub const LOCK_HELD_EXIT_CODE: i32 = 78;
+
 impl DaemonInstanceLock {
     fn acquire(config_dir: &std::path::Path) -> anyhow::Result<Self> {
         use std::fs::OpenOptions;
@@ -81,10 +99,7 @@ impl DaemonInstanceLock {
             // take_exclusive_lock doc comment for why ErrorKind::WouldBlock
             // does not reliably match Windows' real contention error.
             Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
-                anyhow::bail!(
-                    "another YadoriLink daemon is already running for {}",
-                    config_dir.display()
-                )
+                Err(InstanceLockHeld(config_dir.to_path_buf()).into())
             }
             Err(error) => Err(anyhow::anyhow!(
                 "failed to acquire daemon instance lock {}: {error}",
@@ -512,11 +527,27 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<RunEnd> {
 
     let dir = config.config_dir;
     let tuning = config.tuning;
+    // A data volume that is not there yet (a disk not plugged in) is waited for, not failed on: an
+    // exit status would make a supervisor restart the daemon every few seconds until it returns.
+    if crate::data_volume_watch::is_armed() {
+        tokio::select! {
+            () = crate::data_volume_watch::wait_until_available(
+                &dir,
+                crate::data_volume_watch::STARTUP_WAIT_INTERVAL,
+            ) => {}
+            reason = wait_for_os_signal() => {
+                tracing::info!(reason, "stop requested while waiting for the data volume");
+                return Ok(RunEnd::Stopped);
+            }
+        }
+    }
     refuse_unusable_state_dir(&yadorilink_fs_platform::state_dir::Env::from_process(), &dir)?;
     // The one place the credential settings are read from the environment; everything below
     // is handed this value.
     let credentials = credential_config_from_env(&dir)?;
     yadorilink_fs_platform::durable_dir::create_dir_all_durably(&dir)?;
+    // A data volume that drops under the running daemon stops it (armed by the standalone binary only).
+    crate::data_volume_watch::start_if_armed(&dir);
     // Acquire before opening the block store/SQLite or touching either Unix
     // socket. In particular, a losing process must never unlink the live
     // daemon's socket before discovering that it does not own this config.
@@ -582,6 +613,13 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<RunEnd> {
     } else {
         None
     };
+
+    // The credential store must be readable before anything below creates or migrates data:
+    // a store that cannot be read (a keychain the program may not use, a damaged or
+    // unsupported document) refuses the start here, while the block store and database are
+    // still untouched. The full load that builds the coordination credential happens at the
+    // end of startup; this read only decides whether starting is allowed at all.
+    credential_store::installation(&dir, &credentials)?;
 
     // Additive to the config-dir lock above: take exclusive OS locks on the
     // block-store root and the sync-state database *before* opening either
@@ -690,6 +728,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<RunEnd> {
             application,
             crate::adapters::build_query_services(state.clone()),
             dir.clone(),
+            state.network_policy.clone(),
         )
         .with_identity(identity.clone()),
     );
@@ -930,7 +969,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<RunEnd> {
         }
         _ => {
             tracing::warn!(
-                "not logged in or no device registered yet — running with local link management only; run `yadorilink login` and `yadorilink device register` to enable P2P sync"
+                "not logged in or no device registered yet — running with local link management only; run `yadorilink login` to enable P2P sync"
             );
             // Signed out, or not a registered device: there is no account
             // relationship left for a last-known-good peer authorization to
@@ -1255,7 +1294,7 @@ async fn graceful_shutdown(
         sink.flush().await;
     }
 
-    crate::engine_startup::quiesce(state).await;
+    timed_shutdown_phase("links and broadcasts", crate::engine_startup::quiesce(state)).await;
 
     // Remove the socket files last, once nothing should be listening
     // through them anymore — a stale socket left behind after an
@@ -1340,15 +1379,25 @@ async fn graceful_shutdown(
         crate::receive_diag::emit_report("shutdown");
     }
 
-    crate::engine_startup::close_substrate(state).await;
+    timed_shutdown_phase("peer endpoint", crate::engine_startup::close_substrate(state)).await;
 
     // Finally, stop the essential tasks themselves (control socket,
     // shell IPC, peer orchestrator) — aborts whichever of them are still
     // running and awaits their abort, so this doesn't return until
     // they're actually gone.
-    essential.shutdown().await;
+    timed_shutdown_phase("essential tasks", essential.shutdown()).await;
 
-    crate::engine_startup::checkpoint_data(state).await;
+    timed_shutdown_phase("database checkpoint", crate::engine_startup::checkpoint_data(state))
+        .await;
+}
+
+/// Runs one phase of the graceful shutdown and logs how long it took, so a slow stop says which
+/// phase it waited in.
+async fn timed_shutdown_phase<T>(phase: &str, work: impl std::future::Future<Output = T>) -> T {
+    let started = std::time::Instant::now();
+    let result = work.await;
+    tracing::info!(phase, elapsed_ms = started.elapsed().as_millis() as u64, "shutdown phase done");
+    result
 }
 
 /// The daemon's `/metrics`
@@ -1595,8 +1644,9 @@ mod credential_config_tests {
         clear();
 
         let unset = credential_config_from_env(dir.path()).unwrap();
-        assert_eq!(unset.backend, Backend::platform_default(dir.path()));
-        assert_eq!(unset.key_mirror, KeyMirror::OsKeyring);
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(unset.backend, Backend::default_for_executable(dir.path(), &exe));
+        assert_eq!(unset.key_mirror, KeyMirror::from_env());
         assert_eq!(unset.auth_server_addr, None);
 
         std::env::set_var("YADORILINK_CREDENTIAL_STORE", "file");
@@ -1625,10 +1675,9 @@ mod tuning_config_tests {
     use super::*;
     use crate::test_support::CONFIG_ENV_MUTEX;
 
-    const VARS: [&str; 6] = [
+    const VARS: [&str; 5] = [
         "YADORILINK_CONFIG_DIR",
         "YADORILINK_RECEIVE_WRITE_PERMITS",
-        "YADORILINK_RECEIVE_ASYNC_COMMIT",
         "YADORILINK_SYNC_RELAYS",
         "YADORILINK_NAS_ADMIN",
         "YADORILINK_WITNESS_DIR",
@@ -1648,11 +1697,9 @@ mod tuning_config_tests {
             unset.receive_write_permits,
             crate::engine_tuning::EngineTuning::default().receive_write_permits
         );
-        assert!(unset.receive_async_commit);
         assert!(!unset.offer_nas_admin);
 
         std::env::set_var("YADORILINK_RECEIVE_WRITE_PERMITS", "5");
-        std::env::set_var("YADORILINK_RECEIVE_ASYNC_COMMIT", "0");
         std::env::set_var("YADORILINK_SYNC_RELAYS", "none");
         std::env::set_var("YADORILINK_NAS_ADMIN", "1");
         std::env::set_var("YADORILINK_WITNESS_DIR", witness.path());
@@ -1660,7 +1707,6 @@ mod tuning_config_tests {
         clear();
 
         assert_eq!(set.receive_write_permits, 5);
-        assert!(!set.receive_async_commit);
         assert_eq!(set.sync_relays.as_deref(), Some("none"));
         assert!(set.offer_nas_admin);
         assert_eq!(
@@ -1773,6 +1819,54 @@ mod startup_config_validation_tests {
         assert!(
             !attempt.sync_db_path.exists(),
             "a missing device key must abort before SQLite creation"
+        );
+    }
+
+    /// An unreadable credential store refuses startup before any data is created: the block
+    /// store's format and the replica database are written only after the credentials are
+    /// known to be readable.
+    // apple-cfg: ios-explicit `run` refuses on iOS: the daemon process model does not run there
+    #[cfg_attr(target_os = "ios", ignore = "the daemon process model does not run on iOS")]
+    #[tokio::test]
+    async fn an_unreadable_credential_store_is_refused_before_any_data_is_written() {
+        let _env_guard = CONFIG_ENV_MUTEX.lock().await;
+        let config_dir = tempfile::tempdir().unwrap();
+        let block_store_root = config_dir.path().join("blocks");
+        let sync_db_path = config_dir.path().join("sync-state.sqlite3");
+        std::env::set_var("YADORILINK_CONFIG_DIR", config_dir.path());
+        std::env::set_var("YADORILINK_BLOCK_STORE", &block_store_root);
+        std::env::set_var("YADORILINK_SYNC_DB", &sync_db_path);
+        std::env::set_var("YADORILINK_CREDENTIAL_STORE", "file");
+        std::fs::write(config_dir.path().join("device.json"), current_device_json()).unwrap();
+        yadorilink_transport::DeviceSigningKeyPair::generate_and_persist(
+            config_dir.path().join("signing_key"),
+            yadorilink_transport::KeyMirror::Disabled,
+        )
+        .unwrap();
+        let credentials = config_dir.path().join("credentials.json");
+        std::fs::write(&credentials, "not a credential document").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let outcome = run(DaemonConfig::from_env().unwrap()).await;
+
+        for variable in [
+            "YADORILINK_CONFIG_DIR",
+            "YADORILINK_BLOCK_STORE",
+            "YADORILINK_SYNC_DB",
+            "YADORILINK_CREDENTIAL_STORE",
+        ] {
+            std::env::remove_var(variable);
+        }
+        let error = outcome.expect_err("an unreadable credential store refuses startup");
+        assert!(format!("{error:#}").contains("credential"), "{error:#}");
+        assert!(!sync_db_path.exists(), "no database before the credentials are known readable");
+        assert!(
+            !block_store_root.exists(),
+            "no block store before the credentials are known readable"
         );
     }
 
@@ -1991,6 +2085,13 @@ mod startup_config_validation_tests {
     #[cfg_attr(target_os = "ios", ignore = "the daemon process model does not run on iOS")]
     #[tokio::test]
     async fn an_older_schema_database_leaves_its_reason_and_reset_steps() {
+        // A stamp an earlier build shipped is the typed "older generation"; one no build ever wrote is damage. Both are
+        // refused with the reset steps; the wording tells them apart.
+        older_schema_refusal(yadorilink_sqlite_runtime::SCHEMA_VERSION - 1, "predates").await;
+        older_schema_refusal(1, "not a version any shipped build wrote").await;
+    }
+
+    async fn older_schema_refusal(stamp: i32, reason: &str) {
         let _env_guard = CONFIG_ENV_MUTEX.lock().await;
         let config_dir = tempfile::tempdir().unwrap();
         let block_store_root = config_dir.path().join("blocks");
@@ -2006,7 +2107,8 @@ mod startup_config_validation_tests {
         .unwrap();
         {
             let conn = rusqlite::Connection::open(&sync_db_path).unwrap();
-            conn.execute_batch("CREATE TABLE t(x); PRAGMA user_version = 1;").unwrap();
+            conn.execute_batch(&format!("CREATE TABLE t(x); PRAGMA user_version = {stamp};"))
+                .unwrap();
         }
 
         let outcome = tokio::time::timeout(
@@ -2024,7 +2126,7 @@ mod startup_config_validation_tests {
         outcome.expect("startup must fail closed").expect_err("an older schema must be refused");
         let refusal = refusal.expect("the refusal must be left for status to show");
         assert!(refusal.contains("cannot open the data on disk"), "{refusal}");
-        assert!(refusal.contains("predates"), "the underlying reason: {refusal}");
+        assert!(refusal.contains(reason), "the underlying reason for stamp {stamp}: {refusal}");
         assert!(refusal.contains(&sync_db_path.display().to_string()), "{refusal}");
         assert!(refusal.contains(&block_store_root.display().to_string()), "{refusal}");
         let marker = yadorilink_sqlite_runtime::creation_marker_path(&sync_db_path);

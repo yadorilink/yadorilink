@@ -382,7 +382,7 @@ def validate_ledger(ledger, records: dict[str, dict], *, floor: str,
             try:
                 if semver_key(minimum) > semver_key(ver):
                     p.append(f"minimum_supported_version {minimum} exceeds {source} version {ver}")
-                if _core(floor) > _core(ver):
+                if semver_key(floor) > semver_key(ver):
                     p.append(f"{where}.version {ver} is older than {floor}, the first release of "
                              "the protocol generation this tree carries")
             except ValueError as ex:
@@ -402,6 +402,8 @@ def validate_ledger(ledger, records: dict[str, dict], *, floor: str,
         generations[source] = (ver, json.dumps(rec.get("protocol_generation"), sort_keys=True))
     if minimum is not None:
         try:
+            # Cores only: the minimum may name a prerelease of the floor's core until the
+            # floor's own release is live, so older prereleases of that core are tolerated.
             if _core(floor) > _core(minimum):
                 p.append(f"minimum_supported_version {minimum} is below {floor}, the first release of "
                          "this protocol generation; older builds must be told an update is required")

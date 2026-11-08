@@ -48,26 +48,50 @@ async fn path_lock_recording_is_inert_until_armed_and_keyed_on_the_caller() {
 }
 
 /// A second task blocked on the lock shows up as wait time at ITS site, not
-/// the holder's.
+/// the holder's. No sleeps: the waiter is polled once, which starts its wait and finds the lock
+/// held; the time the test then lets pass before releasing the holder is a lower bound the
+/// recorded wait must cover (both read the same monotonic clock), whatever the timer granularity.
 #[tokio::test]
 async fn a_blocked_acquisition_records_its_wait_at_its_own_site() {
+    use std::future::Future;
     let _owner = GLOBAL_TEST_LOCK.lock().await;
     reset();
     set_enabled(true);
     let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
     let holder = lock.clone();
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
     let hold = tokio::spawn(async move {
         let _g = holder.lock().await;
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        held_tx.send(()).unwrap();
+        release_rx.await.unwrap();
     });
-    tokio::time::sleep(Duration::from_millis(5)).await;
-    drop(lock_path(&lock).await);
+    held_rx.await.unwrap();
+
+    let waiter = lock_path(&lock);
+    tokio::pin!(waiter);
+    let blocked =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(waiter.as_mut().poll(cx).is_pending()))
+            .await;
+    assert!(blocked, "the holder has the lock");
+    let blocked_since = std::time::Instant::now();
+    // Let some real time pass while it is provably blocked, so the bound below is not empty.
+    tokio::task::yield_now().await;
+    let released_at = std::time::Instant::now();
+    release_tx.send(()).unwrap();
+    drop(waiter.await);
     hold.await.unwrap();
     set_enabled(false);
 
     let sites = own_sites();
-    assert_eq!(sites.len(), 1);
-    assert!(sites[0].wait_nanos >= 15_000_000, "waited behind the holder: {:?}", sites[0]);
+    assert_eq!(sites.len(), 1, "{sites:?}");
+    let observed_blocked = released_at.saturating_duration_since(blocked_since).as_nanos();
+    assert!(
+        sites[0].wait_nanos >= observed_blocked,
+        "the wait covers the time it was seen blocked ({observed_blocked} ns): {:?}",
+        sites[0]
+    );
+    assert_eq!(sites[0].acquisitions, 1);
     reset();
 }
 

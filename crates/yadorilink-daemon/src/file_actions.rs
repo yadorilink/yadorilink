@@ -18,6 +18,8 @@ pub(crate) struct ItemFacts {
     pub in_transition: bool,
     /// The item is a regular file (not a folder, link or missing).
     pub is_file: bool,
+    /// The item is a directory.
+    pub is_folder: bool,
     /// The item is inside a provider folder (the operating system downloads and removes its
     /// downloads).
     pub provider_folder: bool,
@@ -30,7 +32,9 @@ pub(crate) struct ItemFacts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Retention {
     pub pinned: bool,
-    /// The pin was set at exactly this path rather than inherited from a folder above.
+    /// An `online_only` rule frees the item's copy.
+    pub online_only: bool,
+    /// The rule was set at exactly this path rather than inherited from a folder above.
     pub explicit: bool,
 }
 
@@ -46,7 +50,24 @@ pub(crate) fn free_up_space_offered(facts: &ItemFacts) -> bool {
 
 /// The actions available for the item, in presentation order.
 pub(crate) fn available_actions(facts: &ItemFacts) -> Vec<FileAction> {
+    // A folder is not freed itself, but its rules are: Free Up Space on an online-only folder
+    // runs the rule again for what it left behind.
+    let folder_free_up_space = facts.is_folder
+        && facts.provider_folder
+        && facts.reclaim_gate_open
+        && facts.retention.is_some_and(|r| r.online_only);
     if !facts.known || facts.in_transition {
+        // A folder the daemon holds no state for still has its rules to choose from.
+        if facts.is_folder && !facts.in_transition {
+            let mut actions = Vec::new();
+            if folder_free_up_space {
+                actions.push(FileAction::FreeUpSpace);
+            }
+            if let Some(retention) = facts.retention {
+                actions.extend(rule_actions(facts, retention));
+            }
+            return actions;
+        }
         return Vec::new();
     }
     let mut actions = Vec::new();
@@ -57,12 +78,30 @@ pub(crate) fn available_actions(facts: &ItemFacts) -> Vec<FileAction> {
     } else if !facts.provider_folder {
         actions.push(FileAction::Download);
     }
-    // A file kept only because a folder above is has neither keep action: that folder is what
-    // to release.
-    match facts.retention {
-        Some(Retention { pinned: false, .. }) => actions.push(FileAction::KeepOnDevice),
-        Some(Retention { pinned: true, explicit: true }) => actions.push(FileAction::StopKeeping),
-        Some(Retention { pinned: true, explicit: false }) | None => {}
+    if folder_free_up_space {
+        actions.push(FileAction::FreeUpSpace);
+    }
+    // Each rule is offered where it would change something. A rule inherited from a folder above
+    // is replaced by setting another one here (an exception); "Default" is offered only where a
+    // rule stands at exactly this path. Online only needs an operating-system copy to drop, so it
+    // is a provider folder's choice.
+    if let Some(retention) = facts.retention {
+        actions.extend(rule_actions(facts, retention));
+    }
+    actions
+}
+
+/// The rule choices that would change something for an item.
+fn rule_actions(facts: &ItemFacts, retention: Retention) -> Vec<FileAction> {
+    let mut actions = Vec::new();
+    if !retention.pinned {
+        actions.push(FileAction::KeepOnDevice);
+    }
+    if facts.provider_folder && !retention.online_only {
+        actions.push(FileAction::OnlineOnly);
+    }
+    if retention.explicit {
+        actions.push(FileAction::Default);
     }
     actions
 }

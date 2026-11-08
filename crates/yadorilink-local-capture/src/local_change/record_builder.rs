@@ -261,6 +261,9 @@ pub(super) fn flush_before_commit(
     if flush_failure_armed(path) {
         return Barrier::CouldNotFlush;
     }
+    if !yadorilink_fs_platform::flush::can_flush_directory_entries() {
+        return Barrier::CouldNotFlush;
+    }
     let Ok(flush_handle) = yadorilink_fs_platform::flush::open_for_flush(path) else {
         return Barrier::CouldNotFlush;
     };
@@ -696,6 +699,28 @@ impl LocalChangeProcessor {
         Ok(self.state.disk_is_untouched_proven_write(group_id, rel_path, root, path)?)
     }
 
+    /// Whether the regular file at `path` is, untouched since, the bytes of the version the row
+    /// names that this device wrote and verified a moment ago (see
+    /// [`LocalMutationStore::verified_echo_untouched`](crate::ports::LocalMutationStore::verified_echo_untouched)).
+    /// Fail-closed: any doubt, or a failed row read, is `false`.
+    fn is_untouched_verified_write(
+        &self,
+        group_id: &str,
+        rel_path: &str,
+        root: &Path,
+        path: &Path,
+    ) -> bool {
+        let Ok(Some(row)) = self.state.canonical_current_row(group_id, rel_path) else {
+            return false;
+        };
+        if row.snapshot.deleted
+            || row.snapshot.record_kind != yadorilink_replica_domain::file::RecordKind::File
+        {
+            return false;
+        }
+        self.state.verified_echo_untouched(group_id, rel_path, &row.version_hash(), root, path)
+    }
+
     /// Builds the `FileRecord` for a `CreatedOrModified` event without
     /// writing it to the index — shared by `process_event` (which writes
     /// immediately, one file at a time) and `scan_existing_files` (which
@@ -869,13 +894,19 @@ impl LocalChangeProcessor {
                 if let Ok(metadata) = std::fs::metadata(path) {
                     let current_mtime_matches =
                         metadata_mtime_matches(&metadata, existing.mtime_unix_nanos);
+                    // The watcher's report of this device's own just-verified write needs no second
+                    // read of the bytes: they were checked against this version when written, and
+                    // nothing has touched the file since (identity, size, mode, modification and
+                    // change time all as recorded, and old enough to prove it). Every other case
+                    // reads and hashes the file as before.
                     if existing.size == metadata.len()
                         && current_mtime_matches
-                        && disk_bytes_match_indexed_blocks_off_worker(
-                            path,
-                            &existing.blocks,
-                            metadata.len(),
-                        )?
+                        && (self.is_untouched_verified_write(group_id, &rel_path, root, path)
+                            || disk_bytes_match_indexed_blocks_off_worker(
+                                path,
+                                &existing.blocks,
+                                metadata.len(),
+                            )?)
                     {
                         // size, mtime, AND content are all verified
                         // identical here — but that still isn't the whole
@@ -970,6 +1001,12 @@ impl LocalChangeProcessor {
         // Whether this file's blocks go into the store or are only hashed (`crate::ingest`). A
         // file that cannot be flushed falls back to the store below.
         let mut ingest = self.ingest_policy.ingest_for(group_id, &rel_path, lstat.len());
+        // A file-only capture is only as durable as the file's own directory entry. Where that
+        // cannot be flushed (Windows), the file is stored: no pass is spent hashing a file that
+        // would be hashed again after a failed barrier.
+        if !yadorilink_fs_platform::flush::can_flush_directory_entries() {
+            ingest = Ingest::Store;
+        }
         // ONE LOOK AT THE FILE. The record built below -- blocks, size,
         // mtime, mode -- must describe a single state of the file, and a
         // file can be written while it is read (a `git clone` streaming a

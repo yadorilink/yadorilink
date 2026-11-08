@@ -335,8 +335,8 @@ jobs:
       - name: Unsigned installer builds
         run: ./packaging/linux/build-deb.sh
 
-  # The one-line installers (packaging/install): the pin block is well formed, and
-  # each installer passes its suite against a local fixture release signed with a
+  # The one-line installer (packaging/install): the pin block is well formed, and
+  # the installer passes its suite against a local fixture release signed with a
   # throw-away key. Nothing here touches the network or a real key.
   script-installer:
     name: script installer (${{ matrix.os }})
@@ -345,7 +345,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -359,17 +359,7 @@ jobs:
           python3 packaging/install/pins.py --self-test
           python3 packaging/install/pins.py check
       - name: sh installer suite
-        if: runner.os != 'Windows'
         run: sh packaging/install/tests/run-tests.sh
-      - name: PowerShell installer suite
-        if: runner.os == 'Windows'
-        shell: powershell
-        run: |
-          $root = Join-Path $env:RUNNER_TEMP 'lp-install'
-          New-Item -ItemType Directory -Force -Path $root | Out-Null
-          Copy-Item packaging/install/install.ps1, packaging/install/tests/build-fixture.py, packaging/install/tests/serve.py, packaging/install/tests/windows/Run-Tests.ps1, packaging/install/tests/windows/verifier-vectors.ps1 $root
-          powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'Run-Tests.ps1') -Root $root
-          exit $LASTEXITCODE
 
   # macOS runs three lanes, Windows four, in parallel, so a long workspace
   # run no longer queues the daemon work behind it. The daemon lane does not

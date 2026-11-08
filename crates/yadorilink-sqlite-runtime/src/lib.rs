@@ -31,6 +31,7 @@ pub use pool::{CachedStatements, ConnectionPool, BUSY_TIMEOUT, STATEMENT_CACHE_C
 pub use schema::{
     authoring_evidence_missing, check_replica_schema_generation, check_schema_version_supported,
     files_authoring_triggers, init_schema, note_child_set_change, note_item_replaced,
-    note_retention_changed, reconcile_provider_liveness, table_exists, SCHEMA_VERSION,
+    note_retention_changed, reconcile_provider_liveness, table_exists,
+    FIRST_SHIPPED_SCHEMA_VERSION, SCHEMA_VERSION,
 };
 pub use state_stamp::{read_state_stamp, StateStamp};

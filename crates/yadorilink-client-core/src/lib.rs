@@ -23,6 +23,7 @@
 #[cfg(feature = "ffi")]
 uniffi::setup_scaffolding!();
 
+pub mod account_email;
 pub mod coordination;
 pub mod daemon;
 /// The shared meaning of problems that need the user (see `yadorilink-product-view`).

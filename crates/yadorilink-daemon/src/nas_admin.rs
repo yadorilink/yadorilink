@@ -290,7 +290,10 @@ impl NasAdminEndpoint for Dashboard {
 
     fn deliver(&self, stream: NasAdminStream) {
         if let Some(streams) = &self.streams {
-            streams.offer(Box::new(stream));
+            // A stream without the dialler's session secret is not served: the
+            // dashboard would have nothing to require of its requests.
+            let Some(secret) = stream.secret().copied() else { return };
+            streams.offer(Box::new(stream), secret);
         }
     }
 }

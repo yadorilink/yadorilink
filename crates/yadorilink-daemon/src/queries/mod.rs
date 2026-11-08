@@ -8,6 +8,7 @@
 //! -- add a new field only when a new slice lands, never a placeholder for
 //! one that hasn't.
 
+pub(crate) mod account_devices;
 pub(crate) mod diagnostics;
 #[cfg(feature = "process-model")]
 pub(crate) mod diagnostics_bundle;
@@ -36,6 +37,7 @@ pub(crate) struct QueryServices {
     pub(crate) governance: Arc<governance::GovernanceQueryService>,
     pub(crate) reporting: Arc<reporting::ReportingQueryService>,
     pub(crate) recovery: Arc<recovery::RecoveryQueryService>,
+    pub(crate) account_devices: Arc<account_devices::AccountDevicesQueryService>,
     #[cfg(feature = "process-model")]
     pub(crate) diagnostics_bundle: Arc<diagnostics_bundle::DiagnosticsBundleQueryService>,
     pub(crate) handoff_readiness: Arc<handoff_readiness::HandoffReadinessQueryService>,

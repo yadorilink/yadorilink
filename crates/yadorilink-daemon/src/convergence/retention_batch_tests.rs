@@ -155,7 +155,10 @@ async fn ask_all(
     replies
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// The queue coalesces what is asked within a short window. Paused time makes the window close
+// only once every request has been queued, so the partition does not depend on how fast the
+// host spawns the tasks.
+#[tokio::test(start_paused = true)]
 async fn files_asked_together_are_kept_with_one_store_commit_and_all_have_provenance() {
     let f = fixture(false).await;
     let store = CountingStore::new(f.executor.durable_store.clone());
@@ -173,7 +176,9 @@ async fn files_asked_together_are_kept_with_one_store_commit_and_all_have_proven
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// Like the test above, on paused time: a refused batch is the first or the second one only if
+// all the requests are queued before the window closes.
+#[tokio::test(start_paused = true)]
 async fn a_batch_the_store_refuses_claims_none_of_its_files_kept_and_records_no_provenance() {
     let f = fixture(false).await;
     let store = CountingStore::new(f.executor.durable_store.clone());
@@ -192,7 +197,9 @@ async fn a_batch_the_store_refuses_claims_none_of_its_files_kept_and_records_no_
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// Paused time, for the partition [5, 5, 2] to be a fact of the limits and not of how fast the
+// host queues twelve requests.
+#[tokio::test(start_paused = true)]
 async fn only_the_files_of_the_batch_that_failed_are_left_unkept() {
     let f = fixture(false).await;
     let store = CountingStore::new(f.executor.durable_store.clone());
@@ -347,7 +354,7 @@ async fn a_file_that_grew_while_its_batch_was_committed_is_not_claimed_kept() {
     assert!(matches!(&replies[1], Ok(p) if is_in_store(p)), "{replies:?}");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn a_batch_never_holds_more_than_64_files_open() {
     let f = fixture(false).await;
     let store = CountingStore::new(f.executor.durable_store.clone());

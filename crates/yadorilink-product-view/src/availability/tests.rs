@@ -8,6 +8,7 @@ fn part(availability: Availability, reachable: &[&str], offline: &[&str]) -> Ava
         reachable_device_ids: reachable.iter().map(|s| s.to_string()).collect(),
         offline_device_ids: offline.iter().map(|s| s.to_string()).collect(),
         update_required_device_ids: Vec::new(),
+        newer_peer_device_ids: Vec::new(),
     }
 }
 

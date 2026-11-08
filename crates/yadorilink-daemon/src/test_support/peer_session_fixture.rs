@@ -1607,6 +1607,13 @@ where
     runtime_build(session, local_device_id, state, store.clone(), sync_roots, ports, Some(store))
 }
 
+/// A rules store in a directory of its own, for a test that never writes rules.
+pub fn scratch_ignore_rules() -> yadorilink_fs_platform::ignore_patterns::IgnoreRulesStore {
+    yadorilink_fs_platform::ignore_patterns::IgnoreRulesStore::new(
+        tempfile::tempdir().unwrap().keep(),
+    )
+}
+
 fn runtime_build(
     session: Arc<PeerSyncSession>,
     local_device_id: &str,
@@ -1626,6 +1633,7 @@ fn runtime_build(
             store,
             ports.block_write_activity_provider.clone(),
             crate::local_convergence::HeadroomPolicy::disabled(),
+            scratch_ignore_rules(),
         ),
         session,
         state,

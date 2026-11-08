@@ -455,6 +455,8 @@ pub(super) fn disk_bytes_match_indexed_blocks_off_worker(
     size: u64,
 ) -> Result<bool, yadorilink_local_storage::StorageError> {
     use yadorilink_local_storage::StorageError;
+    #[cfg(test)]
+    verify_calls::record(path);
     let source_only = |result: Result<bool, StorageError>| match result {
         Err(StorageError::Io(error)) => Err(StorageError::SourceRead(error)),
         other => other,
@@ -467,6 +469,27 @@ pub(super) fn disk_bytes_match_indexed_blocks_off_worker(
     source_only(run_capture_pass_off_worker(|| {
         yadorilink_local_storage::disk_bytes_match_indexed_blocks(path, blocks)
     }))
+}
+
+/// Test-only: how many times each path was read back and hashed by the verification above, so a
+/// test can tell "skipped" from "ran and agreed".
+#[cfg(test)]
+pub(super) mod verify_calls {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    static CALLS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+    pub(in crate::local_change) fn record(path: &Path) {
+        let mut calls = CALLS.get_or_init(Default::default).lock().unwrap();
+        *calls.entry(path.to_path_buf()).or_default() += 1;
+    }
+
+    #[cfg(unix)]
+    pub(in crate::local_change) fn count(path: &Path) -> usize {
+        CALLS.get_or_init(Default::default).lock().unwrap().get(path).copied().unwrap_or(0)
+    }
 }
 
 #[cfg(test)]

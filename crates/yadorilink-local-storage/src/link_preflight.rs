@@ -123,7 +123,7 @@ pub struct LinkPreflightReport {
     /// scenario.
     pub entry_count: u64,
     /// Count of entries matched by the effective ignore rules (built-in
-    /// defaults plus any `.yadorilinkignore`) — this forms the ignored-file
+    /// defaults; a folder has no rules of its own before it is linked) — this forms the ignored-file
     /// summary.
     pub ignored_entry_count: u64,
     /// Sum of file sizes among the non-ignored entries counted above.
@@ -137,22 +137,14 @@ pub struct LinkPreflightReport {
     pub free_space: Option<VolumeFreeSpace>,
     pub nested_conflicts: Vec<NestedLinkConflict>,
     pub risky_location: Option<RiskyLocation>,
-    /// Set when this folder's effective ignore rules could not be read (a
-    /// corrupt or unreadable `.yadorilinkignore`). The scan below then falls
-    /// back to the built-in defaults, so the ignored/non-ignored counts do
-    /// NOT reflect the user's own exclusion rules — files they meant to
-    /// exclude may be counted as syncing. Treated as a risky condition so
-    /// link setup surfaces it (and requires acknowledgement) rather than
-    /// silently proceeding as if no custom ignore rules existed.
-    pub ignore_rules_unreadable: bool,
     /// Root-relative paths this scan found that collide with the reserved
     /// artefact namespace (`reserved_namespace`) — a file or directory
     /// existing under this name before the folder is ever linked. Counted
     /// inside `ignored_entry_count` too (a collision never participates in
     /// sync either way), but named here explicitly rather than only
     /// blending into the ordinary ignored-file summary: an ignore-pattern
-    /// match is a user choice the user can undo by editing
-    /// `.yadorilinkignore`, while this is a naming collision with the
+    /// match is a user choice the user can undo by changing
+    /// the folder's ignore rules, while this is a naming collision with the
     /// engine's own on-disk protocol that the user cannot undo that way at
     /// all — they can only rename the file. Surfacing it separately, by
     /// path, is what `Blocked(ReservedNamespaceCollision)` means for a
@@ -204,7 +196,6 @@ impl LinkPreflightReport {
             )
             || self.nested_conflicts.iter().any(|c| !c.is_structural())
             || self.risky_location.is_some()
-            || self.ignore_rules_unreadable
             || !self.reserved_namespace_blocked_paths.is_empty()
     }
 
@@ -216,14 +207,6 @@ impl LinkPreflightReport {
         if !self.path_exists {
             out.push("path does not exist".to_string());
             return out;
-        }
-        if self.ignore_rules_unreadable {
-            out.push(
-                "this folder's ignore rules could not be read (corrupt or unreadable \
-                 .yadorilinkignore) — files you meant to exclude may sync; fix the file before \
-                 linking"
-                    .to_string(),
-            );
         }
         if !self.is_empty_folder() {
             out.push(format!(
@@ -322,7 +305,6 @@ pub fn run_preflight_with_identity_probe(
         report.ignored_entry_count = scan.ignored_entry_count;
         report.total_size_bytes = scan.total_size_bytes;
         report.scan_truncated = scan.scan_truncated;
-        report.ignore_rules_unreadable = scan.ignore_rules_unreadable;
         report.reserved_namespace_blocked_paths = scan.reserved_namespace_blocked_paths;
         report.volume_identity_unproven = !proves_identity(local_path);
     }
@@ -337,39 +319,15 @@ struct ScanResult {
     ignored_entry_count: u64,
     total_size_bytes: u64,
     scan_truncated: bool,
-    /// Set when the effective ignore rules could not be loaded and the scan
-    /// fell back to defaults-only — surfaced up into
-    /// [`LinkPreflightReport::ignore_rules_unreadable`].
-    ignore_rules_unreadable: bool,
     /// Surfaced up into
     /// [`LinkPreflightReport::reserved_namespace_blocked_paths`].
     reserved_namespace_blocked_paths: Vec<String>,
 }
 
-/// Reuses the real per-link ignore engine (`ignore_patterns`) rather than a
-/// second, ad hoc ignore list — the folder's own `.yadorilinkignore` (if
-/// any is already present from a previous partial setup) plus the built-in
-/// defaults (`.DS_Store`, `.git`, etc.) are what actually determine what
-/// would sync, so that's what the preflight's non-empty/ignored counts
-/// should reflect too.
+/// Counts what linking `root` would sync, with the built-in ignore defaults: a folder has no
+/// rules of its own before it is linked.
 fn scan_directory(root: &Path) -> ScanResult {
-    // Fail closed: a corrupt/unreadable ignore file must NOT silently drop the
-    // user's exclusion rules and let files they meant to keep out start
-    // syncing. Fall back to defaults for the scan counts, but flag it so the
-    // preflight surfaces it (as a risky condition needing acknowledgement)
-    // rather than proceeding as if no custom ignore rules existed.
-    let (ignore_set, ignore_rules_unreadable) = match EffectiveIgnoreSet::load_for_link_root(root) {
-        Ok(set) => (set, false),
-        Err(e) => {
-            tracing::warn!(
-                root = %root.display(),
-                error = %e,
-                "could not read this folder's ignore rules; preflight will flag the folder rather \
-                 than silently scanning with defaults only"
-            );
-            (EffectiveIgnoreSet::defaults_only(), true)
-        }
-    };
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
     let mut entry_count = 0u64;
     let mut ignored_entry_count = 0u64;
     let mut total_size_bytes = 0u64;
@@ -448,7 +406,6 @@ fn scan_directory(root: &Path) -> ScanResult {
         ignored_entry_count,
         total_size_bytes,
         scan_truncated,
-        ignore_rules_unreadable,
         reserved_namespace_blocked_paths,
     }
 }

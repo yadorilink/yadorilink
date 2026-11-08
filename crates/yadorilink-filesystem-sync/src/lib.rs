@@ -4,12 +4,15 @@
 
 pub mod block_deletion;
 pub mod block_liveness;
+mod crash_facts;
 pub mod debounce;
 pub mod device_boundary;
 pub mod held_path_reconcile;
 pub mod materialization_eviction;
 pub mod materialization_execution;
 pub mod materialization_repair;
+pub mod repair_failpoint;
+pub mod repair_trace;
 pub mod watcher;
 #[cfg(feature = "os-watch")]
 #[cfg_attr(not(windows), allow(dead_code))]

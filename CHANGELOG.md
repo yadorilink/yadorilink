@@ -11,6 +11,27 @@ prerelease suffix (e.g. `v0.1.0-beta.1`).
 
 ## [Unreleased]
 
+## [v0.1.0-beta.10] - 2026-11-08
+
+### Main changes
+- **Download when needed:** On Mac and Windows, folders you create and folders you join by invitation download a file when you open it. You can choose which files stay on the device.
+- **Windows from the Microsoft Store:** The Windows version is distributed through the Microsoft Store only.
+- **Windows pause:** Pause for 2 hours, 8 hours, 24 hours, or until you resume. The pause continues after a restart.
+- **Space for older versions:** Older versions are kept up to a tenth of the disk (at most 20 GB), and the oldest are removed first.
+- **Lighter to run:** Less power and network use while idle, and receiving files is lighter too.
+- **Japanese text:** The command line and the install script show Japanese.
+
+### Main fixes
+- Mac: fixed problems such as Finder freezing on right-click and read-only files looking writable.
+- Windows: a send or invitation that arrives while the app is busy now waits its turn instead of being lost.
+- YadoriLink no longer overwrites or deletes a file you changed while it is repairing a folder.
+
+### Before you update
+- beta.10 cannot open beta.9's data. On each device, set YadoriLink up again. Your synced files are not deleted.
+- First run `yadorilink preserved list` and clear anything it shows.
+- Pins are not carried over. Set them again.
+- Devices on beta.9 and beta.10 sync with each other, so you can update them one at a time.
+
 ## [v0.1.0-beta.9] - 2026-11-03
 
 ### Added

@@ -154,86 +154,6 @@ pub struct SubstrateReachability {
     pub relays: Vec<String>,
 }
 
-/// A Track Send rendezvous grant from `POST /send/authorization` --
-/// the coordination service's `routes/send.ts`, backed by the `send_authorizations`
-/// table (see that migration's own doc comment for what this primitive is
-/// and, deliberately, is not: never an extension of folder-group/ACL
-/// membership). Names the exact sender+receiver pair it authorizes and
-/// carries ONLY the receiver's own Track Send connect material -- its
-/// signing key (= iroh endpoint id) and where its iroh endpoint answers --
-/// never any other same-account device's key or address.
-#[derive(Debug, Clone)]
-pub struct SendAuthorizationGrant {
-    pub grant_id: String,
-    /// Presented alongside `grant_id` at consume time, never alone -- see
-    /// `consume_send_authorization`'s own doc comment for why a leaked or
-    /// logged grant id must not be independently consumable.
-    pub nonce: String,
-    pub expires_at_unix: i64,
-    pub receiver_device_id: String,
-    pub receiver_signing_key: [u8; 32],
-    /// Empty when the receiver's iroh endpoint has not published an
-    /// address yet; the dial then relies on what the endpoint's own lookup
-    /// knows.
-    pub receiver_reachability: SubstrateReachability,
-}
-
-/// A freshly minted cross-account Send link (`POST /send/links`).
-#[derive(Debug, Clone)]
-pub struct CreatedSendLink {
-    pub link_id: String,
-    /// Shown once; the service keeps only its hash.
-    pub code: String,
-    pub expires_at_unix: i64,
-}
-
-/// The sender's view of a link (`GET /send/links/:id`).
-#[derive(Debug, Clone)]
-pub struct SendLinkStatus {
-    /// `open`, `redeemed`, `granted`, `cancelled` or `expired`.
-    pub state: String,
-    pub receiver_device_name: Option<String>,
-}
-
-/// What a signed-in holder of a code may see of a link before redeeming it
-/// (`POST /send/links/preview`).
-#[derive(Debug, Clone)]
-pub struct SendLinkPreview {
-    pub sender_name: String,
-    /// (name, size in bytes) of each file the link carries; empty when the sender attached none.
-    pub files: Vec<(String, u64)>,
-    pub expires_at_unix: i64,
-}
-
-/// Why a send-link call to the coordination plane failed, as a kind a caller can branch on
-/// without reading the message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SendLinkCallKind {
-    /// The service could not be reached.
-    Unreachable,
-    /// 401 or 403: this device's sign-in is not accepted.
-    SignInRequired,
-    /// 404: for a redeem, the service's one uniform refusal (unknown, expired, used or
-    /// cancelled); for another call, the link is not one of this account's.
-    NotFound,
-    /// The service has Send links switched off (a 404 carrying the code `send_links_disabled`).
-    FeatureDisabled,
-    Other,
-}
-
-/// A failed send-link call: its kind plus the text for a details view.
-#[derive(Debug, Clone)]
-pub struct SendLinkCallError {
-    pub kind: SendLinkCallKind,
-    pub message: String,
-}
-
-impl std::fmt::Display for SendLinkCallError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
 /// Where a device's iroh endpoint answers, in the wire shape the
 /// coordination plane uses for it (`{direct, relays}`). Unparseable direct
 /// addresses are dropped.
@@ -401,24 +321,43 @@ impl std::fmt::Display for DeviceListingError {
     }
 }
 
-pub use imp::{
+mod enrollment;
+mod handoff;
+mod membership;
+mod send;
+mod send_code;
+pub use enrollment::{
     activate_create, activate_invite_accept, activate_join, cancel_create,
     cancel_create_classified, cancel_invite_accept_classified, cancel_join, cancel_join_classified,
-    cancel_send_link, commit_handoff_role_loss, compensate_handoff_role_loss,
-    consume_send_authorization, create_send_link, fetch_edge_state, find_account_device,
-    find_handoff_lease, list_account_device_keys, prepare_create, prepare_invite_accept,
-    prepare_join, preview_send_link, query_enrollment_operation, query_membership_operation,
-    query_membership_operation_categorized, query_role_loss_operation, redeem_send_link,
-    release_handoff_lease, report_endpoint, request_authorization_checkpoint,
-    request_handoff_lease, request_send_authorization, request_send_link_authorization,
-    resolve_edge, send_link_status, set_storage_mode,
+    prepare_create, prepare_invite_accept, prepare_join, query_enrollment_operation,
 };
+pub use handoff::{
+    commit_handoff_role_loss, compensate_handoff_role_loss, find_handoff_lease,
+    query_role_loss_operation, release_handoff_lease, request_authorization_checkpoint,
+    request_handoff_lease,
+};
+pub use imp::{report_endpoint, set_storage_mode};
+pub use membership::EdgeInfo;
+pub use membership::{
+    fetch_edge_state, find_account_device, list_account_device_keys, list_account_device_names,
+    list_share_edges, query_membership_operation, query_membership_operation_categorized,
+    resolve_edge,
+};
+pub use send::{
+    cancel_send_link, consume_send_authorization, create_send_link, preview_send_link,
+    redeem_send_link, request_send_authorization, request_send_link_authorization,
+    send_link_status, CreatedSendLink, SendAuthorizationGrant, SendLinkCallError, SendLinkCallKind,
+    SendLinkPreview, SendLinkStatus,
+};
+#[cfg(fuzzing)]
+pub use send_code::fuzz_entry as fuzz_send_code;
 // `MintedInvite` is `pub(crate)` (defined in `application::model`, a
 // crate-internal module) -- unlike every other re-export above, whose
 // return types are genuinely part of this module's own public surface, so
 // `mint_invite` can only ever be re-exported at `pub(crate)`, not widened
 // to `pub` alongside its siblings.
-pub(crate) use imp::{is_terms_consent_refusal, mint_invite};
+pub(crate) use imp::is_terms_consent_refusal;
+pub(crate) use membership::mint_invite;
 
 /// Why a remote-evidence lookup could not be answered -- see
 /// `RemoteEvidence`'s own doc comment for the
@@ -615,21 +554,11 @@ mod imp {
     use base64::Engine;
     use serde::{Deserialize, Serialize};
 
-    use super::{
-        categorize_error_status, evidence_http_client, ActivateOutcome, CoordinationAuth,
-        CoordinationCallError, CreatedSendLink, DeviceListingError, EnrollmentOperationRecord,
-        EnrollmentRemoteRequest, EnrollmentRemoteStatus, HandoffCommitResult, HandoffLeaseGrant,
-        MembershipOperationLookup, MembershipOperationRecord, MembershipRemoteRequest,
-        MembershipRemoteRequestGroup, MembershipRemoteResult, MembershipRemoteStatus,
-        RemoteEvidenceErrorCategory, RemoteQueryError, RoleLossCommitOutcome,
-        RoleLossCommitRequest, RoleLossCompensationOutcome, RoleLossOperationRecord,
-        SendAuthorizationGrant, SendAuthorized, SendLinkCallError, SendLinkCallKind,
-        SendLinkPreview, SendLinkStatus, StorageModeWriteError, SubstrateReachability,
-    };
+    use super::{CoordinationAuth, SendAuthorized, StorageModeWriteError};
 
     /// `skip_serializing_if` predicate for an optional boolean request
     /// field whose `false` means exactly what omitting it means.
-    fn is_false(value: &bool) -> bool {
+    pub(crate) fn is_false(value: &bool) -> bool {
         !*value
     }
 
@@ -645,7 +574,7 @@ mod imp {
     }
 
     /// The machine-readable `code` of a coordination error body, when it has one.
-    fn coord_error_code(body_text: &str) -> Option<String> {
+    pub(crate) fn coord_error_code(body_text: &str) -> Option<String> {
         let value: serde_json::Value = serde_json::from_str(body_text).ok()?;
         value.get("code")?.as_str().map(str::to_string)
     }
@@ -659,7 +588,7 @@ mod imp {
     /// error detail in this file falls back to, and still does here too
     /// (see the caller) whenever the body does not parse as this exact
     /// shape.
-    fn coord_error_message(body_text: &str) -> Option<String> {
+    pub(crate) fn coord_error_message(body_text: &str) -> Option<String> {
         let value: serde_json::Value = serde_json::from_str(body_text).ok()?;
         value.get("error")?.as_str().map(str::to_string)
     }
@@ -673,9 +602,10 @@ mod imp {
     /// connection or a 500 reaches the backoff; a TCP connection that is
     /// accepted and then answered by nobody would park `send()` forever, and
     /// this device's reachability would never be republished.
-    const ENDPOINT_REPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    pub(crate) const ENDPOINT_REPORT_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(10);
 
-    async fn post_no_content_ok<B: Serialize>(
+    pub(crate) async fn post_no_content_ok<B: Serialize>(
         url: String,
         auth: &CoordinationAuth,
         body: &B,
@@ -705,541 +635,29 @@ mod imp {
     /// active" vs. "freshly activated" makes no difference to any caller of
     /// `activate_create`/`activate_join`.
     #[derive(Deserialize)]
-    struct ActivateResultBody {
-        result: String,
+    pub(crate) struct ActivateResultBody {
+        pub(crate) result: String,
     }
 
     /// The coordination plane's own result strings, matched POSITIVELY --
     /// an unrecognized future outcome falls through to plain `Success`
     /// (the status code already confirmed the mutation landed), never into
     /// one of the specific branches.
-    const ACTIVATE_RESULT_ALREADY_ACTIVE: &str = "already_active";
-    const ACTIVATE_RESULT_AWAITING_APPROVAL: &str = "awaiting_approval";
-    const ACTIVATE_RESULT_ALREADY_AWAITING_APPROVAL: &str = "already_awaiting_approval";
+    pub(crate) const ACTIVATE_RESULT_ALREADY_ACTIVE: &str = "already_active";
+    pub(crate) const ACTIVATE_RESULT_AWAITING_APPROVAL: &str = "awaiting_approval";
+    pub(crate) const ACTIVATE_RESULT_ALREADY_AWAITING_APPROVAL: &str = "already_awaiting_approval";
 
-    /// Shared by `activate_create`/`activate_join`/`activate_invite_accept`:
-    /// every one of those coordination service routes is 404 on a
-    /// permanently-gone row and otherwise 2xx with a `{"result": ...}` body
-    /// -- see the coordination service's activate
-    /// handlers.
-    async fn post_activate<B: Serialize>(
-        url: String,
-        auth: &CoordinationAuth,
-        body: &B,
-        what: &str,
-    ) -> ActivateOutcome {
-        let result = reqwest::Client::new().post(&url).json(body).send_authorized(auth).await;
-        match result {
-            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
-                tracing::debug!(what, "coordination call: operation not found (row gone)");
-                ActivateOutcome::Deleted
-            }
-            Ok(resp) if resp.status().is_success() => match resp.json::<ActivateResultBody>().await
-            {
-                Ok(body) if body.result == ACTIVATE_RESULT_ALREADY_ACTIVE => {
-                    ActivateOutcome::AlreadyActive
-                }
-                // Both awaiting-approval outcomes are the same answer to
-                // the only question a caller of this has: is this device a
-                // member yet? (No.) Which call parked it -- this one, or an
-                // earlier attempt -- changes nothing about what happens
-                // next or what the user is told.
-                Ok(body)
-                    if body.result == ACTIVATE_RESULT_AWAITING_APPROVAL
-                        || body.result == ACTIVATE_RESULT_ALREADY_AWAITING_APPROVAL =>
-                {
-                    ActivateOutcome::AwaitingApproval
-                }
-                _ => ActivateOutcome::Success,
-            },
-            Ok(resp) => {
-                tracing::debug!(status = %resp.status(), what, "coordination call rejected");
-                ActivateOutcome::TransientFailure
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, what, "coordination call failed");
-                ActivateOutcome::TransientFailure
-            }
-        }
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub(crate) struct OperationIdBody<'a> {
+        pub(crate) operation_id: &'a str,
     }
 
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
-    struct OperationIdBody<'a> {
-        operation_id: &'a str,
-    }
-
-    #[derive(Serialize)]
-    #[serde(rename_all = "camelCase")]
-    struct JoinOperationBody<'a> {
-        operation_id: &'a str,
-        device_id: &'a str,
-    }
-
-    /// Confirms a previously-prepared CREATE enrollment (the coordination service's
-    /// `POST /shares/groups/:groupId/activate`), turning a Pending group +
-    /// its creator's Pending eager membership into the real thing. Called
-    /// both by the CLI's own create flow (immediately, via its own HTTP
-    /// client) and by `EnrollmentRecoveryService::reconcile_once` on daemon startup, for
-    /// a marker left over from a killed CLI process.
-    pub async fn activate_create(
-        addr: &str,
-        auth: &CoordinationAuth,
-        group_id: &str,
-        operation_id: &str,
-    ) -> ActivateOutcome {
-        post_activate(
-            format!("{addr}/shares/groups/{group_id}/activate"),
-            auth,
-            &OperationIdBody { operation_id },
-            "create activate",
-        )
-        .await
-    }
-
-    /// The compensating call for a CREATE enrollment that will never be
-    /// activated (`POST /shares/groups/:groupId/cancel`) -- a no-op on the
-    /// server if the group was already activated or is already gone.
-    pub async fn cancel_create(
-        addr: &str,
-        auth: &CoordinationAuth,
-        group_id: &str,
-        operation_id: &str,
-    ) -> bool {
-        post_no_content_ok(
-            format!("{addr}/shares/groups/{group_id}/cancel"),
-            auth,
-            &OperationIdBody { operation_id },
-            "create cancel",
-        )
-        .await
-    }
-
-    /// Confirms a previously-prepared JOIN enrollment (`POST
-    /// /shares/groups/:groupId/join/activate`), turning a Pending membership
-    /// into the real thing.
-    pub async fn activate_join(
-        addr: &str,
-        auth: &CoordinationAuth,
-        group_id: &str,
-        operation_id: &str,
-        device_id: &str,
-    ) -> ActivateOutcome {
-        post_activate(
-            format!("{addr}/shares/groups/{group_id}/join/activate"),
-            auth,
-            &JoinOperationBody { operation_id, device_id },
-            "join activate",
-        )
-        .await
-    }
-
-    /// The compensating call for a JOIN enrollment that will never be
-    /// activated (`POST /shares/groups/:groupId/join/cancel`) -- deletes
-    /// only the membership, never the group; a no-op on the server if it
-    /// was already activated or is already gone.
-    pub async fn cancel_join(
-        addr: &str,
-        auth: &CoordinationAuth,
-        group_id: &str,
-        operation_id: &str,
-        device_id: &str,
-    ) -> bool {
-        post_no_content_ok(
-            format!("{addr}/shares/groups/{group_id}/join/cancel"),
-            auth,
-            &JoinOperationBody { operation_id, device_id },
-            "join cancel",
-        )
-        .await
-    }
-
-    /// Sends the create-prepare request and classifies the response -- see
-    /// [`super::EnrollmentPrepareOutcome`].
-    pub async fn prepare_create(
-        addr: &str,
-        auth: &CoordinationAuth,
-        operation_id: &str,
-        name: &str,
-        device_id: &str,
-        storage_mode: &str,
-    ) -> super::EnrollmentPrepareOutcome {
-        use super::EnrollmentPrepareOutcome;
-
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Body<'a> {
-            operation_id: &'a str,
-            name: &'a str,
-            creating_device_id: &'a str,
-            storage_mode: &'a str,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Response {
-            group_id: String,
-        }
-
-        let response = match reqwest::Client::new()
-            .post(format!("{addr}/shares/groups/prepare"))
-            .json(&Body { operation_id, name, creating_device_id: device_id, storage_mode })
-            .send_authorized(auth)
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => return EnrollmentPrepareOutcome::Ambiguous(error.to_string()),
-        };
-        let status = response.status();
-        if status == reqwest::StatusCode::CONFLICT {
-            return EnrollmentPrepareOutcome::Conflict(response.text().await.unwrap_or_default());
-        }
-        if status.is_client_error() {
-            let body_text = response.text().await.unwrap_or_default();
-            let detail = format!("create prepare returned HTTP {status}: {body_text}");
-            return if is_terms_consent_refusal(status, &body_text) {
-                EnrollmentPrepareOutcome::TermsConsentRequired(detail)
-            } else {
-                EnrollmentPrepareOutcome::DefinitelyRejected(detail)
-            };
-        }
-        if !status.is_success() {
-            return EnrollmentPrepareOutcome::Ambiguous(format!(
-                "create prepare returned HTTP {status}: {}",
-                response.text().await.unwrap_or_default()
-            ));
-        }
-        match response.json::<Response>().await {
-            Ok(body) if !body.group_id.is_empty() => {
-                EnrollmentPrepareOutcome::Prepared { group_id: body.group_id }
-            }
-            Ok(_) => EnrollmentPrepareOutcome::Ambiguous(
-                "create prepare returned an empty group_id".to_string(),
-            ),
-            Err(error) => EnrollmentPrepareOutcome::Ambiguous(format!(
-                "create prepare may have committed but its response was unparseable: {error}"
-            )),
-        }
-    }
-
-    /// Sends the join-prepare request and classifies the response. Unlike
-    /// create, the group id is already known (it names the group being
-    /// joined), so a bare 2xx is enough to confirm `Prepared`.
-    pub async fn prepare_join(
-        addr: &str,
-        auth: &CoordinationAuth,
-        operation_id: &str,
-        group_id: &str,
-        device_id: &str,
-        storage_mode: &str,
-    ) -> super::EnrollmentPrepareOutcome {
-        use super::EnrollmentPrepareOutcome;
-
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Body<'a> {
-            operation_id: &'a str,
-            device_id: &'a str,
-            storage_mode: &'a str,
-        }
-
-        let response = match reqwest::Client::new()
-            .post(format!("{addr}/shares/groups/{group_id}/join/prepare"))
-            .json(&Body { operation_id, device_id, storage_mode })
-            .send_authorized(auth)
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => return EnrollmentPrepareOutcome::Ambiguous(error.to_string()),
-        };
-        let status = response.status();
-        if status.is_success() {
-            return EnrollmentPrepareOutcome::Prepared { group_id: group_id.to_string() };
-        }
-        let body_text = response.text().await.unwrap_or_default();
-        let detail = format!("join prepare returned HTTP {status}: {body_text}");
-        if status == reqwest::StatusCode::CONFLICT {
-            EnrollmentPrepareOutcome::Conflict(detail)
-        } else if is_terms_consent_refusal(status, &body_text) {
-            EnrollmentPrepareOutcome::TermsConsentRequired(detail)
-        } else if status.is_client_error() {
-            EnrollmentPrepareOutcome::DefinitelyRejected(detail)
-        } else {
-            EnrollmentPrepareOutcome::Ambiguous(detail)
-        }
-    }
-
-    async fn classify_cancel_response(
-        response: Result<reqwest::Response, CoordinationCallError>,
-    ) -> super::EnrollmentCancelOutcome {
-        use super::EnrollmentCancelOutcome;
-
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => return EnrollmentCancelOutcome::Ambiguous(error.to_string()),
-        };
-        let status = response.status();
-        if status.is_success() {
-            return EnrollmentCancelOutcome::Confirmed;
-        }
-        let detail =
-            format!("cancel returned HTTP {status}: {}", response.text().await.unwrap_or_default());
-        // A 404 here is NOT a routine "already gone" -- the Worker's own
-        // cancel routes already fold that into an ordinary 2xx no-op, so a
-        // 404 or 409 means this operation_id's identity itself doesn't
-        // match.
-        if status == reqwest::StatusCode::CONFLICT || status == reqwest::StatusCode::NOT_FOUND {
-            EnrollmentCancelOutcome::Conflict(detail)
-        } else {
-            EnrollmentCancelOutcome::Ambiguous(detail)
-        }
-    }
-
-    /// Sends the create-cancel request and classifies the response -- see
-    /// [`super::EnrollmentCancelOutcome`]. Distinct from the plain bool
-    /// [`cancel_create`] above: `EnrollmentService`'s own compensation
-    /// sequence needs to tell a confirmed identity mismatch apart from a
-    /// merely-ambiguous transport failure, which a bare bool cannot.
-    pub async fn cancel_create_classified(
-        addr: &str,
-        auth: &CoordinationAuth,
-        group_id: &str,
-        operation_id: &str,
-    ) -> super::EnrollmentCancelOutcome {
-        classify_cancel_response(
-            reqwest::Client::new()
-                .post(format!("{addr}/shares/groups/{group_id}/cancel"))
-                .json(&OperationIdBody { operation_id })
-                .send_authorized(auth)
-                .await,
-        )
-        .await
-    }
-
-    /// Sends the join-cancel request and classifies the response -- see
-    /// [`cancel_create_classified`]'s own doc comment.
-    pub async fn cancel_join_classified(
-        addr: &str,
-        auth: &CoordinationAuth,
-        group_id: &str,
-        operation_id: &str,
-        device_id: &str,
-    ) -> super::EnrollmentCancelOutcome {
-        classify_cancel_response(
-            reqwest::Client::new()
-                .post(format!("{addr}/shares/groups/{group_id}/join/cancel"))
-                .json(&JoinOperationBody { operation_id, device_id })
-                .send_authorized(auth)
-                .await,
-        )
-        .await
-    }
-
-    /// Sends the cross-account invite-accept prepare request and classifies
-    /// the response -- see [`prepare_create`]'s own doc comment for why:
-    /// unlike join, the group id is not known ahead of time (only the
-    /// invite code names it), so a successful response's `groupId` is what
-    /// the caller learns the group actually is.
-    pub async fn prepare_invite_accept(
-        addr: &str,
-        auth: &CoordinationAuth,
-        operation_id: &str,
-        code: &str,
-        device_id: &str,
-        storage_mode: &str,
-    ) -> super::EnrollmentPrepareOutcome {
-        use super::EnrollmentPrepareOutcome;
-
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Body<'a> {
-            operation_id: &'a str,
-            code: &'a str,
-            device_id: &'a str,
-            storage_mode: &'a str,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Response {
-            group_id: String,
-        }
-
-        let response = match reqwest::Client::new()
-            .post(format!("{addr}/shares/invites/accept/prepare"))
-            .json(&Body { operation_id, code, device_id, storage_mode })
-            .send_authorized(auth)
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => return EnrollmentPrepareOutcome::Ambiguous(error.to_string()),
-        };
-        let status = response.status();
-        if status == reqwest::StatusCode::CONFLICT {
-            return EnrollmentPrepareOutcome::Conflict(response.text().await.unwrap_or_default());
-        }
-        if status.is_client_error() {
-            let body_text = response.text().await.unwrap_or_default();
-            // Prefer the coordination plane's own clean `error` message
-            // (e.g. "invite is invalid or already used") over a raw
-            // HTTP-status-plus-JSON-body dump -- this is the detail an
-            // expired/already-used/cancelled invite surfaces all the way
-            // up to `yadorilink share accept`'s own error output, so it
-            // should read as a sentence, not a debug trace.
-            let detail = coord_error_message(&body_text).unwrap_or_else(|| {
-                format!("invite accept prepare returned HTTP {status}: {body_text}")
-            });
-            if is_terms_consent_refusal(status, &body_text) {
-                return EnrollmentPrepareOutcome::TermsConsentRequired(detail);
-            }
-            return match coord_error_code(&body_text).as_deref() {
-                Some("invite_expired") => EnrollmentPrepareOutcome::InviteRefused {
-                    reason: crate::application::model::InviteRefusal::Expired,
-                    detail,
-                },
-                Some("invite_already_used") => EnrollmentPrepareOutcome::InviteRefused {
-                    reason: crate::application::model::InviteRefusal::AlreadyUsed,
-                    detail,
-                },
-                _ => EnrollmentPrepareOutcome::DefinitelyRejected(detail),
-            };
-        }
-        if !status.is_success() {
-            return EnrollmentPrepareOutcome::Ambiguous(format!(
-                "invite accept prepare returned HTTP {status}: {}",
-                response.text().await.unwrap_or_default()
-            ));
-        }
-        match response.json::<Response>().await {
-            Ok(body) if !body.group_id.is_empty() => {
-                EnrollmentPrepareOutcome::Prepared { group_id: body.group_id }
-            }
-            Ok(_) => EnrollmentPrepareOutcome::Ambiguous(
-                "invite accept prepare returned an empty group_id".to_string(),
-            ),
-            Err(error) => EnrollmentPrepareOutcome::Ambiguous(format!(
-                "invite accept prepare may have committed but its response was unparseable: \
-                 {error}"
-            )),
-        }
-    }
-
-    /// Confirms a previously-prepared cross-account invite acceptance
-    /// (`POST /shares/groups/:groupId/invites/accept/activate`), turning a
-    /// Pending membership into the real thing. No code in the body -- the
-    /// coordination plane re-derives the invite (and its role) from what
-    /// this (deviceId, operationId) pair already redeemed at prepare time.
-    pub async fn activate_invite_accept(
-        addr: &str,
-        auth: &CoordinationAuth,
-        group_id: &str,
-        operation_id: &str,
-        device_id: &str,
-    ) -> ActivateOutcome {
-        post_activate(
-            format!("{addr}/shares/groups/{group_id}/invites/accept/activate"),
-            auth,
-            &JoinOperationBody { operation_id, device_id },
-            "invite accept activate",
-        )
-        .await
-    }
-
-    /// The compensating call for an invite acceptance that will never be
-    /// activated (`POST /shares/groups/:groupId/invites/accept/cancel`) --
-    /// deletes only the still-Pending membership; does NOT return the
-    /// invite itself to unused (see the coordination plane's own doc
-    /// comment on that route).
-    pub async fn cancel_invite_accept_classified(
-        addr: &str,
-        auth: &CoordinationAuth,
-        group_id: &str,
-        operation_id: &str,
-        device_id: &str,
-    ) -> super::EnrollmentCancelOutcome {
-        classify_cancel_response(
-            reqwest::Client::new()
-                .post(format!("{addr}/shares/groups/{group_id}/invites/accept/cancel"))
-                .json(&JoinOperationBody { operation_id, device_id })
-                .send_authorized(auth)
-                .await,
-        )
-        .await
-    }
-
-    /// Mints a one-use, expiring, device-scoped cross-account invite for
-    /// `group_id` (`POST /shares/groups/:groupId/invites`). Owner-only on
-    /// the coordination plane's side; `Err` carries the rejection detail
-    /// verbatim (e.g. "not the owner", "invalid role") -- there is no
-    /// crash-safety story to classify here (a single stateless request, no
-    /// local state to reconcile), so a plain `Result` is enough, unlike the
-    /// enrollment prepare/activate/cancel calls above.
-    pub(crate) async fn mint_invite(
-        addr: &str,
-        auth: &CoordinationAuth,
-        group_id: &str,
-        minting_device_id: &str,
-        role: Option<&str>,
-        ttl_secs: Option<u64>,
-        requires_approval: bool,
-    ) -> Result<super::MintedInvite, crate::application::model::MintInviteError> {
-        use crate::application::model::MintInviteError;
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Body<'a> {
-            minting_device_id: &'a str,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            role: Option<&'a str>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            ttl_secs: Option<u64>,
-            /// Omitted entirely when false, the way `role`/`ttl_secs` are
-            /// when unset: the coordination plane treats an absent key and
-            /// an explicit `false` identically, so skipping keeps a mint
-            /// that wants no approval step byte-identical on the wire to
-            /// one from a build that predates this option.
-            #[serde(skip_serializing_if = "is_false")]
-            requires_approval: bool,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Response {
-            code: String,
-            invite_id: String,
-            group_id: String,
-            role: String,
-            expires_at_unix: i64,
-            /// Whether the invite is approval-gated. Required: the mint
-            /// route always reports it, and reading an absent value as
-            /// `false` would tell the daemon an approval-gated invite needs
-            /// no approval.
-            requires_approval: bool,
-        }
-
-        let response = reqwest::Client::new()
-            .post(format!("{addr}/shares/groups/{group_id}/invites"))
-            .json(&Body { minting_device_id, role, ttl_secs, requires_approval })
-            .send_authorized(auth)
-            .await
-            .map_err(|e| MintInviteError::Rejected(e.to_string()))?;
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            let detail = format!("invite mint returned HTTP {status}: {text}");
-            return Err(if is_terms_consent_refusal(status, &text) {
-                MintInviteError::TermsConsentRequired(detail)
-            } else {
-                MintInviteError::Rejected(detail)
-            });
-        }
-        let body = response.json::<Response>().await.map_err(|e| {
-            MintInviteError::Rejected(format!("invite mint response was unparseable: {e}"))
-        })?;
-        Ok(super::MintedInvite {
-            code: body.code,
-            invite_id: body.invite_id,
-            group_id: body.group_id,
-            role: body.role,
-            expires_at_unix: body.expires_at_unix,
-            requires_approval: body.requires_approval,
-        })
+    pub(crate) struct JoinOperationBody<'a> {
+        pub(crate) operation_id: &'a str,
+        pub(crate) device_id: &'a str,
     }
 
     /// Returns whether the plane accepted the report.
@@ -1293,134 +711,10 @@ mod imp {
         }
     }
 
-    /// Looks up whether `target_device_id` currently holds a live handoff
-    /// lease for `group_id` (`GET /shares/groups/:groupId/handoff/lease?
-    /// targetDeviceId=...`) -- the SOURCE side of the round trip
-    /// `request_handoff_lease` starts on the TARGET side. Called by a
-    /// source-side role-loss commit path just before
-    /// `commit_handoff_role_loss`, so a target that already requested a
-    /// lease (because it independently verified readiness) has that lease
-    /// actually presented and confirmed as part of the commit, instead of
-    /// the commit always going through with `lease_id: None` and the lease
-    /// being left to expire on its own. `None` on any failure (unreachable
-    /// coordination plane, rejected request, unparseable response, or no
-    /// live lease found) -- the caller treats this exactly like "no lease
-    /// to present": `commit_handoff_role_loss` still succeeds on the
-    /// Active+eager guard alone (a lease is retention-protection insurance
-    /// for the target, not a hard prerequisite for the role-loss
-    /// authorization itself).
-    pub async fn find_handoff_lease(
-        addr: &str,
-        auth: &CoordinationAuth,
-        group_id: &str,
-        target_device_id: &str,
-    ) -> Option<String> {
-        #[derive(Deserialize)]
-        struct LeaseInfo {
-            #[serde(rename = "leaseId")]
-            lease_id: String,
-        }
-        #[derive(Deserialize)]
-        struct Resp {
-            lease: Option<LeaseInfo>,
-        }
-        let url = match url::Url::parse(&format!("{addr}/shares/groups/{group_id}/handoff/lease")) {
-            Ok(mut u) => {
-                u.query_pairs_mut().append_pair("targetDeviceId", target_device_id);
-                u
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "handoff lease lookup: could not build request URL");
-                return None;
-            }
-        };
-        let result = reqwest::Client::new().get(url).send_authorized(auth).await;
-        match result {
-            Ok(resp) if resp.status().is_success() => match resp.json::<Resp>().await {
-                Ok(r) => r.lease.map(|l| l.lease_id),
-                Err(e) => {
-                    tracing::debug!(error = %e, "handoff lease lookup: unparseable response");
-                    None
-                }
-            },
-            Ok(resp) => {
-                tracing::debug!(status = %resp.status(), "handoff lease lookup rejected");
-                None
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "handoff lease lookup failed");
-                None
-            }
-        }
-    }
-
-    /// Requests a full-replica-handoff lease from the coordination service
-    /// (`POST /shares/groups/:groupId/handoff/lease`), called by the handoff
-    /// TARGET immediately after its own local readiness check confirms it
-    /// holds every root of the group. Carries no digest or other
-    /// content-derived value -- the request is purely `(group_id,
-    /// target_device_id)`; the Worker's whole contribution to a handoff is
-    /// confirming device/group membership and eligibility, never anything
-    /// about the actual files or versions involved. `None` on any failure
-    /// (unreachable coordination plane, rejected request, or an unparseable
-    /// response) -- the caller (`daemon_state`'s handoff-lease request path)
-    /// treats this exactly like an unconfirmed local readiness check: no
-    /// lease was requested or recorded, and the caller's own TTL/retry story
-    /// (retry the whole check-then-request sequence later) is unaffected.
-    pub async fn request_handoff_lease(
-        addr: &str,
-        auth: &CoordinationAuth,
-        group_id: &str,
-        target_device_id: &str,
-    ) -> Option<HandoffLeaseGrant> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Body<'a> {
-            target_device_id: &'a str,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Resp {
-            lease_id: String,
-            expires_at: i64,
-            ttl_seconds: i64,
-        }
-        let url = format!("{addr}/shares/groups/{group_id}/handoff/lease");
-        let body = Body { target_device_id };
-        let Ok(client) = reqwest::Client::builder()
-            .timeout(crate::native_checkpoint_flush::CHECKPOINT_REQUEST_TIMEOUT)
-            .build()
-        else {
-            return None;
-        };
-        let result = client.post(&url).json(&body).send_authorized(auth).await;
-        match result {
-            Ok(resp) if resp.status().is_success() => match resp.json::<Resp>().await {
-                Ok(r) => Some(HandoffLeaseGrant {
-                    lease_id: r.lease_id,
-                    expires_at_unix: r.expires_at,
-                    ttl_seconds: r.ttl_seconds,
-                }),
-                Err(e) => {
-                    tracing::debug!(error = %e, "handoff lease request: unparseable response");
-                    None
-                }
-            },
-            Ok(resp) => {
-                tracing::debug!(status = %resp.status(), "handoff lease request rejected");
-                None
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "handoff lease request failed");
-                None
-            }
-        }
-    }
-
     /// The JSON body of an authorization-checkpoint request. Ordinary
     /// publication requests carry no `purpose`, so they are unchanged; a
     /// seal names it explicitly.
-    fn checkpoint_request_body(
+    pub(crate) fn checkpoint_request_body(
         device_id: &str,
         request_id: &str,
         merkle_root: [u8; 32],
@@ -1437,965 +731,6 @@ mod imp {
             body["purpose"] = serde_json::Value::from("seal");
         }
         body
-    }
-
-    /// Requests (or, for an already-decided `request_id`,
-    /// replays) a signed `AuthorizationCheckpoint` for `device_id`'s
-    /// pending batch, via the coordination service's
-    /// `POST /shares/groups/:groupId/authorization-checkpoint`
-    /// (`src/routes/shares.ts`). `request_id` MUST be
-    /// deterministic in the caller for a given `(group_id, device_id,
-    /// merkle_root, leaf_count)` — see
-    /// `checkpoint_source::pending_batch_request_id` — so a retry after a
-    /// lost response reuses the SAME decided record rather than being
-    /// judged (and potentially refused) as a brand new request against
-    /// possibly-changed writer status.
-    ///
-    /// Best-effort like every other call in this module: `None` on any
-    /// failure, including a legitimate 403 ("not currently a writer" —
-    /// expected and not logged above debug) and a 409 (idempotency
-    /// conflict — should never happen for a caller deriving `request_id`
-    /// correctly, logged at `warn` since it indicates a caller bug rather
-    /// than an expected outcome).
-    #[allow(clippy::too_many_arguments)]
-    pub async fn request_authorization_checkpoint(
-        addr: &str,
-        auth: &CoordinationAuth,
-        group_id: &str,
-        device_id: &str,
-        request_id: &str,
-        merkle_root: [u8; 32],
-        leaf_count: u64,
-        purpose: crate::checkpoint_source::CheckpointPurpose,
-    ) -> Option<(
-        yadorilink_replica_domain::authorization_checkpoint::AuthorizationCheckpoint,
-        [u8; 64],
-    )> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Resp {
-            group_id: String,
-            device_id: String,
-            signing_key_fingerprint_base64: String,
-            merkle_root_base64: String,
-            leaf_count: u64,
-            checkpoint_seq: u64,
-            signer_key_id_base64: String,
-            policy_epoch: u64,
-            policy_seq: u64,
-            policy_head_base64: String,
-            issued_at_unix: u64,
-            signature_base64: Option<String>,
-        }
-        fn decode32(b64: &str) -> Option<[u8; 32]> {
-            let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
-            bytes.try_into().ok()
-        }
-        let url = format!("{addr}/shares/groups/{group_id}/authorization-checkpoint");
-        let body = checkpoint_request_body(device_id, request_id, merkle_root, leaf_count, purpose);
-        let result = reqwest::Client::new().post(&url).json(&body).send_authorized(auth).await;
-        match result {
-            Ok(resp) if resp.status().is_success() => match resp.json::<Resp>().await {
-                Ok(r) => {
-                    let Some(signature_base64) = r.signature_base64 else {
-                        tracing::debug!(
-                            "authorization checkpoint request: response carried no signature yet"
-                        );
-                        return None;
-                    };
-                    let Some(signature_bytes) = base64::engine::general_purpose::STANDARD
-                        .decode(&signature_base64)
-                        .ok()
-                        .and_then(|b| <[u8; 64]>::try_from(b).ok())
-                    else {
-                        tracing::debug!("authorization checkpoint request: unparseable signature");
-                        return None;
-                    };
-                    let (
-                        Some(signing_key_fingerprint),
-                        Some(merkle_root),
-                        Some(signer_key_id),
-                        Some(policy_head),
-                    ) = (
-                        decode32(&r.signing_key_fingerprint_base64),
-                        decode32(&r.merkle_root_base64),
-                        decode32(&r.signer_key_id_base64),
-                        decode32(&r.policy_head_base64),
-                    )
-                    else {
-                        tracing::debug!(
-                            "authorization checkpoint request: unparseable 32-byte field"
-                        );
-                        return None;
-                    };
-                    Some((
-                        yadorilink_replica_domain::authorization_checkpoint::AuthorizationCheckpoint {
-                            group_id: r.group_id,
-                            device_id: r.device_id,
-                            signing_key_fingerprint,
-                            merkle_root,
-                            leaf_count: r.leaf_count,
-                            checkpoint_seq: r.checkpoint_seq,
-                            signer_key_id,
-                            policy_epoch: r.policy_epoch,
-                            policy_seq: r.policy_seq,
-                            policy_head,
-                            issued_at_unix: r.issued_at_unix,
-                        },
-                        signature_bytes,
-                    ))
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "authorization checkpoint request: unparseable response");
-                    None
-                }
-            },
-            Ok(resp) if resp.status() == reqwest::StatusCode::FORBIDDEN => {
-                tracing::debug!(
-                    device_id,
-                    group_id,
-                    "authorization checkpoint request: not currently a writer"
-                );
-                None
-            }
-            Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => {
-                tracing::warn!(
-                    request_id,
-                    "authorization checkpoint request: idempotency conflict -- request_id was \
-                     reused for a different payload, which should never happen for a correctly \
-                     derived request_id"
-                );
-                None
-            }
-            Ok(resp) => {
-                tracing::debug!(status = %resp.status(), "authorization checkpoint request rejected");
-                None
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "authorization checkpoint request failed");
-                None
-            }
-        }
-    }
-
-    /// Explicitly releases a still-provisional handoff lease this device (as
-    /// the target) decided not to use after all
-    /// (`POST /shares/groups/:groupId/handoff/lease/:leaseId/release`) —
-    /// called when the atomic local verify+pin
-    /// (`SyncState::record_handoff_lease_atomic`) finds the durability-root
-    /// set has moved since the readiness digest this lease was requested
-    /// against was captured, so the lease is abandoned rather than kept
-    /// around under a set it no longer matches. Carries no digest or other
-    /// content-derived value, matching every other call in this module — just
-    /// the opaque `lease_id` plus `(group_id, target_device_id)`. Best-effort
-    /// like `find_handoff_lease`/`request_handoff_lease`: a failure here just
-    /// means the lease is instead cleaned up later by the coordination service's
-    /// own TTL sweep, so it is logged at debug and swallowed rather than
-    /// surfaced to the caller.
-    ///
-    /// `true` only when the service reports the lease ended (`released`, or
-    /// `gone` for no such lease). A success answer without that state, or one
-    /// saying the lease is left alone (`reserved-not-released`,
-    /// `confirmed-not-released`), is `false`.
-    pub async fn release_handoff_lease(
-        addr: &str,
-        auth: &CoordinationAuth,
-        group_id: &str,
-        target_device_id: &str,
-        lease_id: &str,
-    ) -> bool {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Body<'a> {
-            target_device_id: &'a str,
-        }
-        let url = format!("{addr}/shares/groups/{group_id}/handoff/lease/{lease_id}/release");
-        let body = Body { target_device_id };
-        let result = reqwest::Client::new().post(&url).json(&body).send_authorized(auth).await;
-        #[derive(serde::Deserialize)]
-        struct Answer {
-            state: String,
-        }
-        match result {
-            Ok(resp) if resp.status().is_success() => match resp.json::<Answer>().await {
-                Ok(answer) if matches!(answer.state.as_str(), "released" | "gone") => true,
-                Ok(answer) => {
-                    tracing::debug!(state = %answer.state, "handoff lease left in place");
-                    false
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "handoff lease release answer unreadable");
-                    false
-                }
-            },
-            Ok(resp) => {
-                tracing::debug!(status = %resp.status(), "handoff lease release rejected");
-                false
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "handoff lease release failed");
-                false
-            }
-        }
-    }
-
-    /// Commits a source device's full-replica-handoff role loss
-    /// (`POST /shares/groups/:groupId/handoff/commit`) — the coordination service
-    /// atomically confirms `target_device_id` is currently an Active, eager
-    /// full replica before committing `action` (`"demote"`: this device's own
-    /// ACL edge narrows to on-demand; `"revoke"`: some other device's edge is
-    /// removed entirely) and, if `lease_id` is set, confirms that lease (an
-    /// opaque token scoped to `(group_id, target_device_id)`) in the same
-    /// write. Carries no digest or other content-derived value, matching
-    /// `request_handoff_lease` — the coordination plane's role here is
-    /// entirely membership/eligibility adjudication; the "is this still the
-    /// version I verified" question stays peer-attested and local (this
-    /// device's own pre-existing digest-recapture-then-recheck gate, e.g.
-    /// `SyncState::recheck_digest_then_remove_link`), never something the
-    /// Worker checks. Unlike every other call in this module, this one
-    /// surfaces its failure to the caller instead of swallowing it: the CLI
-    /// call sites (`commands::share`, `commands::durability_force`) must not
-    /// proceed to commit the LOCAL side of a role loss (removing a link,
-    /// flipping local materialization policy) when the coordination-plane
-    /// commit itself was refused or unreachable.
-    pub async fn commit_handoff_role_loss(
-        addr: &str,
-        auth: &CoordinationAuth,
-        request: RoleLossCommitRequest<'_>,
-    ) -> RoleLossCommitOutcome {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Body<'a> {
-            source_device_id: &'a str,
-            target_device_id: &'a str,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            lease_id: Option<&'a str>,
-            action: &'a str,
-            operation_id: &'a str,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Resp {
-            target_device_id: String,
-            membership_generation: i64,
-            lease_id: Option<String>,
-        }
-        let url = format!("{addr}/shares/groups/{}/handoff/commit", request.group_id);
-        let body = Body {
-            source_device_id: request.source_device_id,
-            target_device_id: request.target_device_id,
-            lease_id: request.lease_id,
-            action: request.action,
-            operation_id: request.operation_id,
-        };
-        let resp = match reqwest::Client::new().post(&url).json(&body).send_authorized(auth).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                return RoleLossCommitOutcome::Ambiguous(format!(
-                    "could not confirm the coordination-plane commit: {e}"
-                ));
-            }
-        };
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            let detail =
-                format!("coordination plane refused the handoff commit ({status}): {text}");
-            return if status == reqwest::StatusCode::CONFLICT {
-                RoleLossCommitOutcome::Conflict(detail)
-            } else if is_terms_consent_refusal(status, &text) {
-                RoleLossCommitOutcome::TermsConsentRequired(detail)
-            } else if status.is_client_error() {
-                RoleLossCommitOutcome::DefinitelyRejected(detail)
-            } else {
-                RoleLossCommitOutcome::Ambiguous(detail)
-            };
-        }
-        let parsed: Resp = match resp.json().await {
-            Ok(parsed) => parsed,
-            Err(e) => {
-                return RoleLossCommitOutcome::Ambiguous(format!(
-                    "handoff commit succeeded but its response was unparseable: {e}"
-                ));
-            }
-        };
-        RoleLossCommitOutcome::Committed(HandoffCommitResult {
-            target_device_id: parsed.target_device_id,
-            membership_generation: parsed.membership_generation,
-            lease_id: parsed.lease_id,
-        })
-    }
-
-    /// Resolves a share edge id to its `(group_id, device_id)` by listing
-    /// the account's own share edges, the same `/shares` route the CLI used
-    /// to call directly. Kept here so `revoke_edge` is fully daemon-owned:
-    /// the CLI never sees the edge listing or issues a raw HTTP delete
-    /// against the coordination plane for it (see
-    /// `ReplicaMembershipService::revoke_edge`'s doc comment).
-    pub async fn resolve_edge(
-        addr: &str,
-        auth: &CoordinationAuth,
-        edge_id: &str,
-    ) -> Result<Option<(String, String)>, String> {
-        Ok(list_share_edges(addr, auth)
-            .await?
-            .into_iter()
-            .find(|edge| edge.edge_id == edge_id)
-            .map(|edge| (edge.group_id, edge.device_id)))
-    }
-
-    /// One row of the `GET /shares` listing, as far as this daemon reads it.
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct EdgeInfo {
-        edge_id: String,
-        group_id: String,
-        device_id: String,
-        /// The edge's membership state (`"active"`, `"pending"`, or
-        /// `"pending_approval"`). Required: `acl.state` is NOT NULL and the
-        /// listing reports it for every row, so an absent value is a
-        /// malformed response rather than an edge whose state is unknown.
-        state: String,
-    }
-
-    async fn list_share_edges(
-        addr: &str,
-        auth: &CoordinationAuth,
-    ) -> Result<Vec<EdgeInfo>, String> {
-        #[derive(Deserialize)]
-        struct Resp {
-            edges: Vec<EdgeInfo>,
-        }
-        let resp = reqwest::Client::new()
-            .get(format!("{addr}/shares"))
-            .send_authorized(auth)
-            .await
-            .map_err(|e| e.to_string())?;
-        if !resp.status().is_success() {
-            return Err(format!("listing shares returned HTTP {}", resp.status()));
-        }
-        let parsed: Resp = resp.json().await.map_err(|e| e.to_string())?;
-        Ok(parsed.edges)
-    }
-
-    /// The signing keys of every active device on this device's own account
-    /// that is not signed out -- `GET /devices`, scoped by the caller's
-    /// credential, so a device on another account (a folder-sharing peer
-    /// included) is never listed. A removed device is not listed either. A
-    /// signed-out device is listed with `signedOut: true` and left out here.
-    /// A key that does not decode is left out rather than failing the
-    /// listing: it can only fail to admit.
-    pub async fn list_account_device_keys(
-        addr: &str,
-        auth: &CoordinationAuth,
-    ) -> Result<Vec<[u8; 32]>, DeviceListingError> {
-        Ok(list_account_devices(addr, auth)
-            .await?
-            .into_iter()
-            .filter(|device| !device.signed_out)
-            .filter_map(|device| decode_signing_key(&device.signing_public_key_base64))
-            .collect())
-    }
-
-    /// One device on this device's own account, from the same `GET
-    /// /devices` listing: its signing key (its endpoint id) and where its
-    /// endpoint last said it answers. `Ok(None)` when the account lists no
-    /// such device, or lists it with a key that does not decode. The
-    /// reachability is empty when the device has published none (or the
-    /// coordination plane does not report it); a dial then relies on what
-    /// the endpoint's own lookup knows.
-    pub async fn find_account_device(
-        addr: &str,
-        auth: &CoordinationAuth,
-        device_id: &str,
-    ) -> Result<Option<([u8; 32], SubstrateReachability)>, String> {
-        Ok(list_account_devices(addr, auth).await.map_err(|e| e.to_string())?.into_iter().find_map(
-            |device| {
-                if device.device_id != device_id {
-                    return None;
-                }
-                let key = decode_signing_key(&device.signing_public_key_base64)?;
-                Some((key, device.substrate_reachability.map(Into::into).unwrap_or_default()))
-            },
-        ))
-    }
-
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct AccountDevice {
-        #[serde(default)]
-        device_id: String,
-        signing_public_key_base64: String,
-        /// Required, with no default: a plane that does not say whether a
-        /// device is signed out gives no listing at all, so management never
-        /// trusts an older plane on this point.
-        signed_out: bool,
-        #[serde(default)]
-        substrate_reachability: Option<super::WireSubstrateReachability>,
-    }
-
-    async fn list_account_devices(
-        addr: &str,
-        auth: &CoordinationAuth,
-    ) -> Result<Vec<AccountDevice>, DeviceListingError> {
-        #[derive(Deserialize)]
-        struct Resp {
-            devices: Vec<AccountDevice>,
-        }
-        let resp = reqwest::Client::new()
-            .get(format!("{addr}/devices"))
-            .send_authorized(auth)
-            .await
-            .map_err(DeviceListingError::from)?;
-        let status = resp.status();
-        if status.is_server_error() {
-            return Err(DeviceListingError::Unreachable(format!(
-                "listing devices returned HTTP {status}"
-            )));
-        }
-        if !status.is_success() {
-            return Err(DeviceListingError::Refused(format!(
-                "listing devices returned HTTP {status}"
-            )));
-        }
-        let body =
-            resp.bytes().await.map_err(|e| DeviceListingError::Unreachable(e.to_string()))?;
-        let parsed: Resp = serde_json::from_slice(&body)
-            .map_err(|e| DeviceListingError::Refused(format!("unusable device listing: {e}")))?;
-        Ok(parsed.devices)
-    }
-
-    /// The coordination plane's membership `state` for one (group, device)
-    /// edge, read from the same `/shares` listing `resolve_edge` uses.
-    /// `Ok(None)` means the account's listing carries no such edge at all,
-    /// or carries one whose state this coordination plane does not report
-    /// -- both of which callers must treat as "unknown", never as "not
-    /// active".
-    pub async fn fetch_edge_state(
-        addr: &str,
-        auth: &CoordinationAuth,
-        group_id: &str,
-        device_id: &str,
-    ) -> Result<Option<String>, String> {
-        Ok(list_share_edges(addr, auth)
-            .await?
-            .into_iter()
-            .find(|edge| edge.group_id == group_id && edge.device_id == device_id)
-            .map(|edge| edge.state))
-    }
-
-    /// Confirms whether a daemon-driven membership mutation actually landed,
-    /// by `operation_id` -- see `MembershipOperationLookup`'s doc comment.
-    /// Scoped by this device's own account, never by device ownership, so it
-    /// keeps answering correctly after the removed device's own row is gone
-    /// (unlike `resolve_edge`/eager-groups above). `Ok(NotFound)` means a
-    /// genuine HTTP 404 -- no durable operation record was returned for
-    /// this operation id at lookup time. It does NOT prove that the
-    /// request was definitely rejected, that no historical mutation
-    /// occurred, or that treating this operation as resolved is safe --
-    /// see `RemoteEvidence`'s own doc comment
-    /// for the same contract stated once, generally. Distinct from `Err`,
-    /// which means the query itself couldn't be answered (network error,
-    /// 5xx) and the caller must treat the operation's outcome as still
-    /// unknown, not as rejected.
-    pub async fn query_membership_operation(
-        addr: &str,
-        auth: &CoordinationAuth,
-        operation_id: &str,
-    ) -> Result<MembershipOperationLookup, String> {
-        query_membership_operation_categorized(&evidence_http_client(), addr, auth, operation_id)
-            .await
-            .map_err(|e| e.message)
-    }
-
-    /// Same lookup as [`query_membership_operation`], sharing its entire
-    /// request-building/parsing implementation, but with the failure
-    /// categorized -- see [`RemoteEvidenceErrorCategory`]'s own doc
-    /// comment. Used by the recovery-evidence module's
-    /// `RecoveryEvidenceSource` implementation, which must distinguish a
-    /// timeout/network/server error (still `Unavailable`, might resolve on
-    /// retry) from a 404 (`RecordNotFound`, a real answer) -- a
-    /// distinction the plain `String` error above deliberately does not
-    /// expose to its own (pre-existing) callers, which never needed it.
-    /// Takes `client` explicitly (rather than building one internally, the
-    /// way every other function in this file does) so a test can inject a
-    /// short-timeout client and exercise a genuine, real `Timeout`
-    /// classification end to end, through `WorkerEvidenceSource` itself,
-    /// instead of only unit-testing `categorize_transport_error` in
-    /// isolation against a raw `reqwest::Error`.
-    pub async fn query_membership_operation_categorized(
-        client: &reqwest::Client,
-        addr: &str,
-        auth: &CoordinationAuth,
-        operation_id: &str,
-    ) -> Result<MembershipOperationLookup, RemoteQueryError> {
-        // Decoded as a plain `String` below, not a serde enum -- see
-        // `query_enrollment_operation`'s identical reasoning for why an
-        // unrecognized-but-well-formed status must be `Unsupported`, not
-        // `MalformedResponse`.
-        #[derive(Deserialize, Default)]
-        #[serde(rename_all = "camelCase")]
-        struct ResultBody {
-            #[serde(default)]
-            affected_group_ids: Option<Vec<String>>,
-            target_device_id: Option<String>,
-            membership_generation: Option<i64>,
-            lease_id: Option<String>,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct RequestGroupBody {
-            group_id: String,
-            target_device_id: Option<String>,
-            lease_id: Option<String>,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct RequestBody {
-            // Present on the wire (the Worker's own fingerprint input
-            // includes it) but unused here: this lookup is already scoped
-            // to the caller's own account server-side, so there's nothing
-            // left to compare it against locally.
-            #[allow(dead_code)]
-            user_id: String,
-            action: String,
-            removed_device_id: String,
-            mode: String,
-            groups: Vec<RequestGroupBody>,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Resp {
-            operation_id: String,
-            status: String,
-            action: String,
-            removed_device_id: String,
-            request_fingerprint: String,
-            request: RequestBody,
-            result: Option<ResultBody>,
-            rejection_code: Option<String>,
-            rejection_detail: Option<String>,
-        }
-        let resp = client
-            .get(format!("{addr}/devices/membership-operations/{operation_id}"))
-            .send_authorized(auth)
-            .await
-            .map_err(|e| RemoteQueryError { category: e.category(), message: e.to_string() })?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(MembershipOperationLookup::NotFound);
-        }
-        if !resp.status().is_success() {
-            let status = resp.status();
-            return Err(RemoteQueryError {
-                category: categorize_error_status(status),
-                message: format!("membership operation lookup returned HTTP {status}"),
-            });
-        }
-        let parsed: Resp = resp.json().await.map_err(|e| RemoteQueryError {
-            category: RemoteEvidenceErrorCategory::MalformedResponse,
-            message: e.to_string(),
-        })?;
-        // Same endpoint-contract check as `query_enrollment_operation`'s own
-        // -- see that function's identical comment.
-        if parsed.operation_id != operation_id {
-            return Err(RemoteQueryError {
-                category: RemoteEvidenceErrorCategory::MalformedResponse,
-                message: format!(
-                    "operation id mismatch: requested {operation_id}, received {}",
-                    parsed.operation_id
-                ),
-            });
-        }
-        let status = match parsed.status.as_str() {
-            "committed" => MembershipRemoteStatus::Committed,
-            "definitely-rejected" => MembershipRemoteStatus::DefinitelyRejected,
-            // An approved removal that has not finished: neither outcome is
-            // known, and the same operation id completes it.
-            "removal-pending" => {
-                return Err(RemoteQueryError {
-                    category: RemoteEvidenceErrorCategory::Pending,
-                    message: format!(
-                        "membership operation {operation_id} is still pending; retry it with the same operation id"
-                    ),
-                });
-            }
-            other => {
-                return Err(RemoteQueryError {
-                    category: RemoteEvidenceErrorCategory::Unsupported,
-                    message: format!("unsupported membership operation status: {other}"),
-                });
-            }
-        };
-        // The Worker's own `MembershipOperationAction`/`MembershipOperationMode`
-        // wire types (the coordination service) are each a
-        // closed two-value set -- an unrecognized value here means a newer
-        // Worker deploy this build predates, `Unsupported`, not a shape
-        // violation. Checked on both the top-level `action` and the nested
-        // `request.action` since they are independently-decoded fields.
-        for candidate in [parsed.action.as_str(), parsed.request.action.as_str()] {
-            if candidate != "revoke" && candidate != "remove-device" {
-                return Err(RemoteQueryError {
-                    category: RemoteEvidenceErrorCategory::Unsupported,
-                    message: format!("unsupported membership operation action: {candidate}"),
-                });
-            }
-        }
-        if parsed.request.mode != "guarded" && parsed.request.mode != "plain" {
-            return Err(RemoteQueryError {
-                category: RemoteEvidenceErrorCategory::Unsupported,
-                message: format!("unsupported membership operation mode: {}", parsed.request.mode),
-            });
-        }
-        // Two independently-decoded fields naming the same request
-        // (top-level vs. `request.*`) disagreeing is not an unrecognized
-        // value -- it is the response contradicting itself, which is
-        // `MalformedResponse`, not `Unsupported`.
-        if parsed.action != parsed.request.action {
-            return Err(RemoteQueryError {
-                category: RemoteEvidenceErrorCategory::MalformedResponse,
-                message: format!(
-                    "membership operation action mismatch: top-level {}, request {}",
-                    parsed.action, parsed.request.action
-                ),
-            });
-        }
-        if parsed.removed_device_id != parsed.request.removed_device_id {
-            return Err(RemoteQueryError {
-                category: RemoteEvidenceErrorCategory::MalformedResponse,
-                message: format!(
-                    "membership operation removed device mismatch: top-level {}, request {}",
-                    parsed.removed_device_id, parsed.request.removed_device_id
-                ),
-            });
-        }
-        let result = parsed.result.map(|r| MembershipRemoteResult {
-            affected_group_ids: r.affected_group_ids,
-            target_device_id: r.target_device_id,
-            membership_generation: r.membership_generation,
-            lease_id: r.lease_id,
-        });
-        let request = MembershipRemoteRequest {
-            action: parsed.request.action,
-            removed_device_id: parsed.request.removed_device_id,
-            mode: parsed.request.mode,
-            groups: parsed
-                .request
-                .groups
-                .into_iter()
-                .map(|group| MembershipRemoteRequestGroup {
-                    group_id: group.group_id,
-                    target_device_id: group.target_device_id,
-                    lease_id: group.lease_id,
-                })
-                .collect(),
-        };
-        Ok(MembershipOperationLookup::Found(Box::new(MembershipOperationRecord {
-            status,
-            action: parsed.action,
-            removed_device_id: parsed.removed_device_id,
-            request_fingerprint: parsed.request_fingerprint,
-            request,
-            result,
-            rejection_code: parsed.rejection_code,
-            rejection_detail: parsed.rejection_detail,
-        })))
-    }
-
-    /// Reads the coordination plane's own `enrollment_operations` ledger
-    /// row by `operation_id`, scoped to this device's own account (the
-    /// Worker route itself is `userId`-scoped). `Ok(None)` means a genuine
-    /// HTTP 404 -- no durable operation record was returned for this
-    /// operation id at lookup time. It does NOT prove that the request was
-    /// definitely rejected, that no historical mutation occurred, or that
-    /// treating this operation as resolved is safe -- see
-    /// `RemoteEvidence`'s own doc comment for
-    /// the same contract stated once, generally. Distinct from `Err`, which
-    /// means the query itself could not be answered -- see
-    /// [`RemoteEvidenceErrorCategory`]'s own doc comment for why these must
-    /// never be conflated.
-    pub async fn query_enrollment_operation(
-        client: &reqwest::Client,
-        addr: &str,
-        auth: &CoordinationAuth,
-        operation_id: &str,
-    ) -> Result<Option<EnrollmentOperationRecord>, RemoteQueryError> {
-        // `kind`/`status` are decoded as plain `String`, not a serde enum:
-        // a serde enum fails the ENTIRE response parse on an unrecognized
-        // variant, which this lookup would then report as
-        // `MalformedResponse` -- indistinguishable from genuinely broken
-        // JSON. Matched explicitly below instead, so an unrecognized-but
-        // well-formed value (a newer Worker deploy adding a status this
-        // build predates) is reported as `Unsupported`.
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct RequestBody {
-            // Present on the wire (the fingerprint input includes it) but
-            // unused here: this lookup is already scoped to the caller's
-            // own account server-side.
-            #[allow(dead_code)]
-            user_id: String,
-            #[serde(default)]
-            group_name: Option<String>,
-            #[serde(default)]
-            group_id: Option<String>,
-            device_id: String,
-            #[serde(default)]
-            storage_mode: Option<String>,
-        }
-        #[derive(Deserialize, Default)]
-        struct ResultBody {
-            #[serde(rename = "groupId")]
-            group_id: Option<String>,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Resp {
-            operation_id: String,
-            kind: String,
-            status: String,
-            request_fingerprint: String,
-            request: RequestBody,
-            result: Option<ResultBody>,
-        }
-        let resp = client
-            .get(format!("{addr}/devices/enrollment-operations/{operation_id}"))
-            .send_authorized(auth)
-            .await
-            .map_err(|e| RemoteQueryError { category: e.category(), message: e.to_string() })?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if !resp.status().is_success() {
-            let status = resp.status();
-            return Err(RemoteQueryError {
-                category: categorize_error_status(status),
-                message: format!("enrollment operation lookup returned HTTP {status}"),
-            });
-        }
-        let parsed: Resp = resp.json().await.map_err(|e| RemoteQueryError {
-            category: RemoteEvidenceErrorCategory::MalformedResponse,
-            message: e.to_string(),
-        })?;
-        // The endpoint's own contract is to answer for exactly the
-        // requested operation_id -- a mismatch means the Worker response
-        // itself broke that contract (not a local-vs-remote identity
-        // question the diagnosis engine handles), so this is
-        // `MalformedResponse`, not `Conflict` (which does not even exist
-        // at this layer).
-        if parsed.operation_id != operation_id {
-            return Err(RemoteQueryError {
-                category: RemoteEvidenceErrorCategory::MalformedResponse,
-                message: format!(
-                    "operation id mismatch: requested {operation_id}, received {}",
-                    parsed.operation_id
-                ),
-            });
-        }
-        let status = match parsed.status.as_str() {
-            "preparing" => EnrollmentRemoteStatus::Preparing,
-            "prepared" => EnrollmentRemoteStatus::Prepared,
-            "active" => EnrollmentRemoteStatus::Active,
-            "cancelled" => EnrollmentRemoteStatus::Cancelled,
-            other => {
-                return Err(RemoteQueryError {
-                    category: RemoteEvidenceErrorCategory::Unsupported,
-                    message: format!("unsupported enrollment status: {other}"),
-                });
-            }
-        };
-        // `storage_mode` is a real wire field for `join`; for `create` it
-        // is always `"eager"` by construction (see
-        // `EnrollmentRemoteRequest`'s own doc comment) -- an absent field
-        // there is expected, not a shape violation. A `join` response
-        // missing it, or either kind missing its own required id field, IS
-        // a shape this build doesn't recognize.
-        let request = match parsed.kind.as_str() {
-            "create" => {
-                let Some(group_name) = parsed.request.group_name else {
-                    return Err(RemoteQueryError {
-                        category: RemoteEvidenceErrorCategory::Unsupported,
-                        message: "create enrollment response missing groupName".to_string(),
-                    });
-                };
-                EnrollmentRemoteRequest::Create {
-                    group_name,
-                    device_id: parsed.request.device_id,
-                    storage_mode: "eager".to_string(),
-                }
-            }
-            "join" => {
-                let (Some(group_id), Some(storage_mode)) =
-                    (parsed.request.group_id, parsed.request.storage_mode)
-                else {
-                    return Err(RemoteQueryError {
-                        category: RemoteEvidenceErrorCategory::Unsupported,
-                        message: "join enrollment response missing groupId/storageMode".to_string(),
-                    });
-                };
-                if storage_mode != "eager" && storage_mode != "on-demand" {
-                    return Err(RemoteQueryError {
-                        category: RemoteEvidenceErrorCategory::Unsupported,
-                        message: format!("unsupported join storage mode: {storage_mode}"),
-                    });
-                }
-                EnrollmentRemoteRequest::Join {
-                    group_id,
-                    device_id: parsed.request.device_id,
-                    storage_mode,
-                }
-            }
-            other => {
-                return Err(RemoteQueryError {
-                    category: RemoteEvidenceErrorCategory::Unsupported,
-                    message: format!("unsupported enrollment kind: {other}"),
-                });
-            }
-        };
-        Ok(Some(EnrollmentOperationRecord {
-            status,
-            request_fingerprint: parsed.request_fingerprint,
-            request,
-            result_group_id: parsed.result.and_then(|r| r.group_id),
-        }))
-    }
-
-    /// Reads the coordination plane's `role_loss_operation_receipts` row by
-    /// `operation_id` -- the receipt's mere existence IS the
-    /// evidence that a role-loss commit landed; there is no separate
-    /// status field the way enrollment/membership have one. `Ok(None)`
-    /// means a genuine HTTP 404 -- no durable receipt was returned for this
-    /// operation id at lookup time. It does NOT prove that the request was
-    /// definitely rejected, that no historical mutation occurred (a commit
-    /// made before generation 7, when this table did not exist, leaves no
-    /// receipt either), or that treating this operation as resolved is
-    /// safe -- see `RemoteEvidence`'s own doc
-    /// comment for the same contract stated once, generally.
-    pub async fn query_role_loss_operation(
-        client: &reqwest::Client,
-        addr: &str,
-        auth: &CoordinationAuth,
-        operation_id: &str,
-    ) -> Result<Option<RoleLossOperationRecord>, RemoteQueryError> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Resp {
-            operation_id: String,
-            group_id: String,
-            source_device_id: String,
-            target_device_id: String,
-            lease_id: Option<String>,
-            action: String,
-            membership_generation: Option<i64>,
-            committed_at: i64,
-        }
-        let resp = client
-            .get(format!("{addr}/devices/role-loss-operations/{operation_id}"))
-            .send_authorized(auth)
-            .await
-            .map_err(|e| RemoteQueryError { category: e.category(), message: e.to_string() })?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if !resp.status().is_success() {
-            let status = resp.status();
-            return Err(RemoteQueryError {
-                category: categorize_error_status(status),
-                message: format!("role-loss operation lookup returned HTTP {status}"),
-            });
-        }
-        let parsed: Resp = resp.json().await.map_err(|e| RemoteQueryError {
-            category: RemoteEvidenceErrorCategory::MalformedResponse,
-            message: e.to_string(),
-        })?;
-        // Same endpoint-contract check as `query_enrollment_operation`'s own
-        // -- see that function's identical comment.
-        if parsed.operation_id != operation_id {
-            return Err(RemoteQueryError {
-                category: RemoteEvidenceErrorCategory::MalformedResponse,
-                message: format!(
-                    "operation id mismatch: requested {operation_id}, received {}",
-                    parsed.operation_id
-                ),
-            });
-        }
-        // `action` is well-formed JSON but has a closed, known set of legal
-        // values on the Worker side (`"demote"`/`"revoke"` -- see
-        // `commitHandoffRoleLoss`'s own doc comment) -- anything else is
-        // `Unsupported`, not a shape violation.
-        if parsed.action != "demote" && parsed.action != "revoke" {
-            return Err(RemoteQueryError {
-                category: RemoteEvidenceErrorCategory::Unsupported,
-                message: format!("unsupported role-loss action: {}", parsed.action),
-            });
-        }
-        // Generation 8's `role_loss_operation_receipts.membership_generation`
-        // column is `NOT NULL` (see that table's own migration comment) --
-        // a receipt with no generation at all is a shape this build does
-        // not recognize, not a legitimately absent value; treating it as
-        // generation 0 (an earlier version of this code did) would silently
-        // fabricate a successful outcome from a malformed row.
-        let Some(membership_generation) = parsed.membership_generation else {
-            return Err(RemoteQueryError {
-                category: RemoteEvidenceErrorCategory::Unsupported,
-                message: "role-loss receipt missing membershipGeneration".to_string(),
-            });
-        };
-        Ok(Some(RoleLossOperationRecord {
-            group_id: parsed.group_id,
-            source_device_id: parsed.source_device_id,
-            target_device_id: parsed.target_device_id,
-            lease_id: parsed.lease_id,
-            action: parsed.action,
-            membership_generation,
-            committed_at_unix: parsed.committed_at,
-        }))
-    }
-
-    pub async fn compensate_handoff_role_loss(
-        addr: &str,
-        auth: &CoordinationAuth,
-        group_id: &str,
-        source_device_id: &str,
-        target_device_id: &str,
-        lease_id: &str,
-        expected_membership_generation: Option<i64>,
-    ) -> Result<RoleLossCompensationOutcome, String> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Body<'a> {
-            source_device_id: &'a str,
-            target_device_id: &'a str,
-            lease_id: &'a str,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            expected_membership_generation: Option<i64>,
-        }
-        #[derive(Deserialize)]
-        struct Resp {
-            status: String,
-        }
-        let response = reqwest::Client::new()
-            .post(format!("{addr}/shares/groups/{group_id}/handoff/compensate"))
-            .json(&Body {
-                source_device_id,
-                target_device_id,
-                lease_id,
-                expected_membership_generation,
-            })
-            .send_authorized(auth)
-            .await
-            .map_err(|e| format!("could not confirm role-loss compensation: {e}"))?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(format!(
-                "coordination plane rejected role-loss compensation ({status}): {text}"
-            ));
-        }
-        match response.json::<Resp>().await.map_err(|e| e.to_string())?.status.as_str() {
-            "restored" => Ok(RoleLossCompensationOutcome::Restored),
-            "superseded" => Ok(RoleLossCompensationOutcome::Superseded),
-            other => Err(format!("unknown role-loss compensation status: {other}")),
-        }
     }
 
     /// Reports this device's storage mode for a folder group
@@ -2458,381 +793,26 @@ mod imp {
     /// present-but-wrong-length value here means a build mismatch between
     /// this daemon and the coordination plane, not a real key to try to use
     /// anyway.
-    fn decode_signing_key(base64_key: &str) -> Option<[u8; 32]> {
+    pub(super) fn decode_signing_key(base64_key: &str) -> Option<[u8; 32]> {
         let bytes = base64::engine::general_purpose::STANDARD.decode(base64_key).ok()?;
         bytes.try_into().ok()
     }
 
-    /// Requests a Track Send rendezvous grant naming `receiver_device_id` as
-    /// the exact (and only) device this call authorizes `sender_device_id`
-    /// to reach -- `POST /send/authorization`. Unlike most calls in this
-    /// module, this surfaces its failure to the caller: `SendTransferService`
-    /// needs to tell a user-initiated `yadorilink send` apart a real
-    /// rejection (receiver removed, not on this account, budget exceeded)
-    /// from a transient outage, and a silently-swallowed `None` cannot do
-    /// that.
-    pub async fn request_send_authorization(
-        addr: &str,
-        auth: &CoordinationAuth,
-        sender_device_id: &str,
-        receiver_device_id: &str,
-    ) -> Result<SendAuthorizationGrant, String> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Body<'a> {
-            sender_device_id: &'a str,
-            receiver_device_id: &'a str,
-        }
-        post_send_grant(
-            auth,
-            &format!("{addr}/send/authorization"),
-            &Body { sender_device_id, receiver_device_id },
-        )
-        .await
-    }
-
-    /// Posts a grant request (same-account `POST /send/authorization`, or a
-    /// redeemed link's `POST /send/links/:id/authorization`) and parses the
-    /// grant both answer with.
-    async fn post_send_grant(
-        auth: &CoordinationAuth,
-        url: &str,
-        body: &impl Serialize,
-    ) -> Result<SendAuthorizationGrant, String> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct ReceiverBody {
-            device_id: String,
-            signing_public_key_base64: String,
-            #[serde(default)]
-            substrate_reachability: Option<super::WireSubstrateReachability>,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Resp {
-            grant_id: String,
-            nonce: String,
-            expires_at: i64,
-            receiver: ReceiverBody,
-        }
-        let resp = reqwest::Client::new()
-            .post(url)
-            .json(body)
-            .send_authorized(auth)
-            .await
-            .map_err(|e| format!("could not reach the coordination plane: {e}"))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "coordination plane refused the send-authorization request ({status}): {text}"
-            ));
-        }
-        let parsed: Resp = resp
-            .json()
-            .await
-            .map_err(|e| format!("unparseable send-authorization response: {e}"))?;
-        let receiver_signing_key = decode_signing_key(&parsed.receiver.signing_public_key_base64)
-            .ok_or_else(|| {
-            "send-authorization response carried an unparseable receiver signing key".to_string()
-        })?;
-        Ok(SendAuthorizationGrant {
-            grant_id: parsed.grant_id,
-            nonce: parsed.nonce,
-            expires_at_unix: parsed.expires_at,
-            receiver_device_id: parsed.receiver.device_id,
-            receiver_signing_key,
-            receiver_reachability: parsed
-                .receiver
-                .substrate_reachability
-                .map(Into::into)
-                .unwrap_or_default(),
-        })
-    }
-
-    /// The pair-bound grant for a redeemed cross-account Send link --
-    /// `POST /send/links/:id/authorization`. Issued once per link.
-    pub async fn request_send_link_authorization(
-        addr: &str,
-        auth: &CoordinationAuth,
-        link_id: &str,
-        sender_device_id: &str,
-    ) -> Result<SendAuthorizationGrant, String> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Body<'a> {
-            sender_device_id: &'a str,
-        }
-        post_send_grant(
-            auth,
-            &format!("{addr}/send/links/{link_id}/authorization"),
-            &Body { sender_device_id },
-        )
-        .await
-    }
-
-    /// Mints a one-use expiring cross-account Send link --
-    /// `POST /send/links`. The code is shown once; the service keeps only
-    /// its hash.
-    pub async fn create_send_link(
-        addr: &str,
-        auth: &CoordinationAuth,
-        sender_device_id: &str,
-        ttl_seconds: Option<u32>,
-        files: &[(String, u64)],
-    ) -> Result<CreatedSendLink, SendLinkCallError> {
-        #[derive(Serialize)]
-        struct File<'a> {
-            name: &'a str,
-            size: u64,
-        }
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Body<'a> {
-            sender_device_id: &'a str,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            ttl_seconds: Option<u32>,
-            #[serde(skip_serializing_if = "Vec::is_empty")]
-            files: Vec<File<'a>>,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Resp {
-            link_id: String,
-            code: String,
-            expires_at: i64,
-        }
-        let resp = send_link_request(
-            reqwest::Client::new().post(format!("{addr}/send/links")).json(&Body {
-                sender_device_id,
-                ttl_seconds,
-                files: files.iter().map(|(name, size)| File { name, size: *size }).collect(),
-            }),
-            auth,
-            "create the send link",
-        )
-        .await?;
-        let parsed: Resp = resp.json().await.map_err(|e| SendLinkCallError {
-            kind: SendLinkCallKind::Other,
-            message: format!("unparseable send-link response: {e}"),
-        })?;
-        Ok(CreatedSendLink {
-            link_id: parsed.link_id,
-            code: parsed.code,
-            expires_at_unix: parsed.expires_at,
-        })
-    }
-
-    /// Redeems a code with one of this account's devices --
-    /// `POST /send/links/redeem`. Returns the link id. Every failure (unknown,
-    /// expired, used, cancelled) is the service's one uniform refusal.
-    pub async fn redeem_send_link(
-        addr: &str,
-        auth: &CoordinationAuth,
-        code: &str,
-        receiver_device_id: &str,
-    ) -> Result<String, SendLinkCallError> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Body<'a> {
-            code: &'a str,
-            receiver_device_id: &'a str,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Resp {
-            link_id: String,
-        }
-        let resp = send_link_request(
-            reqwest::Client::new()
-                .post(format!("{addr}/send/links/redeem"))
-                .json(&Body { code, receiver_device_id }),
-            auth,
-            "redeem the send link",
-        )
-        .await?;
-        let parsed: Resp = resp.json().await.map_err(|e| SendLinkCallError {
-            kind: SendLinkCallKind::Other,
-            message: format!("unparseable send-link response: {e}"),
-        })?;
-        Ok(parsed.link_id)
-    }
-
-    /// What a link carries and who sends it, before redeeming --
-    /// `POST /send/links/preview`. Reads only; the service refuses every link that is not open
-    /// alike (`NotFound`).
-    pub async fn preview_send_link(
-        addr: &str,
-        auth: &CoordinationAuth,
-        code: &str,
-    ) -> Result<SendLinkPreview, SendLinkCallError> {
-        #[derive(Serialize)]
-        struct Body<'a> {
-            code: &'a str,
-        }
-        #[derive(Deserialize)]
-        struct File {
-            name: String,
-            size: u64,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Resp {
-            sender_name: String,
-            expires_at: i64,
-            #[serde(default)]
-            files: Vec<File>,
-        }
-        let resp = send_link_request(
-            reqwest::Client::new().post(format!("{addr}/send/links/preview")).json(&Body { code }),
-            auth,
-            "read the send link",
-        )
-        .await?;
-        let parsed: Resp = resp.json().await.map_err(|e| SendLinkCallError {
-            kind: SendLinkCallKind::Other,
-            message: format!("unparseable send-link response: {e}"),
-        })?;
-        Ok(SendLinkPreview {
-            sender_name: parsed.sender_name,
-            files: parsed.files.into_iter().map(|f| (f.name, f.size)).collect(),
-            expires_at_unix: parsed.expires_at,
-        })
-    }
-
-    /// The sender's view of a link -- `GET /send/links/:id`.
-    pub async fn send_link_status(
-        addr: &str,
-        auth: &CoordinationAuth,
-        link_id: &str,
-    ) -> Result<SendLinkStatus, SendLinkCallError> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Resp {
-            state: String,
-            #[serde(default)]
-            receiver_device_name: Option<String>,
-        }
-        let resp = send_link_request(
-            reqwest::Client::new().get(format!("{addr}/send/links/{link_id}")),
-            auth,
-            "read the send link",
-        )
-        .await?;
-        let parsed: Resp = resp.json().await.map_err(|e| SendLinkCallError {
-            kind: SendLinkCallKind::Other,
-            message: format!("unparseable send-link response: {e}"),
-        })?;
-        Ok(SendLinkStatus {
-            state: parsed.state,
-            receiver_device_name: parsed.receiver_device_name,
-        })
-    }
-
-    /// Cancels a link and revokes its unconsumed grant -- `DELETE /send/links/:id`.
-    pub async fn cancel_send_link(
-        addr: &str,
-        auth: &CoordinationAuth,
-        link_id: &str,
-    ) -> Result<(), SendLinkCallError> {
-        send_link_request(
-            reqwest::Client::new().delete(format!("{addr}/send/links/{link_id}")),
-            auth,
-            "cancel the send link",
-        )
-        .await
-        .map(|_| ())
-    }
-
-    /// Whether a 404 body is the service's "Send links are switched off" answer, which an
-    /// unknown link's plain 404 is not.
-    fn is_send_links_disabled(body: &str) -> bool {
-        serde_json::from_str::<serde_json::Value>(body)
-            .ok()
-            .and_then(|v| v.get("code").and_then(|c| c.as_str().map(str::to_owned)))
-            .is_some_and(|code| code == "send_links_disabled")
-    }
-
-    async fn send_link_request(
-        request: reqwest::RequestBuilder,
-        auth: &CoordinationAuth,
-        what: &str,
-    ) -> Result<reqwest::Response, SendLinkCallError> {
-        let resp = request.send_authorized(auth).await.map_err(|e| SendLinkCallError {
-            kind: SendLinkCallKind::Unreachable,
-            message: format!("could not reach the coordination plane: {e}"),
-        })?;
-        if resp.status().is_success() {
-            return Ok(resp);
-        }
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        let kind = match status.as_u16() {
-            401 | 403 => SendLinkCallKind::SignInRequired,
-            404 if is_send_links_disabled(&text) => SendLinkCallKind::FeatureDisabled,
-            404 => SendLinkCallKind::NotFound,
-            _ => SendLinkCallKind::Other,
-        };
-        Err(SendLinkCallError { kind, message: format!("could not {what} ({status}): {text}") })
-    }
-
-    /// Atomically consumes a grant -- `POST /send/authorization/:grantId/consume`
-    /// -- naming the exact sender identity this device's own Track Send
-    /// handshake just authenticated (never a value merely claimed in the application-
-    /// layer offer that presented `grant_id`/`nonce`; see
-    /// `yadorilink-send`'s `handle_offer`, which is what calls this). Only
-    /// the first consume of a grant succeeds -- see
-    /// `consumeSendAuthorization`'s own doc comment on the
-    /// Worker side for why a SECOND call with the exact same arguments
-    /// (a replay, or an honest retry after this device never saw the first
-    /// response) reliably fails rather than reliably succeeding twice: only
-    /// the first to actually commit gets a receiver's `Ok`, and a caller
-    /// that legitimately needs to retry a transient failure does so by
-    /// requesting a fresh grant, not by re-presenting a consumed one.
-    pub async fn consume_send_authorization(
-        addr: &str,
-        auth: &CoordinationAuth,
-        grant_id: &str,
-        nonce: &str,
-        sender_device_id: &str,
-        receiver_device_id: &str,
-    ) -> Result<(), String> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Body<'a> {
-            nonce: &'a str,
-            sender_device_id: &'a str,
-            receiver_device_id: &'a str,
-        }
-        let url = format!("{addr}/send/authorization/{grant_id}/consume");
-        let body = Body { nonce, sender_device_id, receiver_device_id };
-        let resp = reqwest::Client::new()
-            .post(&url)
-            .json(&body)
-            .send_authorized(auth)
-            .await
-            .map_err(|e| format!("could not reach the coordination plane: {e}"))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "send authorization is invalid, expired, or already used ({status}): {text}"
-            ));
-        }
-        // The response also names the sender; this device already knows who
-        // it is from the authenticated connection, so the body is not read.
-        Ok(())
-    }
-
     #[cfg(test)]
     mod tests {
-        use super::{
-            activate_invite_accept, checkpoint_request_body, coord_error_message, fetch_edge_state,
-            find_account_device, list_account_device_keys, prepare_create, prepare_invite_accept,
-            prepare_join, request_authorization_checkpoint, resolve_edge, SubstrateReachability,
+        use super::super::membership::{
+            fetch_edge_state, find_account_device, list_account_device_keys,
+            list_account_device_names, mint_invite, resolve_edge,
         };
-        use super::{commit_handoff_role_loss, mint_invite};
+        use super::{checkpoint_request_body, coord_error_message};
         use crate::checkpoint_source::CheckpointPurpose;
+        use crate::coordination_client::enrollment::{
+            activate_invite_accept, prepare_create, prepare_invite_accept, prepare_join,
+        };
+        use crate::coordination_client::handoff::{
+            commit_handoff_role_loss, request_authorization_checkpoint,
+        };
+        use crate::coordination_client::SubstrateReachability;
         use crate::coordination_client::{ActivateOutcome, EnrollmentPrepareOutcome};
         use crate::coordination_client::{CoordinationCallError, DeviceListingError};
         use crate::coordination_client::{RoleLossCommitOutcome, RoleLossCommitRequest};
@@ -2846,184 +826,6 @@ mod imp {
         /// that takes a string at all.
         fn test_auth() -> yadorilink_fapi_client::CoordinationAuth {
             yadorilink_fapi_client::test_support::offline_auth()
-        }
-
-        #[tokio::test]
-        async fn a_send_link_goes_from_created_to_redeemed_to_a_pair_bound_grant() {
-            use super::{
-                cancel_send_link, create_send_link, redeem_send_link,
-                request_send_link_authorization, send_link_status,
-            };
-            use base64::Engine as _;
-            use wiremock::matchers::body_json;
-            let key = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
-            let server = MockServer::start().await;
-            Mock::given(method("POST"))
-                .and(path("/send/links"))
-                .and(body_json(serde_json::json!({ "senderDeviceId": "dev-a", "ttlSeconds": 600 })))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "linkId": "link-1", "code": "ABCD-EFGH", "expiresAt": 1234
-                })))
-                .expect(1)
-                .mount(&server)
-                .await;
-            Mock::given(method("POST"))
-                .and(path("/send/links/redeem"))
-                .and(body_json(
-                    serde_json::json!({ "code": "ABCD-EFGH", "receiverDeviceId": "dev-b" }),
-                ))
-                .respond_with(
-                    ResponseTemplate::new(200)
-                        .set_body_json(serde_json::json!({ "linkId": "link-1" })),
-                )
-                .expect(1)
-                .mount(&server)
-                .await;
-            Mock::given(method("GET"))
-                .and(path("/send/links/link-1"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "linkId": "link-1", "state": "redeemed", "expiresAt": 1234,
-                    "receiverDeviceName": "Bob laptop"
-                })))
-                .mount(&server)
-                .await;
-            Mock::given(method("POST"))
-                .and(path("/send/links/link-1/authorization"))
-                .and(body_json(serde_json::json!({ "senderDeviceId": "dev-a" })))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "grantId": "g1", "nonce": "n1", "expiresAt": 99,
-                    "receiver": { "deviceId": "dev-b", "signingPublicKeyBase64": key }
-                })))
-                .expect(1)
-                .mount(&server)
-                .await;
-            Mock::given(method("DELETE"))
-                .and(path("/send/links/link-1"))
-                .respond_with(
-                    ResponseTemplate::new(200)
-                        .set_body_json(serde_json::json!({ "cancelled": true })),
-                )
-                .expect(1)
-                .mount(&server)
-                .await;
-            let (addr, auth) = (server.uri(), test_auth());
-
-            let link = create_send_link(&addr, &auth, "dev-a", Some(600), &[]).await.unwrap();
-            assert_eq!((link.link_id.as_str(), link.code.as_str()), ("link-1", "ABCD-EFGH"));
-            assert_eq!(
-                redeem_send_link(&addr, &auth, &link.code, "dev-b").await.unwrap(),
-                "link-1"
-            );
-            let status = send_link_status(&addr, &auth, "link-1").await.unwrap();
-            assert_eq!(status.state, "redeemed");
-            assert_eq!(status.receiver_device_name.as_deref(), Some("Bob laptop"));
-            let grant =
-                request_send_link_authorization(&addr, &auth, "link-1", "dev-a").await.unwrap();
-            assert_eq!(
-                (grant.grant_id.as_str(), grant.nonce.as_str(), grant.receiver_device_id.as_str()),
-                ("g1", "n1", "dev-b")
-            );
-            assert_eq!(grant.receiver_signing_key, [9u8; 32]);
-            cancel_send_link(&addr, &auth, "link-1").await.unwrap();
-        }
-
-        #[tokio::test]
-        async fn a_preview_reads_the_link_and_a_refusal_is_the_uniform_not_found() {
-            use super::{create_send_link, preview_send_link};
-            use wiremock::matchers::{body_json, method, path};
-            use wiremock::{Mock, MockServer, ResponseTemplate};
-            let server = MockServer::start().await;
-            Mock::given(method("POST"))
-                .and(path("/send/links"))
-                .and(body_json(serde_json::json!({
-                    "senderDeviceId": "dev-a",
-                    "files": [{ "name": "a.txt", "size": 5 }]
-                })))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "linkId": "link-1", "code": "CODE", "expiresAt": 9
-                })))
-                .mount(&server)
-                .await;
-            Mock::given(method("POST"))
-                .and(path("/send/links/preview"))
-                .and(body_json(serde_json::json!({ "code": "GOOD" })))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "senderName": "Kai's Mac",
-                    "expiresAt": 1_800_000_000,
-                    "files": [{ "name": "a.txt", "size": 5 }]
-                })))
-                .mount(&server)
-                .await;
-            Mock::given(method("POST"))
-                .and(path("/send/links/preview"))
-                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
-                    "error": "send link is invalid, expired, or already used"
-                })))
-                .mount(&server)
-                .await;
-            let (addr, auth) = (server.uri(), test_auth());
-            create_send_link(&addr, &auth, "dev-a", None, &[("a.txt".to_string(), 5)])
-                .await
-                .unwrap();
-            let preview = preview_send_link(&addr, &auth, "GOOD").await.unwrap();
-            assert_eq!(preview.sender_name, "Kai's Mac");
-            assert_eq!(preview.files, vec![("a.txt".to_string(), 5)]);
-            assert_eq!(preview.expires_at_unix, 1_800_000_000);
-            let refused = preview_send_link(&addr, &auth, "BAD").await.unwrap_err();
-            assert_eq!(refused.kind, super::super::SendLinkCallKind::NotFound);
-        }
-
-        #[tokio::test]
-        async fn a_service_with_send_links_off_is_told_apart_from_an_unknown_link() {
-            use super::{preview_send_link, send_link_status};
-            let server = MockServer::start().await;
-            Mock::given(method("POST"))
-                .and(path("/send/links/preview"))
-                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
-                    "error": "send links are not available", "code": "send_links_disabled"
-                })))
-                .mount(&server)
-                .await;
-            Mock::given(method("GET"))
-                .and(path("/send/links/link-1"))
-                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
-                    "error": "send link not found"
-                })))
-                .mount(&server)
-                .await;
-            let (addr, auth) = (server.uri(), test_auth());
-            let off = preview_send_link(&addr, &auth, "ANY").await.unwrap_err();
-            assert_eq!(off.kind, super::super::SendLinkCallKind::FeatureDisabled);
-            let unknown = send_link_status(&addr, &auth, "link-1").await.unwrap_err();
-            assert_eq!(unknown.kind, super::super::SendLinkCallKind::NotFound);
-        }
-
-        #[tokio::test]
-        async fn refused_send_link_calls_surface_the_service_refusal() {
-            use super::{redeem_send_link, request_send_link_authorization};
-            let server = MockServer::start().await;
-            // Reused, expired, cancelled and unknown codes all look like this.
-            Mock::given(method("POST"))
-                .and(path("/send/links/redeem"))
-                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
-                    "error": "send link is invalid, expired, or already used"
-                })))
-                .mount(&server)
-                .await;
-            // A second grant request for the same link, or one before redeem.
-            Mock::given(method("POST"))
-                .and(path("/send/links/link-1/authorization"))
-                .respond_with(ResponseTemplate::new(404))
-                .mount(&server)
-                .await;
-            let (addr, auth) = (server.uri(), test_auth());
-            let err = redeem_send_link(&addr, &auth, "USED-CODE", "dev-b").await.unwrap_err();
-            assert!(err.message.contains("404") && err.message.contains("already used"), "{err}");
-            // The uniform refusal is typed, so a front end never reads the text.
-            assert_eq!(err.kind, super::super::SendLinkCallKind::NotFound);
-            assert!(request_send_link_authorization(&addr, &auth, "link-1", "dev-a")
-                .await
-                .is_err());
         }
 
         #[tokio::test]
@@ -3043,6 +845,48 @@ mod imp {
                 .await;
             let keys = list_account_device_keys(&server.uri(), &test_auth()).await.unwrap();
             assert_eq!(keys, vec![[7u8; 32]]);
+        }
+
+        /// A plane that takes the request and never answers gives `Unreachable`
+        /// once the client's timeout passes, instead of hanging the listing.
+        #[tokio::test]
+        async fn a_device_listing_that_never_answers_is_unreachable() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/devices"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(5)),
+                )
+                .mount(&server)
+                .await;
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_millis(100))
+                .build()
+                .unwrap();
+            let result = crate::coordination_client::membership::list_account_devices_with(
+                &client,
+                &server.uri(),
+                &test_auth(),
+            )
+            .await;
+            assert!(matches!(result, Err(DeviceListingError::Unreachable(_))));
+        }
+
+        #[tokio::test]
+        async fn account_device_names_leave_out_signed_out_devices() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/devices"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "devices": [
+                        { "deviceId": "a", "deviceName": "Mac", "online": true, "signingPublicKeyBase64": "", "signedOut": false },
+                        { "deviceId": "b", "deviceName": "Old", "online": false, "signingPublicKeyBase64": "", "signedOut": true },
+                    ]
+                })))
+                .mount(&server)
+                .await;
+            let names = list_account_device_names(&server.uri(), &test_auth()).await.unwrap();
+            assert_eq!(names, vec![("a".to_string(), "Mac".to_string(), true)]);
         }
 
         /// The device to manage is looked up on this device's own account
@@ -3210,12 +1054,116 @@ mod imp {
             assert_eq!(publication["leafCount"], 3);
         }
 
+        /// What a refused checkpoint request is called, by what the service answered: only a plain
+        /// 403 says the device may not publish; the Terms (a 403 with its own code), a refused
+        /// credential and a missing route are the service answering without deciding the role; a
+        /// server error is the service failing.
+        #[tokio::test]
+        async fn a_refused_checkpoint_request_is_told_apart_by_what_the_service_answered() {
+            use crate::checkpoint_source::CheckpointRefusal as R;
+            let answer = |status: u16, body: serde_json::Value| async move {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path("/shares/groups/g1/authorization-checkpoint"))
+                    .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                    .mount(&server)
+                    .await;
+                request_authorization_checkpoint(
+                    &server.uri(),
+                    &test_auth(),
+                    "g1",
+                    "dev",
+                    "req",
+                    [1; 32],
+                    1,
+                    CheckpointPurpose::Publication,
+                )
+                .await
+                .unwrap_err()
+            };
+            let none = serde_json::json!({});
+            // A 403 is a refusal of this device's right to publish only by its code, never by its
+            // message: the two codes of the checkpoint route, and nothing else.
+            for code in ["not_writer", "not_device_owner"] {
+                let body = serde_json::json!({"error": code, "message": "whatever the words are"});
+                assert_eq!(answer(403, body).await, R::NotAuthorized, "{code}");
+            }
+            assert_eq!(answer(403, none.clone()).await, R::Rejected, "a 403 with no code");
+            assert_eq!(
+                answer(403, serde_json::json!({"error": "forbidden"})).await,
+                R::Rejected,
+                "an unknown code"
+            );
+            // The words are not the contract: a prose-only body is not a refusal of the role.
+            assert_eq!(
+                answer(403, serde_json::json!({"error": "dev is not currently a writer for g1"}))
+                    .await,
+                R::Rejected
+            );
+            assert_eq!(
+                answer(403, serde_json::json!({"error": "terms_consent_required"})).await,
+                R::Rejected
+            );
+            assert_eq!(answer(401, none.clone()).await, R::Rejected);
+            assert_eq!(answer(404, none.clone()).await, R::Rejected);
+            assert_eq!(answer(409, none.clone()).await, R::Rejected);
+            assert_eq!(answer(500, none.clone()).await, R::Unreachable);
+            assert_eq!(answer(503, none.clone()).await, R::Unreachable);
+            // The abuse budget sheds load with a 429 and a retry hint: later, not never.
+            assert_eq!(
+                answer(429, serde_json::json!({"error": "rate_limited", "retryAfterSecs": 3}))
+                    .await,
+                R::Unreachable
+            );
+        }
+
+        /// A decision the service has recorded but not yet signed (`signatureBase64: null`) is a
+        /// moment's wait: the same request is answered with the signature on the next try.
+        #[tokio::test]
+        async fn a_decided_but_unsigned_checkpoint_is_a_wait_not_a_refusal() {
+            let server = MockServer::start().await;
+            let b64 = |bytes: [u8; 32]| {
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
+            };
+            Mock::given(method("POST"))
+                .and(path("/shares/groups/g1/authorization-checkpoint"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "requestId": "req", "groupId": "g1", "deviceId": "dev",
+                    "signingKeyFingerprintBase64": b64([1; 32]),
+                    "merkleRootBase64": b64([1; 32]),
+                    "leafCount": 1, "checkpointSeq": 1,
+                    "signerKeyIdBase64": b64([2; 32]),
+                    "policyEpoch": 1, "policySeq": 1,
+                    "policyHeadBase64": b64([3; 32]),
+                    "issuedAtUnix": 5, "signatureBase64": null,
+                })))
+                .mount(&server)
+                .await;
+            let answer = request_authorization_checkpoint(
+                &server.uri(),
+                &test_auth(),
+                "g1",
+                "dev",
+                "req",
+                [1; 32],
+                1,
+                CheckpointPurpose::Publication,
+            )
+            .await;
+            assert_eq!(
+                answer.unwrap_err(),
+                crate::checkpoint_source::CheckpointRefusal::Unreachable
+            );
+        }
+
         #[tokio::test]
         async fn the_checkpoint_request_posts_the_seal_purpose_to_the_issuance_route() {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/shares/groups/g1/authorization-checkpoint"))
-                .respond_with(ResponseTemplate::new(403))
+                .respond_with(ResponseTemplate::new(403).set_body_json(
+                    serde_json::json!({"error": "not_writer", "message": "not a writer"}),
+                ))
                 .mount(&server)
                 .await;
             let seal = request_authorization_checkpoint(
@@ -3229,7 +1177,10 @@ mod imp {
                 CheckpointPurpose::Seal,
             )
             .await;
-            assert!(seal.is_none());
+            assert_eq!(
+                seal.unwrap_err(),
+                crate::checkpoint_source::CheckpointRefusal::NotAuthorized
+            );
             let requests = server.received_requests().await.expect("recorded requests");
             assert_eq!(requests.len(), 1);
             let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();

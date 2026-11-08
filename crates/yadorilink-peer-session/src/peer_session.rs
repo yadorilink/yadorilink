@@ -466,12 +466,12 @@ pub struct PeerSyncSession {
     /// this device's other peers) chooses to do with the same path.
     ///
     /// Originally loaded once at construction only, the same way
-    /// `canonical_sync_roots` is: a `.yadorilinkignore` edit took effect
+    /// `canonical_sync_roots` is: an ignore-rules edit took effect
     /// for incoming records on this peer's *next* session (a fresh
     /// `PeerSyncSession`), not live mid-session — deliberate, since local
     /// scanning/watching (`link_manager`'s executor,
-    /// `EffectiveIgnoreSet::load_for_link_root` reloaded fresh on every
-    /// call there) already picks up the edit immediately for the LOCAL
+    /// the stored rules reloaded fresh on every
+    /// flush there) already picks up the edit immediately for the LOCAL
     /// side. But a long-lived peer connection has no bound on how stale
     /// this cached set could get for the PEER-reconciliation side, and
     /// nothing else ever forced a reconnect — a review finding flagged
@@ -536,6 +536,10 @@ pub struct PeerSyncSession {
     /// like the fields it replaced: it is set once, at construction, and
     /// never replaced, so there is nothing to guard.
     transports: crate::ports::SessionTransports,
+    /// When the peer last answered a block request (with anything), and whether a request went
+    /// wholly unanswered since: a silent peer is not a fetch candidate until it answers again.
+    last_block_reply: std::sync::Mutex<std::time::Instant>,
+    unreachable: std::sync::atomic::AtomicBool,
     /// This session's caller-injected bridge to the daemon's own
     /// coordination-plane-backed lease machinery (`DaemonState::request_
     /// handoff_lease`) — see `HandoffLeaseResponder`'s doc comment. Set once
@@ -610,6 +614,8 @@ impl PeerSyncSession {
                 MAX_IN_FLIGHT_MESSAGES_PER_PEER,
             ),
             transports,
+            last_block_reply: std::sync::Mutex::new(std::time::Instant::now()),
+            unreachable: std::sync::atomic::AtomicBool::new(false),
             handoff_lease_responder: deps.handoff_lease_responder,
             handoff_ticket_responder: deps.handoff_ticket_responder,
             custody_rehome_responder: deps.custody_rehome_responder,

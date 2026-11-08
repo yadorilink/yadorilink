@@ -528,20 +528,17 @@ fn a_rotation_closure_before_the_first_delta_refuses_the_first_delta() {
     assert_eq!(frontier_seq(&c, &b1), None);
 }
 
-/// Storing the closure is invisible to the summary roots, the cache token that
-/// keys them.
+/// Storing the closure is invisible to the summary roots.
 #[test]
-fn a_rotation_closure_is_outside_every_root_digest_and_token() {
+fn a_rotation_closure_is_outside_every_root_digest() {
     let (c, _a, b) = source();
     let roots = roots_of(&c);
-    let token = crate::native_summary_cache::state_token(&c, &group()).unwrap();
     let bundle = built(&c);
 
     rotation_closure_at(&c, &group(), &b, Some(AuthorSeq(1)));
     rotation_closure_at(&c, &group(), &author("device-d"), None);
 
     assert_eq!(roots_of(&c), roots);
-    assert_eq!(crate::native_summary_cache::state_token(&c, &group()).unwrap(), token);
     let after = built(&c);
     assert_eq!(after.checkpoint, bundle.checkpoint);
     assert_eq!(after.authors, bundle.authors);

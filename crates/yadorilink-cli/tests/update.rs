@@ -143,6 +143,32 @@ async fn update_status_reflects_an_available_held_back_update() {
     assert_eq!(status.update_holdback_reason, "staged rollout at 10%");
 }
 
+/// A version that cannot open this device's data reaches the apps as its own state, not as the
+/// staged-rollout hold-back.
+#[tokio::test]
+async fn update_status_reports_a_version_that_cannot_open_this_data_as_its_own_state() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (_dir, state) = start_daemon().await;
+    state
+        .update_manager
+        .policy
+        .update(|p| {
+            p.state = UpdateState::StateIncompatible;
+            p.available_version = Some("0.2.0".into());
+            p.holdback_reason = Some("the data uses state database version 133".into());
+        })
+        .unwrap();
+    let resp = yadorilink_client_core::daemon::control::send(ReqPayload::UpdateStatus(
+        UpdateStatusRequest {},
+    ))
+    .await
+    .unwrap();
+    let Some(RespPayload::UpdateStatus(status)) = resp.payload else {
+        panic!("expected an UpdateStatus response");
+    };
+    assert_eq!(status.state, "state_incompatible");
+}
+
 /// case.
 #[tokio::test]
 async fn update_status_reflects_a_failed_check() {

@@ -11,11 +11,11 @@
 
 use yadorilink_ipc_proto::daemonctl::{
     CreateSendLinkResponse, InboxTransfer, PreviewSendLinkResponse, ReceiveTransferResponse,
-    SendFileResponse, SendLinkFile, SendLinkStatusResponse, SentTransferEntry,
+    RetryDirection, SendFileResponse, SendLinkFile, SendLinkStatusResponse, SentTransferEntry,
 };
 
 use super::{CommandError, EngineCommands};
-use crate::send_transfer::SendFailure;
+use crate::send_transfer::{RetryOutcome, SendFailure};
 
 impl From<SendFailure> for CommandError {
     fn from(failure: SendFailure) -> Self {
@@ -210,6 +210,63 @@ impl EngineCommands {
     pub fn cancel_transfer(&self, transfer_id: &str) -> Result<(), CommandError> {
         self.context.application.send_transfer.cancel(transfer_id).map_err(CommandError::failed)
     }
+
+    /// Resumes a failed or cancelled received transfer after the engine re-validates it. A
+    /// transfer this device sent is refused before anything is done.
+    ///
+    /// # Errors
+    /// [`CommandError`] for an unknown transfer, one on the other side, or one that cannot be
+    /// resumed.
+    pub async fn retry_transfer(
+        &self,
+        transfer_id: &str,
+    ) -> Result<ReceiveTransferResponse, CommandError> {
+        match self.retry(transfer_id, RetryDirection::Received).await? {
+            RetryOutcome::Received(outcome) => Ok(ReceiveTransferResponse {
+                destination_dir: outcome.destination_dir.to_string_lossy().into_owned(),
+                files_received: outcome.files_received,
+                bytes_received: outcome.bytes_received,
+            }),
+            RetryOutcome::Offered(_) => {
+                Err(CommandError::failed("a received-side retry offered a transfer"))
+            }
+        }
+    }
+
+    /// Offers a sent transfer again after the engine checks the offered files are unchanged and
+    /// obtains a new authorization for the same device. A transfer this device received is
+    /// refused before anything is done.
+    ///
+    /// # Errors
+    /// As [`Self::retry_transfer`]; a transfer whose files changed has to be sent again.
+    pub async fn retry_sent_transfer(
+        &self,
+        transfer_id: &str,
+    ) -> Result<SendFileResponse, CommandError> {
+        match self.retry(transfer_id, RetryDirection::Sent).await? {
+            RetryOutcome::Offered(outcome) => Ok(SendFileResponse {
+                transfer_id: transfer_id.to_owned(),
+                files_offered: outcome.files_offered,
+                total_size: outcome.total_size,
+            }),
+            RetryOutcome::Received(_) => {
+                Err(CommandError::failed("a sent-side retry received a transfer"))
+            }
+        }
+    }
+
+    async fn retry(
+        &self,
+        transfer_id: &str,
+        side: RetryDirection,
+    ) -> Result<RetryOutcome, CommandError> {
+        self.context
+            .application
+            .send_transfer
+            .retry(transfer_id, side)
+            .await
+            .map_err(CommandError::failed)
+    }
 }
 
 fn status_to_proto(view: crate::send_transfer::LinkStatusView) -> SendLinkStatusResponse {
@@ -217,5 +274,6 @@ fn status_to_proto(view: crate::send_transfer::LinkStatusView) -> SendLinkStatus
         state: view.state as i32,
         receiver_device_name: view.receiver_device_name,
         transfer_id: view.transfer_id,
+        failure: view.failure,
     }
 }

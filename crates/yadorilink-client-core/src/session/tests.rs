@@ -9,7 +9,7 @@ use crate::dto::{BrowserPurpose, LoginFlow, SignInState};
 use crate::error::{NetworkErrorKind, PermissionDeniedReason};
 
 fn options(timeout: Option<Duration>) -> LoginOptions {
-    LoginOptions { flow: LoginFlow::Loopback, overall_timeout: timeout }
+    LoginOptions { flow: LoginFlow::Loopback, overall_timeout: timeout, device_name: None }
 }
 
 fn no_precheck() -> LoginPrecheckFn {
@@ -25,6 +25,9 @@ fn account() -> AccountStatus {
         default_device_name: "Mac".into(),
         has_linked_folders: None,
         start_over_pending: false,
+        email: None,
+        sign_in_provider: None,
+        display_name: None,
     }
 }
 
@@ -318,6 +321,9 @@ async fn the_capture_time_alone_is_not_a_change() {
                         default_device_name: String::new(),
                         has_linked_folders: None,
                         start_over_pending: false,
+                        email: None,
+                        sign_in_provider: None,
+                        display_name: None,
                     },
                     SystemTime::now(),
                 ),

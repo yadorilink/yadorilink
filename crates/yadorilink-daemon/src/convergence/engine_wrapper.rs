@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use yadorilink_fs_platform::ignore_patterns::{is_ignore_file_relative_path, EffectiveIgnoreSet};
+use yadorilink_fs_platform::ignore_patterns::{EffectiveIgnoreSet, IgnoreRulesStore};
 
 use crate::daemon_state::DaemonState;
 
@@ -315,8 +315,8 @@ async fn run_hazard_recheck_pass(state: &Arc<DaemonState>, pending: BTreeMap<Str
 ///
 /// Deliberately backstop-only for now, unlike the retirement/hazard loops
 /// (no `GroupWake`-style event-driven fast path): the natural trigger
-/// -- "the ignore-set cache for this group just reloaded from a changed
-/// `.yadorilinkignore`" -- fires deep inside `yadorilink-peer-session`'s
+/// -- "the ignore-set cache for this group just reloaded from changed
+/// ignore rules" -- fires deep inside the convergence executor's
 /// `effective_ignore_set`, and wiring a cross-crate notification back into
 /// this loop is a possible follow-up, not required to close the liveness
 /// gap itself: the `IGNORE_RECHECK_BACKSTOP_INTERVAL` poll alone already
@@ -379,7 +379,7 @@ async fn run_ignore_recheck_loop(state: Arc<DaemonState>) {
 /// resolution failure re-arms rather than leaving the path parked, which
 /// is safe (the ordinary claim cycle re-evaluates ignore policy again
 /// downstream) and strictly better than risking the quarantine side effect.
-async fn run_ignore_recheck_pass(state: &Arc<DaemonState>, group_id: &str) {
+pub(crate) async fn run_ignore_recheck_pass(state: &Arc<DaemonState>, group_id: &str) {
     let replica_coordinator_for_list = state.replica_coordinator.clone();
     let list_group_id = group_id.to_string();
     let ignore_blocked_paths = match tokio::task::spawn_blocking(move || {
@@ -400,22 +400,18 @@ async fn run_ignore_recheck_pass(state: &Arc<DaemonState>, group_id: &str) {
     if ignore_blocked_paths.is_empty() {
         return;
     }
-    let sync_roots = crate::peer_orchestrator::sync_roots_for_groups(
-        state,
-        std::slice::from_ref(&group_id.to_string()),
+    let ignore_set = Some(
+        IgnoreRulesStore::new(state.config_dir())
+            .load(group_id)
+            .unwrap_or_else(|_| EffectiveIgnoreSet::defaults_only()),
     );
-    let ignore_set = sync_roots.get(group_id).map(|root| {
-        EffectiveIgnoreSet::load_for_link_root(root)
-            .unwrap_or_else(|_| EffectiveIgnoreSet::defaults_only())
-    });
     let mut any_rearmed = false;
     for path in &ignore_blocked_paths {
         // The same rule as `LocalConvergenceExecutor::is_locally_ignored`:
         // a directory-only pattern covers a path the namespace places a
         // directory at.
         let still_ignored = ignore_set.as_ref().is_some_and(|set| {
-            is_ignore_file_relative_path(path)
-                || set.is_ignored(path, false)
+            set.is_ignored(path, false)
                 || (set.is_ignored(path, true)
                     && matches!(
                         state.replica_coordinator.desired_path_state(group_id, path),

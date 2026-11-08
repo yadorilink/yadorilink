@@ -1,0 +1,43 @@
+name: Install YadoriLink
+description: >-
+  Install a pinned YadoriLink engine (the yadorilink command line and daemon) and put it on PATH.
+  The installer's attestation and the signed release manifest are verified; any failure fails the job.
+inputs:
+  version:
+    description: Exact release version to install, for example 0.1.0-beta.9. A version is required so a job never changes under you.
+    required: true
+  channel:
+    description: Release channel the version belongs to (beta or nightly).
+    default: beta
+  prefix:
+    description: Install directory (absolute). Defaults to a directory under the runner's temp directory.
+    default: ''
+outputs:
+  bin-dir:
+    description: Directory holding yadorilink and yadorilink-daemon (already added to PATH).
+    value: ${{ steps.install.outputs.bin-dir }}
+runs:
+  using: composite
+  steps:
+    # Nothing is cached on purpose: restoring an installed directory would skip the verification
+    # that installing performs, and the engine bundle is a short signed download.
+    - id: install
+      if: runner.os != 'Windows'
+      shell: sh
+      env:
+        GH_TOKEN: ${{ github.token }}
+        VERSION: ${{ inputs.version }}
+        CHANNEL: ${{ inputs.channel }}
+        PREFIX: ${{ inputs.prefix }}
+      run: |
+        prefix=${PREFIX:-$RUNNER_TEMP/yadorilink}
+        bin=$(sh "$GITHUB_ACTION_PATH/install-yadorilink.sh" "$VERSION" "$prefix" "$CHANNEL")
+        echo "$bin" >> "$GITHUB_PATH"
+        echo "bin-dir=$bin" >> "$GITHUB_OUTPUT"
+
+    # Windows ships through the Microsoft Store only; there is no command-line installer for it.
+    - if: runner.os == 'Windows'
+      shell: sh
+      run: |
+        echo "::error::this action installs the command line on Linux and macOS runners; YadoriLink for Windows is distributed through the Microsoft Store only"
+        exit 1

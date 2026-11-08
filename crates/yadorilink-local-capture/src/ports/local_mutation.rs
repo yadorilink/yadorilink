@@ -359,6 +359,22 @@ pub trait LocalMutationStore: Send + Sync {
         out_path: &Path,
     ) -> Result<bool, SyncSqliteError>;
 
+    /// Whether the regular file at `out_path` is, untouched, the bytes of `version` that this
+    /// device wrote and verified a moment ago: the watcher event for that very write need not
+    /// read and hash the file again. Fail-closed in every respect (no entry, another version, any
+    /// difference in the file's identity, size, mode, modification or change time, a write too
+    /// recent for the timestamps to prove anything): `false`, and the caller reads the bytes.
+    fn verified_echo_untouched(
+        &self,
+        _group_id: &str,
+        _path: &str,
+        _version: &yadorilink_replica_domain::ids::VersionHash,
+        _sync_root: &Path,
+        _out_path: &Path,
+    ) -> bool {
+        false
+    }
+
     /// Bulk placeholder-identity lookup for a whole group -- used by
     /// `scan_existing_files` for the same reason as
     /// `list_materialization_states`: one query for the whole scan instead
@@ -632,6 +648,13 @@ pub trait LocalMutationStore: Send + Sync {
         &self,
         group_id: &str,
     ) -> Result<Vec<(String, yadorilink_replica_domain::file::RecordKind)>, SyncSqliteError>;
+
+    /// Every current row's path, kind, size, modification time and tombstone mark, without
+    /// decoding content: what the periodic drift check compares the disk against.
+    fn list_indexed_stat_rows(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<yadorilink_sync_sqlite::file_index::IndexedStatRow>, SyncSqliteError>;
 
     /// Re-verifies an already-established root's identity, requiring the
     /// persisted root-identity token rather than silently adopting an

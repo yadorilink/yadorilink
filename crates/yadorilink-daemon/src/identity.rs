@@ -226,13 +226,19 @@ impl RuntimeIdentity {
         let release_id = self.release_id();
         let install_root = self.install_root.display().to_string();
         // The root follows an update only when the program proves it is the same installation:
-        // a Store package of the same family (the folder carries the version). Any other
+        // a Store package of the same family (the folder carries the version) or a script
+        // install's next version tree under the same install directory. Any other
         // install, however alike, stays what was recorded: the hand-off finds the previous
         // daemon and the uninstaller checks the install tree by this path, and a second install
         // must not take them over.
-        let moves_root = record.install_root != install_root
-            && record.install_source == "microsoft_store"
-            && ownership::is_same_store_package(&record.install_root, &install_root);
+        let same_install = match record.install_source.as_str() {
+            "microsoft_store" => {
+                ownership::is_same_store_package(&record.install_root, &install_root)
+            }
+            "script" => ownership::is_same_script_install(&record.install_root, &install_root),
+            _ => false,
+        };
+        let moves_root = record.install_root != install_root && same_install;
         if record.release_id == release_id && !moves_root {
             return Ok(());
         }

@@ -18,6 +18,7 @@ use yadorilink_local_storage::{
 
 use super::completion_window::{PendingFlush, TempFlushItem};
 use crate::replica_coordinator::ReplicaCoordinator;
+use crate::write_op::StepEvent;
 
 /// Parallel flushes in one barrier.
 const FLUSH_WORKERS: usize = 8;
@@ -101,13 +102,40 @@ pub(crate) fn run_flush_barrier(
         }
     }
     let flushed_in = started.elapsed();
-    match state.clear_flush_pending_intents(&to_clear) {
-        Ok(cleared) => report.cleared = cleared,
+    // An injected failure before the clear leaves the intents open, as a failed clear does.
+    let injected = to_clear.iter().find_map(|(_, path, _)| {
+        crate::write_op::failpoint::hit(
+            crate::write_op::failpoint::WriteOpFailpoint::BeforeBarrier2,
+            path,
+        )
+        .err()
+    });
+    let cleared = match injected {
+        Some(error) => Err(error.to_string()),
+        None => state.clear_flush_pending_intents(&to_clear).map_err(|e| e.to_string()),
+    };
+    match cleared {
+        Ok(cleared) => {
+            report.cleared = cleared;
+            if cleared == to_clear.len() {
+                for (group_id, path, _) in &to_clear {
+                    crate::write_op::trace::emit_at(group_id, path, StepEvent::Settled);
+                }
+            }
+        }
         Err(error) => tracing::warn!(
             error = %error,
             "could not clear the intents of the flushed received files; they stay open and \
              startup repair closes them"
         ),
+    }
+    // A probe, not a fault: it runs whether or not the clear succeeded, and an injected failure
+    // is discarded. A test reads `Armed::fired` and the intent state.
+    for (_, path, _) in &to_clear {
+        let _ = crate::write_op::failpoint::hit(
+            crate::write_op::failpoint::WriteOpFailpoint::AfterBarrier2,
+            path,
+        );
     }
     // Logged under the call timer's target, which a measurement run already
     // enables, so the time to stable storage can be read next to the receive.
@@ -206,72 +234,6 @@ pub(crate) fn run_temp_flush_barrier(
             }
             ReceivedFlushOutcome::Failed(reason) => Err(refused(reason)),
         });
-    }
-    // Every temp that is about to be renamed unflushed has its flushed directory entry recorded
-    // before any rename of the batch: after a power cut, the temp still being there then says
-    // the rename was lost, and its absence that the name was renamed durably and removed. One
-    // transaction for the batch; if it cannot be written, none of those temps may be renamed.
-    let witnessed: Vec<usize> = (0..items.len())
-        .filter(|i| matches!(results[*i], Some(Ok(_))) && items[*i].witness.is_some())
-        .collect();
-    if !witnessed.is_empty() {
-        let names: Vec<String> = witnessed
-            .iter()
-            .map(|i| {
-                items[*i]
-                    .tmp_path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            })
-            .collect();
-        let records: Vec<(&str, &str, i64, &str)> = witnessed
-            .iter()
-            .zip(&names)
-            .map(|(i, name)| {
-                let witness = items[*i].witness.as_ref().expect("filtered on witness");
-                (items[*i].group_id.as_str(), witness.path.as_str(), witness.fence, name.as_str())
-            })
-            .collect();
-        let recorded =
-            state.database().write_immediate::<_, yadorilink_sync_sqlite::SyncSqliteError>(|tx| {
-                yadorilink_sync_sqlite::record_temp_witnesses_in_tx(tx, &records)
-            });
-        match recorded {
-            // One recorded per item: an item whose intent was reopened or whose fence moved
-            // recorded nothing and must not be renamed (nothing says its temp is the witness).
-            Ok(count) if count == records.len() => {}
-            Ok(_) => {
-                // Find which: re-read each item's witness and refuse the others.
-                for (i, name) in witnessed.iter().zip(&names) {
-                    let witness = items[*i].witness.as_ref().expect("filtered on witness");
-                    let held = state
-                        .database()
-                        .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
-                            Ok(yadorilink_sync_sqlite::write_removal_facts(
-                                conn,
-                                &items[*i].group_id,
-                                &witness.path,
-                            )?
-                            .and_then(|facts| facts.temp_witness))
-                        })
-                        .ok()
-                        .flatten();
-                    if held.as_deref() != Some(name.as_str()) {
-                        results[*i] = Some(Err(refused(
-                            "the write's intent no longer matches this temp".into(),
-                        )));
-                    }
-                }
-            }
-            Err(error) => {
-                for i in &witnessed {
-                    results[*i] = Some(Err(refused(format!(
-                        "could not record the flushed temp name: {error}"
-                    ))));
-                }
-            }
-        }
     }
     tracing::info!(
         target: "yadorilink_daemon::local_convergence::call_timer",

@@ -31,7 +31,7 @@ impl LinkPauseResumePort for DaemonPauseResumeAdapter {
         duration: PauseDuration,
         expected_group: Option<&str>,
     ) -> Result<(), SyncError> {
-        let links = self.state.replica_coordinator.link_repository();
+        let links = self.state.replica_coordinator.link_admission();
         match duration.resume_at(chrono::Local::now()) {
             Some(resume_at) => {
                 links.pause_until_expecting_group(local_path, resume_at, expected_group)

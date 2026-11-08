@@ -16,6 +16,7 @@ pub mod link;
 pub mod local_time;
 pub mod materialization;
 pub mod membership_render;
+pub mod network;
 pub mod preserved;
 pub mod provider_folder;
 pub mod recovery;

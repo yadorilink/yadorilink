@@ -198,9 +198,9 @@ fn preview_rewind_sync(
         .link_repository()
         .list_links()
         .map_err(|error| RewindError::Failed(error.to_string()))?;
-    let Some(link) = links.iter().find(|link| !link.orphaned && link.group_id == group_id) else {
+    if !links.iter().any(|link| !link.orphaned && link.group_id == group_id) {
         return Err(RewindError::UnknownGroup(group_id.to_string()));
-    };
+    }
     let sqlite = state.replica_coordinator.sqlite();
     let failed =
         |error: yadorilink_sync_sqlite::SyncSqliteError| RewindError::Failed(error.to_string());
@@ -209,12 +209,10 @@ fn preview_rewind_sync(
     // before the plan's own read so the ignore check (which reads the
     // namespace for directory-only patterns) runs outside it. Without a
     // readable ignore set none is excluded, so each stays unavailable.
-    let ignore_set = link.folder_path().and_then(|root| {
-        yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet::load_for_link_root_checked(
-            root,
-        )
-        .ok()
-    });
+    let ignore_set =
+        yadorilink_fs_platform::ignore_patterns::IgnoreRulesStore::new(state.config_dir())
+            .load(group_id)
+            .ok();
     let still_excluded: std::collections::HashSet<String> = match &ignore_set {
         Some(set) => sqlite
             .rewind_erased_unindexed_paths(group_id, at_unix_nanos)

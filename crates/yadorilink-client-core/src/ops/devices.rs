@@ -64,6 +64,29 @@ struct ListDevicesResponse {
     devices: Vec<DeviceInfo>,
 }
 
+/// The name offered for this computer when it is registered: its own machine name.
+#[must_use]
+pub fn suggested_device_name() -> String {
+    crate::facade::desktop_device_name()
+}
+
+/// Whether this computer has never been registered as a device: no `device.json` at all. A file
+/// that exists but cannot be read is not this case, and registering again over it would create a
+/// second identity for the same device.
+#[must_use]
+pub fn needs_registration() -> bool {
+    matches!(
+        crate::coordination::device_config::load(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// The command that registers this computer, with its own name as the device name.
+#[must_use]
+pub fn register_command() -> String {
+    format!("yadorilink device register --name \"{}\"", suggested_device_name())
+}
+
 /// Registers this device and persists the one canonical pre-release
 /// `device.json` shape, returning the assigned `device_id`. A daemon that is
 /// already running is restarted, with `launch`, so it starts as this registered device.
@@ -93,7 +116,7 @@ pub async fn register_device(
 /// The registration is done and stays done; the restart that was to make the daemon adopt it
 /// failed. The restart's own next step is carried outward; with none, starting the daemon is it
 /// unless that cannot help (see below).
-fn restart_failed_after_registration(
+pub(crate) fn restart_failed_after_registration(
     device_id: &str,
     restart_error: CoreError,
     startup_refusal: Option<String>,
@@ -125,6 +148,15 @@ pub async fn register_device_in(
     // `device.json` could not be kept would orphan the device.
     let signing_key_path = dir.join("signing_key");
     crate::ops::start_over::ensure_registration_allowed(dir)?;
+    // A second registration would leave the first device on the account with nothing here to
+    // use it. Replacing an identity is `device start-over`, which moves the old file aside first.
+    if dir.join("device.json").exists() {
+        return Err(CoreError::InvalidInput(
+            "this computer is already registered as a device; to replace its identity run \
+             `yadorilink device start-over`"
+                .to_owned(),
+        ));
+    }
     let auth = crate::coordination::http_client::require_auth_in(dir, settings).await?;
     let signing_keypair = yadorilink_transport::DeviceSigningKeyPair::load_or_generate(
         signing_key_path,

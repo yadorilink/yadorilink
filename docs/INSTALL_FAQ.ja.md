@@ -5,10 +5,11 @@ YadoriLink エンジン（`yadorilink` コマンドラインと `yadorilink-daem
 [Linux README](../packaging/linux/README.md) も参照してください。
 英語版は [INSTALL_FAQ.md](INSTALL_FAQ.md) で、内容に差がある場合は英語版が正です。
 
-現状: 現在のリリースはエンジンのみで、デスクトップアプリはまだありません。
-以下で説明するワンライン インストーラーは作成とテストが済んでいますが、まだ公開されて
-いません（README の「Planned」を参照）。そのため今は Linux パッケージまたはエンジン
-バンドルからインストールします。このページはインストーラーの動作も説明しているので、
+現状: このリポジトリのリリースはエンジンのみです（macOS アプリは公開ベータ版、Windows アプリはベータ版で、いずれも別に配布しています）。
+以下で説明するワンライン インストーラーは yadori.link で公開されており、Homebrew formula は
+プロジェクトの tap にあります（リリースのたびに手作業で更新するため、最新版に遅れることがあります）。
+apt リポジトリはまだありません。仕組みはありますが、APT 署名鍵を設定するまで公開を行わないため、
+Debian / Ubuntu では `.deb` をインストールしてください。このページはインストーラーの動作も説明しているので、
 実行前に読めます。すべての OS で確認できていない記述は、テスト結果ではなく、ソフトウェアが
 設計上どう動くかとして書いています。
 
@@ -18,11 +19,13 @@ YadoriLink エンジン（`yadorilink` コマンドラインと `yadorilink-daem
 |---|---|---|---|
 | Debian / Ubuntu | GitHub Releases の `.deb` | 新しい `.deb` をインストール | `sudo apt remove yadorilink` |
 | macOS、Windows、Linux（現時点のエンジンのみ） | 展開するエンジンバンドル zip | あなた（新しいバンドルを展開） | あなた（フォルダーを削除） |
-| macOS（Apple silicon）、Linux x86_64、Windows x64（公開後） | ワンライン インストーラー | `yadorilink self-update` のあと、表示されるインストーラーコマンド | `yadorilink uninstall`（Windows は `install.ps1 -Uninstall`） |
-| macOS / Windows デスクトップアプリ（未リリース） | アプリ | アプリ | アプリ自身のアンインストール |
+| macOS（Apple silicon）、Linux x86_64 | ワンライン インストーラー | `yadorilink self-update` のあと、表示されるインストーラーコマンド | `yadorilink uninstall` |
+| NAS・常時稼働サーバー | Docker イメージ `ghcr.io/yadorilink/yadorilink:<version>`（[詳細](../packaging/docker/README.md)） | 新しいバージョンタグを pull して `docker compose up -d` | `docker compose down`（データボリュームは削除するまで残ります） |
+| macOS デスクトップアプリ（公開ベータ版）、Windows デスクトップアプリ（ベータ版。Microsoft Store での公開は準備中） | アプリ | アプリ（macOS は Sparkle によるアプリ内アップデート） | アプリ自身のアンインストール |
 
-Docker イメージ、apt リポジトリ、Homebrew、WinGet は計画中で未公開です。このページの内容は
-それらに依存しません。
+apt リポジトリは未公開（署名鍵がまだありません）で、WinGet は計画中です。このページの内容は
+それらに依存しません。Homebrew でのインストールは Homebrew の管理下にあり、`yadorilink self-update` と
+`yadorilink uninstall` はそれを拒否して `brew upgrade yadorilink` と `brew uninstall yadorilink` を案内します。
 
 すべてのデバイスを同じバージョンにしてください。どの方法でインストールしても、更新と削除は
 同じ方法で行います。YadoriLink は、他のものが管理しているインストールを更新しません。
@@ -31,11 +34,10 @@ Docker イメージ、apt リポジトリ、Homebrew、WinGet は計画中で未
 ## ワンライン インストーラーは何をしますか?
 
 ```sh
-curl -fsSL https://yadori.link/install.sh | sh          # macOS, Linux
-irm https://yadori.link/install.ps1 | iex               # Windows (PowerShell 5.1 以降)
+curl -fsSL https://yadori.link/install.sh | sh          # macOS, Linux（Windows は Microsoft Store）
 ```
 
-- ホームディレクトリ配下（既定は `~/.local`、Windows は `%LOCALAPPDATA%\YadoriLink`）に
+- ホームディレクトリ配下（既定は `~/.local`）に
   インストールします。`sudo` や管理者権限は使わず、デーモンも起動しません。
 - チャンネル（`beta`、または `--channel nightly` で `nightly`）の署名付きリリース
   マニフェストをダウンロードし、スクリプトに組み込まれたリリース鍵で署名を検証します。
@@ -43,8 +45,8 @@ irm https://yadori.link/install.ps1 | iex               # Windows (PowerShell 5.
   すべてのファイルをバンドル自身のチェックサムと照合します。すべて通ったときだけ、
   `<prefix>/bin` の `yadorilink` と `yadorilink-daemon` を新しいバージョンに切り替えます。
   どれかの検証に失敗した場合は、メッセージを出して何も変更せず停止します。
-- `--no-modify-path`（`-NoModifyPath`）を指定しない限り、`<prefix>/bin` をシェルの
-  プロファイル（Windows ではユーザーの PATH）に追加します。
+- `--no-modify-path` を指定しない限り、`<prefix>/bin` をシェルの
+  プロファイルに追加します。
 - `curl`、`unzip`、`awk`、および `sha256sum` または `shasum` が必要です。それ以外の OS や
   CPU（例: Alpine、32 ビット ARM）は終了コード 5 で拒否されます。
 
@@ -57,8 +59,10 @@ irm https://yadori.link/install.ps1 | iex               # Windows (PowerShell 5.
 
 ## ネットワークなし、または CI でインストールするには?
 
-- CI: `sh install.sh --yes --no-modify-path --prefix "$RUNNER_TEMP/yadorilink"`
-  （Windows は `-Yes -NoModifyPath -Prefix`）。質問せず、プロファイルも編集しません。
+- CI: GitHub Actions のステップ `uses: yadorilink/yadorilink/packaging/ci@<tag>`（`version:` を指定。
+  [`packaging/ci`](../packaging/ci/README.md) 参照）は、インストーラーのアテステーションを検証してから
+  実行します。手動なら同じインストーラーを
+  `sh install.sh --yes --no-modify-path --prefix "$RUNNER_TEMP/yadorilink"`。質問せず、プロファイルも編集しません。
 - オフライン: `--from FILE` は、事前にダウンロードした署名付きマニフェストファイルから
   インストールします。エンジンバンドル（macOS と Linux では署名検証プログラムも）を
   同じ場所に置いてください。ライブのマニフェストに到達できない場合、インストーラーは
@@ -100,7 +104,7 @@ Linux パッケージとエンジンバンドルでは、インストールす�
 選びます。1.0 より前のリリースでは、古いバージョンが新しいバージョンの書いたデータを開ける
 ことは保証されません（下記のダウングレードの注意を参照）。ワンライン インストーラーでは:
 
-`--version X.Y.Z`（Windows は `-Version`、または環境変数 `YADORILINK_VERSION`）を
+`--version X.Y.Z`（または環境変数 `YADORILINK_VERSION`）を
 付けて実行します。署名付きのバージョン別マニフェストからそのバージョンをそのまま
 インストールします。ただし、ライブのチャンネルマニフェストで取り下げられている場合や、
 最小サポートバージョン未満の場合は拒否されます。`--force` で同じバージョンを再インストール
@@ -134,8 +138,12 @@ Linux パッケージとエンジンバンドルでは、インストールす�
 
 `YADORILINK_CONFIG_DIR` で場所を変更できます。保存済みバージョンやダウンロード済み
 コンテンツを含むため、大きくなることがあります。サインイン情報は別に保管されます:
-macOS は Keychain、Windows は資格情報マネージャー、Linux はデータディレクトリ内の
-`credentials.json` です。
+Windows は資格情報マネージャー、macOS の YadoriLink アプリは Keychain です。Linux と、
+macOS のスクリプト/エンジンバンドルでのインストール(アプリ外のプログラムは Keychain を
+使えません)では、データディレクトリ内の本人のみ読み取り可能な `credentials.json` です。
+`YADORILINK_CREDENTIAL_STORE=file` または `keyring` で上書きできます。以前のスクリプト
+インストールでは Keychain 項目は作られていないため、`yadorilink login` で再サインインして
+ください。
 
 ## どうアンインストールしますか?
 
@@ -165,8 +173,7 @@ yadorilink uninstall --dry-run      # 削除対象を表示するだけで、何
 yadorilink uninstall                # 先に確認する。--yes で確認を省略
 ```
 
-Windows ではインストーラーを `-Uninstall` 付きで実行します。シェル版インストーラーを使った
-環境では `sh install.sh --uninstall` も使えます。
+シェル版インストーラーを使った環境では `sh install.sh --uninstall` も使えます。
 
 - 削除されるもの: `yadorilink` と `yadorilink-daemon` のリンク、インストールされた
   プログラムファイル（`<prefix>/share/yadorilink`）、インストーラーが追加した PATH の
@@ -183,8 +190,8 @@ Windows ではインストーラーを `-Uninstall` 付きで実行します。�
 インストール記録がない、または読み取れない場合、`uninstall` はその旨を表示して何も削除
 しません。対処は `yadorilink doctor` が示します。`yadorilink uninstall` が見つけたその他の
 インストール（パッケージマネージャー、アプリ、コンテナー）も、終了コード 19 と所有者側の
-手順（例: `brew uninstall --cask yadorilink`、`winget uninstall yadorilink`）を示して
-拒否されます。これらのチャンネルはまだ公開されていません。
+手順（例: `brew uninstall yadorilink`、`winget uninstall yadorilink`）を示して
+拒否されます。WinGet はまだ公開されていません。
 
 ## YadoriLink のデータも削除するには?
 
@@ -198,7 +205,7 @@ Windows ではインストーラーを `-Uninstall` 付きで実行します。�
 - それ以外（展開したバンドル、Windows）: `yadorilink daemon stop` のあと、データ
   ディレクトリを手動で削除します。
 
-macOS と Windows では、サインイン情報はデータディレクトリの外にあります。
+Windows と macOS アプリでは、サインイン情報はデータディレクトリの外にあります。
 `yadorilink uninstall --purge-data` はデータディレクトリと一緒にそれも削除します（デバイス鍵の
 コピーを削除できない場合は、データディレクトリを削除する前に停止し、何が残っているかを
 表示します）。データディレクトリを手動で削除する場合は、先に `yadorilink credentials purge`

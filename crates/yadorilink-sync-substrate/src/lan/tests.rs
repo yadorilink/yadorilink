@@ -223,6 +223,19 @@ async fn an_unauthorized_peer_announced_on_the_lan_is_never_dialled() {
 #[tokio::test]
 #[ignore = "needs a host that delivers local multicast"]
 async fn two_authorized_endpoints_find_each_other_over_real_mdns() {
+    find_each_other_after(Duration::ZERO).await;
+}
+
+/// Both sides sit idle until their sources were dropped, then one dials: the lookup starts its
+/// source again. The idle one is off and does not answer, so this finds it only because the
+/// dialing side's fresh queries are answered when the other one starts too (see below).
+#[tokio::test]
+#[ignore = "needs a host that delivers local multicast; takes about 50 s"]
+async fn idle_endpoints_that_slowed_down_still_find_each_other_over_real_mdns() {
+    find_each_other_after(FAST_WINDOW + Duration::from_secs(10)).await;
+}
+
+async fn find_each_other_after(idle: Duration) {
     let alice_key = iroh::SecretKey::from_bytes(&[31; 32]);
     let bob_key = iroh::SecretKey::from_bytes(&[32; 32]);
     let alice_id = PeerId::from_bytes(*alice_key.public().as_bytes());
@@ -245,12 +258,112 @@ async fn two_authorized_endpoints_find_each_other_over_real_mdns() {
     .await
     .expect("alice starts");
 
-    let link = tokio::time::timeout(Duration::from_secs(30), alice.connect(bob_id))
-        .await
-        .expect("the dial did not finish")
-        .expect("an authorized peer was not found over mDNS");
-    assert_eq!(link.peer(), bob_id);
+    tokio::time::sleep(idle).await;
+    // Each device's keeper dials every peer it has pinned, so both sides ask for the other and
+    // each one's mDNS source is running when it does; either dial finding the peer is enough.
+    let link = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            found = alice.connect(bob_id) => found,
+            found = bob.connect(alice_id) => found,
+        }
+    })
+    .await
+    .expect("the dial did not finish")
+    .expect("an authorized peer was not found over mDNS");
+    assert!(link.peer() == bob_id || link.peer() == alice_id);
 
     alice.shutdown().await;
     bob.shutdown().await;
+}
+
+/// A source that remembers what it was told to advertise.
+#[derive(Debug)]
+struct Built {
+    published: std::sync::Mutex<Vec<EndpointData>>,
+}
+
+impl AddressLookup for Built {
+    fn publish(&self, data: &EndpointData) {
+        self.published.lock().unwrap().push(data.clone());
+    }
+
+    fn resolve(&self, _endpoint_id: iroh::EndpointId) -> Option<BoxStream<Result<Item, Error>>> {
+        None
+    }
+}
+
+fn cadenced() -> (Cadenced<Built>, Arc<std::sync::Mutex<Vec<Duration>>>) {
+    let builds = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = builds.clone();
+    let source = Cadenced::new(move |cadence| {
+        log.lock().unwrap().push(cadence);
+        Some(Built { published: Default::default() })
+    });
+    (source, builds)
+}
+
+/// Running after start, off once nobody has asked for a whole window, running again on a lookup:
+/// the source is built only at those transitions, and the new one is told what to advertise.
+#[tokio::test(start_paused = true)]
+async fn mdns_runs_only_while_something_asks() {
+    let (source, builds) = cadenced();
+    assert_eq!(*builds.lock().unwrap(), vec![FAST_CADENCE], "built at start");
+    let data = EndpointData::default();
+    source.publish(&data);
+
+    tokio::time::sleep(FAST_WINDOW + Duration::from_secs(1)).await;
+    assert!(source.inner.state().source.is_none(), "dropped once idle: no multicast listener");
+    assert_eq!(builds.lock().unwrap().len(), 1, "going off builds nothing");
+
+    let _ = source.resolve(endpoint(1));
+    assert_eq!(*builds.lock().unwrap(), vec![FAST_CADENCE, FAST_CADENCE], "a lookup starts it");
+    let again = source.inner.state().source.clone().unwrap();
+    assert_eq!(again.published.lock().unwrap().len(), 1, "the new source advertises again");
+
+    // A lookup keeps it running for the whole window; no rebuild while asked again.
+    tokio::time::sleep(FAST_WINDOW / 2).await;
+    let _ = source.resolve(endpoint(1));
+    tokio::time::sleep(FAST_WINDOW / 2 + Duration::from_secs(1)).await;
+    assert_eq!(builds.lock().unwrap().len(), 2, "still running: asked within the window");
+    assert!(source.inner.state().source.is_some());
+
+    // Off again after the next quiet window, and a second lookup works the same way.
+    tokio::time::sleep(FAST_WINDOW).await;
+    assert!(source.inner.state().source.is_none());
+    let _ = source.resolve(endpoint(2));
+    assert_eq!(builds.lock().unwrap().len(), 3);
+}
+
+/// A dropped mDNS source leaves nothing running. swarm-discovery's guard stops only its
+/// guardian task, so a source that shared the daemon's runtime kept about 60 wakeups per second
+/// alive for every replacement; each source now owns its runtime and dropping it ends them all.
+#[tokio::test]
+async fn a_dropped_mdns_source_leaves_no_task_running() {
+    let outer = tokio::runtime::Handle::current();
+    let outer_before = outer.metrics().num_alive_tasks();
+    let Ok(source) = IsolatedMdns::build(endpoint(7), FAST_CADENCE) else {
+        eprintln!("no mDNS on this host; nothing to check");
+        return;
+    };
+    let runtime = source.runtime_handle();
+    assert!(
+        runtime.metrics().num_alive_tasks() > 0,
+        "a running source has tasks, or this test checks nothing"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        outer.metrics().num_alive_tasks(),
+        outer_before,
+        "the source started a task on the caller's runtime"
+    );
+    drop(source);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while runtime.metrics().num_alive_tasks() > 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{} tasks still alive after the source was dropped",
+            runtime.metrics().num_alive_tasks()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

@@ -244,6 +244,10 @@ message LinkStatus {
   // duplicates). They are in neither `availability_reachable_device_ids` nor
   // `availability_offline_device_ids`. Additive; empty from an older daemon.
   repeated string availability_update_required_device_ids = 53;
+  // The members of `availability_update_required_device_ids` whose protocol version is newer than
+  // this device's: this device is the old one, and updating it is the remedy. The others in that
+  // list are older than this device, and it is they that have to update.
+  repeated string availability_newer_peer_device_ids = 67;
   // True while this link is `degraded` because it waits for free disk space on a volume (a
   // receive or provider read was refused for lack of room; sync resumes by itself once there is
   // room). The typed form of that state: `degraded_reason` is human detail only and must never be
@@ -280,6 +284,40 @@ message LinkStatus {
   bool rebuild_needed = 62;
   // The state of this folder alone, computed by the daemon (see `ProductStatus`).
   ProductStatus product = 63;
+  // Pinned items whose download is pending: how many (they are part of `requested_content_count`,
+  // so the folder reads Waiting or Syncing), the last failure as the daemon reported it, and the
+  // seconds until the next automatic attempt. 0 / empty when none is pending.
+  uint64 pinned_pending_count = 64;
+  string pinned_pending_error = 65;
+  uint64 pinned_pending_retry_secs = 66;
+  // Changes made on this device that no other device is known to hold yet: edits captured but
+  // not yet recorded, plus recorded changes no peer has asked past. Counts changes, not files
+  // (one file edited three times is three). 0 when the folder has no other device. Additive.
+  uint64 pending_local_changes = 68;
+  // Local retention rules of this folder (see `SetRetentionRuleRequest`): how many explicit rules
+  // of either kind it has, and, for its online-only rules, whether their apply pass has finished
+  // and what it did with the files. 0 / UNSPECIFIED from an older daemon.
+  uint64 retention_rule_count = 69;
+  RetentionApplyState retention_apply_state = 70;
+  // Files the passes freed (or found already without a copy), left on purpose (unsynced edits,
+  // held or conflicted, open), and could not try yet (the host was not ready; the rule retries).
+  uint64 retention_done_count = 71;
+  uint64 retention_skipped_count = 72;
+  uint64 retention_retryable_count = 73;
+  // The device the folder's newest recorded change came from, when it is another device (empty when the
+  // newest change was made on this device or its author is not known here). The apps show it beside the time
+  // of the last sync ("3 min ago · from MacBook Air"); the name is theirs to look up.
+  string last_change_origin_device_id = 74;
+}
+
+enum RetentionApplyState {
+  RETENTION_APPLY_STATE_UNSPECIFIED = 0;
+  // No online-only rule: nothing to apply.
+  RETENTION_APPLY_STATE_NONE = 1;
+  // At least one online-only rule is still being applied or waiting for a retry.
+  RETENTION_APPLY_STATE_PENDING = 2;
+  // Every online-only rule has been applied.
+  RETENTION_APPLY_STATE_DONE = 3;
 }
 
 // See `LinkStatus.degraded_cause`.
@@ -310,7 +348,7 @@ enum ProductAvailability {
   reserved 4;
   PRODUCT_AVAILABILITY_UNKNOWN = 5;
   // No usable device holds the content, and a device recorded as holding it is online but
-  // speaks another protocol version (`PeerStatus.version_incompatible`): updating it (or this
+  // speaks another protocol version (`PeerStatus.version_skew`): updating it (or this
   // device) is the remedy, waiting is not. An older client reads this value as `UNKNOWN`
   // (never as available).
   PRODUCT_AVAILABILITY_UPDATE_REQUIRED = 6;
@@ -518,6 +556,14 @@ enum UnreachableCategory {
   UNREACHABLE_CATEGORY_DEVICE_REPLACED = 5;
 }
 
+enum VersionSkew {
+  VERSION_SKEW_UNSPECIFIED = 0;
+  // The peer speaks a newer protocol version than this device: update this device.
+  VERSION_SKEW_PEER_NEWER = 1;
+  // The peer speaks an older protocol version: update the peer.
+  VERSION_SKEW_PEER_OLDER = 2;
+}
+
 message PeerStatus {
   string device_id = 1;
   // Field 2 was `bool connected`, a redundant mirror of the `reachability`
@@ -555,10 +601,15 @@ message PeerStatus {
   // no device to opt in.
   reserved 8;
   reserved "relay_capability";
+  // Value 9 was a bool `version_incompatible`; the skew below replaces it.
+  reserved 9;
+  reserved "version_incompatible";
   // The peer is reachable but its lane hello speaks another protocol version, so sync with it is
   // paused until both devices run the same release. Independent of `reachability`, which stays
-  // `CONNECTED`: the device is online and the fix is to update, not to wait.
-  bool version_incompatible = 9;
+  // `CONNECTED`: the device is online and the fix is to update, not to wait. Names the side that
+  // is older, so the remedy is exact: update this device when the peer is newer, and the peer
+  // when it is older. `UNSPECIFIED` when the versions are compatible.
+  VersionSkew version_skew = 12;
   // The device that replaced this one, set exactly when `unreachable_category`
   // is `UNREACHABLE_CATEGORY_DEVICE_REPLACED`; empty otherwise.
   string replaced_by_device_id = 10;
@@ -743,10 +794,9 @@ message PauseRequest {
 // A closed set of pause lengths; the daemon computes the deadline.
 enum PauseDuration {
   PAUSE_DURATION_UNSPECIFIED = 0;
-  PAUSE_DURATION_THIRTY_MINUTES = 1;
-  PAUSE_DURATION_ONE_HOUR = 2;
-  // Until the next local midnight.
-  PAUSE_DURATION_UNTIL_TOMORROW = 3;
+  PAUSE_DURATION_TWO_HOURS = 1;
+  PAUSE_DURATION_EIGHT_HOURS = 2;
+  PAUSE_DURATION_TWENTY_FOUR_HOURS = 3;
 }
 message PauseResponse {}
 
@@ -829,7 +879,7 @@ message NotKeptSpan {
   optional int64 to_unix_nanos = 2;
   int64 from_seq = 3;
   int64 to_seq = 4;
-  // "LowSpace" | "Expired".
+  // "LowSpace" | "Expired" | "OverBudget".
   string reason = 5;
 }
 
@@ -989,6 +1039,11 @@ message ActivityEventInfo {
   // Whether that is this device (or unknown, i.e. a local write).
   bool is_this_device = 6;
   int64 at_unix_nanos = 7;
+  // For a conflict event: the device whose version holds the original path now, the other side of the conflict
+  // (`origin_device_id` is the device whose version became the conflict copy). Read when the page is listed, not
+  // stored: if the original was edited since, it names whoever holds it now. Empty for any other event, and when
+  // the original no longer exists or its author is not known here.
+  string other_origin_device_id = 8;
 }
 
 message ListActivityResponse {
@@ -1119,6 +1174,9 @@ message SendLinkStatusResponse {
   string receiver_device_name = 2;
   // The transfer under this link, when this daemon started one since it last restarted.
   string transfer_id = 3;
+  // Why an interrupted link stopped, as the closed code of `SentTransferEntry.failure`
+  // ("sender_canceled" is this device's own stop). Empty when there is no reason on record.
+  string failure = 4;
 }
 
 message SendFileResponse {
@@ -1154,6 +1212,11 @@ message InboxTransfer {
   uint64 received_bytes = 9;
   // The folder the files are being received into; empty until a receive chose one.
   string destination_dir = 10;
+  // Files fully received so far for an "in_progress" transfer; `files_total` once "completed";
+  // 0 otherwise.
+  uint32 files_done = 11;
+  // How many files the offer holds.
+  uint32 files_total = 12;
 }
 
 // The transfers this device sent: every one still going and the most recent finished ones, oldest
@@ -1179,6 +1242,9 @@ message SentTransferEntry {
   string failure = 7;
   // Whether a retry is offered for it.
   bool can_retry = 8;
+  // Bytes of the offer the receiver has been served so far while "accepted" (live: it starts again
+  // from nothing when the engine restarts); `total_size` once "completed"; 0 otherwise.
+  uint64 bytes_sent = 9;
 }
 message ListSentTransfersResponse {
   repeated SentTransferEntry transfers = 1;
@@ -1226,6 +1292,53 @@ message SpaceManagementSettings {
   reserved 2;
   reserved "keep_days";
 }
+// What the host says the connection is. UNKNOWN is read as not metered.
+enum NetworkCost {
+  NETWORK_COST_UNKNOWN = 0;
+  NETWORK_COST_UNMETERED = 1;
+  NETWORK_COST_METERED = 2;
+}
+
+// The metered-network policy: whether peer traffic may flow on the connection the host reported.
+message NetworkPolicy {
+  // The user's setting: sync even on a metered connection. Off by default.
+  bool sync_on_metered = 1;
+  // What the host last reported; UNKNOWN until it does and after a daemon restart.
+  NetworkCost cost = 2;
+  // Peer traffic is paused right now because the connection is metered.
+  bool paused_on_metered = 3;
+}
+
+message GetNetworkPolicyRequest {}
+message SetSyncOnMeteredRequest {
+  bool enabled = 1;
+}
+message ReportNetworkCostRequest {
+  NetworkCost cost = 1;
+}
+// The answer to all three requests: the policy now in force.
+message NetworkPolicyResponse {
+  NetworkPolicy policy = 1;
+}
+
+// A folder's ignore rules: one text, one pattern per line (gitignore-style; `#` starts a comment;
+// `!` re-includes; `(?i)` makes a line case-insensitive). Stored per group by the daemon; the
+// built-in defaults always apply beneath it.
+message IgnoreRulesGetRequest {
+  string group_id = 1;
+}
+message IgnoreRulesGetResponse {
+  // Empty when the folder has no rules of its own.
+  string text = 1;
+}
+// Replaces the folder's rules. A line the engine cannot use is refused with `line N: ...` and
+// nothing is stored; otherwise the rules are stored durably and applied to the folder at once.
+message IgnoreRulesSetRequest {
+  string group_id = 1;
+  string text = 2;
+}
+message IgnoreRulesSetResponse {}
+
 message GetSpaceManagementRequest {}
 message GetSpaceManagementResponse {
   SpaceManagementSettings settings = 1;
@@ -1366,7 +1479,7 @@ message StatusResponse {
   string overall_state = 22;
   // Short, coarse, pre-redacted reason codes behind a non-"healthy"
   // `overall_state` (e.g. "conflict:<group_id>", "low_disk:<path>",
-  // "peer_disconnected:<device_id>", "peer_update_required:<device_id>", "update_required", "recent_error:<category>",
+  // "peer_disconnected:<device_id>", "peer_update_required:<device_id>" (that peer is older: update it), "peer_newer:<device_id>" (that peer is newer: update this device), "update_required", "recent_error:<category>",
   // "update_failed:<category>") -- same redaction discipline as
   // `RecentSyncError.category`/`coarse_context` (never a raw path, key,
   // token, or IP beyond what's already exposed elsewhere in this message).
@@ -1404,6 +1517,31 @@ message StatusResponse {
   // The state of the whole device, computed by the daemon from the folders above and from the
   // `attention_reasons` that belong to no folder. Front ends show it and do not derive it again.
   ProductStatus product = 35;
+  // The bytes kept as version history that nothing current also holds, and the byte budget
+  // bounding them (the smaller of a tenth of the block-store volume and 20 GiB). Absent when the
+  // history could not be read.
+  optional uint64 kept_history_bytes = 36;
+  optional uint64 kept_history_budget_bytes = 37;
+  // Changes saved on this device that the last publish attempt could not publish (a new edit
+  // reaches other devices only once the coordination service has signed it). By why:
+  // `unpublished_edits_service_unreachable`: the service did not answer (or failed); they publish
+  // when it is back. Includes disk edits journaled in a folder whose group policy this device does
+  // not have (a lower bound, and not counted during the first minute of the engine).
+  // `unpublished_edits_not_authorized`: the service answered 403: this device is not allowed to
+  // publish in the folder (a viewer, a revoked device); waiting does not help.
+  // `unpublished_edits_rejected`: the service answered but would not publish (the Terms are not
+  // accepted, the credential was refused, the request was not accepted); a sign-in or an update
+  // may help. All 0 when nothing is waiting. Front ends word these keys in their own language.
+  uint64 unpublished_edits_service_unreachable = 40;
+  uint64 unpublished_edits_not_authorized = 41;
+  uint64 unpublished_edits_rejected = 42;
+  // Peer traffic is paused because the connection is metered and the user has not allowed sync
+  // on a metered connection.
+  bool paused_on_metered = 38;
+  // Whether the host has reported the network cost since this engine started. False from
+  // engine start until a ReportNetworkCost arrives, so a host that sees false after an engine
+  // restart knows its earlier report was lost and reports again.
+  bool network_cost_known = 39;
 }
 
 // What a person is told about a folder, or about the whole device: one of five states, the
@@ -1451,9 +1589,16 @@ message ProductStatus {
   repeated string availability_reachable_device_ids = 10;
   repeated string availability_offline_device_ids = 11;
   repeated string availability_update_required_device_ids = 12;
+  // As on `LinkStatus.availability_newer_peer_device_ids`: the devices in the list above that run
+  // a newer version than this device, so this device has to update.
+  repeated string availability_newer_peer_device_ids = 16;
   // Whether the data survives losing this device, and the devices behind that answer.
   DataProtection protection = 13;
   repeated string protection_device_ids = 14;
+  // When this scope was last seen up to date, as seconds since the Unix epoch: now while its state
+  // is up to date, otherwise the last time a status read found it so since the daemon started.
+  // Absent when it has not been seen up to date since then (never read as "never synced").
+  optional int64 last_synced_unix = 15;
 }
 
 message ProviderRemovalStatus {
@@ -2034,7 +2179,13 @@ enum FileAction {
   FILE_ACTION_DOWNLOAD = 1;
   FILE_ACTION_FREE_UP_SPACE = 2;
   FILE_ACTION_KEEP_ON_DEVICE = 3;
-  FILE_ACTION_STOP_KEEPING = 4;
+  // 4 was STOP_KEEPING: "Default" below removes a rule of either kind.
+  reserved 4;
+  reserved "FILE_ACTION_STOP_KEEPING";
+  // Keep nothing of this item in the folder (its content stays available online).
+  FILE_ACTION_ONLINE_ONLY = 5;
+  // Remove the rule set at this path, so the nearest rule above (or the folder's mode) applies.
+  FILE_ACTION_DEFAULT = 6;
 }
 
 // Whether local space for a path may be reclaimed. Local to this device: it is never sent to
@@ -2043,21 +2194,38 @@ enum RetentionPolicy {
   RETENTION_POLICY_RECLAIMABLE = 0;
   // "Always keep on this device".
   RETENTION_POLICY_PINNED = 1;
+  // "Online only": the folder holds no copy; the content is downloaded when it is opened.
+  RETENTION_POLICY_ONLINE_ONLY = 2;
 }
 
 message RetentionState {
   RetentionPolicy policy = 1;
-  // The pin was set at exactly this path. When `policy` is PINNED and this is false, the pin is
-  // inherited from a folder above, and only unpinning that folder lifts it.
+  // The rule was set at exactly this path. When it is false and `policy` is PINNED or ONLINE_ONLY,
+  // the rule is inherited from a folder above, and only changing that folder's rule lifts it.
   bool explicit = 2;
 }
 
-// Marks a file or folder "always keep on this device" and fetches what is not here yet through
-// the ordinary download path. A folder's pin covers everything beneath it.
-message PinItemRequest {
-  string absolute_path = 1;
+// What a person decided about the copy of a path in a provider folder, on this device only.
+enum RetentionRule {
+  RETENTION_RULE_UNSPECIFIED = 0;
+  // "Keep on this device": fetched through the ordinary download path and never freed.
+  RETENTION_RULE_KEEP = 1;
+  // "Online only": no copy in the folder; copies present are freed once, and later downloads of
+  // the path (an open) are freed again by a clean-up. The device still holds the blocks when it
+  // is a full replica.
+  RETENTION_RULE_ONLINE_ONLY = 2;
+  // Remove the rule at this path.
+  RETENTION_RULE_DEFAULT = 3;
 }
-message PinItemResponse {
+
+// Sets the retention rule at a file or folder. A rule replaces every rule beneath its path, and
+// is a no-op when the same rule is already set there. A folder's rule covers everything beneath
+// it. `ONLINE_ONLY` applies to provider folders only. Replaces the earlier pin and unpin requests.
+message SetRetentionRuleRequest {
+  string absolute_path = 1;
+  RetentionRule rule = 2;
+}
+message SetRetentionRuleResponse {
   RetentionState retention = 1;
   // Why the content could not be downloaded just now; empty when it was (or needed no download).
   // The pin stands either way.
@@ -2069,15 +2237,6 @@ message PinItemResponse {
   // the daemon could not check. Empty when every file beneath the pin is held (or none needs it).
   // Added after the fact: the meaning of the other fields is unchanged.
   string history_not_kept_reason = 3;
-}
-
-// Stops keeping a file or folder: content is NOT removed, it only becomes eligible to be freed.
-message UnpinItemRequest {
-  string absolute_path = 1;
-}
-message UnpinItemResponse {
-  // The policy in force afterwards: still PINNED (and not explicit) when a folder above is.
-  RetentionState retention = 1;
 }
 
 // What stands on this device for one path, as two independent facts plus the
@@ -2307,7 +2466,7 @@ message LimitsShowResponse {
 // "microsoft_store" for install_source on Windows, "standalone" on macOS.
 // `state` is likewise a string — "idle" | "checking" | "available" |
 // "downloading" | "downloaded" | "verified" | "installing" | "failed" |
-// "deferred" | "up_to_date" | "held_back" — mirroring the listed
+// "deferred" | "up_to_date" | "held_back" | "state_incompatible" — mirroring the listed
 // update-attempt states.
 message UpdateStatusRequest {}
 message UpdateStatusResponse {
@@ -2656,6 +2815,15 @@ enum ApplicationErrorCode {
   // Local Network privacy setting, or a firewall), so a device on the same network could not be
   // reached. A device that is reachable only over the internet still can be.
   APPLICATION_ERROR_CODE_SEND_LOCAL_NETWORK_BLOCKED = 36;
+  // The folder is on a drive the product cannot sync into yet (ReFS / Dev
+  // Drive, exFAT/FAT, a network share, a removable drive). Nothing was linked;
+  // `drive_reason` and `file_system` of the error say which, for a front end
+  // to word in its own language.
+  APPLICATION_ERROR_CODE_UNSUPPORTED_DRIVE = 37;
+  // The list of files in a Send link could not be verified: it does not open with the link's
+  // code (altered, or sealed for another link). The link itself is still valid; nothing was
+  // consumed. Do not show a list.
+  APPLICATION_ERROR_CODE_SEND_PREVIEW_UNVERIFIED = 38;
 }
 
 // What a person can do next about a refusal, as an action rather than a command line. The
@@ -2685,11 +2853,29 @@ message RefusedWithNextStep {
   NextStep next_step = 2;
 }
 
+// Why a drive cannot be synced into (`APPLICATION_ERROR_CODE_UNSUPPORTED_DRIVE`).
+enum UnsupportedDriveReason {
+  UNSUPPORTED_DRIVE_REASON_UNSPECIFIED = 0;
+  // ReFS, including a Dev Drive.
+  UNSUPPORTED_DRIVE_REASON_REFS = 1;
+  UNSUPPORTED_DRIVE_REASON_EXFAT = 2;
+  // FAT or FAT32.
+  UNSUPPORTED_DRIVE_REASON_FAT = 3;
+  // Not a local fixed disk: a network share or a removable drive.
+  UNSUPPORTED_DRIVE_REASON_NOT_LOCAL_FIXED = 4;
+  // Any other file system; `file_system` names it.
+  UNSUPPORTED_DRIVE_REASON_OTHER = 5;
+}
+
 message ApplicationCommandError {
   ApplicationErrorCode code = 1;
   string message = 2;
   repeated string group_ids = 3;
   string operation_id = 4;
+  // Set only with `APPLICATION_ERROR_CODE_UNSUPPORTED_DRIVE`.
+  UnsupportedDriveReason drive_reason = 5;
+  // The file system's name as Windows reports it ("ReFS", "exFAT", ...); set with `drive_reason`.
+  string file_system = 6;
 }
 
 message RemoveDeviceCommandResponse {
@@ -3011,6 +3197,34 @@ message ShowRecoveryOperationResponse {
 // a File Provider folder at its place in the file manager (a path inside it is refused: a command
 // that takes a folder takes the folder itself), resolved by the one resolver every path-taking
 // command uses (`plain folder, then File Provider location`). A refusal is the `error` payload.
+// The devices registered on this account, as the coordination service lists
+// them, so a front end can name a device instead of printing its id.
+message ListAccountDevicesRequest {}
+message AccountDeviceInfo {
+  string device_id = 1;
+  string device_name = 2;
+  bool online = 3;
+  // True for the device this daemon runs on (always shown online).
+  bool is_this_device = 4;
+}
+message ListAccountDevicesResponse {
+  repeated AccountDeviceInfo devices = 1;
+}
+
+// The share edges of this account's folder groups: who is a member of which
+// group, and in what state. Read from the coordination plane.
+message ListShareEdgesRequest {}
+message ShareEdgeInfo {
+  string edge_id = 1;
+  string group_id = 2;
+  string device_id = 3;
+  // `active`, `pending` or `pending_approval`.
+  string state = 4;
+}
+message ListShareEdgesResponse {
+  repeated ShareEdgeInfo edges = 1;
+}
+
 message ResolveFolderRequest {
   string path = 1;
 }
@@ -3356,9 +3570,8 @@ message DaemonControlRequest {
     // Originals a rebootstrap kept under a claim: list them, try to release them.
     ListRetainedOriginalsRequest list_retained_originals = 80;
     ReleaseRetainedOriginalsRequest release_retained_originals = 81;
-    // Local retention ("always keep on this device"). `pin`/`unpin` and 9/10 are reserved.
-    PinItemRequest pin_item = 82;
-    UnpinItemRequest unpin_item = 83;
+    // Local retention rules (keep / online only / default). `pin`/`unpin` and 9/10 are reserved.
+    SetRetentionRuleRequest set_retention_rule = 82;
     CancelTransferRequest cancel_transfer = 84;
     RetryTransferRequest retry_transfer = 85;
     GetSpaceManagementRequest get_space_management = 86;
@@ -3383,6 +3596,13 @@ message DaemonControlRequest {
     SendLinkStatusRequest send_link_status = 105;
     PreviewSendLinkRequest preview_send_link = 106;
     ResolveFolderRequest resolve_folder = 107;
+    ListAccountDevicesRequest list_account_devices = 108;
+    GetNetworkPolicyRequest get_network_policy = 110;
+    SetSyncOnMeteredRequest set_sync_on_metered = 111;
+    ReportNetworkCostRequest report_network_cost = 112;
+    IgnoreRulesGetRequest ignore_rules_get = 113;
+    IgnoreRulesSetRequest ignore_rules_set = 114;
+    ListShareEdgesRequest list_share_edges = 115;
   }
   // Field numbers 24-26 were the directional-mode requests (set_mode,
   // override, revert); 40-43 were the directional folder-operation requests
@@ -3394,8 +3614,8 @@ message DaemonControlRequest {
   // the iroh endpoint's own mDNS, whose candidate set this daemon does not
   // enumerate.
   // 9 and 10 were `pin` and `unpin`, removed with pinning.
-  reserved 9, 10, 24, 25, 26, 40, 41, 42, 43, 72;
-  reserved "pin", "unpin", "set_mode", "override", "revert", "folder_divergence_summary",
+  reserved 9, 10, 24, 25, 26, 40, 41, 42, 43, 72, 83;
+  reserved "unpin_item", "pin", "unpin", "set_mode", "override", "revert", "folder_divergence_summary",
     "folder_resolution_preview", "folder_resolution_confirm",
     "list_folder_operation_audit", "list_lan_discovered_candidates";
   // The CLI's own control-
@@ -3507,8 +3727,7 @@ message DaemonControlResponse {
     ListProviderPendingResponse list_provider_pending = 79;
     ListRetainedOriginalsResponse list_retained_originals = 80;
     ReleaseRetainedOriginalsResponse release_retained_originals = 81;
-    PinItemResponse pin_item = 82;
-    UnpinItemResponse unpin_item = 83;
+    SetRetentionRuleResponse set_retention_rule = 82;
     CancelTransferResponse cancel_transfer = 84;
     RetryTransferResponse retry_transfer = 85;
     GetSpaceManagementResponse get_space_management = 86;
@@ -3540,6 +3759,12 @@ message DaemonControlResponse {
     SendLinkStatusResponse send_link_status = 107;
     PreviewSendLinkResponse preview_send_link = 108;
     ResolveFolderResponse resolve_folder = 109;
+    ListAccountDevicesResponse list_account_devices = 110;
+    // The answer to get_network_policy, set_sync_on_metered and report_network_cost.
+    NetworkPolicyResponse network_policy = 111;
+    IgnoreRulesGetResponse ignore_rules_get = 112;
+    IgnoreRulesSetResponse ignore_rules_set = 113;
+    ListShareEdgesResponse list_share_edges = 114;
   }
   // Field numbers 25-27 were the directional-mode responses (set_mode,
   // override, revert); 40-43 were the directional folder-operation responses
@@ -3549,8 +3774,8 @@ message DaemonControlResponse {
   // 72 was `list_lan_discovered_candidates`, removed with the legacy LAN
   // broadcast discovery that produced the candidate list.
   // 9 and 10 were `pin` and `unpin`, removed with pinning.
-  reserved 9, 10, 25, 26, 27, 40, 41, 42, 43, 72;
-  reserved "pin", "unpin", "set_mode", "override", "revert", "folder_divergence_summary",
+  reserved 9, 10, 25, 26, 27, 40, 41, 42, 43, 72, 83;
+  reserved "unpin_item", "pin", "unpin", "set_mode", "override", "revert", "folder_divergence_summary",
     "folder_resolution_preview", "folder_resolution_confirm",
     "list_folder_operation_audit", "list_lan_discovered_candidates";
   // Mirrors

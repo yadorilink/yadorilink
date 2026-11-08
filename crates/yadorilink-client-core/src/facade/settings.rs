@@ -7,9 +7,9 @@ use super::ClientCore;
 use crate::dto::{
     self, AccountDeletionImpact, AccountDeletionRequest, AccountDeletionStatus, BandwidthLimits,
     DaemonStartOutcome, DiagnosticsCollectionMode, DiagnosticsExport, GcReport, IncomingTransfer,
-    OutgoingTransfer, ReceivedTransfer, SendLink, SendLinkPreview, SendLinkStatus, SendLinkTtl,
-    SentTransfer, SpaceManagement, SpaceReclaimPreview, UpdateConfig, UpdateDownloadGuidance,
-    UpdateStatus,
+    NetworkCost, NetworkPolicy, OutgoingTransfer, ReceivedTransfer, SendLink, SendLinkPreview,
+    SendLinkStatus, SendLinkTtl, SentTransfer, SpaceManagement, SpaceReclaimPreview, UpdateConfig,
+    UpdateDownloadGuidance, UpdateStatus,
 };
 use crate::error::{CoreError, DaemonUnavailableReason, DesktopError, RefusalReason};
 use crate::ops;
@@ -260,6 +260,63 @@ impl ClientCore {
         enabled: bool,
     ) -> Result<SpaceManagement, DesktopError> {
         Ok(dto::space_management(Some(&ops::storage::set_space_management(enabled).await?)))
+    }
+
+    /// The metered-network policy the daemon holds.
+    ///
+    /// # Errors
+    /// Daemon failures.
+    pub async fn network_policy(&self) -> Result<NetworkPolicy, DesktopError> {
+        Ok(dto::network_policy(&ops::network::network_policy().await?))
+    }
+
+    /// Allows (`true`) or pauses (`false`, the default) sync on a metered connection.
+    ///
+    /// # Errors
+    /// Daemon failures.
+    pub async fn set_sync_on_metered(&self, enabled: bool) -> Result<NetworkPolicy, DesktopError> {
+        Ok(dto::network_policy(&ops::network::set_sync_on_metered(enabled).await?))
+    }
+
+    /// Tells the daemon what the connection is: the OS knows, the engine does not guess. Call
+    /// at start and on every change (Windows: the connection's metered cost type).
+    ///
+    /// # Errors
+    /// Daemon failures.
+    pub async fn report_network_cost(
+        &self,
+        cost: NetworkCost,
+    ) -> Result<NetworkPolicy, DesktopError> {
+        use yadorilink_ipc_proto::daemonctl::NetworkCost as Wire;
+        let wire = match cost {
+            NetworkCost::Unknown => Wire::Unknown,
+            NetworkCost::Unmetered => Wire::Unmetered,
+            NetworkCost::Metered => Wire::Metered,
+        };
+        Ok(dto::network_policy(&ops::network::report_network_cost(wire).await?))
+    }
+
+    /// The folder's ignore rules: one pattern per line, empty when it has none. The text is the
+    /// daemon's own, per device, and never synced; the built-in defaults (`.DS_Store`, ...)
+    /// always apply beneath it.
+    ///
+    /// # Errors
+    /// Daemon failures, including an unknown folder.
+    pub async fn ignore_rules_get(&self, group_id: String) -> Result<String, DesktopError> {
+        Ok(ops::ignore_rules::ignore_rules_get(&group_id).await?)
+    }
+
+    /// Replaces the folder's ignore rules with `text` and applies them to the folder at once.
+    /// A line the engine cannot use is refused with `line N: ...` and nothing is stored.
+    ///
+    /// # Errors
+    /// Daemon failures, including an unknown folder or an unusable line.
+    pub async fn ignore_rules_set(
+        &self,
+        group_id: String,
+        text: String,
+    ) -> Result<(), DesktopError> {
+        Ok(ops::ignore_rules::ignore_rules_set(&group_id, &text).await?)
     }
 
     /// What automatic space management would do now; nothing is removed.

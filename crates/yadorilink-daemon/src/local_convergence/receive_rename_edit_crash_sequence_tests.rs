@@ -167,6 +167,8 @@ fn repair(h: &Harness) {
         &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
     )
     .unwrap();
+    // The sweep after repair: a temp an intent named is gone with the intent.
+    h.state.remove_recorded_temp_files(GROUP, &h.path("")).unwrap();
 }
 
 /// The live indexed files: path to the hex of its block hashes.

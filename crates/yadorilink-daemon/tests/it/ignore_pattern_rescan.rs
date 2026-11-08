@@ -1,14 +1,7 @@
-//! Editing `.yadorilinkignore` must trigger a rescan of the affected link
-//! and reconverge with peers, entirely through the already-running
-//! daemon — no stop/start restart anywhere in
-//! this test. `LinkRuntimeController::start`'s executor task already
-//! wires this (confirmed by reading
-//! the daemon's own link-runtime task wiring): a debounced flush that
-//! touches the ignore file reloads the effective pattern set and forces a
-//! full `RescanRequired` reconciliation scan. This test exercises that path
-//! end-to-end via the real OS-level watcher (not a direct call into
-//! `local_change`), across two networked devices, the same shape as
-//! `live_burst_batching.rs`.
+//! Replacing a folder's ignore rules must scan the affected link and reconverge with peers,
+//! entirely through the already-running daemon — no stop/start restart anywhere in this test.
+//! Setting the rules stores them and has the engine scan the folder with the new set, across
+//! two networked devices, the same shape as `live_burst_batching.rs`.
 
 use crate::support;
 
@@ -17,11 +10,12 @@ use std::time::Duration;
 
 use support::wait_until;
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
+use yadorilink_daemon::ignore_rules::IgnoreRulesService;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_storage::SegmentBlockStore;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn editing_yadorilinkignore_rescans_and_reconverges_without_daemon_restart() {
+async fn replacing_ignore_rules_rescans_and_reconverges_without_daemon_restart() {
     let coordination_addr = support::start_coordination_server().await;
     let account =
         support::register_and_login(&coordination_addr, "ignore-rescan@example.com").await;
@@ -83,12 +77,12 @@ async fn editing_yadorilinkignore_rescans_and_reconverges_without_daemon_restart
         .unwrap()
         .is_some());
 
-    // Edit `.yadorilinkignore` on device A only — device-local, unsynced.
-    // No restart: `start_link_watch`'s executor task is still the same
-    // one spawned above; `flush_touches_ignore_file` (link_runtime/tasks.rs) is
-    // what's expected to notice this write and force a full
-    // reconciliation scan with the reloaded pattern set.
-    std::fs::write(root_a.path().join(".yadorilinkignore"), "*.log\n").unwrap();
+    // Replace the ignore rules on device A only — device-local, unsynced.
+    // No restart: the link's executor task is still the same one spawned
+    // above; setting the rules is what makes the engine scan the folder with
+    // the new rules.
+    let rules = IgnoreRulesService::new(state_a.clone());
+    rules.set(&group_id, "*.log\n").await.unwrap();
 
     // the triggered rescan drops "build.log" from device A's own
     // index (dropped, not deleted — the on-disk file is untouched) —
@@ -123,11 +117,11 @@ async fn editing_yadorilinkignore_rescans_and_reconverges_without_daemon_restart
         .unwrap();
     assert!(!record_b.deleted, "no tombstone must reach the peer for a newly-ignored file");
 
-    // removing the pattern (editing the ignore file again, still
+    // removing the pattern (replacing the rules again, still
     // without any daemon restart) must un-ignore "build.log" and let a
     // *newly created* matching file be picked back up by the next
     // triggered rescan.
-    std::fs::write(root_a.path().join(".yadorilinkignore"), "").unwrap();
+    rules.set(&group_id, "").await.unwrap();
     std::fs::write(root_a.path().join("release-notes.log"), b"now wanted again").unwrap();
 
     wait_until(|| root_b.path().join("release-notes.log").exists(), Duration::from_secs(15)).await;

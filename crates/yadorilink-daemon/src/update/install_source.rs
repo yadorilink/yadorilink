@@ -26,7 +26,7 @@ pub const DOWNLOAD_PAGE_URL: &str = "https://github.com/yadorilink/yadorilink/re
 /// downloads the new version from [`DOWNLOAD_PAGE_URL`].
 pub fn manual_update_guidance(install_source: &str) -> String {
     match install_source {
-        "homebrew" => "This install is managed by Homebrew; run `brew upgrade --cask yadorilink`.".to_string(),
+        "homebrew" => "This install is managed by Homebrew; run `brew upgrade yadorilink`.".to_string(),
         "apt" => "This install is managed by apt; run `sudo apt update && sudo apt install --only-upgrade yadorilink`.".to_string(),
         "winget" => "This install is managed by WinGet; run `winget upgrade yadorilink`.".to_string(),
         "microsoft_store" => "This install is managed by the Microsoft Store; open Store > Library > Updates.".to_string(),
@@ -70,9 +70,15 @@ pub fn running_exe() -> std::path::PathBuf {
     std::fs::canonicalize(&exe).unwrap_or(exe)
 }
 
+/// File the Homebrew formula installs under its prefix: `<prefix>/share/yadorilink/install-source`
+/// holding `homebrew`, found relative to the real program (`<prefix>/bin/yadorilink-daemon`).
+/// The formula writes nothing outside its own prefix, so this is its only signal.
+pub const HOMEBREW_PREFIX_MARKER: &str = "share/yadorilink/install-source";
+
 /// Applies the platform-independent installation facts to what the platform's own detection
 /// found (`detected`). Order: a container declaration, then a bundle path layout, then a
-/// one-liner receipt (only over `standalone`, which is the absence of every other marker).
+/// one-liner receipt or the Homebrew formula's marker (both only over `standalone`, which is
+/// the absence of every other marker).
 /// `env_value` is the value of [`INSTALL_SOURCE_ENV`]; only `container` is honoured.
 pub fn refine(detected: String, exe: &Path, env_value: Option<&str>) -> String {
     if env_value == Some("container") {
@@ -90,7 +96,17 @@ pub fn refine(detected: String, exe: &Path, env_value: Option<&str>) -> String {
     if detected == "standalone" && script_receipt_present(exe) {
         return "script".to_string();
     }
+    if detected == "standalone" && homebrew_marker_present(exe) {
+        return "homebrew".to_string();
+    }
     detected
+}
+
+/// Whether the formula's marker sits beside `exe`'s `bin` directory and says `homebrew`.
+fn homebrew_marker_present(exe: &Path) -> bool {
+    let Some(prefix) = exe.parent().and_then(Path::parent) else { return false };
+    std::fs::read_to_string(prefix.join(HOMEBREW_PREFIX_MARKER))
+        .is_ok_and(|contents| contents.trim() == "homebrew")
 }
 
 /// Whether `install-receipt.json` beside `exe` names the one-liner (`"source": "script"`).

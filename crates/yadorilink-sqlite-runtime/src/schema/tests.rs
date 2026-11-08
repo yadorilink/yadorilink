@@ -195,6 +195,33 @@ fn a_brand_new_database_passes_the_replica_generation_check() {
         .expect("an empty database at user_version 0 is a first run, not a stale one");
 }
 
+/// Only a stamp an earlier build really wrote is "an older generation" (the typed refusal); a stamp below the first
+/// shipped one, or negative, is damage and stays a plain corrupt-schema refusal.
+#[test]
+fn only_a_shipped_older_stamp_is_the_typed_refusal() {
+    for (stamp, typed) in [
+        (FIRST_SHIPPED_SCHEMA_VERSION, true),
+        (SCHEMA_VERSION - 1, true),
+        (FIRST_SHIPPED_SCHEMA_VERSION - 1, false),
+        (1, false),
+        (-1, false),
+        (i32::MIN, false),
+    ] {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "user_version", stamp).unwrap();
+        let error = check_schema_version_supported(&conn).unwrap_err();
+        assert_eq!(
+            matches!(error, DatabaseError::SchemaTooOld { .. }),
+            typed,
+            "stamp {stamp}: {error:?}"
+        );
+        assert!(
+            typed || matches!(error, DatabaseError::CorruptSchema(_)),
+            "stamp {stamp}: {error:?}"
+        );
+    }
+}
+
 /// A database written by an older build is refused, not migrated, and the refusal says how to save
 /// what the older build set aside before the index is deleted (the recovery items live beside the
 /// index and go with it).

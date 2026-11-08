@@ -127,7 +127,6 @@ LAYOUTS = {
             # the C# generated from it.
             ("yadorilink_client_ffi.dll", "bin", "yadorilink_client_ffi.dll", True),
             ("csharp/BINDING-NOTES.md", "csharp", "BINDING-NOTES.md", False),
-            ("install.ps1", "installer", "install.ps1", False),
         ],
         "globs": [("csharp/Generated", "csharp", "Generated", ".cs")],
     },
@@ -319,9 +318,24 @@ def source_notice(repository: str, release_tag: str, public_commit_sha: str, con
 DEV_MANIFEST_KEY = "00e033f866c263139ff4afd165e75bae3cfca67eb32399dddd6e33a3251af1e3"
 
 
+STAGING_COORDINATION_ADDR = "https://control-staging.yadori.link"
+
+
+def check_coordination_lane(config: dict) -> None:
+    """The staging lane (YADORILINK_STAGING_LANE=1) compiles the staging service in and every other build refuses it,
+    so a staging engine cannot point at production nor a production engine at staging."""
+    addr = config.get("coordination_addr", "")
+    if os.environ.get("YADORILINK_STAGING_LANE") == "1":
+        if addr != STAGING_COORDINATION_ADDR:
+            raise SystemExit(f"error: the staging lane must build with coordination_addr={STAGING_COORDINATION_ADDR}, not {addr!r}")
+    elif addr == STAGING_COORDINATION_ADDR:
+        raise SystemExit("error: only the staging lane may build with the staging coordination address")
+
+
 def build_identity(args):
     """(kind, config, config_digest) of a build, known before any binary is built."""
     config = dict(item.split("=", 1) for item in args.build_config)
+    check_coordination_lane(config)
     kind = "dev" if args.channel == "dev" else "release"
     enforced = "enforce-release-trust-root" in config.get("features", "")
     if kind == "release" and not enforced and LAYOUTS.get(args.target, {}).get("trust_root", True):
@@ -371,6 +385,16 @@ def build(args) -> int:
         raise SystemExit("error: --third-party-licenses file is empty")
     files["THIRD-PARTY-LICENSES"] = notices
 
+    if args.target.startswith("windows-"):
+        # A clean Windows has no VC++ redistributable: a binary that imports it will not start.
+        spec = importlib.util.spec_from_file_location("check_pe_imports", Path(__file__).with_name("check-pe-imports.py"))
+        pe_check = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pe_check)
+        for name, data in sorted(files.items()):
+            if name.lower().endswith((".exe", ".dll")):
+                hits = sorted({n for n in (pe_check.import_names(data) or []) if pe_check.FORBIDDEN.match(n)})
+                if hits:
+                    raise SystemExit(f"error: {name} imports the VC++ runtime ({', '.join(hits)}); build with the static CRT (.cargo/config.toml crt-static)")
     kind, config, config_digest = build_identity(args)
     expected_id = f"{args.public_commit_sha}:{config_digest}"
     if args.expect_release_id != expected_id:
@@ -709,7 +733,7 @@ def installer_problems(zip_path: Path, installers: Path) -> list[str]:
     published, attested one, byte for byte."""
     problems = []
     with zipfile.ZipFile(zip_path) as z:
-        for name in ("install.sh", "install.ps1"):
+        for name in ("install.sh",):
             if name not in z.namelist():
                 continue
             published = installers / name
@@ -721,6 +745,26 @@ def installer_problems(zip_path: Path, installers: Path) -> list[str]:
 
 
 def self_test() -> int:
+    lane = os.environ.pop("YADORILINK_STAGING_LANE", None)
+    try:
+        check_coordination_lane({"coordination_addr": "https://control.yadori.link"})
+        check_coordination_lane({})
+        for lane_on, addr in ((None, STAGING_COORDINATION_ADDR), ("1", "https://control.yadori.link"), ("1", ""), ("1", "http://127.0.0.1:8787")):
+            if lane_on:
+                os.environ["YADORILINK_STAGING_LANE"] = lane_on
+            else:
+                os.environ.pop("YADORILINK_STAGING_LANE", None)
+            try:
+                check_coordination_lane({"coordination_addr": addr})
+            except SystemExit:
+                continue
+            raise AssertionError(f"coordination lane check accepted {addr!r} with lane {lane_on!r}")
+        os.environ["YADORILINK_STAGING_LANE"] = "1"
+        check_coordination_lane({"coordination_addr": STAGING_COORDINATION_ADDR})
+    finally:
+        os.environ.pop("YADORILINK_STAGING_LANE", None)
+        if lane is not None:
+            os.environ["YADORILINK_STAGING_LANE"] = lane
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         lic = tmp / "LICENSE"
@@ -804,7 +848,7 @@ def self_test() -> int:
         expected_names = {
             "linux-x86_64": {"yadorilink", "yadorilink-daemon", "install.sh"},
             "windows-x86_64": {
-                "install.ps1", "yadorilink.exe", "yadorilink-daemon.exe",
+                "yadorilink.exe", "yadorilink-daemon.exe",
                 "yadorilink_shell_ext.dll", "yadorilink-cfapi-host.exe",
                 "yadorilink_client_ffi.dll", "csharp/BINDING-NOTES.md",
                 "csharp/Generated/A.cs", "csharp/Generated/B.cs",
@@ -830,17 +874,13 @@ def self_test() -> int:
             entries = entries_of(z1)
             assert set(entries) == names | set(RESERVED), (target, sorted(entries))
             assert verify_zip(z1) == [] and verify_zip(z1, target=target) == [], verify_zip(z1, target=target)
-            if "install.sh" in names or "install.ps1" in names:
+            if "install.sh" in names:
                 # the bundled installer must equal the published one, byte for byte
                 pub_dir = tmp / f"published-{target}"
                 pub_dir.mkdir()
-                for inst in ("install.sh", "install.ps1"):
-                    if inst in names:
-                        (pub_dir / inst).write_bytes(entries[inst])
+                (pub_dir / "install.sh").write_bytes(entries["install.sh"])
                 assert installer_problems(z1, pub_dir) == []
-                for inst in ("install.sh", "install.ps1"):
-                    if inst in names:
-                        (pub_dir / inst).write_bytes(entries[inst] + b"# changed\n")
+                (pub_dir / "install.sh").write_bytes(entries["install.sh"] + b"# changed\n")
                 assert installer_problems(z1, pub_dir), "a changed published installer was not noticed"
             sums = entries["SHA256SUMS"].decode()
             assert all(f"  {n}\n" in sums for n in names | set(NOTICE_FILES)), "SHA256SUMS misses a file"
@@ -1181,7 +1221,7 @@ def parse(argv):
     v.add_argument("--expect-zip-sha256")
     v.add_argument("--lock")
     v.add_argument("--release", action="store_true", help="release or production path: refuse a development bundle")
-    v.add_argument("--installers", help="directory of the published installers: the bundle's install.sh / install.ps1 must be byte-identical to them")
+    v.add_argument("--installers", help="directory of the published installers: the bundle's install.sh must be byte-identical to them")
     return p.parse_args(argv)
 
 

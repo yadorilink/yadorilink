@@ -12,7 +12,7 @@ use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 
 use super::FileBlockSource;
-use crate::engine_tuning::EngineTuning;
+use crate::engine_tuning::{EngineTuning, FileMode};
 use crate::test_support::peer_session_fixture::{
     expect_found, request_block, spawn_session_configured_with_deps,
     AlwaysValidRootCommitAuthorityProvider, Device, GROUP,
@@ -24,8 +24,7 @@ const PATH: &str = "doc.bin";
 
 fn tuning(file_block_source: bool) -> EngineTuning {
     EngineTuning {
-        file_block_source,
-        single_pass: false,
+        file_mode: if file_block_source { FileMode::ServesFromFiles } else { FileMode::Blocks },
         witness: crate::install_witness::WitnessPlacement::BesideDatabase,
         ..EngineTuning::default()
     }

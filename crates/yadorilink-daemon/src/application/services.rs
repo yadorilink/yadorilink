@@ -53,4 +53,6 @@ pub(crate) struct ApplicationServices {
     /// Folder Rewind's execution: a thin wrapper like `send_transfer`; the
     /// run itself is `crate::rewind`'s.
     pub(crate) rewind: Arc<crate::rewind::RewindService>,
+    /// A folder's ignore rules.
+    pub(crate) ignore_rules: Arc<crate::ignore_rules::IgnoreRulesService>,
 }

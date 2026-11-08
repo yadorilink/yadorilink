@@ -80,7 +80,12 @@ struct TestDevice {
     _index_dir: tempfile::TempDir,
 }
 
-async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
+async fn setup_device(account: &TestAccount, name: &str) -> Option<TestDevice> {
+    // The scenarios remove directories on one device and expect them gone on the other; the
+    // daemon removes only what it can prove is the same object, which tmpfs cannot. The synced
+    // folder lives beside the build output, on disk; the helper reports a skip loudly (and
+    // panics under CI=true) when even that cannot prove identity.
+    let root = support::identity_proving_temp_root()?;
     let device_id = support::register_device(account, name, [0u8; 32]).await;
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
@@ -93,13 +98,7 @@ async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
     // `LinkRuntimeController::start` — a key installed after the watch starts
     // would leave change emission off and nothing would propagate.
     support::ensure_device_signing_key(&state);
-    TestDevice {
-        device_id,
-        state,
-        root: tempfile::tempdir().unwrap(),
-        _store_dir: store_dir,
-        _index_dir: index_dir,
-    }
+    Some(TestDevice { device_id, state, root, _store_dir: store_dir, _index_dir: index_dir })
 }
 
 async fn start_watching(device: &TestDevice, group_id: &str) {
@@ -112,13 +111,13 @@ async fn start_watching(device: &TestDevice, group_id: &str) {
 
 /// Sets up two devices, both syncing a fresh folder group, and waits for
 /// peer sessions to establish. Every scenario below starts from this.
-async fn two_synced_devices(test_name: &str) -> (TestDevice, TestDevice, String) {
+async fn two_synced_devices(test_name: &str) -> Option<(TestDevice, TestDevice, String)> {
     let coordination_addr = support::start_coordination_server().await;
     let account =
         support::register_and_login(&coordination_addr, &format!("{test_name}@example.com")).await;
 
-    let device_a = setup_device(&account, "device-a").await;
-    let device_b = setup_device(&account, "device-b").await;
+    let device_a = setup_device(&account, "device-a").await?;
+    let device_b = setup_device(&account, "device-b").await?;
     let group_id = support::create_folder_group(&account, "directory-collision-group").await;
     support::grant_access(&account, &group_id, &device_a.device_id).await;
     support::grant_access(&account, &group_id, &device_b.device_id).await;
@@ -136,7 +135,7 @@ async fn two_synced_devices(test_name: &str) -> (TestDevice, TestDevice, String)
     .await;
 
     tokio::time::sleep(Duration::from_millis(300)).await;
-    (device_a, device_b, group_id)
+    Some((device_a, device_b, group_id))
 }
 
 fn is_conflict_copy(name: &str) -> bool {
@@ -225,8 +224,11 @@ async fn wait_devices_quiescent(device_a: &TestDevice, device_b: &TestDevice, gr
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_directory_rename_to_different_targets() {
     let _ = tracing_subscriber::fmt::try_init();
-    let (device_a, device_b, group_id) =
-        two_synced_devices("dir-collision-rename-rename-diff").await;
+    let Some((device_a, device_b, group_id)) =
+        two_synced_devices("dir-collision-rename-rename-diff").await
+    else {
+        return;
+    };
 
     let dir_a = device_a.root.path().join("shared_dir");
     std::fs::create_dir_all(&dir_a).unwrap();
@@ -234,8 +236,7 @@ async fn concurrent_directory_rename_to_different_targets() {
     std::fs::write(dir_a.join("b.txt"), b"content b").unwrap();
     std::fs::write(dir_a.join("c.txt"), b"content c").unwrap();
 
-    wait_until(|| device_b.root.path().join("shared_dir/c.txt").exists(), Duration::from_secs(10))
-        .await;
+    wait_until(|| device_b.root.path().join("shared_dir/c.txt").exists(), SETTLE_TIMEOUT).await;
     wait_devices_quiescent(&device_a, &device_b, &group_id).await;
 
     std::fs::rename(
@@ -308,8 +309,11 @@ async fn concurrent_directory_rename_to_different_targets() {
 /// one present with its real content) that reasoning predicts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delete_directory_while_peer_adds_a_file_inside_it() {
-    let (device_a, device_b, group_id) =
-        two_synced_devices("dir-collision-delete-vs-add-inside").await;
+    let Some((device_a, device_b, group_id)) =
+        two_synced_devices("dir-collision-delete-vs-add-inside").await
+    else {
+        return;
+    };
     let _ = group_id;
 
     let dir_a = device_a.root.path().join("target_dir");
@@ -317,11 +321,8 @@ async fn delete_directory_while_peer_adds_a_file_inside_it() {
     std::fs::write(dir_a.join("existing-1.txt"), b"existing content one").unwrap();
     std::fs::write(dir_a.join("existing-2.txt"), b"existing content two").unwrap();
 
-    wait_until(
-        || device_b.root.path().join("target_dir/existing-2.txt").exists(),
-        Duration::from_secs(10),
-    )
-    .await;
+    wait_until(|| device_b.root.path().join("target_dir/existing-2.txt").exists(), SETTLE_TIMEOUT)
+        .await;
     wait_devices_quiescent(&device_a, &device_b, &group_id).await;
 
     std::fs::remove_dir_all(&dir_a).unwrap();
@@ -384,15 +385,17 @@ async fn delete_directory_while_peer_adds_a_file_inside_it() {
 /// nested path, the renamed one, or a conflict copy), not "nowhere".
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nested_rename_races_a_child_file_edit() {
-    let (device_a, device_b, group_id) =
-        two_synced_devices("dir-collision-nested-rename-vs-edit").await;
+    let Some((device_a, device_b, group_id)) =
+        two_synced_devices("dir-collision-nested-rename-vs-edit").await
+    else {
+        return;
+    };
 
     let subdir_a = device_a.root.path().join("subdir");
     std::fs::create_dir_all(&subdir_a).unwrap();
     std::fs::write(subdir_a.join("child.txt"), b"original child content").unwrap();
 
-    wait_until(|| device_b.root.path().join("subdir/child.txt").exists(), Duration::from_secs(10))
-        .await;
+    wait_until(|| device_b.root.path().join("subdir/child.txt").exists(), SETTLE_TIMEOUT).await;
     wait_devices_quiescent(&device_a, &device_b, &group_id).await;
 
     std::fs::rename(
@@ -448,8 +451,11 @@ async fn nested_rename_races_a_child_file_edit() {
 /// not produce a conflict.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrently_creating_same_named_directory_with_different_files_inside() {
-    let (device_a, device_b, group_id) =
-        two_synced_devices("dir-collision-create-create-merge").await;
+    let Some((device_a, device_b, group_id)) =
+        two_synced_devices("dir-collision-create-create-merge").await
+    else {
+        return;
+    };
     let _ = group_id;
 
     std::fs::create_dir_all(device_a.root.path().join("newdir")).unwrap();
@@ -503,8 +509,11 @@ async fn concurrently_creating_same_named_directory_with_a_conflicting_file_insi
     ) {
         return;
     }
-    let (device_a, device_b, group_id) =
-        two_synced_devices("dir-collision-create-create-conflict").await;
+    let Some((device_a, device_b, group_id)) =
+        two_synced_devices("dir-collision-create-create-conflict").await
+    else {
+        return;
+    };
     let _ = group_id;
 
     std::fs::create_dir_all(device_a.root.path().join("newdir")).unwrap();
@@ -623,7 +632,10 @@ async fn settle_to_one_tree(
 /// that are now gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rm_rf_directory_removes_now_empty_directory_on_peer() {
-    let (device_a, device_b, group_id) = two_synced_devices("dir-rm-rf-leaves-no-dir").await;
+    let Some((device_a, device_b, group_id)) = two_synced_devices("dir-rm-rf-leaves-no-dir").await
+    else {
+        return;
+    };
 
     let linux = device_a.root.path().join("linux");
     std::fs::create_dir_all(linux.join("arch")).unwrap();
@@ -645,7 +657,10 @@ async fn rm_rf_directory_removes_now_empty_directory_on_peer() {
 /// appears on the other.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn empty_directory_created_on_one_device_appears_on_peer() {
-    let (device_a, device_b, _group_id) = two_synced_devices("dir-empty-dir-syncs").await;
+    let Some((device_a, device_b, _group_id)) = two_synced_devices("dir-empty-dir-syncs").await
+    else {
+        return;
+    };
 
     std::fs::create_dir(device_a.root.path().join("empty")).unwrap();
     let tree = settle_to_one_tree(&device_a, &device_b, |t| {
@@ -658,7 +673,10 @@ async fn empty_directory_created_on_one_device_appears_on_peer() {
 /// An explicit empty directory removed on one device goes on the other.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rmdir_of_explicit_empty_directory_propagates() {
-    let (device_a, device_b, _group_id) = two_synced_devices("dir-rmdir-propagates").await;
+    let Some((device_a, device_b, _group_id)) = two_synced_devices("dir-rmdir-propagates").await
+    else {
+        return;
+    };
 
     std::fs::create_dir(device_a.root.path().join("empty")).unwrap();
     settle_to_one_tree(&device_a, &device_b, |t| {
@@ -677,7 +695,10 @@ async fn rmdir_of_explicit_empty_directory_propagates() {
 /// now-empty `sub/`) may linger on either device.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delete_directory_vs_concurrent_child_keeps_child_and_container() {
-    let (device_a, device_b, group_id) = two_synced_devices("dir-rm-rf-vs-child").await;
+    let Some((device_a, device_b, group_id)) = two_synced_devices("dir-rm-rf-vs-child").await
+    else {
+        return;
+    };
 
     let dir_a = device_a.root.path().join("target_dir");
     std::fs::create_dir_all(dir_a.join("sub")).unwrap();
@@ -727,7 +748,10 @@ async fn file_vs_descendant_structural_conflict_keeps_both() {
     ) {
         return;
     }
-    let (device_a, device_b, _group_id) = two_synced_devices("dir-file-vs-descendant").await;
+    let Some((device_a, device_b, _group_id)) = two_synced_devices("dir-file-vs-descendant").await
+    else {
+        return;
+    };
 
     std::fs::write(device_a.root.path().join("a"), b"file a").unwrap();
     std::fs::create_dir(device_b.root.path().join("a")).unwrap();
@@ -753,7 +777,10 @@ async fn explicit_directory_keeps_its_name_against_a_file_before_and_after_its_c
     ) {
         return;
     }
-    let (device_a, device_b, _group_id) = two_synced_devices("dir-explicit-vs-file").await;
+    let Some((device_a, device_b, _group_id)) = two_synced_devices("dir-explicit-vs-file").await
+    else {
+        return;
+    };
 
     std::fs::write(device_a.root.path().join("a"), b"file a").unwrap();
     std::fs::create_dir(device_b.root.path().join("a")).unwrap();
@@ -781,7 +808,10 @@ async fn explicit_directory_keeps_its_name_against_a_file_before_and_after_its_c
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn explicit_directory_keeps_its_name_against_a_symlink() {
-    let (device_a, device_b, _group_id) = two_synced_devices("dir-explicit-vs-symlink").await;
+    let Some((device_a, device_b, _group_id)) = two_synced_devices("dir-explicit-vs-symlink").await
+    else {
+        return;
+    };
 
     std::os::unix::fs::symlink("target", device_a.root.path().join("a")).unwrap();
     std::fs::create_dir(device_b.root.path().join("a")).unwrap();
@@ -808,7 +838,10 @@ async fn directory_rename_across_two_devices_moves_explicit_entries_only() {
     ) {
         return;
     }
-    let (device_a, device_b, group_id) = two_synced_devices("dir-rename-vs-child").await;
+    let Some((device_a, device_b, group_id)) = two_synced_devices("dir-rename-vs-child").await
+    else {
+        return;
+    };
 
     std::fs::create_dir(device_a.root.path().join("d")).unwrap();
     std::fs::write(device_a.root.path().join("d/f.txt"), b"moved").unwrap();
@@ -833,7 +866,10 @@ async fn directory_rename_across_two_devices_moves_explicit_entries_only() {
 /// explicit entry and appears, empty, on the peer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mkdir_after_remote_rm_rf_of_same_path_is_captured_as_explicit() {
-    let (device_a, device_b, group_id) = two_synced_devices("dir-mkdir-after-rm-rf").await;
+    let Some((device_a, device_b, group_id)) = two_synced_devices("dir-mkdir-after-rm-rf").await
+    else {
+        return;
+    };
 
     std::fs::create_dir(device_a.root.path().join("p")).unwrap();
     std::fs::write(device_a.root.path().join("p/f.txt"), b"f").unwrap();
@@ -856,7 +892,11 @@ async fn mkdir_after_remote_rm_rf_of_same_path_is_captured_as_explicit() {
 /// the file is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_file_materialization_never_authors_a_directory_change() {
-    let (device_a, device_b, group_id) = two_synced_devices("dir-materialize-no-author").await;
+    let Some((device_a, device_b, group_id)) =
+        two_synced_devices("dir-materialize-no-author").await
+    else {
+        return;
+    };
 
     std::fs::create_dir_all(device_a.root.path().join("nested/deeper")).unwrap();
     std::fs::write(device_a.root.path().join("nested/deeper/file.txt"), b"payload").unwrap();

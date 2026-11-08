@@ -5,9 +5,11 @@
 //! Nothing here reads the process environment: the state directory the replacement records
 //! live in is passed in by the caller.
 
+use crate::folder_state::FolderBlocker;
 use yadorilink_ipc_proto::daemonctl::{
     ActiveTransferProgress, DegradedCause, FetchAvailability, GroupDurabilityStatus, HeldFile,
-    LinkStatus, LocalStorageState, PeerStatus, RecentSyncError, StatusResponse, VolumeFreeSpace,
+    LinkStatus, LocalStorageState, PeerStatus, RecentSyncError, RetentionApplyState,
+    StatusResponse, VersionSkew, VolumeFreeSpace,
 };
 
 /// Maps the daemon's internal reachability into the control-socket wire
@@ -136,7 +138,15 @@ pub(crate) fn encode_runtime_status(
                 reachability: reachability as i32,
                 unreachable_category: category as i32,
                 route_kind: route_kind as i32,
-                version_incompatible: peer.version_incompatible,
+                version_skew: match peer.version_skew {
+                    Some(crate::peer_connectivity_runtime::VersionSkew::PeerNewer) => {
+                        VersionSkew::PeerNewer as i32
+                    }
+                    Some(crate::peer_connectivity_runtime::VersionSkew::PeerOlder) => {
+                        VersionSkew::PeerOlder as i32
+                    }
+                    None => VersionSkew::Unspecified as i32,
+                },
                 replaced_by_device_id: peer.replaced_by_device_id.unwrap_or_default(),
                 last_connected_unix: peer.last_connected_unix,
             }
@@ -197,11 +207,19 @@ pub(crate) fn encode_runtime_status(
         update_channel: update.channel,
         update_install_source: update.install_source,
         update_holdback_reason: update.holdback_reason,
+        // Filled by `compose_status`, which holds the network policy.
+        paused_on_metered: false,
+        network_cost_known: false,
         current_upload_bytes_per_sec: view.current_upload_bytes_per_sec,
         current_download_bytes_per_sec: view.current_download_bytes_per_sec,
         volumes,
         block_store_total_bytes: view.block_store.total_bytes,
         block_store_block_count: view.block_store.block_count,
+        kept_history_bytes: view.kept_history.map(|k| k.bytes),
+        kept_history_budget_bytes: view.kept_history.map(|k| k.budget_bytes),
+        unpublished_edits_service_unreachable: view.unpublished_edits_service_unreachable,
+        unpublished_edits_not_authorized: view.unpublished_edits_not_authorized,
+        unpublished_edits_rejected: view.unpublished_edits_rejected,
         last_gc_unix: view.last_gc_unix,
         gc_reclaimable_estimate_bytes: view.gc_reclaimable_estimate_bytes,
         active_transfers,
@@ -235,6 +253,12 @@ pub(crate) fn encode_link_status(view: crate::queries::link_status::LinkStatusVi
         })
         .collect();
     let held_file_count = held_files.len() as u64;
+    // The folder's gates come from its snapshot (`crate::folder_state`), not from separate flags.
+    let blocked = |blocker: FolderBlocker| view.folder_blockers.contains(&blocker);
+    let degraded_cause = view.folder_blockers.iter().find_map(|b| match b {
+        FolderBlocker::Degraded(cause) => Some(*cause),
+        _ => None,
+    });
     let durability_status = durability_status_to_proto(view.durability_status);
     let durability_evidence = durability_evidence_to_proto(view.durability_evidence);
     // A provider-backed root is not a plain folder the daemon writes itself.
@@ -242,7 +266,7 @@ pub(crate) fn encode_link_status(view: crate::queries::link_status::LinkStatusVi
     LinkStatus {
         root_access_warning: view.root_access_warning,
         index_damaged_path: view.index_damaged_path,
-        rebuild_needed: view.rebuild_needed,
+        rebuild_needed: blocked(FolderBlocker::RebuildNeeded),
         product: None,
         history_skipped_last_day: view.history_skipped_last_day,
         history_skipped_last_30_days: view.history_skipped_last_30_days,
@@ -253,6 +277,8 @@ pub(crate) fn encode_link_status(view: crate::queries::link_status::LinkStatusVi
         paused: view.paused,
         conflict_count: view.conflict_count,
         conflicts_pending: view.conflicts_pending,
+        pending_local_changes: view.pending_local_changes,
+        last_change_origin_device_id: view.last_change_origin_device_id.unwrap_or_default(),
         conflict_note: view.conflict_note,
         materialization_policy: view.materialization_policy,
         hydrated_count: view.hydrated_count,
@@ -261,6 +287,20 @@ pub(crate) fn encode_link_status(view: crate::queries::link_status::LinkStatusVi
         total_bytes: Some(view.total_bytes),
         online_only_bytes: Some(view.online_only_bytes),
         requested_content_count: view.requested_content_count,
+        pinned_pending_count: view.pinned_pending_count,
+        pinned_pending_error: view.pinned_pending_error,
+        pinned_pending_retry_secs: view.pinned_pending_retry_secs,
+        retention_rule_count: view.retention.rule_count,
+        retention_apply_state: if view.retention.online_only_count == 0 {
+            RetentionApplyState::None
+        } else if view.retention.pending_count > 0 {
+            RetentionApplyState::Pending
+        } else {
+            RetentionApplyState::Done
+        } as i32,
+        retention_done_count: u64::from(view.retention.counts.done),
+        retention_skipped_count: u64::from(view.retention.counts.skipped),
+        retention_retryable_count: u64::from(view.retention.counts.retryable),
         held_file_count,
         held_files,
         stranded_directory_count: view.stranded_directory_count,
@@ -278,16 +318,10 @@ pub(crate) fn encode_link_status(view: crate::queries::link_status::LinkStatusVi
             })
             .collect(),
         skipped_symlink_count: view.skipped_symlink_count,
-        degraded: view.degraded.is_some(),
-        waiting_for_disk_space: view
-            .degraded
-            .as_ref()
-            .is_some_and(|d| d.cause == crate::link_registry::DegradedCause::WaitingForDiskSpace),
-        degraded_cause: view
-            .degraded
-            .as_ref()
-            .map_or(DegradedCause::Unspecified, |d| d.cause.to_wire())
-            .into(),
+        degraded: degraded_cause.is_some(),
+        waiting_for_disk_space: degraded_cause
+            == Some(crate::link_registry::DegradedCause::WaitingForDiskSpace),
+        degraded_cause: degraded_cause.map_or(DegradedCause::Unspecified, |c| c.to_wire()).into(),
         degraded_reason: view.degraded.map(|d| d.reason).unwrap_or_default(),
         // This link's active-transfer rollup -- absent (all zero,
         // `has_active_transfer = false`) when nothing is currently
@@ -301,17 +335,17 @@ pub(crate) fn encode_link_status(view: crate::queries::link_status::LinkStatusVi
         durability_status: durability_status as i32,
         durability_evidence: durability_evidence as i32,
         durability_check_pending: view.durability_check_pending,
-        policy_stale: view.policy_stale,
+        policy_stale: blocked(FolderBlocker::PolicyStale),
         // A folder group linked at more than one folder refuses to sync
         // entirely (each folder's scan would delete the other's files on
         // every device). The refusal is otherwise only a log line, which is
         // loud in the code and silent in the UI -- this is what makes it
         // visible where the user actually looks, and names every folder
         // involved so the remedy (unlink all but one) is actionable.
-        ambiguous: view.ambiguous_local_paths.len() > 1,
+        ambiguous: blocked(FolderBlocker::AmbiguousLink),
         ambiguous_local_paths: view.ambiguous_local_paths,
-        capture_volume_changed: view.capture_volume_changed,
-        capture_volume_unconfirmed: view.capture_volume_unconfirmed,
+        capture_volume_changed: blocked(FolderBlocker::CaptureVolumeChanged),
+        capture_volume_unconfirmed: blocked(FolderBlocker::CaptureVolumeUnconfirmed),
         local_storage_state: local_storage_state_to_proto(view.local_storage_state) as i32,
         fetch_availability: fetch_availability_to_proto(view.fetch_availability) as i32,
         full_replica_device_ids: view.full_replica_device_ids,
@@ -321,6 +355,7 @@ pub(crate) fn encode_link_status(view: crate::queries::link_status::LinkStatusVi
         availability_reachable_device_ids: Vec::new(),
         availability_offline_device_ids: Vec::new(),
         availability_update_required_device_ids: Vec::new(),
+        availability_newer_peer_device_ids: Vec::new(),
         protection: 0,
         // Input to the dimension fill: who confirmed the custody, if anyone.
         protection_device_ids: view.custody_confirmed_by,
@@ -334,6 +369,11 @@ pub(crate) fn encode_link_status(view: crate::queries::link_status::LinkStatusVi
 /// string this converts to via `as_str`, matching every other
 /// string-typed status enum in this message
 /// (`LinkStatus.materialization_policy`, `VolumeFreeSpace.state`,...).
+///
+/// `Healthy` does not say the data is safely stored: a folder whose copy is not confirmed yet
+/// still reads healthy here, and only the product view's protection line ("Not confirmed yet")
+/// says so. A consumer that wants "safely stored" reads `StatusResponse.product` (protection),
+/// not this value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OverallState {
     Healthy,
@@ -397,60 +437,33 @@ pub(crate) fn apply_account_deletion(
 }
 
 /// The device that was replaced may have held the only complete replica of a group, and the new
-/// device's state is not confirmed yet: status is never healthy meanwhile. The reason is appended
-/// after the others.
+/// device's state is not confirmed yet: status is never healthy meanwhile. One reason is appended
+/// after the others, `replacement_unconfirmed` with the step the person or the daemon is at: what
+/// is asked of the person comes before a wait, a wait (`:waiting:<why>`, so it can be told from a
+/// stall) before the plain "not confirmed yet".
 pub(crate) fn apply_replacement_unconfirmed(
     pending: bool,
+    sign_in_required: bool,
+    acknowledgement_required: bool,
+    waiting: Option<String>,
     overall_state: &mut OverallState,
     attention_reasons: &mut Vec<String>,
 ) {
+    use yadorilink_local_storage::replacement_unconfirmed as record;
     if !pending {
         return;
     }
-    attention_reasons
-        .push(yadorilink_local_storage::replacement_unconfirmed::ATTENTION_REASON.to_owned());
+    attention_reasons.push(if acknowledgement_required {
+        record::ACKNOWLEDGEMENT_ATTENTION_REASON.to_owned()
+    } else if sign_in_required {
+        record::SIGN_IN_ATTENTION_REASON.to_owned()
+    } else if let Some(why) = waiting {
+        format!("{}:{why}", record::WAITING_ATTENTION_REASON)
+    } else {
+        record::ATTENTION_REASON.to_owned()
+    });
     if *overall_state == OverallState::Healthy {
         *overall_state = OverallState::Attention;
-    }
-}
-
-/// The confirmation of the replacement was refused for lack of a valid sign-in: the person has to
-/// sign in again. Appended after every other reason (the state is already attention, because the
-/// replacement is unconfirmed).
-pub(crate) fn apply_replacement_sign_in(required: bool, attention_reasons: &mut Vec<String>) {
-    if required {
-        attention_reasons.push(
-            yadorilink_local_storage::replacement_unconfirmed::SIGN_IN_ATTENTION_REASON.to_owned(),
-        );
-    }
-}
-
-/// The person has not yet acknowledged that changes made after the backup may be missing, which
-/// the confirm of the replacement waits for. Appended after every other reason (the state is
-/// already attention, because the replacement is unconfirmed).
-pub(crate) fn apply_replacement_acknowledgement(
-    required: bool,
-    attention_reasons: &mut Vec<String>,
-) {
-    if required {
-        attention_reasons.push(
-            yadorilink_local_storage::replacement_unconfirmed::ACKNOWLEDGEMENT_ATTENTION_REASON
-                .to_owned(),
-        );
-    }
-}
-
-/// Why the confirmation of the replacement is still waiting, as the daemon's last pass recorded
-/// it. Appended after every other reason as `code:reason`, so the wait can be told from a stall.
-pub(crate) fn apply_replacement_waiting(
-    reason: Option<String>,
-    attention_reasons: &mut Vec<String>,
-) {
-    if let Some(reason) = reason {
-        attention_reasons.push(format!(
-            "{}:{reason}",
-            yadorilink_local_storage::replacement_unconfirmed::WAITING_ATTENTION_REASON
-        ));
     }
 }
 
@@ -482,6 +495,42 @@ pub(crate) struct StatusSources {
     pub(crate) auto_reclaim: std::sync::Arc<crate::provider_auto_reclaim::AutoReclaimSlot>,
     /// Where the replacement records live.
     pub(crate) config_dir: std::path::PathBuf,
+    pub(crate) network_policy: std::sync::Arc<crate::network_policy::NetworkPolicy>,
+    /// When each folder, and the device, was last seen up to date.
+    pub(crate) last_synced: LastSynced,
+}
+
+/// When each scope (a folder by local path, the device by the empty key) was last found up to
+/// date by a status read. In memory: a restart starts empty and the field is then absent until
+/// the scope is next found up to date; it is never read as "never synced".
+#[derive(Default)]
+pub(crate) struct LastSynced {
+    seen: std::sync::Mutex<std::collections::HashMap<String, i64>>,
+}
+
+impl LastSynced {
+    /// Stamps `last_synced_unix` on the device and every folder of a finished reply. A scope that
+    /// is up to date is stamped `now_unix` and remembered, unless `stale` (a reply that makes no
+    /// positive claim); others get their remembered time. Folders no longer listed are forgotten.
+    pub(crate) fn stamp(&self, response: &mut StatusResponse, now_unix: i64, stale: bool) {
+        use yadorilink_ipc_proto::daemonctl::product_status::State;
+        let mut seen = self.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let live: std::collections::HashSet<&str> =
+            response.links.iter().map(|l| l.local_path.as_str()).collect();
+        seen.retain(|key, _| key.is_empty() || live.contains(key.as_str()));
+        let mut one =
+            |key: &str, product: &mut Option<yadorilink_ipc_proto::daemonctl::ProductStatus>| {
+                let Some(product) = product else { return };
+                if !stale && product.state() == State::UpToDate {
+                    seen.insert(key.to_owned(), now_unix);
+                }
+                product.last_synced_unix = seen.get(key).copied();
+            };
+        for link in &mut response.links {
+            one(&link.local_path.clone(), &mut link.product);
+        }
+        one("", &mut response.product);
+    }
 }
 
 /// What a status reads from the ledger, the block index, the filesystem and shell-installed
@@ -492,6 +541,9 @@ pub(crate) struct CollectedStatus {
     provider_removals: Vec<yadorilink_ipc_proto::daemonctl::ProviderRemovalStatus>,
     orphan_domains: Vec<String>,
     provider_registry_restored: bool,
+    /// What the host last reported the OS holds, per provider folder group.
+    pub(crate) os_file_counts:
+        std::collections::HashMap<String, crate::provider_status::OsFileCounts>,
     reclaimable: std::collections::HashMap<String, u64>,
     /// The volume entries that share the block store's physical volume.
     shares_block_store_volume: std::collections::HashSet<String>,
@@ -521,6 +573,7 @@ pub(crate) fn collect_status(sources: &StatusSources) -> Result<CollectedStatus,
     Ok(CollectedStatus {
         runtime,
         provider_roots: sources.provider_status.snapshot(),
+        os_file_counts: sources.provider_status.os_file_counts(),
         provider_removals,
         orphan_domains,
         provider_registry_restored: crate::windows_sync_roots::registry_restored(
@@ -547,6 +600,17 @@ pub(crate) fn build_status(sources: &StatusSources) -> Result<StatusResponse, St
     Ok(compose_status(sources, &collect_status(sources)?, false))
 }
 
+/// A provider folder's three file counts, from what its table says (whose total is the folder's file
+/// count) and what the host reported the OS holds.
+pub(crate) fn provider_counts_of(
+    hydrated: u64,
+    placeholder: u64,
+    hydrating: u64,
+    os: crate::provider_status::OsFileCounts,
+) -> (u64, u64, u64) {
+    crate::provider_status::provider_file_counts(hydrated + placeholder + hydrating, os)
+}
+
 /// The whole status of the engine, as the wire type: the runtime view, the provider roots,
 /// space that could be reclaimed, the preserved-items summary and the attention rollup, from
 /// collected facts and what the daemon holds in memory now. Reads no ledger, file or block
@@ -566,9 +630,23 @@ pub(crate) fn compose_status(
     response.provider_removals = collected.provider_removals.clone();
     response.orphan_domains = collected.orphan_domains.clone();
     response.provider_registry_restored = collected.provider_registry_restored;
+    let policy = sources.network_policy.current();
+    response.paused_on_metered = policy.paused_on_metered();
+    response.network_cost_known = policy.cost_known;
     crate::status_dimensions::fill_link_dimensions(&mut response);
     for link in &mut response.links {
         link.reclaimable_bytes = collected.reclaimable.get(&link.group_id).copied().unwrap_or(0);
+        if !link.provider_root_id.is_empty() {
+            if let Some(os) = collected.os_file_counts.get(&link.group_id) {
+                (link.hydrated_count, link.placeholder_count, link.hydrating_count) =
+                    provider_counts_of(
+                        link.hydrated_count,
+                        link.placeholder_count,
+                        link.hydrating_count,
+                        *os,
+                    );
+            }
+        }
     }
     attribute_reclaimable(&mut response.volumes, &collected.reclaimable, |path| {
         collected.shares_block_store_volume.contains(path)
@@ -596,18 +674,19 @@ pub(crate) fn compose_status(
     apply_account_deletion(account_deletion, &mut overall_state, &mut attention_reasons);
     apply_replacement_unconfirmed(
         collected.replacement_pending,
+        collected.replacement_sign_in,
+        collected.replacement_acknowledgement,
+        collected.replacement_waiting.clone(),
         &mut overall_state,
         &mut attention_reasons,
     );
-    apply_replacement_sign_in(collected.replacement_sign_in, &mut attention_reasons);
-    apply_replacement_acknowledgement(
-        collected.replacement_acknowledgement,
-        &mut attention_reasons,
-    );
-    apply_replacement_waiting(collected.replacement_waiting.clone(), &mut attention_reasons);
     response.overall_state = overall_state.as_str().to_string();
     response.attention_reasons = attention_reasons;
     yadorilink_product_view::wire::fill_product_status(&mut response);
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    sources.last_synced.stamp(&mut response, now_unix, stale);
     let preserved = &collected.preserved;
     response.preserved = Some(yadorilink_ipc_proto::daemonctl::PreservedSummary {
         total: preserved.total,
@@ -689,9 +768,11 @@ pub(crate) fn overall_status(response: &StatusResponse) -> (OverallState, Vec<St
                     degraded_reasons.push(format!("file_watch_limit:{group}"));
                 }
                 DegradedCause::OwnershipLost => {
-                    degraded_reasons.push(format!("ownership_lost:{group}"));
+                    degraded_reasons.push(format!("folder_needs_relink:{group}"));
                 }
-                DegradedCause::NotJoined => degraded_reasons.push(format!("not_joined:{group}")),
+                DegradedCause::NotJoined => {
+                    degraded_reasons.push(format!("folder_needs_relink:{group}"));
+                }
                 DegradedCause::Unspecified => degraded_reasons.push(format!("degraded:{group}")),
             }
         }
@@ -750,7 +831,11 @@ pub(crate) fn overall_status(response: &StatusResponse) -> (OverallState, Vec<St
     for root in &response.provider_roots {
         // A provider folder the user can act on: not ready (enable File Provider, an error), files
         // that keep failing to download, edits kept beside a file waiting to be merged.
-        if root.readiness != "ready" && root.readiness != "preparing the folder" {
+        // Waiting for the app to finish setting up is a wait, not a fault.
+        if root.readiness != "ready"
+            && root.readiness != "preparing the folder"
+            && root.readiness != crate::provider_status::HANDOFF_ROOT_WAIT_TEXT
+        {
             attention_reasons.push(format!("provider_not_ready:{}", root.root_id));
         }
         if !root.stuck.is_empty() {
@@ -782,8 +867,14 @@ pub(crate) fn overall_status(response: &StatusResponse) -> (OverallState, Vec<St
         // Only a device on another version is a reason (the person updates it). A device that is
         // away or still connecting is availability, shown with when it was last seen, at any
         // duration; a device whose own history cannot catch up says so itself (`rebuild_needed`).
-        if peer.version_incompatible {
-            attention_reasons.push(format!("peer_update_required:{}", peer.device_id));
+        // The reason names the side to update: that device when it is older, this one when it is
+        // newer.
+        match peer.version_skew() {
+            VersionSkew::Unspecified => {}
+            VersionSkew::PeerNewer => {
+                attention_reasons.push(format!("peer_newer:{}", peer.device_id));
+            }
+            _ => attention_reasons.push(format!("peer_update_required:{}", peer.device_id)),
         }
     }
     for error in &response.recent_errors {

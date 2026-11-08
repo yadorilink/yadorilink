@@ -807,3 +807,23 @@ fn the_sweep_removes_a_probe_of_an_earlier_process_that_had_the_same_pid() {
     assert_eq!(sweep.removed, vec![stranded]);
     assert!(own.exists());
 }
+
+#[test]
+#[should_panic(expected = "not allowed to skip")]
+fn a_lost_identity_test_panics_where_skipping_is_not_allowed() {
+    report_identity_coverage_lost("some_test", true);
+}
+
+#[test]
+fn a_lost_identity_test_is_reported_not_silent_where_skipping_is_allowed() {
+    report_identity_coverage_lost("some_test", false);
+}
+
+#[test]
+fn the_temp_dir_helper_leaves_an_identity_proving_temp_dir_alone() {
+    // On a host whose temp dir proves identity (not tmpfs) the helper changes nothing; where it
+    // does not, it points TMPDIR beside the build output and the temp dir proves it afterwards.
+    if temp_dir_proves_object_identity_for_test() {
+        assert!(probe_volume_proves_object_identity(&std::env::temp_dir()));
+    }
+}

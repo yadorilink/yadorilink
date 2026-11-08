@@ -142,6 +142,10 @@ fn refusal(response: &ProviderApplyChangeResponse, original: &str) -> ResolveCon
         F::StaleView | F::KeepLocal | F::NotFound => {
             ResolveConflictError::UnrecordedLocalChanges(original.to_string())
         }
+        F::PublishOnly => ResolveConflictError::NotResolvable(
+            "this folder is publish-only on this device, so a conflict in it cannot be settled here"
+                .into(),
+        ),
         F::NotReady | F::NotAuthorized => ResolveConflictError::NotResolvable(format!(
             "the provider folder does not take changes now: {}",
             response.error

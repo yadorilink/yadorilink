@@ -658,8 +658,14 @@ fn print_claim_plan() {
          INDEXED BY idx_projection_obligations_runnable \
          WHERE state = 'pending' AND group_id = 'g' AND next_attempt_at <= 1 AND NOT {} AND NOT {} AND NOT {} \
          ORDER BY updated_at ASC, path ASC LIMIT 8",
-        crate::paused_items::covered_by_paused_item_sql("projection_obligations.group_id", "projection_obligations.path"),
-        crate::held_path::held_sql("projection_obligations.group_id", "projection_obligations.path"),
+        crate::paused_items::covered_by_paused_item_sql(
+            "projection_obligations.group_id",
+            "projection_obligations.path"
+        ),
+        crate::held_path::held_sql(
+            "projection_obligations.group_id",
+            "projection_obligations.path"
+        ),
         crate::native_rebootstrap::frozen_group_sql("projection_obligations.group_id"),
     );
     for row in conn.prepare(&sql).unwrap().query_map([], |r| r.get::<_, String>(3)).unwrap() {
@@ -938,4 +944,66 @@ fn the_next_wake_is_the_earliest_deadline_of_a_row_only_the_clock_can_release() 
     )
     .unwrap();
     assert_eq!(next_obligation_wake(&conn).unwrap(), None);
+}
+
+/// `obligation_runnability` agrees with the claim for every gate combination: a path is
+/// `Runnable` exactly when `claim_runnable_obligations` returns it.
+#[test]
+fn runnability_matches_the_claim_for_every_gate() {
+    let conn = conn();
+    // (path, group): one row per reason, plus two runnable ones.
+    insert_pending(&conn, "g", "plain", 1, 0);
+    insert_pending(&conn, "g", "later", 2, 5_000);
+    insert_pending(&conn, "g", "held", 3, 0);
+    insert_pending(&conn, "g", "paused/x", 4, 0);
+    insert_pending(&conn, "g", "parked", 5, 0);
+    insert_pending(&conn, "frozen", "a", 6, 0);
+    insert_pending(&conn, "prov", "a", 7, 0);
+    conn.execute(
+        "INSERT INTO held_paths (group_id, path, held_at_unix_nanos) VALUES ('g', 'held', 0)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO paused_items (group_id, path, paused_at_unix_nanos) VALUES ('g', 'paused', 0)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE projection_obligations SET state = 'ignore_blocked' WHERE path = 'parked'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO native_rebootstrap_journal \
+         (group_id, recovery_id, state, target_checkpoint_hash, started_at, updated_at) \
+         VALUES ('frozen', 'r', 'capturing', x'00', 0, 0)",
+        [],
+    )
+    .unwrap();
+    conn.execute("CREATE TABLE provider_roots (group_id TEXT PRIMARY KEY)", []).unwrap();
+    conn.execute("INSERT INTO provider_roots (group_id) VALUES ('prov')", []).unwrap();
+
+    let now = 100;
+    let claimed = names(&claim_runnable_obligations(&conn, now, 100, 100).unwrap());
+    let cases = [
+        ("g", "plain", ObligationRunnability::Runnable),
+        (
+            "g",
+            "later",
+            ObligationRunnability::Blocked(ObligationBlock::BackedOff { next_attempt_at: 5_000 }),
+        ),
+        ("g", "held", ObligationRunnability::Blocked(ObligationBlock::Held)),
+        ("g", "paused/x", ObligationRunnability::Blocked(ObligationBlock::Paused)),
+        ("g", "parked", ObligationRunnability::Blocked(ObligationBlock::Parked)),
+        ("frozen", "a", ObligationRunnability::Blocked(ObligationBlock::GroupFrozen)),
+        ("prov", "a", ObligationRunnability::Blocked(ObligationBlock::ProviderGroup)),
+        ("g", "never", ObligationRunnability::NoObligation),
+    ];
+    for (group, path, want) in cases {
+        let got = obligation_runnability(&conn, group, path, now).unwrap();
+        assert_eq!(got, want, "{group}/{path}");
+        let is_claimed = claimed.contains(&(group.to_string(), path.to_string()));
+        assert_eq!(got == ObligationRunnability::Runnable, is_claimed, "{group}/{path}");
+    }
 }

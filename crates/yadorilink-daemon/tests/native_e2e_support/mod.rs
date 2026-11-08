@@ -386,6 +386,12 @@ pub fn read<T>(node: &TopologyNode, f: impl FnMut(&Connection) -> Result<T, Sync
     node.state.replica_coordinator.database().read(f).unwrap()
 }
 
+/// Brings the node's stored namespace trie up to its heads, as a summary exchange does first.
+pub fn flush_namespace(node: &TopologyNode) {
+    yadorilink_sync_sqlite::native_namespace::flush_all(&node.state.replica_coordinator.database())
+        .unwrap();
+}
+
 pub fn user_version(node: &TopologyNode) -> i32 {
     read(node, |conn| Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?))
 }
@@ -438,6 +444,7 @@ pub fn replica_state(
     node: &TopologyNode,
     group: &str,
 ) -> (BTreeMap<String, Vec<DeltaHash>>, String) {
+    // The root of the heads as loaded, whether or not the stored trie is up to date.
     let root = read(node, |conn| {
         let group = yadorilink_replica_domain::ids::FolderGroupId(group.to_owned());
         let state = yadorilink_sync_sqlite::native_store::load_state(conn, &group)?;
@@ -533,6 +540,7 @@ pub fn native_plan_names(node: &TopologyNode, group: &str) -> BTreeMap<String, [
 /// heads and root, or, for a native run, the same native summary roots.
 pub async fn converge_state(nodes: &[&TopologyNode], group: &str, what: &str) {
     let roots = |node: &TopologyNode| {
+        flush_namespace(node);
         format!(
             "{:?}",
             read(node, |conn| yadorilink_sync_sqlite::native_replication::summary_roots(
@@ -829,6 +837,7 @@ pub fn admit_native_put(
 /// The device's native summary roots, as one comparable value: what a restart
 /// or a no-op must leave unchanged.
 pub fn native_state(node: &TopologyNode, group: &str) -> String {
+    flush_namespace(node);
     format!(
         "{:?}",
         read(node, |conn| yadorilink_sync_sqlite::native_replication::summary_roots(

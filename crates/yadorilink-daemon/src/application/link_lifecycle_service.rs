@@ -124,6 +124,7 @@ impl LinkLifecycleService {
         path: &std::path::Path,
         acknowledged: bool,
     ) -> Result<(), DaemonError> {
+        crate::error::refuse_unsupported_drive(path)?;
         if acknowledged {
             return Ok(());
         }
@@ -271,6 +272,8 @@ impl LinkLifecycleService {
                 step: NextStep::CheckLinkStatus,
             });
         }
+
+        crate::error::refuse_unsupported_drive(std::path::Path::new(&command.local_path))?;
 
         // Nested links, and one folder linked to two groups, are an unsupported
         // topology: refused at every confirmation level, because two linked

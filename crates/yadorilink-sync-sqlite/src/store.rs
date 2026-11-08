@@ -768,6 +768,11 @@ impl SqliteSyncStore {
             else {
                 return Ok(None);
             };
+            // A symlink cannot be rewritten in place: a replaced one is a new object, so its
+            // recorded identity alone says it is still the one the daemon put there.
+            if basis.object_kind == MaterializedObjectKind::Symlink {
+                return Ok(Some((basis, None)));
+            }
             if basis.object_kind != MaterializedObjectKind::RegularFile {
                 return Ok(None);
             }
@@ -793,7 +798,7 @@ impl SqliteSyncStore {
                     info
                 })
                 .collect();
-            Ok(Some((basis, blocks)))
+            Ok(Some((basis, Some(blocks))))
         })?;
         let Some((basis, blocks)) = found else { return Ok(false) };
         if revalidate_identity_against_disk(&basis, out_path, birth_time_granularity)
@@ -805,6 +810,7 @@ impl SqliteSyncStore {
         // in-place rewrite it says nothing about the bytes. The bytes are the recorded version's,
         // or this is not the pre-image: what matches a version in the history cannot be an edit
         // that history lacks.
+        let Some(blocks) = blocks else { return Ok(true) };
         Ok(yadorilink_local_storage::disk_content_comparison(out_path, &blocks)
             .is_ok_and(|found| found == yadorilink_local_storage::DiskContentComparison::Matched))
     }

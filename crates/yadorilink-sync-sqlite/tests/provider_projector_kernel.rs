@@ -110,6 +110,12 @@ fn run(layout: &str, n: usize, batch: usize) -> (f64, f64) {
     }
     let projected = started.elapsed().as_secs_f64();
     assert_eq!(done, n);
+    // A projected row names the device that wrote its head.
+    let index = yadorilink_sync_sqlite::file_index::FileIndexRepository::new(db.clone());
+    assert_eq!(
+        index.get_origin_device_id(GROUP, &path_for(layout, 0)).unwrap().as_deref(),
+        Some("dev-kernel")
+    );
     let t = Instant::now();
     assert_eq!(repo.verify_namespace(GROUP).unwrap(), None);
     let verified = t.elapsed().as_secs_f64();

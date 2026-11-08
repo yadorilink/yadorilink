@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 /// The record's file name in the state directory.
 pub const FILE: &str = "replacement-unconfirmed.json";
 
-/// The attention code the daemon reports while the record exists.
+/// The attention code the daemon reports while the record exists (the first step; the other
+/// steps are `replacement_unconfirmed:<step>`).
 pub const ATTENTION_REASON: &str = "replacement_unconfirmed";
 
 /// Present while the daemon's confirmation was refused for lack of a valid sign-in: the person has
@@ -22,13 +23,12 @@ pub const SIGN_IN_REQUIRED_FILE: &str = "replacement-unconfirmed.sign-in-require
 
 /// The extra attention code the daemon reports while [`SIGN_IN_REQUIRED_FILE`] exists next to
 /// the record.
-pub const SIGN_IN_ATTENTION_REASON: &str = "replacement_unconfirmed_sign_in_required";
+pub const SIGN_IN_ATTENTION_REASON: &str = "replacement_unconfirmed:sign_in";
 
 /// The attention code the daemon reports while the record exists and the person has not yet
 /// acknowledged that changes made after the backup may be missing (see
 /// [`Record::acknowledged_possible_loss`]). Appended after the other reasons.
-pub const ACKNOWLEDGEMENT_ATTENTION_REASON: &str =
-    "replacement_unconfirmed_acknowledgement_required";
+pub const ACKNOWLEDGEMENT_ATTENTION_REASON: &str = "replacement_unconfirmed:acknowledge";
 
 /// Holds the reason the daemon's last confirmation pass is still waiting, as one line of text.
 /// Status shows it so a wait can be told from a stall; it is only ever read beside a record.
@@ -36,7 +36,7 @@ pub const WAITING_FILE: &str = "replacement-unconfirmed.waiting";
 
 /// The attention code (`code:reason`) the daemon reports while [`WAITING_FILE`] exists next to
 /// the record.
-pub const WAITING_ATTENTION_REASON: &str = "replacement_unconfirmed_waiting";
+pub const WAITING_ATTENTION_REASON: &str = "replacement_unconfirmed:waiting";
 
 /// The longest wait reason that is kept; longer text is cut.
 const WAITING_REASON_MAX_CHARS: usize = 300;

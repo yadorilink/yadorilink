@@ -17,6 +17,13 @@ fn main() {
     let roots: Vec<_> = groups
         .iter()
         .map(|group| {
+            // A stopped daemon may leave head writes whose paths are not yet patched into the
+            // stored trie; a summary does that first.
+            yadorilink_sync_sqlite::native_namespace::flush_pending(
+                &conn,
+                &FolderGroupId(group.clone()),
+            )
+            .expect("bring the stored trie up to date");
             let r = yadorilink_sync_sqlite::native_replication::summary_roots(
                 &conn,
                 &FolderGroupId(group.clone()),

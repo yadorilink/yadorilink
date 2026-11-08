@@ -906,6 +906,7 @@ async fn an_abandoned_hydration_keeps_its_space_reserved_until_its_write_finishe
         store.clone() as Arc<dyn yadorilink_peer_session::ports::BlockContentStore>,
         ports.block_write_activity_provider.clone(),
         super::HeadroomPolicy::disabled(),
+        crate::test_support::peer_session_fixture::scratch_ignore_rules(),
     );
     executor.set_headroom_enforced_for_tests(true);
     *executor.fake_available_bytes.lock().unwrap() = Some(100 * 1024 * 1024);

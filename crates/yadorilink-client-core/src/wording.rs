@@ -291,6 +291,9 @@ pub fn login_event_lines(event: &crate::ops::auth::LoginEvent) -> Vec<String> {
         LoginEvent::SignedIn { client_id } => {
             vec![format!("Logged in. This computer is enrolled as {client_id}.")]
         }
+        LoginEvent::DeviceRegistered { device_name } => {
+            vec![format!("Added this computer to your account as \"{device_name}\".")]
+        }
     }
 }
 

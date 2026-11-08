@@ -161,3 +161,17 @@ fn the_log_is_bounded_by_count_and_age() {
     put(&repo, "fresh", 1, false, ME);
     assert_eq!(count(&db), 1);
 }
+
+#[test]
+fn the_newest_events_author_is_read_without_a_scan_and_is_per_group() {
+    let repo = FileIndexRepository::new(open());
+    assert_eq!(repo.newest_activity_origin(G).unwrap(), None, "no event yet");
+
+    put(&repo, "a.txt", 1, false, PEER);
+    assert_eq!(repo.newest_activity_origin(G).unwrap(), Some(Some(PEER.to_string())));
+    // A later change by this device is the newest now.
+    put(&repo, "b.txt", 2, false, ME);
+    assert_eq!(repo.newest_activity_origin(G).unwrap(), Some(Some(ME.to_string())));
+    // Another group's events say nothing about this one.
+    assert_eq!(repo.newest_activity_origin("other").unwrap(), None);
+}

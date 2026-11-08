@@ -51,6 +51,7 @@ NAMES = (
     "fs::hard_link",
     "MoveFileExW",
     "FlushFileBuffers",
+    "SetFileInformationByHandle",
     "DeleteFileW",
     "RemoveDirectoryW",
     "CreateHardLinkW",
@@ -71,6 +72,9 @@ ALLOWLIST: dict[str, dict[str, int]] = {
         "fs::remove_file": 5,
         "fs::rename": 1,
     },
+    # The start-at-login entry: a removal that is lost leaves an entry whose program is gone or
+    # still valid, and `daemon stop --disable` repeats it.
+    C + "yadorilink-client-core/src/ops/autostart.rs": {"fs::remove_file": 1},
     # Generation files: the removal of generations older than the previous one, of a retired
     # record, and of a generation published below the newest; a lost removal leaves an old
     # generation no reader prefers.
@@ -82,8 +86,18 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     # lookup of the account's device list; nothing is published to a peer or depends on it.
     C + "yadorilink-cli/src/commands/device_names.rs": {"fs::remove_file": 1, "fs::rename": 1},
     C + "yadorilink-fs-platform/src/generation.rs": {"fs::remove_file": 3},
-    C + "yadorilink-fs-platform/src/durable_dir/raw.rs": {"MoveFileExW": 1, "fs::rename": 1},
-    C + "yadorilink-fs-platform/src/durable_dir/probe.rs": {"fs::remove_dir_all": 1},
+    # The Windows durable move itself: a rename on a handle held open on the source, with both
+    # parent directories flushed before it returns (see `durable_dir`'s module comment).
+    C + "yadorilink-fs-platform/src/durable_dir/raw.rs": {"SetFileInformationByHandle": 1},
+    # The Windows arm of the judged segment-file unlink (`delete_through`: the disposition set on
+    # the one handle the verdict was asked about, the extended form and its plain fallback). Like
+    # the other arm it is not a namespace publish, and a lost unlink leaves a segment the next
+    # collection removes again.
+    C
+    + "yadorilink-fs-platform/src/durable_dir/probe.rs": {
+        "SetFileInformationByHandle": 2,
+        "fs::remove_dir_all": 1,
+    },
     # The non-Windows arm of the judged segment-file unlink: the unlink of a block-store
     # segment is not a namespace publish, and a lost one leaves a segment the next collection
     # removes again.
@@ -156,6 +170,7 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     # The receiver's list of redeemed links: a convenience; losing it only means an offer waits
     # for an explicit receive after a restart.
     C + "yadorilink-daemon/src/send_transfer/redeem_book.rs": {"fs::rename": 1},
+    C + "yadorilink-daemon/src/network_policy.rs": {"fs::rename": 1},
     C + "yadorilink-daemon/src/space_management_config.rs": {"fs::rename": 1},
     C + "yadorilink-daemon/src/log_roll.rs": {"fs::rename": 1},
     C + "yadorilink-daemon/src/reporting/counters.rs": {"fs::rename": 1},
@@ -214,11 +229,6 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     C + "yadorilink-windows-provider-policy/src/provider_authoring.rs": {"fs::remove_file": 2},
     # The Windows side of authoring: the throwaway partial copy of a failed ingest copy, which
     # nothing refers to.
-    # The uninstall guardian's executable copy in the temporary directory, outside the package, any
-    # sync root and the user's data: copied to a partial name and renamed into place. A rename lost
-    # to a crash leaves no file at the final name, so the next start stages the copy again; a stale
-    # partial is overwritten by that copy.
-    S + "package_removal.rs": {"fs::rename": 1},
     S + "provider_authoring.rs": {"fs::remove_file": 3},
     S + "provider_namespace.rs": {
         "CfConvertToPlaceholder": 1,
@@ -226,6 +236,12 @@ ALLOWLIST: dict[str, dict[str, int]] = {
         # reported done. It adds durability; a failed flush is an error to the caller,
         # so nothing is reported done that is not on the disk.
         "FlushFileBuffers": 1,
+        # `delete_on_close`, behind the authoring step's `discard`: the removal of the one object
+        # it names, through a handle that allows no writer in and whose identity and USN were just
+        # checked. A removal that does not happen is returned to the caller as an error (the
+        # bytes worth keeping were moved away by a durable move before); nothing is published and
+        # nothing else is touched.
+        "SetFileInformationByHandle": 1,
     },
 }
 

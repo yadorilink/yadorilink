@@ -26,7 +26,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use yadorilink_replica_domain::author::AuthorId;
 use yadorilink_replica_domain::author_closure::SignedAuthorClosure;
@@ -182,6 +182,13 @@ pub fn build_native_recovery_bundle(
     group_id: &FolderGroupId,
     sealer_key: &ed25519_dalek::SigningKey,
 ) -> Result<NativeBootstrap, SyncSqliteError> {
+    // The cheap refusal first. A head whose delta or publication evidence this replica does not
+    // hold makes the bundle impossible, and a requester that is refused asks again; finding that
+    // out after loading every head and rebuilding the roots made each refusal cost the whole group
+    // with the writer gate held.
+    if let Some(provenance) = first_head_without_evidence(conn, group_id)? {
+        delta_evidence(conn, group_id, &provenance)?;
+    }
     let checkpoint = crate::native_store::seal_checkpoint(conn, group_id, sealer_key)?;
     let state = crate::native_store::load_state(conn, group_id)?;
     let states = crate::native_store::load_author_states(conn, group_id)?;
@@ -283,6 +290,26 @@ pub fn adopt_own_seal(
         policy,
         &crate::native_checkpoint_frontier::CheckpointCoverage { states },
     )
+}
+
+/// The provenance of a live head whose signed delta or publication evidence is not held, if any:
+/// one indexed probe per head that stops at the first.
+fn first_head_without_evidence(
+    conn: &Connection,
+    group_id: &FolderGroupId,
+) -> Result<Option<DeltaHash>, SyncSqliteError> {
+    let found: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT h.provenance FROM native_heads h WHERE h.group_id = ?1 AND ( \
+               NOT EXISTS (SELECT 1 FROM native_delta_bodies b \
+                           WHERE b.group_id = h.group_id AND b.delta_hash = h.provenance) \
+               OR NOT EXISTS (SELECT 1 FROM native_delta_authorization a \
+                              WHERE a.delta_hash = h.provenance)) LIMIT 1",
+            [group_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    found.map(|bytes| Ok(DeltaHash(crate::native_store::as_array32(&bytes)?))).transpose()
 }
 
 fn delta_evidence(
@@ -564,6 +591,7 @@ mod tests {
     mod rebootstrap_freeze;
     mod rebootstrap_install;
     mod rebootstrap_items;
+    mod rebootstrap_phase;
     mod rebootstrap_preserve;
     mod rebootstrap_replay;
     mod rebootstrap_sweep;
@@ -1423,6 +1451,7 @@ mod tests {
     // --- auxiliary native tables around a join -------------------------------
 
     fn roots_of(c: &Connection) -> ([u8; 32], [u8; 32]) {
+        crate::native_namespace::flush_pending(c, &group()).unwrap();
         let roots = crate::native_replication::summary_roots(c, &group()).unwrap();
         (roots.namespace_root, roots.author_state_root)
     }

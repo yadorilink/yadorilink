@@ -67,9 +67,13 @@ pub const CLEARED_BY_INSTALL: &[&str] = &[
     "native_delta_log",
     "native_heads",
     "native_history_floor",
+    "native_namespace_node",
+    "native_namespace_pending",
+    "native_namespace_root",
     "native_local_capture",
     "native_recursive_operation_parts",
     "native_removal_operation",
+    "peer_own_progress",
 ];
 
 /// Tables with a `group_id` column the install keeps: the rebootstrap's own
@@ -105,8 +109,6 @@ pub const PRESERVED_BY_INSTALL: &[&str] = &[
     "native_contest_candidate",
     // The units of own intent a replay did not author: the area that holds them stays.
     "native_unreplayed_unit",
-    // A cache token that moves by trigger when the tables it covers change.
-    "native_state_generation",
     // What describes the sync root and this device's use of the group.
     "block_fetch_refusals",
     "duplicate_recovery_paths",
@@ -133,7 +135,6 @@ pub const PRESERVED_BY_INSTALL: &[&str] = &[
     "path_local_history_erased",
     "path_materialized_generations",
     "paused_items",
-    "pinned_items",
     "provider_dirs",
     "provider_dirty_paths",
     "provider_items",
@@ -144,6 +145,8 @@ pub const PRESERVED_BY_INSTALL: &[&str] = &[
     "projection_obligations",
     "restore_operations",
     "retained_directories",
+    "retention_rule_generations",
+    "retention_rules",
     // A rewind's progress journal: what it authored are ordinary changes,
     // and the row only says how far the run got.
     "rewind_runs",
@@ -462,8 +465,22 @@ pub(crate) fn clear_native_state(
         if *table == "native_authorization_checkpoints" {
             continue;
         }
+        if *table == "native_authoring_witness" {
+            // A file row stays authored after its head is superseded: the witness behind it
+            // outlives the head (see the table's definition). The rows the group keeps are
+            // rewritten by the projection of the installed state, and a committed database
+            // refuses to open with a current row whose witness is gone while others exist.
+            conn.execute(
+                "DELETE FROM native_authoring_witness WHERE group_id = ?1 AND identity NOT IN \
+                 (SELECT native_authoring_identity FROM files \
+                  WHERE group_id = ?1 AND deleted = 0 AND native_authoring_identity IS NOT NULL)",
+                [g],
+            )?;
+            continue;
+        }
         conn.execute(&format!("DELETE FROM {table} WHERE group_id = ?1"), [g])?;
     }
+    crate::peer_progress::note_install(g);
     Ok(())
 }
 

@@ -243,6 +243,36 @@ impl ProviderMembership {
         snapshot.test_age += by;
     }
 
+    /// How many items the host last reported the OS holds bytes of in `root_id`, from its COMPLETE
+    /// snapshot (the host lists files only); `None` when there is none. Kept incrementally by the
+    /// host's reports, so this reads a length and walks nothing.
+    pub(crate) fn held_count(&self, root_id: &str) -> Option<u64> {
+        self.roots
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .snapshots
+            .get(root_id)
+            .filter(|snapshot| snapshot.complete)
+            .map(|snapshot| snapshot.items.len() as u64)
+    }
+
+    /// How many files of `group_id` are being downloaded: the requested opens, leaving out the
+    /// files that only linger after their last request and that the host already reports as on this
+    /// computer (see `RequestedOpens::count_unless_held`).
+    pub(crate) fn opening_count(
+        &self,
+        opens: &crate::requested_opens::RequestedOpens,
+        group_id: &str,
+        root_id: &str,
+    ) -> u64 {
+        opens.count_unless_held(group_id, |item| self.is_held(root_id, item))
+    }
+
+    /// Whether `item` is in the root's COMPLETE snapshot of what the OS holds.
+    pub(crate) fn is_held(&self, root_id: &str, item: &[u8]) -> bool {
+        item_id(item).is_some_and(|item| self.stamp(root_id, &item).is_some())
+    }
+
     /// The `observed_after_seq` of the root's COMPLETE snapshot, of any age.
     fn observed_after(&self, root_id: &str) -> Option<u64> {
         self.roots
@@ -277,7 +307,7 @@ pub(crate) fn record_handoff(
     item: &ItemId,
     version: yadorilink_replica_domain::ids::VersionHash,
 ) -> Result<Option<u64>, crate::sync_error::SyncError> {
-    let seq = coordinator.provider_repository().record_handoff(root_id, item, version)?;
+    let seq = coordinator.provider_writes().record_handoff(root_id, item, version)?;
     if let Some(seq) = seq {
         host.evidence_tick(root_id, seq);
     }
@@ -295,7 +325,7 @@ pub(crate) fn record_window_serve(
     item: &ItemId,
     version: yadorilink_replica_domain::ids::VersionHash,
 ) -> Result<Option<u64>, crate::sync_error::SyncError> {
-    let seq = coordinator.provider_repository().record_window_serve(root_id, item, version)?;
+    let seq = coordinator.provider_writes().record_window_serve(root_id, item, version)?;
     if let Some(seq) = seq {
         host.evidence_tick(root_id, seq);
     }

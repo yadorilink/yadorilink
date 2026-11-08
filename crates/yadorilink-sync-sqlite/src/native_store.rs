@@ -252,9 +252,9 @@ pub fn init_native_tables(conn: &Connection) -> Result<(), SyncSqliteError> {
     crate::native_rebootstrap_install::init_tables(conn)?;
     crate::native_rebootstrap_replay::init_tables(conn)?;
     crate::native_recovery_items::init_tables(conn)?;
-    crate::native_summary_cache::init_tables(conn)?;
+    crate::native_namespace::init_tables(conn)?;
     crate::projection_obligations::init_projection_obligations_schema(conn)?;
-    crate::pinned_items::init_pinned_items_schema(conn)?;
+    crate::retention_rules::init_retention_rules_schema(conn)?;
     Ok(())
 }
 
@@ -394,6 +394,13 @@ pub fn native_heads_at(
 
 /// The live head in the columns `author, incarnation, seq, version, provenance`
 /// starting at column `base` of `row`.
+pub(crate) fn live_head_at(
+    row: &rusqlite::Row<'_>,
+    base: usize,
+) -> Result<yadorilink_replica_domain::native_state::LiveHead, SyncSqliteError> {
+    live_head_from_row(row, base)
+}
+
 fn live_head_from_row(
     row: &rusqlite::Row<'_>,
     base: usize,
@@ -512,6 +519,12 @@ pub(crate) fn as_array32(bytes: &[u8]) -> Result<[u8; 32], SyncSqliteError> {
 /// `MAX_SELF_HEADS`, so a state that violates that bound (which
 /// `NativeState::author` never produces) is refused here, not silently
 /// truncated.
+pub(crate) fn author_buckets_of(
+    heads: &std::collections::BTreeMap<Dot, HeadPayload>,
+) -> AuthorBuckets {
+    author_buckets(heads)
+}
+
 fn author_buckets(heads: &std::collections::BTreeMap<Dot, HeadPayload>) -> AuthorBuckets {
     let mut by_author: std::collections::BTreeMap<AuthorId, Vec<DeltaHash>> =
         std::collections::BTreeMap::new();
@@ -780,8 +793,9 @@ fn seal_checkpoint_in(
     group_id: &FolderGroupId,
     sealer_key: &ed25519_dalek::SigningKey,
 ) -> Result<NativeCheckpoint, SyncSqliteError> {
-    let state = load_state(tx, group_id)?;
-    let namespace = namespace_root(&state)?;
+    // The stored trie's root, not a rebuild of it from every head, brought up to the heads first.
+    crate::native_namespace::flush_pending(tx, group_id)?;
+    let namespace = crate::native_namespace::namespace_root(tx, group_id)?;
     let author_state_root = author_state_root(tx, group_id)?;
 
     let mut checkpoint = NativeCheckpoint::new(
@@ -1026,6 +1040,7 @@ fn install_touched_heads(
             }
         }
     }
+    // The stored namespace trie is patched from the paths a trigger noted, when its root is wanted.
     Ok(())
 }
 
@@ -1398,6 +1413,8 @@ pub fn install_state(
             count_head_rows_written(1);
         }
     }
+    drop(insert_head);
+    // The stored trie follows from the paths the triggers noted (every old and every new head's).
     Ok(())
 }
 

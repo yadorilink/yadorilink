@@ -59,12 +59,31 @@ const JOURNAL: &str = "identity-restart.json";
 /// Where retired identities are kept, one directory per retired device id.
 pub(crate) const RETIRED_DIR: &str = "retired-devices";
 
+/// Why a linked folder was not joined to its group again; a front end words each in its own
+/// language and never shows `RejoinFailure::message`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RejoinReason {
+    /// A provider folder: it is joined again from the provider folder list.
+    ProviderFolder,
+    /// This host does not join a folder again by itself: accept an invite to its group again, or
+    /// unlink the folder.
+    HostCannotRejoin,
+    /// This account does not own the folder group, so it cannot be joined again from here:
+    /// accept a new invite to it.
+    NotGroupOwner,
+    /// Joining the group again failed; start over again retries it. The message says why, for
+    /// the log.
+    JoinFailed,
+}
+
 /// What happened to one linked folder when the new device joined its group again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RejoinFailure {
     pub local_path: String,
     pub group_id: String,
+    /// The English sentence, for the command line and the log.
     pub message: String,
+    pub reason: RejoinReason,
 }
 
 /// The finished (or nearly finished) start over.
@@ -560,18 +579,25 @@ async fn rejoin_all<P: StartOverPorts>(
     };
     for folder in folders {
         let needs_person = if folder.local_path.starts_with("provider://") {
-            Some("a provider folder is joined again from the provider folder list")
+            Some((
+                RejoinReason::ProviderFolder,
+                "a provider folder is joined again from the provider folder list",
+            ))
         } else if !can_rejoin {
-            Some("this host does not join a folder again by itself; accept an invite to its group again, or unlink the folder")
+            Some((
+                RejoinReason::HostCannotRejoin,
+                "this host does not join a folder again by itself; accept an invite to its group again, or unlink the folder",
+            ))
         } else if !names.iter().any(|(id, _)| *id == folder.group_id) {
-            Some(
+            Some((
+                RejoinReason::NotGroupOwner,
                 "this account does not own the folder group, so it cannot be joined again from \
                  here; accept a new invite to it",
-            )
+            ))
         } else {
             None
         };
-        if let Some(message) = needs_person {
+        if let Some((reason, message)) = needs_person {
             if marked.contains(&folder.local_path) {
                 continue;
             }
@@ -600,6 +626,7 @@ async fn rejoin_all<P: StartOverPorts>(
                 local_path: folder.local_path,
                 group_id: folder.group_id,
                 message,
+                reason,
             });
             continue;
         }
@@ -620,6 +647,7 @@ async fn rejoin_all<P: StartOverPorts>(
                     local_path: folder.local_path,
                     group_id: folder.group_id,
                     message: error.to_string(),
+                    reason: RejoinReason::JoinFailed,
                 });
             }
         }

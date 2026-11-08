@@ -146,6 +146,8 @@ pub(super) struct Harness {
     processor: Arc<LocalChangeProcessor>,
     #[cfg(unix)]
     pub(super) store: Arc<SegmentBlockStore>,
+    /// Where this harness's ignore rules live; a test writes a group's rules here.
+    pub(super) rules: yadorilink_fs_platform::ignore_patterns::IgnoreRulesStore,
     root: std::path::PathBuf,
     flush: Arc<LinkFlushHandle>,
     /// What `LinkFlush` (the `through_link_flush` guard) asks.
@@ -234,6 +236,9 @@ impl Harness {
         let generation = state.startup_readiness().begin_group_startup(GROUP);
         state.startup_readiness().mark_group_ready(GROUP, generation);
 
+        let rules = yadorilink_fs_platform::ignore_patterns::IgnoreRulesStore::new(
+            store_dir.path().join("config"),
+        );
         let root_lock =
             yadorilink_root_authority::sync_root_lock::SyncRootLock::acquire(&root).unwrap();
         let root_lease = Arc::new(RootLease::new(root_lock, GROUP.to_string(), 1));
@@ -253,7 +258,8 @@ impl Harness {
                     SigningKey::from_bytes(&[7u8; 32]),
                 )
                 .unwrap(),
-            )),
+            ))
+            .with_ignore_rules(rules.clone()),
         );
 
         let (status_push_tx, _rx) = tokio::sync::broadcast::channel(16);
@@ -262,6 +268,7 @@ impl Harness {
             block_store: store.clone(),
             telemetry: Arc::new(crate::runtime_telemetry::RuntimeTelemetry::new(status_push_tx)),
             device_id: LOCAL_DEVICE.to_string(),
+            ignore_rules: rules.clone(),
             host: Arc::new(NoopHost),
         });
         // An accumulator with nothing pending for any exact path: answers
@@ -319,6 +326,7 @@ impl Harness {
             store.clone() as Arc<dyn yadorilink_peer_session::ports::BlockContentStore>,
             ports.block_write_activity_provider.clone(),
             super::HeadroomPolicy::disabled(),
+            rules.clone(),
         );
         Self {
             session,
@@ -327,6 +335,7 @@ impl Harness {
             processor,
             #[cfg(unix)]
             store,
+            rules,
             root,
             flush: handle,
             guard_handle,
@@ -1150,8 +1159,10 @@ async fn the_older_bytes_a_failed_write_left_under_the_newer_row_are_not_authore
 /// the root is not writable) is demoted: the row holds the newer version, the
 /// disk still holds this device's own older bytes, and the write's fence bump
 /// has already voided the older bytes' proof. Startup repair must not read
-/// those bytes as an offline edit and author them over the peer's version: it
-/// quarantines them and rebuilds the row's version from the local blocks.
+/// those bytes as an offline edit and author them over the peer's version: they
+/// are this device's own earlier write, untouched, so it replaces them in place
+/// with the row's version rebuilt from the local blocks (no conflict copy of
+/// bytes the device itself wrote).
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn startup_repair_does_not_author_the_older_bytes_a_demoted_write_left_under_the_newer_row() {
@@ -1211,12 +1222,8 @@ async fn startup_repair_does_not_author_the_older_bytes_a_demoted_write_left_und
     )
     .unwrap();
 
-    assert_eq!(report.quarantined_dirty.len(), 1, "{report:?}");
-    assert_eq!(
-        std::fs::read(h.path(&report.quarantined_dirty[0].1)).unwrap(),
-        older,
-        "the older bytes are preserved"
-    );
+    assert!(report.quarantined_dirty.is_empty(), "{report:?}");
+    assert_eq!(report.reconstructed, vec!["notes.txt".to_string()], "{report:?}");
     assert_eq!(std::fs::read(h.path("notes.txt")).unwrap(), newer, "the row's version is rebuilt");
     assert!(h.state.materialization_intent_target(GROUP, "notes.txt").unwrap().is_none());
     h.redrive().await;

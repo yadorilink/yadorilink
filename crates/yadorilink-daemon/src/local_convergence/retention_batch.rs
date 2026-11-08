@@ -228,7 +228,7 @@ impl RetentionIngestQueue {
             Opened::Gone => {
                 return Read::Answer(Ok(RetentionProof::NoLocalBytes(request.row.clone())))
             }
-            Opened::Unavailable => return Read::Answer(Err(ProofError::FileUnavailable)),
+            Opened::Unavailable(_) => return Read::Answer(Err(ProofError::FileUnavailable)),
         };
         let no_bytes = || Read::Answer(Ok(RetentionProof::NoLocalBytes(request.row.clone())));
         let expected_len = request

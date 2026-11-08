@@ -320,6 +320,28 @@ impl HandoffLeaseRepository {
     }
 }
 
+/// The versions every active lease of every folder pins, by folder, read on `conn` so a caller's
+/// transaction sees leases and rows from one snapshot.
+pub(crate) fn leased_version_keys_all_groups(
+    conn: &rusqlite::Connection,
+    now_unix_seconds: i64,
+) -> Result<std::collections::HashMap<String, HashSet<PinnedVersion>>, SyncSqliteError> {
+    let mut stmt = conn.prepare(
+        "SELECT group_id, pinned_versions_json FROM handoff_leases \
+         WHERE state IN ('provisional', 'confirmed') AND expires_at_unix > ?1",
+    )?;
+    let mut pinned: std::collections::HashMap<String, HashSet<PinnedVersion>> =
+        std::collections::HashMap::new();
+    let rows = stmt
+        .query_map([now_unix_seconds], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    for row in rows {
+        let (group_id, json) = row?;
+        let versions: Vec<PinnedVersion> = serde_json::from_str(&json)?;
+        pinned.entry(group_id).or_default().extend(versions);
+    }
+    Ok(pinned)
+}
+
 fn handoff_lease_decode_error(column_index: usize, detail: impl Into<String>) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(
         column_index,

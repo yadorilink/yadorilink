@@ -1,0 +1,7 @@
+# comment
+*.tmp
+!keep.tmp
+build/
+/root-only
+**/deep/*.log
+\#hash

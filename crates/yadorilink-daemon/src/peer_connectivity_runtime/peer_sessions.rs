@@ -60,9 +60,20 @@ pub(crate) fn keep_peer_sessions(
     stack: &Arc<SyncStack>,
 ) -> tokio::task::JoinHandle<()> {
     let changes = state.authority.subscribe_to_peer_changes();
-    let keepers = follow_authorized_peers(Arc::downgrade(state), Arc::downgrade(stack), changes);
+    let keepers = follow_authorized_peers(
+        Arc::downgrade(state),
+        Arc::downgrade(stack),
+        changes,
+        state.network_policy.subscribe(),
+    );
     let recycler = recycle_when_network_returns(Arc::downgrade(stack));
     let relay_guard = super::relay_guard::run(Arc::downgrade(stack));
+    let wake_stack = Arc::downgrade(stack);
+    let wake = crate::wake_detector::run(crate::wake_detector::SystemClock, move || {
+        if let Some(stack) = wake_stack.upgrade() {
+            stack.endpoint().network_resumed();
+        }
+    });
     // A peer that stops answering on its native connection is not carrying sync traffic on
     // the sync connection either: both ride the same paths. The native side finds out (it
     // asks the peer something every round) and says so here.
@@ -74,7 +85,7 @@ pub(crate) fn keep_peer_sessions(
         }
     }));
     tokio::spawn(async move {
-        tokio::join!(keepers, recycler, relay_guard);
+        tokio::join!(keepers, recycler, relay_guard, wake);
     })
 }
 
@@ -107,9 +118,23 @@ async fn follow_authorized_peers(
     state: Weak<DaemonState>,
     stack: Weak<SyncStack>,
     mut changes: tokio::sync::watch::Receiver<()>,
+    mut policy: tokio::sync::watch::Receiver<crate::network_policy::PolicyState>,
 ) {
     let mut keepers = Keepers::default();
     loop {
+        // Paused (a metered connection): no keeper dials and what is connected is closed. The
+        // keepers start again, with fresh backoff, when the policy allows traffic.
+        if policy.borrow_and_update().paused_on_metered() {
+            keepers.stop_all().await;
+            if let Some(stack) = stack.upgrade() {
+                let closed = stack.endpoint().recycle_connections();
+                tracing::info!(closed, "paused on a metered network; closed the peer connections");
+            }
+            if policy.changed().await.is_err() {
+                return;
+            }
+            continue;
+        }
         let Some(pinned) = state.upgrade().map(|state| state.authority.pinned_peers()) else {
             return;
         };
@@ -133,8 +158,9 @@ async fn follow_authorized_peers(
                 slot.insert((key, keeper));
             }
         }
-        if changes.changed().await.is_err() {
-            return;
+        tokio::select! {
+            changed = changes.changed() => if changed.is_err() { return },
+            changed = policy.changed() => if changed.is_err() { return },
         }
     }
 }
@@ -142,6 +168,17 @@ async fn follow_authorized_peers(
 /// The per-peer keepers, stopped together when their owner is.
 #[derive(Default)]
 struct Keepers(HashMap<String, ([u8; 32], tokio::task::JoinHandle<()>)>);
+
+impl Keepers {
+    /// Stops every keeper and waits until each has let go of what it held, so a dial in flight
+    /// cannot register a connection after the caller has swept them.
+    async fn stop_all(&mut self) {
+        for (_, keeper) in self.0.drain().map(|(_, entry)| entry) {
+            keeper.abort();
+            let _ = keeper.await;
+        }
+    }
+}
 
 impl Drop for Keepers {
     fn drop(&mut self) {
@@ -161,13 +198,34 @@ async fn keep_session(state: Weak<DaemonState>, stack: Weak<SyncStack>, device: 
         Some(stack) => stack.endpoint().arrivals(),
         None => return,
     };
+    let Some(mut demand) = state.upgrade().map(|state| state.peers.subscribe_to_demand()) else {
+        return;
+    };
+    // Whether a request has already ended a dial of this attempt: a slow handshake is ended once
+    // by a request, not again by each one that follows. Cleared whenever `attempt` is set.
+    let mut restarted = false;
+    let groups_of_peer = |state: &Weak<DaemonState>, device: &str| {
+        state.upgrade().map(|state| state.authority.authorized_groups_for_peer(device))
+    };
     loop {
+        // A demand from before this dial is not news: the dial is the answer to it.
+        demand.acknowledge();
         let link = {
             let Some(stack) = stack.upgrade() else { return };
             // A dial started against a network that has since come back is
             // abandoned and made again at once (see `redial_pacing`).
             let dial = crate::redial_pacing::bounded_dial(attempt, stack.link_to(&device));
-            match arrivals.run(dial).await {
+            // A person asking for this peer's folder while a dial hangs ends it and starts
+            // another at once, without counting a failure: what it was dialling may be stale.
+            let dialled = tokio::select! {
+                dialled = arrivals.run(dial) => dialled,
+                () = demand.wanted(|| groups_of_peer(&state, &device)), if !restarted => {
+                    tracing::debug!(peer = %device, attempt, "sync dial restarted by a person's request");
+                    restarted = true;
+                    continue;
+                }
+            };
+            match dialled {
                 Some(Some(linked)) => linked.map(|link| (link, stack)),
                 Some(None) => Err(crate::sync_adapter::sync_stack::SyncStackError::DialTimedOut {
                     device: device.clone(),
@@ -176,6 +234,7 @@ async fn keep_session(state: Weak<DaemonState>, stack: Weak<SyncStack>, device: 
                 None => {
                     tracing::debug!(peer = %device, "sync dial abandoned, network came back");
                     attempt = 0;
+                    restarted = false;
                     continue;
                 }
             }
@@ -223,10 +282,33 @@ async fn keep_session(state: Weak<DaemonState>, stack: Weak<SyncStack>, device: 
                         }
                     }
                 }
+                // The session belongs to the peer, not to the link it opened on: while another live
+                // link to the peer is held (a crossed dial leaves two, one of them kept), the
+                // loss of this one is a switch, not the end of the session.
                 if connected {
-                    while carrier.next().await.is_some() {}
+                    loop {
+                        while carrier.next().await.is_some() {}
+                        // Only a session that is still the registered one is carried over; one that
+                        // was replaced or removed meanwhile is rebuilt by the reconnect below.
+                        let standing = registered.session.as_ref().is_some_and(|mine| {
+                            state
+                                .upgrade()
+                                .and_then(|state| state.peers.session(&device))
+                                .is_some_and(|current| Arc::ptr_eq(&current, mine))
+                        });
+                        let next = stack
+                            .upgrade()
+                            .filter(|_| standing)
+                            .and_then(|stack| stack.endpoint().live_link(&device));
+                        match next {
+                            Some(link) => carrier = link.carrier_changes(),
+                            None => break,
+                        }
+                    }
                 }
                 registered.release();
+                // A request made while the connection stood was answered by it.
+                demand.acknowledge();
                 if connected_at.elapsed() > HEALTHY_CONNECTION {
                     attempt = 0;
                 }
@@ -240,14 +322,21 @@ async fn keep_session(state: Weak<DaemonState>, stack: Weak<SyncStack>, device: 
         // ours was refused or timed out) can be, so that ends the wait.
         let Some(waiting) = stack.upgrade() else { return };
         let backoff = BackoffConfig::RECONNECT.next(attempt);
+        // A person waiting for content that this peer holds ends the wait too, without
+        // forgetting what the failures earned: the next backoff is as long as it would have been.
         let nudged = tokio::select! {
             wake = arrivals.sleep(backoff) => wake == crate::redial_pacing::Wake::Nudged,
             () = waiting.endpoint().wait_for_link(&device) => false,
+            () = demand.wanted(|| groups_of_peer(&state, &device)) => {
+                tracing::debug!(peer = %device, attempt, "sync session keeper woken by a person's request");
+                false
+            }
         };
         drop(waiting);
         // The network came back: the backoff the outage earned is forgotten.
         tracing::debug!(peer = %device, attempt, nudged, ?backoff, "sync session keeper waited");
         attempt = if nudged { 0 } else { attempt.saturating_add(1) };
+        restarted = false;
     }
 }
 
@@ -379,3 +468,6 @@ fn open_session(
 mod inbound_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod metered_tests;

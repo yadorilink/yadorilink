@@ -25,8 +25,10 @@
 //! [`Backend::Keyring`] is the OS-native store. [`Backend::File`] is an
 //! owner-only file. The file backend is **not** a degraded mode: a headless
 //! Linux host has no Secret Service, and requiring one there is what made this
-//! undeployable. So it is the default on Linux, and the keyring is the default
-//! on macOS and Windows, and either can be selected explicitly.
+//! undeployable. So it is the default on Linux, and on macOS for the
+//! executables outside the signed app bundle (the script install: it cannot carry the keychain
+//! entitlement). The keyring is the default on Windows and inside the macOS app bundle, and
+//! either can be selected explicitly.
 //!
 //! What this module will not do is *fall back*. A keyring that cannot be
 //! reached is an error naming `YADORILINK_CREDENTIAL_STORE=file`, never a
@@ -279,6 +281,27 @@ struct Generation {
     format: u32,
 }
 
+/// What to do about a keyring that cannot be used. The file store is a supported backend, not a
+/// fallback, so it is named rather than switched to.
+fn keyring_advice() -> String {
+    advice_for(cfg!(windows))
+}
+
+fn advice_for(windows: bool) -> String {
+    if windows {
+        format!(
+            "if this session has no interactive logon (ssh, a service), Windows may have no \
+             credential vault for it: run in an interactive desktop session, or set \
+             {STORE_VAR}=file, which is a supported backend and not a fallback"
+        )
+    } else {
+        format!(
+            "on a host with no Secret Service, set {STORE_VAR}=file, which is a supported backend \
+             and not a fallback"
+        )
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("{STORE_VAR} is {0:?}, which is not a credential store this build implements; use \"keyring\" or \"file\"")]
@@ -316,7 +339,7 @@ pub enum StoreError {
     )]
     Permissions { path: PathBuf, mode: u32 },
 
-    #[error("the OS keyring is unavailable ({0}); on a host with no Secret Service, set {STORE_VAR}=file, which is a supported backend and not a fallback")]
+    #[error("the OS keyring is unavailable ({0}); {advice}", advice = keyring_advice())]
     Keyring(String),
 
     #[error("credential store I/O at {path}: {source}")]
@@ -399,19 +422,33 @@ pub enum Backend {
 }
 
 impl Backend {
-    /// The default for this platform.
+    /// The default for the executable at `exe` (symlink-resolved; the entry point passes the
+    /// running one, see [`Backend::from_env`]).
     ///
-    /// Linux gets the file backend because a headless Linux host -- the
-    /// deployment this whole workstream exists to make possible -- has no
-    /// Secret Service, and a default that cannot start there is a default that
-    /// does not work. macOS and Windows have an OS store that is always
-    /// present, so they use it.
+    /// The file backend is the default wherever an OS store cannot be relied on to be
+    /// usable by this program: a headless Linux host has no Secret Service, and a
+    /// macOS executable outside the signed application bundle cannot carry the
+    /// `keychain-access-groups` entitlement the Data Protection Keychain requires (that
+    /// entitlement needs a provisioning profile, which only an app bundle can embed), so
+    /// the keychain fails there with `-34018`. Windows, and the executables inside the
+    /// macOS app bundle, use the keyring.
+    ///
+    /// The choice is made from where the program lives, before anything is read or
+    /// written -- never after a keyring failure.
     #[must_use]
-    pub fn platform_default(config_dir: &Path) -> Self {
-        if cfg!(target_os = "linux") {
-            Backend::File(config_dir.join(CREDENTIALS_FILE))
+    pub fn default_for_executable(config_dir: &Path, exe: &Path) -> Self {
+        let keyring = if cfg!(windows) {
+            true
+        // apple-cfg: macos-only the keychain entitlement is a macOS app-bundle matter
+        } else if cfg!(target_os = "macos") {
+            yadorilink_fs_platform::app_bundle::is_app_bundle_path(exe)
         } else {
+            false
+        };
+        if keyring {
             Backend::Keyring { scope: None }
+        } else {
+            Backend::File(config_dir.join(CREDENTIALS_FILE))
         }
     }
 
@@ -441,7 +478,9 @@ impl Backend {
     pub fn from_env(config_dir: &Path) -> StoreResult<Self> {
         let selected = std::env::var(STORE_VAR).ok();
         let file_override = std::env::var_os(FILE_VAR).map(PathBuf::from);
-        Self::select(selected.as_deref(), file_override, config_dir)
+        let exe = std::env::current_exe().unwrap_or_default();
+        let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+        Self::select(selected.as_deref(), file_override, config_dir, &exe)
     }
 
     /// The selection rules, over already-read values.
@@ -449,9 +488,10 @@ impl Backend {
         selected: Option<&str>,
         file_override: Option<PathBuf>,
         config_dir: &Path,
+        exe: &Path,
     ) -> StoreResult<Self> {
         match (selected, file_override) {
-            (None, None) => Ok(Backend::platform_default(config_dir)),
+            (None, None) => Ok(Backend::default_for_executable(config_dir, exe)),
             (None, Some(path)) | (Some("file"), Some(path)) => Ok(Backend::File(path)),
             (Some("file"), None) => Ok(Backend::File(config_dir.join(CREDENTIALS_FILE))),
             (Some("keyring"), None) => Ok(Backend::Keyring { scope: None }),

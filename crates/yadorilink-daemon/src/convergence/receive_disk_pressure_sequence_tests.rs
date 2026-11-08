@@ -333,7 +333,7 @@ async fn receive_resumes_on_its_own_backoff_once_space_returns() {
 }
 
 fn mark_waiting(f: &Fixture) {
-    f.state.mark_link_waiting_for_disk_space(
+    f.state.wait_for_disk_space(
         &f.root.to_string_lossy(),
         crate::link_registry::waiting_for_disk_space_reason("v", MIB, 1 << 30),
     );

@@ -78,7 +78,18 @@ fn mode(h: &Harness, path: &str) -> u32 {
     std::fs::metadata(h.path(path)).unwrap().permissions().mode() & 0o777
 }
 
-/// `d` (mode 0755) and `d/f1`, both settled on this device.
+/// The mode a directory created by this process gets (0o777 less the host's umask: 0o755 under 022,
+/// 0o775 under 002). A directory settled from a record takes the local umask, so this is what the
+/// tests expect of it, whatever the host's umask is.
+fn default_directory_mode() -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    let probe = tempfile::tempdir().unwrap();
+    let dir = probe.path().join("probe");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777
+}
+
+/// `d` (the default directory mode) and `d/f1`, both settled on this device.
 async fn settled_directory(h: &Harness) -> VersionHash {
     let f1 = stored_version(h, "scratch-f1", b"first child").await;
     let d = FileVersion::directory();
@@ -91,7 +102,7 @@ async fn settled_directory(h: &Harness) -> VersionHash {
     );
     settle(h, &["d", "d/f1"]).await;
     assert!(h.path("d").is_dir());
-    assert_eq!(mode(h, "d"), 0o755);
+    assert_eq!(mode(h, "d"), default_directory_mode());
     d.version_hash
 }
 
@@ -397,4 +408,67 @@ async fn a_directory_write_stopped_after_its_creation_leaves_a_user_delete_stand
     let report = super::receive_deferred_flush_tests::startup(&h);
 
     assert!(!h.path("d").exists(), "the user's delete was undone by repair: {report:?}");
+}
+
+/// The steps of an explicit directory's write, as the write operation records them: the intent,
+/// row and fence are prepared together, the directory is created, and one commit proves it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_explicit_directory_write_goes_prepared_published_proven() {
+    use crate::write_op::trace::StepTrace;
+    use crate::write_op::{IntentSettlement, ProofOutcome, StepEvent};
+    need_identity!();
+    let h = Harness::new(true);
+    let d = FileVersion::directory();
+    remote(&h, "device-remote", &[put("trace-dir", d.version_hash)], Basis::CurrentHeads, &[&d]);
+
+    settle(&h, &["trace-dir"]).await;
+
+    assert!(h.path("trace-dir").is_dir());
+    assert_eq!(
+        StepTrace::of(GROUP, "trace-dir"),
+        [
+            StepEvent::Prepared,
+            StepEvent::Published { names_deferred: false, landed_marked: true },
+            StepEvent::Proven {
+                outcome: ProofOutcome::Exact,
+                intent: IntentSettlement::Cleared,
+                obligation_closed: false,
+            },
+        ]
+    );
+}
+
+/// An explicit directory's write stopped at each of its transitions leaves no wrong object, and
+/// the next pass creates the directory and settles it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_directory_write_stopped_at_each_transition_is_completed_by_the_next_pass() {
+    use crate::write_op::failpoint::{arm, WriteOpFailpoint};
+    need_identity!();
+    for (i, point) in [
+        WriteOpFailpoint::AfterPrepare,
+        WriteOpFailpoint::AfterPublish,
+        WriteOpFailpoint::BeforeProve,
+        WriteOpFailpoint::AfterProve,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("fp-dir-{i}");
+        let h = Harness::new(true);
+        let d = FileVersion::directory();
+        remote(&h, "device-remote", &[put(&name, d.version_hash)], Basis::CurrentHeads, &[&d]);
+        {
+            let armed = arm(point, &name);
+            let _ = reconcile(&h, &[name.as_str()]).await;
+            assert!(armed.fired() >= 1, "{point:?} was reached");
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(h.path(&name)) {
+            assert!(meta.is_dir(), "{point:?}: only a directory may stand at the name");
+        }
+
+        settle(&h, &[name.as_str()]).await;
+
+        assert!(h.path(&name).is_dir(), "{point:?}");
+        assert!(!h.state.has_materialization_intent(GROUP, &name).unwrap(), "{point:?}");
+    }
 }

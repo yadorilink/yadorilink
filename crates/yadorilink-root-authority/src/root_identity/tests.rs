@@ -2,7 +2,7 @@
 
 use super::*;
 
-/// The marker is top-level-only, exactly like `.yadorilinkignore`: a
+/// The marker is top-level-only, at the top level only: a
 /// same-named file a user keeps inside a subdirectory is their content
 /// and must keep syncing.
 #[test]

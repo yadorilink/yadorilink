@@ -45,6 +45,7 @@ use super::provider_materialize::{
 };
 use crate::provider_ingest::IngestError;
 use crate::shell_context::ShellContext;
+use crate::write_op::ingest::IngestOp;
 
 const KIND_APPLY: u8 = b'A';
 
@@ -406,6 +407,10 @@ fn log_refusal(request: &ProviderApplyChangeRequest, failure: &Failure) {
     );
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one request's steps in their durable order: journal, ingest, commit point, apply"
+)]
 async fn run(
     context: &Arc<ShellContext>,
     caller: Caller<'_>,
@@ -425,6 +430,15 @@ async fn run(
         return Err(Failure::new(ProviderApplyFailure::NotReady, "no temp root is configured"));
     };
     let root = hex::encode(&request.root_id);
+    // The operating system's registration of this root is gone (its domain was removed, or the
+    // sync root unregistered): the placeholders vanishing with it are not the person deleting
+    // them, and a change authored from what is left would replicate as a delete to every device.
+    if context.provider_host.root_reported_lost(&root) {
+        return Err(Failure::new(
+            ProviderApplyFailure::NotReady,
+            "the host reports that the operating system no longer has this root registered",
+        ));
+    }
     let repo = context.replica_coordinator.provider_repository();
 
     let upload = journal_upload(context, &handoff, repo, &root, request)?;
@@ -434,6 +448,10 @@ async fn run(
         .into_iter()
         .find(|r| r.root_id == root)
         .ok_or_else(|| Failure::new(ProviderApplyFailure::NotReady, "unknown provider root"))?;
+    let op = IngestOp::new(&declared.group_id, &root, &request.session_id, request.operation_seq);
+    if upload.is_some() {
+        op.journaled();
+    }
     let ready = match caller {
         Caller::Extension(_) => declared.readiness() == Readiness::Ready,
         Caller::App => declared.error_description.is_none(),
@@ -520,6 +538,20 @@ async fn run(
         Err(error) => return Err(map_error(error, &request.content)),
     }
 
+    // A publish-only root takes additions only. Asked after the replay check, so a change that
+    // committed earlier still answers with its stored outcome; the staged file stays for the app
+    // to discard and the journal row of this attempt is cleared, so the refusal leaves nothing
+    // behind and a retry after the flag is cleared is a fresh operation.
+    if declared.publish_only && kind != ChangeKind::Create {
+        if upload.is_some() {
+            let _ = repo.clear_pending_ingest(&root, &request.session_id, request.operation_seq);
+        }
+        return Err(Failure::new(
+            ProviderApplyFailure::PublishOnly,
+            "this folder is publish-only on this device: it adds files but does not change or delete them",
+        ));
+    }
+
     // A restore takes its contents from a retained version. The blocks are held (or fetched) and
     // kept from deletion until the change commits.
     let _restore_activity =
@@ -544,6 +576,7 @@ async fn run(
             let ingested =
                 ingest_copy(context, &handoff, &declared.group_id, source, &used).await?;
             ingested_name = Some(used);
+            op.store_durable();
             Some(ingested)
         }
         _ => restored.as_ref().and_then(|r| r.content.clone()),
@@ -588,6 +621,8 @@ async fn run(
         (context.replica_coordinator.clone(), context.writer.device_id());
     let gate = gate.clone();
     let writer = context.writer.clone();
+    let host = context.provider_host.clone();
+    let root_hex = root.clone();
     let group_id = declared.group_id.clone();
     #[cfg(test)]
     let request_id = request.request_id.clone();
@@ -608,17 +643,30 @@ async fn run(
             .begin_operation()
             .map_err(|e| ApplyError::Db(yadorilink_sync_sqlite::SyncSqliteError::from(e)))?;
         let local = yadorilink_sync_sqlite::local_author::LocalAuthor::of_key(&author);
-        coordinator.provider_repository().apply_change(
-            &input,
-            &local,
-            &device_id,
-            &operation.permit(),
-        )
+        // Applied only while the root is not reported lost, and a loss reported meanwhile is
+        // recorded after the apply has finished: a change that passed the check is the last one
+        // that can commit, and none starts after the report.
+        let applied = host.while_not_lost(&root_hex, || {
+            coordinator.provider_repository().apply_change(
+                &input,
+                &local,
+                &device_id,
+                &operation.permit(),
+            )
+        });
+        match applied {
+            Some(result) => result,
+            None => Err(ApplyError::Retry(
+                "the host reports that the operating system no longer has this root registered"
+                    .into(),
+            )),
+        }
     })
     .await
     .map_err(|e| Failure::new(ProviderApplyFailure::Retry, e.to_string()))?;
 
     if outcome.is_ok() {
+        op.applied();
         push_evidence(context, repo, &root);
         context.writer.after_commit(&declared.group_id).await;
         if announce_to_os {

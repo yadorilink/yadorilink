@@ -999,21 +999,19 @@ pub fn evict_file(
         return Ok(outcome);
     }
 
-    // `Evicting` (a failure here fails the eviction with nothing else
-    // touched), then the fence bump for the physical write below. The
-    // bump's own result comes back unpropagated: it is chained into the
-    // placeholder write and handled as that write's failure. From here on
+    // `Evicting` and the fence bump for the physical write below are ONE
+    // transaction (a failure here fails the eviction with nothing touched,
+    // and no crash leaves `Evicting` over an unbumped fence). From here on
     // every failure closes the row with `abandon_eviction` rather than
     // leave it `Evicting`.
-    let eviction_fence = state.open_eviction(group_id, path, permit)?;
+    state.open_eviction(group_id, path, permit)?;
     let placeholder_result: Result<Removal, MaterializationExecutionError> = {
         // The mutator's own physical write (hydrated content ->
         // placeholder) -- bumped before it, inside `path_lock` (held by
         // `_path_guard` for this whole function). No frontier proof to
         // publish under here, so this only ever invalidates. Everything
         // after this point has touched, or may have touched, the file.
-        eviction_fence
-            .and_then(|_| evict_to_remote(state, group_id, path, &out_path, root, &approved_object))
+        evict_to_remote(state, group_id, path, &out_path, root, &approved_object)
     };
     let placeholder_outcome = match placeholder_result {
         Ok(Removal::Removed(outcome)) => outcome,

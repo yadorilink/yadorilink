@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use yadorilink_fs_platform::ignore_patterns::{is_ignore_file_relative_path, EffectiveIgnoreSet};
+use yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet;
 use yadorilink_fs_platform::reserved_namespace::is_sync_root_lock_relative_path;
 use yadorilink_fs_platform::reserved_namespace::path_has_reserved_component;
 use yadorilink_root_authority::root_identity::is_root_marker_relative_path;
@@ -155,16 +155,15 @@ pub(super) fn is_excluded_from_sync(
     // produce a conflicted copy of the very file that proves which folder this
     // is. Excluded here — the one place scan, watch, and the becoming-ignored
     // index cleanup all consult — rather than as a pattern in the default
-    // ignore set, because a user-editable `.yadorilinkignore` can negate a
+    // ignore set, because a user-editable ignore rule can negate a
     // pattern (`!.yadorilink-root`) and must not be able to.
     // The sync-root single-instance lock sidecar (`crate::sync_root_lock`) is
     // likewise this device's own process-management artefact, not user
     // content, and excluded for the identical reason as the identity marker
     // immediately above: it names no fixed identity to disagree over like the
-    // marker does, but syncing it would still make it visible to `.yadorilinkignore`
+    // marker does, but syncing it would still make it visible to ignore-rule
     // negation and conflicted-copy machinery it has no business being subject to.
     is_root_marker_relative_path(relative_path)
         || is_sync_root_lock_relative_path(relative_path)
-        || is_ignore_file_relative_path(relative_path)
         || ignore_set.is_ignored(relative_path, is_dir)
 }

@@ -56,7 +56,8 @@ fn attributes(path: &[u16]) -> Option<u32> {
 }
 
 impl Kept {
-    /// `Ok(None)` when there is nothing to keep: the target is absent, a directory or a reparse point.
+    /// `Ok(None)` when there is nothing to keep: the target is absent, a directory or a reparse point,
+    /// or the staged object is a reparse point (a link).
     /// An `Err` stops the publish before anything was moved: the staged file could not be given what the
     /// replaced file's owner set on it (the staged file is left as it was).
     pub(super) fn prepare(stage: &[u16], target: &[u16]) -> std::io::Result<Option<Kept>> {
@@ -65,6 +66,11 @@ impl Kept {
             return Ok(None);
         }
         let Some(stage_attributes) = attributes(stage) else { return Ok(None) };
+        // A staged link has nothing to keep, and copying a security descriptor onto it would
+        // follow the link to whatever it points at.
+        if stage_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Ok(None);
+        }
         let mut kept = Kept {
             stage: stage.to_vec(),
             target: target.to_vec(),
@@ -255,4 +261,35 @@ fn descriptor_is_protected(descriptor: PSECURITY_DESCRIPTOR) -> bool {
     // SAFETY: out pointers are valid.
     let ok = unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) };
     ok != 0 && control & SE_DACL_PROTECTED != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::windows::ffi::OsStrExt;
+
+    fn wide(path: &std::path::Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+
+    /// A staged symlink replacing a file has nothing to keep: the file's attributes and security
+    /// descriptor are never applied to a link (or, through it, to what it points at). Skipped where
+    /// the account may not create symlinks.
+    #[test]
+    fn a_staged_link_has_nothing_to_keep() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pointed_at, stage, target) =
+            (dir.path().join("pointed-at"), dir.path().join("stage"), dir.path().join("target"));
+        std::fs::write(&pointed_at, "the pointed-at file").unwrap();
+        std::fs::write(&target, "a file").unwrap();
+        if std::os::windows::fs::symlink_file(&pointed_at, &stage).is_err() {
+            eprintln!("skipped: this account may not create symlinks");
+            return;
+        }
+
+        let kept = Kept::prepare(&wide(&stage), &wide(&target)).unwrap();
+
+        assert!(kept.is_none());
+        assert_eq!(std::fs::read_to_string(&pointed_at).unwrap(), "the pointed-at file");
+    }
 }

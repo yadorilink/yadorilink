@@ -36,6 +36,8 @@ pub enum FreedReason {
     Expired,
     /// There was no room on the disk to keep it.
     LowSpace,
+    /// The versions kept on this device exceeded the byte budget, and this was among the oldest.
+    OverBudget,
 }
 
 impl FreedReason {
@@ -43,6 +45,7 @@ impl FreedReason {
         match self {
             FreedReason::Expired => "Expired",
             FreedReason::LowSpace => "LowSpace",
+            FreedReason::OverBudget => "OverBudget",
         }
     }
 
@@ -50,6 +53,7 @@ impl FreedReason {
         match text {
             "Expired" => Some(FreedReason::Expired),
             "LowSpace" => Some(FreedReason::LowSpace),
+            "OverBudget" => Some(FreedReason::OverBudget),
             _ => None,
         }
     }
@@ -59,6 +63,7 @@ impl FreedReason {
         match self {
             FreedReason::Expired => "the retention period ended",
             FreedReason::LowSpace => "the disk was nearly full",
+            FreedReason::OverBudget => "the space set aside for older versions was full",
         }
     }
 }

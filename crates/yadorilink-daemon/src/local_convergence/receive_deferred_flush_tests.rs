@@ -40,11 +40,29 @@ pub(super) fn present(h: &Harness, path: &str) -> bool {
     h.state.get_materialization_state(GROUP, path).unwrap() == Some(MaterializationState::Present)
 }
 
+/// The phase the open write intent of `path` records, `None` when no intent is open.
+pub(super) fn intent_phase(h: &Harness, path: &str) -> Option<String> {
+    h.state
+        .database()
+        .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT phase FROM materialization_intents \
+                     WHERE group_id = ?1 AND path = ?2 AND kind = 'write'",
+                    rusqlite::params![GROUP, path],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .ok()
+                .flatten())
+        })
+        .unwrap()
+}
+
 pub(super) fn intent_open(h: &Harness, path: &str) -> bool {
     h.state.has_materialization_intent(GROUP, path).unwrap()
 }
 
-/// The fence the open write intent is marked as waiting for, if it is marked.
+/// The fence the open write intent is marked as waiting for (phase `flush_pending`), if it is.
 fn marker(h: &Harness, path: &str) -> Option<i64> {
     h.state
         .database()
@@ -52,7 +70,8 @@ fn marker(h: &Harness, path: &str) -> Option<i64> {
             Ok(conn
                 .query_row(
                     "SELECT mutation_generation FROM materialization_intents \
-                     WHERE group_id = ?1 AND path = ?2 AND kind = 'write'",
+                     WHERE group_id = ?1 AND path = ?2 AND kind = 'write' \
+                       AND phase = 'flush_pending'",
                     rusqlite::params![GROUP, path],
                     |r| r.get::<_, Option<i64>>(0),
                 )
@@ -62,23 +81,10 @@ fn marker(h: &Harness, path: &str) -> Option<i64> {
         .unwrap()
 }
 
-/// The power cut lost the rename of `path`'s received file: a new name is missing with its
-/// witnessed temp still there (the temp's directory entry was flushed before the rename), so the
-/// received file goes back to its temp name; without a witness the name simply disappears.
+/// The power cut lost the rename of `path`'s received file: the new name is missing (the temp it
+/// was renamed from is a stray the next start sweeps).
 pub(super) fn lose_the_rename(h: &Harness, path: &str) {
-    let from = h.path(path);
-    let witness = h
-        .state
-        .database()
-        .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
-            Ok(yadorilink_sync_sqlite::write_removal_facts(conn, GROUP, path)?
-                .and_then(|facts| facts.temp_witness))
-        })
-        .unwrap();
-    match witness {
-        Some(name) => std::fs::rename(&from, from.with_file_name(name)).unwrap(),
-        None => std::fs::remove_file(&from).unwrap(),
-    }
+    std::fs::remove_file(h.path(path)).unwrap();
 }
 
 /// Closed as an ordinary durable write: proof, `Present`, no intent.
@@ -223,6 +229,65 @@ async fn startup_rebuilds_a_torn_file_in_place_without_a_conflict_copy() {
     assert!(report.reconstructed.contains(&name), "{report:?}");
     assert_eq!(std::fs::read(h.path(&name)).unwrap(), content);
     assert!(closed(&h, &name));
+    assert_eq!(conflict_copies(&h), 0);
+}
+
+/// The torn file is removed by the user in the instant between repair deciding to rebuild it in
+/// place and the rename: the rebuild publishes nothing over a name it did not classify, does not
+/// turn the row into a placeholder, and keeps the intent; the next pass writes the version.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torn_file_removed_under_the_in_place_rebuild_is_left_for_the_next_pass() {
+    use yadorilink_filesystem_sync::repair_failpoint::{interleave, RepairFailpoint};
+    let h = Harness::new(false);
+    let (name, content) = received_with_failed_barrier(&h, "gone-").await;
+    tear_in_place(&h, &name, content.len());
+    record_observed_identity_as_proof(&h, &name);
+
+    let report = {
+        let target = h.path(&name);
+        let _removal = interleave(RepairFailpoint::BeforePublish, move || {
+            std::fs::remove_file(&target).unwrap();
+        });
+        startup(&h)
+    };
+
+    assert!(report.reconstructed.is_empty(), "{report:?}");
+    assert!(report.demoted_to_placeholder.is_empty(), "{report:?}");
+    assert!(report.failed.is_empty(), "{report:?}");
+    assert!(intent_open(&h, &name), "the intent stays open");
+    assert!(!h.path(&name).exists(), "nothing was published over a name that was not classified");
+    let next = startup(&h);
+    assert!(next.demoted_to_placeholder.is_empty(), "{next:?}");
+    assert_eq!(std::fs::read(h.path(&name)).unwrap(), content, "{next:?}");
+    assert!(closed(&h, &name));
+}
+
+/// A received file waiting for its batch flush whose row has since moved to another version (a
+/// metadata-only bump here): the flush intent stands, the proof it was waiting for names the
+/// version the row left. If the flush never happened and a crash tore the file, repair rebuilds
+/// it in place from the blocks like any torn file; it is not left for ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn startup_rebuilds_a_torn_file_whose_flush_pending_proof_names_a_superseded_version() {
+    let h = Harness::new(false);
+    let (name, content) = received_with_failed_barrier(&h, "superseded-").await;
+    tear_in_place(&h, &name, content.len());
+    record_observed_identity_as_proof(&h, &name);
+    h.state
+        .file_index_repository()
+        .set_exec(
+            GROUP,
+            &name,
+            true,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+
+    let report = startup(&h);
+
+    assert!(report.quarantined_dirty.is_empty(), "{report:?}");
+    assert!(report.reconstructed.contains(&name), "{report:?}");
+    assert_eq!(std::fs::read(h.path(&name)).unwrap(), content);
     assert_eq!(conflict_copies(&h), 0);
 }
 
@@ -649,7 +714,11 @@ async fn delete_after_a_per_file_flushed_write(fence_moved: bool) {
     *h.convergence.overlap_probe.lock().unwrap() = None;
     let name = &files[0];
     assert!(intent_open(&h, name) && !proven(&h, name), "setup: stopped before the commit");
-    assert!(marker(&h, name).is_some(), "the write recorded that its rename landed");
+    assert_eq!(
+        intent_phase(&h, name).as_deref(),
+        Some("landed"),
+        "the write recorded that its rename landed"
+    );
     assert_eq!(std::fs::read(h.path(name)).unwrap(), contents[name], "setup: bytes placed");
 
     if fence_moved {
@@ -674,4 +743,59 @@ fn windows_never_defers_the_flush_whatever_is_asked() {
         assert_eq!(parse_deferred_flush_on(false, raw), None, "{raw:?}");
     }
     assert!(parse_deferred_flush_on(true, None).is_some());
+}
+
+// The steps of a deferred write, as the write operation records them: the same chain as the
+// durable write, with the rename left unflushed and the barrier as its last step.
+
+use crate::write_op::trace::StepTrace;
+use crate::write_op::{IntentSettlement, ProofOutcome, StepEvent};
+
+const DEFERRED_PROVEN: StepEvent = StepEvent::Proven {
+    outcome: ProofOutcome::Exact,
+    intent: IntentSettlement::FlushPending,
+    obligation_closed: false,
+};
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deferred_write_goes_prepared_published_proven_settled() {
+    for mode in [FULL_FLUSH_EACH, SINGLE_BARRIER] {
+        let h = Harness::new(false);
+        pin_concurrency(&h, 4);
+        use_deferred(&h, mode);
+        let files = names(&format!("trace{mode}-"), 1);
+        publish_new_files(&h, &files).await;
+
+        reconcile(&h, &files).await;
+        h.convergence.drain_flush_barriers().await;
+
+        assert_eq!(
+            StepTrace::of(GROUP, &files[0]),
+            [
+                StepEvent::Prepared,
+                StepEvent::Published { names_deferred: true, landed_marked: false },
+                DEFERRED_PROVEN,
+                StepEvent::Settled,
+            ],
+            "mode {mode}"
+        );
+    }
+}
+
+/// A barrier that fails leaves the write proven and waiting: the intent says `flush_pending`,
+/// and the trace ends before `Settled`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deferred_write_whose_barrier_fails_stops_after_proven_with_a_flush_pending_phase() {
+    let h = Harness::new(false);
+    let (name, _) = received_with_failed_barrier(&h, "tracefail-").await;
+
+    assert_eq!(
+        StepTrace::of(GROUP, &name),
+        [
+            StepEvent::Prepared,
+            StepEvent::Published { names_deferred: true, landed_marked: false },
+            DEFERRED_PROVEN,
+        ]
+    );
+    assert_eq!(intent_phase(&h, &name).as_deref(), Some("flush_pending"));
 }

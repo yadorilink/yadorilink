@@ -7,11 +7,12 @@ use yadorilink_client_core::ops::storage;
 use yadorilink_ipc_proto::daemonctl::PreservedItem;
 
 use crate::error::CliError;
+use crate::i18n::{tr, trf};
 
 pub async fn list() -> Result<(), CliError> {
     let items = storage::list_preserved().await?;
     if items.is_empty() {
-        println!("Nothing is preserved.");
+        println!("{}", tr("Nothing is preserved."));
         return Ok(());
     }
     for item in &items {
@@ -23,7 +24,13 @@ pub async fn list() -> Result<(), CliError> {
 pub async fn restore(item_id: &str) -> Result<(), CliError> {
     let group = group_of(item_id).await?;
     storage::restore_preserved(&group, item_id).await?;
-    println!("Restored {item_id}: it is written back as a new version; the item is kept.");
+    println!(
+        "{}",
+        trf!(
+            "Restored {item_id}: it is written back as a new version; the item is kept.",
+            item_id = item_id
+        )
+    );
     Ok(())
 }
 
@@ -45,7 +52,7 @@ pub async fn discard(item_id: &str, yes: bool) -> Result<(), CliError> {
     }
     let group = group_of(item_id).await?;
     storage::discard_preserved(&group, item_id).await?;
-    println!("Discarded {item_id}.");
+    println!("{}", trf!("Discarded {item_id}.", item_id = item_id));
     Ok(())
 }
 
@@ -97,7 +104,7 @@ pub(crate) fn format_item(item: &PreservedItem) -> String {
 pub async fn retained_list() -> Result<(), CliError> {
     let items = storage::list_retained_originals().await?;
     if items.is_empty() {
-        println!("No originals are kept.");
+        println!("{}", tr("No originals are kept."));
         return Ok(());
     }
     println!("{RETAINED_EXPLANATION}");
@@ -122,7 +129,7 @@ pub async fn retained_release(group: Option<String>) -> Result<(), CliError> {
         }
     };
     if groups.is_empty() {
-        println!("No originals are kept.");
+        println!("{}", tr("No originals are kept."));
         return Ok(());
     }
     for group in groups {

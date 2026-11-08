@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, Weak};
 use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
-use yadorilink_fs_platform::ignore_patterns::{is_ignore_file_relative_path, EffectiveIgnoreSet};
+use yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet;
 use yadorilink_fs_platform::reserved_namespace::path_has_reserved_component;
 
 use super::{
@@ -60,7 +60,7 @@ pub fn watch_folder_with_capacity(
     root: &Path,
     capacity: usize,
 ) -> Result<FolderWatcher, WatcherError> {
-    let ignore_set = Arc::new(EffectiveIgnoreSet::load_for_link_root(root)?);
+    let ignore_set = Arc::new(EffectiveIgnoreSet::defaults_only());
     watch_folder_with_capacity_and_ignore(root, capacity, ignore_set)
 }
 
@@ -704,15 +704,11 @@ fn should_queue_path(
     if relative_path.as_os_str().is_empty() {
         return false;
     }
-    // The reserved artefact namespace is excluded before anything else,
-    // including the `.yadorilinkignore` special-case just below — a
+    // The reserved artefact namespace is excluded before anything else: a
     // transaction artefact must never be queued as a local change no
-    // matter what a user's ignore file says about it.
+    // matter what the ignore rules say about it.
     if path_has_reserved_component(relative_path) {
         return false;
-    }
-    if is_ignore_file_relative_path(relative_path) {
-        return true;
     }
     // Lstat-equivalent, not `path.is_dir` — a symlink to a
     // directory must be treated as a (symlink) leaf for ignore-pattern

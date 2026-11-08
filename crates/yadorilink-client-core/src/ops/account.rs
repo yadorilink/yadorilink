@@ -11,6 +11,7 @@ use std::future::Future;
 
 use crate::coordination::http_client::CoordinationAccess;
 
+use crate::account_email::AccountInfo;
 use crate::coordination::http_client::{get_json, post_json, post_json_with_failure, require_auth};
 use crate::error::CoreError;
 
@@ -230,6 +231,26 @@ pub async fn deletion_status_with(auth: &CoordinationAccess) -> Result<DeletionS
     get_json("/account/deletion/status", auth).await
 }
 
+/// The signed-in account's email, sign-in provider and display name, from the same account-state
+/// read as [`deletion_status_with`] (the service answers it to the signed-in account only). Every
+/// field is optional: an older service, or a provider that gave none, leaves it `None`.
+pub async fn account_info_with(auth: &CoordinationAccess) -> Result<AccountInfo, CoreError> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Answer {
+        email: Option<String>,
+        sign_in_provider: Option<String>,
+        display_name: Option<String>,
+    }
+    let answer: Answer = get_json("/account/deletion/status", auth).await?;
+    let some = |value: Option<String>| value.filter(|v| !v.is_empty());
+    Ok(AccountInfo {
+        email: some(answer.email),
+        sign_in_provider: some(answer.sign_in_provider).filter(|p| p == "google" || p == "apple"),
+        display_name: some(answer.display_name),
+    })
+}
+
 /// The raw versioned export document. The server builds it from an allowlist
 /// and it is content-blind by construction: it never holds file contents,
 /// names or paths.
@@ -313,6 +334,37 @@ mod tests {
             })))
             .mount(server)
             .await;
+    }
+
+    #[tokio::test]
+    async fn the_account_info_is_read_from_the_account_state_and_an_empty_one_is_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/account/deletion/status"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"state": "active", "email": "me@example.com", "signInProvider": "apple", "displayName": "Ada Lovelace"}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        assert_eq!(
+            account_info_with(&access(&server)).await.unwrap(),
+            AccountInfo {
+                email: Some("me@example.com".to_owned()),
+                sign_in_provider: Some("apple".to_owned()),
+                display_name: Some("Ada Lovelace".to_owned()),
+            }
+        );
+        let none = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/account/deletion/status"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"state": "active"})),
+            )
+            .mount(&none)
+            .await;
+        assert_eq!(account_info_with(&access(&none)).await.unwrap(), AccountInfo::default());
     }
 
     #[tokio::test]

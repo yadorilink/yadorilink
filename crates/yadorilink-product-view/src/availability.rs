@@ -88,6 +88,9 @@ pub struct AvailabilitySummary {
     pub reachable_device_ids: Vec<String>,
     pub offline_device_ids: Vec<String>,
     pub update_required_device_ids: Vec<String>,
+    /// The members of `update_required_device_ids` that run a newer version than this device:
+    /// this device is the one to update. The others are older, and are the ones to update.
+    pub newer_peer_device_ids: Vec<String>,
 }
 
 impl AvailabilitySummary {
@@ -98,6 +101,7 @@ impl AvailabilitySummary {
             reachable_device_ids: link.availability_reachable_device_ids.clone(),
             offline_device_ids: link.availability_offline_device_ids.clone(),
             update_required_device_ids: link.availability_update_required_device_ids.clone(),
+            newer_peer_device_ids: link.availability_newer_peer_device_ids.clone(),
         }
     }
 
@@ -111,6 +115,8 @@ impl AvailabilitySummary {
         let offline: BTreeSet<&String> = parts.iter().flat_map(|p| &p.offline_device_ids).collect();
         let update_required: BTreeSet<&String> =
             parts.iter().flat_map(|p| &p.update_required_device_ids).collect();
+        let newer: BTreeSet<&String> =
+            parts.iter().flat_map(|p| &p.newer_peer_device_ids).collect();
         let reachable: BTreeSet<&String> = parts
             .iter()
             .flat_map(|p| &p.reachable_device_ids)
@@ -121,6 +127,7 @@ impl AvailabilitySummary {
             reachable_device_ids: reachable.into_iter().cloned().collect(),
             offline_device_ids: offline.into_iter().cloned().collect(),
             update_required_device_ids: update_required.into_iter().cloned().collect(),
+            newer_peer_device_ids: newer.into_iter().cloned().collect(),
         }
     }
 }

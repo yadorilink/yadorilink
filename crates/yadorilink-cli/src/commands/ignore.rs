@@ -1,137 +1,117 @@
-use std::path::{Path, PathBuf};
+//! `yadorilink ignore`: a folder's ignore rules, read and replaced through the daemon (the rules
+//! are the daemon's own, per device; no file in the folder holds them).
 
+use std::io::Read;
+use std::path::Path;
+
+use yadorilink_client_core::ops;
 use yadorilink_fs_platform::ignore_patterns::{
     EffectiveIgnoreSet, IgnorePattern, IgnorePatternSource,
 };
-use yadorilink_replica_domain::reserved_paths::IGNORE_FILE_NAME;
 
 use crate::error::CliError;
 
-pub fn list(link_path: PathBuf) -> Result<(), CliError> {
-    for line in pattern_lines(&link_path)? {
+/// The folder's rules as the engine applies them. `folder` is a folder path or its group id.
+async fn load(folder: &str) -> Result<Loaded, CliError> {
+    let group = ops::rewind::resolve_folder_group(folder).await?;
+    let text = ops::ignore_rules::ignore_rules_get(&group).await?;
+    let set = EffectiveIgnoreSet::from_text(&text).map_err(|e| CliError::Other(e.to_string()))?;
+    // Where the folder is on this disk, to tell a directory from a file; a folder with no
+    // directory (a File Provider folder) has none, and a trailing `/` names a directory then.
+    let dir = ops::links::list_links()
+        .await?
+        .into_iter()
+        .find(|link| link.group_id == group)
+        .map(|link| link.local_path)
+        .filter(|path| !path.is_empty());
+    Ok(Loaded { set, dir })
+}
+
+struct Loaded {
+    set: EffectiveIgnoreSet,
+    dir: Option<String>,
+}
+
+pub async fn list(folder: String) -> Result<(), CliError> {
+    let loaded = load(&folder).await?;
+    for line in pattern_lines(&loaded.set) {
         println!("{line}");
     }
     Ok(())
 }
 
-pub fn test(path: PathBuf) -> Result<(), CliError> {
-    println!("{}", test_path_output(&path)?);
+pub async fn test(folder: String, path: String) -> Result<(), CliError> {
+    let loaded = load(&folder).await?;
+    println!("{}", test_path_output(&loaded.set, loaded.dir.as_deref(), &path));
     Ok(())
 }
 
-/// `yadorilink ignore explain <path>` — a richer sibling of `test` (kept
-/// separate rather than changing `test`'s output, since
-/// `test_path_output`'s exact wording has
-/// its own fixture tests in `tests/ignore.rs`): the winning rule's source
-/// file, `#include` chain, line number, and case-sensitivity mode, using
-/// the exact same `EffectiveIgnoreSet` evaluator `test`/`list` use.
-pub fn explain(path: PathBuf) -> Result<(), CliError> {
-    println!("{}", explain_path_output(&path)?);
+/// `yadorilink ignore explain <folder> <path>` — a richer sibling of `test`: the winning rule's
+/// line number and case-sensitivity mode, from the same evaluator `test` and `list` use.
+pub async fn explain(folder: String, path: String) -> Result<(), CliError> {
+    let loaded = load(&folder).await?;
+    println!("{}", explain_path_output(&loaded.set, loaded.dir.as_deref(), &path));
     Ok(())
 }
 
-pub fn explain_path_output(path: &Path) -> Result<String, CliError> {
-    let (link_root, relative_path, is_dir) = resolve_test_path(path)?;
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&link_root)
-        .map_err(|e| CliError::Other(e.to_string()))?;
-    let display_path = relative_path.to_string_lossy().replace('\\', "/");
+/// `yadorilink ignore set <folder> <file>`: replaces the folder's rules with the text of `file`
+/// (`-` reads standard input). An unusable line is refused with its number and nothing changes.
+pub async fn set(folder: String, file: String) -> Result<(), CliError> {
+    let mut text = String::new();
+    if file == "-" {
+        std::io::stdin().read_to_string(&mut text)?;
+    } else {
+        text = std::fs::read_to_string(&file)
+            .map_err(|e| CliError::Other(format!("cannot read {file}: {e}")))?;
+    }
+    let group = ops::rewind::resolve_folder_group(&folder).await?;
+    ops::ignore_rules::ignore_rules_set(&group, &text).await?;
+    println!("ignore rules replaced for {folder}");
+    Ok(())
+}
 
-    match ignore_set.explain_path(&relative_path, is_dir) {
+pub fn pattern_lines(set: &EffectiveIgnoreSet) -> Vec<String> {
+    set.patterns().iter().map(format_pattern).collect()
+}
+
+/// `path` is relative to the folder; a directory is told apart by the folder's own disk, or by a
+/// trailing `/`.
+fn is_dir(folder_dir: Option<&str>, path: &str) -> bool {
+    path.ends_with('/') || folder_dir.is_some_and(|dir| Path::new(dir).join(path).is_dir())
+}
+
+pub fn test_path_output(set: &EffectiveIgnoreSet, folder_dir: Option<&str>, path: &str) -> String {
+    match set.match_path(path, is_dir(folder_dir, path)) {
+        Some(matched) => {
+            let verdict = if matched.ignored { "ignored" } else { "not ignored" };
+            format!(
+                "{verdict}: {path} (matched {} pattern `{}`)",
+                source_label(matched.pattern.source()),
+                matched.pattern.original()
+            )
+        }
+        None => format!("not ignored: {path} (no matching pattern)"),
+    }
+}
+
+pub fn explain_path_output(
+    set: &EffectiveIgnoreSet,
+    folder_dir: Option<&str>,
+    path: &str,
+) -> String {
+    match set.explain_path(path, is_dir(folder_dir, path)) {
         Some(explanation) if explanation.matched => {
             let verdict = if explanation.ignored { "ignored" } else { "not ignored" };
             let source = if explanation.source == IgnorePatternSource::BuiltIn {
-                "builtin".to_string()
-            } else if explanation.include_chain.is_empty() {
-                explanation.source_file.clone()
+                "built-in default".to_string()
             } else {
-                format!(
-                    "{} (via {})",
-                    explanation.source_file,
-                    explanation.include_chain.join(" -> ")
-                )
+                format!("line {}", explanation.line)
             };
             let case = if explanation.case_insensitive { ", case-insensitive" } else { "" };
-            Ok(format!(
-                "{verdict}: {display_path} (rule `{}` at {}:{}{case})",
-                explanation.rule_text, source, explanation.line
-            ))
+            format!("{verdict}: {path} (rule `{}` at {source}{case})", explanation.rule_text)
         }
-        _ => Ok(format!("not ignored: {display_path} (no matching pattern)")),
+        _ => format!("not ignored: {path} (no matching pattern)"),
     }
-}
-
-pub fn pattern_lines(link_path: &Path) -> Result<Vec<String>, CliError> {
-    ensure_directory(link_path)?;
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(link_path)
-        .map_err(|e| CliError::Other(e.to_string()))?;
-    Ok(ignore_set.patterns().iter().map(format_pattern).collect())
-}
-
-pub fn test_path_output(path: &Path) -> Result<String, CliError> {
-    let (link_root, relative_path, is_dir) = resolve_test_path(path)?;
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&link_root)
-        .map_err(|e| CliError::Other(e.to_string()))?;
-    let display_path = relative_path.to_string_lossy().replace('\\', "/");
-
-    match ignore_set.match_path(&relative_path, is_dir) {
-        Some(matched) => {
-            let verdict = if matched.ignored { "ignored" } else { "not ignored" };
-            Ok(format!(
-                "{verdict}: {display_path} (matched {} pattern `{}`)",
-                source_label(matched.pattern.source()),
-                matched.pattern.original()
-            ))
-        }
-        None => Ok(format!("not ignored: {display_path} (no matching pattern)")),
-    }
-}
-
-fn ensure_directory(path: &Path) -> Result<(), CliError> {
-    let metadata = std::fs::metadata(path)
-        .map_err(|e| CliError::Other(format!("cannot read {}: {e}", path.display())))?;
-    if !metadata.is_dir() {
-        return Err(CliError::Other(format!("not a directory: {}", path.display())));
-    }
-    Ok(())
-}
-
-fn resolve_test_path(path: &Path) -> Result<(PathBuf, PathBuf, bool), CliError> {
-    let absolute_path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().map_err(|e| CliError::Other(e.to_string()))?.join(path)
-    };
-    let is_dir = absolute_path.is_dir();
-    let search_start = if is_dir {
-        absolute_path.as_path()
-    } else {
-        absolute_path.parent().unwrap_or_else(|| Path::new("."))
-    };
-    let link_root = nearest_ignore_root(search_start).unwrap_or_else(|| {
-        if path.is_absolute() {
-            search_start.to_path_buf()
-        } else {
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-        }
-    });
-    let relative_path = absolute_path
-        .strip_prefix(&link_root)
-        .map_err(|_| {
-            CliError::Other(format!(
-                "{} is not under inferred link root {}",
-                absolute_path.display(),
-                link_root.display()
-            ))
-        })?
-        .to_path_buf();
-    Ok((link_root, relative_path, is_dir))
-}
-
-fn nearest_ignore_root(start: &Path) -> Option<PathBuf> {
-    start
-        .ancestors()
-        .find(|ancestor| ancestor.join(IGNORE_FILE_NAME).is_file())
-        .map(Path::to_path_buf)
 }
 
 fn format_pattern(pattern: &IgnorePattern) -> String {

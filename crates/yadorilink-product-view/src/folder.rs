@@ -129,6 +129,9 @@ pub struct FolderSummary {
     pub state: FolderState,
     pub paused: bool,
     pub conflict_count: u64,
+    /// Changes made on this device that no other device is known to hold yet (changes, not
+    /// files); 0 when the folder has no other device.
+    pub pending_local_changes: u64,
     pub files_hydrated: u64,
     pub files_placeholder: u64,
     pub files_hydrating: u64,
@@ -186,8 +189,7 @@ impl DegradedCause {
             Self::Stopped => I::FolderStopped,
             Self::WaitingForDiskSpace => I::WaitingForDiskSpace,
             Self::FileWatchLimit => I::FileWatchLimit,
-            Self::OwnershipLost => I::OwnershipLost,
-            Self::NotJoined => I::NotJoined,
+            Self::OwnershipLost | Self::NotJoined => I::FolderNeedsRelink,
         }
     }
 }
@@ -214,6 +216,7 @@ impl From<&LinkStatus> for FolderSummary {
             state: FolderState::from_link(link),
             paused: link.paused,
             conflict_count: link.conflict_count,
+            pending_local_changes: link.pending_local_changes,
             files_hydrated: link.hydrated_count,
             files_placeholder: link.placeholder_count,
             files_hydrating: link.hydrating_count,

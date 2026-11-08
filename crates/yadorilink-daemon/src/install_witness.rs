@@ -315,6 +315,15 @@ pub fn check_persistent_dir(dir: &Path, data_areas: &[&Path]) -> Result<(), Stri
     Ok(())
 }
 
+/// The macOS witness directory's name under `~/Library/Caches`: the product's, unless the build
+/// names its own state directory (a staging app), which then keeps its witness beside its own data
+/// and never shares the installed product's.
+#[cfg(target_vendor = "apple")]
+const WITNESS_DIR_NAME: &str = match option_env!("YADORILINK_STATE_DIR_NAME") {
+    Some(name) => name,
+    None => "YadoriLink",
+};
+
 /// The platform's default witness directory, from the environment `var` reads (the desktop
 /// composition root passes the process environment; an embedded host names its directory itself):
 /// the user's cache directory (excluded from Time Machine on macOS; not part of a profile or
@@ -332,7 +341,7 @@ pub fn platform_witness_dir(
     #[cfg(target_vendor = "apple")]
     {
         let home = var("HOME").ok_or_else(|| missing("HOME"))?;
-        Ok(PathBuf::from(home).join("Library/Caches/YadoriLink"))
+        Ok(PathBuf::from(home).join("Library/Caches").join(WITNESS_DIR_NAME))
     }
     #[cfg(windows)]
     {

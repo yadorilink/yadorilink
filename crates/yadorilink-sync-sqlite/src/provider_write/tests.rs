@@ -1052,7 +1052,7 @@ fn the_engine_decides_whether_the_os_may_drop_an_items_copy() {
         |id: &ItemId| fx.repo.lookup_item(&fx.root, id).unwrap().unwrap().0.eviction_allowed;
     assert!(allowed(&dir.item_id) && allowed(&kept.item_id) && allowed(&other.item_id));
 
-    let pins = crate::PinnedItemRepository::new(fx.db.clone());
+    let pins = crate::RetentionRuleRepository::new(fx.db.clone());
     pins.pin(GROUP, "docs/kept").unwrap();
     assert!(!allowed(&kept.item_id), "a kept file was allowed");
     assert!(!allowed(&dir.item_id), "a folder holding a kept file was allowed");
@@ -1069,6 +1069,38 @@ fn the_engine_decides_whether_the_os_may_drop_an_items_copy() {
     // Pinning a prefix-sharing name does not cover its neighbour ("doc" vs "docs").
     pins.pin(GROUP, "doc").unwrap();
     assert!(allowed(&dir.item_id) && allowed(&loose.item_id));
+}
+
+/// The longest rule wins when the OS asks: an online-only exception under a kept folder may be
+/// dropped, a folder holding it stays refused while something else under it is kept, and a kept
+/// exception under an online-only folder keeps its folder refused (an ancestor's own rule never
+/// authorises dropping a directory).
+#[test]
+fn an_online_only_exception_and_a_kept_exception_decide_by_the_nearest_rule() {
+    use crate::Rule;
+    let fx = Fx::new();
+    let docs = fx.create_dir(None, "docs");
+    let free = fx.create_dir(Some(docs.item_id), "free");
+    let inner = fx.create(Some(free.item_id), "inner", b"i");
+    let kept = fx.create(Some(docs.item_id), "kept", b"k");
+    let allowed =
+        |id: &ItemId| fx.repo.lookup_item(&fx.root, id).unwrap().unwrap().0.eviction_allowed;
+    let rules = crate::RetentionRuleRepository::new(fx.db.clone());
+
+    rules.set(GROUP, "docs", Some(Rule::Keep)).unwrap();
+    rules.set(GROUP, "docs/free", Some(Rule::OnlineOnly)).unwrap();
+    assert!(!allowed(&kept.item_id), "kept through the folder above");
+    assert!(allowed(&inner.item_id), "the nearer online-only rule frees the file");
+    assert!(allowed(&free.item_id), "nothing under the online-only folder is kept");
+    assert!(!allowed(&docs.item_id), "the kept folder itself stays refused");
+
+    rules.unpin(GROUP, "docs").unwrap();
+    rules.set(GROUP, "docs", Some(Rule::OnlineOnly)).unwrap();
+    rules.set(GROUP, "docs/free/inner", Some(Rule::Keep)).unwrap();
+    assert!(!allowed(&inner.item_id));
+    assert!(!allowed(&free.item_id), "a folder holding a kept exception is refused");
+    assert!(!allowed(&docs.item_id), "so is the online-only folder above it");
+    assert!(allowed(&kept.item_id), "a sibling with no kept rule is free");
 }
 
 /// A pin or unpin changes what the OS may do with the item, so the engine republishes it: the item
@@ -1143,7 +1175,7 @@ fn a_retention_change_republishes_the_item_its_descendants_and_ancestors() {
 fn a_pin_and_its_republication_commit_together_or_not_at_all() {
     let fx = Fx::new();
     let a = fx.create(None, "a", b"a");
-    let pins = crate::PinnedItemRepository::new(fx.db.clone());
+    let pins = crate::RetentionRuleRepository::new(fx.db.clone());
     let refuse_root_updates = |on: bool| {
         fx.db
             .write_immediate::<_, SyncSqliteError>(|tx| {
@@ -4156,4 +4188,36 @@ fn a_create_of_another_kind_onto_an_existing_name_is_not_adopted() {
         fx.run_raw(&create_input(&fx, None, "d", EntryKind::File, Some(b"x"))).unwrap();
     assert_eq!(file_on_dir.outcome, OutcomeKind::Concurrent);
     assert!(fx.live_paths().contains(&"d".to_string()));
+}
+
+/// A file's held state decides its badge, so a flip tells the OS (an upsert event and the root
+/// signal counter) and anything that is not a flip stays silent.
+#[test]
+fn a_held_state_flip_tells_the_os_and_a_repeat_does_not() {
+    let fx = Fx::new();
+    let made = fx.create(None, "a", b"a");
+    fx.page(&[], None, 100); // the OS lists the folder: the item is shown
+    let anchor = fx.revision();
+    let held = crate::materialization_state::MaterializationStateRepository::new(fx.db.clone());
+    let signal = |fx: &Fx| fx.repo.unannounced_changes(&fx.root).unwrap();
+    let before = signal(&fx);
+
+    held.set_held(GROUP, "a", "case_collision", 5).unwrap();
+    assert_eq!(fx.revision(), anchor + 1, "a hold was not announced");
+    assert_ne!(signal(&fx), before, "the root signal did not move");
+    let page = fx.changes(&ChangeScope::WorkingSet, anchor, 100);
+    assert_eq!(page.upserts.len(), 1);
+    assert_eq!(page.upserts[0].item_id, made.item_id);
+
+    held.set_held(GROUP, "a", "case_collision", 6).unwrap();
+    held.set_held_with_key(GROUP, "a", "case_collision", 7, Some("k")).unwrap();
+    assert_eq!(fx.revision(), anchor + 1, "a repeated hold of the same reason is not a flip");
+
+    held.set_held(GROUP, "a", "reserved_name", 8).unwrap();
+    assert_eq!(fx.revision(), anchor + 2, "a new reason is a change");
+
+    held.clear_held(GROUP, "a").unwrap();
+    assert_eq!(fx.revision(), anchor + 3, "release was not announced");
+    held.clear_held(GROUP, "a").unwrap();
+    assert_eq!(fx.revision(), anchor + 3, "clearing a file that is not held is not a flip");
 }

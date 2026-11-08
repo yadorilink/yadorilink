@@ -14,7 +14,7 @@ use yadorilink_ipc_proto::daemonctl::{
     RestoreVersionRequest, TrashedFileInfo,
 };
 use yadorilink_ipc_proto::daemonctl::{
-    PinItemRequest, PinItemResponse, UnpinItemRequest, UnpinItemResponse,
+    RetentionRule, SetRetentionRuleRequest, SetRetentionRuleResponse,
 };
 
 use crate::daemon::control;
@@ -230,22 +230,21 @@ pub fn evict_refusal(code: &str) -> Option<EvictRefusal> {
     Some(EvictRefusal { why, retryable, hint })
 }
 
-/// Marks a file or folder "always keep on this device" and downloads what is not here yet.
-pub async fn pin(absolute_path: String) -> Result<PinItemResponse, CoreError> {
-    let resp = control::send(ReqPayload::PinItem(PinItemRequest { absolute_path })).await?;
-    let Some(RespPayload::PinItem(pin)) = resp.payload else {
+/// Sets the retention rule at a file or folder: keep it on this device (and download what is not
+/// here yet), keep nothing of it in the folder, or remove the rule set there. Nothing is deleted.
+pub async fn set_retention_rule(
+    absolute_path: String,
+    rule: RetentionRule,
+) -> Result<SetRetentionRuleResponse, CoreError> {
+    let resp = control::send(ReqPayload::SetRetentionRule(SetRetentionRuleRequest {
+        absolute_path,
+        rule: rule as i32,
+    }))
+    .await?;
+    let Some(RespPayload::SetRetentionRule(set)) = resp.payload else {
         return Err(unexpected());
     };
-    Ok(pin)
-}
-
-/// Stops keeping a file or folder. Nothing is removed: its space becomes reclaimable.
-pub async fn unpin(absolute_path: String) -> Result<UnpinItemResponse, CoreError> {
-    let resp = control::send(ReqPayload::UnpinItem(UnpinItemRequest { absolute_path })).await?;
-    let Some(RespPayload::UnpinItem(unpin)) = resp.payload else {
-        return Err(unexpected());
-    };
-    Ok(unpin)
+    Ok(set)
 }
 
 /// What to do with a kept copy of a file that was edited on two devices.

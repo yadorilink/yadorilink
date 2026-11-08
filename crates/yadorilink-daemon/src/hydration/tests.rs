@@ -1,3 +1,4 @@
+#![cfg(test)]
 // Exactly one epoch. The restore's native head changes what the path is
 // desired to be, which is what keeps the old basis from being trusted
 // (its proof no longer matches the desired state), so authoring advances
@@ -1274,6 +1275,23 @@ async fn hydrate_applies_the_recorded_unix_mode_after_reconstruct() {
 #[cfg(unix)]
 async fn setup_remote_doc(
 ) -> (Arc<DaemonState>, Arc<ReplicaCoordinator>, tempfile::TempDir, &'static [u8]) {
+    setup_remote_doc_with(true).await
+}
+
+/// `block_in_store: false` leaves the block out of the local store, so only a peer could supply it.
+#[cfg(unix)]
+async fn setup_remote_doc_with(
+    block_in_store: bool,
+) -> (Arc<DaemonState>, Arc<ReplicaCoordinator>, tempfile::TempDir, &'static [u8]) {
+    setup_remote_file(block_in_store, "doc.txt").await
+}
+
+/// The same, for the file `name`.
+#[cfg(unix)]
+async fn setup_remote_file(
+    block_in_store: bool,
+    name: &str,
+) -> (Arc<DaemonState>, Arc<ReplicaCoordinator>, tempfile::TempDir, &'static [u8]) {
     let store = Arc::new(SegmentBlockStore::new(tempfile::tempdir().unwrap().keep()).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let root_dir = tempfile::tempdir().unwrap();
@@ -1287,7 +1305,9 @@ async fn setup_remote_doc(
 
     let indexed_content: &'static [u8] = b"the remote content this placeholder stands in for";
     let hash = Sha256::digest(indexed_content).to_vec();
-    store.put(indexed_content).unwrap();
+    if block_in_store {
+        store.put(indexed_content).unwrap();
+    }
     sync_state.record_block_provenance("group-1", std::slice::from_ref(&hash)).unwrap();
     let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
     sync_state
@@ -1295,7 +1315,7 @@ async fn setup_remote_doc(
         .upsert_file(
             "group-1",
             &yadorilink_replica_domain::file::FileRecord {
-                path: "doc.txt".into(),
+                path: name.into(),
                 size: indexed_content.len() as u64,
                 mtime_unix_nanos: 0,
                 blocks: vec![BlockInfo { hash, offset: 0, size: indexed_content.len() as u32 }],
@@ -1306,7 +1326,7 @@ async fn setup_remote_doc(
         .unwrap();
     sync_state
         .materialization_state_repository()
-        .set_materialization_state("group-1", "doc.txt", MaterializationState::Remote, &permit)
+        .set_materialization_state("group-1", name, MaterializationState::Remote, &permit)
         .unwrap();
 
     let state = DaemonState::new("device-a".into(), sync_state.clone(), store);
@@ -1331,6 +1351,436 @@ async fn a_remote_row_with_nothing_at_the_path_hydrates() {
             .unwrap(),
         Some(MaterializationState::Present)
     );
+}
+
+/// The steps of an on-demand hydration, as the write operation records them: the intent and the
+/// fence bump are prepared together, the bytes land, and one commit proves them.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_on_demand_hydration_goes_prepared_published_proven() {
+    use crate::write_op::trace::StepTrace;
+    use crate::write_op::{IntentSettlement, ProofOutcome, StepEvent};
+    let (state, _sync_state, _root_dir, _content) =
+        setup_remote_file(true, "trace-hydrate.txt").await;
+
+    hydrate_inner(&state, "group-1", "trace-hydrate.txt", Some(&test_stall())).await.unwrap();
+
+    assert_eq!(
+        StepTrace::of("group-1", "trace-hydrate.txt"),
+        [
+            StepEvent::Prepared,
+            StepEvent::Published { names_deferred: false, landed_marked: true },
+            StepEvent::Proven {
+                outcome: ProofOutcome::Exact,
+                intent: IntentSettlement::Cleared,
+                obligation_closed: false,
+            },
+        ]
+    );
+}
+
+/// A failure injected after the bytes are placed leaves the write unsettled (the intent stays
+/// open, nothing is proven) and the next attempt completes it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failure_after_the_hydration_placed_its_bytes_leaves_the_intent_for_the_next_attempt() {
+    use crate::write_op::failpoint::{arm, WriteOpFailpoint};
+    let (state, sync_state, root_dir, content) = setup_remote_file(true, "fp-hydrate.txt").await;
+
+    {
+        let _armed = arm(WriteOpFailpoint::AfterPublish, "fp-hydrate.txt");
+        assert!(hydrate_inner(&state, "group-1", "fp-hydrate.txt", Some(&test_stall()))
+            .await
+            .is_err());
+    }
+    assert!(sync_state.has_materialization_intent("group-1", "fp-hydrate.txt").unwrap());
+
+    hydrate_inner(&state, "group-1", "fp-hydrate.txt", Some(&test_stall())).await.unwrap();
+
+    assert_eq!(std::fs::read(root_dir.path().join("fp-hydrate.txt")).unwrap(), content);
+    assert!(!sync_state.has_materialization_intent("group-1", "fp-hydrate.txt").unwrap());
+}
+
+/// A hydration write stopped at each of its other transitions loses nothing and the next
+/// attempt completes it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_hydration_stopped_at_each_other_transition_is_completed_by_the_next_attempt() {
+    use crate::write_op::failpoint::{arm, WriteOpFailpoint};
+    for (i, point) in [
+        WriteOpFailpoint::AfterPrepare,
+        WriteOpFailpoint::BeforeProve,
+        WriteOpFailpoint::AfterProve,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("fp-hydrate-{i}.txt");
+        let (state, sync_state, root_dir, content) = setup_remote_file(true, &name).await;
+        {
+            let armed = arm(point, &name);
+            assert!(
+                hydrate_inner(&state, "group-1", &name, Some(&test_stall())).await.is_err(),
+                "{point:?}: the armed failpoint fails the attempt"
+            );
+            assert!(armed.fired() >= 1, "{point:?} was reached");
+        }
+        if let Ok(bytes) = std::fs::read(root_dir.path().join(&name)) {
+            assert_eq!(bytes, content, "{point:?}: only the whole object may stand at the name");
+        }
+
+        hydrate_inner(&state, "group-1", &name, Some(&test_stall())).await.unwrap();
+
+        assert_eq!(std::fs::read(root_dir.path().join(&name)).unwrap(), content, "{point:?}");
+        assert!(
+            !sync_state.has_materialization_intent("group-1", &name).unwrap(),
+            "{point:?}: the next attempt settled it"
+        );
+    }
+}
+
+/// A `Remote` row for a file of several large blocks, all of them already in the block store, in
+/// a linked folder. Large enough that a device receiving in place writes it into a temp beside it.
+#[cfg(unix)]
+async fn setup_remote_large_file(
+    name: &str,
+) -> (Arc<DaemonState>, Arc<ReplicaCoordinator>, tempfile::TempDir, Vec<u8>) {
+    let store = Arc::new(SegmentBlockStore::new(tempfile::tempdir().unwrap().keep()).unwrap());
+    setup_remote_large_file_over(name, store).await
+}
+
+/// [`setup_remote_large_file`] over a block store of the caller's, which must hold the blocks put
+/// into it here.
+#[cfg(unix)]
+async fn setup_remote_large_file_over<S: BlockStore + Send + Sync + 'static>(
+    name: &str,
+    store: Arc<S>,
+) -> (Arc<DaemonState>, Arc<ReplicaCoordinator>, tempfile::TempDir, Vec<u8>) {
+    let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+    let root_dir = tempfile::tempdir().unwrap();
+    sync_state.link_repository().add_link(&root_dir.path().to_string_lossy(), "group-1").unwrap();
+    yadorilink_root_authority::root_identity::VerifiedRoot::open(
+        root_dir.path(),
+        "group-1",
+        sync_state.as_ref(),
+    )
+    .unwrap();
+    let chunks: Vec<Vec<u8>> =
+        (1..=3u8).map(|tag| (0..2 * 1024 * 1024).map(|n| (n as u8) ^ tag).collect()).collect();
+    let mut blocks = Vec::new();
+    let mut offset = 0u64;
+    for chunk in &chunks {
+        store.put(chunk).unwrap();
+        let hash = Sha256::digest(chunk).to_vec();
+        sync_state.record_block_provenance("group-1", std::slice::from_ref(&hash)).unwrap();
+        blocks.push(BlockInfo { hash, offset, size: chunk.len() as u32 });
+        offset += chunk.len() as u64;
+    }
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+    sync_state
+        .file_index_repository()
+        .upsert_file(
+            "group-1",
+            &yadorilink_replica_domain::file::FileRecord {
+                path: name.into(),
+                size: offset,
+                mtime_unix_nanos: 0,
+                blocks,
+                deleted: false,
+            },
+            &permit,
+        )
+        .unwrap();
+    sync_state
+        .materialization_state_repository()
+        .set_materialization_state("group-1", name, MaterializationState::Remote, &permit)
+        .unwrap();
+    let state = DaemonState::new("device-a".into(), sync_state.clone(), store);
+    state.install_test_root_commit_authority("group-1");
+    (state, sync_state, root_dir, chunks.concat())
+}
+
+/// A large file written into a temp beside it is hydrated whole, leaves no temp, and a hydration
+/// stopped at each of its transitions loses nothing: the next attempt completes it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_large_file_hydrated_in_place_survives_a_stop_at_each_transition() {
+    use crate::write_op::failpoint::{arm, WriteOpFailpoint};
+    let names = |dir: &std::path::Path| -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|name| name != ".yadorilink-root")
+            .collect()
+    };
+    for (i, point) in [
+        None,
+        Some(WriteOpFailpoint::AfterPrepare),
+        Some(WriteOpFailpoint::AfterPublish),
+        Some(WriteOpFailpoint::BeforeProve),
+        Some(WriteOpFailpoint::AfterProve),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("fp-large-{i}.bin");
+        let (state, sync_state, root_dir, content) = setup_remote_large_file(&name).await;
+        assert!(
+            writes_in_place(&state, "group-1", &name, content.len() as u64),
+            "the file is written in place"
+        );
+        if let Some(point) = point {
+            let armed = arm(point, &name);
+            assert!(
+                hydrate_inner(&state, "group-1", &name, Some(&test_stall())).await.is_err(),
+                "{point:?}: the armed failpoint fails the attempt"
+            );
+            assert!(armed.fired() >= 1, "{point:?} was reached");
+            drop(armed);
+            if let Ok(bytes) = std::fs::read(root_dir.path().join(&name)) {
+                assert!(bytes == content, "{point:?}: only the whole object may stand at the name");
+            }
+        }
+        hydrate_inner(&state, "group-1", &name, Some(&test_stall())).await.unwrap();
+
+        assert!(std::fs::read(root_dir.path().join(&name)).unwrap() == content, "{point:?}");
+        assert!(
+            !sync_state.has_materialization_intent("group-1", &name).unwrap(),
+            "{point:?}: the next attempt settled it"
+        );
+        assert_eq!(
+            names(root_dir.path()),
+            std::slice::from_ref(&name),
+            "{point:?}: no temp is left beside it"
+        );
+        let record =
+            sync_state.file_index_repository().get_file("group-1", &name).unwrap().unwrap();
+        assert_eq!(record.blocks.len(), 3);
+    }
+}
+
+/// A block store that runs one event the first time a block is read from it: the point at which a
+/// hydration written in place is filling its temp.
+#[cfg(unix)]
+struct EditOnFirstRead {
+    inner: SegmentBlockStore,
+    event: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+#[cfg(unix)]
+impl EditOnFirstRead {
+    fn arm(&self, event: impl FnOnce() + Send + 'static) {
+        *self.event.lock().unwrap() = Some(Box::new(event));
+    }
+
+    fn fire(&self) {
+        let event = self.event.lock().unwrap().take();
+        if let Some(event) = event {
+            event();
+        }
+    }
+}
+
+#[cfg(unix)]
+impl BlockStore for EditOnFirstRead {
+    fn put(&self, data: &[u8]) -> Result<yadorilink_local_storage::ContentHash, StorageError> {
+        self.inner.put(data)
+    }
+
+    fn get(&self, hash: &str) -> Result<Vec<u8>, StorageError> {
+        self.fire();
+        self.inner.get(hash)
+    }
+
+    fn get_unchecked(&self, hash: &str) -> Result<Vec<u8>, StorageError> {
+        self.fire();
+        self.inner.get_unchecked(hash)
+    }
+
+    fn delete(&self, hash: &str) -> Result<(), StorageError> {
+        self.inner.delete(hash)
+    }
+
+    fn exists(&self, hash: &str) -> Result<bool, StorageError> {
+        self.inner.exists(hash)
+    }
+
+    fn storage_root(&self) -> Option<&std::path::Path> {
+        self.inner.storage_root()
+    }
+
+    fn list_by_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<yadorilink_local_storage::ContentHash>, StorageError> {
+        self.inner.list_by_prefix(prefix)
+    }
+
+    fn sweep(
+        &self,
+        live: &HashSet<yadorilink_local_storage::ContentHash>,
+        grace_cutoff: std::time::SystemTime,
+        dry_run: bool,
+    ) -> Result<yadorilink_local_storage::GcReport, StorageError> {
+        self.inner.sweep(live, grace_cutoff, dry_run)
+    }
+}
+
+/// What a refused in-place hydration leaves: the user's edit standing, no `Present` row over it,
+/// the edit journalled for capture, and no temp beside it.
+#[cfg(unix)]
+fn assert_edit_kept_over_a_large_placeholder(
+    sync_state: &ReplicaCoordinator,
+    root: &std::path::Path,
+    name: &str,
+    edit: &[u8],
+    when: &str,
+) {
+    assert_eq!(std::fs::read(root.join(name)).unwrap(), edit, "{when}: the edit was overwritten");
+    assert_ne!(
+        sync_state
+            .materialization_state_repository()
+            .get_materialization_state("group-1", name)
+            .unwrap(),
+        Some(MaterializationState::Present),
+        "{when}: the row claims Present over a local edit"
+    );
+    assert!(
+        sync_state.dirty_path_repository().is_path_dirty("group-1", name).unwrap(),
+        "{when}: the edit must be journalled for capture"
+    );
+    let left: Vec<String> = directory_names(root)
+        .into_iter()
+        .filter(|entry| entry != name && entry != ".yadorilink-root")
+        .collect();
+    assert!(left.is_empty(), "{when}: a temp was left beside the edit: {left:?}");
+}
+
+/// A local edit written while a large file's blocks are being written into its temp is never
+/// overwritten: the attempt fails, the edit stands and is journalled, and nothing is left behind.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_edit_while_a_large_file_is_written_in_place_is_never_overwritten() {
+    let name = "inplace-edit.bin";
+    let store = Arc::new(EditOnFirstRead {
+        inner: SegmentBlockStore::new(tempfile::tempdir().unwrap().keep()).unwrap(),
+        event: StdMutex::new(None),
+    });
+    let (state, sync_state, root_dir, _content) =
+        setup_remote_large_file_over(name, store.clone()).await;
+    assert!(
+        writes_in_place(&state, "group-1", name, 6 * 1024 * 1024),
+        "the file is written in place"
+    );
+    let edit = b"an edit made while the temp is being filled";
+    let edited = root_dir.path().join(name);
+    store.arm(move || std::fs::write(edited, edit).unwrap());
+
+    let result = hydrate_inner(&state, "group-1", name, Some(&test_stall())).await;
+
+    assert!(store.event.lock().unwrap().is_none(), "the edit landed during the write");
+    assert!(result.is_err(), "hydration reported success over a local edit: {result:?}");
+    assert_edit_kept_over_a_large_placeholder(
+        &sync_state,
+        root_dir.path(),
+        name,
+        edit,
+        "during the write",
+    );
+}
+
+/// A newer version that supersedes the row while a large file is being written into its temp is
+/// never reported hydrated: the attempt fails and the row is not `Present` for the old version.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_version_superseding_a_large_file_mid_write_is_never_reported_hydrated() {
+    let name = "inplace-superseded.bin";
+    let store = Arc::new(EditOnFirstRead {
+        inner: SegmentBlockStore::new(tempfile::tempdir().unwrap().keep()).unwrap(),
+        event: StdMutex::new(None),
+    });
+    let (state, sync_state, root_dir, _content) =
+        setup_remote_large_file_over(name, store.clone()).await;
+    let newer = b"a newer version, much smaller than the one being written";
+    let (state_for_event, sync_for_event) = (state.clone(), sync_state.clone());
+    store.arm(move || {
+        let block = put_block(&state_for_event, "group-1", newer);
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        sync_for_event
+            .file_index_repository()
+            .upsert_file(
+                "group-1",
+                &record_with_blocks(name, vec![block], newer.len() as u64),
+                &permit,
+            )
+            .unwrap();
+    });
+
+    let result = hydrate_inner(&state, "group-1", name, Some(&test_stall())).await;
+
+    assert!(store.event.lock().unwrap().is_none(), "the supersession landed during the write");
+    assert!(result.is_err(), "hydration reported success for a superseded version: {result:?}");
+    assert_ne!(
+        sync_state
+            .materialization_state_repository()
+            .get_materialization_state("group-1", name)
+            .unwrap(),
+        Some(MaterializationState::Present),
+        "the row claims Present for a version this attempt did not write"
+    );
+    let left: Vec<String> = directory_names(root_dir.path())
+        .into_iter()
+        .filter(|entry| entry != name && entry != ".yadorilink-root")
+        .collect();
+    assert!(left.is_empty(), "a temp was left behind: {left:?}");
+}
+
+/// A local edit that lands after the last check and before the temp is renamed into place is kept,
+/// not replaced: the publish checks the target against the baseline itself.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_edit_just_before_a_large_file_is_renamed_into_place_is_never_overwritten() {
+    let name = "inplace-gap.bin";
+    let (state, sync_state, root_dir, _content) = setup_remote_large_file(name).await;
+    let out_path = root_dir.path().join(name);
+    let edit = b"an edit in the gap before the rename";
+    {
+        let (path, bytes) = (out_path.clone(), edit.to_vec());
+        set_swap_gap_hook(&out_path, Arc::new(move || std::fs::write(&path, &bytes).unwrap()));
+    }
+
+    let result = hydrate_inner(&state, "group-1", name, Some(&test_stall())).await;
+
+    assert!(result.is_err(), "hydration reported success over a local edit: {result:?}");
+    assert_edit_kept_over_a_large_placeholder(
+        &sync_state,
+        root_dir.path(),
+        name,
+        edit,
+        "before the rename",
+    );
+}
+
+/// A directory symlink planted under the root must not receive the temp of a large file: the
+/// write target is checked before the temp is created, not only before it is renamed.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_large_file_behind_a_symlinked_directory_is_not_written_outside_the_root() {
+    let name = "link/big.bin";
+    let (state, _sync_state, root_dir, _content) = setup_remote_large_file(name).await;
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), root_dir.path().join("link")).unwrap();
+
+    // The check that gates the temp's creation refuses the symlinked ancestor, and accepts a plain one.
+    let root = root_dir.path();
+    assert!(!folder_write_target_ok(&state, "group-1", root, &root.join(name)));
+    assert!(folder_write_target_ok(&state, "group-1", root, &root.join("plain/big.bin")));
+
+    let result = hydrate_inner(&state, "group-1", name, Some(&test_stall())).await;
+
+    assert!(result.is_err(), "the write is refused");
+    let escaped: Vec<_> = std::fs::read_dir(outside.path()).unwrap().collect();
+    assert!(escaped.is_empty(), "nothing was written outside the root: {escaped:?}");
 }
 
 /// An edit written at a `Remote` row's path before a hydration attempt
@@ -1664,6 +2114,7 @@ async fn fetch_blocks_from_sessions_is_a_no_op_for_empty_missing_list() {
         crate::recent_errors::RecentErrorLog::new(),
         None,
         LaneStop::new(),
+        None,
     )
     .await;
     assert!(result.unwrap().remaining.is_empty());
@@ -1687,6 +2138,7 @@ async fn fetch_blocks_from_sessions_returns_missing_blocks_when_no_candidates() 
         crate::recent_errors::RecentErrorLog::new(),
         None,
         LaneStop::new(),
+        None,
     )
     .await;
     assert_eq!(
@@ -2576,6 +3028,75 @@ async fn hydrate_refuses_a_superseded_proof_whose_bytes_were_edited_since() {
     );
 }
 
+/// A crash during the fetch of a newer version, before the write's intent exists, leaves the row
+/// `Hydrating` over the older version's bytes. The startup reset promotes it to `Present` (the
+/// object stands), and that is safe because of evidence, not state: the older bytes are still the
+/// daemon's own untouched write (their proof's identity is unchanged), so neither capture nor the
+/// repair sweep reads them as an edit to author or to quarantine. Pins the question of whether a
+/// stranded `Hydrating` row can get an older object authored over the newer version.
+#[tokio::test]
+async fn a_hydrating_row_stranded_over_older_bytes_is_not_read_as_an_edit_after_the_startup_reset()
+{
+    if !yadorilink_fs_platform::fs_capabilities::temp_dir_proves_object_identity_for_test() {
+        return;
+    }
+    let (state, root, _store_dir) = superseded_proof_fixture().await;
+    let coordinator = &state.replica_coordinator;
+    let v1 = b"the bytes a prior cycle proved";
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+    coordinator
+        .materialization_state_repository()
+        .set_materialization_state(GROUP, PATH, MaterializationState::Hydrating, &permit)
+        .unwrap();
+    assert!(!coordinator
+        .materialization_intent_repository()
+        .has_materialization_intent(GROUP, PATH)
+        .unwrap());
+
+    let (hydrating, evicting) = coordinator.reset_stale_transient_states();
+
+    assert_eq!(hydrating.unwrap(), 1);
+    assert_eq!(evicting.unwrap(), 0);
+    assert_eq!(
+        coordinator
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, PATH)
+            .unwrap(),
+        Some(MaterializationState::Present),
+        "the object stands, so the reset keeps it visible to the repair sweep"
+    );
+    let on_disk = root.path().join(PATH);
+    let canonical_root = root.path().canonicalize().unwrap();
+    let processor = yadorilink_local_capture::LocalChangeProcessor::new(
+        coordinator.clone(),
+        Arc::new(crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
+            state.block_store.clone(),
+        )),
+        "device-under-test".to_string(),
+        Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
+    );
+    let authored = processor.scan_existing_files(GROUP, &canonical_root).unwrap();
+    assert!(
+        !authored.iter().any(|record| record.path == PATH),
+        "capture authored the older version over the newer one: {authored:?}"
+    );
+    let report =
+        yadorilink_filesystem_sync::materialization_repair::repair_interrupted_materializations(
+            coordinator.as_ref(),
+            &crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
+                state.block_store.clone(),
+            ),
+            &canonical_root,
+            GROUP,
+            yadorilink_filesystem_sync::materialization_repair::RepairMode::Startup,
+            &permit,
+        )
+        .unwrap();
+    assert!(report.quarantined_dirty.is_empty(), "{report:?}");
+    assert_eq!(std::fs::read(&on_disk).unwrap(), v1);
+    assert!(!coordinator.dirty_path_repository().is_path_dirty(GROUP, PATH).unwrap());
+}
+
 /// A newer version arriving over existing bytes leaves the row `Present`, and
 /// what protects those bytes is evidence, not state: the proof that vouches
 /// for them (identity unchanged since the daemon wrote them) makes them its
@@ -2698,6 +3219,11 @@ async fn a_restart_reconciles_stranded_transient_rows_against_the_disk() {
 /// aside: they are the daemon's own earlier write.
 #[tokio::test]
 async fn a_hydration_that_died_before_its_intent_does_not_turn_the_older_bytes_into_an_edit() {
+    // The premise is that the daemon's own earlier file is recognised again as the same object; a
+    // temp filesystem that cannot prove that (tmpfs) makes the verdict Ambiguous, by design.
+    if !yadorilink_fs_platform::fs_capabilities::temp_dir_proves_object_identity_for_test() {
+        return;
+    }
     let (state, root, _store_dir) = superseded_proof_fixture().await;
     let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
     let coordinator = state.replica_coordinator.clone();
@@ -3002,6 +3528,54 @@ async fn superseded_proof_fixture() -> (Arc<DaemonState>, tempfile::TempDir, tem
 /// The result was a `Present` row whose proof named no version and sat
 /// one epoch behind the fence: unusable on both counts, so the path
 /// stayed outstanding no matter how correct the bytes on disk were.
+/// The steps of a restore, as the write operation records them: its journal row and fence bump
+/// prepare it, the restored bytes land, and the settle commits the row and the proof.
+#[tokio::test]
+async fn a_restore_goes_prepared_published_proven() {
+    use crate::write_op::trace::StepTrace;
+    use crate::write_op::{IntentSettlement, ProofOutcome, StepEvent};
+    const TRACE_PATH: &str = "trace-restore.bin";
+    let (state, _store_dir) = test_state();
+    state.set_device_signing_key(ed25519_dalek::SigningKey::from_bytes(&[23u8; 32]));
+    state.replica_coordinator.set_local_policy_head_provider(Arc::new(|_| Ok([0u8; 32])));
+    let root = tempfile::tempdir().unwrap();
+    let local_path = root.path().to_string_lossy().to_string();
+    state.replica_coordinator.link_repository().add_link(&local_path, GROUP).unwrap();
+    state.install_test_root_commit_authority(GROUP);
+    yadorilink_root_authority::root_identity::VerifiedRoot::open(
+        root.path(),
+        GROUP,
+        state.replica_coordinator.as_ref(),
+    )
+    .unwrap();
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+    for (content, size) in [(&b"version one content"[..], 19), (&b"version two content!!"[..], 21)]
+    {
+        let block = put_block(&state, GROUP, content);
+        let record = record_with_blocks(TRACE_PATH, vec![block], size);
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file_with_origin(GROUP, &record, "device-a", &permit)
+            .unwrap();
+    }
+
+    restore_to_version(&state, GROUP, TRACE_PATH, 1).await.unwrap();
+
+    assert_eq!(
+        StepTrace::of(GROUP, TRACE_PATH),
+        [
+            StepEvent::Prepared,
+            StepEvent::Published { names_deferred: false, landed_marked: false },
+            StepEvent::Proven {
+                outcome: ProofOutcome::Exact,
+                intent: IntentSettlement::Cleared,
+                obligation_closed: false,
+            },
+        ]
+    );
+}
+
 #[tokio::test]
 async fn restore_publishes_a_versioned_proof_under_the_epoch_its_own_write_bumped() {
     let (state, _store_dir) = test_state();
@@ -3937,9 +4511,10 @@ async fn a_convergence_rehydration_that_fails_after_its_fence_bump_leaves_presen
         .begin_hydration(GROUP, PATH, Some(MaterializationState::Present), canonical.version_hash())
         .unwrap()
         .expect("the entry CAS lands");
-    guard.begin_physical_write().unwrap();
-    // The reconstruct (or the metadata apply) fails: the lane returns Err
-    // and the guard drops uncommitted.
+    let (intent, _fence) = guard.prepare_physical_write(b"target", &permit).unwrap();
+    // The reconstruct (or the metadata apply) fails: the lane returns Err, its intent scope
+    // clears the intent and the guard drops uncommitted.
+    intent.clear().unwrap();
     drop(guard);
 
     let after = state
@@ -4218,6 +4793,65 @@ async fn a_failed_placement_keeps_the_write_intent_open() {
             .unwrap(),
         "the write intent was cleared by a failed placement"
     );
+}
+
+/// A user saves to the file in the instant after hydration's last check and before the
+/// replacement: the save stands, nothing is published, the path is journaled for capture and
+/// no temp file is left.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_save_that_lands_just_before_the_replacement_is_kept() {
+    if !yadorilink_fs_platform::fs_capabilities::temp_dir_proves_object_identity_for_test() {
+        return;
+    }
+    let (state, sync_state, root_dir, _old) = setup_legitimately_hydrated_doc().await;
+    move_doc_to_newer_version(
+        &state,
+        &sync_state,
+        b"the newer version's bytes, longer than the old ones",
+    );
+    let out = root_dir.path().join("doc.txt");
+    {
+        let target = out.clone();
+        set_swap_gap_hook(
+            &out,
+            Arc::new(move || std::fs::write(&target, b"saved a moment ago").unwrap()),
+        );
+    }
+
+    let result = hydrate_inner(&state, "group-1", "doc.txt", Some(&test_stall())).await;
+
+    assert!(matches!(result, Err(SyncError::HydrationFailed(_))), "got {result:?}");
+    assert_eq!(std::fs::read(&out).unwrap(), b"saved a moment ago");
+    assert!(sync_state.dirty_path_repository().is_path_dirty("group-1", "doc.txt").unwrap());
+    assert_eq!(
+        directory_names(root_dir.path()),
+        [".yadorilink-root", "doc.txt"],
+        "a temp or a displaced object stayed"
+    );
+}
+
+/// The same for a restore: a save landing after its last check is kept.
+#[tokio::test]
+async fn restore_does_not_replace_a_save_that_lands_after_its_last_check() {
+    let (state, _store_dir, root) = restore_fixture();
+    super::RESTORE_BEFORE_PUBLISH_HOOK.lock().unwrap().push((
+        root.path().join(PATH).display().to_string(),
+        Box::new(|out_path| std::fs::write(out_path, b"saved a moment ago").unwrap()),
+    ));
+
+    let result = restore_to_version(&state, GROUP, PATH, 1).await;
+
+    assert!(matches!(result, Err(SyncError::PathChangedLocally(_))), "got {result:?}");
+    assert_eq!(std::fs::read(root.path().join(PATH)).unwrap(), b"saved a moment ago");
+    assert!(state.replica_coordinator.dirty_path_repository().is_path_dirty(GROUP, PATH).unwrap());
+    assert_eq!(restore_journal_rows(&state), 0, "a refused restore removes its own journal row");
+    let stray: Vec<_> = std::fs::read_dir(root.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.starts_with(".yadorilink-root") && name != PATH)
+        .collect();
+    assert!(stray.is_empty(), "the abandoned temp file is removed: {stray:?}");
 }
 
 /// The volume under the root goes away after the content was assembled and before it is renamed
@@ -4580,13 +5214,78 @@ mod pin {
         let (state, sync_state, root_dir, content) = setup_remote_doc().await;
         let adapter = DaemonMaterializationAdapter::new(state.clone());
 
-        let outcome = adapter.pin("group-1", "doc.txt").await.unwrap();
+        let outcome = adapter
+            .set_rule("group-1", "doc.txt", crate::application::ports::RuleChoice::Keep)
+            .await
+            .unwrap();
 
         assert_eq!(outcome.download_error, None);
         assert!(outcome.retention.pinned && outcome.retention.explicit);
         assert_eq!(std::fs::read(root_dir.path().join("doc.txt")).unwrap(), content);
         assert_eq!(materialization(&sync_state, "doc.txt"), Some(MaterializationState::Present));
         assert!(adapter.retention("group-1", "doc.txt").unwrap().pinned);
+    }
+
+    /// A pinned file whose bytes no device can supply yet is reported pending (and counts as
+    /// wanted content), and the next pass downloads it once the bytes are here.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pinned_file_that_cannot_be_fetched_is_retried_until_it_downloads() {
+        use crate::adapters::runtime::materialization::retry_pass;
+        let (state, sync_state, root_dir, content) = setup_remote_doc_with(false).await;
+        sync_state.retention_rules().pin("group-1", "doc.txt").unwrap();
+
+        assert!(retry_pass(&state, std::time::Duration::from_secs(5)).await);
+        let pending = state.telemetry.pinned_pending("group-1").expect("pending is reported");
+        assert_eq!(pending.items, 1);
+        assert!(!pending.last_error.is_empty());
+        assert_eq!(materialization(&sync_state, "doc.txt"), Some(MaterializationState::Remote));
+
+        state.block_store.put(content).unwrap();
+        assert!(!retry_pass(&state, std::time::Duration::from_secs(5)).await);
+        assert!(state.telemetry.pinned_pending("group-1").is_none());
+        assert_eq!(std::fs::read(root_dir.path().join("doc.txt")).unwrap(), content);
+        assert_eq!(materialization(&sync_state, "doc.txt"), Some(MaterializationState::Present));
+    }
+
+    /// The pinned-download pass reads the nearest rule: a file under a kept folder that an
+    /// online-only rule frees is not downloaded again, and is downloaded once the rule is gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_pinned_download_pass_leaves_an_online_only_exception_alone() {
+        use crate::adapters::runtime::materialization::retry_pass;
+        use yadorilink_sync_sqlite::Rule;
+        let (state, sync_state, root_dir, content) = setup_remote_doc().await;
+        sync_state.retention_rules().set("group-1", "", Some(Rule::Keep)).unwrap();
+        sync_state.retention_rules().set("group-1", "doc.txt", Some(Rule::OnlineOnly)).unwrap();
+
+        assert!(!retry_pass(&state, std::time::Duration::from_secs(5)).await, "nothing is wanted");
+        assert_eq!(materialization(&sync_state, "doc.txt"), Some(MaterializationState::Remote));
+        assert!(!root_dir.path().join("doc.txt").exists());
+
+        sync_state.retention_rules().unpin("group-1", "doc.txt").unwrap();
+        assert!(!retry_pass(&state, std::time::Duration::from_secs(5)).await);
+        assert_eq!(std::fs::read(root_dir.path().join("doc.txt")).unwrap(), content);
+        assert_eq!(materialization(&sync_state, "doc.txt"), Some(MaterializationState::Present));
+    }
+
+    /// Pausing a folder takes its pending state off the next pass at once, and the time of the
+    /// next attempt is set when the pass ends.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_paused_folder_drops_its_pending_state() {
+        use crate::adapters::runtime::materialization::retry_pass;
+        let (state, sync_state, root_dir, _content) = setup_remote_doc_with(false).await;
+        sync_state.retention_rules().pin("group-1", "doc.txt").unwrap();
+
+        let before = std::time::Instant::now();
+        assert!(retry_pass(&state, std::time::Duration::from_secs(40)).await);
+        let pending = state.telemetry.pinned_pending("group-1").expect("pending is reported");
+        assert!(pending.next_retry >= before + std::time::Duration::from_secs(40));
+
+        sync_state.link_repository().set_paused(&root_dir.path().to_string_lossy(), true).unwrap();
+        assert!(!retry_pass(&state, std::time::Duration::from_secs(40)).await);
+        assert!(state.telemetry.pinned_pending("group-1").is_none());
     }
 
     /// A hydrated file is pinned without being rewritten or re-versioned.
@@ -4600,7 +5299,10 @@ mod pin {
         let version = current_version_hash_for(&sync_state, "group-1", "doc.txt");
         let adapter = DaemonMaterializationAdapter::new(state.clone());
 
-        let outcome = adapter.pin("group-1", "doc.txt").await.unwrap();
+        let outcome = adapter
+            .set_rule("group-1", "doc.txt", crate::application::ports::RuleChoice::Keep)
+            .await
+            .unwrap();
 
         assert_eq!(outcome.download_error, None);
         let after = std::fs::metadata(&on_disk).unwrap();
@@ -4621,7 +5323,10 @@ mod pin {
         // Reaching the eviction itself must be possible, so that only the pin stops it.
         state.set_test_on_demand_allowed(true);
         let adapter = DaemonMaterializationAdapter::new(state.clone());
-        adapter.pin("group-1", "doc.txt").await.unwrap();
+        adapter
+            .set_rule("group-1", "doc.txt", crate::application::ports::RuleChoice::Keep)
+            .await
+            .unwrap();
 
         let result = adapter.evict("group-1", "doc.txt");
 
@@ -4748,7 +5453,10 @@ mod pin {
         assert!(!state.block_store.exists(&hex_hash).unwrap());
         let adapter = DaemonMaterializationAdapter::new(state.clone());
 
-        let outcome = adapter.pin("group-1", "doc.txt").await.unwrap();
+        let outcome = adapter
+            .set_rule("group-1", "doc.txt", crate::application::ports::RuleChoice::Keep)
+            .await
+            .unwrap();
 
         assert_eq!(outcome.download_error, None, "{outcome:?}");
         assert_eq!(outcome.history_not_kept_reason, None, "{outcome:?}");
@@ -4843,7 +5551,7 @@ mod pin {
         state.set_test_on_demand_allowed(true);
         let adapter = DaemonMaterializationAdapter::new(state.clone());
         // The link root is the folder; its pin covers every file.
-        adapter.pin("group-1", "").await.unwrap();
+        adapter.set_rule("group-1", "", crate::application::ports::RuleChoice::Keep).await.unwrap();
 
         let file = adapter.evict("group-1", "doc.txt");
         let folder = adapter.evict("group-1", "");
@@ -4862,7 +5570,10 @@ mod pin {
         let (state, sync_state, root_dir, content) = setup_legitimately_hydrated_doc().await;
         state.set_test_on_demand_allowed(true);
         let adapter = DaemonMaterializationAdapter::new(state.clone());
-        adapter.pin("group-1", "doc.txt").await.unwrap();
+        adapter
+            .set_rule("group-1", "doc.txt", crate::application::ports::RuleChoice::Keep)
+            .await
+            .unwrap();
 
         let outcome = adapter.evict("group-1", "").expect("nothing eligible is not an error");
 
@@ -4879,10 +5590,17 @@ mod pin {
         let (state, sync_state, root_dir, content) = setup_legitimately_hydrated_doc().await;
         state.set_test_on_demand_allowed(true);
         let adapter = DaemonMaterializationAdapter::new(state.clone());
-        adapter.pin("group-1", "doc.txt").await.unwrap();
+        adapter
+            .set_rule("group-1", "doc.txt", crate::application::ports::RuleChoice::Keep)
+            .await
+            .unwrap();
         assert!(is_pin_refusal(&adapter.evict("group-1", "doc.txt")));
 
-        let after = adapter.unpin("group-1", "doc.txt").unwrap();
+        let after = adapter
+            .set_rule("group-1", "doc.txt", crate::application::ports::RuleChoice::Default)
+            .await
+            .unwrap()
+            .retention;
 
         assert!(!after.pinned);
         assert_eq!(std::fs::read(root_dir.path().join("doc.txt")).unwrap(), content);
@@ -4901,13 +5619,21 @@ mod pin {
     async fn unpinning_an_inherited_pin_changes_nothing() {
         let (state, _sync_state, _root_dir, _content) = setup_legitimately_hydrated_doc().await;
         let adapter = DaemonMaterializationAdapter::new(state.clone());
-        adapter.pin("group-1", "").await.unwrap();
+        adapter.set_rule("group-1", "", crate::application::ports::RuleChoice::Keep).await.unwrap();
 
-        let after = adapter.unpin("group-1", "doc.txt").unwrap();
+        let after = adapter
+            .set_rule("group-1", "doc.txt", crate::application::ports::RuleChoice::Default)
+            .await
+            .unwrap()
+            .retention;
 
         assert_eq!(
             after,
-            crate::application::ports::RetentionState { pinned: true, explicit: false }
+            crate::application::ports::RetentionState {
+                pinned: true,
+                online_only: false,
+                explicit: false
+            }
         );
     }
 
@@ -4920,7 +5646,7 @@ mod pin {
         sync_state
             .database()
             .write::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
-                conn.execute_batch("DROP TABLE pinned_items")?;
+                conn.execute_batch("DROP TABLE retention_rules")?;
                 Ok(())
             })
             .unwrap();
@@ -4940,7 +5666,10 @@ mod pin {
         let (state, sync_state, root_dir, content) = setup_remote_doc().await;
         let adapter = DaemonMaterializationAdapter::new(state.clone());
 
-        let outcome = adapter.pin("group-1", "").await.unwrap();
+        let outcome = adapter
+            .set_rule("group-1", "", crate::application::ports::RuleChoice::Keep)
+            .await
+            .unwrap();
 
         assert_eq!(outcome.download_error, None);
         assert_eq!(std::fs::read(root_dir.path().join("doc.txt")).unwrap(), content);
@@ -4960,7 +5689,11 @@ mod pin {
 
         let pinning = tokio::spawn({
             let adapter = adapter.clone();
-            async move { adapter.pin("group-1", "doc.txt").await }
+            async move {
+                adapter
+                    .set_rule("group-1", "doc.txt", crate::application::ports::RuleChoice::Keep)
+                    .await
+            }
         });
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
@@ -4986,7 +5719,9 @@ mod pin {
 
         let pinning = tokio::spawn({
             let adapter = adapter.clone();
-            async move { adapter.pin("group-1", "").await }
+            async move {
+                adapter.set_rule("group-1", "", crate::application::ports::RuleChoice::Keep).await
+            }
         });
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
@@ -4998,4 +5733,145 @@ mod pin {
         pinning.await.unwrap().unwrap();
         assert!(adapter.retention("group-1", "doc.txt").unwrap().pinned);
     }
+}
+
+/// Content that is not here and no peer connected is a person waiting: the keepers are woken.
+/// Content that is all here wakes nobody.
+#[tokio::test]
+async fn wanting_missing_content_with_no_peer_wakes_the_keepers() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with_link(&dir.path().to_string_lossy(), "group-1");
+    let mut demand = state.peers.subscribe_to_demand();
+
+    let none = resolve_blocks_local_first(&state, "group-1", "doc.txt", &[], None).await.unwrap();
+    assert!(none.is_empty());
+    assert!(!folder_was_wanted(&mut demand, "group-1").await, "nothing was wanted");
+
+    let missing =
+        resolve_blocks_local_first(&state, "group-1", "doc.txt", &[block(9)], None).await.unwrap();
+    assert_eq!(missing.len(), 1);
+    assert!(
+        folder_was_wanted(&mut demand, "group-1").await,
+        "a missing block with no peer must wake the keepers"
+    );
+}
+
+/// A peer of the folder with no session is a keeper that may be sleeping: wanting missing content
+/// wakes it even when another peer's session stands and could be asked.
+#[tokio::test]
+async fn wanting_missing_content_wakes_the_keeper_of_a_peer_with_no_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with_link(&dir.path().to_string_lossy(), "group-1");
+    state.replace_peer_netmap_metadata(
+        "device-offline",
+        Some([7; 32]),
+        &std::iter::once("group-1".to_string()).collect(),
+        &Default::default(),
+    );
+    let mut demand = state.peers.subscribe_to_demand();
+    let missing =
+        resolve_blocks_local_first(&state, "group-1", "doc.txt", &[block(9)], None).await.unwrap();
+    assert_eq!(missing.len(), 1);
+    assert!(
+        folder_was_wanted(&mut demand, "group-1").await,
+        "the wake names the folder that was wanted"
+    );
+    assert!(!folder_was_wanted(&mut demand, "another-folder").await);
+}
+
+/// Whether the keepers of peers that share `group` have been asked to dial.
+async fn folder_was_wanted(demand: &mut crate::peer_registry::DemandWatch, group: &str) -> bool {
+    let groups = || Some(vec![group.to_string()]);
+    // Polled once: the wake is already in the channel or it is not coming, so no timing is involved.
+    tokio::time::timeout(std::time::Duration::ZERO, demand.wanted(groups)).await.is_ok()
+}
+
+/// A sink for a two-block file in `dir`, with the first block written into it.
+#[cfg(unix)]
+async fn assembly_sink_with_one_block_written(
+    dir: &std::path::Path,
+    temps: &Arc<crate::local_convergence::filled_temps::PartialTemps>,
+) -> (AssemblySink, Vec<u8>) {
+    use crate::local_convergence::large_file_sink::LargeFileSink;
+    let (first, second) = (vec![1u8; 100], vec![2u8; 100]);
+    let blocks: Vec<BlockInfo> = [(&first, 0u64), (&second, 100)]
+        .iter()
+        .map(|(data, offset)| BlockInfo {
+            hash: hex::decode(yadorilink_local_storage::hash_block_bytes(data).as_bytes()).unwrap(),
+            offset: *offset,
+            size: 100,
+        })
+        .collect();
+    let record = yadorilink_replica_domain::file::FileRecord {
+        path: "big.bin".into(),
+        size: 200,
+        mtime_unix_nanos: 0,
+        blocks: blocks.clone(),
+        deleted: false,
+    };
+    let staged = yadorilink_local_storage::StagedFile::create(
+        &dir.join("staging"),
+        200,
+        Arc::new(yadorilink_local_storage::NoTempLedger),
+    )
+    .unwrap();
+    let mut sink = LargeFileSink::new(
+        staged,
+        Arc::new(crate::local_convergence::HeadroomReservation::unreserved()),
+    );
+    let verified =
+        yadorilink_local_storage::VerifiedBlock::check(&first, &blocks[0].hash, 100).unwrap();
+    sink.write_block(&record, &verified).await.unwrap();
+    let key = ("group".to_string(), "big.bin".to_string(), "v1".to_string());
+    let assembly = AssemblySink {
+        target: BlockSinkTarget {
+            sink: Arc::new(tokio::sync::Mutex::new(sink)),
+            record: Arc::new(record),
+            written: None,
+        },
+        temps: temps.clone(),
+        key,
+        done: false,
+    };
+    (assembly, blocks[0].hash.clone())
+}
+
+/// A fetch dropped before its file is whole keeps the blocks it wrote, also when a block write
+/// holds the sink at that moment: the file is parked once the write lets go.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_fetch_parks_its_file_even_while_a_block_write_holds_the_sink() {
+    let dir = tempfile::tempdir().unwrap();
+    let temps = Arc::new(crate::local_convergence::filled_temps::PartialTemps::default());
+    let (assembly, first_hash) = assembly_sink_with_one_block_written(dir.path(), &temps).await;
+    let key = assembly.key.clone();
+    let held = assembly.target.sink.clone().lock_owned().await;
+    drop(assembly);
+    assert!(temps.is_empty(), "nothing can be copied while the write holds the sink");
+    drop(held);
+    for _ in 0..500 {
+        if !temps.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let parked = temps.take(&key).expect("the file was parked once the write let go");
+    assert!(parked.written.contains(&first_hash), "the block written before the drop is claimed");
+}
+
+/// A fetch that completed (its file handed over) parks nothing; one dropped without the sink
+/// being locked parks at once.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_finished_assembly_parks_nothing_and_an_unfinished_one_parks_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let temps = Arc::new(crate::local_convergence::filled_temps::PartialTemps::default());
+    let (mut finished, _) = assembly_sink_with_one_block_written(dir.path(), &temps).await;
+    finished.done = true;
+    drop(finished);
+    assert!(temps.is_empty(), "a finished assembly leaves nothing parked");
+    let dir = tempfile::tempdir().unwrap();
+    let (unfinished, _) = assembly_sink_with_one_block_written(dir.path(), &temps).await;
+    drop(unfinished);
+    assert_eq!(temps.len(), 1);
 }

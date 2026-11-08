@@ -60,6 +60,15 @@ pub struct RuntimeTelemetry {
     /// Files each link's scans could not read and that need the person. Written by the
     /// capture scans, read by status; rebuilt by the first scan after a restart.
     unreadable_files: std::sync::Arc<yadorilink_local_capture::unreadable::UnreadableFileLedger>,
+    /// Per group, the pinned items the background download could not fetch yet.
+    pinned_pending: Mutex<HashMap<String, PinnedPending>>,
+    /// Wakes the background download of pinned items.
+    pinned_download_wake: std::sync::Arc<tokio::sync::Notify>,
+    /// Per group, the edits saved on this device that the last publish attempt could not publish,
+    /// and why. Empty for a group whose last attempt published (or had nothing to publish).
+    unpublished: Mutex<HashMap<String, (UnpublishedReason, u64)>>,
+    /// When this engine started.
+    started: Mutex<std::time::Instant>,
     /// Delta admission outcomes and bytes/messages served to peers, for `/metrics`.
     replication: std::sync::Arc<crate::native_replication_driver::ReplicationCounters>,
     /// How many state-changing requests have finished, on every entry point (control socket,
@@ -68,7 +77,86 @@ pub struct RuntimeTelemetry {
     command_epoch: tokio::sync::watch::Sender<u64>,
 }
 
+/// Why edits saved on this device are not published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnpublishedReason {
+    /// The coordination service did not answer: the edits publish when it is back.
+    ServiceUnreachable,
+    /// The service answered 403: this device may not publish in the group (a viewer, a revoked
+    /// device): waiting does not help.
+    NotAuthorized,
+    /// The service answered, and not with a decision about the role (the Terms, a refused
+    /// credential, a missing route): a sign-in or an update may help, waiting does not by itself.
+    Rejected,
+}
+
+/// Saved edits that are not published, over all groups, by why.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct UnpublishedTotals {
+    pub(crate) service_unreachable: u64,
+    pub(crate) not_authorized: u64,
+    pub(crate) rejected: u64,
+}
+
+/// The pinned items of one group that the background download has not fetched yet.
+#[derive(Debug, Clone)]
+pub(crate) struct PinnedPending {
+    pub(crate) items: u64,
+    /// The failure of the last attempt, as the download reported it.
+    pub(crate) last_error: String,
+    /// When the next attempt starts, unless a device coming back starts it sooner.
+    pub(crate) next_retry: std::time::Instant,
+}
+
 impl RuntimeTelemetry {
+    /// The last publish attempt of `group` could not publish `count` saved edits, for `reason`.
+    pub(crate) fn set_unpublished(&self, group: &str, reason: UnpublishedReason, count: u64) {
+        self.unpublished
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(group.to_owned(), (reason, count));
+    }
+
+    /// The last publish attempt of `group` published everything it tried (or had nothing).
+    pub(crate) fn clear_unpublished(&self, group: &str) {
+        self.unpublished.lock().unwrap_or_else(|p| p.into_inner()).remove(group);
+    }
+
+    /// Saved edits not published, over all groups, in one consistent read.
+    pub(crate) fn unpublished_totals(&self) -> UnpublishedTotals {
+        let map = self.unpublished.lock().unwrap_or_else(|p| p.into_inner());
+        let mut totals = UnpublishedTotals::default();
+        for (reason, count) in map.values() {
+            match reason {
+                UnpublishedReason::ServiceUnreachable => totals.service_unreachable += count,
+                UnpublishedReason::NotAuthorized => totals.not_authorized += count,
+                UnpublishedReason::Rejected => totals.rejected += count,
+            }
+        }
+        totals
+    }
+
+    /// Forgets the groups that are no longer linked and active: their last attempt says nothing
+    /// about edits that are no longer waiting to be published.
+    pub(crate) fn retain_unpublished(&self, active_groups: &[String]) {
+        self.unpublished
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|group, _| active_groups.contains(group));
+    }
+
+    /// How long this engine has been running.
+    pub(crate) fn uptime(&self) -> std::time::Duration {
+        self.started.lock().unwrap_or_else(|p| p.into_inner()).elapsed()
+    }
+
+    /// Test-only: makes the engine look as if it started `ago` ago.
+    #[cfg(test)]
+    pub(crate) fn pretend_started_ago_for_tests(&self, ago: std::time::Duration) {
+        *self.started.lock().unwrap_or_else(|p| p.into_inner()) =
+            std::time::Instant::now().checked_sub(ago).expect("an instant that far back");
+    }
+
     pub(crate) fn new(status_push_tx: broadcast::Sender<StatusPush>) -> Self {
         Self {
             status_push_tx,
@@ -77,6 +165,10 @@ impl RuntimeTelemetry {
             transfer_progress: crate::transfer_progress::TransferProgressTracker::new(),
             recent_errors: crate::recent_errors::RecentErrorLog::new(),
             unreadable_files: std::sync::Arc::default(),
+            pinned_pending: Mutex::new(HashMap::new()),
+            pinned_download_wake: std::sync::Arc::default(),
+            unpublished: Mutex::new(HashMap::new()),
+            started: Mutex::new(std::time::Instant::now()),
             replication: std::sync::Arc::default(),
             command_epoch: tokio::sync::watch::channel(0).0,
         }
@@ -125,6 +217,48 @@ impl RuntimeTelemetry {
             .iter()
             .map(|(name, alive)| TaskLivenessEntry { name: name.clone(), alive: *alive })
             .collect()
+    }
+
+    /// Records what the background download of pinned items could not fetch in one group, or
+    /// clears it (`None`) once the group is downloaded. Called as each group finishes, so a slow
+    /// item delays only the groups after it.
+    pub(crate) fn set_pinned_group(&self, group_id: &str, pending: Option<PinnedPending>) {
+        let mut map = self.pinned_pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match pending {
+            Some(pending) => {
+                map.insert(group_id.to_string(), pending);
+            }
+            None => {
+                map.remove(group_id);
+            }
+        }
+    }
+
+    /// Ends a pass: forgets the groups the pass did not visit (paused, unlinked) and sets the
+    /// time of the next attempt on the rest, now that the wait begins.
+    pub(crate) fn finish_pinned_pass(
+        &self,
+        visited: &std::collections::HashSet<String>,
+        next_retry: std::time::Instant,
+    ) {
+        let mut map = self.pinned_pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.retain(|group, _| visited.contains(group));
+        for pending in map.values_mut() {
+            pending.next_retry = next_retry;
+        }
+    }
+
+    pub(crate) fn pinned_download_wake(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.pinned_download_wake.clone()
+    }
+
+    /// `group_id`'s pinned items that are not downloaded yet, if any.
+    pub(crate) fn pinned_pending(&self, group_id: &str) -> Option<PinnedPending> {
+        self.pinned_pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(group_id)
+            .cloned()
     }
 
     /// The ledger the capture scans report unreadable files into.

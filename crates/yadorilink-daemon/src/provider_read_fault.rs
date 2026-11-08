@@ -15,9 +15,9 @@ pub(crate) const GROUP: &str = "group-a";
 /// A coordinator with one declared provider root; returns it with the root id.
 pub(crate) fn declared_root() -> (Arc<ReplicaCoordinator>, String) {
     let coordinator = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
-    coordinator.link_repository().add_link("/provider/p", GROUP).unwrap();
+    coordinator.link_admission().add_link("/provider/p", GROUP).unwrap();
     let root = coordinator
-        .provider_repository()
+        .provider_writes()
         .declare_root(GROUP, ProviderKind::MacFileProvider, "P")
         .unwrap();
     (coordinator, root)

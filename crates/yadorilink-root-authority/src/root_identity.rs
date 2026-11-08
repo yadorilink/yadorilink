@@ -67,9 +67,7 @@ const MARKER_COMMENT: &str = concat!(
 
 /// True for exactly `<root>/.yadorilink-root` and nothing else. A
 /// `.yadorilink-root` nested in a subdirectory is ordinary user content and
-/// syncs normally — only the root-level marker is this module's, mirroring
-/// `ignore_patterns::is_ignore_file_relative_path`'s identical top-level-only
-/// rule for `.yadorilinkignore`.
+/// syncs normally — only the root-level marker is this module's, a top-level-only rule.
 ///
 /// Allocation-free: this runs once per directory entry on the scan's walk, so
 /// it is a hot path and must not build a `Vec` to answer a question about at

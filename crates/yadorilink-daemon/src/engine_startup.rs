@@ -289,6 +289,8 @@ pub(crate) fn build_engine(
     // longer depends on. Runs after the stale-`Evicting` reset above, so every
     // row is judged against settled state.
     crate::custody_holds::spawn_custody_hold_reconciler(&state);
+    // Downloads what pinned items keep, retrying with backoff.
+    crate::adapters::runtime::materialization::spawn_pinned_download_retry(&state);
 
     // Wire this device's change-history signing key once, so linked folders
     // emit signed changes. Only for a registered device (an unregistered one
@@ -364,6 +366,24 @@ pub(crate) fn start_provider(
         let context = shell_context.clone();
         crate::supervise::spawn_logged("provider-prefetch", async move {
             crate::provider_prefetch::run(context).await;
+            Ok(())
+        });
+    }
+
+    #[cfg(any(windows, unix))]
+    {
+        let fill = shell_context.retention_store_fill.clone();
+        crate::supervise::spawn_logged("retention-store-fill", async move {
+            crate::retention_store_fill::run(fill).await;
+            Ok(())
+        });
+    }
+
+    #[cfg(any(windows, unix))]
+    {
+        let apply = shell_context.retention_apply.clone();
+        crate::supervise::spawn_logged("retention-apply", async move {
+            crate::retention_apply::run(apply).await;
             Ok(())
         });
     }
@@ -461,15 +481,19 @@ pub(crate) fn data_refusal(
     use yadorilink_local_storage::startup_refusal::{StartOver, StartupRefusal};
     use yadorilink_sqlite_runtime::{DatabaseError, LostDatabaseError};
     let head = format!("The background service cannot open the data on disk: {error}");
-    let unusable =
-        matches!(error.downcast_ref::<DatabaseError>(), Some(DatabaseError::CorruptSchema(_)))
-            || matches!(
-                error.downcast_ref::<LostDatabaseError>(),
-                Some(
-                    LostDatabaseError::MarkerWithoutDatabase { .. }
-                        | LostDatabaseError::OtherDataWithoutDatabase { .. }
-                )
-            );
+    let unusable = matches!(
+        error.downcast_ref::<DatabaseError>(),
+        Some(DatabaseError::CorruptSchema(_) | DatabaseError::SchemaTooOld { .. })
+    ) || matches!(
+        error.downcast_ref::<yadorilink_local_storage::StorageError>(),
+        Some(yadorilink_local_storage::StorageError::AnotherLayout { .. })
+    ) || matches!(
+        error.downcast_ref::<LostDatabaseError>(),
+        Some(
+            LostDatabaseError::MarkerWithoutDatabase { .. }
+                | LostDatabaseError::OtherDataWithoutDatabase { .. }
+        )
+    );
     if unusable {
         StartupRefusal {
             code: None,

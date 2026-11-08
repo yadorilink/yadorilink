@@ -36,6 +36,27 @@ impl EvictHost for ScriptedHost {
         true
     }
 
+    fn serves_root(&self, _root_id: &str) -> bool {
+        true
+    }
+
+    fn send_pin_plan(
+        &self,
+        _root_id: &str,
+        _entries: Vec<(Option<ItemId>, yadorilink_ipc_proto::shellipc::PinChoice)>,
+    ) -> bool {
+        false
+    }
+
+    fn pin_item<'a>(
+        &'a self,
+        _root_id: &'a str,
+        _item: Option<ItemId>,
+        _choice: yadorilink_ipc_proto::shellipc::PinChoice,
+    ) -> BoxFuture<'a, crate::provider_host_link::PinAnswer> {
+        Box::pin(async move { crate::provider_host_link::PinAnswer::Unsupported })
+    }
+
     fn evict_shown_version<'a>(
         &'a self,
         _root_id: &'a str,
@@ -285,6 +306,59 @@ pub async fn materialize_temp_resumed(
     )
     .await;
     (outcome, progress.resumed_from())
+}
+
+/// Starts [`materialize_temp`] for the whole file and drops it, as a cancelled request or a stall
+/// deadline does, as soon as its progress says at least `percent` of the work is done. Returns
+/// whether it was dropped before it finished.
+pub async fn materialize_temp_abandoned_at(
+    state: &Arc<DaemonState>,
+    group_id: &str,
+    path: &str,
+    staging: &std::path::Path,
+    percent: u64,
+) -> bool {
+    let progress = Arc::new(crate::application::ports::AssemblyProgress::default());
+    let task = {
+        let (state, group_id, path, staging) =
+            (state.clone(), group_id.to_string(), path.to_string(), staging.to_path_buf());
+        let progress = progress.clone();
+        tokio::spawn(async move {
+            let _ = materialize_temp_reporting(
+                &state,
+                &group_id,
+                &path,
+                &staging,
+                None,
+                None,
+                Some(progress),
+            )
+            .await;
+        })
+    };
+    loop {
+        if task.is_finished() {
+            let _ = task.await;
+            return false;
+        }
+        if progress
+            .snapshot()
+            .is_some_and(|(completed, total)| completed.saturating_mul(100) >= percent * total)
+        {
+            task.abort();
+            let _ = task.await;
+            // The partly written file is kept for the next attempt by the dropped fetch's cleanup,
+            // which may wait for a block write: wait for it, so the next attempt sees it.
+            for _ in 0..2500 {
+                if !state.replica_coordinator.hydration_partial_temps().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
 }
 
 async fn materialize_temp_reporting(

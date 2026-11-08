@@ -400,7 +400,10 @@ fn error_from_body(status: u16, body: &serde_json::Value) -> CoreError {
             Some(secs) => format!("too many requests; retry in about {secs}s"),
             None => "too many requests; slow down and retry shortly".to_string(),
         };
-        return CoreError::LimitExceeded { message: msg, kind: LimitKind::RateLimited };
+        return CoreError::LimitExceeded {
+            message: msg,
+            kind: LimitKind::RateLimited { retry_after_secs: retry },
+        };
     }
 
     if status == 403 && code == "terms_consent_required" {

@@ -30,6 +30,11 @@ use crate::change_policy::GroupPolicyState;
 #[derive(Default)]
 struct PeerNetmapMetadata {
     signing_keys: HashMap<String, [u8; 32]>,
+    /// The key each peer's group authorization was last settled under by a netmap pass. The
+    /// netmap publishes a peer's key before it validates the peer's groups, so `signing_keys`
+    /// already holds the new key when a changed key is seen; this map still holds the old one,
+    /// which is how a key change is told apart from a push that repeats what was settled.
+    authorized_under: HashMap<String, [u8; 32]>,
     writers: HashSet<(String, String)>,
     full_replicas: HashSet<(String, String)>,
 }
@@ -387,6 +392,7 @@ impl PeerAuthorityState {
                 let mut metadata =
                     self.peer_netmap_metadata.lock().unwrap_or_else(|p| p.into_inner());
                 metadata.signing_keys.clear();
+                metadata.authorized_under.clear();
                 metadata.writers.clear();
                 metadata.full_replicas.clear();
             }
@@ -577,6 +583,30 @@ impl PeerAuthorityState {
             .any(|(device_id, _)| metadata.writers.iter().any(|(peer, _)| peer == device_id))
     }
 
+    /// The groups `device_id` holds now, when its authorization was last settled by a netmap pass
+    /// under exactly `signing_key` and it is not a replaced device; `None` otherwise. Only then may
+    /// a pass that validates the peer again let it keep what it holds meanwhile.
+    pub(super) fn settled_authorization_under(
+        &self,
+        device_id: &str,
+        signing_key: Option<[u8; 32]>,
+    ) -> Option<(HashSet<String>, HashSet<String>)> {
+        let key = signing_key?;
+        if self.superseded_by(device_id).is_some() {
+            return None;
+        }
+        let metadata = self.peer_netmap_metadata.lock().unwrap_or_else(|p| p.into_inner());
+        if metadata.authorized_under.get(device_id) != Some(&key)
+            || metadata.signing_keys.get(device_id) != Some(&key)
+        {
+            return None;
+        }
+        let groups_of = |set: &HashSet<(String, String)>| -> HashSet<String> {
+            set.iter().filter(|(peer, _)| peer == device_id).map(|(_, g)| g.clone()).collect()
+        };
+        Some((groups_of(&metadata.writers), groups_of(&metadata.full_replicas)))
+    }
+
     /// Applies one peer's netmap entry as an authoritative snapshot and
     /// returns whether anything changed. Every peer-scoped authorization set
     /// is replaced, not incrementally patched, so demotion/revocation cannot
@@ -619,6 +649,14 @@ impl PeerAuthorityState {
             Some(key) => metadata.signing_keys.insert(device_id.to_string(), key) != Some(key),
             None => metadata.signing_keys.remove(device_id).is_some(),
         };
+        match signing_key {
+            Some(key) => {
+                metadata.authorized_under.insert(device_id.to_string(), key);
+            }
+            None => {
+                metadata.authorized_under.remove(device_id);
+            }
+        }
         metadata.writers.retain(|(peer, _)| peer != device_id);
         metadata
             .writers
@@ -702,6 +740,22 @@ impl PeerAuthorityState {
             .filter(|(dev, _)| dev == device_id)
             .map(|(_, group)| group.clone())
             .collect()
+    }
+
+    /// Every peer the netmap authorizes for `group_id`, sorted. This device itself is among them
+    /// when it is a writer; the caller leaves it out.
+    pub fn peers_authorized_for_group(&self, group_id: &str) -> Vec<String> {
+        let mut peers: Vec<String> = self
+            .peer_netmap_metadata
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .writers
+            .iter()
+            .filter(|(_, group)| group == group_id)
+            .map(|(device, _)| device.clone())
+            .collect();
+        peers.sort();
+        peers
     }
 
     /// Every group the netmap records `device_id` as a full replica of.
@@ -943,18 +997,36 @@ impl PeerAuthorityState {
     ///
     /// `is_linked` runs only when no netmap writer names the group, and
     /// after the metadata guard has been released.
-    fn group_is_introduced(&self, group_id: &str, is_linked: impl FnOnce() -> bool) -> bool {
+    ///
+    /// `ignoring_peer` is not counted among the writers that name the group. The netmap validation
+    /// of that very peer passes it: whether a group may be served to the peer must not depend on
+    /// the authorization it already has for the group, or a peer admitted before a verified policy
+    /// arrived would be refused by its own admission at the next push.
+    fn group_is_introduced(
+        &self,
+        group_id: &str,
+        ignoring_peer: Option<&str>,
+        is_linked: impl FnOnce() -> bool,
+    ) -> bool {
         if self
             .peer_netmap_metadata
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .writers
             .iter()
-            .any(|(_, gid)| gid.as_str() == group_id)
+            .any(|(peer, gid)| gid.as_str() == group_id && Some(peer.as_str()) != ignoring_peer)
         {
             return true;
         }
         is_linked()
+    }
+
+    /// Whether the answer to "may this group be served" is the same for every peer: the group has
+    /// a verified policy, or is marked stale. Otherwise it also depends on which other peers name
+    /// the group, and so on the peer asking.
+    pub(crate) fn group_policy_is_settled(&self, group_id: &str) -> bool {
+        let book = self.group_policies();
+        book.stale.contains_key(group_id) || book.verified.contains_key(group_id)
     }
 
     /// The resolution behind `DaemonState::resolve_group_policy` -- see that
@@ -964,6 +1036,17 @@ impl PeerAuthorityState {
     pub(crate) fn resolve_group_policy(
         &self,
         group_id: &str,
+        is_linked: impl FnOnce() -> bool,
+    ) -> GroupPolicyResolution {
+        self.resolve_group_policy_ignoring(group_id, None, is_linked)
+    }
+
+    /// [`Self::resolve_group_policy`] as if `ignoring_peer` were not a writer of anything (see
+    /// [`Self::group_is_introduced`]).
+    pub(crate) fn resolve_group_policy_ignoring(
+        &self,
+        group_id: &str,
+        ignoring_peer: Option<&str>,
         is_linked: impl FnOnce() -> bool,
     ) -> GroupPolicyResolution {
         {
@@ -976,7 +1059,7 @@ impl PeerAuthorityState {
                 return GroupPolicyResolution::Verified(policy.clone());
             }
         }
-        if self.group_is_introduced(group_id, is_linked) {
+        if self.group_is_introduced(group_id, ignoring_peer, is_linked) {
             GroupPolicyResolution::Withhold
         } else {
             GroupPolicyResolution::Bootstrap

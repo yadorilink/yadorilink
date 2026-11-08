@@ -15,6 +15,20 @@ pub enum DatabaseError {
     #[error("unsupported database schema version {on_disk_version} (this build supports {supported_version})")]
     UnsupportedSchemaDowngrade { on_disk_version: i32, supported_version: i32 },
 
+    /// The database was written by an older build; pre-release builds have no migration.
+    /// Callers branch on this variant, never on the wording.
+    #[error(
+        "index database schema v{on_disk_version} predates this build's v{supported_version}, \
+         and pre-release builds do not migrate old databases. Before you delete the index \
+         database and re-import the folder, save anything set aside for you: with the \
+         previous version run `yadorilink preserved list`, then `yadorilink preserved \
+         restore <item-id>` or `yadorilink preserved discard <item-id> --yes` for each \
+         item; if that is no longer possible, copy the `recovery-items` folder in the \
+         YadoriLink data directory somewhere safe first. Deleting the index also discards \
+         that folder's contents"
+    )]
+    SchemaTooOld { on_disk_version: i32, supported_version: i32 },
+
     #[error("corrupt database schema: {0}")]
     CorruptSchema(String),
 

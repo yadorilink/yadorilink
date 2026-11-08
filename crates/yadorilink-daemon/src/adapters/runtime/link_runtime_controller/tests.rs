@@ -614,8 +614,8 @@ async fn a_deleted_lock_sidecar_ends_the_links_repair_pass_and_only_relink_resto
     }
     assert_eq!(state.replica_coordinator.held_path_subscribers(), subscribers_running - 1);
     // Disk-pressure bookkeeping neither overwrites nor clears the terminal mark.
-    state.mark_link_waiting_for_disk_space(&path, "disk".into());
-    state.clear_link_degraded(&path);
+    state.wait_for_disk_space(&path, "disk".into());
+    state.recover_link(&path);
     assert!(state.links.is_ownership_lost(&path));
     assert!(!state.links.mark_ownership_lost(&path, 0), "already terminal: no second transition");
     assert!(!sidecar.exists(), "the sidecar is never recreated automatically");
@@ -1070,7 +1070,7 @@ async fn a_running_link_that_lost_its_root_lock_is_restarted_once_available() {
     // blocking pool does in the field; the restart is then refused as "in use".
     let old = state.links.runtime(&path).unwrap();
     let before = Arc::downgrade(&old);
-    assert!(state.mark_link_ownership_lost(&path));
+    assert!(state.lose_ownership(&path));
 
     let controller = LinkRuntimeController::new(state.clone());
     controller.follow_link_volumes().await;
@@ -1266,4 +1266,119 @@ fn a_repair_tick_is_skipped_only_after_a_pass_that_left_nothing_for_the_filesyst
     let visited = MaterializationRepairReport { rows_visited: 1, ..Default::default() };
     skip.note_pass(7, &visited);
     assert!(!skip.skips(true, 7));
+}
+
+#[test]
+fn the_history_budget_is_a_tenth_of_the_volume_capped_at_20_gib() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    assert_eq!(super::history_budget_bytes(Some(100 * GIB)), 10 * GIB);
+    assert_eq!(super::history_budget_bytes(Some(1000 * GIB)), 20 * GIB);
+    assert_eq!(super::history_budget_bytes(None), 20 * GIB);
+}
+
+/// A change the watcher never reported is found by the drift sweep and takes the live route: a file
+/// that grew on disk is re-indexed, a file that vanished is tombstoned. Nothing moves before the
+/// sweep runs, and nothing moves for a link the schedule says is not due.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_drift_sweep_recovers_a_modify_and_a_delete_the_watcher_never_reported() {
+    use crate::maintenance::drift_detector::DriftSchedule;
+    use yadorilink_filesystem_sync::watcher::SimulatedFolderWatchSource;
+    let state = test_state();
+    state
+        .replica_coordinator
+        .set_local_policy_head_provider(std::sync::Arc::new(|_group_id| Ok([0u8; 32])));
+    let root = tempfile::tempdir().unwrap();
+    let group = "group-1";
+    let local_path = root.path().to_string_lossy().to_string();
+    std::fs::write(root.path().join("grows.txt"), b"short").unwrap();
+    std::fs::write(root.path().join("vanishes.txt"), b"will go").unwrap();
+    state.replica_coordinator.link_repository().add_link(&local_path, group).unwrap();
+    // A watcher that never reports anything: every change below is a missed event.
+    let (silent, _events) = SimulatedFolderWatchSource::new(16);
+    let controller = LinkRuntimeController::new(state.clone());
+    controller.start_with_source(local_path.clone(), group.to_string(), Arc::new(silent)).unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        state.replica_coordinator.wait_group_ready(group),
+    )
+    .await
+    .expect("the initial scan must finish")
+    .expect("the initial scan must succeed");
+
+    std::fs::write(root.path().join("grows.txt"), b"now a good deal longer than before").unwrap();
+    std::fs::remove_file(root.path().join("vanishes.txt")).unwrap();
+    let index = state.replica_coordinator.file_index_repository();
+    let row = |path: &str| index.get_file(group, path).unwrap().unwrap();
+    assert_eq!(row("grows.txt").size, 5, "nothing reported the edit");
+    assert!(!row("vanishes.txt").deleted, "nothing reported the delete");
+
+    // Not due yet: nothing happens.
+    let now = std::time::Instant::now();
+    // Started long enough ago that the per-link stagger of the first check has passed.
+    let long_ago = now.checked_sub(std::time::Duration::from_secs(3600)).unwrap();
+    let not_due = Arc::new(std::sync::Mutex::new(DriftSchedule::new(
+        std::time::Duration::from_secs(3600),
+        std::time::Duration::from_secs(3600),
+        now,
+    )));
+    for pass in controller.run_drift_detector_sweep(&not_due).await {
+        pass.await.unwrap();
+    }
+    assert_eq!(row("grows.txt").size, 5);
+    assert!(!row("vanishes.txt").deleted);
+
+    let due = Arc::new(std::sync::Mutex::new(DriftSchedule::new(
+        std::time::Duration::from_secs(3600),
+        std::time::Duration::ZERO,
+        long_ago,
+    )));
+    for pass in controller.run_drift_detector_sweep(&due).await {
+        pass.await.unwrap();
+    }
+    assert_eq!(row("grows.txt").size, 34, "the edit was captured");
+    assert!(row("vanishes.txt").deleted, "the delete was captured");
+}
+
+/// A folder whose disk is away is not read as a set of deletions: the sweep skips it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_drift_sweep_leaves_a_folder_that_is_away_alone() {
+    use crate::maintenance::drift_detector::DriftSchedule;
+    use yadorilink_filesystem_sync::watcher::SimulatedFolderWatchSource;
+    let state = test_state();
+    state
+        .replica_coordinator
+        .set_local_policy_head_provider(std::sync::Arc::new(|_group_id| Ok([0u8; 32])));
+    let root = tempfile::tempdir().unwrap();
+    let group = "group-1";
+    let local_path = root.path().to_string_lossy().to_string();
+    std::fs::write(root.path().join("keep.txt"), b"still mine").unwrap();
+    state.replica_coordinator.link_repository().add_link(&local_path, group).unwrap();
+    let (silent, _events) = SimulatedFolderWatchSource::new(16);
+    let controller = LinkRuntimeController::new(state.clone());
+    controller.start_with_source(local_path.clone(), group.to_string(), Arc::new(silent)).unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        state.replica_coordinator.wait_group_ready(group),
+    )
+    .await
+    .expect("the initial scan must finish")
+    .expect("the initial scan must succeed");
+    std::fs::remove_file(root.path().join("keep.txt")).unwrap();
+
+    let away: super::VolumeProbeHook = Arc::new({
+        let local_path = local_path.clone();
+        move |folder| (folder == local_path).then_some(super::FolderVolume::Away)
+    });
+    *super::VOLUME_PROBE_HOOK.lock().unwrap() = Some(away);
+    let due = Arc::new(std::sync::Mutex::new(DriftSchedule::new(
+        std::time::Duration::from_secs(3600),
+        std::time::Duration::ZERO,
+        std::time::Instant::now().checked_sub(std::time::Duration::from_secs(3600)).unwrap(),
+    )));
+    for pass in controller.run_drift_detector_sweep(&due).await {
+        pass.await.unwrap();
+    }
+    *super::VOLUME_PROBE_HOOK.lock().unwrap() = None;
+    let kept = state.replica_coordinator.file_index_repository().get_file(group, "keep.txt");
+    assert!(!kept.unwrap().unwrap().deleted, "an away folder's files are not deletions");
 }

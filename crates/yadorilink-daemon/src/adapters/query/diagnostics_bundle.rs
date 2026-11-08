@@ -102,7 +102,10 @@ impl RuntimeDiagnosticsPort for DaemonRuntimeDiagnostics {
                 } else {
                     "synced"
                 };
-                DiagnosticsLinkView { state_label }
+                DiagnosticsLinkView {
+                    state_label,
+                    blockers: link.folder_blockers.iter().map(|b| b.label()).collect(),
+                }
             })
             .collect();
 

@@ -35,8 +35,6 @@ pub mod dir_watch;
 pub mod ipc_client;
 pub mod menu_model;
 mod overlay;
-// Unregisters the sync roots when the package is uninstalled while the host runs.
-pub mod package_removal;
 pub mod provider_authoring;
 pub mod provider_client;
 pub mod provider_namespace;

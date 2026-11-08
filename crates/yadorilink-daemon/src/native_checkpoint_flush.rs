@@ -35,6 +35,22 @@ const MAX_BATCH_LEAVES: usize = 1 << 20;
 /// it (and how long the runtime goes without a scheduling point).
 const VERIFY_CHUNK_LEAVES: usize = 4096;
 
+/// The batch cap in force: [`MAX_BATCH_LEAVES`], or a test's smaller one.
+fn batch_cap() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = TEST_BATCH_CAP.with(std::cell::Cell::get) {
+        return cap;
+    }
+    MAX_BATCH_LEAVES
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's batch cap for this thread (tests with a paused clock run on one thread).
+    pub(crate) static TEST_BATCH_CAP: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Cuts `pending` (in publication order) to at most `max` entries.
 fn cap_batch<T>(pending: &mut Vec<T>, max: usize) {
     pending.truncate(max);
@@ -45,6 +61,9 @@ fn cap_batch<T>(pending: &mut Vec<T>, max: usize) {
 pub struct NativeFlush {
     pub outcome: FlushOutcome,
     pub published: Vec<DeltaHash>,
+    /// How many deltas are still without evidence after this flush: all of them when nothing was
+    /// published, the part of a longer-than-one-batch backlog left when a batch was.
+    pub pending: usize,
 }
 
 /// [`flush_pending_native_checkpoint_until`] with no stop signal.
@@ -89,9 +108,16 @@ pub async fn flush_pending_native_checkpoint_until(
     let mut pending: Vec<_> = db.read(|conn| {
         native_publication::pending_native_deltas_for_device(conn, &group, device_id)
     })?;
-    cap_batch(&mut pending, MAX_BATCH_LEAVES);
+    // Every delta waiting, before the batch cap: what a refused flush reports, and what is left
+    // after a published batch.
+    let total = pending.len();
+    cap_batch(&mut pending, batch_cap());
     if pending.is_empty() {
-        return Ok(NativeFlush { outcome: FlushOutcome::NothingPending, published: Vec::new() });
+        return Ok(NativeFlush {
+            outcome: FlushOutcome::NothingPending,
+            published: Vec::new(),
+            pending: 0,
+        });
     }
 
     let leaves: Vec<[u8; 32]> =
@@ -103,7 +129,8 @@ pub async fn flush_pending_native_checkpoint_until(
     );
     let root = merkle_root(&leaves);
 
-    let Some((checkpoint, signature)) = tokio::time::timeout(
+    let waiting = total;
+    let answer = tokio::time::timeout(
         CHECKPOINT_REQUEST_TIMEOUT,
         source.request_authorization_checkpoint(
             group_id,
@@ -114,10 +141,31 @@ pub async fn flush_pending_native_checkpoint_until(
             CheckpointPurpose::Publication,
         ),
     )
-    .await
-    .ok()
-    .flatten() else {
-        return Ok(NativeFlush { outcome: FlushOutcome::Refused, published: Vec::new() });
+    .await;
+    let (checkpoint, signature) = match answer {
+        Ok(Ok(issued)) => issued,
+        Ok(Err(crate::checkpoint_source::CheckpointRefusal::NotAuthorized)) => {
+            return Ok(NativeFlush {
+                outcome: FlushOutcome::NotAuthorized,
+                published: Vec::new(),
+                pending: waiting,
+            });
+        }
+        Ok(Err(crate::checkpoint_source::CheckpointRefusal::Rejected)) => {
+            return Ok(NativeFlush {
+                outcome: FlushOutcome::Rejected,
+                published: Vec::new(),
+                pending: waiting,
+            });
+        }
+        // No answer within the timeout, or an answer that decided nothing.
+        Ok(Err(crate::checkpoint_source::CheckpointRefusal::Unreachable)) | Err(_) => {
+            return Ok(NativeFlush {
+                outcome: FlushOutcome::Unreachable,
+                published: Vec::new(),
+                pending: waiting,
+            });
+        }
     };
 
     // The checkpoint-level checks (signature, group, device, key) do not
@@ -135,7 +183,11 @@ pub async fn flush_pending_native_checkpoint_until(
     let proofs = build_merkle_proofs(&leaves);
     for (chunk_index, chunk) in leaves.chunks(VERIFY_CHUNK_LEAVES).enumerate() {
         if should_stop() {
-            return Ok(NativeFlush { outcome: FlushOutcome::Interrupted, published: Vec::new() });
+            return Ok(NativeFlush {
+                outcome: FlushOutcome::Interrupted,
+                published: Vec::new(),
+                pending: waiting,
+            });
         }
         let first = chunk_index * VERIFY_CHUNK_LEAVES;
         for (offset, leaf) in chunk.iter().enumerate() {
@@ -147,7 +199,11 @@ pub async fn flush_pending_native_checkpoint_until(
         tokio::task::yield_now().await;
     }
     if should_stop() {
-        return Ok(NativeFlush { outcome: FlushOutcome::Interrupted, published: Vec::new() });
+        return Ok(NativeFlush {
+            outcome: FlushOutcome::Interrupted,
+            published: Vec::new(),
+            pending: waiting,
+        });
     }
 
     let checkpoint_encoded = canonical_signing_bytes(&checkpoint);
@@ -178,6 +234,7 @@ pub async fn flush_pending_native_checkpoint_until(
             checkpoint_seq: checkpoint.checkpoint_seq,
         },
         published: entries.into_iter().map(|(hash, _)| hash).collect(),
+        pending: total - pending.len(),
     })
 }
 

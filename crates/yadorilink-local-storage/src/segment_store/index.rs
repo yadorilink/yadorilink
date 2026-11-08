@@ -36,17 +36,46 @@ use crate::segment_store::format::{RAW_HASH_LEN, RECORD_HEADER_LEN, SEGMENT_HEAD
 /// Version 3 checksums records with XXH3-64; version 2 used CRC-32.
 pub(crate) const STORE_FORMAT_VERSION: i64 = 3;
 
-/// The refusal of a block store written by another build: what was found, why nothing is read, and
+/// The refusal text of a block store written by another build: what was found, why nothing is read, and
 /// how to keep what is set aside before the store is deleted and the folder imported again.
-pub(crate) fn another_layout_refusal(found: &str) -> String {
+pub(crate) fn another_layout_refusal(found: &str, layout: &str, expected: i64) -> String {
     format!(
-        "{found} is not this build's block store format v{STORE_FORMAT_VERSION}, and pre-release \
+        "{found} is not this build's {layout} v{expected}, and pre-release \
          builds do not migrate old block stores. Before you delete the block store and re-import \
          the folder, save anything set aside for you: with the previous version run `yadorilink \
          preserved list`, then `yadorilink preserved restore <item-id>` or `yadorilink preserved \
          discard <item-id> --yes` for each item. Deleting the block store discards the content of \
          anything still set aside"
     )
+}
+
+/// Block store marker versions an earlier build wrote and handed out (git history of `STORE_FORMAT_VERSION`: 2 from
+/// 2026-09-16 until 3 on 2026-11-01). Only these are "an older build's store"; any other value is damage or a
+/// newer build's, never offered a reset.
+pub(crate) const SHIPPED_STORE_FORMATS: &[i64] = &[2];
+
+/// Segment layout versions an earlier build wrote (git history of `SEGMENT_FORMAT_VERSION`: 1 until 2 on 2026-11-01).
+pub(crate) const SHIPPED_SEGMENT_LAYOUTS: &[i64] = &[1];
+
+/// The typed refusal for data of a layout an earlier build shipped (`found` is one of `shipped`).
+/// Anything else (a number this build cannot place, data a newer build wrote, a damaged header) is not known to be
+/// an old layout, so it stays an ordinary refusal and never offers the destructive reset.
+/// A version written as plain decimal digits (no sign, no spaces), or none.
+pub(crate) fn plain_version(text: &str) -> Option<i64> {
+    (!text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| text.parse().ok())
+        .flatten()
+}
+
+pub(crate) fn older_layout(
+    found: Option<i64>,
+    shipped: &[i64],
+    expected: i64,
+    layout: &'static str,
+    detail: &str,
+) -> Option<StorageError> {
+    let found = found.filter(|found| shipped.contains(found))?;
+    Some(StorageError::AnotherLayout { found, expected, layout, detail: detail.to_owned() })
 }
 
 const META_FORMAT_VERSION: &str = "format_version";
@@ -269,7 +298,8 @@ impl BlockIndex {
     /// not write. There is deliberately no migration branch: an older
     /// store is refused, not converted.
     fn check_or_stamp_format_version(&self) -> Result<(), StorageError> {
-        self.db
+        let foreign: Option<String> = self
+            .db
             .write_immediate(|tx| {
                 let stamped: Option<String> = tx
                     .query_row_cached(
@@ -287,17 +317,35 @@ impl BlockIndex {
                                 STORE_FORMAT_VERSION.to_string()
                             ],
                         )?;
-                        Ok(())
+                        Ok(None)
                     }
                     Some(raw) if raw.trim().parse::<i64>().ok() == Some(STORE_FORMAT_VERSION) => {
-                        Ok(())
+                        Ok(None)
                     }
-                    Some(raw) => Err(DatabaseError::CorruptSchema(another_layout_refusal(
-                        &format!("block store format version {raw:?}"),
-                    ))),
+                    Some(raw) => Ok(Some(raw)),
                 }
             })
-            .map_err(to_storage)
+            .map_err(to_storage)?;
+        match foreign {
+            None => Ok(()),
+            Some(raw) => {
+                let detail = format!("block store format version {raw:?}");
+                Err(older_layout(
+                    plain_version(raw.trim()),
+                    SHIPPED_STORE_FORMATS,
+                    STORE_FORMAT_VERSION,
+                    "block store format",
+                    &detail,
+                )
+                .unwrap_or_else(|| {
+                    StorageError::Index(another_layout_refusal(
+                        &detail,
+                        "block store format",
+                        STORE_FORMAT_VERSION,
+                    ))
+                }))
+            }
+        }
     }
 
     /// The highest segment id ever handed out, as recorded. The caller

@@ -68,7 +68,7 @@ impl FolderWatchSource for NoChangeSource {
         yadorilink_filesystem_sync::watcher::FolderWatcher,
         yadorilink_filesystem_sync::watcher::WatcherError,
     > {
-        self.links.mark_no_change_source(&root.to_string_lossy(), crate::daemon_state::now_unix());
+        crate::folder_state::stop_without_change_source(&self.links, &root.to_string_lossy());
         yadorilink_filesystem_sync::watcher::NoWatchSource.watch(root, ignore_set)
     }
 }
@@ -84,6 +84,7 @@ use yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet;
 
 use crate::daemon_state::DaemonState;
 use crate::error::DaemonError;
+use crate::folder_state;
 use crate::link_registry::LinkRegistry;
 use crate::link_runtime::factory::LinkRuntimeFactory;
 use crate::link_runtime::operations::capture_local_change::announce_local_change;
@@ -248,7 +249,7 @@ impl LinkRuntimeController {
         // the folder returns. Its startup gate stays Failed meanwhile, so peer
         // changes are deferred, not applied.
         if folder_volume(state, &local_path) != FolderVolume::Available {
-            state.links.mark_awaiting_volume(&local_path);
+            folder_state::await_volume(&state.links, &local_path);
             return Err(DaemonError::Config(format!(
                 "linked folder {local_path} is missing or not on the volume it was recorded on \
                  (its disk may be unmounted or replaced); it is not touched until that volume \
@@ -358,7 +359,7 @@ impl LinkRuntimeController {
                         // Latch: even if the sidecar becomes observable again, no operation is
                         // admitted until a relink or restart builds a fresh lease.
                         lease_to_latch.begin_stopping();
-                        if repair_state.mark_link_ownership_lost(&repair_root.to_string_lossy()) {
+                        if repair_state.lose_ownership(&repair_root.to_string_lossy()) {
                             tracing::error!(
                                 local_path = %repair_root.display(),
                                 reason = %msg,
@@ -452,9 +453,9 @@ impl LinkRuntimeController {
         // for why the slot was reserved as `Starting` back at this function's
         // very start rather than appearing from nothing right here.
         link_slot_guard.publish(Arc::new(runtime));
-        state.links.clear_awaiting_volume(&local_path);
+        folder_state::stop_awaiting_volume(&state.links, &local_path);
         // A fresh start holds a fresh lock: a previous OwnershipLost no longer applies.
-        state.links.clear_ownership_lost(&local_path);
+        state.restart_after_ownership_loss(&local_path);
         // A rebootstrap the journal records is continued now that the folder is watched
         // again; for a group with none this reads the journal and returns.
         crate::native_rebootstrap::spawn_resume(state.clone(), group_id);
@@ -511,7 +512,7 @@ impl LinkRuntimeController {
         // A stopped link is not waiting for its volume (an unlink must not leave
         // it to be started again); the volume job's own stop re-marks it through
         // the refused start that follows.
-        state.links.clear_awaiting_volume(local_path);
+        folder_state::stop_awaiting_volume(&state.links, local_path);
 
         // Waits out a `LinkSlot::Starting` entry rather than treating it as
         // absent -- see `LinkSlotStartingGuard`'s own doc for the zombie-
@@ -677,7 +678,7 @@ impl LinkRuntimeController {
                 ))
             })?;
         }
-        state.replica_coordinator.link_repository().set_paused_expecting_group(
+        state.replica_coordinator.link_admission().set_paused_expecting_group(
             local_path,
             false,
             Some(&link.group_id),
@@ -694,6 +695,8 @@ impl LinkRuntimeController {
                 )))
             }
         }
+        // A resumed folder's pinned items are downloaded now, not at the next pass.
+        state.telemetry.pinned_download_wake().notify_one();
         state.on_local_native_commit(&group_id).await;
         Ok(())
     }
@@ -719,6 +722,25 @@ impl LinkRuntimeController {
     /// its sibling maintenance jobs use instead of a full `Arc<DaemonState>`.
     pub(crate) fn recheck_degraded_links(&self) {
         self.state.recheck_degraded_links();
+    }
+
+    /// Resolves when a disk-pressure re-check may be due: at once-ish when one is scheduled (never
+    /// sooner than `MIN_GAP` after the last call), and not until a link degrades while none is.
+    pub(crate) async fn wait_for_degraded_recheck(&self, min_gap: std::time::Duration) {
+        let links = &self.state.links;
+        match links.next_degraded_recheck_unix() {
+            None => links.degraded_scheduled().await,
+            Some(due) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs() as i64);
+                let wait = std::time::Duration::from_secs((due - now).max(0) as u64).max(min_gap);
+                tokio::select! {
+                    () = tokio::time::sleep(wait) => {}
+                    () = links.degraded_scheduled() => {}
+                }
+            }
+        }
     }
 
     pub(crate) fn run_retention_expiry_sweep(&self) {
@@ -757,6 +779,18 @@ impl LinkRuntimeController {
                     );
                 }
             }
+        }
+        let budget = history_budget_bytes(
+            state.block_store.free_space().ok().flatten().map(|space| space.total_bytes),
+        );
+        match state.replica_coordinator.trim_history_over_budget(budget, now_unix_nanos) {
+            Ok(dropped) if dropped > 0 => tracing::debug!(
+                dropped,
+                budget_bytes = budget,
+                "retention sweep dropped the oldest kept versions over the byte budget"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "kept-version byte budget trim failed"),
         }
     }
 
@@ -844,6 +878,162 @@ impl LinkRuntimeController {
         let _ =
             tokio::time::timeout(SWEEP_TIME_BUDGET, futures_util::future::join_all(passes)).await;
     }
+}
+
+impl LinkRuntimeController {
+    /// The drift detector's sweep: for every running link that is due (see
+    /// `maintenance::drift_detector`), compares its folder with its index by size and time and sends
+    /// what differs through the per-path route a live watcher event takes. Paused and orphaned links,
+    /// provider roots and links without a runtime are skipped; a link whose previous pass (this
+    /// one or the add-only backstop) is still running is left for the next tick.
+    pub(crate) async fn run_drift_detector_sweep(
+        &self,
+        schedule: &Arc<std::sync::Mutex<crate::maintenance::drift_detector::DriftSchedule>>,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        let state = &self.state;
+        let links = match state.replica_coordinator.link_repository().list_links() {
+            Ok(links) => links,
+            Err(e) => {
+                tracing::warn!(error = %e, "drift check: failed to list links");
+                return Vec::new();
+            }
+        };
+        let mut passes = Vec::new();
+        for link in links {
+            if link.paused || link.orphaned {
+                continue;
+            }
+            let Some(folder) = link.folder_path() else { continue };
+            let now = std::time::Instant::now();
+            if !schedule.lock().unwrap_or_else(|p| p.into_inner()).due(folder, now) {
+                continue;
+            }
+            // A few links per tick: after a wake every link is due, and their walks should not all
+            // start at once.
+            if passes.len() >= DRIFT_PASSES_PER_TICK {
+                continue;
+            }
+            if crate::provider_gate::require_filesystem_root(
+                &state.replica_coordinator,
+                &link.group_id,
+            )
+            .is_err()
+            {
+                continue;
+            }
+            let Some(runtime) = state.links.runtime(folder) else { continue };
+            let Some(claim) = state.begin_backstop_pass(folder) else { continue };
+            let (state, schedule) = (state.clone(), schedule.clone());
+            let folder = folder.to_string();
+            passes.push(tokio::spawn(async move {
+                let _claim = claim;
+                // Recorded when the pass has looked at the folder, not when it was started: a pass
+                // that found the disk away has not checked anything and comes round again.
+                if drift_pass_one_link(state, runtime, link).await {
+                    schedule.lock().unwrap_or_else(|p| p.into_inner()).ran(&folder, now);
+                }
+            }));
+        }
+        // Passes outlive the tick on purpose (a large folder takes minutes at the walk's rate cap):
+        // the caller does not await them, and the claim keeps a link from being walked twice at once.
+        passes
+    }
+}
+
+/// How many paths a pass sends between two looks at whether the folder is still on its volume.
+const DRIFT_VOLUME_RECHECK_EVERY: usize = 64;
+
+/// How many links one tick starts a drift pass for.
+const DRIFT_PASSES_PER_TICK: usize = 2;
+
+async fn drift_pass_one_link(
+    state: Arc<DaemonState>,
+    runtime: Arc<crate::link_runtime::LinkRuntime>,
+    link: yadorilink_replica_domain::session_state::FolderLink,
+) -> bool {
+    use yadorilink_local_capture::{DriftKind, DriftOptions};
+    let folder = link.key().to_string();
+    let group_id = link.group_id.clone();
+    // A folder whose disk is away, replaced or unreadable is not looked at: its files being
+    // missing is not a set of deletions.
+    let on_volume = |state: Arc<DaemonState>, folder: String| async move {
+        let probe = tokio::task::spawn_blocking(move || folder_volume(&state, &folder));
+        matches!(
+            tokio::time::timeout(VOLUME_PROBE_TIMEOUT, probe).await,
+            Ok(Ok(FolderVolume::Available))
+        )
+    };
+    if !on_volume(state.clone(), folder.clone()).await {
+        tracing::debug!(local_path = %folder, "drift check: the folder is not on its volume; skipped");
+        return false;
+    }
+    let walk_runtime = runtime.clone();
+    let walk_group = group_id.clone();
+    let walked = tokio::task::spawn_blocking(move || {
+        walk_runtime.detect_drift_from_disk(&walk_group, DriftOptions::default())
+    })
+    .await;
+    let report = match walked {
+        Ok(Some(Ok(report))) => report,
+        Ok(Some(Err(error))) => {
+            tracing::warn!(%error, local_path = %folder, "drift check could not compare the folder");
+            return false;
+        }
+        Ok(None) => return false,
+        Err(join_error) => {
+            tracing::warn!(error = %join_error, local_path = %folder, "drift check panicked");
+            return false;
+        }
+    };
+    // The detector withheld its deletion verdicts (a partial or suspicious inventory): nothing in
+    // this pass may become a deletion, including a file that vanishes before it is captured.
+    let detector_withheld = report.gone_withheld.is_some();
+    if let Some(why) = &report.gone_withheld {
+        tracing::warn!(local_path = %folder, %why, "drift check: deletions were not considered");
+    }
+    let mut candidates = report.candidates;
+    // Deletions are sent only while the folder is still on its volume and nothing withholds
+    // them (the same gate a full capture of the group applies).
+    let deletions_allowed = !detector_withheld
+        && on_volume(state.clone(), folder.clone()).await
+        && !state
+            .replica_coordinator
+            .link_repository()
+            .suppress_tombstones_for_group(&group_id)
+            .unwrap_or(true);
+    if !deletions_allowed {
+        candidates.retain(|c| c.kind != DriftKind::Gone);
+    }
+    if candidates.is_empty() {
+        tracing::debug!(local_path = %folder, walked = report.walked, "drift check: no drift");
+        return true;
+    }
+    tracing::info!(
+        local_path = %folder,
+        group_id = %group_id,
+        count = candidates.len(),
+        walked = report.walked,
+        "drift check: path(s) differ from the index although no watcher event reported them;          capturing them"
+    );
+    for (sent, candidate) in candidates.iter().enumerate() {
+        if candidate.kind == DriftKind::Gone
+            && sent % DRIFT_VOLUME_RECHECK_EVERY == 0
+            && !on_volume(state.clone(), folder.clone()).await
+        {
+            tracing::warn!(local_path = %folder, "drift check: the folder left its volume; stopping");
+            return false;
+        }
+        // A path that vanished between the walk and now is a deletion whatever the walk called it;
+        // while deletions are withheld it is left alone.
+        if !deletions_allowed
+            && std::fs::symlink_metadata(std::path::Path::new(&folder).join(&candidate.rel_path))
+                .is_err()
+        {
+            continue;
+        }
+        let _ = runtime.capture_drifted_path(&group_id, &candidate.rel_path).await;
+    }
+    true
 }
 
 /// Where a link's folder stands relative to the volume recorded for it.
@@ -935,7 +1125,11 @@ impl LinkRuntimeController {
             )));
         }
         let previous = links.capture_volume_identity_for_path(local_path)?;
-        if !links.confirm_capture_volume_identity(local_path, &link.group_id, &current)? {
+        if !state.replica_coordinator.link_admission().confirm_capture_volume_identity(
+            local_path,
+            &link.group_id,
+            &current,
+        )? {
             return Err(SyncError::NotFound(format!("linked folder {local_path}")));
         }
         tracing::info!(local_path, volume = %current, "the user confirmed the folder's disk");
@@ -1055,7 +1249,7 @@ impl LinkRuntimeController {
     /// its slot: marking that live link would close its peer apply for good.
     pub(crate) fn wait_unless_started(&self, folder: &str) {
         if !self.state.links.has_entry(folder) {
-            self.state.links.mark_awaiting_volume(folder);
+            folder_state::await_volume(&self.state.links, folder);
         }
     }
 }
@@ -1175,17 +1369,24 @@ impl FolderWatchSource for WatchLimitReporter {
         let key = root.to_string_lossy();
         match self.inner.watch(root, ignore_set) {
             Ok(watcher) => {
-                self.links.track_watcher(&key, watcher.watch_limited_flag());
+                folder_state::watcher_bound(&self.links, &key, watcher.watch_limited_flag());
                 Ok(watcher)
             }
             Err(err) => {
                 if err.is_watch_limit() {
-                    self.links.record_watch_limit_startup_failure(&key);
+                    folder_state::watch_limit_blocked_start(&self.links, &key);
                 } else {
-                    self.links.clear_watch_limit(&key);
+                    folder_state::watch_limit_forgotten(&self.links, &key);
                 }
                 Err(err)
             }
         }
     }
+}
+
+/// The most bytes the versions kept as history may hold that nothing current also holds: a tenth
+/// of the volume holding the block store, at most 20 GiB (20 GiB when there is no volume to ask).
+pub(crate) fn history_budget_bytes(volume_total_bytes: Option<u64>) -> u64 {
+    const CAP: u64 = 20 * 1024 * 1024 * 1024;
+    volume_total_bytes.map_or(CAP, |total| (total / 10).min(CAP))
 }

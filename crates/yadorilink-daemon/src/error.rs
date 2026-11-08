@@ -60,6 +60,11 @@ pub enum DaemonError {
     #[error("{0}")]
     PathNotAllowed(String),
 
+    /// A link was refused because the folder's drive cannot be synced into yet (see
+    /// [`yadorilink_fs_platform::durable_dir::UnsupportedDrive`]); no confirmation overrides it.
+    #[error("link refused: {}", .0.message())]
+    UnsupportedDrive(yadorilink_fs_platform::durable_dir::UnsupportedDrive),
+
     /// A link start was refused because a safe stop is under way. Nothing was changed; the
     /// same request succeeds once the stop has failed or been abandoned.
     #[error("a safe stop is in progress; try again in a few seconds")]
@@ -80,6 +85,10 @@ impl DaemonError {
         use crate::application::model::LinkRefusal;
         match self {
             DaemonError::PathNotAllowed(_) => Some(LinkRefusal::PathNotAllowed),
+            DaemonError::UnsupportedDrive(drive) => Some(LinkRefusal::UnsupportedDrive {
+                reason: drive.reason,
+                file_system: drive.file_system.clone(),
+            }),
             DaemonError::Io(e) if e.kind() == std::io::ErrorKind::StorageFull => {
                 Some(LinkRefusal::DiskFull)
             }
@@ -97,5 +106,58 @@ impl DaemonError {
 impl From<tokio_tungstenite::tungstenite::Error> for DaemonError {
     fn from(err: tokio_tungstenite::tungstenite::Error) -> Self {
         DaemonError::WebSocket(Box::new(err))
+    }
+}
+
+/// A folder on a drive the product cannot sync into (ReFS / Dev Drive, a network share, ...) is
+/// refused up front, in words, instead of failing at the first publish into it. No confirmation
+/// overrides it.
+pub(crate) fn refuse_unsupported_drive(path: &std::path::Path) -> Result<(), DaemonError> {
+    match yadorilink_fs_platform::durable_dir::unsupported_drive(path) {
+        Some(drive) => Err(DaemonError::UnsupportedDrive(drive)),
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod unsupported_drive_tests {
+    use super::*;
+
+    /// A folder on a drive the product cannot sync into is refused as a path that is not allowed,
+    /// with words that name the drive and what to do. Needs a ReFS (Dev Drive) volume, so it runs
+    /// on demand: `YADORILINK_TEST_REFS_DIR=R:\x cargo test -p yadorilink-daemon --lib
+    /// unsupported_drive -- --ignored`.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs a ReFS volume: set YADORILINK_TEST_REFS_DIR"]
+    fn a_folder_on_a_refs_drive_is_refused_in_words() {
+        let dir = std::env::var("YADORILINK_TEST_REFS_DIR").expect("YADORILINK_TEST_REFS_DIR");
+        let dir = std::path::Path::new(&dir);
+        // A folder that does not exist yet is judged by the drive it would be created on.
+        for path in [dir.to_path_buf(), dir.join("not-created-yet").join("deeper")] {
+            let refusal = refuse_unsupported_drive(&path).expect_err("a ReFS folder is refused");
+            let words = refusal.to_string();
+            assert!(
+                words.contains("ReFS / Dev Drive")
+                    && words.contains("not supported yet")
+                    && words.contains("NTFS"),
+                "{words}"
+            );
+            assert!(matches!(
+                refusal.link_refusal(),
+                Some(crate::application::model::enrollment::LinkRefusal::UnsupportedDrive {
+                    reason: yadorilink_fs_platform::durable_dir::DriveReason::Refs,
+                    ..
+                })
+            ));
+        }
+    }
+
+    /// An ordinary folder is not refused (on every platform).
+    #[test]
+    fn an_ordinary_folder_is_not_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(refuse_unsupported_drive(dir.path()).is_ok());
+        assert!(refuse_unsupported_drive(&dir.path().join("new").join("deeper")).is_ok());
     }
 }

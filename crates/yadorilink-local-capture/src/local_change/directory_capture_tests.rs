@@ -275,7 +275,7 @@ fn a_directory_becoming_ignored_is_dropped_without_a_tombstone() {
     proc.scan_existing_files(GROUP, &root).unwrap();
     assert_eq!(ops_at(&state, "build"), ["put-dir"]);
 
-    let ignore_set = EffectiveIgnoreSet::from_user_patterns("build/\n");
+    let ignore_set = EffectiveIgnoreSet::from_text("build/\n").unwrap();
     proc.scan_existing_files_with_ignore(GROUP, &root, &ignore_set).unwrap();
 
     assert_eq!(ops_at(&state, "build"), ["put-dir"], "becoming ignored is not a deletion");
@@ -295,7 +295,7 @@ async fn dir_only_ignore_pattern_applies_on_rmdir_event() {
     assert_eq!(ops_at(&state, "build"), ["put-dir"]);
 
     std::fs::remove_dir(root.join("build")).unwrap();
-    let ignore_set = EffectiveIgnoreSet::from_user_patterns("build/\n");
+    let ignore_set = EffectiveIgnoreSet::from_text("build/\n").unwrap();
     proc.process_event_with_ignore(
         GROUP,
         &root,

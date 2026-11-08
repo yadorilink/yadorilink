@@ -109,6 +109,12 @@ pub trait Local {
     /// Whether `path` is confirmed not to exist (`NotFound`). A path that cannot be inspected
     /// (access denied, a sharing violation) is not missing.
     fn confirmed_missing(&self, path: &Path) -> bool;
+    /// Whether the operating system still has the sync root at `root_path` registered. Asked right
+    /// before each delete: a registration that went away during the pass took the placeholders with
+    /// it, and what then reads as missing is not what the person did.
+    fn root_registered(&self, _root_path: &Path) -> bool {
+        true
+    }
 }
 
 /// The answer to "where is the placeholder of this item".
@@ -589,6 +595,7 @@ impl Authoring {
         // they went.
         vanished.sort_by_key(|(_, item)| item.path.components().count());
         let mut deleted: Vec<PathBuf> = Vec::new();
+        let mut registration_lost = false;
         for (id, item) in vanished {
             // Skip what an earlier step already settled (an item that moved is shown at its new
             // path by now) and what lies below a folder deleted in this pass.
@@ -611,6 +618,14 @@ impl Authoring {
                     continue;
                 }
                 Located::Absent => {}
+            }
+            if registration_lost || !cx.local.root_registered(&self.root_path) {
+                // Nothing is deleted from a root the operating system no longer has registered; the
+                // host judges the registration itself after the pass, and the paths are looked at
+                // again if the root is served again.
+                registration_lost = true;
+                cx.report.retry.insert(item.path.clone());
+                continue;
             }
             self.delete(&id, &item, cx);
             deleted.push(item.path.clone());
@@ -1293,6 +1308,8 @@ mod tests {
 
     #[derive(Default)]
     struct FakeLocal {
+        /// The operating system's registration of the sync root has gone.
+        registration_lost: std::cell::Cell<bool>,
         entries: RefCell<HashMap<PathBuf, LocalStat>>,
         children: RefCell<HashMap<PathBuf, Vec<PathBuf>>>,
         adopted: RefCell<Vec<(PathBuf, Vec<u8>)>>,
@@ -1463,6 +1480,9 @@ mod tests {
         }
         fn confirmed_missing(&self, path: &Path) -> bool {
             !self.stat_unavailable.get() && !self.unreadable.borrow().contains(path)
+        }
+        fn root_registered(&self, _root_path: &Path) -> bool {
+            !self.registration_lost.get()
         }
     }
 
@@ -2382,6 +2402,30 @@ mod tests {
         assert_eq!(request.base_version_hash, vec![3; 40]);
         assert_eq!(report.applied, 1);
         assert!(shown.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The registration goes while a pass is running: what has vanished by then is not what the
+    /// person did, so nothing is deleted and the paths are kept for a later look.
+    #[test]
+    fn nothing_is_deleted_once_the_registration_is_gone() {
+        let (auth, dir) = setup("registration-lost");
+        let (local, api) = (FakeLocal::default(), FakeApi::default());
+        let mut shown: ShownItems =
+            [item("a.txt", 3, 0, false, 10), item("b.txt", 4, 0, false, 10)].into();
+        api.accept_delete();
+        local.registration_lost.set(true);
+        let report = auth.process(&signals(&[p("a.txt"), p("b.txt")]), &mut shown, &local, &api);
+        assert!(api.requests.borrow().is_empty(), "a delete was authored for a lost registration");
+        assert_eq!(shown.len(), 2, "the shown items were dropped");
+        assert_eq!(report.retry, [p("a.txt"), p("b.txt")].into_iter().collect());
+
+        // The control: with the registration in place the same pass deletes both.
+        local.registration_lost.set(false);
+        api.accept_delete();
+        let report = auth.process(&signals(&[p("a.txt"), p("b.txt")]), &mut shown, &local, &api);
+        assert_eq!(api.requests.borrow().len(), 2);
+        assert_eq!(report.applied, 2);
         let _ = std::fs::remove_dir_all(dir);
     }
 

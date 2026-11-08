@@ -16,6 +16,27 @@ use crate::provider_eager::{EagerDriver, EagerInputs, EagerStatus};
 use crate::replica_coordinator::ReplicaCoordinator;
 
 type Builder = Arc<dyn Fn() -> Vec<ProviderRootStatus> + Send + Sync>;
+type CountsBuilder = Arc<dyn Fn() -> std::collections::HashMap<String, OsFileCounts> + Send + Sync>;
+
+/// What the operating system holds of a provider folder, as the host last reported it, per folder
+/// group: the files it has bytes of, and the files being opened (fetched) right now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OsFileCounts {
+    pub held: u64,
+    pub opening: u64,
+}
+
+/// A provider folder's `(hydrated, placeholder, hydrating)` file counts from the OS's reading. The
+/// folder's own table counts every file as a placeholder (the operating system owns the content, the
+/// daemon records nothing per file), so only its total is used: `held` of those files are on this PC,
+/// `opening` of the rest are being fetched, and everything else is online only. Both are clamped to
+/// the total, so a report that is a moment ahead of the index cannot make the parts exceed the whole.
+#[must_use]
+pub fn provider_file_counts(total: u64, os: OsFileCounts) -> (u64, u64, u64) {
+    let hydrated = os.held.min(total);
+    let hydrating = os.opening.min(total - hydrated);
+    (hydrated, total - hydrated - hydrating, hydrating)
+}
 type ExtrasBuilder = Arc<dyn Fn() -> (Vec<ProviderRemovalStatus>, Vec<String>) + Send + Sync>;
 type PendingBuilder = Arc<dyn Fn(u32) -> Result<Vec<PendingPublication>, String> + Send + Sync>;
 
@@ -25,11 +46,23 @@ pub struct ProviderStatusSource {
     builder: RwLock<Option<Builder>>,
     pending: RwLock<Option<PendingBuilder>>,
     extras: RwLock<Option<ExtrasBuilder>>,
+    counts: RwLock<Option<CountsBuilder>>,
 }
 
 impl ProviderStatusSource {
     pub(crate) fn install(&self, builder: Builder) {
         *self.builder.write().unwrap_or_else(|p| p.into_inner()) = Some(builder);
+    }
+
+    pub(crate) fn install_counts(&self, builder: CountsBuilder) {
+        *self.counts.write().unwrap_or_else(|p| p.into_inner()) = Some(builder);
+    }
+
+    /// What the host last reported the OS holds, per provider folder group (empty until installed,
+    /// and for a folder with no complete report from the attached host).
+    pub(crate) fn os_file_counts(&self) -> std::collections::HashMap<String, OsFileCounts> {
+        let builder = self.counts.read().unwrap_or_else(|p| p.into_inner()).clone();
+        builder.map_or_else(Default::default, |build| build())
     }
 
     pub(crate) fn install_extras(&self, builder: ExtrasBuilder) {
@@ -250,16 +283,37 @@ fn repository_lines(repo: &ProviderRepository, now_ms: i64) -> Vec<(String, Prov
         .collect()
 }
 
+/// What a ready root says while its pending updates are held because the app has not yet told the
+/// daemon where its shared folder is (the daemon cannot take back files a previous run handed out
+/// until it can open that folder). A wait, not a fault: the app finishing its set-up clears it.
+pub(crate) const HANDOFF_ROOT_WAIT_TEXT: &str =
+    "waiting for the app to finish setting up the folder";
+
+/// How long a publication must have been held before the line says why.
+const HANDOFF_ROOT_WAIT_AFTER_MS: u64 = 60_000;
+
+/// Replaces a ready root's words with the reason its updates are held. `held_ms` is how long a
+/// publication of this root has been refused for want of the folder; it is not read from the
+/// pending-publication rows, because the hold comes before a row exists. Anything that is not
+/// "ready" (an error, an unregistered folder) keeps its own words: they are the more useful ones.
+fn apply_handoff_root_wait(line: &mut ProviderRootStatus, held_ms: Option<u64>) {
+    if line.readiness == "ready" && held_ms.is_some_and(|ms| ms >= HANDOFF_ROOT_WAIT_AFTER_MS) {
+        line.readiness = HANDOFF_ROOT_WAIT_TEXT.into();
+    }
+}
+
 /// One line per declared provider root.
 pub(crate) fn provider_root_lines(
     coordinator: &ReplicaCoordinator,
     eager: &EagerDriver,
     inputs: &EagerInputs<'_>,
     now_ms: i64,
+    handoff_hold_ms: &dyn Fn(&str) -> Option<u64>,
 ) -> Vec<ProviderRootStatus> {
     repository_lines(coordinator.provider_repository(), now_ms)
         .into_iter()
         .map(|(root_id, mut line)| {
+            apply_handoff_root_wait(&mut line, handoff_hold_ms(&root_id));
             if let Some(status) = eager.status(inputs, &root_id) {
                 encode_eager(&status, &mut line);
                 if status.unreadable {

@@ -605,6 +605,15 @@ impl GroupPolicyState {
     }
 }
 
+/// The untrusted-input entry point, for the fuzz targets only: a policy log as the coordination
+/// plane delivers it (JSON), decoded and verified against a fixed service key.
+#[cfg(fuzzing)]
+pub fn fuzz_policy_log(data: &[u8]) {
+    if let Ok(log) = serde_json::from_slice::<GroupPolicyLog>(data) {
+        let _ = verify_group_policy_log(&[7u8; HASH_LEN], &log);
+    }
+}
+
 pub fn verify_group_policy_log(
     service_public_key: &[u8],
     log: &GroupPolicyLog,

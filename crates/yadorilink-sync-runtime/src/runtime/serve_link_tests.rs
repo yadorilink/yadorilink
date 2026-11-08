@@ -111,8 +111,8 @@ async fn a_hello_from_another_protocol_version_is_reported_as_incompatible() {
     for theirs in [PROTOCOL_VERSION + 1, PROTOCOL_VERSION - 1] {
         let (mut seen, link, (client_node, server, _handle)) = serving_pair().await;
         let (reported_tx, mut reported) = tokio::sync::mpsc::unbounded_channel();
-        server.when_lane_incompatible(Arc::new(move |peer, theirs, ours| {
-            let _ = reported_tx.send((peer, theirs, ours));
+        server.when_lane_incompatible(Arc::new(move |link, theirs, ours| {
+            let _ = reported_tx.send((link.peer(), theirs, ours));
         }));
 
         let mut lane = link.open_lane(Lane::Service).await.expect("a lane opens");
@@ -138,8 +138,8 @@ async fn a_hello_from_another_protocol_version_is_reported_as_incompatible() {
 async fn a_matching_hello_is_not_reported_as_incompatible() {
     let (mut seen, link, (_client_node, server, _handle)) = serving_pair().await;
     let (reported_tx, mut reported) = tokio::sync::mpsc::unbounded_channel();
-    server.when_lane_incompatible(Arc::new(move |peer, theirs, ours| {
-        let _ = reported_tx.send((peer, theirs, ours));
+    server.when_lane_incompatible(Arc::new(move |link, theirs, ours| {
+        let _ = reported_tx.send((link.peer(), theirs, ours));
     }));
 
     open_hello_lane(&link, "fine").await;

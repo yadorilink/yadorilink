@@ -234,7 +234,7 @@ impl CliError {
     /// A coarse, stable category label for this error, used as the
     /// `error_category` field of a candidate created by
     /// `commands::report::handle_reportable_error` — never the raw
-    /// message (that goes in `log_lines`, already redacted).
+    /// message, which can echo user-chosen names and is not recorded at all.
     pub fn report_category(&self) -> &'static str {
         match self {
             CliError::NotLoggedIn => "cli_not_logged_in",
@@ -288,6 +288,7 @@ fn cli_hint_text(hint: Hint) -> &'static str {
         // Replaced whole in `with_hint`; the suffix only serves a category that cannot carry it.
         Hint::AlreadyEnrolled => ". Run `yadorilink logout` first to enrol again",
         Hint::SignInAgain => ". Run `yadorilink login` again and open the link it prints.",
+        Hint::RegisterDevice => "; run `yadorilink device register --name <name>`",
         Hint::CreateOrAcceptShare => {
             " (run `yadorilink share create` to make one, or `yadorilink share accept` to join \
              one you were invited to)"
@@ -392,6 +393,11 @@ impl From<CoreError> for CliError {
                 message,
                 ..
             } => CliError::EnrollmentPendingReconciliation(message),
+            CoreError::DaemonCommand {
+                code: ApplicationErrorCode::LocalIdentityUnavailable,
+                message,
+                ..
+            } => CliError::Other(local_identity_unavailable_message(message)),
             CoreError::DaemonCommand { code: ApplicationErrorCode::DiskFull, message, .. } => {
                 CliError::Other(format!(
                     "there is not enough free disk space to do this; free some space and try \
@@ -438,6 +444,36 @@ impl From<CoreError> for CliError {
             | CoreError::Io(message)
             | CoreError::Other(message) => CliError::Other(message),
         }
+    }
+}
+
+/// The refusal of a command that needs this computer's device identity. Signing in enrols the
+/// computer with the account; registering it as a named device is a separate step. When no
+/// device has ever been registered here that step is named; any other cause (an expired
+/// sign-in, an unreadable device file) keeps the daemon's own words, since registering again
+/// would not help and could create a second identity.
+fn local_identity_unavailable_message(daemon_message: String) -> String {
+    local_identity_message_for(
+        daemon_message,
+        yadorilink_client_core::ops::devices::needs_registration(),
+        &yadorilink_client_core::ops::devices::register_command(),
+    )
+}
+
+fn local_identity_message_for(
+    daemon_message: String,
+    needs_registration: bool,
+    register_command: &str,
+) -> String {
+    if needs_registration {
+        format!(
+            "this computer is signed in but not registered as a device yet; run \
+             `{register_command}` first"
+        )
+    } else if daemon_message.is_empty() {
+        "local device identity is unavailable".to_owned()
+    } else {
+        daemon_message
     }
 }
 

@@ -1,4 +1,4 @@
-#![cfg(all(test, unix))]
+#![cfg(test)]
 //! A file captured in the file-only mode is hashed, flushed and indexed without a single block
 //! going into the store, and a policy that never asks for it changes nothing.
 //!
@@ -102,6 +102,7 @@ async fn without_a_policy_every_file_goes_into_the_store() {
 
 /// A file-only capture indexes exactly the blocks a store capture of the same bytes does, puts none
 /// of them into the store and records no provenance for them, and flushes the file and its new name.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_file_only_capture_hashes_without_storing_and_flushes_first() {
     let stored = fixture(Some(Ingest::Store));
@@ -125,6 +126,7 @@ async fn a_file_only_capture_hashes_without_storing_and_flushes_first() {
 
 /// The reconciliation scan takes the same mode for a file it finds: the pooled staging is not
 /// used, nothing is put into the store, and the record names the file.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_scan_captures_a_file_only_file_without_staging_its_blocks() {
     let f = fixture(Some(Ingest::FileOnly));
@@ -138,8 +140,23 @@ async fn a_scan_captures_a_file_only_file_without_staging_its_blocks() {
     assert!(f.state.get_file(GROUP, "scanned.bin").unwrap().is_some());
 }
 
+/// Where a file's directory entry cannot be flushed (Windows), the policy's file-only choice is
+/// not honoured: the file goes into the store, with provenance, and the record is the same.
+#[cfg(not(unix))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_a_directory_flush_a_file_only_policy_stores_the_file() {
+    let f = fixture(Some(Ingest::FileOnly));
+    std::fs::write(f.root.join("a.bin"), payload()).unwrap();
+
+    let record = expect_file_changed(capture(&f, "a.bin").await);
+
+    assert_eq!(blocks_in_store(&f, &record), record.blocks.len());
+    assert_eq!(blocks_with_provenance(&f, &record), record.blocks.len());
+}
+
 /// A file that cannot be flushed is not captured file-only: its blocks go into the store, with
 /// provenance, and the record is the same.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_file_that_cannot_be_flushed_falls_back_to_the_store() {
     let f = fixture(Some(Ingest::FileOnly));
@@ -156,6 +173,7 @@ async fn a_file_that_cannot_be_flushed_falls_back_to_the_store() {
 
 /// The name is swapped for another file after the read: nothing is captured from this pass, and
 /// nothing about either file is indexed.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_name_swapped_after_the_read_captures_nothing() {
     let f = fixture(Some(Ingest::FileOnly));
@@ -177,6 +195,7 @@ async fn a_name_swapped_after_the_read_captures_nothing() {
 }
 
 /// The file is written after it was read: the barrier does not turn a changed file into a record.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_file_written_after_the_read_is_not_captured_from_that_pass() {
     let f = fixture(Some(Ingest::FileOnly));
@@ -199,6 +218,7 @@ async fn a_file_written_after_the_read_is_not_captured_from_that_pass() {
 
 /// The barrier flushes the file it read, not whatever now stands under the name: a rename over the
 /// name after the read is reported as a moved name, whatever the change times say.
+#[cfg(unix)]
 #[test]
 fn the_barrier_notices_a_name_that_now_leads_to_another_file() {
     use super::record_builder::{flush_before_commit, Barrier};
@@ -219,6 +239,7 @@ fn the_barrier_notices_a_name_that_now_leads_to_another_file() {
 
 /// Every directory entry between the file and the folder's root is flushed, so a directory the user
 /// has just made cannot disappear in a crash after the record that names its file has committed.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_barrier_flushes_the_directories_down_to_the_root() {
     let f = fixture(Some(Ingest::FileOnly));

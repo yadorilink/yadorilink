@@ -528,10 +528,7 @@ async fn mark_link_degraded_makes_the_link_report_degraded_with_a_reason() {
     let state = test_state();
     assert!(!state.is_link_degraded("/links/photos"));
 
-    state.mark_link_waiting_for_disk_space(
-        "/links/photos",
-        "disk pressure on /links/photos".to_string(),
-    );
+    state.wait_for_disk_space("/links/photos", "disk pressure on /links/photos".to_string());
 
     assert!(state.is_link_degraded("/links/photos"));
     let info = state.degraded_link_info("/links/photos").unwrap();
@@ -545,13 +542,13 @@ async fn mark_link_degraded_makes_the_link_report_degraded_with_a_reason() {
 #[tokio::test]
 async fn clear_link_degraded_removes_the_entry() {
     let state = test_state();
-    state.mark_link_waiting_for_disk_space("/links/photos", "disk pressure".to_string());
+    state.wait_for_disk_space("/links/photos", "disk pressure".to_string());
     assert!(state.is_link_degraded("/links/photos"));
 
-    state.clear_link_degraded("/links/photos");
+    state.recover_link("/links/photos");
     assert!(!state.is_link_degraded("/links/photos"));
     // Clearing an already-clear (or never-degraded) link is a safe no-op.
-    state.clear_link_degraded("/links/photos");
+    state.recover_link("/links/photos");
     assert!(!state.is_link_degraded("/links/photos"));
 }
 
@@ -563,11 +560,11 @@ async fn clear_link_degraded_removes_the_entry() {
 #[tokio::test]
 async fn repeated_disk_pressure_increases_backoff_instead_of_resetting_it() {
     let state = test_state();
-    state.mark_link_waiting_for_disk_space("/links/photos", "disk pressure".to_string());
+    state.wait_for_disk_space("/links/photos", "disk pressure".to_string());
     let first = state.degraded_link_info("/links/photos").unwrap();
     assert_eq!(first.backoff_attempt, 0);
 
-    state.mark_link_waiting_for_disk_space("/links/photos", "disk pressure".to_string());
+    state.wait_for_disk_space("/links/photos", "disk pressure".to_string());
     let second = state.degraded_link_info("/links/photos").unwrap();
     assert_eq!(second.backoff_attempt, 1);
     assert!(
@@ -579,7 +576,7 @@ async fn repeated_disk_pressure_increases_backoff_instead_of_resetting_it() {
     // been degraded, not just "since the last re-check."
     assert_eq!(second.since_unix, first.since_unix);
 
-    state.mark_link_waiting_for_disk_space("/links/photos", "disk pressure".to_string());
+    state.wait_for_disk_space("/links/photos", "disk pressure".to_string());
     let third = state.degraded_link_info("/links/photos").unwrap();
     assert_eq!(third.backoff_attempt, 2);
     assert!(third.next_recheck_unix >= second.next_recheck_unix);
@@ -597,7 +594,7 @@ async fn recheck_degraded_links_clears_a_link_once_headroom_check_succeeds() {
 
     // Mark the link degraded directly (bypassing a real preflight
     // call) so this test only exercises the re-check/clear half.
-    state.mark_link_waiting_for_disk_space(&link_path, "disk pressure".to_string());
+    state.wait_for_disk_space(&link_path, "disk pressure".to_string());
     assert!(state.is_link_degraded(&link_path));
 
     // A headroom override of `0` ("no headroom required") always
@@ -626,7 +623,7 @@ async fn recheck_keeps_the_typed_disk_space_wait() {
     let link_root = tempfile::tempdir().unwrap();
     let link_path = link_root.path().to_string_lossy().to_string();
 
-    state.mark_link_waiting_for_disk_space(&link_path, "free some room".to_string());
+    state.wait_for_disk_space(&link_path, "free some room".to_string());
     state.governance_config.set_headroom_override_bytes(Some(u64::MAX / 2)).unwrap();
     state.links.force_degraded_recheck_due_now(&link_path, now_unix());
     state.recheck_degraded_links();
@@ -635,7 +632,7 @@ async fn recheck_keeps_the_typed_disk_space_wait() {
     assert_eq!(info.cause, DegradedCause::WaitingForDiskSpace);
     assert_eq!(info.reason, "free some room");
 
-    state.mark_link_degraded(
+    state.degrade_link(
         "/links/other",
         DegradedCause::FileWatchLimit,
         "Waiting for disk space on /v".to_string(),
@@ -655,7 +652,7 @@ async fn recheck_degraded_links_reschedules_a_link_still_under_pressure() {
     let link_root = tempfile::tempdir().unwrap();
     let link_path = link_root.path().to_string_lossy().to_string();
 
-    state.mark_link_waiting_for_disk_space(&link_path, "disk pressure".to_string());
+    state.wait_for_disk_space(&link_path, "disk pressure".to_string());
     // A headroom override far larger than any real disk's free space
     // keeps this link `Critical` no matter what.
     state.governance_config.set_headroom_override_bytes(Some(u64::MAX / 2)).unwrap();

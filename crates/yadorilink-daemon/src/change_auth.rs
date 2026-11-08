@@ -19,6 +19,7 @@ use crate::daemon_state::DaemonState;
 /// sharing it.
 pub(crate) fn effective_servable_groups(
     state: Arc<DaemonState>,
+    peer_device_id: &str,
     raw_groups: &HashSet<String>,
     validation_cache: &Mutex<HashMap<String, bool>>,
 ) -> HashSet<String> {
@@ -30,8 +31,18 @@ pub(crate) fn effective_servable_groups(
             {
                 return cached_ok.then(|| group_id.clone());
             }
-            let ok = state.group_is_servable(group_id);
-            validation_cache.lock().unwrap_or_else(|p| p.into_inner()).insert(group_id.clone(), ok);
+            // Judged as if the peer holding this entry had no authorization yet: its own admission
+            // is not evidence about the group.
+            let ok = state.group_is_servable_ignoring_peer(group_id, peer_device_id);
+            // Shared across the peers of one pass, so only an answer that does not depend on the
+            // peer is kept: for a group with no verified policy the answer depends on which other
+            // peers name it.
+            if state.group_servability_is_peer_independent(group_id) {
+                validation_cache
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(group_id.clone(), ok);
+            }
             ok.then(|| group_id.clone())
         })
         .collect()

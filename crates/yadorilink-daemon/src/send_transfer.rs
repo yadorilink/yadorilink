@@ -412,6 +412,9 @@ pub(crate) struct LinkStatusView {
     pub(crate) state: SendLinkState,
     pub(crate) receiver_device_name: String,
     pub(crate) transfer_id: String,
+    /// The closed failure code of the interrupted link's transfer (or of the send that never got
+    /// one); empty when none is on record.
+    pub(crate) failure: String,
 }
 
 /// The link state a front end shows. `transfer` is the link's transfer, when this daemon started
@@ -523,7 +526,10 @@ impl From<SendLinkCallError> for SendFailure {
             SendLinkCallKind::SignInRequired => ApplicationErrorCode::LocalIdentityUnavailable,
             SendLinkCallKind::NotFound => ApplicationErrorCode::SendLinkInvalid,
             SendLinkCallKind::FeatureDisabled => ApplicationErrorCode::SendLinksDisabled,
-            SendLinkCallKind::Other => return Self { code: None, message: error.message },
+            SendLinkCallKind::PreviewUnverified => ApplicationErrorCode::SendPreviewUnverified,
+            SendLinkCallKind::Other | SendLinkCallKind::Conflict => {
+                return Self { code: None, message: error.message }
+            }
         };
         Self::typed(code, error.message)
     }
@@ -566,6 +572,8 @@ pub(crate) fn inbox_entry_to_proto(
         failure: t.failure.unwrap_or_default(),
         link_id: t.link_id,
         received_bytes: t.received_bytes,
+        files_done: t.files_done,
+        files_total: t.files_total,
         destination_dir: t.destination_dir.unwrap_or_default(),
     }
 }
@@ -588,6 +596,7 @@ pub(crate) fn sent_entry_to_proto(
         status: t.status.to_string(),
         failure: t.failure.unwrap_or_default(),
         can_retry: t.can_retry,
+        bytes_sent: t.bytes_sent,
     }
 }
 
@@ -873,11 +882,18 @@ impl SendTransferService {
                 .and_then(|sent| sent.into_iter().find(|entry| &entry.transfer_id == id)),
             None => None,
         };
+        let send_failure = self.links().send_failure_of(link_id);
+        let failure = transfer
+            .as_ref()
+            .and_then(|t| t.failure.clone())
+            .or_else(|| send_failure.clone())
+            .unwrap_or_default();
         Ok(LinkStatusView {
+            failure,
             state: link_state(
                 &status.state,
                 transfer.as_ref().map(|t| (t.status, t.failure.is_some())),
-                self.links().send_failure_of(link_id).is_some(),
+                send_failure.is_some(),
             ),
             receiver_device_name: status.receiver_device_name.unwrap_or_default(),
             transfer_id: transfer_id.unwrap_or_default(),

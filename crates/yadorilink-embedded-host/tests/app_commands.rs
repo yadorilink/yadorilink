@@ -6,9 +6,10 @@
 use std::time::Duration;
 
 use yadorilink_embedded_host::{
-    CallError, CallOptions, CancelHandle, Command, CommandErrorKind, CommandOutput, CreateShare,
-    DoctorStatus, EmbeddedHost, JoinGroup, JoinShare, PauseFor, PauseLink, PreservedRef,
-    PreservedRefusal, ProviderFolder, ResumeLink, ShareFolder, SpaceManagement, UnlinkFolder,
+    CallError, CallOptions, CancelHandle, Command, CommandErrorKind, CommandOutput,
+    ConflictResolution, CreateShare, DoctorStatus, EmbeddedHost, JoinGroup, JoinShare, NetworkCost,
+    PauseFor, PauseLink, PolicyState, PreservedRef, PreservedRefusal, ProviderFolder, ResumeLink,
+    RetentionRule, ShareFolder, SpaceManagement, UnlinkFolder,
 };
 use yadorilink_ipc_proto::daemonctl::ApplicationErrorCode;
 
@@ -81,6 +82,37 @@ fn space_management_is_off_until_set_and_survives_a_restart_of_the_engine() {
 }
 
 #[test]
+fn metered_sync_is_paused_by_default_the_setting_persists_and_the_host_report_does_not() {
+    let _serial = serialized();
+    let (host, _area) = running_host();
+    let policy = |sync_on_metered, cost, cost_known| {
+        CommandOutput::NetworkPolicy(PolicyState { sync_on_metered, cost, cost_known })
+    };
+    assert_eq!(
+        host.execute(Command::NetworkPolicy, &within(30)).unwrap(),
+        policy(false, NetworkCost::Unknown, false)
+    );
+    assert_eq!(
+        host.execute(Command::ReportNetworkCost { cost: NetworkCost::Metered }, &within(30))
+            .unwrap(),
+        policy(false, NetworkCost::Metered, true)
+    );
+    assert_eq!(
+        host.execute(Command::SetSyncOnMetered { enabled: true }, &within(30)).unwrap(),
+        policy(true, NetworkCost::Metered, true)
+    );
+    host.suspend().unwrap();
+    host.resume().unwrap();
+    assert_eq!(
+        host.execute(Command::NetworkPolicy, &within(30)).unwrap(),
+        policy(true, NetworkCost::Unknown, false),
+        "the setting is stored; what the host reported is for the host to say again, and the \
+engine says it has not been told"
+    );
+    host.stop().unwrap();
+}
+
+#[test]
 fn a_link_is_paused_and_resumed_and_a_stale_group_changes_nothing() {
     let _serial = serialized();
     let (host, _area) = host_with_link("/folders/photos", "group-a");
@@ -98,7 +130,7 @@ fn a_link_is_paused_and_resumed_and_a_stale_group_changes_nothing() {
 
     let pause = PauseLink {
         link_key: "/folders/photos".into(),
-        duration: PauseFor::OneHour,
+        duration: PauseFor::TwoHours,
         expected_group_id: Some("group-a".into()),
     };
     assert_eq!(host.execute(Command::PauseLink(pause), &within(30)).unwrap(), CommandOutput::Done);
@@ -262,6 +294,132 @@ fn the_history_listings_of_a_fresh_provider_folder_are_empty_and_unknown_ids_are
     host.stop().unwrap();
 }
 
+/// The keep-on-device commands name an item by (root, item) like the history listings: an unknown
+/// root, an unknown item or a malformed id is a failure with the engine's message, never a
+/// silent success that would read as "pinned".
+#[test]
+fn the_keep_on_device_commands_refuse_unknown_items_and_a_fresh_folder_previews_nothing() {
+    let _serial = serialized();
+    let (host, _area) = running_host();
+    let root_hex = host.add_provider_link_for_test("g-offline").unwrap();
+    let root: Vec<u8> = (0..root_hex.len() / 2)
+        .map(|i| u8::from_str_radix(&root_hex[2 * i..2 * i + 2], 16).unwrap())
+        .collect();
+    for (root_id, item_id) in
+        [(root.clone(), vec![7; 16]), (root.clone(), vec![7; 3]), (vec![9; 16], vec![7; 16])]
+    {
+        for command in [
+            Command::SetRetentionRule {
+                root_id: root_id.clone(),
+                item_id: item_id.clone(),
+                rule: RetentionRule::Keep,
+            },
+            Command::SetRetentionRule {
+                root_id: root_id.clone(),
+                item_id: item_id.clone(),
+                rule: RetentionRule::OnlineOnly,
+            },
+            Command::SetRetentionRule {
+                root_id: root_id.clone(),
+                item_id: item_id.clone(),
+                rule: RetentionRule::Default,
+            },
+            Command::ItemRetention { root_id: root_id.clone(), item_id: item_id.clone() },
+            Command::EvictItem { root_id: root_id.clone(), item_id: item_id.clone() },
+        ] {
+            let result = host.execute(command.clone(), &within(30));
+            let Err(CallError::Failed(error)) = result else {
+                panic!("{command:?} should be refused: {result:?}")
+            };
+            assert_eq!(error.kind(), CommandErrorKind::Failed);
+            assert!(!error.message().is_empty());
+        }
+    }
+    let CommandOutput::SpaceReclaim(preview) =
+        host.execute(Command::PreviewSpaceReclaim, &within(30)).unwrap()
+    else {
+        panic!("a reclaim preview")
+    };
+    assert!(preview.items.is_empty());
+    host.stop().unwrap();
+}
+
+/// The sync-problem commands on a fresh engine: nothing in conflict or waiting reads as empty (the
+/// reads succeeded), and a conflict or preserved item that does not exist is a typed failure.
+#[test]
+fn the_sync_problem_commands_answer_for_a_fresh_provider_folder_and_refuse_unknown_items() {
+    let _serial = serialized();
+    let (host, _area) = running_host();
+    let root_hex = host.add_provider_link_for_test("g-conflicts").unwrap();
+    let root: Vec<u8> = (0..root_hex.len() / 2)
+        .map(|i| u8::from_str_radix(&root_hex[2 * i..2 * i + 2], 16).unwrap())
+        .collect();
+
+    let CommandOutput::Conflicts(conflicts) =
+        host.execute(Command::ListConflicts, &within(30)).unwrap()
+    else {
+        panic!("a conflict list")
+    };
+    assert!(conflicts.is_empty());
+    let CommandOutput::ProviderPending(pending) =
+        host.execute(Command::ListProviderPending { limit: 50 }, &within(30)).unwrap()
+    else {
+        panic!("a pending list")
+    };
+    assert!(pending.is_empty());
+
+    for (root_id, item_id) in
+        [(root.clone(), vec![7; 16]), (root.clone(), vec![7; 3]), (vec![9; 16], vec![7; 16])]
+    {
+        let command =
+            Command::ResolveConflict { root_id, item_id, resolution: ConflictResolution::KeepBoth };
+        let result = host.execute(command.clone(), &within(30));
+        let Err(CallError::Failed(error)) = result else {
+            panic!("{command:?} should be refused: {result:?}")
+        };
+        assert_eq!(error.kind(), CommandErrorKind::Failed);
+    }
+    let result = host.execute(
+        Command::RetryPreserved(PreservedRef { group_id: "g".into(), item_id: "nope".into() }),
+        &within(30),
+    );
+    let Err(CallError::Failed(error)) = result else { panic!("expected a refusal: {result:?}") };
+    assert_eq!(error.kind(), CommandErrorKind::Preserved(PreservedRefusal::NotFound));
+    host.stop().unwrap();
+}
+
+/// The group 3 commands call the services the daemon calls, so what the daemon refuses they
+/// refuse: an unknown transfer, an unknown root, a path that is not deleted, and an invite with
+/// no account behind it.
+#[test]
+fn transfer_retry_folder_restore_and_invite_commands_refuse_what_the_daemon_refuses() {
+    let _serial = serialized();
+    let (host, _area) = running_host();
+    let root_hex = host.add_provider_link_for_test("g-group3").unwrap();
+    let root: Vec<u8> = (0..root_hex.len() / 2)
+        .map(|i| u8::from_str_radix(&root_hex[2 * i..2 * i + 2], 16).unwrap())
+        .collect();
+    for command in [
+        Command::RetryTransfer { transfer_id: "no-such-transfer".into() },
+        Command::RetrySentTransfer { transfer_id: "no-such-transfer".into() },
+        Command::RestoreDeletedOperation { root_id: root.clone(), path: "gone/a.txt".into() },
+        Command::RestoreDeletedOperation { root_id: vec![9; 16], path: "gone/a.txt".into() },
+        Command::MintInvite {
+            group_id: "g-group3".into(),
+            role: None,
+            ttl_secs: None,
+            requires_approval: false,
+        },
+    ] {
+        let result = host.execute(command.clone(), &within(30));
+        let Err(CallError::Failed(error)) = result else {
+            panic!("{command:?} should be refused: {result:?}")
+        };
+        assert!(!error.message().is_empty(), "{command:?}");
+    }
+    host.stop().unwrap();
+}
+
 /// An ordinary folder cannot be captured by this build, so a share into one is refused before
 /// anything is created on this device or redeemed with the coordination plane.
 #[test]
@@ -416,5 +574,23 @@ fn creating_a_share_on_demand_is_refused_for_want_of_a_full_replica() {
         panic!("refused")
     };
     assert_ne!(error.kind(), CommandErrorKind::NoFullReplica);
+    host.stop().unwrap();
+}
+
+/// A revoke goes through the engine's guarded membership path: with no coordination identity it
+/// is refused with that path's typed code and changes nothing.
+#[test]
+fn revoking_a_member_without_an_identity_is_refused_with_the_membership_code() {
+    let _serial = serialized();
+    let (host, _area) = running_host();
+    let result = host.execute(
+        Command::RevokeMember { group_id: "g".into(), device_id: "d".into(), force: false },
+        &within(30),
+    );
+    let Err(CallError::Failed(error)) = result else { panic!("should be refused: {result:?}") };
+    assert_eq!(
+        error.kind(),
+        CommandErrorKind::Refused(ApplicationErrorCode::LocalIdentityUnavailable)
+    );
     host.stop().unwrap();
 }

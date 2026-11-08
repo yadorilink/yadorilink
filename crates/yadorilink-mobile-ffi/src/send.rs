@@ -31,7 +31,10 @@ use yadorilink_embedded_host::dto;
 use crate::{CallFailure, CancelHandle, MobileHost};
 
 fn unexpected(command: &str, output: &host::CommandOutput) -> CallFailure {
-    CallFailure::Failed { message: format!("{command} returned {output:?}") }
+    CallFailure::Failed {
+        reason: crate::FailureReason::Unspecified,
+        message: format!("{command} returned {output:?}"),
+    }
 }
 
 /// How long a Send link stays redeemable.
@@ -54,12 +57,23 @@ impl From<SendLinkTtl> for dto::SendLinkTtl {
 
 /// A Send link just created. The code is shown once: the service keeps only its hash, and the
 /// engine does not keep it either.
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
 pub struct SendLink {
     pub link_id: String,
     /// What the sender hands to the recipient, on any account.
     pub code: String,
     pub expires_at: Option<SystemTime>,
+}
+
+impl std::fmt::Debug for SendLink {
+    /// Names no part of the code: it unlocks the link's file list.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendLink")
+            .field("link_id", &self.link_id)
+            .field("code", &"..")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 impl From<dto::SendLink> for SendLink {
@@ -145,6 +159,9 @@ pub struct SendLinkStatus {
     /// The transfer under this link, once a send started one; match it against
     /// `list_sent_transfers` for progress.
     pub transfer_id: Option<String>,
+    /// Why an `Interrupted` link stopped, when the engine has it on record: `SenderCanceled` is
+    /// this device's own stop.
+    pub failure: Option<TransferFailure>,
 }
 
 impl From<dto::SendLinkStatus> for SendLinkStatus {
@@ -154,6 +171,7 @@ impl From<dto::SendLinkStatus> for SendLinkStatus {
             state: status.state.into(),
             receiver_device_name: status.receiver_device_name,
             transfer_id: status.transfer_id,
+            failure: status.failure.map(Into::into),
         }
     }
 }
@@ -306,6 +324,10 @@ pub struct IncomingTransfer {
     pub link_id: Option<String>,
     /// Bytes written so far while in progress; `total_size` once completed; 0 otherwise.
     pub received_bytes: u64,
+    /// Files fully received so far while in progress; `files_total` once completed; 0 otherwise.
+    pub files_done: u32,
+    /// How many files the offer holds.
+    pub files_total: u32,
     /// The folder the files are received into, once a receive chose one.
     pub destination_dir: Option<String>,
 }
@@ -323,6 +345,8 @@ impl From<dto::IncomingTransfer> for IncomingTransfer {
             can_retry: transfer.can_retry,
             link_id: transfer.link_id,
             received_bytes: transfer.received_bytes,
+            files_done: transfer.files_done,
+            files_total: transfer.files_total,
             destination_dir: transfer.destination_dir,
         }
     }
@@ -367,6 +391,9 @@ pub struct OutgoingTransfer {
     pub created_at: Option<SystemTime>,
     pub status: OutgoingTransferStatus,
     pub failure: Option<TransferFailure>,
+    /// Bytes of the offer the receiver has been served so far while `Accepted` (live: it starts
+    /// again from nothing when the engine restarts); `total_size` once `Completed`; 0 otherwise.
+    pub bytes_sent: u64,
 }
 
 impl From<dto::OutgoingTransfer> for OutgoingTransfer {
@@ -379,6 +406,7 @@ impl From<dto::OutgoingTransfer> for OutgoingTransfer {
             created_at: transfer.created_at,
             status: transfer.status.into(),
             failure: transfer.failure.map(Into::into),
+            bytes_sent: transfer.bytes_sent,
         }
     }
 }
@@ -436,7 +464,7 @@ impl MobileHost {
         cancel: &CancelHandle,
         deadline_ms: Option<u64>,
     ) -> Result<SendLinkPreview, CallFailure> {
-        match self.run(host::Command::PreviewSendLink { code }, cancel, deadline_ms)? {
+        match self.run(host::Command::PreviewSendLink { code: code.into() }, cancel, deadline_ms)? {
             host::CommandOutput::SendLinkPreview(preview) => Ok(preview.into()),
             other => Err(unexpected("preview_send_link", &other)),
         }
@@ -457,8 +485,11 @@ impl MobileHost {
         cancel: &CancelHandle,
         deadline_ms: Option<u64>,
     ) -> Result<String, CallFailure> {
-        let command =
-            host::Command::RedeemSendLink { code, device_id: None, destination_dir: receive_dir };
+        let command = host::Command::RedeemSendLink {
+            code: code.into(),
+            device_id: None,
+            destination_dir: receive_dir,
+        };
         match self.run(command, cancel, deadline_ms)? {
             host::CommandOutput::SendLinkRedeemed(link_id) => Ok(link_id),
             other => Err(unexpected("redeem_send_link", &other)),
@@ -604,6 +635,42 @@ impl MobileHost {
         match self.run(host::Command::CancelTransfer { transfer_id }, cancel, deadline_ms)? {
             host::CommandOutput::Done => Ok(()),
             other => Err(unexpected("cancel_transfer", &other)),
+        }
+    }
+
+    /// Resumes a failed or cancelled received transfer after the engine re-validates it. A
+    /// transfer this device sent is refused.
+    ///
+    /// # Errors
+    /// `Failed` for an unknown transfer, one on the other side, or one that cannot be resumed;
+    /// the other [`CallFailure`] cases.
+    pub fn retry_transfer(
+        &self,
+        transfer_id: String,
+        cancel: &CancelHandle,
+        deadline_ms: Option<u64>,
+    ) -> Result<ReceivedTransfer, CallFailure> {
+        match self.run(host::Command::RetryTransfer { transfer_id }, cancel, deadline_ms)? {
+            host::CommandOutput::Received(received) => Ok(received.into()),
+            other => Err(unexpected("retry_transfer", &other)),
+        }
+    }
+
+    /// Offers a sent transfer again once the engine has checked the files are unchanged and
+    /// obtained a new authorization for the same device. A transfer whose files changed has to be
+    /// sent again.
+    ///
+    /// # Errors
+    /// As `retry_transfer`.
+    pub fn retry_sent_transfer(
+        &self,
+        transfer_id: String,
+        cancel: &CancelHandle,
+        deadline_ms: Option<u64>,
+    ) -> Result<OfferedTransfer, CallFailure> {
+        match self.run(host::Command::RetrySentTransfer { transfer_id }, cancel, deadline_ms)? {
+            host::CommandOutput::SendOffered(sent) => Ok(sent.into()),
+            other => Err(unexpected("retry_sent_transfer", &other)),
         }
     }
 }

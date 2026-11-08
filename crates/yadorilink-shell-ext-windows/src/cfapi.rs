@@ -46,7 +46,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use windows::core::{Result as WinResult, GUID, PCWSTR};
+use windows::core::{Interface, Result as WinResult, GUID, HSTRING, PCWSTR};
+use windows::Storage::Provider::{
+    StorageProviderHardlinkPolicy, StorageProviderHydrationPolicy,
+    StorageProviderHydrationPolicyModifier, StorageProviderInSyncPolicy,
+    StorageProviderPopulationPolicy, StorageProviderProtectionMode, StorageProviderSyncRootInfo,
+    StorageProviderSyncRootManager,
+};
+use windows::Storage::Streams::DataWriter;
+use windows::Storage::{IStorageFolder, StorageFolder};
 use windows::Win32::Foundation::{
     NTSTATUS, STATUS_CLOUD_FILE_INSUFFICIENT_RESOURCES, STATUS_CLOUD_FILE_NETWORK_UNAVAILABLE,
     STATUS_CLOUD_FILE_NOT_IN_SYNC, STATUS_CLOUD_FILE_REQUEST_CANCELED, STATUS_SUCCESS,
@@ -54,19 +62,14 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Storage::CloudFilters::{
     CfConnectSyncRoot, CfCreatePlaceholders, CfDisconnectSyncRoot, CfExecute,
-    CfGetSyncRootInfoByPath, CfRegisterSyncRoot, CfReportProviderProgress, CfUnregisterSyncRoot,
-    CF_CALLBACK_INFO, CF_CALLBACK_PARAMETERS, CF_CALLBACK_REGISTRATION,
-    CF_CALLBACK_TYPE_CANCEL_FETCH_DATA, CF_CALLBACK_TYPE_FETCH_DATA, CF_CALLBACK_TYPE_NONE,
-    CF_CONNECT_FLAG_NONE, CF_CREATE_FLAG_NONE, CF_HARDLINK_POLICY_NONE, CF_HYDRATION_POLICY,
-    CF_HYDRATION_POLICY_FULL, CF_HYDRATION_POLICY_MODIFIER_NONE, CF_INSYNC_POLICY_TRACK_ALL,
-    CF_OPERATION_INFO, CF_OPERATION_PARAMETERS, CF_OPERATION_PARAMETERS_0,
+    CfGetSyncRootInfoByPath, CfReportProviderProgress, CfUnregisterSyncRoot, CF_CALLBACK_INFO,
+    CF_CALLBACK_PARAMETERS, CF_CALLBACK_REGISTRATION, CF_CALLBACK_TYPE_CANCEL_FETCH_DATA,
+    CF_CALLBACK_TYPE_FETCH_DATA, CF_CALLBACK_TYPE_NONE, CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO,
+    CF_CREATE_FLAG_NONE, CF_OPERATION_INFO, CF_OPERATION_PARAMETERS, CF_OPERATION_PARAMETERS_0,
     CF_OPERATION_PARAMETERS_0_6, CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
     CF_OPERATION_TYPE_TRANSFER_DATA, CF_PLACEHOLDER_CREATE_FLAG_DISABLE_ON_DEMAND_POPULATION,
     CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC, CF_PLACEHOLDER_CREATE_INFO,
-    CF_PLACEHOLDER_MANAGEMENT_POLICY_DEFAULT, CF_POPULATION_POLICY,
-    CF_POPULATION_POLICY_ALWAYS_FULL, CF_POPULATION_POLICY_MODIFIER_NONE,
-    CF_POPULATION_POLICY_PARTIAL, CF_REGISTER_FLAG_NONE, CF_REGISTER_FLAG_UPDATE, CF_SYNC_POLICIES,
-    CF_SYNC_REGISTRATION, CF_SYNC_ROOT_INFO_STANDARD, CF_SYNC_ROOT_STANDARD_INFO,
+    CF_SYNC_ROOT_INFO_STANDARD, CF_SYNC_ROOT_STANDARD_INFO,
 };
 use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO,
@@ -79,10 +82,11 @@ use crate::windowed_fetch;
 
 /// Fixed provider identity. Namespace-derived, like the
 /// overlay CLSIDs in `overlay.rs` — a real release would hand-pick and
-/// never regenerate this, since `CfRegisterSyncRoot` ties a sync root's
-/// registration to this GUID.
+/// never regenerate this, since the sync root registration is tied to this GUID.
 const PROVIDER_ID: GUID = GUID::from_u128(0x8f3a1c00_1e6b_4b7a_9d2e_1a2b3c4d5e20);
-const PROVIDER_NAME: &str = "yadorilink";
+/// The provider part of a sync root Id (`<provider>!<user SID>!<root>`). The operating system
+/// reports it back as the registration's provider name, and `registered_root_identity` checks it.
+const PROVIDER_NAME: &str = "YadoriLink";
 const PROVIDER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn wide(s: &str) -> Vec<u16> {
@@ -147,102 +151,145 @@ fn unix_nanos_to_filetime_ticks(unix_nanos: i64) -> i64 {
     unix_nanos / 100 + UNIX_EPOCH_IN_FILETIME_TICKS
 }
 
-/// Diagnostics only (debug builds): `YADORILINK_CFAPI_HYDRATION_POLICY=partial|progressive` selects
-/// another hydration policy for an experiment; release builds and the default are always `FULL`.
-fn experiment_hydration_policy(
-) -> windows::Win32::Storage::CloudFilters::CF_HYDRATION_POLICY_PRIMARY {
-    use windows::Win32::Storage::CloudFilters::{
-        CF_HYDRATION_POLICY_PARTIAL, CF_HYDRATION_POLICY_PROGRESSIVE,
-    };
-    if cfg!(debug_assertions) {
-        match std::env::var("YADORILINK_CFAPI_HYDRATION_POLICY").as_deref() {
-            Ok("partial") => return CF_HYDRATION_POLICY_PARTIAL,
-            Ok("progressive") => return CF_HYDRATION_POLICY_PROGRESSIVE,
-            _ => {}
-        }
-    }
-    CF_HYDRATION_POLICY_FULL
-}
-
-/// Registers `local_path` as a Cloud Filter API sync root and
-/// connects it, wiring up the `CF_CALLBACK_TYPE_FETCH_DATA` handler.
-/// Idempotent-ish: `CfRegisterSyncRoot` itself tolerates
-/// re-registering the same root (it's meant to be called on every
-/// provider startup, not just the first time — this is the documented
-/// pattern, not a workaround).
-///
-/// Hydration policy is `FULL` (whole-file only — no partial/byte-range
-/// hydration in this MVP) and population policy is `PARTIAL` (the
-/// provider, not the OS, controls
-/// which files are placeholders vs. fully present, which is exactly the
-/// OnDemand model).
+/// Registers a sync root for `local_path` and connects it, wiring up the
+/// `CF_CALLBACK_TYPE_FETCH_DATA` handler. The root's identity is derived from the path: for
+/// tests and probes, which need a connected sync root but no declared root.
 pub fn register_and_connect(local_path: &Path) -> WinResult<()> {
-    register_and_connect_root(local_path, None)
+    use std::hash::{Hash, Hasher};
+    let mut identity = Vec::with_capacity(16);
+    for salt in [0u8, 1] {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (salt, local_path).hash(&mut hasher);
+        identity.extend_from_slice(&hasher.finish().to_le_bytes());
+    }
+    register_and_connect_provider(&identity, local_path)
 }
 
 /// Registers and connects the sync root of a provider root. The root id is stored in the
-/// registration as the sync root identity, so the registration itself says which declared root it
-/// serves.
+/// registration as the sync root identity (the WinRT `Context`), so the registration itself says
+/// which declared root it serves.
+///
+/// The registration is `StorageProviderSyncRootManager::Register` and nothing else: it writes the
+/// shell's `SyncRootManager` entry (cloud icons, Status column, the Windows "Always keep on this
+/// device" / "Free up space" verbs, the navigation-pane node) and the cloud registration in one
+/// step, and, because this process is packaged and the package declares `windows.cloudFiles`, the
+/// operating system removes all of it when the user uninstalls the package. Calling
+/// `CfRegisterSyncRoot` as well would produce a second, unrelated registration (lab: `0x80070490`).
+///
+/// Registered again at every host start, on the same Id: that refreshes what depends on the
+/// installed version (the icon path inside the package's folder, the version). It cannot be done
+/// while a provider is connected (`0x8007018B`), so a second host instance fails here instead of
+/// disturbing the first one.
+/// Hydration is `FULL` (whole files only) and population is `AlwaysFull`: the host itself
+/// populates every folder, so the operating system never waits for a population callback (WinRT
+/// has no partial population policy).
 pub fn register_and_connect_provider(root_id: &[u8], local_path: &Path) -> WinResult<()> {
-    register_and_connect_root(local_path, Some(root_id))
+    ensure_winrt();
+    let id = sync_root_id(root_id)?;
+    let folder = storage_folder(local_path)?;
+    let info = StorageProviderSyncRootInfo::new()?;
+    info.SetId(&id)?;
+    info.SetPath(&folder)?;
+    info.SetDisplayNameResource(&HSTRING::from(display_name(local_path)))?;
+    info.SetIconResource(&HSTRING::from(icon_resource()))?;
+    info.SetHydrationPolicy(StorageProviderHydrationPolicy::Full)?;
+    info.SetHydrationPolicyModifier(StorageProviderHydrationPolicyModifier::None)?;
+    info.SetPopulationPolicy(StorageProviderPopulationPolicy::AlwaysFull)?;
+    info.SetInSyncPolicy(IN_SYNC_TRACK_ALL)?;
+    info.SetHardlinkPolicy(StorageProviderHardlinkPolicy::None)?;
+    info.SetProtectionMode(StorageProviderProtectionMode::Personal)?;
+    info.SetShowSiblingsAsGroup(false)?;
+    info.SetAllowPinning(true)?;
+    info.SetVersion(&HSTRING::from(PROVIDER_VERSION))?;
+    info.SetProviderId(PROVIDER_ID)?;
+    let writer = DataWriter::new()?;
+    writer.WriteBytes(root_id)?;
+    info.SetContext(&writer.DetachBuffer()?)?;
+    StorageProviderSyncRootManager::Register(&info)?;
+    connect(local_path, Some(root_id))
 }
 
-fn register_and_connect_root(local_path: &Path, provider_root: Option<&[u8]>) -> WinResult<()> {
-    let path_wide = wide(&local_path.to_string_lossy());
-    let provider_name_wide = wide(PROVIDER_NAME);
-    let provider_version_wide = wide(PROVIDER_VERSION);
+/// The in-sync policy of every attribute and timestamp the engine tracks (the equivalent of the
+/// Win32 `CF_INSYNC_POLICY_TRACK_ALL`).
+const IN_SYNC_TRACK_ALL: StorageProviderInSyncPolicy = StorageProviderInSyncPolicy(
+    StorageProviderInSyncPolicy::FileCreationTime.0
+        | StorageProviderInSyncPolicy::FileReadOnlyAttribute.0
+        | StorageProviderInSyncPolicy::FileHiddenAttribute.0
+        | StorageProviderInSyncPolicy::FileSystemAttribute.0
+        | StorageProviderInSyncPolicy::FileLastWriteTime.0
+        | StorageProviderInSyncPolicy::DirectoryCreationTime.0
+        | StorageProviderInSyncPolicy::DirectoryReadOnlyAttribute.0
+        | StorageProviderInSyncPolicy::DirectoryHiddenAttribute.0
+        | StorageProviderInSyncPolicy::DirectorySystemAttribute.0
+        | StorageProviderInSyncPolicy::DirectoryLastWriteTime.0,
+);
 
-    let registration = CF_SYNC_REGISTRATION {
-        StructSize: std::mem::size_of::<CF_SYNC_REGISTRATION>() as u32,
-        ProviderName: PCWSTR::from_raw(provider_name_wide.as_ptr()),
-        ProviderVersion: PCWSTR::from_raw(provider_version_wide.as_ptr()),
-        SyncRootIdentity: provider_root.map_or(std::ptr::null(), |id| id.as_ptr().cast()),
-        SyncRootIdentityLength: provider_root.map_or(0, |id| id.len() as u32),
-        FileIdentity: std::ptr::null(),
-        FileIdentityLength: 0,
-        ProviderId: PROVIDER_ID,
-    };
+/// WinRT needs the thread in an apartment; the host has none of its own. An apartment that is
+/// already there (any kind) is fine.
+fn ensure_winrt() {
+    use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
+    let _ = unsafe { RoInitialize(RO_INIT_MULTITHREADED) };
+}
 
-    let policies = CF_SYNC_POLICIES {
-        StructSize: std::mem::size_of::<CF_SYNC_POLICIES>() as u32,
-        Hydration: CF_HYDRATION_POLICY {
-            Primary: experiment_hydration_policy(),
-            Modifier: CF_HYDRATION_POLICY_MODIFIER_NONE,
-        },
-        Population: CF_POPULATION_POLICY {
-            // A provider root is populated by the host itself (every folder is created fully
-            // populated), so the operating system never waits for a population callback.
-            Primary: if provider_root.is_some() {
-                CF_POPULATION_POLICY_ALWAYS_FULL
-            } else {
-                CF_POPULATION_POLICY_PARTIAL
-            },
-            Modifier: CF_POPULATION_POLICY_MODIFIER_NONE,
-        },
-        InSync: CF_INSYNC_POLICY_TRACK_ALL,
-        HardLink: CF_HARDLINK_POLICY_NONE,
-        PlaceholderManagement: CF_PLACEHOLDER_MANAGEMENT_POLICY_DEFAULT,
-    };
+fn storage_folder(path: &Path) -> WinResult<IStorageFolder> {
+    // `GetFolderFromPathAsync` takes an absolute path in the plain spelling.
+    StorageFolder::GetFolderFromPathAsync(&HSTRING::from(path.as_os_str()))?.get()?.cast()
+}
 
-    // A root registered by an earlier run of this host (or by the previous version of the
-    // registration) is updated in place; a new one is registered.
+/// `YadoriLink!<user SID>!<root id as hex>`: one registration per declared root.
+fn sync_root_id(root_id: &[u8]) -> WinResult<HSTRING> {
+    let hex: String = root_id.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(HSTRING::from(format!("{PROVIDER_NAME}!{}!{hex}", current_user_sid()?)))
+}
+
+fn current_user_sid() -> WinResult<String> {
+    use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     unsafe {
-        if CfRegisterSyncRoot(
-            PCWSTR::from_raw(path_wide.as_ptr()),
-            &registration,
-            &policies,
-            CF_REGISTER_FLAG_UPDATE,
-        )
-        .is_err()
-        {
-            CfRegisterSyncRoot(
-                PCWSTR::from_raw(path_wide.as_ptr()),
-                &registration,
-                &policies,
-                CF_REGISTER_FLAG_NONE,
-            )?;
-        }
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)?;
+        let mut needed = 0u32;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
+        let mut buffer = vec![0u64; (needed as usize).div_ceil(8).max(1)];
+        let read = GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            needed,
+            &mut needed,
+        );
+        let _ = CloseHandle(token);
+        read?;
+        let user = &*buffer.as_ptr().cast::<TOKEN_USER>();
+        let mut text = windows::core::PWSTR::null();
+        ConvertSidToStringSidW(user.User.Sid, &mut text)?;
+        let sid = text.to_string();
+        let _ = LocalFree(HLOCAL(text.0.cast()));
+        sid.map_err(|_| windows::core::Error::from(windows::Win32::Foundation::E_FAIL))
     }
+}
+
+/// What Explorer shows for the root: the folder's name under the product's.
+fn display_name(path: &Path) -> String {
+    match path.file_name().and_then(|n| n.to_str()) {
+        Some(name) => format!("YadoriLink {name}"),
+        None => "YadoriLink".to_string(),
+    }
+}
+
+/// The icon Explorer shows for the root: `yadorilink.ico` next to the host executable (the
+/// package puts it there).
+fn icon_resource() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("yadorilink.ico")))
+        .map_or_else(String::new, |icon| format!("{},0", icon.display()))
+}
+
+fn connect(local_path: &Path, provider_root: Option<&[u8]>) -> WinResult<()> {
+    let path_wide = wide(&local_path.to_string_lossy());
 
     // Sentinel-terminated array: a `CF_CALLBACK_TYPE_NONE` entry marks the
     // end, per the documented `CfConnectSyncRoot` contract.
@@ -263,7 +310,9 @@ fn register_and_connect_root(local_path: &Path, provider_root: Option<&[u8]>) ->
             PCWSTR::from_raw(path_wide.as_ptr()),
             callbacks.as_ptr(),
             None,
-            CF_CONNECT_FLAG_NONE,
+            // Without REQUIRE_PROCESS_INFO `CF_CALLBACK_INFO.ProcessInfo` is never filled and the
+            // fetch trace would always print pid 0.
+            CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO,
         )?
     };
     register_root(key.0, local_path, provider_root.map(<[u8]>::to_vec));
@@ -280,20 +329,27 @@ pub fn disconnect(local_path: &Path) -> WinResult<()> {
     unsafe { CfDisconnectSyncRoot(windows::Win32::Storage::CloudFilters::CF_CONNECTION_KEY(key)) }
 }
 
-/// Unregisters a sync root (the uninstall path).
+/// Unregisters a sync root: the person removed the folder from this PC, or a test cleans up.
+/// Never on exit and never because files are missing: unregistering deletes the root's online-only
+/// placeholders (the operating system does that too when the package is uninstalled; the host
+/// reads a registration it lost as a lost registration, not as deleted files).
 ///
-/// `CfUnregisterSyncRoot` is documented to fail with
-/// `ERROR_CLOUD_FILE_INVALID_REQUEST` if a sync provider is still
-/// connected to the root (confirmed against real cfapi on a Windows 11
-/// VM) — this disconnects first if *this process* holds a connection for
-/// `local_path`. It does NOT reach into another process's connection:
-/// the real long-lived `yadorilink-cfapi-host` process holds the actual
-/// production connection, so callers driving the uninstall flow (like
-/// `install.ps1`) must stop that process/its Scheduled Task before
-/// calling this, not after — a connection is tied to process lifetime,
-/// so stopping the process itself also tears down its connection.
+/// A root this host registered is unregistered through the same WinRT manager that registered it,
+/// which removes the shell's entry as well. A path the manager does not know is a plain Cloud
+/// Files root (or none): `CfUnregisterSyncRoot` answers for it.
+///
+/// Both refuse while a provider is connected (`ERROR_CLOUD_FILE_INVALID_REQUEST`): this
+/// disconnects this process's own connection first. It does NOT reach into another process's
+/// connection: the real long-lived `yadorilink-cfapi-host` holds the production connection, so
+/// callers driving removal from another process must stop the host first.
 pub fn unregister(local_path: &Path) -> WinResult<()> {
     let _ = disconnect(local_path);
+    ensure_winrt();
+    if let Ok(folder) = storage_folder(local_path) {
+        if let Ok(info) = StorageProviderSyncRootManager::GetSyncRootInformationForFolder(&folder) {
+            return StorageProviderSyncRootManager::Unregister(&info.Id()?);
+        }
+    }
     let path_wide = wide(&local_path.to_string_lossy());
     unsafe { CfUnregisterSyncRoot(PCWSTR::from_raw(path_wide.as_ptr())) }
 }
@@ -549,16 +605,16 @@ pub fn create_item_placeholder(
     let stage = stage_name();
     let (from, to) = (parent_dir.join(&stage), parent_dir.join(name));
     ledger.record(&from).map_err(|error| format!("recording the Stage placeholder: {error}"))?;
-    stage_failpoint(StageStep::Recorded)?;
+    stage_failpoint(StageFailpoint::Recorded)?;
     create_item_placeholder_at(parent_dir, &stage, item_id, size, mtime_unix_nanos, directory)
         .map_err(|error| format!("CfCreatePlaceholders: {error}"))?;
-    stage_failpoint(StageStep::Created)?;
+    stage_failpoint(StageFailpoint::Created)?;
     if let Err(error) = move_durably(&from, &to, Replace::No) {
         // Best effort, non-recursive; the record stays for the recovery either way.
         let _ = if directory { std::fs::remove_dir(&from) } else { std::fs::remove_file(&from) };
         return Err(format!("publishing the placeholder as {name:?}: {error}"));
     }
-    stage_failpoint(StageStep::Moved)?;
+    stage_failpoint(StageFailpoint::Moved)?;
     // The Stage name is gone by the durable move.
     ledger.release(&from);
     // The move cleared the in-sync bit (E8). The name is the user's to use by now, so a failure to
@@ -571,7 +627,7 @@ pub fn create_item_placeholder(
 /// A step of [`create_item_placeholder`] after which a test stops it as a killed process would.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) enum StageStep {
+pub(crate) enum StageFailpoint {
     Recorded,
     Created,
     Moved,
@@ -579,19 +635,19 @@ pub(crate) enum StageStep {
 
 #[cfg(test)]
 thread_local! {
-    pub(crate) static STAGE_FAILPOINT: std::cell::Cell<Option<StageStep>> =
+    pub(crate) static STAGE_FAILPOINT: std::cell::Cell<Option<StageFailpoint>> =
         const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
-fn stage_failpoint(point: StageStep) -> Result<(), String> {
+fn stage_failpoint(point: StageFailpoint) -> Result<(), String> {
     if STAGE_FAILPOINT.with(|armed| armed.get()) == Some(point) {
         return Err(format!("killed at {point:?}"));
     }
     Ok(())
 }
 #[cfg(not(test))]
-fn stage_failpoint(_: StageStep) -> Result<(), String> {
+fn stage_failpoint(_: StageFailpoint) -> Result<(), String> {
     Ok(())
 }
 
@@ -1532,8 +1588,13 @@ mod tests {
         let verbatim = yadorilink_fs_platform::long_path::for_win32(&long);
         assert!(verbatim.to_string_lossy().starts_with(r"\\?\"), "not past MAX_PATH");
         std::fs::create_dir_all(&verbatim).unwrap();
+        // The root is registered by its plain spelling (as the host does): the WinRT registration
+        // takes a path past MAX_PATH that way, and refuses the `\\?\` spelling (`0x800700CE`),
+        // registering nothing.
+        let refused = super::register_and_connect(&verbatim).expect_err("the verbatim spelling");
+        assert_eq!(refused.code(), windows::core::HRESULT(0x8007_00CE_u32 as i32));
+        super::register_and_connect(&long).expect("register and connect");
         for path in [&long, &verbatim] {
-            super::register_and_connect(path).expect("register and connect");
             super::create_item_placeholder_at(path, "x.txt", b"i", 1, 0, false)
                 .expect("create in the directory");
             super::create_item_placeholder(
@@ -1549,9 +1610,67 @@ mod tests {
             for name in ["x.txt", "y.txt"] {
                 std::fs::remove_file(verbatim.join(name)).unwrap();
             }
-            super::unregister(path).expect("unregister");
         }
+        super::unregister(&long).expect("unregister");
         let _ = std::fs::remove_dir_all(yadorilink_fs_platform::long_path::for_win32(&base));
+    }
+
+    /// The machine-wide shell registration of the root of `id` (what makes Explorer show the cloud
+    /// icons and what the operating system removes when the package is uninstalled).
+    fn shell_registration_exists(id: &str) -> bool {
+        std::process::Command::new("reg")
+            .args([
+                "query",
+                &format!(
+                    r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager\{id}"
+                ),
+            ])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    /// The registration is the WinRT one and only that: the shell's entry exists under the Id
+    /// `YadoriLink!<SID>!<root id>`, the identity reads back, a second registration of the same
+    /// root (a host restart, after the connection ended) changes nothing, and unregistering removes
+    /// the registration (the shell's entry too, for a packaged caller).
+    #[test]
+    #[ignore = "real Cloud Files state; run on a Windows machine"]
+    fn a_provider_root_is_registered_through_the_shell_manager_and_removed_with_it() {
+        let dir = std::env::temp_dir().join(format!("yl-winrt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root_id = [0x7c_u8; 16];
+        let id = super::sync_root_id(&root_id).unwrap().to_string();
+        assert!(id.starts_with("YadoriLink!S-1-5-"), "unexpected id {id}");
+
+        super::register_and_connect_provider(&root_id, &dir).expect("register and connect");
+        assert!(shell_registration_exists(&id), "no SyncRootManager entry for {id}");
+        assert_eq!(super::registered_root_identity(&dir), Ok(Some(root_id.to_vec())));
+
+        // A host restart: the connection ends, the same root is registered and connected again.
+        super::disconnect(&dir).unwrap();
+        super::register_and_connect_provider(&root_id, &dir).expect("register again");
+        assert!(shell_registration_exists(&id));
+        assert_eq!(super::registered_root_identity(&dir), Ok(Some(root_id.to_vec())));
+
+        super::unregister(&dir).expect("unregister");
+        assert_eq!(super::registered_root_identity(&dir), Ok(None));
+        // The machine-wide key is removed by a packaged caller (checked on a device, with the
+        // package); an unpackaged test process leaves it, so the test removes it if it may.
+        println!(
+            "SyncRootManager entry after unregister (unpackaged): {}",
+            shell_registration_exists(&id)
+        );
+        let _ = std::process::Command::new("reg")
+            .args([
+                "delete",
+                &format!(
+                    r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager\{id}"
+                ),
+                "/f",
+            ])
+            .output();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Manual diagnostic only (matches `registration.rs`'s

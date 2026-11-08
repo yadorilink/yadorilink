@@ -123,6 +123,8 @@ async fn async_main(arena_cap: yadorilink_daemon::malloc_arenas::ArenaCap) -> an
     if std::env::args().skip(1).any(|arg| arg == yadorilink_daemon::exe_replaced::SUPERVISED_ARG) {
         yadorilink_daemon::exe_replaced::arm();
     }
+    // The standalone daemon stops itself when its data volume goes away (an embedded host never does).
+    yadorilink_daemon::data_volume_watch::arm();
     yadorilink_daemon::malloc_arenas::log(arena_cap);
     yadorilink_daemon::fd_limit::raise_nofile_soft_limit();
     let result = match yadorilink_daemon::app::DaemonConfig::from_env() {
@@ -137,6 +139,10 @@ async fn async_main(arena_cap: yadorilink_daemon::malloc_arenas::ArenaCap) -> an
         // The returned error goes to stderr only; the log file is where the
         // service manager's users look.
         tracing::error!(error = %error, "the daemon exited with an error");
+        if error.downcast_ref::<yadorilink_daemon::app::InstanceLockHeld>().is_some() {
+            eprintln!("{error}");
+            std::process::exit(yadorilink_daemon::app::LOCK_HELD_EXIT_CODE);
+        }
         if error.downcast_ref::<yadorilink_daemon::identity::OwnershipRefused>().is_some() {
             // Another owner manages this data area. A service manager that restarts a failed
             // daemon would start this one again at once, forever; waiting before exiting (the

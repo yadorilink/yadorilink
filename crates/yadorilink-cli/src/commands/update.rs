@@ -58,7 +58,10 @@ fn print_status(status: &UpdateStatusResponse) {
         if status.mandatory {
             println!("mandatory: yes (security/compatibility update)");
         }
-        if !status.holdback_reason.is_empty() {
+        if status.state == "state_incompatible" {
+            println!("cannot update this device's data: {}", status.holdback_reason);
+            println!("{STATE_INCOMPATIBLE_HELP}");
+        } else if !status.holdback_reason.is_empty() {
             println!("held back: {}", status.holdback_reason);
         }
         println!("download the new version: run `yadorilink update download`");
@@ -78,6 +81,12 @@ fn print_status(status: &UpdateStatusResponse) {
 }
 
 /// `yadorilink update status` (spec "Show update status").
+/// What to do when the new version cannot read this device's data. Pre-1.0 data formats are not
+/// migrated: the data is removed and the device set up again; synced files are not deleted.
+const STATE_INCOMPATIBLE_HELP: &str = "The new version does not read data written by this one. \
+To update, remove YadoriLink's local data on this device and set it up again after installing \
+(your synced files are not deleted). See \"Before you update\" in the release notes.";
+
 pub async fn status() -> Result<(), CliError> {
     let status = updates::update_status().await?;
     print_status(&status);
@@ -166,53 +175,38 @@ pub async fn config(checks: Option<String>) -> Result<(), CliError> {
 const SELF_UPDATE_SOURCE: &str = "script";
 
 /// The installer prefix of the running binary. `install.sh` keeps each version under
-/// `<prefix>/share/yadorilink/<version dir>/`; `install.ps1` under `<prefix>\\versions\\<version>\\`.
-pub(crate) fn prefix_from_exe(exe: &std::path::Path, windows: bool) -> Option<std::path::PathBuf> {
+/// `<prefix>/share/yadorilink/<version dir>/`.
+pub(crate) fn prefix_from_exe(exe: &std::path::Path) -> Option<std::path::PathBuf> {
     let parts: Vec<_> = exe.components().collect();
-    let at = if windows {
-        parts.iter().rposition(|c| c.as_os_str() == "versions")?
-    } else {
-        parts
-            .windows(2)
-            .rposition(|w| w[0].as_os_str() == "share" && w[1].as_os_str() == "yadorilink")?
-    };
+    let at = parts
+        .windows(2)
+        .rposition(|w| w[0].as_os_str() == "share" && w[1].as_os_str() == "yadorilink")?;
     let prefix: std::path::PathBuf = parts[..at].iter().collect();
     (!prefix.as_os_str().is_empty()).then_some(prefix)
 }
 
-/// Single-quotes `text` for a POSIX shell, or for PowerShell (both double an embedded quote
-/// differently).
-fn shell_quote(text: &str, powershell: bool) -> String {
-    if powershell {
-        format!("'{}'", text.replace('\'', "''"))
-    } else {
-        format!("'{}'", text.replace('\'', "'\\''"))
-    }
+/// The installer prefix of the running binary, through links.
+fn installed_prefix(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let real = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_owned());
+    prefix_from_exe(&real)
+}
+
+/// Single-quotes `text` for a POSIX shell.
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 /// The command that installs `version` with the installer's own full verification (signed
 /// manifest, hashes, replay and withdrawal checks, atomic switch), into the same prefix as the
 /// running install. `self-update` prints it rather than running a downloaded script itself.
-fn installer_command(
-    version: &str,
-    channel: &str,
-    prefix: Option<&std::path::Path>,
-    powershell: bool,
-) -> String {
-    let prefix = prefix.and_then(|p| p.to_str());
-    if powershell {
-        let prefix =
-            prefix.map(|p| format!(" -Prefix {}", shell_quote(p, true))).unwrap_or_default();
-        format!(
-            "& ([scriptblock]::Create((irm https://yadori.link/install.ps1))) -Channel {channel} -Version {version}{prefix}"
-        )
-    } else {
-        let prefix =
-            prefix.map(|p| format!(" --prefix {}", shell_quote(p, false))).unwrap_or_default();
-        format!(
-            "curl -fsSL https://yadori.link/install.sh | sh -s -- --channel {channel} --version {version}{prefix}"
-        )
-    }
+fn installer_command(version: &str, channel: &str, prefix: Option<&std::path::Path>) -> String {
+    let prefix = prefix
+        .and_then(|p| p.to_str())
+        .map(|p| format!(" --prefix {}", shell_quote(p)))
+        .unwrap_or_default();
+    format!(
+        "curl -fsSL https://yadori.link/install.sh | sh -s -- --channel {channel} --version {version}{prefix}"
+    )
 }
 
 /// Only plain release-version and channel text may reach the printed command line.
@@ -301,6 +295,14 @@ fn refuse_if_check_failed(status: &UpdateStatusResponse) -> Result<(), CliError>
 /// against the daemon's live verified channel manifest (fail closed) and, if allowed, prints the
 /// pinned installer command that does the verified download and atomic switch.
 pub async fn self_update(requested: Option<String>, rollback: bool) -> Result<(), CliError> {
+    // Windows has no script install: the Microsoft Store updates YadoriLink.
+    if cfg!(windows) {
+        return Err(CliError::Other(
+            "on Windows, YadoriLink is updated by the Microsoft Store; there is no script install \
+             to update with this command"
+                .into(),
+        ));
+    }
     let exe = std::env::current_exe().unwrap_or_default();
     let record = match yadorilink_client_core::coordination::device_config::config_dir() {
         Ok(config_dir) => ownership::read(&config_dir),
@@ -350,29 +352,22 @@ pub async fn self_update(requested: Option<String>, rollback: bool) -> Result<()
         println!("already up to date (version {})", status.current_version);
         return Ok(());
     }
-    let prefix = std::env::current_exe().ok().and_then(|exe| {
-        prefix_from_exe(&std::fs::canonicalize(&exe).unwrap_or(exe), cfg!(windows))
-    });
+    let prefix = std::env::current_exe().ok().and_then(|exe| installed_prefix(&exe));
     // The installer kept from the verified bundle does the update, when there is one and it is
     // still the bytes that were verified. This command downloads and verifies nothing itself.
-    if let Some(prefix) = prefix.as_deref().filter(|_| !cfg!(windows)) {
-        match kept_installer::plan(&prefix.join("share").join("yadorilink")) {
+    if let Some(prefix) = prefix.as_deref() {
+        match kept_installer::plan_in(&kept_installer::install_dir(prefix)) {
             kept_installer::Plan::Run(script) => {
                 println!(
                     "version {target} is allowed by the verified {} channel manifest; running the \
                      installer that came with this install.",
                     status.channel
                 );
-                let args = vec![
-                    "--channel".to_owned(),
-                    status.channel.clone(),
-                    "--version".to_owned(),
-                    target.clone(),
-                    "--prefix".to_owned(),
-                    prefix.display().to_string(),
-                    "--yes".to_owned(),
-                ];
-                return finish_installer_run(&script, &args);
+                let call = installer_call(
+                    &[("channel", Some(&status.channel)), ("version", Some(&target))],
+                    prefix,
+                );
+                return finish_installer_run(&script, &call);
             }
             kept_installer::Plan::Refuse(why) => return Err(CliError::Other(why)),
             kept_installer::Plan::Print => {}
@@ -382,7 +377,7 @@ pub async fn self_update(requested: Option<String>, rollback: bool) -> Result<()
         "version {target} is allowed by the verified {} channel manifest.\nTo install it (the installer \
          verifies the signature and hashes again and switches atomically):\n  {}",
         status.channel,
-        installer_command(&target, &status.channel, prefix.as_deref(), cfg!(windows))
+        installer_command(&target, &status.channel, prefix.as_deref())
     );
     Ok(())
 }
@@ -390,17 +385,12 @@ pub async fn self_update(requested: Option<String>, rollback: bool) -> Result<()
 /// `yadorilink self-update --rollback`: the kept installer switches back to the previous version.
 /// No manifest is involved: that version was verified when it was installed.
 fn roll_back(exe: &std::path::Path) -> Result<(), CliError> {
-    let prefix = prefix_from_exe(&std::fs::canonicalize(exe).unwrap_or(exe.to_owned()), cfg!(windows))
+    let prefix = installed_prefix(exe)
         .ok_or_else(|| CliError::Other("this yadorilink does not run from an installer layout, so there is nothing to roll back".into()))?;
-    if cfg!(windows) {
-        return Err(CliError::Other(
-            "rolling back is not available from here on Windows yet: run install.ps1 with -Version of the version you want".into(),
-        ));
-    }
-    match kept_installer::plan(&prefix.join("share").join("yadorilink")) {
+    match kept_installer::plan_in(&kept_installer::install_dir(&prefix)) {
         kept_installer::Plan::Run(script) => {
-            let args = vec!["--rollback".to_owned(), "--prefix".to_owned(), prefix.display().to_string()];
-            finish_installer_run(&script, &args)
+            let call = installer_call(&[("rollback", None)], &prefix);
+            finish_installer_run(&script, &call)
         }
         kept_installer::Plan::Refuse(why) => Err(CliError::Other(why)),
         kept_installer::Plan::Print => Err(CliError::Other(
@@ -411,10 +401,31 @@ fn roll_back(exe: &std::path::Path) -> Result<(), CliError> {
     }
 }
 
+/// The installer's call for this prefix: `options` are (option, value) pairs. `install.sh` takes
+/// arguments (`--channel beta`), so nothing is spliced into the script that is run. An install,
+/// not a rollback, also answers the installer's prompt.
+fn installer_call(
+    options: &[(&str, Option<&str>)],
+    prefix: &std::path::Path,
+) -> kept_installer::Call {
+    let rollback = options.iter().any(|(name, _)| *name == "rollback");
+    let mut call = kept_installer::Call::default();
+    for (name, value) in options {
+        call.args.push(format!("--{name}"));
+        call.args.extend(value.map(str::to_owned));
+    }
+    call.args.push("--prefix".into());
+    call.args.push(prefix.display().to_string());
+    if !rollback {
+        call.args.push("--yes".into());
+    }
+    call
+}
+
 /// Runs the verified installer and ends with its status: its output is the output, and a status
 /// with a standing answer gets that answer after it.
-fn finish_installer_run(script: &[u8], args: &[String]) -> Result<(), CliError> {
-    let status = kept_installer::run(script, args)
+fn finish_installer_run(script: &[u8], call: &kept_installer::Call) -> Result<(), CliError> {
+    let status = kept_installer::run(script, call)
         .map_err(|e| CliError::Other(format!("could not start the installer: {e}")))?;
     if status == 0 {
         return Ok(());
@@ -592,35 +603,42 @@ mod tests {
     #[test]
     fn the_printed_command_pins_version_and_channel() {
         assert_eq!(
-            installer_command("1.2.0", "beta", None, false),
+            installer_command("1.2.0", "beta", None),
             "curl -fsSL https://yadori.link/install.sh | sh -s -- --channel beta --version 1.2.0"
         );
         let exe = std::path::Path::new("/opt/it's/share/yadorilink/1.2.0/bin/yadorilink");
-        let prefix = prefix_from_exe(exe, false).expect("installer layout");
+        let prefix = prefix_from_exe(exe).expect("installer layout");
         assert_eq!(prefix, std::path::Path::new("/opt/it's"));
         // The separator is the platform's, so the expectation is built from the path itself.
         let quoted = prefix.to_str().expect("utf-8 path").replace('\'', "'\\''");
-        assert!(installer_command("1.2.0", "beta", Some(&prefix), false)
+        assert!(installer_command("1.2.0", "beta", Some(&prefix))
             .ends_with(&format!("--prefix '{quoted}'")));
         assert_eq!(
-            installer_command("1.2.0", "nightly", Some(std::path::Path::new("D:\\Y'z")), true),
-            "& ([scriptblock]::Create((irm https://yadori.link/install.ps1))) -Channel nightly -Version 1.2.0 -Prefix 'D:\\Y''z'"
-        );
-        assert_eq!(
-            prefix_from_exe(
-                std::path::Path::new("/srv/share/yadorilink/t/share/yadorilink/1/bin/yadorilink"),
-                false
-            ),
+            prefix_from_exe(std::path::Path::new(
+                "/srv/share/yadorilink/t/share/yadorilink/1/bin/yadorilink"
+            )),
             Some(std::path::PathBuf::from("/srv/share/yadorilink/t"))
         );
-        assert_eq!(prefix_from_exe(std::path::Path::new("/usr/bin/yadorilink"), false), None);
-        assert_eq!(
-            prefix_from_exe(
-                std::path::Path::new("/d/Tools/Y/versions/1.2.0/bin/yadorilink.exe"),
-                true
-            ),
-            Some(std::path::PathBuf::from("/d/Tools/Y"))
+        assert_eq!(prefix_from_exe(std::path::Path::new("/usr/bin/yadorilink")), None);
+    }
+}
+
+#[cfg(test)]
+mod installer_args_tests {
+    use super::*;
+
+    #[test]
+    fn the_installer_is_called_with_arguments_for_the_same_prefix() {
+        let call = installer_call(
+            &[("channel", Some("beta")), ("version", Some("1.2.0"))],
+            std::path::Path::new("/p"),
         );
-        assert_eq!(prefix_from_exe(std::path::Path::new("/c/yadorilink.exe"), true), None);
+        let want: Vec<String> =
+            ["--channel", "beta", "--version", "1.2.0", "--prefix", "/p", "--yes"]
+                .map(String::from)
+                .to_vec();
+        assert_eq!(call.args, want);
+        let rollback = installer_call(&[("rollback", None)], std::path::Path::new("/p"));
+        assert!(!rollback.args.contains(&"--yes".to_string()));
     }
 }

@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use yadorilink_peer_session::PeerSessionError;
 use yadorilink_replica_domain::file::{FileRecord, RecordKind};
 use yadorilink_replica_domain::session_state::MaterializationPolicy;
@@ -40,16 +38,6 @@ struct MaterializationPlan<'a> {
     /// handed one. The eager content write closes the obligation under it in
     /// the same transaction as its proof.
     claim: Option<super::obligation_claims::PathClaim<'a>>,
-}
-
-impl MaterializationPlan<'_> {
-    /// Applies the execute flag this payload specifies to `out_path`. Every lane reads it
-    /// from the payload, never the row: what a materialization applies is decided by its
-    /// payload alone.
-    fn apply_payload_metadata(&self, out_path: &Path) -> Result<(), PeerSessionError> {
-        yadorilink_local_storage::apply_file_metadata(out_path, self.payload.version().meta.exec)?;
-        Ok(())
-    }
 }
 
 impl super::LocalConvergenceExecutor {

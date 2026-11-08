@@ -225,6 +225,17 @@ impl StatusHub {
         let facts = self.facts().await?;
         let collected = facts.collected.clone()?;
         let mut links = self.sources.queries.link_status.compose_links(&collected.runtime.links);
+        for link in links.iter_mut().filter(|link| link.provider.is_some()) {
+            if let Some(os) = collected.os_file_counts.get(&link.group_id) {
+                (link.hydrated_count, link.placeholder_count, link.hydrating_count) =
+                    crate::status_report::provider_counts_of(
+                        link.hydrated_count,
+                        link.placeholder_count,
+                        link.hydrating_count,
+                        *os,
+                    );
+            }
+        }
         if facts.built_at.elapsed() > POSITIVE_CLAIM_MAX_AGE {
             for link in &mut links {
                 link.withhold_positive_claims();

@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use yadorilink_local_capture::unreadable::UnreadableReason;
 use yadorilink_replica_domain::author::AuthorId;
 use yadorilink_replica_domain::native_fork::fallback_may_fork;
 use yadorilink_sync_sqlite::SyncSqliteError;
@@ -129,6 +130,9 @@ impl DaemonState {
         if held_for_test(&self.device_id) {
             return None;
         }
+        // A pass that ends before it has looked at every path (a listing error, a cancelled
+        // task) must not leave the previous pass's list standing for the group.
+        let mut clear_if_unfinished = ClearBlockedOnDrop::new(&self.native_replication, group_id);
         // Each path with the row this device's index holds at it before anything is read: the
         // fork is later made only over that very row.
         let paths = match self.replica_coordinator.database().read::<_, SyncSqliteError>(|conn| {
@@ -150,6 +154,7 @@ impl DaemonState {
             }
         };
         let mut settled = true;
+        let mut blocked: Vec<(String, UnreadableReason)> = Vec::new();
         for (path, _) in &paths {
             match crate::store_residency::bring_current_versions_into_daemon_store_with(
                 self, group_id, path, false,
@@ -157,13 +162,34 @@ impl DaemonState {
             .await
             {
                 Ok(crate::store_residency::Residency::InStore) => {}
-                Ok(crate::store_residency::Residency::Pending(_)) => settled = false,
+                Ok(crate::store_residency::Residency::Pending(pending, unreadable)) => {
+                    settled = false;
+                    for path in pending {
+                        // The read's own refusal when it had one: a permission error is listed
+                        // at once, anything else waits to fail repeatedly.
+                        let reason = unreadable
+                            .iter()
+                            .find(|file| file.path == path)
+                            .map_or(UnreadableReason::ReadFailed, |file| file.reason);
+                        blocked.push((path, reason));
+                    }
+                }
                 Err(error) => {
                     tracing::debug!(group_id, path, %error, "a contested version could not be kept in the store");
                     settled = false;
+                    let reason = match &error {
+                        crate::sync_error::SyncError::Io(io) => {
+                            UnreadableReason::from_io(io.kind())
+                        }
+                        _ => UnreadableReason::ReadFailed,
+                    };
+                    blocked.push((path.clone(), reason));
                 }
             }
         }
+        self.native_replication.contest_pass_blocked(group_id, &blocked, std::time::Instant::now());
+        // The list now says what this pass found; the guard has nothing left to clear.
+        clear_if_unfinished.disarm();
         settled.then(|| paths.into_iter().collect())
     }
 
@@ -206,6 +232,34 @@ impl DaemonState {
             if self.fork_contested_group(&group_id).await > 0 {
                 self.on_local_native_commit(&group_id).await;
             }
+        }
+    }
+}
+
+/// Empties a group's contest-blocked list when dropped, unless disarmed.
+struct ClearBlockedOnDrop<'a> {
+    hub: &'a crate::native_replication_runtime::NativeReplicationHub,
+    group_id: &'a str,
+    armed: bool,
+}
+
+impl<'a> ClearBlockedOnDrop<'a> {
+    fn new(
+        hub: &'a crate::native_replication_runtime::NativeReplicationHub,
+        group_id: &'a str,
+    ) -> Self {
+        Self { hub, group_id, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ClearBlockedOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.hub.contest_pass_blocked(self.group_id, &[], std::time::Instant::now());
         }
     }
 }

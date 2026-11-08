@@ -28,8 +28,7 @@ Verification only hashes: the zip against its `.sha256`, each file against
 zip is deterministic (sorted entries, fixed timestamps, fixed modes: `0755` for
 executables, `0644` otherwise).
 
-The macOS, Linux and Windows bundles also carry the **installer** at the root (`install.sh`, or
-`install.ps1` on Windows): byte for byte the published, attested installer asset
+The macOS and Linux bundles also carry the **installer** at the root (`install.sh`): byte for byte the published, attested installer asset
 (`build-engine-bundle.py verify --installers DIR` checks that). It is listed in `SHA256SUMS`, so the
 signed manifest vouches for it. A script install keeps a copy under `<share>/installer/` and records the
 hash it was proven to have in its install receipt (`installer_sha256`); `yadorilink self-update` runs that
@@ -50,7 +49,6 @@ install.sh                 the installer (kept by script installs for self-updat
 All files are at the root.
 
 ```
-install.ps1                the installer (carried; Windows self-update does not run it yet)
 yadorilink.exe
 yadorilink-daemon.exe      (artifact_sha256)
 yadorilink_shell_ext.dll   Explorer overlay and context-menu extension

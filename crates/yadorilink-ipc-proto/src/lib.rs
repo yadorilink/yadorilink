@@ -139,7 +139,76 @@ pub mod daemonctl {
     /// `rebuild_needed` (field 62).
     /// `50`: `StatusResponse` and `LinkStatus` carry `product` (fields 35 and 63), the product
     /// status the daemon computes.
-    pub const CONTROL_PROTOCOL_VERSION: u32 = 50;
+    /// `51`: `ProductStatus` carries `last_synced_unix` (field 15).
+    /// `52`: `StatusResponse` carries `kept_history_bytes` and `kept_history_budget_bytes`
+    /// (fields 36 and 37).
+    /// `53`: `ApplicationCommandError` carries `drive_reason` and `file_system`, and the code
+    /// `UNSUPPORTED_DRIVE` (a link refused because the drive is not supported yet).
+    /// `54`: `StatusResponse` carries `unpublished_edits_service_unreachable` and
+    /// `unpublished_edits_not_authorized` and `unpublished_edits_rejected` (fields 40, 41, 42).
+    /// `55`: `ListShareEdgesRequest` / `ListShareEdgesResponse` (request 115, response 114).
+    /// `56`: the code `SEND_PREVIEW_UNVERIFIED` (a Send link's file list that does not open).
+    /// `57`: `SetRetentionRuleRequest` / `SetRetentionRuleResponse` (request and response 82) replace
+    /// the pin and unpin requests; `FILE_ACTION_ONLINE_ONLY` and `FILE_ACTION_DEFAULT` replace
+    /// `FILE_ACTION_STOP_KEEPING`; `RETENTION_POLICY_ONLINE_ONLY`; `LinkStatus` fields 69-73
+    /// (rule count, apply state and outcome counts).
+    pub const CONTROL_PROTOCOL_VERSION: u32 = 57;
+}
+
+mod redacted_debug {
+    use crate::daemonctl::{CreateSendLinkResponse, PreviewSendLinkRequest, RedeemSendLinkRequest};
+    use std::fmt;
+
+    impl fmt::Debug for PreviewSendLinkRequest {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("PreviewSendLinkRequest").field("code", &"..").finish()
+        }
+    }
+
+    impl fmt::Debug for RedeemSendLinkRequest {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("RedeemSendLinkRequest")
+                .field("code", &"..")
+                .field("receiver_device_id", &self.receiver_device_id)
+                .field("destination_dir", &self.destination_dir)
+                .finish()
+        }
+    }
+
+    impl fmt::Debug for CreateSendLinkResponse {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("CreateSendLinkResponse")
+                .field("link_id", &self.link_id)
+                .field("code", &"..")
+                .field("expires_at_unix", &self.expires_at_unix)
+                .finish()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn debug_output_never_shows_a_send_link_code() {
+            const CODE: &str = "SECRETCODE-ABCD";
+            let preview = PreviewSendLinkRequest { code: CODE.into() };
+            let redeem = RedeemSendLinkRequest {
+                code: CODE.into(),
+                receiver_device_id: "dev".into(),
+                destination_dir: "/tmp/in".into(),
+            };
+            let created = CreateSendLinkResponse {
+                link_id: "link".into(),
+                code: CODE.into(),
+                expires_at_unix: 1,
+            };
+            for text in [format!("{preview:?}"), format!("{redeem:?}"), format!("{created:?}")] {
+                assert!(!text.contains("SECRETCODE"), "{text}");
+            }
+            assert!(format!("{redeem:?}").contains("/tmp/in"));
+        }
+    }
 }
 
 #[cfg(test)]

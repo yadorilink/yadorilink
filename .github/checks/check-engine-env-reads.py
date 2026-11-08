@@ -93,6 +93,13 @@ ALLOWED_FUNCTIONS = {
             "the fallback"
         ),
     },
+    "crates/yadorilink-client-core/src/ops/autostart.rs": {
+        "ensure": "the command line's start-at-login entry: a desktop-only operation, never engine behaviour",
+        "remove": "the command line's start-at-login entry: a desktop-only operation, never engine behaviour",
+        "stable_daemon_path": "the command line's start-at-login entry: finds the daemon beside this executable",
+        "home_dir": "the command line's start-at-login entry: the user's own login directory",
+        "schtasks_program": "the command line's start-at-login entry: the system's own schtasks.exe",
+    },
     "crates/yadorilink-fapi-client/src/store/mod.rs": {
         "from_env": "Backend::from_env, the environment mapping of the entry points; an engine is given a Backend",
     },

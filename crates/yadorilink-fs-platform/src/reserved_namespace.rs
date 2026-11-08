@@ -9,7 +9,7 @@
 //! crate — the watcher, local change processing, the initial scan,
 //! peer admission and stale-file cleanup — agrees on exactly which
 //! names are reserved, and agrees on it *before* user ignore rules run: a
-//! user can configure `.yadorilinkignore` to un-ignore anything, but must
+//! user can configure the ignore rules to un-ignore anything, but must
 //! never be able to make an artefact name eligible for ordinary indexing.
 //!
 //! This module is that single shared predicate. It is a naming *protocol*,

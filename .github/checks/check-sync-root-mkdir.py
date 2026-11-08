@@ -60,6 +60,9 @@ ALLOWLIST: dict[str, dict[str, int]] = {
         "create_dir": 2,
         "create_dir_all": 1,
     },
+    # The start-at-login entry's own directory (`~/Library/LaunchAgents`, `~/.config/systemd/user`),
+    # never inside a sync root.
+    C + "yadorilink-client-core/src/ops/autostart.rs": {"create_dir_all": 1},
     # The block store's own directories (`create_dir_all_durably`: the store
     # root and its `segments/` directory, never inside a sync root).
     C + "yadorilink-local-storage/src/fs_ops.rs": {"create_dir_all": 2},
@@ -75,6 +78,7 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     C + "yadorilink-daemon/src/shell_ipc.rs": {"create_dir_all": 1},
     C + "yadorilink-daemon/src/send_transfer/link_book.rs": {"create_dir_all": 1},
     C + "yadorilink-daemon/src/send_transfer/redeem_book.rs": {"create_dir_all": 1},
+    C + "yadorilink-daemon/src/network_policy.rs": {"create_dir_all": 1},
     C + "yadorilink-daemon/src/space_management_config.rs": {"create_dir_all": 1},
     C + "yadorilink-daemon/src/update/policy.rs": {"create_dir_all": 1},
     C + "yadorilink-http-api/src/token.rs": {"create_dir_all": 2},
@@ -89,9 +93,6 @@ ALLOWLIST: dict[str, dict[str, int]] = {
     # The Windows host's Stage ledger directory: the host's own state directory beside the
     # root's authoring state, never inside the user's tree.
     C + "yadorilink-windows-provider-policy/src/stage_ledger.rs": {"create_dir_all": 3},
-    # The Windows uninstall guardian's helper directory in the temporary directory: outside the
-    # package, any sync root and the user's data.
-    C + "yadorilink-shell-ext-windows/src/package_removal.rs": {"create_dir_all": 1},
     C + "yadorilink-daemon/src/provider_writer.rs": {"DirBuilder::new": 1},
     # The daemon's own log directory (default ~/Library/Logs/yadorilink, 0700; the
     # parent of an operator-set YADORILINK_LOG_FILE otherwise): the daemon's private

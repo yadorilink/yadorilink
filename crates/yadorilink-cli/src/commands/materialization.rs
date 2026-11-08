@@ -4,8 +4,8 @@
 
 use yadorilink_client_core::ops::files;
 use yadorilink_ipc_proto::daemonctl::{
-    local_state_word, EvictResponse, PinItemResponse, RetentionPolicy, RetentionState,
-    UnpinItemResponse,
+    local_state_word, EvictResponse, RetentionPolicy, RetentionRule, RetentionState,
+    SetRetentionRuleResponse,
 };
 
 use crate::error::CliError;
@@ -123,19 +123,19 @@ pub async fn status(local_path: String) -> Result<(), CliError> {
 
 /// Keeps a file or folder on this device: the choice is recorded first, then whatever is not
 /// here yet is downloaded. A download that fails does not undo the choice.
-pub async fn pin(local_path: String) -> Result<(), CliError> {
-    let response = files::pin(absolute_path(&local_path)?).await?;
-    println!("{}", pin_outcome(&local_path, &response)?);
+pub async fn keep(local_path: String) -> Result<(), CliError> {
+    let response =
+        files::set_retention_rule(absolute_path(&local_path)?, RetentionRule::Keep).await?;
+    println!("{}", keep_outcome(&local_path, &response)?);
     Ok(())
 }
 
-/// The report of a pin that kept everything it promises. The pin itself is recorded either way,
-/// but nothing downloads a kept item later on a folder the daemon hydrates itself (and the
-/// operating system's own download is not asked for on other platforms), and a version that is
-/// not yet in the store is only kept by pinning again: a script must see that the request needs
-/// another run, so such a pin is an error carrying the same message.
-fn pin_outcome(local_path: &str, response: &PinItemResponse) -> Result<String, CliError> {
-    let report = pin_report(local_path, response);
+/// The report of a keep that kept everything it promises. The rule itself is recorded either way,
+/// but a script must see that the item is not on this device yet (the daemon keeps retrying and
+/// `materialization-status` shows it), and a version that is not yet in the store is only kept by
+/// running the command again, so such a keep is an error carrying the same message.
+fn keep_outcome(local_path: &str, response: &SetRetentionRuleResponse) -> Result<String, CliError> {
+    let report = keep_report(local_path, response);
     if response.download_error.is_empty() && response.history_not_kept_reason.is_empty() {
         Ok(report)
     } else {
@@ -143,33 +143,46 @@ fn pin_outcome(local_path: &str, response: &PinItemResponse) -> Result<String, C
     }
 }
 
-/// Stops keeping a file or folder. Nothing is removed; its space can be freed again.
-pub async fn unpin(local_path: String) -> Result<(), CliError> {
-    let response = files::unpin(absolute_path(&local_path)?).await?;
-    println!("{}", unpin_report(&local_path, &response));
+/// Keeps nothing of a file or folder in the folder (File Provider folders): the copies on this
+/// device are freed, and the content stays available online.
+pub async fn online_only(local_path: String) -> Result<(), CliError> {
+    let response =
+        files::set_retention_rule(absolute_path(&local_path)?, RetentionRule::OnlineOnly).await?;
+    println!("{}", online_only_report(&local_path, &response));
     Ok(())
 }
 
-fn is_pinned(retention: Option<&RetentionState>) -> Option<&RetentionState> {
-    retention.filter(|state| state.policy() == RetentionPolicy::Pinned)
+/// Removes the rule set at a file or folder. Nothing is removed from disk.
+pub async fn default_rule(local_path: String) -> Result<(), CliError> {
+    let response =
+        files::set_retention_rule(absolute_path(&local_path)?, RetentionRule::Default).await?;
+    println!("{}", default_report(&local_path, &response));
+    Ok(())
+}
+
+fn policy_of(retention: Option<&RetentionState>) -> Option<(RetentionPolicy, bool)> {
+    retention
+        .filter(|state| state.policy() != RetentionPolicy::Reclaimable)
+        .map(|state| (state.policy(), state.explicit))
 }
 
 /// What `materialization-status` appends to the state word.
 fn retention_suffix(retention: Option<&RetentionState>) -> &'static str {
-    match is_pinned(retention) {
+    match policy_of(retention) {
         None => "",
-        Some(state) if state.explicit => ", always kept on this device",
-        Some(_) => ", always kept on this device (by a folder above)",
+        Some((RetentionPolicy::OnlineOnly, true)) => ", online only",
+        Some((RetentionPolicy::OnlineOnly, false)) => ", online only (by a folder above)",
+        Some((_, true)) => ", always kept on this device",
+        Some((_, false)) => ", always kept on this device (by a folder above)",
     }
 }
 
-fn pin_report(local_path: &str, response: &PinItemResponse) -> String {
+fn keep_report(local_path: &str, response: &SetRetentionRuleResponse) -> String {
     let mut report = if response.download_error.is_empty() {
         format!("{local_path} is always kept on this device")
     } else {
         format!(
-            "{local_path} is always kept on this device, but it could not be downloaded yet: {}. \
-             Run `yadorilink pin {local_path}` again to retry.",
+            "{local_path} is always kept on this device, but it could not be downloaded yet: {}.",
             response.download_error
         )
     };
@@ -177,9 +190,11 @@ fn pin_report(local_path: &str, response: &PinItemResponse) -> String {
         "" => None,
         "changing_retry" => Some(
             "Some files were changing, so their previous versions are not safely kept yet; run \
-             the pin again once they settle.",
+             the command again once they settle.",
         ),
-        _ => Some("The previous versions of its files could not be checked; run the pin again."),
+        _ => {
+            Some("The previous versions of its files could not be checked; run the command again.")
+        }
     };
     if let Some(history) = history {
         report.push_str(". ");
@@ -188,16 +203,26 @@ fn pin_report(local_path: &str, response: &PinItemResponse) -> String {
     report
 }
 
-fn unpin_report(local_path: &str, response: &UnpinItemResponse) -> String {
-    if is_pinned(response.retention.as_ref()).is_some() {
-        format!(
-            "{local_path} is still kept on this device because a folder above it is. Unpin that \
-             folder to stop keeping it."
-        )
-    } else {
-        format!(
-            "{local_path} is no longer kept on this device. Its content stays until you free it."
-        )
+fn online_only_report(local_path: &str, _response: &SetRetentionRuleResponse) -> String {
+    format!(
+        "{local_path} is now online only. Its copies on this device are being freed; the content \
+         stays available online and downloads again when opened."
+    )
+}
+
+fn default_report(local_path: &str, response: &SetRetentionRuleResponse) -> String {
+    match policy_of(response.retention.as_ref()) {
+        Some((RetentionPolicy::OnlineOnly, _)) => format!(
+            "{local_path} follows a folder above it that is online only. Change that folder's rule \
+             to change this one."
+        ),
+        Some(_) => format!(
+            "{local_path} is still kept on this device because a folder above it is. Change that \
+             folder's rule to stop keeping it."
+        ),
+        None => {
+            format!("{local_path} has no rule of its own. Its content stays until you free it.")
+        }
     }
 }
 

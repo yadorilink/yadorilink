@@ -26,7 +26,7 @@ use yadorilink_sync_sqlite::native_rebootstrap::{
     begin_rebootstrap, finish_rebootstrap, rebootstrap_status, recover_after_restart, BeginError,
     BeginRequest, CaptureAuthority, CaptureBarrier, Crash, Failpoint, FinalCapture, HeldContent,
     LeaveIncremental, PreserveContext, ReassertAuthority, Reassertability, RebootstrapState,
-    RecoveryContentSource, RestartOutcome,
+    RecoveryContentSource, RestartOutcome, Resume,
 };
 use yadorilink_sync_sqlite::native_rebootstrap_install::{
     install_rebootstrap, observe_regular_file, unlink_exclusively, InstallContext, InstallError,
@@ -230,6 +230,10 @@ impl Machine {
     /// is logged and never fails the rebootstrap. No timer and no age: only these events.
     fn release_retained(&self) {
         let _ = self.fire(Point::RetainedCleanup);
+        // A provider root sets nothing aside, so there is nothing kept to release.
+        if is_provider_group(&self.state, &self.group) {
+            return;
+        }
         match clean_up_retained_originals_held(&self.state, &self.group) {
             Ok(outcomes) => {
                 for (original, outcome) in outcomes {
@@ -409,13 +413,13 @@ impl Machine {
             let Some(status) = status.filter(|s| s.recovery_id == recovery_id) else {
                 return self.finish_pending_work();
             };
-            match status.state {
-                RebootstrapState::Preserved | RebootstrapState::Quarantining => self.install()?,
-                RebootstrapState::CatchingUp => {
+            match status.state.resume() {
+                Resume::Install => self.install()?,
+                Resume::CatchUp => {
                     self.adopt_rotated_author()?;
                     self.catch_up(recovery_id)?;
                 }
-                RebootstrapState::Replaying => {
+                Resume::Replay => {
                     self.adopt_rotated_author()?;
                     self.replay(recovery_id)?;
                     let finished =
@@ -426,12 +430,14 @@ impl Machine {
                         ));
                     }
                 }
-                RebootstrapState::Blocked(reason) => {
-                    return Err(RebootstrapError::Blocked(format!("{reason:?}")))
+                Resume::Blocked => {
+                    let reason = match &status.state {
+                        RebootstrapState::Blocked(reason) => format!("{reason:?}"),
+                        other => format!("{other:?}"),
+                    };
+                    return Err(RebootstrapError::Blocked(reason));
                 }
-                RebootstrapState::Planning
-                | RebootstrapState::Capturing
-                | RebootstrapState::Preserving => {
+                Resume::BeforeBarrier => {
                     return Err(RebootstrapError::Failed(format!(
                         "the rebootstrap stopped before its barrier ({:?})",
                         status.state
@@ -442,10 +448,18 @@ impl Machine {
     }
 
     fn install(&self) -> Result<(), RebootstrapError> {
-        let Some(root) = DaemonQuarantineRoot::open(&self.state, &self.group) else {
-            return Err(RebootstrapError::Blocked(
-                "the folder is not being watched, so its originals cannot be set aside".into(),
-            ));
+        let provider_root = ProviderQuarantineRoot;
+        let link_root;
+        let root: &dyn QuarantineRoot = if is_provider_group(&self.state, &self.group) {
+            &provider_root
+        } else {
+            let Some(opened) = DaemonQuarantineRoot::open(&self.state, &self.group) else {
+                return Err(RebootstrapError::Blocked(
+                    "the folder is not being watched, so its originals cannot be set aside".into(),
+                ));
+            };
+            link_root = opened;
+            &link_root
         };
         let sync_roots = self.sync_roots();
         let capture = DaemonCapture::new(self);
@@ -457,8 +471,7 @@ impl Machine {
         let ctx = self.preserve_context(&sync_roots, &capture, &content, &authority);
         let closure_key =
             if authority.is_writer() { self.state.device_signing_key() } else { None };
-        let install =
-            InstallContext { preserve: &ctx, root: &root, closure_key: closure_key.as_ref() };
+        let install = InstallContext { preserve: &ctx, root, closure_key: closure_key.as_ref() };
         let recovery_id = self
             .read(|conn| rebootstrap_status(conn, &self.group))??
             .map(|s| s.recovery_id)
@@ -606,8 +619,12 @@ fn replay_failure(error: ReplayError) -> RebootstrapError {
     }
 }
 
-/// Folds `group`'s folder into the index once, if its link is running.
+/// Folds `group`'s folder into the index once, if its link is running (a provider group has
+/// no folder to fold in).
 async fn rescan_group(state: &Arc<DaemonState>, group: &FolderGroupId) -> Result<(), String> {
+    if is_provider_group(state, group) {
+        return Ok(());
+    }
     let runtime = runtime_of(state, group.as_str()).ok_or("the folder is not being watched")?;
     runtime.capture_whole_group(group.as_str()).await
 }
@@ -623,6 +640,16 @@ fn runtime_of(
         .ok()
         .flatten()?;
     state.links.runtime(&local_path)
+}
+
+/// Whether `group` is a provider root (Windows Cloud Files, macOS File Provider). It has no
+/// directory the daemon reads and no link runtime: its local edits reach the index through the
+/// provider write path as they happen, and the OS view is converged by the provider projector.
+pub(crate) fn is_provider_group(state: &Arc<DaemonState>, group: &FolderGroupId) -> bool {
+    matches!(
+        state.replica_coordinator.provider_repository().declaration_for_group(group.as_str()),
+        Ok(yadorilink_sync_sqlite::provider::ProviderDeclaration::Provider(_))
+    )
 }
 
 /// Seals this device's state once every own unit of its rebootstraps has been replayed, and
@@ -738,6 +765,11 @@ impl DaemonCapture {
 
 impl FinalCapture for DaemonCapture {
     fn capture(&self, authority: &Arc<CaptureAuthority>) -> CaptureBarrier {
+        if is_provider_group(&self.state, &self.group) {
+            // There is no disk to fold in: every provider edit was authored into the index by
+            // the provider write path, and the frozen group refuses further ones.
+            return CaptureBarrier::Completed;
+        }
         let Some(runtime) = runtime_of(&self.state, self.group.as_str()) else {
             return CaptureBarrier::Partial { detail: "the folder is not being watched".into() };
         };
@@ -977,6 +1009,30 @@ impl DaemonQuarantineRoot {
         Ok(full.with_file_name(
             artefact_component_name(ArtefactKind::Preimage, claim).map_err(|e| e.to_string())?,
         ))
+    }
+}
+
+/// The root of a provider group as the install sees it: there are no originals to set aside,
+/// because nothing of the group stands in a directory the daemon owns. Every path is absent, so
+/// each quarantine row ends `already_absent` with its verified copy in the recovery area, and the
+/// provider projector converges the OS view to the installed state afterwards.
+pub(crate) struct ProviderQuarantineRoot;
+
+impl QuarantineRoot for ProviderQuarantineRoot {
+    fn observe(&self, _path: &str) -> Result<Observed, String> {
+        Ok(Observed::Absent)
+    }
+
+    fn open_file(&self, path: &str) -> Result<Box<dyn std::io::Read>, String> {
+        Err(format!("{path} is not in a directory of this group"))
+    }
+
+    fn remove(&self, path: &str, _expected: &Observed, _claim: &str) -> Result<Removal, String> {
+        Err(format!("{path} is not in a directory of this group"))
+    }
+
+    fn release_claim(&self, _path: &str, _claim: &str) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -1240,5 +1296,62 @@ mod retained_root_tests {
             assert_eq!(result, ClaimedUnlink::Retained);
             assert!(claimed.exists());
         }
+    }
+}
+
+#[cfg(test)]
+mod provider_group_tests {
+    use super::*;
+    use crate::replica_coordinator::ReplicaCoordinator;
+    use yadorilink_local_storage::SegmentBlockStore;
+    use yadorilink_replica_domain::session_state::ProviderKind;
+
+    const PROVIDER: &str = "provider-group";
+    const PLAIN: &str = "plain-group";
+
+    fn state_with_a_provider_and_a_plain_group() -> (tempfile::TempDir, Arc<DaemonState>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SegmentBlockStore::new(dir.path().join("blocks")).unwrap());
+        let coordinator = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+        coordinator.link_admission().add_link("/provider/p", PROVIDER).unwrap();
+        coordinator
+            .provider_writes()
+            .declare_root(PROVIDER, ProviderKind::MacFileProvider, "P")
+            .unwrap();
+        coordinator.link_admission().add_link("/plain/p", PLAIN).unwrap();
+        (dir, DaemonState::new("device-a".into(), coordinator, store))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_provider_group_needs_no_folder_for_the_final_capture() {
+        let (_dir, state) = state_with_a_provider_and_a_plain_group();
+        assert!(is_provider_group(&state, &FolderGroupId(PROVIDER.into())));
+        assert!(!is_provider_group(&state, &FolderGroupId(PLAIN.into())));
+
+        let authority = Arc::new(CaptureAuthority::for_test(
+            &FolderGroupId(PROVIDER.into()),
+            &DeviceId("device-a".into()),
+            "r",
+        ));
+        let provider = Machine::new(&state, &FolderGroupId(PROVIDER.into()));
+        assert!(matches!(
+            DaemonCapture::new(&provider).capture(&authority),
+            CaptureBarrier::Completed
+        ));
+        // A plain group whose folder is not watched still fails closed.
+        let plain = Machine::new(&state, &FolderGroupId(PLAIN.into()));
+        assert!(matches!(
+            DaemonCapture::new(&plain).capture(&authority),
+            CaptureBarrier::Partial { .. }
+        ));
+    }
+
+    #[test]
+    fn a_provider_group_has_no_originals_to_set_aside() {
+        let root = ProviderQuarantineRoot;
+        assert_eq!(root.observe("a/b.txt").unwrap(), Observed::Absent);
+        assert!(root.remove("a/b.txt", &Observed::Absent, "claim").is_err());
+        assert!(root.open_file("a/b.txt").is_err());
+        root.release_claim("a/b.txt", "claim").unwrap();
     }
 }

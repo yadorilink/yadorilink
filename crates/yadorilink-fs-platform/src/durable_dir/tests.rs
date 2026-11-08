@@ -613,28 +613,19 @@ fn removing_what_is_already_gone_still_syncs_the_parent() {
     assert!(trace::take().iter().any(|e| matches!(e, Event::FlushDir { .. })));
 }
 
-/// E2's API and flags check: the move the Windows shapes are built from is
-/// `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`, `MOVEFILE_REPLACE_EXISTING` only
-/// for a replacing move and never `MOVEFILE_COPY_ALLOWED`.
+/// The Windows move is a rename on a held handle with POSIX semantics (a target with an open
+/// reader is replaced), replacing only for a replacing move; there is no copy fallback.
 #[test]
-fn the_windows_move_asks_for_write_through_and_never_for_a_copy() {
-    // The documented values of the Win32 flags.
-    const REPLACE_EXISTING: u32 = 0x1;
-    const COPY_ALLOWED: u32 = 0x2;
-    const WRITE_THROUGH: u32 = 0x8;
-    let no_replace = raw::windows_move_flags(Replace::No);
-    let replace = raw::windows_move_flags(Replace::Yes);
-    assert_eq!(no_replace, WRITE_THROUGH);
-    assert_eq!(replace, WRITE_THROUGH | REPLACE_EXISTING);
-    assert_eq!((no_replace | replace) & COPY_ALLOWED, 0);
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Storage::FileSystem as fs;
-        assert_eq!(
-            (fs::MOVEFILE_REPLACE_EXISTING, fs::MOVEFILE_COPY_ALLOWED, fs::MOVEFILE_WRITE_THROUGH),
-            (REPLACE_EXISTING, COPY_ALLOWED, WRITE_THROUGH)
-        );
-    }
+fn the_windows_rename_replaces_only_when_asked_and_with_posix_semantics() {
+    // The documented values of the FILE_RENAME_FLAG_* constants.
+    const REPLACE_IF_EXISTS: u32 = 0x1;
+    const POSIX_SEMANTICS: u32 = 0x2;
+    const IGNORE_READONLY: u32 = 0x40;
+    assert_eq!(raw::windows_rename_flags(Replace::No), POSIX_SEMANTICS);
+    assert_eq!(
+        raw::windows_rename_flags(Replace::Yes),
+        POSIX_SEMANTICS | REPLACE_IF_EXISTS | IGNORE_READONLY
+    );
 }
 
 #[test]
@@ -682,39 +673,39 @@ fn publish_durably_replaces_or_refuses_and_remove_file_durably_is_idempotent() {
     assert!(names(dir.path()).is_empty());
 }
 
-/// A reader that has the target open (a second device of the same process, a virus scanner,
-/// the search indexer) must not make a replacing publish fail for good: the publish waits for
-/// the reader to let go, and the name is then the new file.
+/// A reader that has the target open (a second device of the same process, a virus scanner, the
+/// search indexer) does not make a replacing publish wait or fail: the name becomes the new file
+/// at once and the reader keeps the old bytes it has open (POSIX rename semantics).
 #[cfg(windows)]
 #[test]
-fn a_replacing_move_waits_out_a_reader_that_has_the_target_open() {
+fn a_replacing_move_does_not_wait_for_a_reader_that_has_the_target_open() {
+    use std::io::Read;
     let dir = tempfile::tempdir().unwrap();
     let (staged, target) = (dir.path().join("staged"), dir.path().join("target"));
     fs::write(&target, b"old").unwrap();
     fs::write(&staged, b"new").unwrap();
-    let reader = fs::File::open(&target).unwrap();
-    let release = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        drop(reader);
-    });
+    let mut reader = fs::File::open(&target).unwrap();
     raw::move_entry(&staged, &target, Replace::Yes).unwrap();
-    release.join().unwrap();
     assert_eq!(fs::read(&target).unwrap(), b"new");
     assert!(!staged.exists());
+    let mut old = Vec::new();
+    reader.read_to_end(&mut old).unwrap();
+    assert_eq!(old, b"old");
 }
 
-/// A reader that never lets go still ends the publish, with the OS error, and leaves the target.
+/// A refused no-replace move releases the source: it can be renamed again afterwards.
 #[cfg(windows)]
 #[test]
-fn a_replacing_move_fails_closed_while_a_reader_never_lets_go() {
+fn a_no_replace_move_onto_an_existing_name_leaves_both_files() {
     let dir = tempfile::tempdir().unwrap();
     let (staged, target) = (dir.path().join("staged"), dir.path().join("target"));
     fs::write(&target, b"old").unwrap();
     fs::write(&staged, b"new").unwrap();
-    let _reader = fs::File::open(&target).unwrap();
-    let error = raw::move_entry(&staged, &target, Replace::Yes).unwrap_err();
-    assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error}");
+    let error = raw::move_entry(&staged, &target, Replace::No).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
     assert_eq!(fs::read(&target).unwrap(), b"old");
+    assert_eq!(fs::read(&staged).unwrap(), b"new");
+    fs::rename(&staged, dir.path().join("free")).unwrap();
 }
 
 #[test]
@@ -890,4 +881,275 @@ fn a_closed_gate_refusal_names_its_cause() {
     )
     .to_string();
     assert!(message.contains("GateClosed") && message.contains("VALIDATED"), "{message}");
+}
+
+/// A parent directory renamed away and replaced by a link to another directory after the move
+/// opened its parents must not redirect the rename: the entry moves inside the directory that
+/// was opened (and flushed), and the directory the link leads to is untouched.
+#[cfg(unix)]
+#[test]
+fn a_parent_swapped_after_it_was_opened_does_not_redirect_the_move() {
+    let dir = tempfile::tempdir().unwrap();
+    let (parent, held, other) =
+        (dir.path().join("p"), dir.path().join("p-held"), dir.path().join("other"));
+    fs::create_dir(&parent).unwrap();
+    fs::create_dir(&other).unwrap();
+    fs::write(parent.join("staged"), b"new").unwrap();
+    let (swap_parent, swap_held, swap_other) = (parent.clone(), held.clone(), other.clone());
+    before_next_move(move || {
+        fs::rename(&swap_parent, &swap_held).unwrap();
+        std::os::unix::fs::symlink(&swap_other, &swap_parent).unwrap();
+    });
+
+    ns().durable_move(&parent.join("staged"), &parent.join("final"), Replace::No)
+        .expect("the move acts on the directory it opened");
+
+    assert_eq!(
+        fs::read(held.join("final")).unwrap(),
+        b"new",
+        "it moved inside the opened directory"
+    );
+    assert!(!held.join("staged").exists());
+    assert!(names(&other).is_empty(), "the directory the swapped-in link leads to was touched");
+}
+
+/// The same swap of a parent, for the replacing publish. The directory the link leads to holds a
+/// decoy of the same two names: the exchange, its parking rename and the removal must all act in the
+/// directory that was opened (and is flushed), so the decoys are never touched. (The reads that decide
+/// the outcome still go by path and may see the decoys, so the publish may be refused; it is never
+/// done in the wrong directory.)
+#[cfg(unix)]
+#[test]
+fn a_parent_swapped_after_it_was_opened_does_not_redirect_a_replacing_publish() {
+    let dir = tempfile::tempdir().unwrap();
+    let (parent, held, other) =
+        (dir.path().join("p"), dir.path().join("p-held"), dir.path().join("other"));
+    fs::create_dir(&parent).unwrap();
+    fs::create_dir(&other).unwrap();
+    fs::write(parent.join("staged"), b"new").unwrap();
+    fs::write(parent.join("target"), b"old").unwrap();
+    fs::write(other.join("staged"), b"decoy-new").unwrap();
+    fs::write(other.join("target"), b"decoy-old").unwrap();
+    let (swap_parent, swap_held, swap_other) = (parent.clone(), held.clone(), other.clone());
+    before_next_move(move || {
+        fs::rename(&swap_parent, &swap_held).unwrap();
+        std::os::unix::fs::symlink(&swap_other, &swap_parent).unwrap();
+    });
+
+    let result =
+        ns().replace_if_unchanged(&parent.join("staged"), &parent.join("target"), true, &|_| true);
+
+    assert_eq!(names(&other), vec!["staged".to_owned(), "target".to_owned()], "{result:?}");
+    assert_eq!(fs::read(other.join("staged")).unwrap(), b"decoy-new", "{result:?}");
+    assert_eq!(fs::read(other.join("target")).unwrap(), b"decoy-old", "{result:?}");
+    // In the opened directory the publish either happened or was refused whole.
+    let target = fs::read(held.join("target")).unwrap();
+    if result.is_ok() {
+        assert_eq!(target, b"new");
+        assert!(!held.join("staged").exists());
+    } else {
+        assert_eq!(target, b"old", "{result:?}");
+        assert_eq!(fs::read(held.join("staged")).unwrap(), b"new");
+    }
+}
+
+/// A name that ends in a separator or in `/.` names a directory by that syntax, which the
+/// descriptor-relative rename would drop: it is refused rather than moved as a plain name.
+#[cfg(unix)]
+#[test]
+fn a_name_with_a_trailing_separator_is_refused_not_moved() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("f"), b"x").unwrap();
+    for spelled in ["f/", "f/."] {
+        let from = std::path::PathBuf::from(format!("{}/{spelled}", dir.path().display()));
+        let result = ns().durable_move(&from, &dir.path().join("g"), Replace::No);
+        assert!(result.is_err(), "{spelled} was moved");
+        assert!(dir.path().join("f").exists() && !dir.path().join("g").exists());
+    }
+}
+
+/// A move between two different directories renames in the opened source and target and flushes both.
+#[cfg(unix)]
+#[test]
+fn a_move_between_two_directories_flushes_both_of_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+    fs::create_dir(&a).unwrap();
+    fs::create_dir(&b).unwrap();
+    fs::write(a.join("f"), b"x").unwrap();
+    trace::take();
+    ns().durable_move(&a.join("f"), &b.join("g"), Replace::No).unwrap();
+    assert_eq!(fs::read(b.join("g")).unwrap(), b"x");
+    let flushed: Vec<_> = trace::take()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::FlushDir { dir } => Some(dir),
+            _ => None,
+        })
+        .collect();
+    assert!(flushed.contains(&a) && flushed.contains(&b), "{flushed:?}");
+}
+
+/// The rename names its target in a buffer built by hand; a name of any length (odd or even, short or
+/// long, ASCII or not) must be published. An exact-fit buffer failed with "the filename ... syntax is
+/// incorrect" for some paths only.
+#[cfg(windows)]
+#[test]
+fn a_move_works_whatever_the_length_of_the_target_name() {
+    let dir = tempfile::tempdir().unwrap();
+    for length in 1..=64 {
+        for unit in ["x", "\u{e9}"] {
+            let (staged, target) =
+                (dir.path().join("staged"), dir.path().join(unit.repeat(length)));
+            fs::write(&staged, b"s").unwrap();
+            raw::move_entry(&staged, &target, Replace::No)
+                .unwrap_or_else(|error| panic!("a {length}-character {unit:?} name: {error}"));
+            assert!(target.exists() && !staged.exists());
+        }
+    }
+}
+
+/// A drive the product cannot sync into is classified by a machine reason and worded in English for
+/// the command line and the logs; NTFS on a local disk is not refused.
+#[test]
+fn an_unsupported_drive_has_a_reason_key_and_words() {
+    assert_eq!(super::classify_drive("NTFS", true), None);
+    assert_eq!(super::classify_drive("ntfs", true), None);
+    for (fs, fixed, key) in [
+        ("ReFS", true, "refs"),
+        ("exFAT", true, "exfat"),
+        ("FAT32", true, "fat"),
+        ("FAT", true, "fat"),
+        ("UDF", true, "other"),
+        ("NTFS", false, "not_local_fixed"),
+        ("ReFS", false, "not_local_fixed"),
+    ] {
+        let drive = super::classify_drive(fs, fixed).unwrap();
+        assert_eq!(drive.reason.key(), key, "{fs} fixed={fixed}");
+        assert_eq!(drive.file_system, fs);
+        assert!(drive.message().contains("NTFS") && drive.message().contains("not supported yet"));
+    }
+    let refs = super::classify_drive("ReFS", true).unwrap().message();
+    assert!(refs.contains("ReFS / Dev Drive"), "{refs}");
+    let other = super::classify_drive("UDF", true).unwrap().message();
+    assert!(other.contains("UDF"), "{other}");
+}
+
+// --- moves on Windows: long names, relative paths, holders, flush failures ---
+
+/// The marker of a move that happened and whose flush failed is told from every other error, and
+/// keeps the flush error as its cause.
+#[test]
+fn a_move_whose_flush_failed_is_told_from_one_that_did_not_happen() {
+    let flush = io::Error::new(io::ErrorKind::PermissionDenied, "flush refused");
+    let marked = io::Error::new(flush.kind(), raw::MovedButNotFlushed(flush));
+    assert!(raw::moved_but_not_flushed(&marked));
+    assert_eq!(marked.kind(), io::ErrorKind::PermissionDenied);
+    assert!(marked.to_string().contains("moved") && marked.to_string().contains("flush refused"));
+    assert!(!raw::moved_but_not_flushed(&io::Error::from(io::ErrorKind::PermissionDenied)));
+    assert!(!raw::moved_but_not_flushed(&io::Error::other("plain")));
+}
+
+/// Names whose full path is far beyond MAX_PATH (a 255-character name under a deep directory) are
+/// moved: the paths are given the `\\?\` form, and the buffer holds a name of any length.
+#[cfg(windows)]
+#[test]
+fn a_move_works_for_names_beyond_the_old_path_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut deep = dir.path().to_path_buf();
+    for _ in 0..3 {
+        deep.push("d".repeat(80));
+    }
+    let deep = crate::long_path::for_win32(&deep);
+    fs::create_dir_all(&deep).unwrap();
+    for length in [241usize, 250, 255] {
+        let (staged, target) = (deep.join("staged"), deep.join("n".repeat(length)));
+        fs::write(&staged, b"s").unwrap();
+        raw::move_entry(&staged, &target, Replace::No)
+            .unwrap_or_else(|error| panic!("a {length}-character name: {error}"));
+        assert!(target.exists() && !staged.exists());
+        fs::write(&staged, b"t").unwrap();
+        raw::move_entry(&staged, &target, Replace::Yes).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"t");
+    }
+}
+
+/// A bare file name (the current directory) is moved.
+#[cfg(windows)]
+#[test]
+fn a_move_works_for_relative_paths() {
+    let id = format!("{}-{:?}", std::process::id(), std::thread::current().id());
+    let (staged, target) =
+        (PathBuf::from(format!("rel-staged-{id}")), PathBuf::from(format!("rel-target-{id}")));
+    fs::write(&staged, b"s").unwrap();
+    let result = raw::move_entry(&staged, &target, Replace::No);
+    let (moved, content) = (target.exists(), fs::read(&target).ok());
+    let _ = fs::remove_file(&staged);
+    let _ = fs::remove_file(&target);
+    result.unwrap();
+    assert!(moved);
+    assert_eq!(content.as_deref(), Some(&b"s"[..]));
+}
+
+/// A holder that opened the target without delete sharing (C `fopen`, .NET `FileShare.Read`, a
+/// scanner) delays a replacing move instead of failing it: the move is retried while the holder
+/// lets go, and refused with the system's error when it never does.
+#[cfg(windows)]
+#[test]
+fn a_replacing_move_waits_for_a_holder_that_does_not_share_delete() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let (staged, target) = (dir.path().join("staged"), dir.path().join("target"));
+    fs::write(&target, b"old").unwrap();
+    fs::write(&staged, b"new").unwrap();
+    let holder = fs::OpenOptions::new().read(true).share_mode(1 | 2).open(&target).unwrap(); // read | write, no delete
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        drop(holder);
+    });
+    raw::move_entry(&staged, &target, Replace::Yes).unwrap();
+    releaser.join().unwrap();
+    assert_eq!(fs::read(&target).unwrap(), b"new");
+
+    // A holder that stays: the move is refused, and nothing changed.
+    fs::write(&staged, b"newer").unwrap();
+    let holder = fs::OpenOptions::new().read(true).share_mode(1 | 2).open(&target).unwrap();
+    let error = raw::move_entry(&staged, &target, Replace::Yes).unwrap_err();
+    assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error}");
+    assert_eq!(fs::read(&target).unwrap(), b"new");
+    assert_eq!(fs::read(&staged).unwrap(), b"newer");
+    drop(holder);
+}
+
+/// A move directly under a volume root (`C:\name`): the parent directory handle used for the flush
+/// is opened with only the access a flush needs, which a root accepts. Skipped where the account
+/// may not create files in the root of the system drive.
+#[cfg(windows)]
+#[test]
+fn a_move_directly_under_a_volume_root_works() {
+    let root = PathBuf::from(format!("{}\\", std::env::var("SystemDrive").unwrap_or("C:".into())));
+    let id = std::process::id();
+    let (staged, target) =
+        (root.join(format!("yl-root-staged-{id}")), root.join(format!("yl-root-target-{id}")));
+    if fs::write(&staged, b"s").is_err() {
+        return;
+    }
+    let result = raw::move_entry(&staged, &target, Replace::No);
+    let moved = target.exists();
+    let _ = fs::remove_file(&staged);
+    let _ = fs::remove_file(&target);
+    result.unwrap();
+    assert!(moved);
+}
+
+/// The errors a Cloud Files provider that is not connected makes the platform answer are told
+/// apart from every other error, so a publish can report "not available now" and leave the path
+/// as it was.
+#[test]
+fn the_provider_unavailable_errors_are_recognised_and_others_are_not() {
+    use std::io::Error;
+    assert!(is_cloud_provider_unavailable(&Error::from_raw_os_error(-2145452027)));
+    assert!(is_cloud_provider_unavailable(&Error::from_raw_os_error(0x17B)));
+    assert!(!is_cloud_provider_unavailable(&Error::from_raw_os_error(5)));
+    assert!(!is_cloud_provider_unavailable(&Error::other("not an os error")));
 }

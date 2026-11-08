@@ -35,6 +35,18 @@ struct TestDevice {
 }
 
 fn new_device(device_id: &str) -> TestDevice {
+    new_device_with(device_id, None)
+}
+
+/// [`new_device`] that commits received blocks to the block store, for a test that counts them.
+fn new_store_first_device(device_id: &str) -> TestDevice {
+    new_device_with(device_id, Some(support::store_first_tuning()))
+}
+
+fn new_device_with(
+    device_id: &str,
+    tuning: Option<yadorilink_daemon::engine_tuning::EngineTuning>,
+) -> TestDevice {
     let store_root = tempfile::tempdir().unwrap();
     let store = Arc::new(SegmentBlockStore::new(store_root.path()).unwrap());
     // File-backed WAL, not `open_in_memory`: the shared-cache in-memory
@@ -47,7 +59,14 @@ fn new_device(device_id: &str) -> TestDevice {
     // never block the writer like this; `monkey_chaos.rs` made the same
     // switch for the same reason (`open_file_backed_replica_coordinator`'s doc).
     let index_dir = tempfile::tempdir().unwrap();
-    let sync_state = Arc::new(ReplicaCoordinator::open(index_dir.path().join("index.db")).unwrap());
+    let index_path = index_dir.path().join("index.db");
+    let sync_state = Arc::new(
+        match tuning {
+            Some(tuning) => ReplicaCoordinator::open_with(index_path, tuning),
+            None => ReplicaCoordinator::open(index_path),
+        }
+        .unwrap(),
+    );
     let state = yadorilink_daemon::test_support::isolated_daemon_state(
         device_id.to_string(),
         sync_state,
@@ -964,7 +983,8 @@ async fn a_cancelled_hydration_stops_fetching_blocks_from_the_peer() {
     let content: Vec<u8> = (0..(DEFAULT_BLOCK_SIZE * 40)).map(|i| (i % 251) as u8).collect();
     let (blocks, data_by_hash) = chunk_content(&content);
     let peer = new_device("device-cancel-peer");
-    let hydrating = new_device("device-cancel-hydrating");
+    // Counts the blocks the fetch commits to the store.
+    let hydrating = new_store_first_device("device-cancel-hydrating");
     let _authority = support::shared_checkpoint_authority(
         &[("device-cancel-peer", &peer.state), ("device-cancel-hydrating", &hydrating.state)],
         &[GROUP.to_string()],

@@ -82,6 +82,11 @@ pub trait ServiceStreamTransport: Send + Sync {
 pub trait BlockStreamTransport: Send + Sync {
     /// See [`ServiceStreamTransport::open`] for why the group is a parameter.
     async fn open(&self, group_id: &str) -> Result<Box<dyn PeerBlockStream>, TransportError>;
+
+    /// The peer answered nothing at all to a block request: drop the connection to it, so it
+    /// stops being a candidate and is dialled afresh when it is back. A transport without a
+    /// connection to drop does nothing.
+    fn peer_unresponsive(&self) {}
 }
 
 /// Everything a `PeerSyncSession` needs to reach its peer: where its block

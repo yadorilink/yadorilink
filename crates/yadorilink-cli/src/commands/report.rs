@@ -57,6 +57,7 @@ use yadorilink_reporting::local_store::{
 
 use crate::control_client;
 use crate::error::CliError;
+use crate::i18n::{tr, trf};
 
 fn reporting_dir() -> Result<PathBuf, CliError> {
     Ok(crate::device_config::config_dir()?.join("reporting"))
@@ -119,7 +120,7 @@ fn print_redaction_summary(redaction_summary: &[(String, u32)]) {
         return;
     }
     println!();
-    println!("Redacted before this preview (categories, occurrence counts):");
+    println!("{}", tr("Redacted before this preview (categories, occurrence counts):"));
     for (category, count) in redaction_summary {
         println!("  {category}: {count}");
     }
@@ -269,7 +270,7 @@ async fn submit_report_json(report_json: String, kind: &str, yes: bool) -> Resul
         ));
     }
     if !confirm(&format!("Submit this {kind} report to the configured reporting endpoint?"), yes) {
-        println!("Not submitted.");
+        println!("{}", tr("Not submitted."));
         return Ok(());
     }
     let resp =
@@ -278,7 +279,10 @@ async fn submit_report_json(report_json: String, kind: &str, yes: bool) -> Resul
         return Err(CliError::Other("unexpected daemon response".into()));
     };
     if r.queued_for_retry {
-        println!("Submission failed but the report was queued locally for automatic retry.");
+        println!(
+            "{}",
+            tr("Submission failed but the report was queued locally for automatic retry.")
+        );
     } else {
         println!("Submitted. Receipt: {} (at {})", r.receipt_id, r.submitted_at);
     }
@@ -300,7 +304,7 @@ pub async fn consent_status() -> Result<(), CliError> {
         println!("Queued unsent reports:    {}", r.queue_count);
         println!("Local error candidates:   {}", r.error_candidate_count);
     } else {
-        println!("(daemon not running — showing local consent state only)");
+        println!("{}", tr("(daemon not running — showing local consent state only)"));
         let consent = local_consent_store()?.load_or_default();
         print_consent(&local_consent_to_proto(&consent));
         let candidate_count = local_error_candidates()?.list().map(|v| v.len()).unwrap_or(0);
@@ -395,7 +399,7 @@ pub async fn queue_list() -> Result<(), CliError> {
         return Err(CliError::Other("unexpected daemon response".into()));
     };
     if list.items.is_empty() {
-        println!("Queue is empty.");
+        println!("{}", tr("Queue is empty."));
         return Ok(());
     }
     for item in &list.items {
@@ -425,9 +429,9 @@ pub async fn queue_delete(report_id: String) -> Result<(), CliError> {
         return Err(CliError::Other("unexpected daemon response".into()));
     };
     if r.deleted {
-        println!("Deleted queue item {report_id}");
+        println!("{}", trf!("Deleted queue item {report_id}", report_id = report_id));
     } else {
-        println!("No queue item found with id {report_id}");
+        println!("{}", trf!("No queue item found with id {report_id}", report_id = report_id));
     }
     Ok(())
 }
@@ -475,8 +479,11 @@ pub async fn handle_reportable_error(err: &CliError) {
     }
 
     let category = err.report_category();
-    let builder = yadorilink_reporting::builder::ErrorPayloadBuilder::new(category, "cli")
-        .log_lines(vec![err.to_string()]);
+    // No log line: a CLI error message is written for the person at the
+    // terminal and echoes what they typed ("no folder group named \"x\""),
+    // and a name chosen by the user is not something the pattern-based
+    // redaction can recognise. The category carries what a maintainer needs.
+    let builder = yadorilink_reporting::builder::ErrorPayloadBuilder::new(category, "cli");
     let env = environment::current(&consent);
     let (envelope, summary) = yadorilink_reporting::builder::build_error_envelope(env, builder);
     let _ = store.create_candidate_with_summary(envelope, &summary);

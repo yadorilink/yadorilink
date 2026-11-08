@@ -124,7 +124,7 @@ impl<R: CommandRunner> ServiceManager for OsServices<R> {
                 .run("systemctl", &args(&["--user", "is-enabled", &plan.name]))?
                 .success),
             Kind::WindowsTask => Ok(true),
-            Kind::BundledLaunchAgent | Kind::SystemdSystemUnit => {
+            Kind::BundledLaunchAgent | Kind::SystemdSystemUnit | Kind::PackagedStartupTask => {
                 Err(format!("{} cannot be moved aside by this program", plan.name))
             }
         }
@@ -169,9 +169,11 @@ impl<R: CommandRunner> ServiceManager for OsServices<R> {
                 }
                 self.windows_run_ok(&["/Delete", "/TN", &plan.name, "/F"]).map(|_| ())
             }
-            (Kind::BundledLaunchAgent | Kind::SystemdSystemUnit, _, _) => {
-                Err(format!("{} cannot be moved aside by this program", plan.name))
-            }
+            (
+                Kind::BundledLaunchAgent | Kind::SystemdSystemUnit | Kind::PackagedStartupTask,
+                _,
+                _,
+            ) => Err(format!("{} cannot be moved aside by this program", plan.name)),
         }
     }
 
@@ -241,7 +243,7 @@ impl<R: CommandRunner> ServiceManager for OsServices<R> {
                     Err(format!("no export of task {} exists; cannot restore it", plan.name))
                 }
             }
-            Kind::BundledLaunchAgent | Kind::SystemdSystemUnit => {
+            Kind::BundledLaunchAgent | Kind::SystemdSystemUnit | Kind::PackagedStartupTask => {
                 Err(format!("{} cannot be moved aside by this program", plan.name))
             }
         }

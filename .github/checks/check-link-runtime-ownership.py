@@ -65,6 +65,7 @@ ALLOWED_CONTROLLER_CALLERS = {
     "maintenance_coordinator.rs",
     "app.rs",
     "engine_startup.rs",  # the startup phases `app.rs` and the embedded host share
+    "test_support.rs",  # `watch_link`: a watched link for other crates' tests (feature-gated fixture)
 }
 
 CFG_TEST_ATTR = re.compile(r"#\[cfg\(\s*test\s*\)\]")

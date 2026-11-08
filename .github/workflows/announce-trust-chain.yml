@@ -3,13 +3,13 @@ name: Announce trust chain
 # Announces a new manifest-signing public key in the update trust chain, so that clients learn
 # it before it is ever needed (a spare, or the next key of a planned rotation). The announcement
 # is a trust record signed by the current signing key; that key exists only as the secret of the
-# release-signing Environment, so the record is produced here, inside an approved run, and
+# manifest-signing Environment, so the record is produced here, inside an approved run, and
 # nobody has to hold the seed. Started by hand (workflow_dispatch); no push, tag, schedule or
 # pull request can reach it. Two jobs:
 #
 #   build-signer  no environment, no secret: builds the signing tool from this commit and
 #                 records its SHA-256.
-#   announce      bound to the release-signing Environment. Its required reviewer must approve
+#   announce      bound to the manifest-signing Environment. Its required reviewer must approve
 #                 the run before any secret is released; the Environment is also restricted to
 #                 main. It checks the inputs against the committed chain, appends one record
 #                 with the signing tool, re-checks the result with an independent
@@ -92,7 +92,7 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    environment: release-signing
+    environment: manifest-signing
     permissions:
       contents: read
     steps:

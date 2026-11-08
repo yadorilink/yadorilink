@@ -17,7 +17,8 @@ use yadorilink_windows_provider_policy::host::{
     encode_shown_record, hex, read_shown_at, Backend, HostEvent, LoadedShown, Signal,
 };
 use yadorilink_windows_provider_policy::namespace_policy::{
-    keep_subtree, needs_update, valid_component, EvictOutcome, ShownItem, ShownItems,
+    keep_subtree, needs_update, valid_component, EvictOutcome, PinOutcome, PinWish, ShownItem,
+    ShownItems,
 };
 use yadorilink_windows_provider_policy::provider_authoring::{self, Api, Authoring};
 use yadorilink_windows_provider_policy::provider_client::{
@@ -127,6 +128,14 @@ impl Backend for PlainBackend {
 
     fn evict(&mut self, path: &Path, item_id: &[u8]) -> Result<(), EvictOutcome> {
         self.fs.evict(path, item_id)
+    }
+
+    fn pin(&mut self, _path: &Path, _item_id: Option<&[u8]>, _wish: PinWish) -> PinOutcome {
+        PinOutcome::Unsupported
+    }
+
+    fn pin_mark(&mut self, _path: &Path) -> Option<PinWish> {
+        None
     }
 
     fn materialized(&mut self, shown: &ShownItems) -> HashSet<Vec<u8>> {

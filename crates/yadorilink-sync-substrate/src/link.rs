@@ -497,6 +497,11 @@ impl PeerLink {
         self.connection.paths().iter().any(|path| path.is_relay())
     }
 
+    /// Whether this side dialled the connection (rather than accepted it).
+    pub fn dialled_here(&self) -> bool {
+        self.connection.side().is_client()
+    }
+
     /// Identifies this connection among the links of a process; stable for its life.
     pub fn connection_id(&self) -> usize {
         self.connection.stable_id()
@@ -587,9 +592,12 @@ impl FairLaneGate {
             receiver
         };
         // Dropping this future leaves a dead sender in the queue; the next
-        // handover skips it. Nothing is lost, because nothing was allocated
-        // to it yet.
-        let permit = receiver.await.map_err(|_| SubstrateError::Lane {
+        // handover skips it. A permit handed over just before the drop is
+        // still in the channel: the guard passes it on instead of letting it
+        // fall back to the semaphore, where the waiters behind it would never
+        // find it.
+        let mut waiting = Waiting { gate: self, receiver };
+        let permit = (&mut waiting.receiver).await.map_err(|_| SubstrateError::Lane {
             lane: self.lane,
             reason: "lane budget closed".to_owned(),
         })?;
@@ -604,8 +612,13 @@ impl FairLaneGate {
                 match state.take_next_in_rotation() {
                     Some(waiter) => waiter,
                     // Nobody waiting: releasing it is what makes it available
-                    // to the fast path.
-                    None => return,
+                    // to the fast path. Released while the lock is held, so a
+                    // caller cannot queue between the check and the release
+                    // and wait for a hand-over that will not come.
+                    None => {
+                        drop(permit);
+                        return;
+                    }
                 }
             };
             match waiter.send(permit) {
@@ -614,6 +627,21 @@ impl FairLaneGate {
                 // turn passes to whoever is next.
                 Err(returned) => permit = returned,
             }
+        }
+    }
+}
+
+/// A caller queued for a turn at the gate.
+struct Waiting<'a> {
+    gate: &'a FairLaneGate,
+    receiver: tokio::sync::oneshot::Receiver<OwnedSemaphorePermit>,
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.receiver.close();
+        if let Ok(permit) = self.receiver.try_recv() {
+            self.gate.hand_on(permit);
         }
     }
 }
@@ -789,5 +817,51 @@ mod carrier_tests {
     fn mixed_unselected_paths_and_no_paths_say_nothing() {
         assert_eq!(carrier_from_paths(&[(false, Carrier::Relay), (false, Carrier::Direct)]), None);
         assert_eq!(carrier_from_paths(&[]), None);
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    /// Callers queued for a lane slot are dropped (cancelled fetches) just after the slot was
+    /// handed to the first and before it ran: the slot goes on to the next caller, not back to a
+    /// semaphore that a later caller, seeing the queue non-empty, never looks at.
+    #[tokio::test]
+    async fn a_slot_handed_to_a_dropped_waiter_is_not_lost() {
+        let gate = Arc::new(FairLaneGate::new(Lane::Block, 1));
+        let held = gate.acquire("a").await.unwrap();
+        let waiters: Vec<_> = (0..2)
+            .map(|_| {
+                let gate = gate.clone();
+                tokio::spawn(async move { gate.acquire("b").await })
+            })
+            .collect();
+        // Let them queue behind the held slot.
+        loop {
+            let queued: usize = gate
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .waiting
+                .values()
+                .map(std::collections::VecDeque::len)
+                .sum();
+            if queued == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        // The hand-over to the first, and both dropped with no poll in between.
+        drop(held);
+        for waiter in &waiters {
+            waiter.abort();
+        }
+        for waiter in waiters {
+            assert!(waiter.await.unwrap_err().is_cancelled());
+        }
+
+        let next = tokio::time::timeout(std::time::Duration::from_secs(2), gate.acquire("c")).await;
+        assert!(matches!(next, Ok(Ok(_))), "the slot handed to a dropped waiter was lost");
     }
 }

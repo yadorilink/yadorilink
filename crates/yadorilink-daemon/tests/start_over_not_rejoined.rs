@@ -120,7 +120,7 @@ mod unix_tests {
         status
             .attention_reasons
             .iter()
-            .filter(|reason| reason.starts_with("not_joined:"))
+            .filter(|reason| reason.starts_with("folder_needs_relink:"))
             .cloned()
             .collect()
     }
@@ -157,7 +157,7 @@ mod unix_tests {
             "{response:?}"
         );
         let marked = status(&socket).await;
-        assert_eq!(not_joined(&marked), ["not_joined:g-kept"]);
+        assert_eq!(not_joined(&marked), ["folder_needs_relink:g-kept"]);
         assert_eq!(marked.overall_state, "degraded");
 
         // The app and the daemon restart.
@@ -167,7 +167,7 @@ mod unix_tests {
         let restarted = status(&socket).await;
         assert_eq!(
             not_joined(&restarted),
-            ["not_joined:g-kept"],
+            ["folder_needs_relink:g-kept"],
             "the folder must still need action after a restart, and only that one"
         );
         let Some(RespPayload::ListLinks(list)) =
@@ -210,7 +210,7 @@ mod unix_tests {
             mark(&socket, &folder).await.payload,
             Some(RespPayload::MarkLinkNotRejoined(_))
         ));
-        assert_eq!(not_joined(&status(&socket).await), ["not_joined:g-docs"]);
+        assert_eq!(not_joined(&status(&socket).await), ["folder_needs_relink:g-docs"]);
         // Like an unlink, the stop of a link that scanned files can leave its root locked for a
         // moment; an invite is accepted long after that, so this waits it out.
         let mut attempt = 0;

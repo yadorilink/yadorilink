@@ -21,6 +21,7 @@
 
 pub(crate) mod degraded_link_recheck;
 pub(crate) mod disk_reconcile_backstop;
+pub(crate) mod drift_detector;
 pub(crate) mod durability_confirmation;
 pub(crate) mod gc_idle;
 pub(crate) mod link_volume;

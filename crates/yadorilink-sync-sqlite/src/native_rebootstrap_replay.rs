@@ -54,8 +54,8 @@ use yadorilink_replica_domain::signed_delta::{
 use crate::error::SyncSqliteError;
 use crate::local_author::LocalAuthor;
 use crate::native_rebootstrap::{
-    acquire, rebootstrap_status, resume_preserved, set_state, BlockedReason, BusyOrStore, Crash,
-    InstallAuthority, ReassertAuthority, Reassertability, RebootstrapState,
+    acquire, advance, rebootstrap_status, resume_preserved, BlockedReason, BusyOrStore, Crash,
+    InstallAuthority, Phase, ReassertAuthority, Reassertability, RebootstrapState,
 };
 use crate::native_rebootstrap_recovery::{sha256, Manifest, ManifestRecursive, RecoveryArea};
 use crate::native_store::Admission;
@@ -237,7 +237,7 @@ pub fn catch_up(
     {
         return Err(ReplayError::NotRunnable("the stage moved".into()));
     }
-    set_state(&tx, group, "replaying", now_unix)?;
+    advance(&tx, group, recovery_id, Phase::CatchingUp, Phase::Replaying, now_unix)?;
     tx.commit()?;
     Ok(CatchUpReport { passes, end })
 }

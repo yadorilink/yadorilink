@@ -307,6 +307,23 @@ impl LocalMutationStore for ReplicaCoordinator {
         )
     }
 
+    fn verified_echo_untouched(
+        &self,
+        group_id: &str,
+        path: &str,
+        version: &yadorilink_replica_domain::ids::VersionHash,
+        sync_root: &std::path::Path,
+        out_path: &std::path::Path,
+    ) -> bool {
+        self.verified_echoes.still_untouched(
+            group_id,
+            path,
+            version,
+            out_path,
+            super::peer_replica_state::cached_birth_time_granularity(sync_root),
+        )
+    }
+
     fn commit_local_mutations_batch(
         &self,
         group_id: &str,
@@ -593,6 +610,13 @@ impl LocalMutationStore for ReplicaCoordinator {
         group_id: &str,
     ) -> Result<Vec<(String, yadorilink_replica_domain::file::RecordKind)>, SyncSqliteError> {
         self.file_index_repository().list_indexed_paths_with_kind(group_id)
+    }
+
+    fn list_indexed_stat_rows(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<yadorilink_sync_sqlite::file_index::IndexedStatRow>, SyncSqliteError> {
+        self.file_index_repository().list_indexed_stat_rows(group_id)
     }
 
     fn verify_root(

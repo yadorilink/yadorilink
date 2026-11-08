@@ -523,6 +523,15 @@ mod badge {
     }
 
     #[test]
+    fn content_being_fetched_is_syncing() {
+        let hydrating = local(false, LocalTransition::Hydrating);
+        assert_eq!(shell_badge(S::Synced, hydrating.as_ref()), ShellBadge::Syncing);
+        assert_eq!(shell_badge(S::Pending, hydrating.as_ref()), ShellBadge::Syncing);
+        assert_eq!(shell_badge(S::Unspecified, hydrating.as_ref()), ShellBadge::Unspecified);
+        assert_eq!(shell_badge(S::Error, hydrating.as_ref()), ShellBadge::Error);
+    }
+
+    #[test]
     fn an_error_is_never_hidden_behind_online_only() {
         let remote = local(false, LocalTransition::None);
         assert_eq!(shell_badge(S::Error, remote.as_ref()), ShellBadge::Error);
@@ -567,4 +576,23 @@ async fn a_link_root_under_a_symlinked_prefix_matches_paths_below_missing_direct
     assert_eq!(resolve(&root.join("plain/x/file.txt")), None);
     // Relative paths never match.
     assert_eq!(resolve(Path::new("root/gone/file.txt")), None);
+}
+
+#[tokio::test]
+async fn a_held_file_shows_the_error_state_with_its_reason() {
+    let state = state_with_link("/home/alice/Photos", "group-1");
+    upsert(&state, "A.txt");
+    upsert(&state, "b.txt");
+    state
+        .replica_coordinator
+        .materialization_state_repository()
+        .set_held("group-1", "A.txt", "case_collision", 5)
+        .unwrap();
+    let held = resolve_status_detail(&state.replica_coordinator, "/home/alice/Photos/A.txt");
+    assert_eq!(held.state, ShellSyncState::Error);
+    assert_eq!(held.detail.as_deref(), Some("case_collision"));
+    assert_eq!(
+        resolve_status(&state.replica_coordinator, "/home/alice/Photos/b.txt"),
+        ShellSyncState::Synced
+    );
 }

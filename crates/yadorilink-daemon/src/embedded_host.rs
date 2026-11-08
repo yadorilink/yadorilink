@@ -126,9 +126,83 @@ pub enum StartError {
     /// database's directory, the block store or the provider temp root (symlinks resolved).
     #[error("the installation witness directory is unusable: {0}")]
     WitnessDirUnusable(String),
+    /// The data on disk was written by another build and this one has no migration: the engine
+    /// cannot start over it until the person resets it. `found` and `expected` are the data's and this
+    /// build's format versions for `component`.
+    #[error("{component} was written in format v{found}; this build uses v{expected} and does not migrate older data")]
+    StoreIncompatible { component: StoreComponent, found: i64, expected: i64 },
     /// Any other reason; the message says what to do.
     #[error("{0:#}")]
-    Other(#[from] anyhow::Error),
+    Other(anyhow::Error),
+}
+
+/// Which part of the engine's data an incompatible format version belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreComponent {
+    /// The block store (content blocks): its marker, segment layout or index stamp.
+    BlockStore,
+    /// The sync index database.
+    IndexDatabase,
+}
+
+impl std::fmt::Display for StoreComponent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::BlockStore => "the block store",
+            Self::IndexDatabase => "the index database",
+        })
+    }
+}
+
+impl StartError {
+    /// The cause a host words in its own language, when the error carries one.
+    #[must_use]
+    pub fn reason(&self) -> FailureReason {
+        match self {
+            Self::Other(error) => failure_reason(error.as_ref()),
+            _ => FailureReason::Unspecified,
+        }
+    }
+}
+
+impl From<anyhow::Error> for StartError {
+    /// A failure to open data of another format is the typed [`StartError::StoreIncompatible`]; every
+    /// other failure keeps its message.
+    fn from(error: anyhow::Error) -> Self {
+        use yadorilink_local_storage::StorageError;
+        use yadorilink_sqlite_runtime::DatabaseError;
+        for cause in error.chain() {
+            if let Some(StorageError::AnotherLayout { found, expected, .. }) =
+                cause.downcast_ref::<StorageError>()
+            {
+                return Self::StoreIncompatible {
+                    component: StoreComponent::BlockStore,
+                    found: *found,
+                    expected: *expected,
+                };
+            }
+            let schema = match cause.downcast_ref::<DatabaseError>() {
+                Some(DatabaseError::SchemaTooOld { on_disk_version, supported_version }) => {
+                    Some((*on_disk_version, *supported_version))
+                }
+                _ => match cause.downcast_ref::<crate::sync_error::SyncError>() {
+                    Some(crate::sync_error::SyncError::SchemaTooOld {
+                        on_disk_version,
+                        supported_version,
+                    }) => Some((*on_disk_version, *supported_version)),
+                    _ => None,
+                },
+            };
+            if let Some((found, expected)) = schema {
+                return Self::StoreIncompatible {
+                    component: StoreComponent::IndexDatabase,
+                    found: i64::from(found),
+                    expected: i64::from(expected),
+                };
+            }
+        }
+        Self::Other(error)
+    }
 }
 
 /// What a running engine claimed in this process.
@@ -292,6 +366,96 @@ pub struct CommandError {
     kind: CommandErrorKind,
     message: String,
     operation_id: String,
+    reason: FailureReason,
+}
+
+/// The causes of a failure a host words in its own language and can act on. Everything else is
+/// `Unspecified`: the host shows a generic sentence and the engine's message goes to the log.
+/// Never invent a finer key for a rare internal cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureReason {
+    /// Not told apart: show a generic failure; the message is for the log.
+    Unspecified,
+    /// The device has no room left for what the engine had to write.
+    DiskFull,
+    /// The system refused the engine access to its data or to the folder.
+    AccessDenied,
+    /// The credential store (keychain, key file) exists and cannot be used.
+    CredentialStoreUnusable,
+}
+
+/// The reason an error's cause chain carries: a full disk (the OS's, the database's, or the
+/// engine's own headroom check), a refusal of access, an unusable credential store;
+/// `Unspecified` otherwise.
+#[must_use]
+pub fn failure_reason(error: &(dyn std::error::Error + 'static)) -> FailureReason {
+    use crate::application::model::LinkRefusal;
+    fn io_reason(io: &std::io::Error) -> Option<FailureReason> {
+        match io.kind() {
+            std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded => {
+                Some(FailureReason::DiskFull)
+            }
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem => {
+                Some(FailureReason::AccessDenied)
+            }
+            _ => None,
+        }
+    }
+    for cause in std::iter::successors(Some(error), |e| e.source()) {
+        if let Some(reason) = cause.downcast_ref::<std::io::Error>().and_then(io_reason) {
+            return reason;
+        }
+        // The engine's own errors: a `transparent` wrapper hides the io error inside it from
+        // the chain, so they are read for what they hold.
+        if let Some(sync) = cause.downcast_ref::<crate::sync_error::SyncError>() {
+            match sync.link_refusal() {
+                Some(LinkRefusal::DiskFull) => return FailureReason::DiskFull,
+                Some(LinkRefusal::AccessDenied) => return FailureReason::AccessDenied,
+                _ => {}
+            }
+            if let crate::sync_error::SyncError::Io(io) = sync {
+                if let Some(reason) = io_reason(io) {
+                    return reason;
+                }
+            }
+        }
+        if let Some(daemon) = cause.downcast_ref::<crate::error::DaemonError>() {
+            match daemon.link_refusal() {
+                Some(LinkRefusal::DiskFull) => return FailureReason::DiskFull,
+                Some(LinkRefusal::AccessDenied) => return FailureReason::AccessDenied,
+                _ => {}
+            }
+        }
+        if matches!(
+            cause.downcast_ref::<yadorilink_local_storage::StorageError>(),
+            Some(yadorilink_local_storage::StorageError::DiskPressure { .. })
+        ) {
+            return FailureReason::DiskFull;
+        }
+        if let Some(rusqlite::Error::SqliteFailure(failure, _)) =
+            cause.downcast_ref::<rusqlite::Error>()
+        {
+            if failure.code == rusqlite::ErrorCode::DiskFull {
+                return FailureReason::DiskFull;
+            }
+        }
+        // A credential store that is damaged, misconfigured or unavailable; "not enrolled", a busy
+        // lock and a plain I/O failure are not that (the io error inside is read on the next step).
+        if let Some(store) = cause.downcast_ref::<yadorilink_fapi_client::store::StoreError>() {
+            use yadorilink_fapi_client::store::StoreError;
+            if !matches!(
+                store,
+                StoreError::NotEnrolled
+                    | StoreError::LockTimeout { .. }
+                    | StoreError::ClientIdChanged { .. }
+                    | StoreError::EntryInUse(_)
+                    | StoreError::Io { .. }
+            ) {
+                return FailureReason::CredentialStoreUnusable;
+            }
+        }
+    }
+    FailureReason::Unspecified
 }
 
 /// What kind of failure a [`CommandError`] is, for the cases a host acts on.
@@ -323,15 +487,37 @@ impl CommandError {
             kind: CommandErrorKind::Failed,
             message: message.into(),
             operation_id: String::new(),
+            reason: FailureReason::Unspecified,
+        }
+    }
+
+    /// A failure with no typed kind that came from `error`: its message, and the reason its cause
+    /// chain carries.
+    pub fn from_error(error: &(dyn std::error::Error + 'static)) -> Self {
+        Self {
+            kind: CommandErrorKind::Failed,
+            message: error.to_string(),
+            operation_id: String::new(),
+            reason: failure_reason(error),
         }
     }
 
     fn refused(code: ApplicationErrorCode, message: String, operation_id: String) -> Self {
-        Self { kind: CommandErrorKind::Refused(code), message, operation_id }
+        Self {
+            kind: CommandErrorKind::Refused(code),
+            message,
+            operation_id,
+            reason: FailureReason::Unspecified,
+        }
     }
 
     fn preserved(refusal: PreservedRefusal, message: String) -> Self {
-        Self { kind: CommandErrorKind::Preserved(refusal), message, operation_id: String::new() }
+        Self {
+            kind: CommandErrorKind::Preserved(refusal),
+            message,
+            operation_id: String::new(),
+            reason: FailureReason::Unspecified,
+        }
     }
 
     fn readopt(refusal: ReadoptRefusal, message: impl Into<String>) -> Self {
@@ -339,6 +525,7 @@ impl CommandError {
             kind: CommandErrorKind::Readopt(refusal),
             message: message.into(),
             operation_id: String::new(),
+            reason: FailureReason::Unspecified,
         }
     }
 
@@ -349,6 +536,7 @@ impl CommandError {
                       create it as a full copy, or join a group that already has one"
                 .to_owned(),
             operation_id: String::new(),
+            reason: FailureReason::Unspecified,
         }
     }
 
@@ -359,6 +547,7 @@ impl CommandError {
                       use provider folders on this platform"
                 .to_owned(),
             operation_id: String::new(),
+            reason: FailureReason::Unspecified,
         }
     }
 
@@ -378,6 +567,13 @@ impl CommandError {
     #[must_use]
     pub fn operation_id(&self) -> &str {
         &self.operation_id
+    }
+
+    /// The cause a host words in its own language; `Unspecified` for most failures, whose
+    /// message is for the log.
+    #[must_use]
+    pub fn reason(&self) -> FailureReason {
+        self.reason
     }
 }
 
@@ -450,7 +646,7 @@ impl EngineCommands {
             tokio::task::spawn_blocking(move || links.require_risks_acknowledged(&path, false))
                 .await
                 .map_err(|e| CommandError::failed(format!("link preflight did not complete: {e}")))?
-                .map_err(|e| CommandError::failed(e.to_string()))?;
+                .map_err(|e| CommandError::from_error(&e))?;
         }
         self.context
             .application
@@ -464,7 +660,7 @@ impl EngineCommands {
             })
             .await
             .map(|_| ())
-            .map_err(|e| CommandError::failed(e.to_string()))
+            .map_err(|e| CommandError::from_error(&e))
     }
 
     /// Restores a file to an earlier version. `Ok(false)` when there is no earlier version.
@@ -477,7 +673,7 @@ impl EngineCommands {
             .version_restore
             .restore_version(&command.group_id, &command.path, command.version_seq)
             .await
-            .map_err(|e| CommandError::failed(e.to_string()))
+            .map_err(|e| CommandError::from_error(&e))
     }
 
     /// Recent file events across every linked folder, newest first: the same query the desktop
@@ -495,7 +691,7 @@ impl EngineCommands {
             .queries
             .file_history
             .list_activity(query)
-            .map_err(|e| CommandError::failed(e.to_string()))?;
+            .map_err(|e| CommandError::from_error(&e))?;
         Ok(events.into_iter().map(crate::queries::file_history::activity_view_to_proto).collect())
     }
 
@@ -509,7 +705,7 @@ impl EngineCommands {
             .queries
             .link_status
             .list_links()
-            .map_err(|e| CommandError::failed(e.to_string()))?;
+            .map_err(|e| CommandError::from_error(&e))?;
         Ok(links.into_iter().map(linked_folder).collect())
     }
 
@@ -552,7 +748,7 @@ impl EngineCommands {
             .link_lifecycle
             .mark_not_rejoined(key)
             .await
-            .map_err(|e| CommandError::failed(e.to_string()))
+            .map_err(|e| CommandError::from_error(&e))
     }
 }
 
@@ -664,6 +860,10 @@ impl Engine {
             None
         };
 
+        // The credential store must be readable before anything is created or migrated, as in
+        // `app::run`: an unreadable one refuses the start while the data area is untouched.
+        crate::credential_store::installation(&dir, &credentials).map_err(anyhow::Error::from)?;
+
         // Before either store is opened or settled: a second engine over the same database or
         // block store, in this or another process, is refused here rather than resetting the
         // first one's state or reclaiming blocks it needs.
@@ -711,6 +911,7 @@ impl Engine {
             application,
             crate::adapters::build_query_services(state.clone()),
             dir.clone(),
+            state.network_policy.clone(),
         ));
         let shell_context = crate::engine_startup::start_provider(
             &state,
@@ -887,7 +1088,7 @@ impl Engine {
     /// When the row cannot be written.
     #[doc(hidden)]
     pub fn add_link_row_for_test(&self, key: &str, group_id: &str, on_demand: bool) {
-        let links = self.state.replica_coordinator.link_repository();
+        let links = self.state.replica_coordinator.link_admission();
         links.add_link(key, group_id).expect("the link row is written");
         if on_demand {
             links
@@ -913,7 +1114,9 @@ impl Engine {
         let links = self.state.replica_coordinator.link_repository();
         let key = format!("provider://test-{group_id}");
         if links.list_links().expect("links are listed").iter().all(|l| l.group_id != group_id) {
-            links
+            self.state
+                .replica_coordinator
+                .link_admission()
                 .add_provider_link(
                     &key,
                     group_id,
@@ -943,6 +1146,98 @@ impl Engine {
     #[doc(hidden)]
     pub fn stall_stop_for_test(&self, release: std::sync::mpsc::Receiver<()>) {
         *self.stall_stop.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(release);
+    }
+}
+
+#[cfg(test)]
+mod failure_reason_tests {
+    use super::*;
+
+    fn io(kind: std::io::ErrorKind) -> std::io::Error {
+        std::io::Error::new(kind, "the system said so")
+    }
+
+    /// The causes an app words are read from the error's chain, however it is wrapped.
+    #[test]
+    fn a_full_disk_and_a_refused_access_are_read_from_the_cause_chain() {
+        assert_eq!(failure_reason(&io(std::io::ErrorKind::StorageFull)), FailureReason::DiskFull);
+        assert_eq!(
+            failure_reason(&io(std::io::ErrorKind::PermissionDenied)),
+            FailureReason::AccessDenied
+        );
+        assert_eq!(
+            failure_reason(&io(std::io::ErrorKind::ReadOnlyFilesystem)),
+            FailureReason::AccessDenied
+        );
+        let wrapped = anyhow::Error::from(io(std::io::ErrorKind::StorageFull))
+            .context("could not write the index")
+            .context("could not start");
+        assert_eq!(failure_reason(wrapped.as_ref()), FailureReason::DiskFull);
+        assert_eq!(
+            StartError::Other(wrapped).reason(),
+            FailureReason::DiskFull,
+            "a start that failed for lack of room says so"
+        );
+    }
+
+    #[test]
+    fn the_engines_own_disk_errors_are_a_full_disk() {
+        use crate::sync_error::SyncError;
+        let pressure = SyncError::DiskPressure {
+            path: "/data".into(),
+            volume: "/data".into(),
+            available_bytes: 0,
+            headroom_bytes: 1,
+        };
+        assert_eq!(failure_reason(&pressure), FailureReason::DiskFull);
+        let wrapped_io = SyncError::Io(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        assert_eq!(failure_reason(&wrapped_io), FailureReason::DiskFull);
+        let denied = SyncError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(failure_reason(&denied), FailureReason::AccessDenied);
+        assert_eq!(
+            CommandError::from_error(&pressure).reason(),
+            FailureReason::DiskFull,
+            "a pin, restore or evict refused for lack of headroom says so"
+        );
+    }
+
+    #[test]
+    fn a_credential_store_error_that_is_not_about_the_store_is_not_told_as_such() {
+        use yadorilink_fapi_client::store::StoreError;
+        assert_eq!(failure_reason(&StoreError::NotEnrolled), FailureReason::Unspecified);
+        let full = StoreError::Io {
+            path: "/c".into(),
+            source: std::io::Error::from(std::io::ErrorKind::StorageFull),
+        };
+        assert_eq!(failure_reason(&full), FailureReason::DiskFull, "the io cause decides");
+    }
+
+    #[test]
+    fn a_credential_store_that_cannot_be_used_is_told_apart() {
+        let store = yadorilink_fapi_client::store::StoreError::ConflictingConfiguration;
+        assert_eq!(failure_reason(&store), FailureReason::CredentialStoreUnusable);
+        let wrapped = anyhow::Error::from(store).context("could not open the credentials");
+        assert_eq!(StartError::Other(wrapped).reason(), FailureReason::CredentialStoreUnusable);
+    }
+
+    /// Anything else stays `Unspecified`: no finer key than an app will word.
+    #[test]
+    fn every_other_cause_is_unspecified() {
+        assert_eq!(failure_reason(&io(std::io::ErrorKind::NotFound)), FailureReason::Unspecified);
+        assert_eq!(
+            StartError::Other(anyhow::anyhow!("some internal failure")).reason(),
+            FailureReason::Unspecified
+        );
+        assert_eq!(CommandError::failed("unknown item").reason(), FailureReason::Unspecified);
+        assert_eq!(StartError::WitnessPlacementRequired.reason(), FailureReason::Unspecified);
+    }
+
+    #[test]
+    fn a_command_failure_from_an_error_carries_the_reason_and_the_message_for_the_log() {
+        let error = CommandError::from_error(&io(std::io::ErrorKind::StorageFull));
+        assert_eq!(error.kind(), CommandErrorKind::Failed);
+        assert_eq!(error.reason(), FailureReason::DiskFull);
+        assert!(error.message().contains("the system said so"));
     }
 }
 
@@ -1025,6 +1320,57 @@ mod claim_tests {
         // Another engine in A with X, and in B with Y, share their own directory's entry.
         claim_for(&mut running, "/a/other", &a, &file_config(&x)).unwrap();
         claim_for(&mut running, "/b/third", &b, &file_config(&y)).unwrap();
+    }
+
+    /// Data written by another build is the typed start refusal, with the versions found and expected,
+    /// whether the cause is the bare error or buried under context; any other failure keeps its message.
+    #[test]
+    fn data_of_another_format_is_a_typed_start_refusal() {
+        use yadorilink_local_storage::StorageError;
+        use yadorilink_sqlite_runtime::DatabaseError;
+        let layout = anyhow::Error::from(StorageError::AnotherLayout {
+            found: 2,
+            expected: 3,
+            layout: "block store format",
+            detail: "the block store's marker (format_version=2)".into(),
+        })
+        .context("open the block store");
+        assert!(matches!(
+            StartError::from(layout),
+            StartError::StoreIncompatible {
+                component: StoreComponent::BlockStore,
+                found: 2,
+                expected: 3
+            }
+        ));
+        let schema = anyhow::Error::from(DatabaseError::SchemaTooOld {
+            on_disk_version: 140,
+            supported_version: 141,
+        });
+        assert!(matches!(
+            StartError::from(schema),
+            StartError::StoreIncompatible {
+                component: StoreComponent::IndexDatabase,
+                found: 140,
+                expected: 141
+            }
+        ));
+        let via_sync = anyhow::Error::from(crate::sync_error::SyncError::SchemaTooOld {
+            on_disk_version: 7,
+            supported_version: 141,
+        });
+        assert!(matches!(
+            StartError::from(via_sync),
+            StartError::StoreIncompatible {
+                component: StoreComponent::IndexDatabase,
+                found: 7,
+                ..
+            }
+        ));
+        assert!(matches!(
+            StartError::from(anyhow::anyhow!("disk is read-only")),
+            StartError::Other(_)
+        ));
     }
 
     #[cfg(unix)]
@@ -1182,6 +1528,16 @@ pub use history_commands::{
     ItemVersion, MAX_DELETED_ITEMS,
 };
 
+mod conflict_commands;
+pub use conflict_commands::{
+    ConflictReason, ConflictResolution, ConflictedFile, PendingPublication,
+};
+
+mod offline_commands;
+pub use offline_commands::{
+    EvictOutcome, ItemRetention, PinOutcome, RetentionRule, SpaceReclaimItem, SpaceReclaimPreview,
+};
+
 mod write_commands;
 pub use write_commands::{
     ApplyChange, ApplyResponse, DeliveryItem, DeliveryReport, DeliveryState, ItemDelivery,
@@ -1189,6 +1545,7 @@ pub use write_commands::{
 };
 
 mod app_commands;
+pub use crate::network_policy::{NetworkCost, PolicyState};
 pub use app_commands::{
     CreateShare, DoctorCheck, DoctorStatus, HandoffInfo, JoinGroup, JoinShare, PauseFor, PauseLink,
     PreservedItem, PreservedKind, PreservedRef, PreservedRefusal, ProviderFolder,

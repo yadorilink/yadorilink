@@ -207,9 +207,13 @@ fn roots_agree_for_the_same_history_and_differ_after_one_more_delta() {
     for c in [&left, &right] {
         author_delta(c, "a", "x", 1);
     }
+    for c in [&left, &right] {
+        crate::native_namespace::flush_pending(c, &group()).unwrap();
+    }
     assert_eq!(summary_roots(&left, &group()).unwrap(), summary_roots(&right, &group()).unwrap());
 
     author_delta(&left, "a", "y", 2);
+    crate::native_namespace::flush_pending(&left, &group()).unwrap();
     assert_ne!(summary_roots(&left, &group()).unwrap(), summary_roots(&right, &group()).unwrap());
 }
 

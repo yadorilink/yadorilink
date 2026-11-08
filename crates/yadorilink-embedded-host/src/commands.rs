@@ -26,10 +26,13 @@ pub use yadorilink_client_core::DesktopError;
 pub use yadorilink_daemon::embedded_host::{
     ordinary_folder_links_supported, ApplyChange, ApplyResponse, CommandError, CommandErrorKind,
     CreateShare, DoctorCheck, DoctorStatus, HandoffInfo, JoinGroup, JoinShare, LinkFolder,
-    LinkedFolder, PauseFor, PauseLink, PreservedItem, PreservedKind, PreservedRef,
-    PreservedRefusal, ProviderFolder, ReadoptMarkedFolder, ReadoptOutcome, ReadoptRefusal,
-    RestoreVersion, ResumeLink, ShareFolder, ShareOutcome, SpaceManagement, UnlinkFolder,
-    UnlinkOutcome,
+    LinkedFolder, NetworkCost, PauseFor, PauseLink, PolicyState, PreservedItem, PreservedKind,
+    PreservedRef, PreservedRefusal, ProviderFolder, ReadoptMarkedFolder, ReadoptOutcome,
+    ReadoptRefusal, RestoreVersion, ResumeLink, ShareFolder, ShareOutcome, SpaceManagement,
+    UnlinkFolder, UnlinkOutcome,
+};
+pub use yadorilink_daemon::embedded_host::{
+    ConflictReason, ConflictResolution, ConflictedFile, PendingPublication,
 };
 pub use yadorilink_daemon::embedded_host::{
     DeletedItem, DeletedItems, DeletedParent, HistoryEntryKind, HistoryVersionState, ItemHistory,
@@ -39,6 +42,9 @@ pub use yadorilink_daemon::embedded_host::{
     DeliveryItem, DeliveryReport, DeliveryState, ItemDelivery, StageMode, StageRefused,
     StageSource, StagedHow, StagedUpload, MAX_DELIVERY_ITEMS,
 };
+pub use yadorilink_daemon::embedded_host::{
+    EvictOutcome, ItemRetention, PinOutcome, RetentionRule, SpaceReclaimItem, SpaceReclaimPreview,
+};
 
 use crate::account::{
     AccountCommand, AccountCommands, AccountDeletionImpact, AccountDeletionRequest,
@@ -46,6 +52,35 @@ use crate::account::{
     SignInStep, SignOutOutcome,
 };
 use crate::HostError;
+
+/// The code of a Send link. It unlocks the link's file list, so its `Debug` output names none of it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SendCode(String);
+
+impl std::fmt::Debug for SendCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SendCode(..)")
+    }
+}
+
+impl From<String> for SendCode {
+    fn from(code: String) -> Self {
+        Self(code)
+    }
+}
+
+impl From<&str> for SendCode {
+    fn from(code: &str) -> Self {
+        Self(code.to_owned())
+    }
+}
+
+impl std::ops::Deref for SendCode {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
 
 /// A command to the engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +122,17 @@ pub enum Command {
     SetSpaceManagement {
         enabled: bool,
     },
+    /// The metered-network policy: the stored setting and what the host last reported.
+    NetworkPolicy,
+    /// Allows (`true`) or pauses (`false`, the default) sync on a metered connection.
+    SetSyncOnMetered {
+        enabled: bool,
+    },
+    /// The host's report of what the connection is. Send it at start and on every change; the
+    /// engine does not guess.
+    ReportNetworkCost {
+        cost: NetworkCost,
+    },
     /// Mints a one-use expiring Send link for the files and folders at `source_paths`
     /// (absolute paths). The code is shown once.
     CreateSendLink {
@@ -95,11 +141,11 @@ pub enum Command {
     },
     /// Who sends the link a code names and what it carries; nothing is consumed.
     PreviewSendLink {
-        code: String,
+        code: SendCode,
     },
     /// Redeems a code with this device (or `device_id`); answers the link id.
     RedeemSendLink {
-        code: String,
+        code: SendCode,
         device_id: Option<String>,
         /// Absolute folder to receive the link's files into; `None` = the engine's own choice.
         destination_dir: Option<String>,
@@ -134,6 +180,24 @@ pub enum Command {
     CancelTransfer {
         transfer_id: String,
     },
+    /// Resumes a failed or cancelled received transfer after the engine re-validates it; a
+    /// transfer this device sent is refused.
+    RetryTransfer {
+        transfer_id: String,
+    },
+    /// Offers a sent transfer again once the engine has checked the files are unchanged; a
+    /// transfer this device received is refused.
+    RetrySentTransfer {
+        transfer_id: String,
+    },
+    /// Mints a one-use invite to a folder group. `None` role or lifetime takes the service's
+    /// default.
+    MintInvite {
+        group_id: String,
+        role: Option<String>,
+        ttl_secs: Option<u64>,
+        requires_approval: bool,
+    },
     /// Sign-in, device registration, sign-out and account deletion.
     Account(AccountCommand),
     /// Puts a file into the engine's ingest directory for an [`Command::ApplyChange`] to name:
@@ -167,6 +231,62 @@ pub enum Command {
     ListDeletedItems {
         root_id: Vec<u8>,
     },
+    /// Brings back everything the folder delete or rename that removed the deleted entry at
+    /// `path` (a listed deleted item's path) removed. One deleted file or folder is brought back
+    /// by an [`Command::ApplyChange`] whose request names `restore_from`.
+    RestoreDeletedOperation {
+        root_id: Vec<u8>,
+        path: String,
+    },
+    /// Sets the retention rule at an item: keep it on this device, keep nothing of it in the
+    /// folder (provider folders), or remove the rule set at exactly this item. The rule is
+    /// recorded first and stands even when a download it starts fails.
+    SetRetentionRule {
+        root_id: Vec<u8>,
+        item_id: Vec<u8>,
+        rule: RetentionRule,
+    },
+    /// The retention policy in force at one item. Read-only.
+    ItemRetention {
+        root_id: Vec<u8>,
+        item_id: Vec<u8>,
+    },
+    /// Frees the local copy of one item (the host drops its copy; the engine frees its cached
+    /// blocks when a full replica holds the version).
+    EvictItem {
+        root_id: Vec<u8>,
+        item_id: Vec<u8>,
+    },
+    /// What automatic space management would free now, without freeing anything. Read-only.
+    PreviewSpaceReclaim,
+    /// The conflict copies of the provider folders. Read-only.
+    ListConflicts,
+    /// Settles one conflict copy (Keep this / Keep both); the engine re-checks every precondition.
+    ResolveConflict {
+        root_id: Vec<u8>,
+        item_id: Vec<u8>,
+        resolution: ConflictResolution,
+    },
+    /// Up to `limit` changes per folder waiting on the operating system. Read-only.
+    ListProviderPending {
+        limit: u32,
+    },
+    /// Asks the engine to try a preserved item again.
+    RetryPreserved(PreservedRef),
+    /// Marks a provider folder publish-only on this device (or clears it): it then adds files
+    /// but refuses to author a modify or a delete there. Remote changes still arrive.
+    SetPublishOnly {
+        root_id: Vec<u8>,
+        publish_only: bool,
+    },
+    /// Takes a device's access to a folder group away. Without `force`, refused
+    /// (`ReplicaNotReady`, nothing changed) when the group would be left without another
+    /// confirmed complete copy; `force` is a data-loss override, never a retry convenience.
+    RevokeMember {
+        group_id: String,
+        device_id: String,
+        force: bool,
+    },
 }
 
 impl Command {
@@ -175,7 +295,7 @@ impl Command {
         match self {
             Self::ListFolders | Self::Status | Self::Doctor | Self::ListPreserved => true,
             Self::ListActivity { .. } => true,
-            Self::SpaceManagement => true,
+            Self::SpaceManagement | Self::NetworkPolicy => true,
             Self::PreviewSendLink { .. }
             | Self::SendLinkStatus { .. }
             | Self::ListSendLinks
@@ -187,7 +307,11 @@ impl Command {
             Self::Account(account) => account.read_only(),
             Self::VersionDelivery { .. }
             | Self::ListItemVersions { .. }
-            | Self::ListDeletedItems { .. } => true,
+            | Self::ListDeletedItems { .. }
+            | Self::ItemRetention { .. }
+            | Self::PreviewSpaceReclaim
+            | Self::ListConflicts
+            | Self::ListProviderPending { .. } => true,
             Self::LinkFolder(_)
             | Self::RestoreVersion(_)
             | Self::CreateShare(_)
@@ -200,13 +324,25 @@ impl Command {
             | Self::RestorePreserved(_)
             | Self::DiscardPreserved(_)
             | Self::SetSpaceManagement { .. }
+            | Self::SetPublishOnly { .. }
+            | Self::SetSyncOnMetered { .. }
+            | Self::ReportNetworkCost { .. }
             | Self::CreateSendLink { .. }
             | Self::RedeemSendLink { .. }
             | Self::CancelSendLink { .. }
             | Self::ReceiveTransfer { .. }
             | Self::CancelTransfer { .. }
+            | Self::RetryTransfer { .. }
+            | Self::RetrySentTransfer { .. }
+            | Self::MintInvite { .. }
+            | Self::RestoreDeletedOperation { .. }
             | Self::StageUpload { .. }
             | Self::DiscardStagedUpload { .. }
+            | Self::SetRetentionRule { .. }
+            | Self::EvictItem { .. }
+            | Self::ResolveConflict { .. }
+            | Self::RetryPreserved(_)
+            | Self::RevokeMember { .. }
             | Self::ApplyChange(_) => false,
         }
     }
@@ -228,6 +364,7 @@ pub enum CommandOutput {
     Doctor(Vec<DoctorCheck>),
     Preserved(Vec<PreservedItem>),
     SpaceManagement(SpaceManagement),
+    NetworkPolicy(PolicyState),
     Account(Box<AccountStatus>),
     SignInBegun(SignInId),
     /// What `CancelCurrentSignIn` found.
@@ -246,6 +383,8 @@ pub enum CommandOutput {
     JoinableGroups(Vec<yadorilink_client_core::dto::GroupSummary>),
     /// The devices of one folder group.
     GroupDevices(Vec<yadorilink_client_core::dto::MemberSummary>),
+    /// A device's access to a group was taken away.
+    MemberRevoked(yadorilink_client_core::dto::MembershipOutcome),
     /// An ownership offer, as just created, cancelled or declined.
     PrimaryTransfer(yadorilink_client_core::dto::PrimaryTransferSummary),
     /// An accepted ownership offer: this account is now the folder's primary owner.
@@ -276,6 +415,22 @@ pub enum CommandOutput {
     ItemVersions(Box<HistoryOutcome<ItemHistory>>),
     /// The deleted items of a provider folder.
     DeletedItems(Box<HistoryOutcome<DeletedItems>>),
+    /// What a folder restore from the deleted items brought back.
+    FolderRestored(yadorilink_client_core::dto::FolderRestoreOutcome),
+    /// An invite just minted.
+    Invite(yadorilink_client_core::dto::InviteSummary),
+    /// What pinning an item did.
+    Pinned(PinOutcome),
+    /// The retention policy in force at an item (after an unpin, or as read).
+    Retention(ItemRetention),
+    /// What freeing an item's local copy did.
+    Evicted(EvictOutcome),
+    /// What automatic space management would free.
+    SpaceReclaim(SpaceReclaimPreview),
+    Conflicts(Vec<ConflictedFile>),
+    /// Where the settled conflict's content is afterwards.
+    ConflictResolved(String),
+    ProviderPending(Vec<PendingPublication>),
 }
 
 /// A history listing with the names of the devices that authored what it lists (by device id; a
@@ -585,6 +740,10 @@ async fn run_command(
     outcome
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one flat arm per command; splitting it would only hide the table"
+)]
 async fn run_command_inner(
     commands: &yadorilink_daemon::embedded_host::EngineCommands,
     accounts: &AccountCommands,
@@ -625,6 +784,13 @@ async fn run_command_inner(
         Command::SpaceManagement => CommandOutput::SpaceManagement(commands.space_management()),
         Command::SetSpaceManagement { enabled } => {
             commands.set_space_management(enabled).map(CommandOutput::SpaceManagement)?
+        }
+        Command::NetworkPolicy => CommandOutput::NetworkPolicy(commands.network_policy()),
+        Command::SetSyncOnMetered { enabled } => {
+            commands.set_sync_on_metered(enabled).map(CommandOutput::NetworkPolicy)?
+        }
+        Command::ReportNetworkCost { cost } => {
+            CommandOutput::NetworkPolicy(commands.report_network_cost(cost))
         }
         Command::ListActivity { limit, before_cursor, filter } => {
             let request = yadorilink_client_core::dto::activity_request(
@@ -705,11 +871,34 @@ async fn run_command_inner(
         Command::CancelTransfer { transfer_id } => {
             commands.cancel_transfer(&transfer_id).map(|()| CommandOutput::Done)?
         }
-        Command::Account(AccountCommand::Status) => {
-            CommandOutput::Account(Box::new(accounts.account_status_with(
-                commands.linked_folders_snapshot().await.ok().map(|l| !l.is_empty()),
-            )))
+        Command::RetryTransfer { transfer_id } => {
+            CommandOutput::Received(yadorilink_client_core::dto::received_transfer(
+                commands.retry_transfer(&transfer_id).await?,
+            ))
         }
+        Command::RetrySentTransfer { transfer_id } => {
+            CommandOutput::SendOffered(yadorilink_client_core::dto::sent_transfer(
+                commands.retry_sent_transfer(&transfer_id).await?,
+            ))
+        }
+        Command::MintInvite { group_id, role, ttl_secs, requires_approval } => {
+            let invite = commands
+                .mint_invite(&group_id, role.as_deref(), ttl_secs, requires_approval)
+                .await?;
+            CommandOutput::Invite(yadorilink_client_core::dto::invite_summary(&invite))
+        }
+        Command::RestoreDeletedOperation { root_id, path } => {
+            CommandOutput::FolderRestored(yadorilink_client_core::dto::folder_restore_outcome(
+                &commands.restore_deleted_operation(&root_id, &path).await?,
+            ))
+        }
+        Command::Account(AccountCommand::Status) => CommandOutput::Account(Box::new(
+            accounts
+                .account_status_with(
+                    commands.linked_folders_snapshot().await.ok().map(|l| !l.is_empty()),
+                )
+                .await,
+        )),
         Command::Account(account) => accounts.run(commands, account).await?,
         Command::StageUpload { source, mode } => {
             CommandOutput::Staged(commands.stage_upload(source, mode).await)
@@ -739,12 +928,44 @@ async fn run_command_inner(
                 if named { accounts.device_names().await } else { Default::default() };
             CommandOutput::ItemVersions(Box::new(HistoryOutcome { listing, device_names }))
         }
+        Command::SetPublishOnly { root_id, publish_only } => {
+            commands.set_publish_only(&root_id, publish_only).map(|()| CommandOutput::Done)?
+        }
         Command::ListDeletedItems { root_id } => {
             let listing = commands.list_deleted_items(&root_id)?;
             let named = listing.items.iter().any(|v| v.origin_device_id.is_some());
             let device_names =
                 if named { accounts.device_names().await } else { Default::default() };
             CommandOutput::DeletedItems(Box::new(HistoryOutcome { listing, device_names }))
+        }
+        Command::SetRetentionRule { root_id, item_id, rule } => {
+            CommandOutput::Pinned(commands.set_retention_rule(&root_id, &item_id, rule).await?)
+        }
+        Command::ItemRetention { root_id, item_id } => {
+            CommandOutput::Retention(commands.item_retention(&root_id, &item_id)?)
+        }
+        Command::EvictItem { root_id, item_id } => {
+            CommandOutput::Evicted(commands.evict_item(&root_id, &item_id).await?)
+        }
+        Command::ListConflicts => CommandOutput::Conflicts(commands.list_conflicts()?),
+        Command::ResolveConflict { root_id, item_id, resolution } => {
+            CommandOutput::ConflictResolved(
+                commands.resolve_conflict(&root_id, &item_id, resolution).await?,
+            )
+        }
+        Command::ListProviderPending { limit } => {
+            CommandOutput::ProviderPending(commands.list_provider_pending(limit)?)
+        }
+        Command::RevokeMember { group_id, device_id, force } => {
+            let outcome = commands.revoke_member(group_id, device_id, force).await?;
+            CommandOutput::MemberRevoked(yadorilink_client_core::dto::membership_outcome(&outcome))
+        }
+        Command::RetryPreserved(item) => {
+            commands.retry_preserved(item).await?;
+            CommandOutput::Done
+        }
+        Command::PreviewSpaceReclaim => {
+            CommandOutput::SpaceReclaim(commands.preview_space_reclaim().await?)
         }
     })
 }
@@ -780,7 +1001,7 @@ async fn status(
     accounts: &AccountCommands,
 ) -> Result<CommandOutput, Failure> {
     let response = commands.status_snapshot().await?;
-    let account = accounts.account_status_with(Some(!response.links.is_empty()));
+    let account = accounts.account_status_with(Some(!response.links.is_empty())).await;
     Ok(CommandOutput::Status(Box::new(yadorilink_client_core::dto::status_snapshot(
         &response,
         account,
@@ -790,6 +1011,21 @@ async fn status(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn debug_output_of_a_send_link_command_never_shows_the_code() {
+        use super::Command;
+        let preview = Command::PreviewSendLink { code: "SECRETCODE".into() };
+        let redeem = Command::RedeemSendLink {
+            code: "SECRETCODE".into(),
+            device_id: Some("dev".into()),
+            destination_dir: None,
+        };
+        for text in [format!("{preview:?}"), format!("{redeem:?}")] {
+            assert!(!text.contains("SECRETCODE"), "{text}");
+        }
+        assert!(format!("{redeem:?}").contains("dev"));
+    }
+
     #[test]
     fn the_inbox_output_carries_the_link_redeemed_receive_fields() {
         use yadorilink_ipc_proto::daemonctl::InboxTransfer;
@@ -828,6 +1064,7 @@ mod tests {
             Command::Doctor,
             Command::ListPreserved,
             Command::SpaceManagement,
+            Command::NetworkPolicy,
             Command::ListActivity { limit: 50, before_cursor: None, filter: None },
             Command::Account(AccountCommand::Status),
             Command::Account(AccountCommand::PollSignIn(PollSignIn { id, after: 0 })),
@@ -836,7 +1073,7 @@ mod tests {
             Command::Account(AccountCommand::ListGroupDevices { group_id: String::new() }),
             Command::Account(AccountCommand::ListPrimaryTransfers),
             Command::Account(AccountCommand::DeletionStatus),
-            Command::PreviewSendLink { code: String::new() },
+            Command::PreviewSendLink { code: "".into() },
             Command::SendLinkStatus { link_id: String::new() },
             Command::ListSendLinks,
             Command::ListInbox,
@@ -844,10 +1081,44 @@ mod tests {
             Command::VersionDelivery { items: Vec::new() },
             Command::ListItemVersions { root_id: Vec::new(), item_id: Vec::new() },
             Command::ListDeletedItems { root_id: Vec::new() },
+            Command::ItemRetention { root_id: Vec::new(), item_id: Vec::new() },
+            Command::PreviewSpaceReclaim,
+            Command::ListConflicts,
+            Command::ListProviderPending { limit: 0 },
             // Waiting for a redeem and offering are safe to drop; see the variant.
             Command::SendToLink { link_id: String::new(), source_paths: Vec::new() },
         ];
         let changes = [
+            Command::RevokeMember {
+                group_id: String::new(),
+                device_id: String::new(),
+                force: false,
+            },
+            Command::RetryPreserved(PreservedRef {
+                group_id: String::new(),
+                item_id: String::new(),
+            }),
+            Command::ResolveConflict {
+                root_id: Vec::new(),
+                item_id: Vec::new(),
+                resolution: ConflictResolution::KeepThis,
+            },
+            Command::RetryTransfer { transfer_id: String::new() },
+            Command::RetrySentTransfer { transfer_id: String::new() },
+            Command::MintInvite {
+                group_id: String::new(),
+                role: None,
+                ttl_secs: None,
+                requires_approval: false,
+            },
+            Command::RestoreDeletedOperation { root_id: Vec::new(), path: String::new() },
+            Command::SetRetentionRule {
+                root_id: Vec::new(),
+                item_id: Vec::new(),
+                rule: RetentionRule::Keep,
+            },
+            Command::EvictItem { root_id: Vec::new(), item_id: Vec::new() },
+            Command::SetPublishOnly { root_id: Vec::new(), publish_only: true },
             Command::LinkFolder(LinkFolder {
                 local_path: String::new(),
                 group_id: String::new(),
@@ -902,6 +1173,8 @@ mod tests {
             Command::RestorePreserved(item.clone()),
             Command::DiscardPreserved(item),
             Command::SetSpaceManagement { enabled: true },
+            Command::SetSyncOnMetered { enabled: true },
+            Command::ReportNetworkCost { cost: NetworkCost::Metered },
             Command::Account(AccountCommand::BeginSignIn(BeginSignIn::default())),
             Command::Account(AccountCommand::BeginPairingSignIn(BeginPairingSignIn {
                 pairing_code: String::new(),
@@ -940,7 +1213,7 @@ mod tests {
                 ttl: yadorilink_client_core::dto::SendLinkTtl::OneHour,
                 source_paths: Vec::new(),
             },
-            Command::RedeemSendLink { code: String::new(), device_id: None, destination_dir: None },
+            Command::RedeemSendLink { code: "".into(), device_id: None, destination_dir: None },
             Command::CancelSendLink { link_id: String::new() },
             Command::ReceiveTransfer { transfer_id: String::new(), destination_dir: None },
             Command::CancelTransfer { transfer_id: String::new() },

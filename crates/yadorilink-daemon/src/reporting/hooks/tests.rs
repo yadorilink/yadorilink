@@ -22,7 +22,7 @@ fn record_severe_error_persists_a_candidate_and_redacts_log_lines() {
 
 /// -3.4 "the hook in isolation": `record_panic` -- the exact
 /// function the installed panic hook calls -- must yield a single bounded,
-/// redacted, unsent candidate. The message, location, and backtrace all
+/// redacted, unsent candidate. The location and backtrace
 /// carry a home path; none of it may reach disk.
 #[test]
 fn record_panic_yields_a_bounded_redacted_unsent_candidate() {
@@ -31,7 +31,6 @@ fn record_panic_yields_a_bounded_redacted_unsent_candidate() {
 
     let id = record_panic(
         &storage,
-        "index corrupt reading /Users/alice/Sync/notes.md",
         Some("crates/yadorilink-daemon/src/foo.rs:42"),
         "0: frame at /Users/alice/secret\n1: more frames",
     );
@@ -49,7 +48,6 @@ fn record_panic_yields_a_bounded_redacted_unsent_candidate() {
     // Redacted: the home path (and the user file name inside it) is gone,
     // and the redaction pass did run (a redaction marker is present).
     assert!(!json.contains("alice"));
-    assert!(!json.contains("notes.md"));
     assert!(json.contains("[REDACTED"));
     // Categorized as a panic, which the intake triages as a crash.
     assert!(json.contains("\"panic\""));

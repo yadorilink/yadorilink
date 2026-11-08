@@ -25,7 +25,7 @@ use crate::ports::CapturedDirectory;
 use yadorilink_fs_platform::fs_identity::{
     disk_race_fingerprint, FileIdentity, IdentityComparison,
 };
-use yadorilink_fs_platform::ignore_patterns::{is_ignore_file_relative_path, EffectiveIgnoreSet};
+use yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet;
 use yadorilink_replica_domain::file::{FileRecord, FileVersion, RecordKind};
 use yadorilink_replica_domain::ids::SyncPath;
 use yadorilink_replica_domain::local_op::Op;
@@ -616,10 +616,9 @@ impl LocalChangeProcessor {
         let native_witness = self.state.native_capture_witness(group_id, dest)?;
         // Whatever the ordinary capture of `dest` would leave unauthored is
         // left unauthored here too: an ignored or unrepresentable name
-        // (which would also fail the whole operation's commit), the ignore
-        // file itself, and a path a pause or an install holds.
-        if is_ignore_file_relative_path(Path::new(dest))
-            || is_excluded_from_sync(dest, lstat.is_dir(), ignore_set)
+        // (which would also fail the whole operation's commit), and a path a pause or an
+        // install holds.
+        if is_excluded_from_sync(dest, lstat.is_dir(), ignore_set)
             || skip_reason_for_inadmissible_wire_path(dest).is_some()
             || self.is_under_user_pause(group_id, dest)?
             || self.is_paused(group_id, dest)?

@@ -13,7 +13,7 @@ use yadorilink_ipc_proto::shellipc::{
     ChangeScope, EntryKind as WireEntryKind, EnumerateChangesRequest, EnumerateChangesResponse,
     EnumerateChildrenRequest, EnumerateChildrenResponse, EnumerateFailure,
     EnumerateWorkingSetRequest, EnumerateWorkingSetResponse, LocalState, ProviderItem,
-    ProviderItemRequest, ProviderItemResponse, ShellIpcMessage,
+    ProviderItemRequest, ProviderItemResponse, ShellBadge, ShellIpcMessage,
 };
 use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_sync_sqlite::provider_enumerate::{
@@ -68,8 +68,9 @@ pub(crate) fn versioned(hash: &[u8; 32], generation: u64) -> Vec<u8> {
     out
 }
 
-fn wire_item(item: &ShownItem, read_only: bool) -> ProviderItem {
+fn wire_item(item: &ShownItem, read_only: bool, badge: ShellBadge) -> ProviderItem {
     ProviderItem {
+        badge: badge as i32,
         read_only,
         eviction_allowed: item.eviction_allowed,
         item_id: item.item_id.to_vec(),
@@ -84,12 +85,47 @@ fn wire_item(item: &ShownItem, read_only: bool) -> ProviderItem {
         mtime_unix_nanos: item.mtime_unix_nanos,
         exec: item.exec,
         content_version: versioned(&item.content_version.0, item.generation),
-        metadata_version: versioned(&item.metadata_version, item.generation),
+        metadata_version: versioned(&with_badge(item.metadata_version, badge), item.generation),
         content_pending: item.content_pending,
         symlink_target: item.symlink_target.clone(),
         parent_generation: item.parent_generation,
         local_state: engine_local_state(item),
     }
+}
+
+/// The metadata identifier the OS is shown: the item's own, changed by its badge, so a badge that
+/// changes is a metadata change and Finder redraws the item. An item without a badge keeps its own.
+pub(crate) fn with_badge(metadata_version: [u8; 32], badge: ShellBadge) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    if badge == ShellBadge::Unspecified {
+        return metadata_version;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(metadata_version);
+    hasher.update([badge as i32 as u8]);
+    hasher.finalize().into()
+}
+
+/// The badge of each item, in order: files through the daemon's one badge rule (`shell_badge`, as a
+/// path status), folders none. Blocking: reads the engine's rows.
+fn badges_of(
+    coordinator: &crate::replica_coordinator::ReplicaCoordinator,
+    root: &str,
+    items: &[ShownItem],
+) -> Vec<ShellBadge> {
+    let group = coordinator.provider_repository().group_of_root(root).ok().flatten();
+    items
+        .iter()
+        .map(|item| match (&group, item.kind) {
+            (Some(group), RecordKind::File) => crate::shell_status::provider_file_badge(
+                coordinator,
+                group,
+                &item.path,
+                engine_local_state(item).as_ref(),
+            ),
+            _ => ShellBadge::Unspecified,
+        })
+        .collect()
 }
 
 /// What the engine holds of the item, from its row. A folder has no bytes of its own, so a
@@ -239,17 +275,19 @@ async fn children(
     let coordinator = context.replica_coordinator.clone();
     let parent = request.parent_item_id.clone();
     let page = tokio::task::spawn_blocking(move || {
-        coordinator.provider_repository().enumerate_children(
+        let page = coordinator.provider_repository().enumerate_children(
             &root,
             &parent,
             after.as_deref(),
             limit,
             PAGE_BYTES,
-        )
+        )?;
+        let badges = badges_of(&coordinator, &root, &page.items);
+        Ok::<_, EnumerateError>((page, badges))
     })
     .await;
     match page {
-        Ok(Ok(page)) => {
+        Ok(Ok((page, badges))) => {
             // Every page repeats the FIRST page's anchor, so the extension finishes the walk
             // with it and the change feed closes whatever happened since.
             let anchor = first_anchor.unwrap_or(page.anchor);
@@ -257,7 +295,12 @@ async fn children(
                 ok: true,
                 failure: EnumerateFailure::None as i32,
                 error: String::new(),
-                items: page.items.iter().map(|item| wire_item(item, read_only)).collect(),
+                items: page
+                    .items
+                    .iter()
+                    .zip(badges)
+                    .map(|(item, badge)| wire_item(item, read_only, badge))
+                    .collect(),
                 next_page_token: page
                     .next_after
                     .map(|last| {
@@ -303,15 +346,19 @@ async fn item(
     };
     let coordinator = context.replica_coordinator.clone();
     let found = tokio::task::spawn_blocking(move || {
-        coordinator.provider_repository().lookup_item(&root, &item_id)
+        let found = coordinator.provider_repository().lookup_item(&root, &item_id)?;
+        Ok::<_, EnumerateError>(found.map(|(shown, anchor)| {
+            let badge = badges_of(&coordinator, &root, std::slice::from_ref(&shown))[0];
+            (shown, anchor, badge)
+        }))
     })
     .await;
     match found {
-        Ok(Ok(Some((shown, anchor)))) => ProviderItemResponse {
+        Ok(Ok(Some((shown, anchor, badge)))) => ProviderItemResponse {
             ok: true,
             failure: EnumerateFailure::None as i32,
             error: String::new(),
-            item: Some(wire_item(&shown, read_only)),
+            item: Some(wire_item(&shown, read_only, badge)),
             anchor,
         },
         Ok(Ok(None)) => fail(EnumerateFailure::NotFound, "no such live item".into()),
@@ -359,15 +406,24 @@ async fn changes(
     let since = request.since_anchor;
     let coordinator = context.replica_coordinator.clone();
     let page = tokio::task::spawn_blocking(move || {
-        coordinator.provider_repository().enumerate_changes(&root, &scope, since, limit, PAGE_BYTES)
+        let page = coordinator
+            .provider_repository()
+            .enumerate_changes(&root, &scope, since, limit, PAGE_BYTES)?;
+        let badges = badges_of(&coordinator, &root, &page.upserts);
+        Ok::<_, ChangesError>((page, badges))
     })
     .await;
     match page {
-        Ok(Ok(page)) => EnumerateChangesResponse {
+        Ok(Ok((page, badges))) => EnumerateChangesResponse {
             ok: true,
             failure: EnumerateFailure::None as i32,
             error: String::new(),
-            upserts: page.upserts.iter().map(|item| wire_item(item, read_only)).collect(),
+            upserts: page
+                .upserts
+                .iter()
+                .zip(badges)
+                .map(|(item, badge)| wire_item(item, read_only, badge))
+                .collect(),
             removed_item_ids: page.removed.iter().map(|id| id.to_vec()).collect(),
             next_anchor: page.next_anchor,
             more: page.more,
@@ -429,15 +485,21 @@ async fn working_set(
         let repo = coordinator.provider_repository();
         let page = repo.enumerate_working_set(&walk_root, after.as_ref(), limit, PAGE_BYTES)?;
         let anchor = first_anchor.unwrap_or(page.anchor);
-        Ok::<_, EnumerateError>((page, anchor))
+        let badges = badges_of(&coordinator, &walk_root, &page.items);
+        Ok::<_, EnumerateError>((page, anchor, badges))
     })
     .await;
     match page {
-        Ok(Ok((page, anchor))) => EnumerateWorkingSetResponse {
+        Ok(Ok((page, anchor, badges))) => EnumerateWorkingSetResponse {
             ok: true,
             failure: EnumerateFailure::None as i32,
             error: String::new(),
-            items: page.items.iter().map(|item| wire_item(item, read_only)).collect(),
+            items: page
+                .items
+                .iter()
+                .zip(badges)
+                .map(|(item, badge)| wire_item(item, read_only, badge))
+                .collect(),
             next_page_token: page
                 .next_after
                 .map(|last| encode_token(WORKING_SET_TAG, anchor, &request.root_id, &[], &last))

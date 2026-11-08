@@ -31,6 +31,9 @@ use crate::service_lane::LaneServiceStream;
 pub trait PeerLinkSource: Send + Sync {
     /// A live connection to the peer, dialling if there is not one.
     async fn link(&self) -> Result<Arc<yadorilink_sync_substrate::PeerLink>, TransportError>;
+
+    /// The peer stopped answering: drop the connections held to it.
+    fn unresponsive(&self) {}
 }
 
 /// Everything one session needs to reach its peer over the substrate.
@@ -73,6 +76,10 @@ impl PeerTransports {
 impl BlockStreamTransport for PeerTransports {
     async fn open(&self, group_id: &str) -> Result<Box<dyn PeerBlockStream>, TransportError> {
         Ok(Box::new(LaneBlockStream::new(self.open_lane_for(Lane::Block, group_id).await?)))
+    }
+
+    fn peer_unresponsive(&self) {
+        self.source.unresponsive();
     }
 }
 

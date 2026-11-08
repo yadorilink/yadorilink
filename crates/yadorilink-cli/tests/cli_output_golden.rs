@@ -56,7 +56,8 @@ impl Env {
         self.dir.path()
     }
 
-    fn command(&self, args: &[&str]) -> Command {
+    /// The binary's command, with `lang` as the locale (`LANG`) when given.
+    fn command_in(&self, args: &[&str], lang: Option<&str>) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_yadorilink"));
         command
             .args(args)
@@ -72,13 +73,20 @@ impl Env {
             // A coordination address nothing listens on: every case here must
             // fail (or finish) before it would contact the coordination plane.
             .env("YADORILINK_COORDINATION_ADDR", "http://127.0.0.1:9");
+        if let Some(lang) = lang {
+            command.env("LANG", lang);
+        }
         command
     }
 
     /// Runs the binary and replaces this environment's temporary directory
     /// (canonical and as given) with `<TMP>` in both streams.
     fn run_blocking(&self, args: &[&str]) -> Run {
-        let output = self.command(args).output().expect("run the yadorilink binary");
+        self.run_blocking_in(args, None)
+    }
+
+    fn run_blocking_in(&self, args: &[&str], lang: Option<&str>) -> Run {
+        let output = self.command_in(args, lang).output().expect("run the yadorilink binary");
         let canonical = self.root().canonicalize().unwrap();
         let normalize = |bytes: &[u8]| {
             String::from_utf8(bytes.to_vec())
@@ -289,8 +297,14 @@ async fn daemon_backed_commands_print_their_results() {
     let _state = start_daemon(&env).await;
 
     assert_eq!(env.run(&["links"]).await, Run::new(0, "No linked folders.\n", ""));
-    assert_eq!(env.run(&["daemon", "pause"]).await, Run::new(0, "Sync paused.\n", ""));
-    assert_eq!(env.run(&["daemon", "resume"]).await, Run::new(0, "Sync resumed.\n", ""));
+    assert_eq!(
+        env.run(&["daemon", "pause"]).await,
+        Run::new(0, "Nothing to pause: no folders are linked.\n", "")
+    );
+    assert_eq!(
+        env.run(&["daemon", "resume"]).await,
+        Run::new(0, "Nothing to resume: no folders are linked.\n", "")
+    );
     assert_eq!(
         env.run(&["limits", "show"]).await,
         Run::new(0, "up=unlimited  down=unlimited\n", "")
@@ -347,6 +361,8 @@ async fn links_then_unlink_print_the_folder() {
         "pausing with one link"
     );
     assert_eq!(env.run(&["links"]).await, Run::new(0, "<TMP>/photos  group=group-1  Paused\n", ""));
+    let status = env.run(&["status"]).await;
+    assert!(status.stdout.contains("<TMP>/photos   Paused\n"), "status while paused: {status:?}");
 
     let canonical = folder.canonicalize().unwrap().to_string_lossy().to_string();
     assert_eq!(
@@ -691,4 +707,28 @@ async fn wait_for_rows(state: &Arc<DaemonState>, group: &str, expected: &[(&str,
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     panic!("the index never held {want:?}; it holds {:?}", rows());
+}
+
+/// Machine-readable output is never translated: `--json` prints the same bytes whatever the
+/// locale, and human text for the same state does change.
+#[tokio::test]
+async fn json_output_is_identical_under_a_japanese_locale() {
+    let _guard = DAEMON_MUTEX.lock().await;
+    let env = Arc::new(Env::new());
+    let _state = start_daemon(&env).await;
+    let folder = env.root().join("photos");
+    std::fs::create_dir_all(&folder).unwrap();
+    link_directly(&env, &folder, "group-1").await;
+
+    let run_in = |args: Vec<&'static str>, lang: Option<&'static str>| {
+        let env = Arc::clone(&env);
+        async move {
+            tokio::task::spawn_blocking(move || env.run_blocking_in(&args, lang)).await.unwrap()
+        }
+    };
+    let english = run_in(vec!["status", "--json"], None).await;
+    let japanese = run_in(vec!["status", "--json"], Some("ja_JP.UTF-8")).await;
+    assert_eq!(english.code, 0, "{english:?}");
+    assert!(english.stdout.trim_start().starts_with('{'), "{english:?}");
+    assert_eq!(english, japanese);
 }

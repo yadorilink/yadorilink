@@ -72,6 +72,8 @@ pub struct ProviderRoot {
     pub error_description: Option<String>,
     pub namespace_ready: bool,
     pub latest_evidence_seq: u64,
+    /// This device only adds to the root: it refuses to author a modify or a delete there.
+    pub publish_only: bool,
 }
 
 impl ProviderRoot {
@@ -147,11 +149,12 @@ fn row_to_root(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRoot> {
         error_description: r.get(6)?,
         namespace_ready: r.get::<_, i64>(7)? != 0,
         latest_evidence_seq: r.get::<_, i64>(8)? as u64,
+        publish_only: r.get::<_, i64>(9)? != 0,
     })
 }
 
 const ROOT_COLUMNS: &str = "root_id, group_id, kind, display_name, domain_registered, \
-     first_handshake_at, error_description, namespace_ready, latest_evidence_seq";
+     first_handshake_at, error_description, namespace_ready, latest_evidence_seq, publish_only";
 
 /// `(parent_path, name)` of a `/`-separated relative path: the parent index keys.
 pub(crate) fn split_parent(path: &str) -> (&str, &str) {
@@ -589,6 +592,23 @@ impl ProviderRepository {
         })
     }
 
+    /// Marks the root publish-only (or not): this device then refuses to author a modify or a
+    /// delete in it, a defence against an app bug removing what it backed up. Changes arriving
+    /// from peers are unaffected.
+    pub fn set_publish_only(
+        &self,
+        root_id: &str,
+        publish_only: bool,
+    ) -> Result<bool, SyncSqliteError> {
+        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
+            let changed = tx.execute_cached(
+                "UPDATE provider_roots SET publish_only = ?2 WHERE root_id = ?1",
+                rusqlite::params![root_id, i64::from(publish_only)],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
     /// Rebootstrap of a root: a NEW `root_id` (a new domain) and no items, so every item is
     /// minted again. The old root's evidence is gone with it.
     pub fn rebootstrap_root(&self, group_id: &str) -> Result<String, SyncSqliteError> {
@@ -744,6 +764,20 @@ pub enum Publication {
     /// The CONTENT differs: the fence is ON until the old copy is evicted and the new
     /// version is signalled.
     ContentPending,
+}
+
+/// Which of a root's files the download query lists: the driver's one definition of "wanted",
+/// as a SQL filter over the retention rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DownloadFilter {
+    /// Every file (an Eager folder with no online-only rule).
+    Everything,
+    /// Only the files whose nearest rule is `keep` (a folder whose default is online-only).
+    KeptOnly,
+    /// Every file except those whose nearest rule is `online_only` (an Eager folder with one).
+    ExceptOnlineOnly,
+    /// Only the files whose nearest rule is `online_only`: what the store-only fetch fills.
+    OnlineOnlyOnly,
 }
 
 /// One live regular file as the Eager driver sees it.
@@ -1400,17 +1434,25 @@ impl ProviderRepository {
     pub fn eager_page(
         &self,
         root_id: &str,
-        kept_only: bool,
+        filter: DownloadFilter,
         after: Option<(u64, &str)>,
         limit: usize,
     ) -> Result<Vec<FileCandidate>, SyncSqliteError> {
-        // `kept_only`: only the files at or beneath a path the user keeps on this device (a pin;
-        // the empty path is the whole root).
-        let filter = if kept_only {
-            " AND EXISTS (SELECT 1 FROM pinned_items p WHERE p.group_id = r.group_id AND \
-             (p.path = '' OR p.path = f.path OR substr(f.path, 1, length(p.path) + 1) = p.path || '/'))"
-        } else {
-            ""
+        // `kept_only`: only the files whose nearest retention rule is `keep` (the empty path is the
+        // whole root).
+        let filter: String = match filter {
+            DownloadFilter::Everything => String::new(),
+            DownloadFilter::KeptOnly => {
+                format!(" AND {}", crate::retention_rules::kept_by_rule_sql("r.group_id", "f.path"))
+            }
+            DownloadFilter::ExceptOnlineOnly => format!(
+                " AND NOT {}",
+                crate::retention_rules::online_only_by_rule_sql("r.group_id", "f.path")
+            ),
+            DownloadFilter::OnlineOnlyOnly => format!(
+                " AND {}",
+                crate::retention_rules::online_only_by_rule_sql("r.group_id", "f.path")
+            ),
         };
         self.read_settled(|conn| {
             let (after_size, after_path) = match after {
@@ -1928,21 +1970,22 @@ pub fn declare_link_root_in_tx(
 }
 
 /// Replaces the group's provider root by a new one: new `root_id`, same kind and display
-/// name, no items and no evidence.
+/// name and publish-only choice, no items and no evidence.
 fn rebootstrap_in_tx(
     tx: &rusqlite::Transaction<'_>,
     group_id: &str,
     old_intent: &str,
     preserved_location: Option<&str>,
 ) -> Result<String, SyncSqliteError> {
-    let old: Option<(String, String, String)> = tx
+    let old: Option<(String, String, String, bool)> = tx
         .query_row_cached(
-            "SELECT root_id, kind, display_name FROM provider_roots WHERE group_id = ?1",
+            "SELECT root_id, kind, display_name, publish_only FROM provider_roots \
+             WHERE group_id = ?1",
             [group_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0)),
         )
         .optional()?;
-    let Some((old_root, kind, display_name)) = old else {
+    let Some((old_root, kind, display_name, publish_only)) = old else {
         return Err(SyncSqliteError::NotFound(format!(
             "group {group_id} has no provider root to rebootstrap"
         )));
@@ -1968,6 +2011,13 @@ fn rebootstrap_in_tx(
     record_removal(tx, &old_root, group_id, &display_name, old_intent, preserved_location)?;
     let root_id = mint_root_id();
     insert_root(tx, &root_id, group_id, &kind, &display_name)?;
+    // The protection is the device's choice for the folder, not for one root id.
+    if publish_only {
+        tx.execute_cached(
+            "UPDATE provider_roots SET publish_only = 1 WHERE root_id = ?1",
+            [&root_id],
+        )?;
+    }
     // The completed-install marker is carried to the new root ONLY when the same semantic
     // namespace is completely built (the install was recorded and no projection obligation is
     // open), so only the provider root is being recreated; otherwise the new root waits for its
@@ -2155,6 +2205,33 @@ pub(crate) fn parent_is_enumerated(
         rusqlite::params![root_id, parent_item_id],
         |r| r.get(0),
     )?)
+}
+
+/// Tells the OS that the item shown for `group_id`/`path` changed without its content or name
+/// changing (its held state flipped, so its badge did): one `upsert` event per root that shows it,
+/// in the caller's transaction. Nothing for a path no root shows yet.
+pub(crate) fn note_badge_changed_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    group_id: &str,
+    path: &str,
+) -> Result<(), SyncSqliteError> {
+    let shown: Vec<(String, Vec<u8>)> = tx
+        .prepare_cached(
+            "SELECT root_id, item_id FROM provider_items \
+             WHERE group_id = ?1 AND path = ?2 AND live = 1 AND exposed = 1",
+        )?
+        .query_map(rusqlite::params![group_id, path], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    for (root_id, item_id) in shown {
+        let parent = parent_item_id(tx, &root_id, split_parent(path).0)?;
+        append_event(tx, &root_id, "upsert", &item_id, &parent, None)?;
+        // The root-level signal to the host is driven by this counter.
+        tx.execute_cached(
+            "UPDATE provider_roots SET change_seq = change_seq + 1 WHERE root_id = ?1",
+            [&root_id],
+        )?;
+    }
+    Ok(())
 }
 
 /// Appends one change event with the next sequence of the root (the revision advances once per

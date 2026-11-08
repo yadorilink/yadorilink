@@ -19,7 +19,6 @@ use std::path::{Path, PathBuf};
 
 use crate::error::LocalCaptureError;
 use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind};
-use yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet;
 use yadorilink_replica_domain::ids::VersionHash;
 use yadorilink_sync_sqlite::CanonicalCurrentRow;
 
@@ -114,7 +113,7 @@ impl LocalChangeProcessor {
         delete: &SemanticDelete,
     ) -> Result<LocalChangeOutcome, LocalCaptureError> {
         debug_assert!(!delete.rel_path.is_empty());
-        let ignore_set = EffectiveIgnoreSet::load_for_link_root(root)?;
+        let ignore_set = self.ignore_set_for(group_id)?;
         let event =
             FsChangeEvent { path: delete.path.clone(), kind: FsChangeKind::ObservedRemoval };
         match self

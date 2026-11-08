@@ -29,6 +29,7 @@ use crate::application::ports::{AssemblyProgress, ByteRange, TempMaterialization
 use crate::provider_publication::{fetch_gate, FetchGate};
 use crate::shell_context::ShellContext;
 use crate::sync_error::SyncError;
+use crate::write_op::{trace, StepEvent};
 
 /// One outgoing message of a connection and, when the sender cares, where to report whether the
 /// framed write to the socket completed. A response is only "delivered" when that write did.
@@ -350,6 +351,7 @@ fn start(
                 }
                 // Delivered means the framed write completed, not that it was queued.
                 if send_and_wait(&reply, response(&task_id, Ok(answer))).await {
+                    trace::emit_at(&handoff.root, &handoff.name, StepEvent::ProviderResponded);
                     after_response(&context, handoff);
                 }
                 // else nobody was told about the file: it is not a handoff, and dropping it
@@ -405,6 +407,7 @@ fn after_response(context: &ShellContext, mut handoff: Handoff) {
         handoff.version,
     ) {
         Ok(Some(_)) => {
+            trace::emit_at(&handoff.root, &handoff.name, StepEvent::ProviderEvidenceRecorded);
             handoff.file.keep();
             if let Some(root) = context.handoff.get() {
                 root.sweep_later(handoff.root.clone(), handoff.item, handoff.name.clone());
@@ -414,8 +417,11 @@ fn after_response(context: &ShellContext, mut handoff: Handoff) {
             // The item moved on: the file is dropped (and so removed) when `handoff` goes out of
             // scope, if the OS has not taken it, and the item goes back to "published at the
             // version handed over" so that, if it did, the ordinary pending state evicts it.
-            let repo = context.replica_coordinator.provider_repository();
-            match repo.reopen_stale_handoff(&handoff.root, &handoff.item, handoff.version) {
+            match context.replica_coordinator.provider_writes().reopen_stale_handoff(
+                &handoff.root,
+                &handoff.item,
+                handoff.version,
+            ) {
                 Ok(true) => context.publication.kick(&handoff.root),
                 Ok(false) => {}
                 Err(error) => tracing::warn!(%error, "could not re-fence a stale provider handoff"),
@@ -554,7 +560,7 @@ async fn run(
     // A slot among the daemon-wide assemblies. An item the Eager driver handed out takes one of
     // the Eager class only, so the user's own fetches always have slots left.
     // Counted as requested content from here, so an open queued for a slot is not idle.
-    let _requested = context.requested_opens.begin(&declared.group_id);
+    let mut open_guard = context.requested_opens.begin(&declared.group_id, &request.item_id);
     let eager = context.eager.was_requested(&root, &item);
     let permits = context.eager.limiter.acquire(eager).await;
     let assembled = context
@@ -638,11 +644,15 @@ async fn run(
     // failed send, a restart, a signal) ever un-records it. A window is not a whole version's
     // content: it records nothing and is paired with no generation (the version was checked
     // current just above, and again after the response is sent).
+    trace::emit_at(&root, &name, StepEvent::ProviderStaged);
     let generation = if assembled.range.is_some() {
         0
     } else {
         match repo.record_may_serve(&root, &item, assembled.version_hash) {
-            Ok(Some(generation)) => generation,
+            Ok(Some(generation)) => {
+                trace::emit_at(&root, &name, StepEvent::ProviderMayServeRecorded);
+                generation
+            }
             Ok(None) => {
                 let _ = std::fs::remove_file(&assembled.assembled);
                 return Err(fail(
@@ -659,6 +669,7 @@ async fn run(
     handoff_root
         .publish(&assembled.assembled, &name)
         .map_err(|e| (MaterializeFailure::Unobtainable, e.to_string()))?;
+    trace::emit_at(&root, &name, StepEvent::ProviderHandoffNamed);
     let mut file = HandoffFile::new(handoff_root.handoff_file(&name));
     if assembled.range.is_some() {
         // A window records no served content, so a newer version's publication finds it only
@@ -682,6 +693,8 @@ async fn run(
             ));
         }
     }
+    // Bytes are being handed over: the file keeps counting as requested until the host reports it.
+    open_guard.served();
     Ok((
         Answer {
             name: name.clone(),

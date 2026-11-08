@@ -35,19 +35,21 @@ pub use account::{
 };
 pub use commands::{
     ordinary_folder_links_supported, ApplyChange, ApplyResponse, CallError, CallOptions,
-    CancelHandle, Command, CommandError, CommandErrorKind, CommandOutput, CreateShare, DeletedItem,
-    DeletedItems, DeletedParent, DeliveryItem, DeliveryOutcome, DeliveryReport, DeliveryState,
-    DesktopError, DoctorCheck, DoctorStatus, HandoffInfo, HistoryEntryKind, HistoryOutcome,
-    HistoryVersionState, ItemDelivery, ItemHistory, ItemVersion, JoinGroup, JoinShare, LinkFolder,
-    LinkedFolder, PauseFor, PauseLink, PreservedItem, PreservedKind, PreservedRef,
-    PreservedRefusal, ProviderFolder, ReadoptMarkedFolder, ReadoptOutcome, ReadoptRefusal,
-    RestoreVersion, ResumeLink, SendLinkEntry, ShareFolder, ShareOutcome, SpaceManagement,
-    StageMode, StageRefused, StageSource, StagedHow, StagedUpload, UnlinkFolder, UnlinkOutcome,
-    MAX_DELETED_ITEMS, MAX_DELIVERY_ITEMS,
+    CancelHandle, Command, CommandError, CommandErrorKind, CommandOutput, ConflictReason,
+    ConflictResolution, ConflictedFile, CreateShare, DeletedItem, DeletedItems, DeletedParent,
+    DeliveryItem, DeliveryOutcome, DeliveryReport, DeliveryState, DesktopError, DoctorCheck,
+    DoctorStatus, EvictOutcome, HandoffInfo, HistoryEntryKind, HistoryOutcome, HistoryVersionState,
+    ItemDelivery, ItemHistory, ItemRetention, ItemVersion, JoinGroup, JoinShare, LinkFolder,
+    LinkedFolder, NetworkCost, PauseFor, PauseLink, PendingPublication, PinOutcome, PolicyState,
+    PreservedItem, PreservedKind, PreservedRef, PreservedRefusal, ProviderFolder,
+    ReadoptMarkedFolder, ReadoptOutcome, ReadoptRefusal, RestoreVersion, ResumeLink, RetentionRule,
+    SendCode, SendLinkEntry, ShareFolder, ShareOutcome, SpaceManagement, SpaceReclaimItem,
+    SpaceReclaimPreview, StageMode, StageRefused, StageSource, StagedHow, StagedUpload,
+    UnlinkFolder, UnlinkOutcome, MAX_DELETED_ITEMS, MAX_DELIVERY_ITEMS,
 };
 
 /// The one parser for invite links and codes, and the reason a permission refusal carries.
-pub use yadorilink_client_core::error::{PermissionDeniedReason, RefusalReason};
+pub use yadorilink_client_core::error::{NetworkErrorKind, PermissionDeniedReason, RefusalReason};
 pub use yadorilink_client_core::wording::{parse_invite_input, InviteLinkError};
 
 pub use log_sink::{install_log_sink, LogLevel, LogSink, LogSinkError};
@@ -59,8 +61,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc;
 pub use yadorilink_daemon::embedded_host::{
-    CredentialBackend, CredentialConfig, EngineConfig, EngineTuning, InstanceNonce,
-    InstanceNonceKeychain, KeyMirror, ReleaseProbe, StartError, WitnessPlacement,
+    CredentialBackend, CredentialConfig, EngineConfig, EngineTuning, FailureReason, InstanceNonce,
+    InstanceNonceKeychain, KeyMirror, ReleaseProbe, StartError, StoreComponent, WitnessPlacement,
 };
 use yadorilink_daemon::embedded_host::{Engine, Held};
 pub use yadorilink_ipc_proto::shellipc::ShellIpcMessage;

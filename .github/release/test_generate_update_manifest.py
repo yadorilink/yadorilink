@@ -108,6 +108,16 @@ class GenerationFloor(unittest.TestCase):
         root = make_tree(notes="- Generation PROTOCOL_VERSION = 4, RPC_VERSION = 2: first release 0.3.0\n")
         self.assertEqual(gum.generation_floor(root), "0.3.0")
 
+    def test_a_prerelease_first_release_keeps_its_prerelease(self):
+        root = make_tree(notes="- Generation PROTOCOL_VERSION = 4, RPC_VERSION = 2: first release 0.1.0-beta.9\n")
+        self.assertEqual(gum.generation_floor(root), "0.1.0-beta.9")
+
+    def test_a_malformed_first_release_fails_closed(self):
+        for bad in ("0.1.0-", "0.1.0-beta.9+build", "0.1.0-beta.9-", "0.3.0."):
+            root = make_tree(notes=f"- Generation PROTOCOL_VERSION = 4, RPC_VERSION = 2: first release {bad}\n")
+            with self.assertRaises(gum.FloorError, msg=bad):
+                gum.generation_floor(root)
+
     def test_a_bump_without_a_recorded_first_release_fails_closed(self):
         notes = "- Generation PROTOCOL_VERSION = 4, RPC_VERSION = 2: first release 0.3.0\n"
         for protocol, rpc in ((5, 2), (4, 3)):
@@ -122,7 +132,7 @@ class GenerationFloor(unittest.TestCase):
             gum.generation_floor(root)
 
     def test_the_real_tree_records_its_current_generation(self):
-        self.assertRegex(gum.generation_floor(REPO), r"^\d+\.\d+\.\d+$")
+        self.assertRegex(gum.generation_floor(REPO), r"^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$")
 
 
 class MinimumAgainstFloor(unittest.TestCase):

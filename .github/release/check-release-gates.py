@@ -438,7 +438,7 @@ def installer_problems(all_jobs: dict[str, str]) -> list[str]:
     for needed in ("python3 packaging/install/pins.py check", 'gh attestation verify "packaging/install/$f"',
                    "--repo ${{ github.repository }}", "--signer-workflow ${{ github.repository }}/.github/workflows/release.yml",
                    "--source-digest ${{ github.sha }}", "--source-ref ${{ github.ref }}",
-                   "generate-release-checksums.py --sidecars dist/install.sh dist/install.ps1"):
+                   "generate-release-checksums.py --sidecars dist/install.sh"):
         if needed not in body:
             out.append(f"beta-release 'Add the installers' must contain: {needed}")
     if "||" in body or "continue-on-error" in body:
@@ -537,8 +537,8 @@ def attest_problems(workflow: str, all_jobs: dict[str, str], bundle: str) -> lis
     verify_at, attest_at = attest.find("build-engine-bundle.py verify"), attest.find("uses: actions/attest")
     if verify_at < 0 or attest_at < 0 or verify_at > attest_at:
         out.append(f"{ATTEST_JOB} must verify the bundle by hash before attesting it")
-    if not re.search(r"subject-path: \|\n\s+engine-unverified/\*\.zip\n\s+packaging/install/install\.sh\n\s+packaging/install/install\.ps1\n", code):
-        out.append(f"{ATTEST_JOB} must attest exactly the verified bundle zip and the two installers")
+    if not re.search(r"subject-path: \|\n\s+engine-unverified/\*\.zip\n\s+packaging/install/install\.sh\n", code):
+        out.append(f"{ATTEST_JOB} must attest exactly the verified bundle zip and the installer")
     pins_at = code.find("python3 packaging/install/pins.py check\n")
     if pins_at < 0 or pins_at > code.find("uses: actions/attest"):
         out.append(f"{ATTEST_JOB} must check the installer pins before attesting the installers")
@@ -657,13 +657,13 @@ def self_test() -> int:
         ("engine-attest downloads another run", WORKFLOW, lambda t: t.replace("          path: engine-unverified\n\n      - name: Re-verify the bundle by hash only\n", "          path: engine-unverified\n          run-id: 1\n\n      - name: Re-verify the bundle by hash only\n", 1)),
         ("engine-attest action unpinned", WORKFLOW, lambda t: re.sub(r"actions/attest-build-provenance@[0-9a-f]{40}", "actions/attest-build-provenance@v4", t, 1)),
         ("engine-attest attests before verifying", WORKFLOW, lambda t: swap_attest_verify(t)),
-        ("engine-attest attests only the bundle", WORKFLOW, lambda t: t.replace("            packaging/install/install.ps1\n", "", 1)),
+        ("engine-attest attests only the bundle", WORKFLOW, lambda t: t.replace("            packaging/install/install.sh\n", "", 1)),
         ("engine-attest skips the installer pin check", WORKFLOW, lambda t: t.replace("        run: python3 packaging/install/pins.py check\n", "        run: echo skipped\n", 1)),
         ("engine-attest drops the verifier pin requirement", WORKFLOW, lambda t: t.replace("pins.py check --require-verifier", "pins.py check", 1)),
         ("engine-attest drops the manifest floor requirement", WORKFLOW, lambda t: t.replace(" --require-floor", "", 1)),
         ("beta-release drops the installer step", WORKFLOW, lambda t: t.replace("- name: Add the installers", "- name: Add something", 1)),
         ("beta-release drops the installer attestation verify", WORKFLOW, lambda t: t.replace('gh attestation verify "packaging/install/$f"', 'true "packaging/install/$f"', 1)),
-        ("beta-release drops the installer sidecars", WORKFLOW, lambda t: t.replace("--sidecars dist/install.sh dist/install.ps1", "--sidecars dist/install.sh", 1)),
+        ("beta-release drops the installer sidecars", WORKFLOW, lambda t: t.replace("--sidecars dist/install.sh", "--sidecars dist/other", 1)),
         ("engine-attest swallows failures", WORKFLOW, lambda t: add_to_job(t, ATTEST_JOB, "    continue-on-error: true\n")),
         ("engine-bundle no longer needs engine-attest", WORKFLOW, lambda t: drop_in_job(t, PROTECTED_BUNDLE_JOB, "      - engine-attest\n")),
         ("engine-bundle drops the attestation verify", WORKFLOW, lambda t: t.replace("gh attestation verify", "true")),

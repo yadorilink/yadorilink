@@ -1,10 +1,11 @@
+use yadorilink_cli::commands::ignore::{explain_path_output, pattern_lines, test_path_output};
+use yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet;
+
 #[test]
 fn ignore_list_includes_defaults_and_user_patterns_in_order() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join(".yadorilinkignore"), "node_modules/\n!important.log\n")
-        .unwrap();
+    let set = EffectiveIgnoreSet::from_text("node_modules/\n!important.log\n").unwrap();
 
-    let lines = yadorilink_cli::commands::ignore::pattern_lines(dir.path()).unwrap();
+    let lines = pattern_lines(&set);
 
     assert_eq!(lines.first().map(String::as_str), Some("builtin\t.DS_Store"));
     assert!(lines.iter().any(|line| line == "builtin\tThumbs.db"));
@@ -16,42 +17,57 @@ fn ignore_list_includes_defaults_and_user_patterns_in_order() {
 
 #[test]
 fn ignore_test_reports_matching_pattern_or_explicit_no_match() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join(".yadorilinkignore"), "*.tmp\n!keep.tmp\n").unwrap();
+    let set = EffectiveIgnoreSet::from_text("*.tmp\n!keep.tmp\n").unwrap();
 
-    let ignored =
-        yadorilink_cli::commands::ignore::test_path_output(&dir.path().join("scratch.tmp"))
-            .unwrap();
-    assert_eq!(ignored, "ignored: scratch.tmp (matched user pattern `*.tmp`)");
-
-    let re_included =
-        yadorilink_cli::commands::ignore::test_path_output(&dir.path().join("keep.tmp")).unwrap();
-    assert_eq!(re_included, "not ignored: keep.tmp (matched user pattern `!keep.tmp`)");
-
-    let no_match =
-        yadorilink_cli::commands::ignore::test_path_output(&dir.path().join("notes.md")).unwrap();
-    assert_eq!(no_match, "not ignored: notes.md (no matching pattern)");
+    assert_eq!(
+        test_path_output(&set, None, "scratch.tmp"),
+        "ignored: scratch.tmp (matched user pattern `*.tmp`)"
+    );
+    assert_eq!(
+        test_path_output(&set, None, "keep.tmp"),
+        "not ignored: keep.tmp (matched user pattern `!keep.tmp`)"
+    );
+    assert_eq!(
+        test_path_output(&set, None, "notes.md"),
+        "not ignored: notes.md (no matching pattern)"
+    );
 }
 
-/// `ignore explain` reports the winning rule's source file and line
-/// number, distinct from `test`'s plainer "matched user pattern" wording.
+/// `ignore explain` reports the winning rule's line number, distinct from `test`'s plainer
+/// "matched user pattern" wording.
 #[test]
-fn ignore_explain_reports_source_file_and_line_number() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join(".yadorilinkignore"), "# comment\n*.tmp\n!keep.tmp\n").unwrap();
+fn ignore_explain_reports_the_line_number() {
+    let set = EffectiveIgnoreSet::from_text("# comment\n*.tmp\n!keep.tmp\n").unwrap();
 
-    let ignored =
-        yadorilink_cli::commands::ignore::explain_path_output(&dir.path().join("scratch.tmp"))
-            .unwrap();
-    assert_eq!(ignored, "ignored: scratch.tmp (rule `*.tmp` at .yadorilinkignore:2)");
+    assert_eq!(
+        explain_path_output(&set, None, "scratch.tmp"),
+        "ignored: scratch.tmp (rule `*.tmp` at line 2)"
+    );
+    assert_eq!(
+        explain_path_output(&set, None, "keep.tmp"),
+        "not ignored: keep.tmp (rule `!keep.tmp` at line 3)"
+    );
+    assert_eq!(
+        explain_path_output(&set, None, "notes.md"),
+        "not ignored: notes.md (no matching pattern)"
+    );
+    assert_eq!(
+        explain_path_output(&set, None, ".DS_Store"),
+        "ignored: .DS_Store (rule `.DS_Store` at built-in default)"
+    );
+}
 
-    let re_included =
-        yadorilink_cli::commands::ignore::explain_path_output(&dir.path().join("keep.tmp"))
-            .unwrap();
-    assert_eq!(re_included, "not ignored: keep.tmp (rule `!keep.tmp` at .yadorilinkignore:3)");
-
-    let no_match =
-        yadorilink_cli::commands::ignore::explain_path_output(&dir.path().join("notes.md"))
-            .unwrap();
-    assert_eq!(no_match, "not ignored: notes.md (no matching pattern)");
+/// A trailing `/` names a directory when the folder has none on this disk, so a directory-only
+/// rule applies to it.
+#[test]
+fn a_trailing_slash_names_a_directory_for_a_directory_only_rule() {
+    let set = EffectiveIgnoreSet::from_text("node_modules/\n").unwrap();
+    assert_eq!(
+        test_path_output(&set, None, "node_modules/"),
+        "ignored: node_modules/ (matched user pattern `node_modules/`)"
+    );
+    assert_eq!(
+        test_path_output(&set, None, "node_modules"),
+        "not ignored: node_modules (no matching pattern)"
+    );
 }

@@ -2,6 +2,10 @@
 
 use super::*;
 
+fn bare_exe() -> &'static Path {
+    Path::new("/opt/yadorilink/bin/yadorilink-daemon")
+}
+
 fn sample() -> Credentials {
     Credentials {
         issuer: "https://as.test".into(),
@@ -334,17 +338,18 @@ fn the_environment_maps_to_the_same_backend_as_the_explicit_selection() {
         }
         let from_env = Backend::from_env(dir.path()).expect("valid combination");
         let explicit =
-            Backend::select(selected, file.map(|v| dir.path().join(v)), dir.path()).unwrap();
+            Backend::select(selected, file.map(|v| dir.path().join(v)), dir.path(), bare_exe())
+                .unwrap();
         assert_eq!(from_env, explicit, "{selected:?} {file:?}");
     }
     std::env::remove_var(STORE_VAR);
     std::env::remove_var(FILE_VAR);
     assert_eq!(
-        Backend::select(Some("file"), None, dir.path()).unwrap(),
+        Backend::select(Some("file"), None, dir.path(), bare_exe()).unwrap(),
         Backend::File(dir.path().join(CREDENTIALS_FILE))
     );
     assert_eq!(
-        Backend::select(Some("keyring"), None, dir.path()).unwrap(),
+        Backend::select(Some("keyring"), None, dir.path(), bare_exe()).unwrap(),
         Backend::Keyring { scope: None }
     );
 }
@@ -565,4 +570,55 @@ fn a_credential_file_named_like_a_lock_file_is_refused_whatever_its_case() {
     for name in ["credentials.json", "credentials", "my.lock", "credentials.lock.json"] {
         file_backend(&dir.path().join(name)).claim_entry().expect(name);
     }
+}
+
+#[test]
+fn the_default_backend_follows_where_the_executable_lives() {
+    let dir = Path::new("/state");
+    let file = Backend::File(dir.join(CREDENTIALS_FILE));
+    let keyring = Backend::Keyring { scope: None };
+    let bare = Path::new("/Users/u/.local/share/yadorilink/1.0/yadorilink-daemon");
+    let bundled = Path::new("/Applications/YadoriLink.app/Contents/Helpers/yadorilink-daemon");
+    // apple-cfg: macos-only the bundle rule applies on macOS only
+    if cfg!(target_os = "macos") {
+        assert_eq!(Backend::default_for_executable(dir, bare), file);
+        assert_eq!(Backend::default_for_executable(dir, bundled), keyring);
+    } else if cfg!(windows) {
+        assert_eq!(Backend::default_for_executable(dir, bare), keyring);
+    } else {
+        assert_eq!(Backend::default_for_executable(dir, bare), file);
+        assert_eq!(Backend::default_for_executable(dir, bundled), file);
+    }
+}
+
+#[test]
+fn an_explicit_store_choice_overrides_the_executable_location() {
+    let dir = Path::new("/state");
+    assert_eq!(
+        Backend::select(Some("keyring"), None, dir, bare_exe()).unwrap(),
+        Backend::Keyring { scope: None }
+    );
+    assert_eq!(
+        Backend::select(Some("file"), None, dir, bare_exe()).unwrap(),
+        Backend::File(dir.join(CREDENTIALS_FILE))
+    );
+}
+
+/// An unusable keyring names the supported file store on every platform, and is clear that
+/// choosing it is the user's decision.
+#[test]
+fn an_unusable_keyring_names_the_file_store_as_a_choice() {
+    let text = StoreError::Keyring("no logon session".into()).to_string();
+    assert!(text.contains("no logon session"), "{text}");
+    assert!(text.contains("=file"), "{text}");
+    assert!(text.contains("not a fallback"), "{text}");
+}
+
+/// The Windows advice does not describe a Linux Secret Service, and says when it applies.
+#[test]
+fn the_windows_keyring_advice_is_about_the_logon_session() {
+    let text = super::advice_for(true);
+    assert!(!text.contains("Secret Service"), "{text}");
+    assert!(text.contains("interactive logon"), "{text}");
+    assert!(text.contains("=file"), "{text}");
 }

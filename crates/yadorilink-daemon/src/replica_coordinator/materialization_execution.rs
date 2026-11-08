@@ -136,6 +136,18 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
             .map_err(SyncError::from)?)
     }
 
+    fn write_intent_tmp_path(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<std::path::PathBuf>, MaterializationExecutionError> {
+        Ok(self
+            .materialization_intent_repository()
+            .write_intent_tmp_path(group_id, path)
+            .map_err(SyncError::from)?
+            .map(std::path::PathBuf::from))
+    }
+
     fn has_unsettled_projection_obligation(
         &self,
         group_id: &str,
@@ -533,22 +545,25 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         Ok(VerifiedRoot::open(root, group_id, self)?)
     }
 
-    fn open_materialization_intent_guard<'a>(
+    fn open_repair_write<'a>(
         &'a self,
         group_id: &'a str,
         path: &'a str,
         target_version_hash: &[u8],
+        mutation_kind: &str,
         permit: &'a RootCommitPermit<'a>,
-    ) -> Result<Box<dyn OpenMaterializationIntent + Send + 'a>, MaterializationExecutionError> {
-        let guard = crate::materialization_intent::MaterializationIntentGuard::open(
+    ) -> Result<(i64, Box<dyn OpenMaterializationIntent + Send + 'a>), MaterializationExecutionError>
+    {
+        let opened = ReplicaCoordinator::open_repair_write(
             self,
             group_id,
             path,
             target_version_hash,
+            mutation_kind,
             permit,
-        )
-        .map_err(SyncError::from)?;
-        Ok(Box::new(guard))
+        )?;
+        crate::write_op::trace::emit_at(group_id, path, crate::write_op::StepEvent::Prepared);
+        Ok(opened)
     }
 
     fn eviction_eligibility_snapshot(
@@ -587,34 +602,12 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
                 .is_path_dirty(group_id, path)
                 .map_err(SyncError::from)?,
             pinned: self
-                .pinned_item_repository()
+                .retention_rules()
                 .retention(group_id, path)
                 .map_err(SyncError::from)?
                 .policy
                 == yadorilink_sync_sqlite::RetentionPolicy::Pinned,
         })
-    }
-
-    fn write_removal_evidence(
-        &self,
-        group_id: &str,
-        path: &str,
-    ) -> Result<
-        Option<yadorilink_filesystem_sync::materialization_execution::WriteRemovalEvidence>,
-        MaterializationExecutionError,
-    > {
-        let facts = self
-            .database
-            .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
-                yadorilink_sync_sqlite::write_removal_facts(conn, group_id, path)
-            })
-            .map_err(SyncError::from)?;
-        Ok(facts.map(|facts| {
-            yadorilink_filesystem_sync::materialization_execution::WriteRemovalEvidence {
-                landed_unproven: facts.landed_unproven,
-                temp_witness: facts.temp_witness,
-            }
-        }))
     }
 
     fn mark_write_landed(
@@ -624,9 +617,15 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         mutation_generation: i64,
         permit: &RootCommitPermit,
     ) -> Result<(), MaterializationExecutionError> {
-        self.materialization_intent_repository()
+        let landed_marked = self
+            .materialization_intent_repository()
             .mark_write_landed(group_id, path, mutation_generation, permit)
             .map_err(SyncError::from)?;
+        crate::write_op::trace::emit_at(
+            group_id,
+            path,
+            crate::write_op::StepEvent::Published { names_deferred: false, landed_marked },
+        );
         Ok(())
     }
 
@@ -791,7 +790,7 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         group_id: &str,
         path: &str,
         permit: &RootCommitPermit<'_>,
-    ) -> Result<Result<i64, MaterializationExecutionError>, MaterializationExecutionError> {
+    ) -> Result<(), MaterializationExecutionError> {
         ReplicaCoordinator::open_eviction(self, group_id, path, permit)
     }
 

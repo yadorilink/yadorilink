@@ -165,6 +165,7 @@ pub(crate) type Skip = HashSet<SkipKey>;
 /// One scanned item.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Entry {
+    pub root_id: String,
     pub group_id: String,
     pub path: String,
     pub item: ItemId,
@@ -282,16 +283,14 @@ impl AutoReclaim {
     fn facts(
         &self,
         root: &ProviderRoot,
-        pinned: Option<&[String]>,
+        pinned: Option<&yadorilink_sync_sqlite::RuleSet>,
         path: &str,
         item: &ItemId,
     ) -> Facts {
         let coordinator = &self.state.replica_coordinator;
         let standing_blocker = self.evictor.standing_blocker(&root.group_id);
         let kept = match pinned {
-            Some(pinned) if yadorilink_sync_sqlite::pinned_items::path_is_covered(pinned, path) => {
-                Kept::Yes
-            }
+            Some(rules) if rules.is_kept(path) => Kept::Yes,
             Some(_) => Kept::No,
             None => Kept::Unreadable,
         };
@@ -320,12 +319,12 @@ impl AutoReclaim {
             }
         };
         for root in roots {
-            let pinned = coordinator.pinned_item_repository().list(&root.group_id).ok();
+            let pinned = coordinator.retention_rules().rules(&root.group_id).ok();
             let mut after: Option<(u64, String)> = None;
             loop {
                 let page = match repo.eager_page(
                     &root.root_id,
-                    false,
+                    yadorilink_sync_sqlite::provider::DownloadFilter::Everything,
                     after.as_ref().map(|(size, path)| (*size, path.as_str())),
                     PAGE,
                 ) {
@@ -343,12 +342,13 @@ impl AutoReclaim {
                     if skip.contains(&(root.group_id.clone(), candidate.path.clone(), item)) {
                         continue;
                     }
-                    let facts = self.facts(&root, pinned.as_deref(), &candidate.path, &item);
+                    let facts = self.facts(&root, pinned.as_ref(), &candidate.path, &item);
                     let Some(verdict) = classify(&facts) else { continue };
                     let Ok(Some(version)) = repo.current_version_hash(&root.root_id, &item) else {
                         continue;
                     };
                     scan.entries.push(Entry {
+                        root_id: root.root_id.clone(),
                         group_id: root.group_id.clone(),
                         path: candidate.path,
                         item,
@@ -514,8 +514,8 @@ impl AutoReclaim {
             Ok(Some(version)) if version == entry.version => {}
             _ => return Verdict::Changed,
         }
-        let pinned = coordinator.pinned_item_repository().list(&entry.group_id).ok();
-        let facts = self.facts(&root, pinned.as_deref(), &entry.path, &entry.item);
+        let pinned = coordinator.retention_rules().rules(&entry.group_id).ok();
+        let facts = self.facts(&root, pinned.as_ref(), &entry.path, &entry.item);
         classify(&facts).unwrap_or(Verdict::Changed)
     }
 
@@ -587,4 +587,4 @@ pub(crate) async fn run(auto: Arc<AutoReclaim>) {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -44,7 +44,7 @@ impl ReplicaRoleRepository for SyncStateReplicaRoleRepository {
     ) -> Result<bool, SyncError> {
         self.state
             .replica_coordinator
-            .link_repository()
+            .link_admission()
             .recheck_digest_then_set_materialization_policy(
                 group_id,
                 local_path,
@@ -63,7 +63,7 @@ impl ReplicaRoleRepository for SyncStateReplicaRoleRepository {
         let removed = self
             .state
             .replica_coordinator
-            .link_repository()
+            .link_admission()
             .recheck_digest_then_remove_link(group_id, local_path, expected_digest)
             .map_err(SyncError::from)?;
         if removed {
@@ -79,7 +79,7 @@ impl ReplicaRoleRepository for SyncStateReplicaRoleRepository {
     ) -> Result<(), SyncError> {
         self.state
             .replica_coordinator
-            .link_repository()
+            .link_admission()
             .remove_link_expecting_group(local_path, group_id)
             .map_err(SyncError::from)?;
         self.state.durability().clear_custody_confirmation(group_id);
@@ -93,7 +93,7 @@ impl ReplicaRoleRepository for SyncStateReplicaRoleRepository {
     ) -> Result<(), SyncError> {
         self.state
             .replica_coordinator
-            .link_repository()
+            .link_admission()
             .set_materialization_policy(local_path, policy)
             .map_err(SyncError::from)
     }
@@ -105,7 +105,7 @@ impl ReplicaRoleRepository for SyncStateReplicaRoleRepository {
     fn arm_duplicate_recovery_paths(&self, group_id: &str) -> Result<(), SyncError> {
         self.state
             .replica_coordinator
-            .link_repository()
+            .link_admission()
             .arm_duplicate_recovery_paths(group_id)
             .map_err(SyncError::from)
     }
@@ -113,7 +113,7 @@ impl ReplicaRoleRepository for SyncStateReplicaRoleRepository {
     fn set_suppress_tombstones(&self, local_path: &str, suppress: bool) -> Result<(), SyncError> {
         self.state
             .replica_coordinator
-            .link_repository()
+            .link_admission()
             .set_suppress_tombstones(local_path, suppress)
             .map_err(SyncError::from)
     }
@@ -132,7 +132,7 @@ mod tests {
         let store = Arc::new(SegmentBlockStore::new(tempfile::tempdir().unwrap().keep()).unwrap());
         let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         let state = DaemonState::new("device-a".into(), sync_state, store);
-        state.replica_coordinator.link_repository().add_link("/tmp/a", "group-2").unwrap();
+        state.replica_coordinator.link_admission().add_link("/tmp/a", "group-2").unwrap();
         let repository = SyncStateReplicaRoleRepository::new(state.clone());
 
         let refused = repository.remove_link_expecting_group("/tmp/a", "group-1");

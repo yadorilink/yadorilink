@@ -32,7 +32,7 @@ impl DaemonLinkStatusReader {
 }
 
 /// Independent of `paused`: why this link is degraded, if it is.
-fn link_degraded_view(
+pub(crate) fn link_degraded_view(
     state: &DaemonState,
     link: &yadorilink_replica_domain::session_state::FolderLink,
 ) -> Option<DegradedLinkView> {
@@ -206,6 +206,7 @@ fn collect_links(
             }
             yadorilink_replica_domain::session_state::LinkLocation::Folder(_) => None,
         };
+        let pending_local_changes = pending_local_changes(state, &link.group_id);
         let paused_until_unix =
             state.replica_coordinator.link_repository().paused_until(link.key())?.unwrap_or(0);
         let conflict_note = if (conflict_count > 0 || conflicts_pending > 0)
@@ -226,6 +227,19 @@ fn collect_links(
         let (history_skipped_last_day, history_skipped_last_30_days) =
             history_skipped_counts(state, &link.group_id);
         let rebuild_needed_now = rebuild_needed(state, &link.group_id);
+        // A rule table that cannot be read says nothing rather than a wrong zero.
+        let retention =
+            state.replica_coordinator.retention_rules().summary(&link.group_id).unwrap_or_default();
+        // The newest change's author, when it is another device (a local write, or an author not known
+        // here, names nobody). An unreadable log says nothing rather than a wrong name.
+        let last_change_origin = match state
+            .replica_coordinator
+            .file_index_repository()
+            .newest_activity_origin(&link.group_id)
+        {
+            Ok(Some(Some(origin))) if origin != state.device_id => Some(origin),
+            _ => None,
+        };
         out.push(LinkFacts {
             link,
             counts,
@@ -233,6 +247,7 @@ fn collect_links(
             conflict_count,
             conflicts_pending,
             held_files,
+            retention,
             skipped_symlink_count,
             stranded_directory_count,
             paused_until_unix,
@@ -248,9 +263,47 @@ fn collect_links(
             rebuild_needed: rebuild_needed_now,
             history_skipped_last_day,
             history_skipped_last_30_days,
+            pending_local_changes,
+            last_change_origin,
         });
     }
     Ok(out)
+}
+
+/// The most dirty paths one status read counts.
+const PENDING_DIRTY_COUNT_CAP: u32 = 10_000;
+
+/// Changes made on this device that no other device is known to hold: journaled dirty paths
+/// (captured, not yet recorded) plus recorded changes no peer has asked past. 0 for a group
+/// with no other device. A figure that cannot be read counts as nothing: the number is a
+/// courtesy beside the folder's state, never a gate.
+fn pending_local_changes(state: &DaemonState, group_id: &str) -> u64 {
+    if !state.authority.current_group_writers(group_id).iter().any(|d| *d != state.device_id) {
+        return 0;
+    }
+    let dirty = state
+        .replica_coordinator
+        .dirty_path_repository()
+        .count_dirty_paths(group_id, PENDING_DIRTY_COUNT_CAP)
+        .unwrap_or_else(|e| {
+            tracing::warn!(group_id = %group_id, error = %e, "cannot count the dirty journal for status");
+            0
+        });
+    let recorded = state
+        .replica_coordinator
+        .database()
+        .read(|conn| {
+            yadorilink_sync_sqlite::peer_progress::pending_own_deltas(
+                conn,
+                group_id,
+                &state.device_id,
+            )
+        })
+        .unwrap_or_else(|e| {
+            tracing::warn!(group_id = %group_id, error = %e, "cannot read peer progress for status");
+            0
+        });
+    dirty.saturating_add(recorded)
 }
 
 /// Whether a verified closure puts this device's history out of step with its peers' (the
@@ -326,7 +379,9 @@ fn compose_link(state: &DaemonState, facts: &LinkFacts) -> LinkStatusView {
     let fully_hydrated_locally = materialization.placeholder == 0
         && materialization.hydrating == 0
         && materialization.evicting == 0;
-    let requested_content_count = requested_content_count(state, link, materialization);
+    let pinned_pending = state.telemetry.pinned_pending(&link.group_id).filter(|_| !link.paused);
+    let requested_content_count = requested_content_count(state, link, materialization)
+        .saturating_add(pinned_pending.as_ref().map_or(0, |p| p.items));
     let local_storage_state = match link.materialization_policy {
         yadorilink_replica_domain::session_state::MaterializationPolicy::Eager => {
             if fully_hydrated_locally {
@@ -359,7 +414,16 @@ fn compose_link(state: &DaemonState, facts: &LinkFacts) -> LinkStatusView {
         } else {
             FetchAvailability::UnavailableNow
         };
+    let policy_stale = state.authority.is_group_policy_stale(&link.group_id);
+    let snapshot = crate::folder_state::FolderSnapshot::read(
+        facts,
+        degraded.as_ref().map(|d| d.cause),
+        policy_stale,
+    );
+    let folder_blockers = snapshot.blockers().to_vec();
     let mut view = LinkStatusView {
+        folder_blockers,
+        pending_local_changes: snapshot.pending_local_changes(),
         provider: facts.provider.clone(),
         local_path: link.key().to_string(),
         group_id: link.group_id.clone(),
@@ -367,6 +431,7 @@ fn compose_link(state: &DaemonState, facts: &LinkFacts) -> LinkStatusView {
         paused: link.paused,
         paused_until_unix: facts.paused_until_unix,
         conflict_count: facts.conflict_count,
+        last_change_origin_device_id: facts.last_change_origin.clone(),
         conflict_note: facts.conflict_note.clone(),
         conflicts_pending: facts.conflicts_pending,
         materialization_policy: link.materialization_policy.as_db_str().to_string(),
@@ -376,10 +441,32 @@ fn compose_link(state: &DaemonState, facts: &LinkFacts) -> LinkStatusView {
         total_bytes: materialization.total_bytes,
         online_only_bytes: materialization.online_only_bytes,
         requested_content_count,
+        pinned_pending_count: pinned_pending.as_ref().map_or(0, |p| p.items),
+        pinned_pending_retry_secs: pinned_pending.as_ref().map_or(0, |p| {
+            p.next_retry.saturating_duration_since(std::time::Instant::now()).as_secs()
+        }),
+        pinned_pending_error: pinned_pending.map(|p| p.last_error).unwrap_or_default(),
+        retention: facts.retention,
         held_files: facts.held_files.clone(),
         skipped_symlink_count: facts.skipped_symlink_count,
         stranded_directory_count: facts.stranded_directory_count,
-        unreadable_files: state.telemetry.unreadable_files(&link.group_id),
+        unreadable_files: {
+            // Files the scan cannot read, and contested files that cannot be read into the
+            // store (they keep the group's forks waiting): one reason, one list.
+            let mut files = state.telemetry.unreadable_files(&link.group_id);
+            let contest_blocked = if link.paused {
+                Vec::new()
+            } else {
+                state.native_replication.contest_blocked_files(&link.group_id)
+            };
+            for blocked in contest_blocked {
+                if !files.iter().any(|file| file.path == blocked.path) {
+                    files.push(blocked);
+                }
+            }
+            files.sort_by(|a, b| a.path.cmp(&b.path));
+            files
+        },
         pending_approvals: state.pending_approvals(&link.group_id),
         degraded,
         transfer,
@@ -390,7 +477,7 @@ fn compose_link(state: &DaemonState, facts: &LinkFacts) -> LinkStatusView {
         // fail closed on, so a group whose policy this daemon distrusts
         // (own verification failure or coordinator-flagged invalid) is
         // distinguishable in status from a healthy one.
-        policy_stale: state.authority.is_group_policy_stale(&link.group_id),
+        policy_stale,
         local_storage_state,
         fetch_availability,
         ambiguous_local_paths: facts.ambiguous_local_paths.clone(),

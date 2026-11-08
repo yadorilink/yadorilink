@@ -28,6 +28,7 @@ use crate::local_convergence::version_retention::{
 };
 use crate::replica_coordinator::ReplicaCoordinator;
 use crate::sync_error::SyncError;
+use yadorilink_local_capture::unreadable::UnreadableReason;
 
 /// Whether the current versions asked about are in the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,7 +37,10 @@ pub(crate) enum Residency {
     InStore,
     /// These paths are not (yet): each is journaled for capture, which puts its next version into
     /// the store, or could not be read as a source right now. Ask again later.
-    Pending(Vec<String>),
+    ///
+    /// The second list holds the paths among them whose read was refused by the operating system
+    /// (or are not a regular file), with why: those do not pass by waiting.
+    Pending(Vec<String>, Vec<yadorilink_local_capture::unreadable::UnreadableFile>),
 }
 
 /// [`bring_current_versions_into_store_with`] for the daemon: the folder, the root lease and the store
@@ -114,6 +118,8 @@ enum Settled {
     Done,
     /// Not in the store, and not readable as the version now.
     NotYet,
+    /// Not in the store, and reading it failed; carries the classified error.
+    Unreadable(yadorilink_local_capture::unreadable::UnreadableReason),
     /// Not in the store, and the folder it would be read from has not been looked up yet.
     NeedsFolder,
 }
@@ -149,6 +155,7 @@ pub(crate) async fn bring_current_versions_into_store_with(
     paths.sort();
     paths.dedup();
     let mut pending = Vec::new();
+    let mut unreadable = Vec::new();
     let mut resolved: Option<Folder> = None;
     for path in paths {
         // The path's lock keeps a capture or a receive from replacing the file while it is read.
@@ -171,11 +178,23 @@ pub(crate) async fn bring_current_versions_into_store_with(
             settled =
                 settle_blocking(coordinator, store, resolved.as_ref(), group_id, &path).await?;
         }
-        if matches!(settled, Settled::NotYet) {
-            pending.push(path);
+        match settled {
+            Settled::Unreadable(reason) => {
+                unreadable.push(yadorilink_local_capture::unreadable::UnreadableFile {
+                    path: path.clone(),
+                    reason,
+                });
+                pending.push(path);
+            }
+            Settled::NotYet => pending.push(path),
+            Settled::Done | Settled::NeedsFolder => {}
         }
     }
-    Ok(if pending.is_empty() { Residency::InStore } else { Residency::Pending(pending) })
+    Ok(if pending.is_empty() {
+        Residency::InStore
+    } else {
+        Residency::Pending(pending, unreadable)
+    })
 }
 
 async fn settle_blocking(
@@ -240,8 +259,11 @@ fn settle_one(
     };
     let file = match open_source(&resolved) {
         Opened::File(file) => file,
-        // Nothing wrong with the file, only not readable as a source now.
-        Opened::Unavailable => return Ok(Settled::NotYet),
+        // A refusal is the person's to fix; anything else is only not readable as a source now.
+        Opened::Unavailable(Some(kind)) => {
+            return Ok(Settled::Unreadable(UnreadableReason::from_io(kind)))
+        }
+        Opened::Unavailable(None) => return Ok(Settled::NotYet),
         Opened::Gone => return journal(coordinator, lease, group_id, path, REMOVED),
     };
     let record_provenance =
@@ -249,7 +271,9 @@ fn settle_one(
     match ingest_version_from_file(store.as_ref(), &file, &record.blocks, &record_provenance) {
         Ok(IngestOutcome::Ingested) => Ok(Settled::Done),
         Ok(IngestOutcome::NotTheVersion) => journal(coordinator, lease, group_id, path, MODIFIED),
-        Err(IngestError::Read(_)) => Ok(Settled::NotYet),
+        Err(IngestError::Read(error)) => {
+            Ok(Settled::Unreadable(UnreadableReason::from_io(error.kind())))
+        }
         Err(error) => Err(SyncError::HydrationFailed(format!("{path}: {error:?}"))),
     }
 }
@@ -281,7 +305,7 @@ pub(crate) fn ensure_file_in_store(
     let file = match open_source(file_path) {
         Opened::File(file) => file,
         Opened::Gone => return StoreResidency::NotTheVersion,
-        Opened::Unavailable => {
+        Opened::Unavailable(_) => {
             return StoreResidency::Failed(format!("{path} cannot be read right now"));
         }
     };

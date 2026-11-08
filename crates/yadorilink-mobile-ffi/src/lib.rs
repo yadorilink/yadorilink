@@ -192,6 +192,50 @@ impl From<host::HostState> for HostState {
     }
 }
 
+/// Which part of the engine's data an incompatible format version belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum StoreComponent {
+    /// The content block store.
+    BlockStore,
+    /// The sync index database.
+    IndexDatabase,
+}
+
+impl From<host::StoreComponent> for StoreComponent {
+    fn from(component: host::StoreComponent) -> Self {
+        match component {
+            host::StoreComponent::BlockStore => Self::BlockStore,
+            host::StoreComponent::IndexDatabase => Self::IndexDatabase,
+        }
+    }
+}
+
+/// The causes of an engine failure an app words in its own language and can act on. Every other
+/// cause is `Unspecified`: show one generic localized sentence; the engine's English message goes
+/// to the log, never to the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FailureReason {
+    /// Not told apart: a generic failure.
+    Unspecified,
+    /// The device has no room left for what the engine had to write.
+    DiskFull,
+    /// The system refused the engine access to its data or to the folder.
+    AccessDenied,
+    /// The credential store (keychain, key file) exists and cannot be used.
+    CredentialStoreUnusable,
+}
+
+impl From<host::FailureReason> for FailureReason {
+    fn from(reason: host::FailureReason) -> Self {
+        match reason {
+            host::FailureReason::Unspecified => Self::Unspecified,
+            host::FailureReason::DiskFull => Self::DiskFull,
+            host::FailureReason::AccessDenied => Self::AccessDenied,
+            host::FailureReason::CredentialStoreUnusable => Self::CredentialStoreUnusable,
+        }
+    }
+}
+
 /// Why a lifecycle call failed.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum HostFailure {
@@ -213,10 +257,17 @@ pub enum HostFailure {
     /// directory); `reason` says why.
     #[error("the installation witness directory is unusable: {reason}")]
     WitnessDirUnusable { reason: String },
-    /// The engine did not start for another reason; the message says what to do.
+    /// The engine's data on disk was written by another build and this one has no migration. The
+    /// app offers to reset the data; `found` and `expected` are the data's and this build's format
+    /// versions of `component`. Nothing was changed.
+    #[error("{component:?} was written in format v{found}; this build uses v{expected}")]
+    StoreIncompatible { component: StoreComponent, found: i64, expected: i64 },
+    /// The engine did not start for another reason. Word `reason` (`Unspecified`: a generic
+    /// failure sentence); `message` is the engine's English text, for the log only.
     #[error("{message}")]
-    StartFailed { message: String },
-    /// The engine's runtime could not be built.
+    StartFailed { reason: FailureReason, message: String },
+    /// The engine's runtime could not be built (an internal failure: a generic sentence;
+    /// `message` is for the log only).
     #[error("{message}")]
     Runtime { message: String },
     /// The engine's blocking work has not finished, so its data area is still locked and the
@@ -250,8 +301,11 @@ impl From<host::HostError> for HostFailure {
             HostError::Start(StartError::WitnessDirUnusable(reason)) => {
                 Self::WitnessDirUnusable { reason }
             }
+            HostError::Start(StartError::StoreIncompatible { component, found, expected }) => {
+                Self::StoreIncompatible { component: component.into(), found, expected }
+            }
             HostError::Start(other @ StartError::Other(_)) => {
-                Self::StartFailed { message: other.to_string() }
+                Self::StartFailed { reason: other.reason().into(), message: other.to_string() }
             }
             HostError::Runtime(error) => Self::Runtime { message: error.to_string() },
             HostError::Draining => Self::Draining,
@@ -301,9 +355,10 @@ pub enum CallFailure {
     /// An account command failed.
     #[error("{}", .error.message)]
     Account { error: AccountError },
-    /// The command ran and failed; the message says what to do.
+    /// The command ran and failed. Word `reason` (`Unspecified`: a generic failure sentence);
+    /// `message` is the engine's English text, for the log only.
     #[error("{message}")]
-    Failed { message: String },
+    Failed { reason: FailureReason, message: String },
 }
 
 impl From<host::CallError> for CallFailure {
@@ -333,7 +388,9 @@ impl From<host::CallError> for CallFailure {
                         Self::ReadoptRefused { reason: reason.into(), message }
                     }
                     CommandErrorKind::NoFullReplica => Self::NoFullReplica { message },
-                    CommandErrorKind::Failed => Self::Failed { message },
+                    CommandErrorKind::Failed => {
+                        Self::Failed { reason: failed.reason().into(), message }
+                    }
                 }
             }
             CallError::Account(error) => Self::Account { error: (*error).into() },
@@ -620,6 +677,8 @@ impl ProviderChannel {
 
 mod app;
 pub use app::*;
+mod offline;
+pub use offline::*;
 mod send;
 pub use send::*;
 mod writes;

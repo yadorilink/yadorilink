@@ -27,6 +27,8 @@ pub struct ShownItem {
     /// Empty = the root container.
     pub parent_item_id: Vec<u8>,
     pub name: String,
+    /// The item's path inside its group (the daemon asks the shell status of this path).
+    pub path: String,
     pub kind: RecordKind,
     pub size: u64,
     pub mtime_unix_nanos: i64,
@@ -222,10 +224,11 @@ fn os_may_drop_copy(
         return Ok(false);
     }
     let kept: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pinned_items \
-          WHERE group_id = ?1 AND ( \
-            path = '' OR path = ?2 OR substr(?2, 1, length(path) + 1) = path || '/' \
-            OR (?3 AND substr(path, 1, length(?2) + 1) = ?2 || '/')))",
+        &format!(
+            "SELECT {} OR (?3 AND {})",
+            crate::retention_rules::kept_by_rule_sql("?1", "?2"),
+            crate::retention_rules::keep_rule_beneath_sql("?1", "?2"),
+        ),
         rusqlite::params![group_id, path, kind == RecordKind::Directory],
         |r| r.get(0),
     )?;
@@ -282,6 +285,7 @@ fn shown_item(
         item_id,
         parent_item_id,
         name: split_parent(path).1.to_owned(),
+        path: path.to_owned(),
         kind: version.meta.record_kind,
         size: version.size,
         mtime_unix_nanos: version.meta.mtime_unix_nanos,
@@ -646,7 +650,7 @@ struct EventRow {
 
 /// What the OS must be told about one item NOW, relative to the scope.
 enum Report {
-    Upsert(ShownItem),
+    Upsert(Box<ShownItem>),
     Remove,
 }
 
@@ -716,7 +720,7 @@ fn report_item(
     }
     let parent_bytes = parent.unwrap_or_default();
     Ok(shown_item(conn, group_id, &path, item_id, &state, parent_bytes)?
-        .map(Report::Upsert)
+        .map(|item| Report::Upsert(Box::new(item)))
         .or(Some(Report::Remove)))
 }
 
@@ -789,7 +793,7 @@ fn changes_in(
                         break;
                     }
                     bytes += size;
-                    upserts.push(item);
+                    upserts.push(*item);
                 }
             }
         }

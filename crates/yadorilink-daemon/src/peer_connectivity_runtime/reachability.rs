@@ -44,6 +44,25 @@ pub(super) fn unreachable_because(failure: DialFailure) -> UnreachableCategory {
     }
 }
 
+/// Which end of a version mismatch has to update: the peer's protocol version is newer than
+/// this device's (this device is the old one), or older.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionSkew {
+    PeerNewer,
+    PeerOlder,
+}
+
+impl VersionSkew {
+    /// The skew between the peer's protocol version and ours; `None` when they match.
+    pub fn between(theirs: u32, ours: u32) -> Option<Self> {
+        match theirs.cmp(&ours) {
+            std::cmp::Ordering::Greater => Some(Self::PeerNewer),
+            std::cmp::Ordering::Less => Some(Self::PeerOlder),
+            std::cmp::Ordering::Equal => None,
+        }
+    }
+}
+
 /// Every peer's connections and dials, and the reachability they add up to.
 #[derive(Debug, Default)]
 pub(super) struct LinkReachability {
@@ -60,17 +79,25 @@ pub(super) struct LinkReachability {
 struct DeviceLinks {
     dialing: u32,
     failure: Option<UnreachableCategory>,
-    /// A live connection to this device opened a lane whose hello speaks another protocol
-    /// version. The device is reachable, so this is not a reachability: it is a fact about the
-    /// connections, and it lasts exactly as long as they do.
-    incompatible: bool,
-    /// Live connections and the kind of path each has selected, if any.
-    links: HashMap<LinkId, Option<Carrier>>,
+    /// Live connections.
+    links: HashMap<LinkId, LinkState>,
+}
+
+#[derive(Debug)]
+struct LinkState {
+    /// The kind of path this connection has selected, if any.
+    carrier: Option<Carrier>,
+    /// The transport's id for this connection, which a lane's report names it by.
+    connection: usize,
+    /// This connection opened a lane whose hello speaks another protocol version. The device is
+    /// reachable, so this is not a reachability: it is a fact about this connection, and it
+    /// ends with it.
+    incompatible: Option<VersionSkew>,
 }
 
 impl DeviceLinks {
     fn reachability(&self) -> Option<PeerReachability> {
-        let selected = |kind| self.links.values().any(|carrier| *carrier == Some(kind));
+        let selected = |kind| self.links.values().any(|link| link.carrier == Some(kind));
         if selected(Carrier::Direct) {
             return Some(PeerReachability::Connected(RouteKind::Direct));
         }
@@ -125,12 +152,17 @@ impl LinkReachability {
         self.dial_ended(peer)
     }
 
-    pub(super) fn link_up(&mut self, device: &str, carrier: Option<Carrier>) -> LinkId {
+    pub(super) fn link_up(
+        &mut self,
+        device: &str,
+        carrier: Option<Carrier>,
+        connection: usize,
+    ) -> LinkId {
         let id = self.next_link;
         self.next_link += 1;
         let links = self.devices.entry(device.to_string()).or_default();
         links.failure = None;
-        links.links.insert(id, carrier);
+        links.links.insert(id, LinkState { carrier, connection, incompatible: None });
         id
     }
 
@@ -138,16 +170,13 @@ impl LinkReachability {
     /// -- closed, or its device revoked -- is not brought back.
     pub(super) fn carrier_changed(&mut self, device: &str, link: LinkId, carrier: Option<Carrier>) {
         if let Some(slot) = self.devices.get_mut(device).and_then(|d| d.links.get_mut(&link)) {
-            *slot = carrier;
+            slot.carrier = carrier;
         }
     }
 
     pub(super) fn link_closed(&mut self, device: &str, link: LinkId) {
         if let Some(links) = self.devices.get_mut(device) {
             links.links.remove(&link);
-            if links.links.is_empty() {
-                links.incompatible = false;
-            }
         }
         self.prune(device);
     }
@@ -158,16 +187,26 @@ impl LinkReachability {
         self.dials.retain(|_, (dialled, _)| dialled != device);
     }
 
-    /// Records that `device`, over a connection that is up, speaks another protocol version. A
-    /// device with no live connection is not marked: nothing says it is reachable.
-    pub(super) fn mark_incompatible(&mut self, device: &str) {
-        if let Some(links) = self.devices.get_mut(device).filter(|d| !d.links.is_empty()) {
-            links.incompatible = true;
+    /// Records that `device`, over its live connection `connection`, speaks another protocol
+    /// version. A connection that is not live is not marked: nothing says it is reachable.
+    pub(super) fn mark_incompatible(&mut self, device: &str, connection: usize, skew: VersionSkew) {
+        if let Some(link) = self
+            .devices
+            .get_mut(device)
+            .and_then(|d| d.links.values_mut().find(|l| l.connection == connection))
+        {
+            link.incompatible = Some(skew);
         }
     }
 
+    /// Whether a live connection to `device` is marked: the mark leaves with its connection.
     pub(super) fn is_incompatible(&self, device: &str) -> bool {
-        self.devices.get(device).is_some_and(|d| d.incompatible)
+        self.version_skew(device).is_some()
+    }
+
+    /// Which side is older, when a live connection to `device` is marked.
+    pub(super) fn version_skew(&self, device: &str) -> Option<VersionSkew> {
+        self.devices.get(device).and_then(|d| d.links.values().find_map(|l| l.incompatible))
     }
 
     pub(super) fn get(&self, device: &str) -> Option<PeerReachability> {
@@ -252,10 +291,10 @@ mod tests {
     #[test]
     fn a_connection_reads_as_its_selected_path_and_direct_wins_over_relay() {
         let mut links = LinkReachability::default();
-        let relayed = links.link_up(DEVICE, Some(Carrier::Relay));
+        let relayed = links.link_up(DEVICE, Some(Carrier::Relay), 0);
         assert_eq!(links.get(DEVICE), Some(PeerReachability::Connected(RouteKind::Relay)));
 
-        let direct = links.link_up(DEVICE, None);
+        let direct = links.link_up(DEVICE, None, 0);
         assert_eq!(
             links.get(DEVICE),
             Some(PeerReachability::Connected(RouteKind::Relay)),
@@ -273,7 +312,7 @@ mod tests {
     #[test]
     fn a_connection_moving_from_relay_to_direct_is_followed() {
         let mut links = LinkReachability::default();
-        let link = links.link_up(DEVICE, Some(Carrier::Relay));
+        let link = links.link_up(DEVICE, Some(Carrier::Relay), 0);
         links.carrier_changed(DEVICE, link, Some(Carrier::Direct));
         assert_eq!(links.get(DEVICE), Some(PeerReachability::Connected(RouteKind::Direct)));
     }
@@ -283,7 +322,7 @@ mod tests {
         let mut links = LinkReachability::default();
         links.dial_started(DEVICE, peer(1));
         links.dial_failed(peer(1), UnreachableCategory::NoCandidates);
-        let link = links.link_up(DEVICE, Some(Carrier::Direct));
+        let link = links.link_up(DEVICE, Some(Carrier::Direct), 0);
         links.link_closed(DEVICE, link);
         assert_eq!(links.get(DEVICE), None, "the old failure does not come back");
     }
@@ -293,7 +332,7 @@ mod tests {
         let mut links = LinkReachability::default();
         links.dial_started(DEVICE, peer(1));
         assert_eq!(links.dial_connected(peer(1)).as_deref(), Some(DEVICE));
-        let link = links.link_up(DEVICE, Some(Carrier::Direct));
+        let link = links.link_up(DEVICE, Some(Carrier::Direct), 0);
         links.link_closed(DEVICE, link);
         assert_eq!(links.get(DEVICE), None);
     }
@@ -302,7 +341,7 @@ mod tests {
     fn a_forgotten_device_is_not_brought_back_by_its_old_connections_or_dials() {
         let mut links = LinkReachability::default();
         links.dial_started(DEVICE, peer(1));
-        let link = links.link_up(DEVICE, Some(Carrier::Direct));
+        let link = links.link_up(DEVICE, Some(Carrier::Direct), 0);
 
         links.forget(DEVICE);
         assert_eq!(links.get(DEVICE), None);
@@ -317,10 +356,10 @@ mod tests {
     #[test]
     fn a_connected_device_that_spoke_another_version_is_incompatible_and_still_connected() {
         let mut links = LinkReachability::default();
-        links.link_up(DEVICE, Some(Carrier::Direct));
+        links.link_up(DEVICE, Some(Carrier::Direct), 0);
         assert!(!links.is_incompatible(DEVICE));
 
-        links.mark_incompatible(DEVICE);
+        links.mark_incompatible(DEVICE, 0, VersionSkew::PeerNewer);
         assert!(links.is_incompatible(DEVICE));
         assert_eq!(
             links.get(DEVICE),
@@ -330,10 +369,25 @@ mod tests {
     }
 
     #[test]
+    fn the_incompatible_mark_leaves_with_its_connection_while_another_remains() {
+        let mut links = LinkReachability::default();
+        let old = links.link_up(DEVICE, Some(Carrier::Direct), 1);
+        links.link_up(DEVICE, Some(Carrier::Direct), 2);
+
+        links.mark_incompatible(DEVICE, 1, VersionSkew::PeerNewer);
+        assert!(links.is_incompatible(DEVICE));
+        links.mark_incompatible(DEVICE, 99, VersionSkew::PeerNewer);
+
+        links.link_closed(DEVICE, old);
+        assert!(!links.is_incompatible(DEVICE), "the marked connection is gone");
+        assert_eq!(links.get(DEVICE), Some(PeerReachability::Connected(RouteKind::Direct)));
+    }
+
+    #[test]
     fn an_incompatible_device_whose_path_is_not_selected_yet_reads_connecting_never_unreachable() {
         let mut links = LinkReachability::default();
-        let link = links.link_up(DEVICE, None);
-        links.mark_incompatible(DEVICE);
+        let link = links.link_up(DEVICE, None, 0);
+        links.mark_incompatible(DEVICE, 0, VersionSkew::PeerNewer);
         assert!(links.is_incompatible(DEVICE));
         assert_eq!(links.get(DEVICE), Some(PeerReachability::Connecting));
 
@@ -344,11 +398,11 @@ mod tests {
     #[test]
     fn incompatibility_ends_with_the_connections_and_is_not_invented_for_a_device_without_one() {
         let mut links = LinkReachability::default();
-        links.mark_incompatible(DEVICE);
+        links.mark_incompatible(DEVICE, 0, VersionSkew::PeerNewer);
         assert!(!links.is_incompatible(DEVICE), "no connection: nothing says it is reachable");
 
-        let link = links.link_up(DEVICE, Some(Carrier::Direct));
-        links.mark_incompatible(DEVICE);
+        let link = links.link_up(DEVICE, Some(Carrier::Direct), 0);
+        links.mark_incompatible(DEVICE, 0, VersionSkew::PeerNewer);
         links.dial_started(DEVICE, peer(1));
         links.link_closed(DEVICE, link);
         assert!(!links.is_incompatible(DEVICE), "the old connection's verdict does not outlive it");
@@ -363,8 +417,8 @@ mod tests {
     #[test]
     fn an_unrelated_failed_dial_does_not_erase_a_live_connections_verdict() {
         let mut links = LinkReachability::default();
-        links.link_up(DEVICE, Some(Carrier::Direct));
-        links.mark_incompatible(DEVICE);
+        links.link_up(DEVICE, Some(Carrier::Direct), 0);
+        links.mark_incompatible(DEVICE, 0, VersionSkew::PeerNewer);
         links.dial_started(DEVICE, peer(1));
         links.dial_failed(peer(1), UnreachableCategory::NoResponse);
         assert!(links.is_incompatible(DEVICE));
@@ -373,8 +427,8 @@ mod tests {
     #[test]
     fn every_listed_peer_is_reported_once() {
         let mut links = LinkReachability::default();
-        links.link_up("a", Some(Carrier::Direct));
-        links.link_up("a", Some(Carrier::Relay));
+        links.link_up("a", Some(Carrier::Direct), 0);
+        links.link_up("a", Some(Carrier::Relay), 0);
         links.dial_started("b", peer(2));
         let mut all = links.all();
         all.sort_by(|x, y| x.0.cmp(&y.0));
@@ -385,5 +439,21 @@ mod tests {
                 ("b".to_string(), PeerReachability::Connecting),
             ]
         );
+    }
+
+    #[test]
+    fn the_skew_names_the_older_end_and_matching_versions_have_none() {
+        assert_eq!(VersionSkew::between(6, 5), Some(VersionSkew::PeerNewer));
+        assert_eq!(VersionSkew::between(4, 5), Some(VersionSkew::PeerOlder));
+        assert_eq!(VersionSkew::between(5, 5), None);
+    }
+
+    #[test]
+    fn the_recorded_skew_is_reported_with_its_connection() {
+        let mut links = LinkReachability::default();
+        links.link_up(DEVICE, Some(Carrier::Direct), 0);
+        assert_eq!(links.version_skew(DEVICE), None);
+        links.mark_incompatible(DEVICE, 0, VersionSkew::PeerOlder);
+        assert_eq!(links.version_skew(DEVICE), Some(VersionSkew::PeerOlder));
     }
 }

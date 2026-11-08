@@ -41,7 +41,7 @@ pub use link::{
 };
 pub use nas_admin::{
     NasAdminAuthorizer, NasAdminConnection, NasAdminEndpoint, NasAdminError, NasAdminLimits,
-    NasAdminService, NasAdminStatus, NasAdminStream, YADORI_NAS_ADMIN_ALPN,
+    NasAdminService, NasAdminStatus, NasAdminStream, NAS_ADMIN_SECRET_LEN, YADORI_NAS_ADMIN_ALPN,
 };
 pub use native_replication_transport::{
     NativeReplicationConnection, NativeReplicationConnections, NativeReplicationReader,

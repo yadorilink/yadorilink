@@ -168,6 +168,24 @@ async fn reportable_error_hook_creates_a_candidate_when_prompts_are_enabled() {
     assert!(!envelope.to_json().contains("alice"), "the candidate must already be redacted");
 }
 
+/// A CLI error message echoes what the user typed, and a user-chosen name has
+/// no pattern the redaction pass could match; the candidate must not carry it.
+#[tokio::test]
+async fn reportable_error_candidate_does_not_keep_user_chosen_names() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (_dir, state) = start_daemon().await;
+
+    let err = yadorilink_cli::error::CliError::Other(
+        "no folder group named \"family-photos-2025\" is visible to this account".to_string(),
+    );
+    yadorilink_cli::commands::report::handle_reportable_error(&err).await;
+
+    let candidates = state.reporting.error_candidates().list().unwrap();
+    let envelope =
+        state.reporting.error_candidates().show(&candidates[0].report_id).unwrap().unwrap();
+    assert!(!envelope.to_json().contains("family-photos"));
+}
+
 /// `report usage --preview`/`--export` still work (providing a limited
 /// CLI-only report) even with no daemon running.
 #[tokio::test]

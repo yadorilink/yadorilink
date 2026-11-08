@@ -14,6 +14,8 @@ use crate::provider_handoff::HandoffRoot;
 use crate::shell_ipc::provider_materialize::Delivery;
 use crate::shell_ipc::provider_tests::{domain_state, handshake, send, state_with_root};
 
+use yadorilink_local_storage::BlockContentStore;
+
 use super::*;
 
 const GROUP_ID: &str = "group-1";
@@ -135,8 +137,8 @@ impl Fx {
     async fn response(&mut self) -> ProviderApplyChangeResponse {
         let delivery = tokio::time::timeout(Duration::from_secs(10), self.rx.recv())
             .await
-            .expect("no response")
-            .expect("closed");
+            .expect("no response within 10 s (a slow machine, or the reply was never sent)")
+            .expect("the response channel closed before a reply");
         if let Some(written) = delivery.written {
             let _ = written.send(true);
         }
@@ -230,6 +232,94 @@ async fn only_a_handshaken_connection_with_an_attached_host_may_write() {
     let response = fx.ask(fx.create(2, "a.txt", None)).await;
     assert_eq!(failure(&response), ProviderApplyFailure::NotReady);
     assert_eq!(fx.repo().pending_items(&fx.root).unwrap().len(), 0, "nothing was authored");
+}
+
+/// The operating system's registration of the root is gone (the host reports its domain removed or
+/// missing): the placeholders vanishing with it are not the person deleting them. A delete that
+/// reaches the daemon from that root is refused and the item survives; once the host reports the
+/// root registered again, the same delete is the person's and is applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delete_from_a_root_the_host_reports_lost_is_refused_and_the_item_survives() {
+    use yadorilink_ipc_proto::shellipc::{DomainEvidence, ProviderDomainState};
+    let mut fx = Fx::new().await;
+    let source = fx.put_ingest("copy-1", b"the only copy another device keeps");
+    let created = fx.ask(fx.create(1, "keep.bin", Some(source))).await;
+    assert!(created.ok, "{created:?}");
+    let item = created.item.unwrap();
+    let root_id = fx.root_id.clone();
+    let delete = |seq: u64| ProviderApplyChangeRequest {
+        base_version_hash: item.content_version.clone(),
+        request_id: format!("delete-{seq}").into_bytes(),
+        session_id: vec![1; 16],
+        operation_seq: seq,
+        root_id: root_id.clone(),
+        kind: ProviderChangeKind::Delete as i32,
+        item_id: item.item_id.clone(),
+        ..Default::default()
+    };
+    async fn report(fx: &Fx, evidence: DomainEvidence) {
+        let message = ShellIpcMessage {
+            payload: Some(Payload::ProviderDomainState(ProviderDomainState {
+                root_id: fx.root_id.clone(),
+                evidence: evidence as i32,
+                preserved_location: String::new(),
+                last_acked_namespace_revision: 0,
+            })),
+        };
+        crate::shell_ipc::provider_channel_message(&fx.context, &fx.host, &message).await;
+    }
+
+    // The registration is lost (a raw reading from the host, before any verdict is reached).
+    report(&fx, DomainEvidence::Absent).await;
+    let refused = fx.ask(delete(2)).await;
+    assert_eq!(failure(&refused), ProviderApplyFailure::NotReady, "{refused:?}");
+    assert_eq!(
+        fx.repo().list_children(&fx.root, "").unwrap().len(),
+        1,
+        "a delete from a root the OS no longer has registered was applied"
+    );
+    assert_eq!(fx.context.writer.follow_ups(), 1, "only the create was published");
+
+    // A reading that proves nothing came back does not lift the refusal.
+    report(&fx, DomainEvidence::Unknown).await;
+    report(&fx, DomainEvidence::NotRegistered).await;
+    assert_eq!(failure(&fx.ask(delete(4)).await), ProviderApplyFailure::NotReady);
+    assert_eq!(fx.repo().list_children(&fx.root, "").unwrap().len(), 1);
+
+    // Registered again: the same request is the person's and goes through.
+    report(&fx, DomainEvidence::Registered).await;
+    assert!(fx.ask(delete(3)).await.ok);
+    assert_eq!(fx.repo().list_children(&fx.root, "").unwrap().len(), 0);
+}
+
+/// A delete that passed the first look is stopped at the commit point when the registration is
+/// reported lost in between (the copy of the bytes is read in that time).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_loss_reported_before_the_commit_point_stops_the_delete() {
+    let mut fx = Fx::new().await;
+    let source = fx.put_ingest("copy-1", b"bytes");
+    let created = fx.ask(fx.create(1, "keep.bin", Some(source))).await;
+    let item = created.item.unwrap();
+    let delete = ProviderApplyChangeRequest {
+        base_version_hash: item.content_version.clone(),
+        request_id: b"delete-in-flight".to_vec(),
+        session_id: vec![1; 16],
+        operation_seq: 2,
+        root_id: fx.root_id.clone(),
+        kind: ProviderChangeKind::Delete as i32,
+        item_id: item.item_id.clone(),
+        ..Default::default()
+    };
+    let (context, root) = (fx.context.clone(), fx.root.clone());
+    set_point(
+        "before_commit_point",
+        &delete.request_id,
+        Arc::new(move || context.provider_host.note_domain_lost(&root, true)),
+    );
+    fx.send(delete);
+    let response = fx.response().await;
+    assert!(!response.ok, "{response:?}");
+    assert_eq!(fx.repo().list_children(&fx.root, "").unwrap().len(), 1, "the delete committed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -631,7 +721,7 @@ async fn the_wire_item_carries_the_engines_eviction_permission() {
         assert!(page.ok, "{}", page.error);
         page.items.into_iter().map(|i| (i.name, i.eviction_allowed)).collect::<Vec<_>>()
     };
-    let pins = fx.state.replica_coordinator.pinned_item_repository();
+    let pins = fx.state.replica_coordinator.retention_rules();
     assert_eq!(
         permissions(ask_children(&fx, &[], &[], 10).await),
         [("free".to_string(), true), ("kept".to_string(), true)]
@@ -713,7 +803,7 @@ async fn a_pin_or_unpin_republishes_the_item_to_the_os() {
     }
     let adapter = DaemonMaterializationAdapter::new(fx.state.clone());
 
-    adapter.pin("group-1", "kept").await.unwrap();
+    adapter.set_rule("group-1", "kept", crate::application::ports::RuleChoice::Keep).await.unwrap();
     let pinned = served(ask_children(&fx, &[], &[], 10).await);
     assert_ne!(pinned["kept"].0, before["kept"].0, "the OS was not given a new token for the pin");
     assert!(!pinned["kept"].1 && pinned["free"].1);
@@ -723,7 +813,10 @@ async fn a_pin_or_unpin_republishes_the_item_to_the_os() {
         fx.repo().mark_announced(&fx.root, changes).unwrap();
     }
 
-    adapter.unpin("group-1", "kept").unwrap();
+    adapter
+        .set_rule("group-1", "kept", crate::application::ports::RuleChoice::Default)
+        .await
+        .unwrap();
     let unpinned = served(ask_children(&fx, &[], &[], 10).await);
     assert_ne!(
         unpinned["kept"].0, pinned["kept"].0,
@@ -1475,6 +1568,62 @@ async fn an_app_write_by_a_reader_is_refused_not_authorized() {
     assert!(fx.ingest_dir().join("up-1").exists());
 }
 
+/// A publish-only root takes new files and nothing else from this device: a modify (contents,
+/// rename, move) and a delete are refused `PublishOnly` before anything is recorded, and clearing
+/// the flag lets the same change through as a fresh operation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_publish_only_root_takes_creates_and_refuses_modify_and_delete() {
+    let fx = Fx::app_only().await;
+    let mut create = fx.create(1, "a.txt", Some(fx.put_ingest("up-1", b"first")));
+    create.session_id = vec![2; 16];
+    let item = fx.app(create).await.item.expect("created");
+
+    assert!(fx.repo().set_publish_only(&fx.root, true).unwrap());
+    let mut more = fx.create(2, "b.txt", Some(fx.put_ingest("up-2", b"second")));
+    more.session_id = vec![2; 16];
+    assert!(fx.app(more).await.ok, "a create is allowed");
+
+    let mut rename = fx.modify(3, &item);
+    rename.name = Some("renamed.txt".into());
+    assert_eq!(failure(&fx.app(rename).await), ProviderApplyFailure::PublishOnly);
+    let mut edit = fx.modify(4, &item);
+    edit.content = Some(fx.put_ingest("up-3", b"changed"));
+    assert_eq!(failure(&fx.app(edit).await), ProviderApplyFailure::PublishOnly);
+    assert!(fx.ingest_dir().join("up-3").exists(), "the staged copy is kept");
+    let mut delete = fx.modify(5, &item);
+    delete.kind = ProviderChangeKind::Delete as i32;
+    assert_eq!(failure(&fx.app(delete).await), ProviderApplyFailure::PublishOnly);
+    assert_eq!(fx.repo().list_children(&fx.root, "").unwrap().len(), 2, "nothing changed");
+
+    // The refusal recorded nothing, not even the journal row of the staged copy.
+    assert_eq!(fx.repo().pending_ingest_name(&fx.root, &[2; 16], 4).unwrap(), None);
+
+    // The same identity succeeds once the flag is cleared.
+    assert!(fx.repo().set_publish_only(&fx.root, false).unwrap());
+    let mut delete = fx.modify(5, &item);
+    delete.kind = ProviderChangeKind::Delete as i32;
+    let deleted = fx.app(delete).await;
+    assert!(deleted.ok, "{deleted:?}");
+}
+
+/// A change that committed before the flag was set still answers with its stored outcome when it
+/// is asked about again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replay_of_a_committed_change_survives_the_flag() {
+    let fx = Fx::app_only().await;
+    let mut create = fx.create(1, "a.txt", Some(fx.put_ingest("up-1", b"first")));
+    create.session_id = vec![2; 16];
+    let item = fx.app(create).await.item.expect("created");
+    let mut delete = fx.modify(2, &item);
+    delete.kind = ProviderChangeKind::Delete as i32;
+    let done = fx.app(delete.clone()).await;
+    assert!(done.ok, "{done:?}");
+
+    assert!(fx.repo().set_publish_only(&fx.root, true).unwrap());
+    let again = fx.app(delete).await;
+    assert!(again.ok && again.replayed, "{again:?}");
+}
+
 /// A root that reported an error of its own is not written to, even by the app.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_app_write_to_a_root_with_an_error_is_not_ready() {
@@ -1955,4 +2104,121 @@ async fn keep_this_does_not_overwrite_an_original_that_changed_before_the_commit
         "the edit stands, the copy did not overwrite it"
     );
     assert!(fx.repo().item_for_path(&fx.root, &copy).unwrap().is_some(), "the copy is still there");
+}
+
+// --- ingest op: step order and the cut between the store barrier and the record -------------
+
+fn ingest_op(fx: &Fx, seq: u64) -> IngestOp {
+    IngestOp::new(GROUP_ID, &fx.root, &[1; 16], seq)
+}
+
+use crate::write_op::StepEvent::{IngestApplied, IngestJournaled, IngestStoreDurable};
+
+/// The bytes are durable in the store before the ingest is recorded as done, and the journal row
+/// is cleared by that record and not before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ingest_makes_the_store_durable_before_it_is_recorded_and_clears_the_journal_with_it() {
+    let mut fx = Fx::new().await;
+    let source = fx.put_ingest("trace-copy", b"traced bytes");
+    let mut request = fx.create(11, "t.txt", Some(source));
+    request.request_id = b"trace-order".to_vec();
+    let id = request.request_id.clone();
+    let seen = Arc::new(Mutex::new(None));
+    {
+        // At the commit point the store barrier is behind us and the record is not yet written.
+        let (op, repo_root, repo, seen) = (
+            ingest_op(&fx, 11),
+            fx.root.clone(),
+            fx.state.replica_coordinator.clone(),
+            seen.clone(),
+        );
+        set_point(
+            "at_commit_point",
+            &id,
+            Arc::new(move || {
+                let journaled = repo
+                    .provider_repository()
+                    .pending_ingest_name(&repo_root, &[1; 16], 11)
+                    .unwrap()
+                    .is_some();
+                *seen.lock().unwrap() = Some((op.steps(), journaled));
+            }),
+        );
+    }
+    let response = fx.ask(request).await;
+    assert!(response.ok, "{response:?}");
+    let (before_record, journal_held) = seen.lock().unwrap().take().unwrap();
+    assert_eq!(before_record, vec![IngestJournaled, IngestStoreDurable]);
+    assert!(journal_held, "the journal row was cleared before the record");
+    assert_eq!(
+        ingest_op(&fx, 11).steps(),
+        vec![IngestJournaled, IngestStoreDurable, IngestApplied]
+    );
+    assert_eq!(fx.repo().pending_ingest_name(&fx.root, &[1; 16], 11).unwrap(), None);
+}
+
+/// Cut between the store barrier and the record: the blocks are durable, nothing is authored and
+/// the journaled upload is still there. The retry of the same operation applies it, and a further
+/// replay is answered from the record without ingesting again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cut_between_the_store_barrier_and_the_record_is_finished_by_the_retry() {
+    let mut fx = Fx::new().await;
+    let source = fx.put_ingest("cut-copy", b"cut bytes");
+    let mut first = fx.create(12, "c.txt", Some(source.clone()));
+    first.request_id = b"cut-1".to_vec();
+    {
+        let (context, requests, handshakes, tx) =
+            (fx.context.clone(), fx.requests.clone(), fx.handshakes.clone(), fx.tx.clone());
+        let cancel = cancel_message(&first.request_id);
+        set_point(
+            "before_commit_point",
+            &first.request_id,
+            Arc::new(move || {
+                assert!(apply_message(&context, &requests, &handshakes, &tx, &cancel));
+            }),
+        );
+    }
+    let response = fx.ask(first).await;
+    assert_eq!(failure(&response), ProviderApplyFailure::Cancelled);
+    assert_eq!(
+        ingest_op(&fx, 12).steps(),
+        vec![IngestJournaled, IngestStoreDurable],
+        "the cut state is store-durable, not applied"
+    );
+    assert_eq!(fx.repo().list_children(&fx.root, "").unwrap().len(), 0);
+    // The blocks are already readable from the store: the barrier is behind the cut.
+    assert_eq!(
+        fx.context.writer.store().get(&hex::encode(sha(b"cut bytes"))).unwrap(),
+        b"cut bytes"
+    );
+    assert_eq!(
+        fx.repo().pending_ingest_name(&fx.root, &[1; 16], 12).unwrap(),
+        Some("cut-copy".to_owned()),
+        "the journal must outlive the cut"
+    );
+    assert!(fx.ingest_dir().join("cut-copy").exists(), "the upload must outlive the cut");
+
+    // The retry (same identity, a new request id) finishes it.
+    let mut retry = fx.create(12, "c.txt", Some(source.clone()));
+    retry.request_id = b"cut-2".to_vec();
+    let response = fx.ask(retry).await;
+    assert!(response.ok, "{response:?}");
+    assert_eq!(fx.repo().list_children(&fx.root, "").unwrap().len(), 1);
+    assert_eq!(fx.repo().pending_ingest_name(&fx.root, &[1; 16], 12).unwrap(), None);
+    let steps = ingest_op(&fx, 12).steps();
+    assert_eq!(steps.last(), Some(&IngestApplied));
+    assert_eq!(steps.iter().filter(|s| **s == IngestApplied).count(), 1);
+
+    // A replay after the record: answered from it, nothing journaled, stored or applied again.
+    let recorded = steps.len();
+    fx.put_ingest("cut-copy", b"cut bytes");
+    let mut replay = fx.create(12, "c.txt", Some(source));
+    replay.request_id = b"cut-3".to_vec();
+    let response = fx.ask(replay).await;
+    assert!(response.ok, "{response:?}");
+    // The replay re-journals its own upload (before the replay check) and clears it again; it
+    // stores and applies nothing.
+    let after = ingest_op(&fx, 12).steps();
+    assert_eq!(after[recorded..], [IngestJournaled]);
+    assert_eq!(fx.repo().pending_ingest_name(&fx.root, &[1; 16], 12).unwrap(), None);
 }

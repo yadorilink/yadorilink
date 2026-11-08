@@ -118,6 +118,68 @@ impl Reporter {
         }]
     }
 
+    /// The items the daemon was last told are materialized.
+    pub fn reported(&self) -> &HashSet<Vec<u8>> {
+        &self.reported
+    }
+
+    /// The evidence sequence the last report was read after.
+    pub fn observed_after(&self) -> u64 {
+        self.observed_after
+    }
+
+    /// What to send now so the daemon learns that, of `candidates`, exactly those in `now` are
+    /// materialized, without the rest of the set having been looked at: the members of
+    /// `candidates` whose state differs from what was last reported are listed or removed, and
+    /// nothing else changes. Nothing when none differs. A reporter that has sent nothing yet
+    /// leaves it to its first full snapshot (empty here), and the caller sends a full report
+    /// instead when there is newer evidence than this reporter has seen (see `reports`).
+    pub fn changed(
+        &mut self,
+        root: &[u8],
+        candidates: &[Vec<u8>],
+        now: &HashSet<Vec<u8>>,
+    ) -> Vec<ProviderMaterializedReport> {
+        if self.seq == 0 {
+            return Vec::new();
+        }
+        let mut added: Vec<Vec<u8>> = candidates
+            .iter()
+            .filter(|id| now.contains(*id) && !self.reported.contains(*id))
+            .cloned()
+            .collect();
+        let mut removed: Vec<Vec<u8>> = candidates
+            .iter()
+            .filter(|id| !now.contains(*id) && self.reported.contains(*id))
+            .cloned()
+            .collect();
+        if added.is_empty() && removed.is_empty() {
+            return Vec::new();
+        }
+        added.sort();
+        added.dedup();
+        removed.sort();
+        removed.dedup();
+        for id in &removed {
+            self.reported.remove(id);
+        }
+        self.reported.extend(added.iter().cloned());
+        self.seq += 1;
+        vec![ProviderMaterializedReport {
+            root_id: root.to_vec(),
+            reporter_epoch: self.epoch,
+            report_seq: self.seq,
+            full: false,
+            observed_after_seq: self.observed_after,
+            upserts: added
+                .into_iter()
+                .map(|item_id| ProviderMaterializedItem { item_id })
+                .collect(),
+            removed,
+            ..Default::default()
+        }]
+    }
+
     /// The daemon's answer. True when the report was refused as out of protocol: the caller
     /// replaces this reporter with a new one (a new epoch and a full snapshot).
     pub fn needs_restart(&self, epoch: u64, needs_full: bool) -> bool {
@@ -185,6 +247,30 @@ mod tests {
         let older = reporter.reports(b"r", 2, &set(&[1, 2, 3]));
         assert!(!older[0].full);
         assert_eq!(older[0].observed_after_seq, 6, "the observation went back");
+    }
+
+    /// A change among a few candidates is reported without the rest of the set being known to the
+    /// caller, and only where the state differs from what was last reported.
+    #[test]
+    fn a_change_among_candidates_is_a_delta_that_leaves_the_rest_of_the_set_alone() {
+        let mut reporter = Reporter::with_epoch(3);
+        assert!(reporter.changed(b"r", &[vec![1; 16]], &set(&[1])).is_empty(), "before a snapshot");
+        reporter.reports(b"r", 5, &set(&[1, 2]));
+        // 3 became materialized, 2 did not, 1 is as reported, 4 is as reported (absent).
+        let candidates: Vec<Vec<u8>> = [1u8, 2, 3, 4].iter().map(|n| vec![*n; 16]).collect();
+        let delta = reporter.changed(b"r", &candidates, &set(&[1, 3]));
+        assert_eq!(delta.len(), 1);
+        assert!(!delta[0].full && delta[0].report_seq == 2 && delta[0].reporter_epoch == 3);
+        assert_eq!(delta[0].observed_after_seq, 5);
+        assert_eq!(
+            delta[0].upserts.iter().map(|u| u.item_id.clone()).collect::<Vec<_>>(),
+            [vec![3u8; 16]]
+        );
+        assert_eq!(delta[0].removed, vec![vec![2u8; 16]]);
+        // Nothing differs now; a full report later agrees with what was sent.
+        assert!(reporter.changed(b"r", &candidates, &set(&[1, 3])).is_empty());
+        assert!(reporter.reports(b"r", 5, &set(&[1, 3])).is_empty());
+        assert_eq!(reporter.observed_after(), 5);
     }
 
     #[test]

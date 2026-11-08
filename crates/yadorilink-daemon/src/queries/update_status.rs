@@ -70,14 +70,14 @@ impl UpdateStatusQueryService {
         }
     }
 
-    /// Read-only: answers from the manifest an earlier check verified (no network, no replay
-    /// floor change).
-    pub(crate) fn verified_entry(
+    /// Answers from the manifest an earlier check verified; when there is none it can vouch for,
+    /// runs one bounded manifest check first (see `UpdateManager::verified_entry_or_check`).
+    pub(crate) async fn verified_entry(
         &self,
         item: &crate::update::manifest::AppcastItem,
         phase: crate::update::manifest::AppcastPhase,
     ) -> crate::update::manager::VerifiedEntryAnswer {
-        self.manager.verified_entry(item, phase)
+        self.manager.verified_entry_or_check(item, phase).await
     }
 }
 

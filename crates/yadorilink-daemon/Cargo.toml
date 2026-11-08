@@ -94,11 +94,12 @@ test-support = [
     "yadorilink-sqlite-runtime/test-support",
     "yadorilink-root-authority/test-support",
     "yadorilink-replica-domain/test-support",
+    "yadorilink-fapi-client/test-support",
 ]
 
 [dependencies]
 async-trait = "0.1"
-# Local midnight for a timed pause that lasts until tomorrow.
+# Dates and durations for a timed pause.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 bytes.workspace = true
 yadorilink-local-capture = { path = "../yadorilink-local-capture" }
@@ -176,6 +177,8 @@ ed25519-dalek = { version = "3", features = ["rand_core"] }
 # elsewhere in the workspace; this is its first direct use.
 semver = "1"
 base64 = "0.23"
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+hkdf = "0.13"
 rand = "0.10.2"
 # WebSocket client for the coordination plane's `/netmap/subscribe` route,
 # the sole netmap subscription transport. rustls-tls-webpki-roots to match

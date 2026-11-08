@@ -28,9 +28,8 @@
 //! local version that the later commit would then wrongly prove as the
 //! received one. So the lock is released only after the outcome has arrived.
 //!
-//! A batch is committed on the blocking pool (`YADORILINK_RECEIVE_ASYNC_COMMIT`,
-//! on unless `0`): whichever waiter finds the queue due takes the batch and
-//! hands it to a job that owns the items, the reply channels and the commit,
+//! A batch is committed on the blocking pool: whichever waiter finds the queue due takes the
+//! batch and hands it to a job that owns the items, the reply channels and the commit,
 //! and every future of the run, that one included, goes on being polled by
 //! the one task that owns the run. The job replies to each waiter and wakes
 //! them; nothing in it touches a waiter's guards.
@@ -146,12 +145,6 @@ pub(crate) struct PendingFlush {
     pub(crate) data_flushed: Option<yadorilink_local_storage::FlushedStamp>,
 }
 
-/// Whether file completions are batched: on unless the variable is `0`.
-/// A/B knob for the measurement.
-pub(crate) fn parse_batch_completion(raw: Option<&str>) -> bool {
-    raw.map(str::trim) != Some("0")
-}
-
 tokio::task_local! {
     static WINDOW: Arc<CompletionWindow>;
     static PARTICIPANT: Participant;
@@ -262,19 +255,6 @@ pub(crate) struct TempFlushItem {
     /// The temp's content is durable elsewhere (the block store): only its NAME must reach stable
     /// storage before the rename, not its data.
     pub(crate) name_only: bool,
-    /// Once the temp's directory entry is flushed, the barrier records
-    /// it on the write's intent, in one transaction for the batch, before any file of the batch
-    /// may be renamed (see `materialization_intents.temp_witness`).
-    pub(crate) witness: Option<TempWitness>,
-}
-
-/// The intent a temp flush is recorded on.
-#[derive(Clone)]
-pub(crate) struct TempWitness {
-    /// The path the temp will be renamed to, relative to the root.
-    pub(crate) path: String,
-    /// The mutation fence the write's open bumped.
-    pub(crate) fence: i64,
 }
 
 /// How long the window's files waited in each collector's queue (summed over

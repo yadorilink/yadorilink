@@ -62,6 +62,15 @@ pub struct ShellContext {
     pub(crate) reclaim_queue: Arc<crate::provider_reclaim::ReclaimQueue>,
     /// Automatic space management: Off unless the setting says otherwise.
     pub(crate) auto_reclaim: Arc<crate::provider_auto_reclaim::AutoReclaim>,
+    /// Frees the OS copies under an `online_only` retention rule.
+    pub(crate) retention_apply: Arc<crate::retention_apply::RetentionApply>,
+    /// Frees OS copies and sets the OS pins for the retention rules.
+    pub(crate) evictor: Arc<crate::provider_evict::ProviderEvictor>,
+    /// The person's pin changes the host reported, applied in order by one worker (started by the
+    /// first one).
+    pub(crate) pin_observations: Arc<std::sync::OnceLock<crate::shell_ipc::PinObservationQueue>>,
+    /// Keeps the block store filling for online-only paths of a full-replica folder.
+    pub(crate) retention_store_fill: Arc<crate::retention_store_fill::RetentionStoreFill>,
     /// The author identity, block store and authoring lease the provider write path uses.
     pub(crate) writer: Arc<crate::provider_writer::ProviderWriter>,
     /// Which other device holds a version no connected peer could supply (weak: the state
@@ -145,6 +154,25 @@ impl crate::provider_auto_reclaim::ReclaimEnvironment for DaemonReclaimEnvironme
         yadorilink_local_storage::free_space::classify_volume(root, headroom_override)
             .ok()
             .map(|space| space.classify())
+    }
+}
+
+/// The machine facts the retention store fill reads.
+struct DaemonFillEnvironment {
+    state: Arc<crate::daemon_state::DaemonState>,
+}
+
+impl crate::retention_store_fill::FillEnvironment for DaemonFillEnvironment {
+    fn low_disk(&self) -> bool {
+        let headroom_override =
+            self.state.governance_config.load_or_default().headroom_override_bytes;
+        let Some(root) = self.state.block_store.storage_root() else { return false };
+        // An unreadable volume is never read as pressure.
+        yadorilink_local_storage::free_space::classify_volume(root, headroom_override)
+            .ok()
+            .is_some_and(|space| {
+                crate::provider_auto_reclaim::under_pressure(Some(space.classify()))
+            })
     }
 }
 
@@ -244,6 +272,28 @@ impl ShellContext {
                     root_id,
                 )
             }));
+            let counts_coordinator = coordinator.clone();
+            let counts_membership = membership.clone();
+            let counts_opens = state.requested_opens.clone();
+            control.provider_status.install_counts(Arc::new(move || {
+                let repository = counts_coordinator.provider_repository();
+                let Ok(roots) = repository.list_declared_roots() else { return Default::default() };
+                roots
+                    .into_iter()
+                    .filter_map(|root| {
+                        let held = counts_membership.held_count(&root.root_id)?;
+                        let opening = counts_membership.opening_count(
+                            &counts_opens,
+                            &root.group_id,
+                            &root.root_id,
+                        );
+                        Some((
+                            root.group_id,
+                            crate::provider_status::OsFileCounts { held, opening },
+                        ))
+                    })
+                    .collect()
+            }));
             control.provider_status.install(Arc::new(move || {
                 let root = host.handoff_root();
                 let inputs = crate::provider_eager::EagerInputs {
@@ -255,7 +305,13 @@ impl ShellContext {
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_millis() as i64);
-                crate::provider_status::provider_root_lines(&coordinator, &eager, &inputs, now_ms)
+                crate::provider_status::provider_root_lines(
+                    &coordinator,
+                    &eager,
+                    &inputs,
+                    now_ms,
+                    &|root_id| host.handoff_hold_ms(root_id),
+                )
             }));
         }
         let reclaim = Arc::new(crate::provider_reclaim::ProviderReclaim::new(state.clone()));
@@ -266,6 +322,17 @@ impl ShellContext {
             membership.clone(),
         ));
         control.provider_evict.install(evictor.clone());
+        let pin_evictor = evictor.clone();
+        let retention_apply = Arc::new(crate::retention_apply::RetentionApply::new(
+            state.clone(),
+            evictor.clone(),
+            membership.clone(),
+            Arc::new(crate::retention_apply::SystemEnvironment),
+        ));
+        let retention_store_fill = Arc::new(crate::retention_store_fill::RetentionStoreFill::new(
+            state.clone(),
+            Arc::new(DaemonFillEnvironment { state: state.clone() }),
+        ));
         let auto_reclaim = Arc::new(crate::provider_auto_reclaim::AutoReclaim::new(
             state.clone(),
             evictor,
@@ -298,6 +365,10 @@ impl ShellContext {
             writer,
             eager,
             auto_reclaim,
+            retention_apply,
+            evictor: pin_evictor,
+            pin_observations: Arc::default(),
+            retention_store_fill,
             requested_opens: state.requested_opens.clone(),
             holders: HolderLookup { state: Arc::downgrade(state) },
             prefetch: Arc::new(crate::provider_prefetch::PrefetchScheduler::new(

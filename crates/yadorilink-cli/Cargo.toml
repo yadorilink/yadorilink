@@ -37,6 +37,7 @@ serde.workspace = true
 serde_json = "1"
 # The kept installer's hash is checked before it runs (commands/kept_installer.rs).
 sha2.workspace = true
+base64 = { version = "0.23" }
 # Renders `share invite`'s one-use URL as a terminal QR code
 # (`commands::share`'s `render_invite_qr`). `default-features = false`
 # drops the `image`/`svg`/`pic` default features entirely -- only the core
@@ -55,7 +56,6 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 [dev-dependencies]
 # The wire-contract harness decodes JWT-shaped values and parses redirect
 # URLs while playing the browser.
-base64 = { version = "0.23" }
 url = { version = "2" }
 # Integration tests wire a registered test device's change-signing key.
 yadorilink-transport = { path = "../yadorilink-transport" }

@@ -234,7 +234,7 @@ async fn watch_folder_with_capacity_accepts_a_custom_capacity() {
 async fn ignore_aware_watcher_skips_ignored_directory_and_leaf_file_events() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
-    let ignore_set = Arc::new(EffectiveIgnoreSet::from_user_patterns("node_modules/\n*.tmp\n"));
+    let ignore_set = Arc::new(EffectiveIgnoreSet::from_text("node_modules/\n*.tmp\n").unwrap());
     let mut watcher = watch_folder_with_capacity_and_ignore(dir.path(), 32, ignore_set).unwrap();
 
     std::fs::write(dir.path().join("node_modules/pkg/index.js"), b"ignored").unwrap();
@@ -250,20 +250,6 @@ async fn ignore_aware_watcher_skips_ignored_directory_and_leaf_file_events() {
         .expect("timed out waiting for non-ignored event")
         .expect("watcher channel closed");
     assert_eq!(event.path.file_name().and_then(|name| name.to_str()), Some("keep.txt"));
-}
-
-#[tokio::test]
-async fn ignore_aware_watcher_still_queues_ignore_file_changes() {
-    let dir = tempfile::tempdir().unwrap();
-    let ignore_set = Arc::new(EffectiveIgnoreSet::from_user_patterns("*\n"));
-    let mut watcher = watch_folder_with_capacity_and_ignore(dir.path(), 32, ignore_set).unwrap();
-
-    std::fs::write(dir.path().join(".yadorilinkignore"), b"*.tmp\n").unwrap();
-    let event = tokio::time::timeout(Duration::from_secs(5), watcher.events.recv())
-        .await
-        .expect("timed out waiting for ignore-file event")
-        .expect("watcher channel closed");
-    assert_eq!(event.path.file_name().and_then(|name| name.to_str()), Some(".yadorilinkignore"));
 }
 
 // --- Symlink-safe directory classification and registration ---
@@ -688,7 +674,7 @@ impl Watcher for WatchLimitWatcher {
 fn a_refused_add_watch_is_reported_as_the_watch_limit() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("sub")).unwrap();
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(dir.path()).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
     let mut watched = BTreeSet::new();
     let err = register_initial_watches(
         &mut WatchLimitWatcher,

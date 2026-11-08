@@ -31,6 +31,7 @@ use std::time::Duration;
 use support::wait_until_with_context;
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
+use yadorilink_fs_platform::ignore_patterns::IgnoreRulesStore;
 use yadorilink_local_storage::SegmentBlockStore;
 
 const GROUP: &str = "path-escape-group";
@@ -198,7 +199,8 @@ async fn a_peers_write_is_refused_under_a_symlinked_component_the_namespace_leav
 
     let outside = tempfile::tempdir().unwrap();
     std::os::unix::fs::symlink(outside.path(), device_a.path("evil_link")).unwrap();
-    std::fs::write(device_a.path(".yadorilinkignore"), "evil_link\n!evil_link/pwned.txt\n")
+    IgnoreRulesStore::new(device_a.state.config_dir())
+        .write(GROUP, "evil_link\n!evil_link/pwned.txt\n")
         .unwrap();
 
     start_watching(&device_a);

@@ -38,6 +38,8 @@ pub struct ControlContext {
     /// What a status collects from, and the builder that serves `Status` and `ListLinks`.
     pub(crate) status_sources: Arc<crate::status_report::StatusSources>,
     pub(crate) status_hub: Arc<crate::status_facts::StatusHub>,
+    /// Whether peer traffic may flow on the connection the host reports.
+    pub(crate) network_policy: Arc<crate::network_policy::NetworkPolicy>,
 }
 
 impl ControlContext {
@@ -45,6 +47,7 @@ impl ControlContext {
         application: Arc<ApplicationServices>,
         queries: Arc<QueryServices>,
         config_dir: std::path::PathBuf,
+        network_policy: Arc<crate::network_policy::NetworkPolicy>,
     ) -> Self {
         let provider_status: Arc<crate::provider_status::ProviderStatusSource> = Arc::default();
         let auto_reclaim: Arc<crate::provider_auto_reclaim::AutoReclaimSlot> = Arc::default();
@@ -54,6 +57,8 @@ impl ControlContext {
             provider_status: provider_status.clone(),
             auto_reclaim: auto_reclaim.clone(),
             config_dir: config_dir.clone(),
+            network_policy: network_policy.clone(),
+            last_synced: Default::default(),
         });
         let status_hub = Arc::new(crate::status_facts::StatusHub::new(
             status_sources.clone(),
@@ -68,6 +73,7 @@ impl ControlContext {
             auto_reclaim,
             status_sources,
             status_hub,
+            network_policy,
             #[cfg(feature = "process-model")]
             identity: Arc::new(crate::identity::RuntimeIdentity::detect(None, None)),
         }
@@ -91,7 +97,8 @@ impl ControlContext {
     pub fn from_state(state: Arc<crate::daemon_state::DaemonState>) -> Self {
         let application = crate::adapters::build_application_services(state.clone());
         let config_dir = state.config_dir().to_path_buf();
+        let network_policy = state.network_policy.clone();
         let queries = crate::adapters::build_query_services(state);
-        Self::new(application, queries, config_dir)
+        Self::new(application, queries, config_dir, network_policy)
     }
 }

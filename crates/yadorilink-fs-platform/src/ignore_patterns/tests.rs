@@ -7,15 +7,34 @@ fn ignored(set: &EffectiveIgnoreSet, path: &str, is_dir: bool) -> bool {
 }
 
 #[test]
-fn comments_blank_lines_and_malformed_lines_are_ignored() {
-    let set = EffectiveIgnoreSet::from_user_patterns("\n  # comment\n!\nfoo//bar\n.\nvalid.log\n");
+fn comments_and_blank_lines_are_skipped() {
+    let set = EffectiveIgnoreSet::from_text("\n  # comment\nvalid.log\n").unwrap();
     assert!(ignored(&set, "valid.log", false));
-    assert!(!ignored(&set, "foo/bar", false));
+}
+
+/// A line the parser cannot use is an error naming it, never silently dropped.
+#[test]
+fn an_unusable_line_is_an_error_that_names_the_line() {
+    for (text, line) in [
+        ("a.log\n!\n", 2),
+        ("foo//bar\n", 1),
+        ("# c\n\n.\n", 3),
+        ("(?i)\n", 1),
+        ("ok\n../escape\n", 2),
+        ("/\n", 1),
+    ] {
+        let err = EffectiveIgnoreSet::from_text(text).unwrap_err();
+        assert!(
+            matches!(&err, IgnoreConfigError::InvalidLine { line: l, .. } if *l == line),
+            "{text:?}: {err:?}"
+        );
+        assert!(err.to_string().starts_with(&format!("line {line}:")), "{err}");
+    }
 }
 
 #[test]
 fn star_double_star_and_question_mark_match_relative_paths() {
-    let set = EffectiveIgnoreSet::from_user_patterns("build/*.tmp\ncache/**/blob-?.bin\n");
+    let set = EffectiveIgnoreSet::from_text("build/*.tmp\ncache/**/blob-?.bin\n").unwrap();
     assert!(ignored(&set, "build/a.tmp", false));
     assert!(!ignored(&set, "build/nested/a.tmp", false));
     assert!(ignored(&set, "cache/a/b/blob-1.bin", false));
@@ -25,11 +44,11 @@ fn star_double_star_and_question_mark_match_relative_paths() {
 
 #[test]
 fn later_patterns_override_and_negation_reincludes() {
-    let set = EffectiveIgnoreSet::from_user_patterns("*.log\n!important.log\nimportant.log\n");
+    let set = EffectiveIgnoreSet::from_text("*.log\n!important.log\nimportant.log\n").unwrap();
     assert!(ignored(&set, "debug.log", false));
     assert!(ignored(&set, "important.log", false));
 
-    let set = EffectiveIgnoreSet::from_user_patterns("*.log\n!important.log\n");
+    let set = EffectiveIgnoreSet::from_text("*.log\n!important.log\n").unwrap();
     assert!(!ignored(&set, "important.log", false));
     let matched = set.match_path("important.log", false).unwrap();
     assert_eq!(matched.pattern.original(), "!important.log");
@@ -38,7 +57,7 @@ fn later_patterns_override_and_negation_reincludes() {
 
 #[test]
 fn directory_only_patterns_match_directories_and_descendants() {
-    let set = EffectiveIgnoreSet::from_user_patterns("node_modules/\n");
+    let set = EffectiveIgnoreSet::from_text("node_modules/\n").unwrap();
     assert!(ignored(&set, "node_modules", true));
     assert!(ignored(&set, "node_modules/pkg/index.js", false));
     assert!(ignored(&set, "app/node_modules/pkg/index.js", false));
@@ -59,18 +78,19 @@ fn built_in_defaults_are_always_active() {
 }
 
 #[test]
-fn loading_missing_ignore_file_falls_back_to_defaults_only() {
+fn loading_a_missing_rules_file_falls_back_to_defaults_only() {
     let dir = tempfile::tempdir().unwrap();
-    let set = EffectiveIgnoreSet::load_for_link_root(dir.path()).unwrap();
+    let set = EffectiveIgnoreSet::load_file(dir.path().join("none")).unwrap();
     assert_eq!(set.patterns().len(), BUILT_IN_DEFAULT_PATTERNS.len());
     assert!(ignored(&set, ".DS_Store", false));
 }
 
 #[test]
-fn loading_ignore_file_merges_defaults_then_user_patterns() {
+fn loading_a_rules_file_merges_defaults_then_user_patterns() {
     let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join(IGNORE_FILE_NAME), "*.log\n!.keep.log\n").unwrap();
-    let set = EffectiveIgnoreSet::load_for_link_root(dir.path()).unwrap();
+    let file = dir.path().join("rules");
+    fs::write(&file, "*.log\n!.keep.log\n").unwrap();
+    let set = EffectiveIgnoreSet::load_file(&file).unwrap();
     assert_eq!(set.patterns().len(), BUILT_IN_DEFAULT_PATTERNS.len() + 2);
     assert!(ignored(&set, ".DS_Store", false));
     assert!(ignored(&set, "debug.log", false));
@@ -78,84 +98,23 @@ fn loading_ignore_file_merges_defaults_then_user_patterns() {
 }
 
 #[test]
+fn a_rules_file_that_is_not_utf8_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("rules");
+    fs::write(&file, [0x2a, 0xff, 0xfe, 0x0a]).unwrap();
+    assert!(matches!(EffectiveIgnoreSet::load_file(&file), Err(IgnoreConfigError::Io(_))));
+}
+
+#[test]
 fn parent_or_absolute_paths_do_not_match() {
-    let set = EffectiveIgnoreSet::from_user_patterns("*.log\n");
+    let set = EffectiveIgnoreSet::from_text("*.log\n").unwrap();
     assert!(!ignored(&set, "../debug.log", false));
     assert!(!ignored(&set, "/tmp/debug.log", false));
 }
 
-// -- include directives -----------------------------------------------
-
-#[test]
-fn include_directive_splices_patterns_at_the_directive_point() {
-    let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join("shared.yadorilinkignore"), "*.log\n!keep.log\n").unwrap();
-    fs::write(dir.path().join(IGNORE_FILE_NAME), "#include shared.yadorilinkignore\nkeep.log\n")
-        .unwrap();
-    let set = EffectiveIgnoreSet::load_for_link_root(dir.path()).unwrap();
-    // Document order: *.log, !keep.log (from the include), then the
-    // top-level file's own `keep.log` re-ignores it again — proving
-    // includes are spliced in place, not appended after the file.
-    assert!(ignored(&set, "debug.log", false));
-    assert!(ignored(&set, "keep.log", false));
-}
-
-#[test]
-fn include_cycle_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join(IGNORE_FILE_NAME), "#include a.ignore\n").unwrap();
-    fs::write(dir.path().join("a.ignore"), "#include b.ignore\n").unwrap();
-    fs::write(dir.path().join("b.ignore"), "#include a.ignore\n").unwrap();
-    let err = EffectiveIgnoreSet::load_for_link_root_checked(dir.path()).unwrap_err();
-    assert!(matches!(err, IgnoreConfigError::IncludeCycle(_)), "{err:?}");
-}
-
-#[test]
-fn include_self_reference_is_rejected_as_a_cycle() {
-    let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join(IGNORE_FILE_NAME), format!("#include {IGNORE_FILE_NAME}\n")).unwrap();
-    let err = EffectiveIgnoreSet::load_for_link_root_checked(dir.path()).unwrap_err();
-    assert!(matches!(err, IgnoreConfigError::IncludeCycle(_)), "{err:?}");
-}
-
-#[test]
-fn include_escaping_the_root_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join(IGNORE_FILE_NAME), "#include ../outside.ignore\n").unwrap();
-    let err = EffectiveIgnoreSet::load_for_link_root_checked(dir.path()).unwrap_err();
-    assert!(matches!(err, IgnoreConfigError::IncludeEscapesRoot(_)), "{err:?}");
-
-    let dir2 = tempfile::tempdir().unwrap();
-    fs::write(dir2.path().join(IGNORE_FILE_NAME), "#include /etc/passwd\n").unwrap();
-    let err2 = EffectiveIgnoreSet::load_for_link_root_checked(dir2.path()).unwrap_err();
-    assert!(matches!(err2, IgnoreConfigError::IncludeEscapesRoot(_)), "{err2:?}");
-}
-
-#[test]
-fn missing_include_target_is_reported() {
-    let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join(IGNORE_FILE_NAME), "#include nope.ignore\n").unwrap();
-    let err = EffectiveIgnoreSet::load_for_link_root_checked(dir.path()).unwrap_err();
-    assert!(matches!(err, IgnoreConfigError::MissingInclude(_)), "{err:?}");
-}
-
-#[test]
-fn non_utf8_ignore_file_is_reported_as_invalid_encoding() {
-    let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join(IGNORE_FILE_NAME), [0x2a, 0xff, 0xfe, 0x0a]).unwrap();
-    let err = EffectiveIgnoreSet::load_for_link_root_checked(dir.path()).unwrap_err();
-    assert!(matches!(err, IgnoreConfigError::InvalidEncoding(_)), "{err:?}");
-}
-
-#[test]
-fn a_line_that_merely_starts_with_include_is_not_misparsed_as_a_directive() {
-    let set = EffectiveIgnoreSet::from_user_patterns("#includes an explanation\n*.log\n");
-    assert!(ignored(&set, "debug.log", false));
-}
-
 #[test]
 fn case_insensitive_marker_matches_regardless_of_case() {
-    let set = EffectiveIgnoreSet::from_user_patterns("(?i)*.LOG\n");
+    let set = EffectiveIgnoreSet::from_text("(?i)*.LOG\n").unwrap();
     assert!(ignored(&set, "debug.log", false));
     assert!(ignored(&set, "DEBUG.LOG", false));
     assert!(ignored(&set, "Debug.Log", false));
@@ -163,7 +122,7 @@ fn case_insensitive_marker_matches_regardless_of_case() {
 
 #[test]
 fn without_the_marker_matching_stays_case_sensitive() {
-    let set = EffectiveIgnoreSet::from_user_patterns("*.LOG\n");
+    let set = EffectiveIgnoreSet::from_text("*.LOG\n").unwrap();
     assert!(ignored(&set, "debug.LOG", false));
     assert!(!ignored(&set, "debug.log", false));
 }
@@ -171,39 +130,35 @@ fn without_the_marker_matching_stays_case_sensitive() {
 #[test]
 fn reload_falls_back_to_previous_set_on_a_config_error() {
     let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join(IGNORE_FILE_NAME), "*.log\n").unwrap();
-    let good = EffectiveIgnoreSet::load_for_link_root(dir.path()).unwrap();
+    let file = dir.path().join("rules");
+    fs::write(&file, "*.log\n").unwrap();
+    let good = EffectiveIgnoreSet::load_file(&file).unwrap();
     assert!(ignored(&good, "debug.log", false));
 
-    fs::write(dir.path().join(IGNORE_FILE_NAME), "#include missing.ignore\n").unwrap();
-    let (reloaded, err) = EffectiveIgnoreSet::reload_for_link_root(dir.path(), &good);
-    assert!(matches!(err, Some(IgnoreConfigError::MissingInclude(_))));
+    fs::write(&file, "*.log\na//b\n").unwrap();
+    let (reloaded, err) = EffectiveIgnoreSet::reload_file(&file, &good);
+    assert!(matches!(err, Some(IgnoreConfigError::InvalidLine { line: 2, .. })));
     // Still the last-known-good set, not defaults-only or an error
     // that silences ignore matching entirely.
     assert!(ignored(&reloaded, "debug.log", false));
 }
 
 #[test]
-fn explain_path_reports_matched_rule_source_and_line() {
-    let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join("included.ignore"), "# comment\n*.log\n").unwrap();
-    fs::write(dir.path().join(IGNORE_FILE_NAME), "#include included.ignore\n").unwrap();
-    let set = EffectiveIgnoreSet::load_for_link_root(dir.path()).unwrap();
+fn explain_path_reports_the_matched_rule_and_line() {
+    let set = EffectiveIgnoreSet::from_text("# comment\n*.log\n").unwrap();
 
     let explanation = set.explain_path("debug.log", false).unwrap();
     assert!(explanation.matched);
     assert!(explanation.ignored);
     assert_eq!(explanation.rule_text, "*.log");
     assert_eq!(explanation.source, IgnorePatternSource::User);
-    assert_eq!(explanation.source_file, "included.ignore");
-    assert_eq!(explanation.include_chain, vec![IGNORE_FILE_NAME.to_string()]);
     assert_eq!(explanation.line, 2);
     assert!(!explanation.case_insensitive);
 }
 
 #[test]
 fn explain_path_reports_no_match_distinctly_from_a_negated_match() {
-    let set = EffectiveIgnoreSet::from_user_patterns("*.log\n!keep.log\n");
+    let set = EffectiveIgnoreSet::from_text("*.log\n!keep.log\n").unwrap();
 
     let no_match = set.explain_path("notes.md", false).unwrap();
     assert!(!no_match.matched);
@@ -222,6 +177,41 @@ fn explain_path_reports_built_in_source_for_default_patterns() {
     let explanation = set.explain_path(".DS_Store", false).unwrap();
     assert!(explanation.ignored);
     assert_eq!(explanation.source, IgnorePatternSource::BuiltIn);
-    assert_eq!(explanation.source_file, BUILT_IN_SOURCE_LABEL);
-    assert!(explanation.include_chain.is_empty());
+}
+
+mod store {
+    use super::*;
+
+    #[test]
+    fn rules_round_trip_through_the_store_and_a_group_with_none_reads_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = IgnoreRulesStore::new(dir.path());
+        assert_eq!(store.read("g1").unwrap(), "");
+        store.write("g1", "*.tmp\n").unwrap();
+        store.write("g2", "*.log\n").unwrap();
+        assert_eq!(store.read("g1").unwrap(), "*.tmp\n");
+        assert!(ignored(&store.load("g1").unwrap(), "a.tmp", false));
+        assert!(!ignored(&store.load("g1").unwrap(), "a.log", false));
+        // Replacing is wholesale.
+        store.write("g1", "").unwrap();
+        assert_eq!(store.read("g1").unwrap(), "");
+    }
+
+    #[test]
+    fn invalid_text_is_refused_with_its_line_and_the_stored_rules_stay() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = IgnoreRulesStore::new(dir.path());
+        store.write("g", "keep.me\n").unwrap();
+        let err = store.write("g", "ok\nbad//line\n").unwrap_err();
+        assert!(matches!(err, IgnoreConfigError::InvalidLine { line: 2, .. }), "{err:?}");
+        assert_eq!(store.read("g").unwrap(), "keep.me\n");
+    }
+
+    #[test]
+    fn a_group_id_cannot_name_another_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = IgnoreRulesStore::new(dir.path());
+        let path = store.path("../../escape");
+        assert_eq!(path.parent().unwrap(), dir.path().join("ignore"));
+    }
 }

@@ -120,9 +120,9 @@ pub fn identity_proving_temp_root() -> Option<tempfile::TempDir> {
     if yadorilink_fs_platform::fs_capabilities::probe_volume_proves_object_identity(dir.path()) {
         Some(dir)
     } else {
-        eprintln!(
-            "SKIPPED: {} cannot prove object identity (e.g. tmpfs); build on a disk-backed directory to run this test",
-            parent.display()
+        yadorilink_fs_platform::fs_capabilities::report_identity_coverage_lost(
+            &format!("a test on {}", parent.display()),
+            yadorilink_fs_platform::fs_capabilities::identity_fs_required(),
         );
         None
     }
@@ -574,8 +574,13 @@ pub struct NodeFeatures {
 #[allow(dead_code)]
 pub fn node_tuning(features: NodeFeatures) -> yadorilink_daemon::engine_tuning::EngineTuning {
     yadorilink_daemon::engine_tuning::EngineTuning {
-        file_block_source: features.serves_from_files,
-        single_pass: features.single_pass_receive,
+        file_mode: if features.single_pass_receive {
+            yadorilink_daemon::engine_tuning::FileMode::ReceivesInPlace
+        } else if features.serves_from_files {
+            yadorilink_daemon::engine_tuning::FileMode::ServesFromFiles
+        } else {
+            yadorilink_daemon::engine_tuning::FileMode::Blocks
+        },
         ..tuning_with_outside_witness()
     }
 }
@@ -619,8 +624,7 @@ pub fn open_store_first_replica_coordinator() -> (ReplicaCoordinator, tempfile::
 #[allow(dead_code)]
 pub fn store_first_tuning() -> yadorilink_daemon::engine_tuning::EngineTuning {
     yadorilink_daemon::engine_tuning::EngineTuning {
-        single_pass: false,
-        file_block_source: false,
+        file_mode: yadorilink_daemon::engine_tuning::FileMode::Blocks,
         witness: yadorilink_daemon::install_witness::WitnessPlacement::BesideDatabase,
         ..Default::default()
     }

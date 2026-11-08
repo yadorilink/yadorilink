@@ -6,6 +6,7 @@
 use yadorilink_client_core::ops::transfers;
 
 use crate::error::CliError;
+use crate::i18n::{tr, trf};
 
 pub async fn send(source_paths: Vec<String>, target_device: String) -> Result<(), CliError> {
     let result = transfers::send_files(source_paths, target_device).await?;
@@ -30,11 +31,46 @@ pub async fn link_create(ttl: Option<u32>, paths: Vec<String>) -> Result<(), Cli
     Ok(())
 }
 
+/// The code to redeem: the argument, or one line from standard input (with a prompt on a
+/// terminal) when it is left out or is `-`. A code given as an argument is on the process list
+/// and in the shell history, so it is said so.
+fn code_to_redeem(argument: Option<String>) -> Result<String, CliError> {
+    use std::io::{BufRead, IsTerminal, Read, Write};
+    match argument.as_deref() {
+        Some(code) if code != "-" => {
+            eprintln!(
+                "note: a code on the command line is visible to other users of this machine and \
+                 stays in your shell history; leave it out to type or pipe it in instead."
+            );
+            Ok(code.to_owned())
+        }
+        _ => {
+            if std::io::stdin().is_terminal() {
+                eprint!("Code: ");
+                let _ = std::io::stderr().flush();
+            }
+            let mut line = String::new();
+            // Bounded: a pipe that is not a code is refused, not buffered.
+            std::io::stdin()
+                .lock()
+                .take(256)
+                .read_line(&mut line)
+                .map_err(|e| CliError::Other(format!("could not read the code: {e}")))?;
+            let code = line.trim();
+            if code.is_empty() {
+                return Err(CliError::Other("no code given".to_string()));
+            }
+            Ok(code.to_owned())
+        }
+    }
+}
+
 pub async fn link_redeem(
-    code: String,
+    code: Option<String>,
     device: Option<String>,
     to: Option<String>,
 ) -> Result<(), CliError> {
+    let code = code_to_redeem(code)?;
     let redeemed = transfers::redeem_send_link(code, device, to).await?;
     let link_id = redeemed.link_id;
     if redeemed.destination_dir.is_empty() {
@@ -52,7 +88,7 @@ pub async fn link_redeem(
 
 pub async fn link_cancel(link_id: String) -> Result<(), CliError> {
     transfers::cancel_send_link(link_id.clone()).await?;
-    println!("Send link {link_id} canceled.");
+    println!("{}", trf!("Send link {link_id} canceled.", link_id = link_id));
     Ok(())
 }
 
@@ -82,7 +118,7 @@ pub async fn link_status(link_id: String) -> Result<(), CliError> {
 pub async fn inbox() -> Result<(), CliError> {
     let transfers = transfers::list_inbox().await?;
     if transfers.is_empty() {
-        println!("Inbox is empty.");
+        println!("{}", tr("Inbox is empty."));
         return Ok(());
     }
     for transfer in &transfers {
@@ -121,7 +157,7 @@ pub async fn inbox() -> Result<(), CliError> {
 pub async fn outbox() -> Result<(), CliError> {
     let sent = transfers::list_sent().await?;
     if sent.is_empty() {
-        println!("Nothing has been sent from this device.");
+        println!("{}", tr("Nothing has been sent from this device."));
         return Ok(());
     }
     for transfer in &sent {
@@ -151,7 +187,7 @@ pub async fn outbox() -> Result<(), CliError> {
 
 pub async fn cancel(transfer_id: String) -> Result<(), CliError> {
     transfers::cancel_transfer(transfer_id.clone()).await?;
-    println!("Transfer {transfer_id} stopped. A finished transfer is left as it is; retry a stopped one to start it again.");
+    println!("{}", trf!("Transfer {transfer_id} stopped. A finished transfer is left as it is; retry a stopped one to start it again.", transfer_id = transfer_id));
     Ok(())
 }
 
@@ -235,6 +271,13 @@ pub async fn receive(transfer_id: String, to: Option<String>) -> Result<(), CliE
 #[cfg(test)]
 mod tests {
     use super::reasons::{sent_status, why_stopped};
+
+    /// A code given as an argument is used as given (the note about the command line goes to
+    /// standard error); reading one from standard input is not exercised here.
+    #[test]
+    fn a_code_given_as_an_argument_is_used_as_given() {
+        assert_eq!(super::code_to_redeem(Some("ABCD-EFGH".to_string())).unwrap(), "ABCD-EFGH");
+    }
 
     /// Every reason code the daemon lists has its own sentence; only an unknown one falls back.
     #[test]

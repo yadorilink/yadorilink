@@ -5,10 +5,14 @@
 //! outstanding and sends their item ids as exclusions; every call recomputes the best candidates
 //! from the durable rows and the host's membership report:
 //!
-//! * which files are wanted depends on the root: an Eager root wants every file, any other root
-//!   only the files the user keeps on this device (`Scope::Kept`, a pin on the file or on a folder
-//!   above it), so a pin on a provider folder is carried out by the OS like an Eager download and
-//!   a file the OS drops later (Finder's Remove Download) is offered again while the pin stands;
+//! * which files are wanted is ONE definition, `Scope`: the nearest retention rule at or above a
+//!   file decides (`keep` wants it, `online_only` does not) and a file with no rule follows the
+//!   root's mode (an Eager root wants it, any other root does not). The offered candidates, the
+//!   settlement of what the app still lists as outstanding, the idle ("done") state and the
+//!   status counts all ask it, so a pin on a provider folder is carried out by the OS like an
+//!   Eager download, a file the OS drops later (Finder's Remove Download) is offered again while
+//!   it is wanted, and a file an online-only rule frees is never offered, never outstanding and
+//!   never counted as remaining;
 //! * wanted = a live regular file (a real current row) that is not held, not paused, and whose
 //!   current content is not present on the OS (`provider_local_presence`), ordered by size and
 //!   then path;
@@ -32,7 +36,7 @@ use yadorilink_ipc_proto::shellipc::{
     DriverState, NextProviderDownloadsRequest, NextProviderDownloadsResponse, ProviderDownload,
 };
 use yadorilink_replica_domain::session_state::{MaterializationPolicy, Readiness};
-use yadorilink_sync_sqlite::provider::{ItemId, ProviderRoot};
+use yadorilink_sync_sqlite::provider::{DownloadFilter, ItemId, ProviderRoot};
 
 use crate::provider_evidence::{provider_local_presence, ProviderMembership};
 use crate::replica_coordinator::ReplicaCoordinator;
@@ -42,32 +46,40 @@ pub(crate) const ASSEMBLIES: usize = 6;
 /// How many of them Eager downloads may hold; the rest are for the user's own fetches.
 pub(crate) const EAGER_ASSEMBLIES: usize = 4;
 
-/// The files of a root the driver wants downloaded.
-pub(crate) enum Scope {
-    /// Eager root: every file.
-    All,
-    /// Any other root: the files covered by one of these pinned paths.
-    Kept(Vec<String>),
+/// The files of a root the driver wants downloaded: the root's retention rules and what a file
+/// with no rule is (an Eager root keeps it, any other root leaves it online-only).
+pub(crate) struct Scope {
+    rules: yadorilink_sync_sqlite::RuleSet,
+    unruled_is_wanted: bool,
 }
 
 impl Scope {
-    /// Whether the candidate query is limited to the kept files.
-    fn kept_only(&self) -> bool {
-        matches!(self, Self::Kept(_))
+    fn new(rules: yadorilink_sync_sqlite::RuleSet, policy: Option<MaterializationPolicy>) -> Self {
+        Self { rules, unruled_is_wanted: policy == Some(MaterializationPolicy::Eager) }
     }
 
-    fn covers(&self, path: &str) -> bool {
-        match self {
-            Self::All => true,
-            Self::Kept(pinned) => {
-                yadorilink_sync_sqlite::pinned_items::path_is_covered(pinned, path)
-            }
+    /// The SQL filter that lists exactly the wanted files.
+    fn filter(&self) -> DownloadFilter {
+        if !self.unruled_is_wanted {
+            DownloadFilter::KeptOnly
+        } else if self.rules.has_online_only() {
+            DownloadFilter::ExceptOnlineOnly
+        } else {
+            DownloadFilter::Everything
         }
     }
 
-    /// Nothing is kept: nothing is wanted.
+    /// Whether the driver wants `path` downloaded.
+    fn covers(&self, path: &str) -> bool {
+        match self.rules.nearest(path) {
+            Some((_, rule)) => rule == yadorilink_sync_sqlite::Rule::Keep,
+            None => self.unruled_is_wanted,
+        }
+    }
+
+    /// Nothing is wanted: no file would be offered.
     fn is_empty(&self) -> bool {
-        matches!(self, Self::Kept(pinned) if pinned.is_empty())
+        !self.unruled_is_wanted && self.rules.kept_paths().next().is_none()
     }
 }
 
@@ -97,6 +109,17 @@ pub(crate) struct EagerConfig {
     pub(crate) page: usize,
     /// At most this many exclusions are looked at.
     pub(crate) max_exclusions: usize,
+    /// How long a query with nothing to answer yet may be held, and how often it is looked at
+    /// again meanwhile (see `shell_ipc::eager_lane`).
+    pub(crate) hold: Duration,
+    pub(crate) hold_step: Duration,
+}
+
+/// The bounds of a held answer.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Hold {
+    pub(crate) total: Duration,
+    pub(crate) step: Duration,
 }
 
 impl Default for EagerConfig {
@@ -109,6 +132,10 @@ impl Default for EagerConfig {
             request_ttl: Duration::from_secs(600),
             page: 256,
             max_exclusions: 8,
+            // The host waits up to a minute for an answer; a held one also delays the answers
+            // behind it on the connection, so it stays short.
+            hold: Duration::from_secs(3),
+            hold_step: Duration::from_millis(100),
         }
     }
 }
@@ -227,11 +254,14 @@ impl EagerDriver {
         item: &ItemId,
         version: yadorilink_replica_domain::ids::VersionHash,
     ) {
-        let repo = coordinator.provider_repository();
         let now = self.environment.now_ms();
-        if let Err(error) =
-            repo.record_download_failure(root_id, item, version, now, |n| self.backoff_ms(n))
-        {
+        if let Err(error) = coordinator.provider_writes().record_download_failure(
+            root_id,
+            item,
+            version,
+            now,
+            |n| self.backoff_ms(n),
+        ) {
             tracing::warn!(%error, "could not record a provider download failure");
         }
     }
@@ -242,8 +272,7 @@ impl EagerDriver {
         root_id: &str,
         item: &ItemId,
     ) {
-        if let Err(error) = coordinator.provider_repository().clear_download_failure(root_id, item)
-        {
+        if let Err(error) = coordinator.provider_writes().clear_download_failure(root_id, item) {
             tracing::warn!(%error, "could not clear a provider download failure");
         }
     }
@@ -258,7 +287,9 @@ impl EagerDriver {
         let repo = coordinator.provider_repository();
         let Ok(Some(version)) = repo.current_version_hash(root_id, item) else { return };
         let next = self.environment.now_ms().saturating_add(self.config.base_backoff_ms);
-        if let Err(error) = repo.record_download_rejection(root_id, item, version, next) {
+        if let Err(error) =
+            coordinator.provider_writes().record_download_rejection(root_id, item, version, next)
+        {
             tracing::warn!(%error, "could not record a rejected provider download");
         }
         self.finished(root_id, item);
@@ -343,12 +374,26 @@ impl EagerDriver {
             .link_repository()
             .materialization_policy_for_group(&root.group_id)
             .map_err(|e| e.to_string())?;
-        if policy == Some(MaterializationPolicy::Eager) {
-            return Ok(Some((root, Scope::All)));
-        }
-        let pinned =
-            coordinator.pinned_item_repository().list(&root.group_id).map_err(|e| e.to_string())?;
-        Ok(Some((root, Scope::Kept(pinned))))
+        let rules =
+            coordinator.retention_rules().rules(&root.group_id).map_err(|e| e.to_string())?;
+        Ok(Some((root, Scope::new(rules, policy))))
+    }
+
+    /// The bounds within which an answer with nothing to say may be held.
+    pub(crate) fn hold(&self) -> Hold {
+        Hold { total: self.config.hold, step: self.config.hold_step.max(Duration::from_millis(1)) }
+    }
+
+    /// Whether an answer offers nothing and settles nothing, in a state that can change by
+    /// itself (a download becomes possible, a slot's item settles). A state that waits for the
+    /// host or the user (low disk, the provider not up, done) is answered at once.
+    pub(crate) fn has_nothing_to_say(response: &NextProviderDownloadsResponse) -> bool {
+        response.downloads.is_empty()
+            && response.settled_item_ids.is_empty()
+            && matches!(
+                DriverState::try_from(response.state),
+                Ok(DriverState::Running | DriverState::WaitingPeers)
+            )
     }
 
     /// Answers one `NextProviderDownloads` query.
@@ -393,7 +438,19 @@ impl EagerDriver {
                 repo.current_version_hash(&root_id, item),
             ) {
                 // An item that is no longer wanted (its pin was removed) settles like a gone one.
-                (Ok(Some((path, true))), Ok(version)) => version.is_some() && scope.covers(&path),
+                (Ok(Some((path, true))), Ok(version)) => {
+                    let wanted = scope.covers(&path);
+                    if version.is_some() && !wanted {
+                        // The host was fetching a file an online-only rule frees: the rule
+                        // applies again, so a copy that just landed is dropped.
+                        if let Err(error) =
+                            coordinator.retention_rules().rearm(&root.group_id, &path)
+                        {
+                            tracing::warn!(root_id, %error, "could not re-arm a retention rule");
+                        }
+                    }
+                    version.is_some() && wanted
+                }
                 (Ok(_), Ok(_)) => false,
                 (Err(error), _) | (_, Err(error)) => {
                     tracing::warn!(root_id, %error, "could not look up an excluded item; not settled");
@@ -453,7 +510,7 @@ impl EagerDriver {
         'scan: while chosen.len() < want {
             let page = match repo.eager_page(
                 &root_id,
-                scope.kept_only(),
+                scope.filter(),
                 after.as_ref().map(|(size, path)| (*size, path.as_str())),
                 self.config.page,
             ) {
@@ -502,7 +559,7 @@ impl EagerDriver {
         for (path, _, item) in chosen {
             let item = match item {
                 Some(item) => item,
-                None => match repo.mint_item(&root_id, &path) {
+                None => match coordinator.provider_writes().mint_item(&root_id, &path) {
                     Ok(item) => item,
                     Err(_) => continue,
                 },
@@ -623,15 +680,43 @@ impl EagerDriver {
             }
         };
         let now = self.environment.now_ms();
-        let mut status = self.scan(inputs.coordinator, inputs, &root, &Scope::All, now);
-        let outstanding = self
+        // The same definition of "wanted" the driver offers by: a file an online-only rule frees
+        // is not remaining work.
+        let scope = match inputs.coordinator.retention_rules().rules(&root.group_id) {
+            Ok(rules) => Scope::new(rules, Some(MaterializationPolicy::Eager)),
+            Err(error) => {
+                tracing::warn!(root_id, %error, "could not read the retention rules for status");
+                return Some(EagerStatus {
+                    state: DriverState::Running,
+                    remote: 0,
+                    hydrating: 0,
+                    current: 0,
+                    stuck: Vec::new(),
+                    unreadable: true,
+                    skipped: 0,
+                });
+            }
+        };
+        let mut status = self.scan(inputs.coordinator, inputs, &root, &scope, now);
+        // Handed out and not yet settled, and still wanted: an item a rule freed since it was
+        // offered is not a download in progress (it settles at the next query).
+        let handed_out: Vec<ItemId> = self
             .requested
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .keys()
             .filter(|(root, _)| root == root_id)
+            .map(|(_, item)| *item)
+            .collect();
+        let repo = inputs.coordinator.provider_repository();
+        status.hydrating = handed_out
+            .iter()
+            .filter(|item| match repo.path_for_item(root_id, item) {
+                Ok(Some((path, _))) => scope.covers(&path),
+                // Unknown or unreadable: counted, as before (it settles when its item is looked up).
+                _ => true,
+            })
             .count() as u64;
-        status.hydrating = outstanding;
         if status.state == DriverState::Running {
             if let Some(dir) = inputs.staging_dir {
                 if self.environment.low_disk(dir, 0) {
@@ -668,7 +753,7 @@ impl EagerDriver {
         loop {
             let page = match repo.eager_page(
                 &root.root_id,
-                scope.kept_only(),
+                scope.filter(),
                 after.as_ref().map(|(size, path)| (*size, path.as_str())),
                 self.config.page,
             ) {

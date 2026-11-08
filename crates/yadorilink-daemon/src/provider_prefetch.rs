@@ -18,7 +18,6 @@ use yadorilink_ipc_proto::shellipc::shell_ipc_message::Payload;
 use yadorilink_ipc_proto::shellipc::{
     ActivityKind, PrefetchResult, ProviderPrefetchControl, ProviderPrefetchHint,
 };
-use yadorilink_sync_sqlite::provider::ProviderRepository;
 
 /// How many times one folder is offered without a DONE before the queue moves past it.
 const MAX_ATTEMPTS: u32 = 5;
@@ -168,7 +167,7 @@ impl PrefetchScheduler {
     pub(crate) fn tick(
         &self,
         root: &str,
-        repo: &ProviderRepository,
+        coordinator: &crate::replica_coordinator::ReplicaCoordinator,
         enabled: bool,
         now: Instant,
     ) -> Vec<Action> {
@@ -210,6 +209,7 @@ impl PrefetchScheduler {
         let after = state.cursor.as_ref().map(|(depth, path)| (*depth, path.as_str()));
         // Only a successful, empty read proves there is nothing left to warm. A failed read is
         // retried on a later tick and never finishes the session.
+        let repo = coordinator.provider_repository();
         let candidates = match repo.prefetch_candidates(
             root,
             self.config.depth,
@@ -227,7 +227,7 @@ impl PrefetchScheduler {
             state.finished = true;
             return actions;
         };
-        let folder = match repo.mint_item(root, &path) {
+        let folder = match coordinator.provider_writes().mint_item(root, &path) {
             Ok(folder) => folder,
             Err(error) => {
                 tracing::warn!(root, %error, "could not mint the prefetch folder; will retry");
@@ -295,7 +295,12 @@ pub(crate) async fn run(context: std::sync::Arc<crate::shell_context::ShellConte
         for root in roots {
             let ready =
                 root.readiness() == yadorilink_replica_domain::session_state::Readiness::Ready;
-            for action in context.prefetch.tick(&root.root_id, repo, ready, Instant::now()) {
+            for action in context.prefetch.tick(
+                &root.root_id,
+                &context.replica_coordinator,
+                ready,
+                Instant::now(),
+            ) {
                 context.provider_host.send_to_host(action.into_payload());
             }
         }
@@ -381,19 +386,18 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let repo = coordinator.provider_repository();
         let s = scheduler();
         let t = Instant::now();
 
         let fault = Fault::inject(&coordinator, "provider_dirs", "parent_path");
-        assert!(s.tick(&root, repo, true, t).is_empty());
+        assert!(s.tick(&root, &coordinator, true, t).is_empty());
         assert!(
             !s.roots.lock().unwrap()[&root].finished,
             "an unreadable candidate list finished the session"
         );
         fault.restore();
 
-        let actions = s.tick(&root, repo, true, t);
+        let actions = s.tick(&root, &coordinator, true, t);
         assert!(matches!(actions.as_slice(), [Action::Hint { .. }]), "{} actions", actions.len());
     }
 }

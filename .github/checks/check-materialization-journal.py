@@ -98,16 +98,24 @@ PERSIST_FORWARDER = "persist_reconstructed_file_off_runtime"
 # guard stops seeing the real call sites (it did, and counted 1 of 4).
 RECONSTRUCT_IN_TOKEN = "reconstruct_file_in("
 PERSIST_IN_TOKEN = "persist_reconstructed_file_in("
+# The durable publish (fsyncs the parent directory); production callers use it.
+PERSIST_DURABLE_TOKEN = "persist_reconstructed_file_durable("
+# The same publish for a write that checks what it replaces (repair's rebuild).
+PERSIST_CHECKED_TOKEN = "persist_reconstructed_file_checked("
 FORWARDER_OF = {
     RECONSTRUCT_TOKEN: RECONSTRUCT_FORWARDER,
     PERSIST_TOKEN: PERSIST_FORWARDER,
     PERSIST_IN_TOKEN: PERSIST_FORWARDER,
+    PERSIST_DURABLE_TOKEN: PERSIST_FORWARDER,
+    PERSIST_CHECKED_TOKEN: PERSIST_FORWARDER,
 }
 RECONSTRUCT_SITE_TOKENS = (
     RECONSTRUCT_TOKEN,
     PERSIST_TOKEN,
     RECONSTRUCT_IN_TOKEN,
     PERSIST_IN_TOKEN,
+    PERSIST_DURABLE_TOKEN,
+    PERSIST_CHECKED_TOKEN,
     RECONSTRUCT_FORWARDER + "(",
     PERSIST_FORWARDER + "(",
 )

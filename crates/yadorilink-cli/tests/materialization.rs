@@ -152,15 +152,15 @@ async fn evict_command_removes_a_present_file_and_leaves_its_row_remote() {
     );
 }
 
-/// `yadorilink pin` keeps a file: Free Up Space is refused while it is kept, the file stays
-/// whole, and unpinning removes nothing.
+/// `yadorilink keep` keeps a file: Free Up Space is refused while it is kept, the file stays
+/// whole, and removing the rule removes nothing.
 #[tokio::test]
-async fn pin_command_makes_evict_refuse_and_unpin_removes_nothing() {
+async fn keep_command_makes_evict_refuse_and_default_removes_nothing() {
     let _guard = TEST_MUTEX.lock().await;
     let (_dir, state, folder) = seeded_hydrated_file().await;
     let file = folder.join("notes.txt").to_string_lossy().to_string();
 
-    yadorilink_cli::commands::materialization::pin(file.clone()).await.unwrap();
+    yadorilink_cli::commands::materialization::keep(file.clone()).await.unwrap();
     let refused = yadorilink_cli::commands::materialization::evict(file.clone()).await;
 
     let message = refused.expect_err("a kept file must not be freed").to_string();
@@ -172,8 +172,8 @@ async fn pin_command_makes_evict_refuse_and_unpin_removes_nothing() {
         Some(MaterializationState::Present)
     );
 
-    yadorilink_cli::commands::materialization::unpin(file).await.unwrap();
-    assert!(folder.join("notes.txt").exists(), "unpinning never removes content");
+    yadorilink_cli::commands::materialization::default_rule(file).await.unwrap();
+    assert!(folder.join("notes.txt").exists(), "removing a rule never removes content");
     assert_eq!(
         materialization.get_materialization_state("group-1", "notes.txt").unwrap(),
         Some(MaterializationState::Present)

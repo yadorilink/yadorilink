@@ -558,7 +558,6 @@ fn an_advised_link_failure_carries_its_step_and_no_command() {
 /// No provider refusal text names a command or flag; the front end words the step.
 #[test]
 fn provider_refusal_texts_name_no_command() {
-    for text in [super::PROVIDER_LOCAL_STATE, super::PROVIDER_DOWNLOAD] {
-        assert!(!text.contains('`') && !text.contains("yadorilink"), "{text}");
-    }
+    let text = super::PROVIDER_DOWNLOAD;
+    assert!(!text.contains('`') && !text.contains("yadorilink"), "{text}");
 }

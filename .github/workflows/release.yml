@@ -431,9 +431,9 @@ jobs:
         env:
           YADORILINK_RELEASE_MANIFEST_KEY_ID: ${{ vars.RELEASE_MANIFEST_KEY_ID }}
           YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
-          MACOSX_DEPLOYMENT_TARGET: "27.0"
         run: |
           set -euo pipefail
+          export MACOSX_DEPLOYMENT_TARGET="$(tr -d '[:space:]' < .github/release/macos-minimum-version)"
           cargo build --release --locked --target aarch64-apple-darwin \
             -p yadorilink-cli -p yadorilink-daemon -p yadorilink-client-ffi \
             --features enforce-release-trust-root
@@ -640,7 +640,6 @@ jobs:
           subject-path: |
             engine-unverified/*.zip
             packaging/install/install.sh
-            packaging/install/install.ps1
 
   # macOS signing half. The unsigned macOS bundle from engine-build (already attested by
   # engine-attest) is checked against that attestation and by hash, its two executables are
@@ -1177,7 +1176,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 packaging/install/pins.py check
-          for f in install.sh install.ps1; do
+          for f in install.sh; do
             gh attestation verify "packaging/install/$f" \
               --repo ${{ github.repository }} \
               --signer-workflow ${{ github.repository }}/.github/workflows/release.yml \
@@ -1185,7 +1184,7 @@ jobs:
               --source-ref ${{ github.ref }}
             cp "packaging/install/$f" "dist/$f"
           done
-          python3 .github/release/generate-release-checksums.py --sidecars dist/install.sh dist/install.ps1
+          python3 .github/release/generate-release-checksums.py --sidecars dist/install.sh
 
       - name: Publish immutable beta release
         env:

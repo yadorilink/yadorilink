@@ -4,13 +4,12 @@ const ALL: [AttentionItem; 43] = [
     AttentionItem::FolderStopped,
     AttentionItem::WaitingForDiskSpace,
     AttentionItem::LinkedTwice,
-    AttentionItem::OwnershipLost,
-    AttentionItem::NotJoined,
+    AttentionItem::FolderNeedsRelink,
+    AttentionItem::ReplacementAcknowledge,
     AttentionItem::FileWatchLimit,
     AttentionItem::VolumeChanged,
     AttentionItem::VolumeUnconfirmed,
     AttentionItem::NoSafeCopy,
-    AttentionItem::SafeCopyUnconfirmed,
     AttentionItem::ContentUnavailable,
     AttentionItem::ContentAvailabilityUnknown,
     AttentionItem::ConflictNeedsReview,
@@ -32,6 +31,7 @@ const ALL: [AttentionItem; 43] = [
     AttentionItem::RetryableFailure,
     AttentionItem::UpdateFailed,
     AttentionItem::UpdateRequired,
+    AttentionItem::UpdateThisDevice,
     AttentionItem::ProviderRegistryRestored,
     AttentionItem::DatabaseRestored,
     AttentionItem::AuthorUnavailable,
@@ -55,46 +55,46 @@ fn ordinal(item: AttentionItem) -> usize {
         I::FolderStopped => 0,
         I::WaitingForDiskSpace => 1,
         I::LinkedTwice => 2,
-        I::OwnershipLost => 3,
+        I::FolderNeedsRelink => 3,
         I::VolumeChanged => 4,
         I::VolumeUnconfirmed => 5,
         I::NoSafeCopy => 6,
-        I::SafeCopyUnconfirmed => 7,
-        I::ContentUnavailable => 8,
-        I::ContentAvailabilityUnknown => 9,
-        I::ConflictNeedsReview => 10,
-        I::ApprovalPending => 11,
-        I::FileHeld => 12,
-        I::UnsupportedFilename => 13,
-        I::FileNotReadable => 14,
-        I::StrandedDirectory => 15,
-        I::UnreadableFiles => 16,
-        I::ProviderNotReady => 17,
-        I::ProviderFilesFailing => 18,
-        I::EditsKeptBeside => 19,
-        I::ProviderOrphan => 20,
-        I::DiskFull => 21,
-        I::DiskLow => 22,
-        I::PeerUnavailable => 23,
-        I::RetryableFailure => 24,
-        I::UpdateFailed => 25,
-        I::UpdateRequired => 26,
-        I::ProviderRegistryRestored => 27,
-        I::DatabaseRestored => 28,
-        I::AuthorUnavailable => 29,
-        I::ReplacementUnconfirmed => 30,
-        I::ReplacementSignInRequired => 31,
-        I::ReplacementWaiting => 32,
-        I::NotJoined => 33,
-        I::FileWatchLimit => 34,
-        I::TermsConsentRequired => 36,
-        I::SignInRequired => 37,
-        I::AccountDeletionPending => 38,
-        I::AccountDeletionUrgent => 39,
-        I::AccountDeletionRequested => 40,
-        I::IndexDamaged => 41,
-        I::RebuildNeeded => 42,
-        I::Unrecognized => 35,
+        I::ContentUnavailable => 7,
+        I::ContentAvailabilityUnknown => 8,
+        I::ConflictNeedsReview => 9,
+        I::ApprovalPending => 10,
+        I::FileHeld => 11,
+        I::UnsupportedFilename => 12,
+        I::FileNotReadable => 13,
+        I::StrandedDirectory => 14,
+        I::UnreadableFiles => 15,
+        I::ProviderNotReady => 16,
+        I::ProviderFilesFailing => 17,
+        I::EditsKeptBeside => 18,
+        I::ProviderOrphan => 19,
+        I::DiskFull => 20,
+        I::DiskLow => 21,
+        I::PeerUnavailable => 22,
+        I::RetryableFailure => 23,
+        I::UpdateFailed => 24,
+        I::UpdateRequired => 25,
+        I::UpdateThisDevice => 42,
+        I::ProviderRegistryRestored => 26,
+        I::DatabaseRestored => 27,
+        I::AuthorUnavailable => 28,
+        I::ReplacementUnconfirmed => 29,
+        I::ReplacementSignInRequired => 30,
+        I::ReplacementWaiting => 31,
+        I::ReplacementAcknowledge => 32,
+        I::FileWatchLimit => 33,
+        I::TermsConsentRequired => 35,
+        I::SignInRequired => 36,
+        I::AccountDeletionPending => 37,
+        I::AccountDeletionUrgent => 38,
+        I::AccountDeletionRequested => 39,
+        I::IndexDamaged => 40,
+        I::RebuildNeeded => 41,
+        I::Unrecognized => 34,
     }
 }
 
@@ -109,7 +109,8 @@ fn all_lists_every_item() {
 fn keys_are_unique_snake_case() {
     let mut seen = std::collections::HashSet::new();
     for item in ALL {
-        assert!(seen.insert(item.key()), "duplicate {}", item.key());
+        // The follow-up steps of a start over share one key and differ by their step.
+        assert!(seen.insert((item.key(), item.step())), "duplicate {}", item.key());
         assert!(item.key().bytes().all(|b| b.is_ascii_lowercase() || b == b'_'));
     }
 }
@@ -126,12 +127,10 @@ fn every_rollup_code_the_daemon_emits_is_recognized() {
         "waiting_for_disk_space:g",
         "file_watch_limit:g",
         "ambiguous:g",
-        "ownership_lost:g",
-        "not_joined:g",
+        "folder_needs_relink:g",
         "volume_changed:g",
         "volume_unconfirmed:g",
         "durability_at_risk:g",
-        "durability_unknown:g",
         "index_damaged:g",
         "fetch_unavailable:g",
         "fetch_availability_unknown:g",
@@ -256,8 +255,7 @@ fn severity_follows_the_rollups_degraded_split() {
     for raw in [
         "degraded:g",
         "ambiguous:g",
-        "ownership_lost:g",
-        "not_joined:g",
+        "folder_needs_relink:g",
         "durability_at_risk:g",
         "low_disk_critical:/p",
     ] {
@@ -267,7 +265,7 @@ fn severity_follows_the_rollups_degraded_split() {
             "{raw}"
         );
     }
-    for raw in ["durability_unknown:g", "fetch_unavailable:g", "peer_disconnected:d"] {
+    for raw in ["fetch_unavailable:g", "peer_disconnected:d"] {
         assert_eq!(Attention::from_reason(raw).item.severity(), AttentionSeverity::Info, "{raw}");
     }
     for raw in [
@@ -320,6 +318,13 @@ fn a_version_mismatch_is_update_required_not_offline() {
     assert_eq!(peer.scope, AttentionScope::Device("d1".into()));
     assert_ne!(peer.item, Attention::from_reason("peer_disconnected:d1").item);
 
+    // A newer peer is the other direction: this device is the one to update.
+    let newer = Attention::from_reason("peer_newer:d1");
+    assert_eq!(newer.item, AttentionItem::UpdateThisDevice);
+    assert_eq!(newer.scope, AttentionScope::Device("d1".into()));
+    assert_eq!(newer.item.key(), "update_this_device");
+    assert_eq!(newer.item.primary_action(), ProductAction::DownloadUpdate);
+
     let local = Attention::from_reason("update_required");
     assert_eq!(local.item, AttentionItem::UpdateRequired);
     assert_eq!(local.scope, AttentionScope::General);
@@ -367,24 +372,50 @@ fn an_unopenable_author_identity_is_critical_and_permanent() {
     assert_eq!(attention.item.primary_action(), ProductAction::ViewDetails);
 }
 
-/// The replacement-unconfirmed codes are known items with their own cause and action, not
-/// `Unrecognized`.
+/// The start-over follow-up is one key whose `step` says where it stands; every step is a known
+/// item, and the old per-step keys are not read any more.
 #[test]
-fn unconfirmed_replacement_codes_are_known_items() {
-    let waiting = Attention::from_reason("replacement_unconfirmed");
-    assert_eq!(waiting.item, AttentionItem::ReplacementUnconfirmed);
-    assert_eq!(waiting.item.key(), "replacement_unconfirmed");
-    assert_eq!(waiting.item.kind(), AttentionKind::Waiting);
+fn unconfirmed_replacement_is_one_key_with_a_step() {
+    let confirming = Attention::from_reason("replacement_unconfirmed");
+    assert_eq!(confirming.item, AttentionItem::ReplacementUnconfirmed);
+    assert_eq!(confirming.item.step(), Some("confirming"));
+    assert_eq!(confirming.item.kind(), AttentionKind::Waiting);
     let why =
-        Attention::from_reason("replacement_unconfirmed_waiting:g1: startup has not finished");
+        Attention::from_reason("replacement_unconfirmed:waiting:g1: startup has not finished");
     assert_eq!(why.item, AttentionItem::ReplacementWaiting);
-    assert_eq!(why.item.key(), "replacement_unconfirmed_waiting");
+    assert_eq!(why.item.step(), Some("waiting"));
     assert_eq!(why.item.kind(), AttentionKind::Waiting);
     assert_eq!(why.item.severity(), AttentionSeverity::Info);
-    let sign_in = Attention::from_reason("replacement_unconfirmed_sign_in_required");
+    let sign_in = Attention::from_reason("replacement_unconfirmed:sign_in");
     assert_eq!(sign_in.item, AttentionItem::ReplacementSignInRequired);
+    assert_eq!(sign_in.item.step(), Some("sign_in"));
     assert_eq!(sign_in.item.kind(), AttentionKind::Permanent);
     assert_eq!(sign_in.item.severity(), AttentionSeverity::Warning);
+    let acknowledge = Attention::from_reason("replacement_unconfirmed:acknowledge");
+    assert_eq!(acknowledge.item, AttentionItem::ReplacementAcknowledge);
+    assert_eq!(acknowledge.item.step(), Some("acknowledge"));
+    for item in [confirming.item, why.item, sign_in.item, acknowledge.item] {
+        assert_eq!(item.key(), "replacement_unconfirmed");
+    }
+    for old in [
+        "replacement_unconfirmed_waiting",
+        "replacement_unconfirmed_sign_in_required",
+        "replacement_unconfirmed_acknowledgement_required",
+        "ownership_lost:g",
+        "not_joined:g",
+    ] {
+        assert_eq!(Attention::from_reason(old).item, AttentionItem::Unrecognized, "{old}");
+    }
+}
+
+/// A folder that has to be linked again is one key, for both of its causes.
+#[test]
+fn a_folder_that_must_be_linked_again_is_one_critical_item() {
+    let attention = Attention::from_reason("folder_needs_relink:g");
+    assert_eq!(attention.item, AttentionItem::FolderNeedsRelink);
+    assert_eq!(attention.item.key(), "folder_needs_relink");
+    assert_eq!(attention.scope, AttentionScope::Folder("g".into()));
+    assert_eq!(attention.item.severity(), AttentionSeverity::Critical);
 }
 
 /// A request waiting on the owner is a warning the owner clears by deciding; the item points at

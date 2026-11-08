@@ -318,6 +318,7 @@ async fn dispatch_until_stalled(
         state.telemetry.recent_errors_handle(),
         Some(stall.clone()),
         stop.clone(),
+        None,
     );
     tokio::pin!(dispatch);
     let mut stalled = false;

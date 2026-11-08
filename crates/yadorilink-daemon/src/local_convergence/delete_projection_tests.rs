@@ -99,6 +99,86 @@ async fn an_admitted_removal_removes_the_file_it_observed() {
     assert!(reconcile(&h, &["notes.txt"]).await.is_settled("notes.txt"));
 }
 
+/// The steps of a tombstone delete, as the write operation records them: the delete intent and
+/// the fence bump are prepared together, the file is removed, and one settle records the absence
+/// and clears the intent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tombstone_delete_goes_prepared_published_proven() {
+    use crate::write_op::trace::StepTrace;
+    use crate::write_op::{IntentSettlement, ProofOutcome, StepEvent};
+    let h = Harness::new(true);
+    let seen = captured(&h, "trace-gone.txt", b"the version the remover saw").await;
+    let mut remote = Remote::new();
+    remote.admit(&h, vec![delete("trace-gone.txt", vec![seen])]).await;
+
+    assert!(reconcile(&h, &["trace-gone.txt"]).await.is_settled("trace-gone.txt"));
+
+    assert_eq!(
+        StepTrace::of(GROUP, "trace-gone.txt"),
+        [
+            StepEvent::Prepared,
+            StepEvent::Published { names_deferred: false, landed_marked: false },
+            StepEvent::Proven {
+                outcome: ProofOutcome::Absent,
+                intent: IntentSettlement::Cleared,
+                obligation_closed: false,
+            },
+        ]
+    );
+    assert!(!h.state.has_materialization_intent(GROUP, "trace-gone.txt").unwrap());
+}
+
+/// A failure injected after the file was removed and before its tombstone is recorded leaves the
+/// delete unsettled (the delete intent stays open, the file is gone); the next pass settles it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failure_after_the_removal_leaves_the_delete_intent_for_the_next_pass() {
+    use crate::write_op::failpoint::{arm, WriteOpFailpoint};
+    let h = Harness::new(true);
+    let seen = captured(&h, "fp-gone.txt", b"the version the remover saw").await;
+    let mut remote = Remote::new();
+    remote.admit(&h, vec![delete("fp-gone.txt", vec![seen])]).await;
+
+    {
+        let _armed = arm(WriteOpFailpoint::BeforeProve, "fp-gone.txt");
+        assert!(!reconcile(&h, &["fp-gone.txt"]).await.is_settled("fp-gone.txt"));
+    }
+    assert!(std::fs::symlink_metadata(h.path("fp-gone.txt")).is_err(), "the file is removed");
+    assert!(h.state.has_materialization_intent(GROUP, "fp-gone.txt").unwrap());
+
+    assert!(reconcile(&h, &["fp-gone.txt"]).await.is_settled("fp-gone.txt"));
+    assert!(!h.state.has_materialization_intent(GROUP, "fp-gone.txt").unwrap());
+}
+
+/// A delete stopped at each of its other transitions loses nothing the delete did not mean to
+/// remove, and the next pass settles it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delete_stopped_at_each_other_transition_is_settled_by_the_next_pass() {
+    use crate::write_op::failpoint::{arm, WriteOpFailpoint};
+    for (i, point) in [
+        WriteOpFailpoint::AfterPrepare,
+        WriteOpFailpoint::AfterPublish,
+        WriteOpFailpoint::AfterProve,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("fp-delete-{i}.txt");
+        let h = Harness::new(true);
+        let seen = captured(&h, &name, b"the version the remover saw").await;
+        let mut remote = Remote::new();
+        remote.admit(&h, vec![delete(&name, vec![seen])]).await;
+        {
+            let armed = arm(point, &name);
+            let _ = reconcile(&h, &[name.as_str()]).await;
+            assert!(armed.fired() >= 1, "{point:?} was reached");
+        }
+
+        assert!(reconcile(&h, &[name.as_str()]).await.is_settled(&name), "{point:?}");
+        assert!(std::fs::symlink_metadata(h.path(&name)).is_err(), "{point:?}: the file is gone");
+        assert!(!h.state.has_materialization_intent(GROUP, &name).unwrap(), "{point:?}");
+    }
+}
+
 /// A removal of a version that superseded the one this device holds
 /// absorbed it: the file this device holds is removed too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -3,6 +3,7 @@
 
 pub mod account;
 pub mod auth;
+pub mod autostart;
 pub mod daemon;
 pub mod device_supersede;
 pub mod devices;
@@ -10,9 +11,11 @@ pub mod diagnostics;
 pub mod files;
 pub mod folders;
 pub mod handoff;
+pub mod ignore_rules;
 pub mod links;
 pub mod mac_claim;
 pub mod nas_admin;
+pub mod network;
 pub mod paths;
 pub mod primary_transfer;
 pub(crate) mod provider_pending;

@@ -1376,6 +1376,44 @@ async fn a_sent_transfer_is_listed_and_a_receive_completes_it() {
     assert_eq!(sent_status(&pair.sender, &pair.transfer_id).status, "completed");
 }
 
+/// The sender's list counts what it has served while the transfer is accepted: the furthest point
+/// of each file, never past the offer's size, the whole offer once completed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sent_transfer_reports_the_bytes_served_so_far() {
+    let pair = offered_pair().await;
+    let total = pair.content.len() as u64;
+    assert_eq!(sent_status(&pair.sender, &pair.transfer_id).bytes_sent, 0);
+
+    pair.sender.note_served(&pair.transfer_id, 0, 10);
+    pair.sender.note_served(&pair.transfer_id, 0, 4);
+    assert_eq!(
+        sent_status(&pair.sender, &pair.transfer_id).bytes_sent,
+        10,
+        "a resume never goes back"
+    );
+    pair.sender.note_served(&pair.transfer_id, 0, total + 99);
+    assert_eq!(
+        sent_status(&pair.sender, &pair.transfer_id).bytes_sent,
+        total,
+        "never past the offer"
+    );
+
+    pair.receiver.receive_transfer(&pair.transfer_id, None).await.unwrap();
+    wait_for_sent_status(&pair.sender, &pair.transfer_id, "completed").await;
+    assert_eq!(sent_status(&pair.sender, &pair.transfer_id).bytes_sent, total);
+}
+
+/// Serving a pull advances the count by the chunks actually written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serving_a_pull_counts_its_bytes() {
+    let pair = offered_pair().await;
+    pair.receiver.receive_transfer(&pair.transfer_id, None).await.unwrap();
+    assert_eq!(
+        pair.sender.served_bytes(&pair.transfer_id, pair.content.len() as u64),
+        pair.content.len() as u64
+    );
+}
+
 /// A receiver that already holds the content never pulls it, yet the sender still learns the
 /// transfer finished: completion comes from the receiver saying so, not from counting pulls.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1609,7 +1647,7 @@ async fn a_serve_ending_after_a_cancel_does_not_record_a_stall() {
     pair.sender.note_serve_outcome(&pair.transfer_id, &Err(SendError::ReceiverStalled));
     let entry = sent_status(&pair.sender, &pair.transfer_id);
     assert_eq!(entry.status, "canceled");
-    assert_eq!(entry.failure, None);
+    assert_eq!(entry.failure.as_deref(), Some(crate::error::failure::SENDER_CANCELED));
 }
 
 /// The bound is on inactivity, not on the whole chunk: a slow receiver that keeps reading is

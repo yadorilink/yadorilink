@@ -23,10 +23,24 @@ impl install_source::CommandRunner for NoSpawnRunner {
 #[cfg(target_os = "linux")]
 #[test]
 fn platform_detection_spawns_no_process_in_a_test_binary() {
-    let before = REFUSED_PROBES.load(std::sync::atomic::Ordering::SeqCst);
     let info = PlatformInfo::detect(None);
-    assert!(REFUSED_PROBES.load(std::sync::atomic::Ordering::SeqCst) > before);
+    // Detection is memoized per process, so another test may have asked first: what matters is
+    // that the question went to the runner, at least once, and not to a process.
+    assert!(REFUSED_PROBES.load(std::sync::atomic::Ordering::SeqCst) >= 1);
     assert_eq!(info.install_source, "standalone");
+}
+
+/// The install source is a property of the running binary: asking again (the daemon's identity,
+/// its update manager and its entry point all do, at start-up) must not run the package-manager
+/// probe again. Each probe reads the whole dpkg database.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_install_source_is_probed_once_per_process() {
+    let _ = PlatformInfo::detect(None);
+    let after_first = REFUSED_PROBES.load(std::sync::atomic::Ordering::SeqCst);
+    let _ = PlatformInfo::detect(None);
+    let _ = PlatformInfo::detect(Some("container"));
+    assert_eq!(REFUSED_PROBES.load(std::sync::atomic::Ordering::SeqCst), after_first);
 }
 
 /// An iOS build is its own platform and an App Store install, whatever its bundle path looks like.
@@ -1016,4 +1030,105 @@ async fn a_channel_without_a_manifest_forgets_the_persisted_one() {
     let _ = verified_manager(Some(&doc), dir.path(), unix_at(NOW)).await;
     let mgr = restarted(dir.path(), unix_at(NOW));
     assert!(mgr.verified_entry(&item(), Downloaded).verdict.is_ok());
+}
+
+// ---- the on-demand check behind the app's question ----
+
+/// A server for `doc` (404 for `None`, 500 for a broken one) and a manager over a fresh,
+/// never-enrolled config directory (no credentials, no device record) pointed at it.
+async fn unenrolled_manager_with_server(
+    status: u16,
+    doc: Option<&manifest::UpdateManifest>,
+    dir: &Path,
+    now: i64,
+) -> (wiremock::MockServer, UpdateManager) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let response = match doc {
+        Some(doc) => ResponseTemplate::new(200).set_body_string(
+            serde_json::to_string(&manifest::test_support::sign_manifest(doc)).unwrap(),
+        ),
+        None => ResponseTemplate::new(status),
+    };
+    Mock::given(method("GET"))
+        .and(path("/manifest.json"))
+        .respond_with(response)
+        .mount(&server)
+        .await;
+    let mut mgr = manager_at(dir, &format!("{}/manifest.json", server.uri()));
+    mgr.set_trusted_keys_for_test(manifest::test_support::trusted_keys_hex(
+        &manifest::test_support::test_trusted_keys(),
+    ));
+    mgr.set_now_for_test(now);
+    (server, mgr)
+}
+
+/// An install whose daemon never enrolled (nothing but an empty config directory) still gets a
+/// verified manifest when the app asks: the check fetches the public manifest and verifies it,
+/// with no account or device involved.
+#[tokio::test]
+async fn an_unregistered_daemon_still_produces_a_verified_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(!dir.path().join("device.json").exists());
+    let doc = doc_with_build(&manager(dir.path()));
+    let (_server, mgr) =
+        unenrolled_manager_with_server(200, Some(&doc), dir.path(), unix_at(NOW)).await;
+
+    // Nothing was checked yet: the plain read cannot confirm...
+    assert_eq!(code(&mgr.verified_entry(&item(), Downloaded)), "not_checked");
+    // ...and the app's question runs the check itself.
+    let it = item();
+    let answer = mgr.verified_entry_or_check(&it, Downloaded).await;
+    assert!(answer.verdict.is_ok(), "{:?}", answer.verdict);
+    assert!(answer.entry.is_some());
+    // The accepted manifest is stored, so the next start answers without the network.
+    assert!(dir.path().join("update_verified_manifest.json").exists());
+}
+
+/// A manifest that fails to verify is never turned into an answer by the on-demand path.
+#[tokio::test]
+async fn the_on_demand_check_keeps_the_trust_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = doc_with_build(&manager(dir.path()));
+    let (_server, mut mgr) =
+        unenrolled_manager_with_server(200, Some(&doc), dir.path(), unix_at(NOW)).await;
+    // A trust root that did not sign the served manifest.
+    mgr.set_trusted_keys_for_test(Vec::new());
+    let it = item();
+    let answer = mgr.verified_entry_or_check(&it, Downloaded).await;
+    assert_eq!(code(&answer), "not_checked");
+    assert!(answer.entry.is_none());
+    assert!(!dir.path().join("update_verified_manifest.json").exists());
+}
+
+/// At most one request per call, and a failing endpoint is not asked again within the gap.
+#[tokio::test]
+async fn the_on_demand_check_does_not_loop_against_a_failing_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, mgr) = unenrolled_manager_with_server(500, None, dir.path(), unix_at(NOW)).await;
+    let it = item();
+    for _ in 0..3 {
+        let answer = mgr.verified_entry_or_check(&it, Downloaded).await;
+        assert_eq!(code(&answer), "not_checked");
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+/// Concurrent questions share one check.
+#[tokio::test]
+async fn concurrent_on_demand_checks_share_one_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = doc_with_build(&manager(dir.path()));
+    let (server, mgr) =
+        unenrolled_manager_with_server(200, Some(&doc), dir.path(), unix_at(NOW)).await;
+    let it = item();
+    let (a, b, c) = tokio::join!(
+        mgr.verified_entry_or_check(&it, Downloaded),
+        mgr.verified_entry_or_check(&it, Downloaded),
+        mgr.verified_entry_or_check(&it, Downloaded),
+    );
+    assert!(a.verdict.is_ok() && b.verdict.is_ok() && c.verdict.is_ok());
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }

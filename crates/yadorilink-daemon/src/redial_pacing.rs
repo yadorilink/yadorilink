@@ -279,4 +279,57 @@ mod tests {
         }
         assert_eq!(Instant::now() - t0, Duration::from_secs(31));
     }
+
+    /// How long a keeper takes to connect when the handshake itself needs `handshake` (a
+    /// device starved of CPU), under the dial bounds and backoff the keeper uses. A dial that
+    /// runs past its bound is dropped and started again from nothing, so a handshake slower
+    /// than a bound only gets through at the first attempt that has no bound of its own, or
+    /// one whose bound is long enough. Backoff at its longest (jitter +25%).
+    async fn time_to_connect(handshake: Duration) -> Duration {
+        use crate::supervise::BackoffConfig;
+        let t0 = Instant::now();
+        let mut attempt: u32 = 0;
+        loop {
+            let dial = async {
+                tokio::time::sleep(handshake).await;
+            };
+            if bounded_dial(attempt, dial).await.is_some() {
+                return Instant::now() - t0;
+            }
+            tokio::time::sleep(BackoffConfig::RECONNECT.max_delay_for_tests(attempt)).await;
+            attempt += 1;
+        }
+    }
+
+    /// Pins what the dial bounds cost a slow device, so a change to them is a decision: a
+    /// handshake that fits the first bound connects at once; one that does not is dropped and
+    /// restarted, and connects at the first attempt whose bound is long enough, which is later
+    /// than its own length by the abandoned attempts and their waits (the time the failed
+    /// attempts spent is also CPU a starved device does not have).
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_handshake_connects_at_the_first_attempt_whose_bound_fits_it() {
+        assert_eq!(time_to_connect(Duration::from_secs(1)).await, Duration::from_secs(1));
+        assert_eq!(time_to_connect(Duration::from_secs(5)).await, Duration::from_secs(5));
+        // 6 s: attempt 0 (5 s) is dropped, 1.25 s wait, attempt 1 (10 s) gets through.
+        assert_eq!(
+            time_to_connect(Duration::from_secs(6)).await,
+            Duration::from_secs(5) + Duration::from_millis(1250) + Duration::from_secs(6)
+        );
+        // 12 s: attempts 0 and 1 are dropped (5 s and 10 s plus waits), attempt 2 (20 s) fits.
+        assert_eq!(
+            time_to_connect(Duration::from_secs(12)).await,
+            Duration::from_secs(5)
+                + Duration::from_millis(1250)
+                + Duration::from_secs(10)
+                + Duration::from_millis(2500)
+                + Duration::from_secs(12)
+        );
+        // 33 s (the transport's own deadline): three attempts dropped, the fourth has no bound.
+        assert_eq!(
+            time_to_connect(Duration::from_secs(33)).await,
+            Duration::from_secs(5 + 10 + 20)
+                + Duration::from_millis(1250 + 2500 + 5000)
+                + Duration::from_secs(33)
+        );
+    }
 }

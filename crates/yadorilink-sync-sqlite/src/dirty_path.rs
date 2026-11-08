@@ -282,6 +282,20 @@ impl DirtyPathRepository {
         })
     }
 
+    /// How many paths are journaled dirty for `group_id`, counting at most `cap`: an index
+    /// range read, so a status read never walks a journal in full swing.
+    pub fn count_dirty_paths(&self, group_id: &str, cap: u32) -> Result<u64, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            Ok(conn
+                .prepare_cached(
+                    "SELECT COUNT(*) FROM \
+                     (SELECT 1 FROM local_dirty_paths WHERE group_id = ?1 LIMIT ?2)",
+                )?
+                .query_row(rusqlite::params![group_id, cap], |r| r.get::<_, i64>(0))?
+                as u64)
+        })
+    }
+
     /// Every currently journaled dirty path for `group_id`, oldest-first — the
     /// daemon's startup rescan worklist. Ordered by `first_seen_unix_nanos` so
     /// the longest-outstanding edits are re-driven first.

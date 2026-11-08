@@ -5,13 +5,16 @@ use std::sync::Arc;
 use yadorilink_local_capture::Ingest;
 
 use super::*;
-use crate::engine_tuning::EngineTuning;
+use crate::engine_tuning::{EngineTuning, FileMode};
 
 const GROUP: &str = "group-1";
 const LARGE: u64 = FILE_ONLY_MIN_SIZE + 1;
 
 fn coordinator(file_block_source: bool) -> Arc<ReplicaCoordinator> {
-    let tuning = EngineTuning { file_block_source, single_pass: false, ..EngineTuning::default() };
+    let tuning = EngineTuning {
+        file_mode: if file_block_source { FileMode::ServesFromFiles } else { FileMode::Blocks },
+        ..EngineTuning::default()
+    };
     Arc::new(ReplicaCoordinator::open_in_memory_with(tuning).unwrap())
 }
 
@@ -53,7 +56,7 @@ fn a_large_unkept_file_is_only_hashed_and_a_small_one_is_copied() {
 #[test]
 fn a_pinned_or_leased_item_is_copied_into_the_store() {
     let c = coordinator(true);
-    c.pinned_item_repository().pin(GROUP, "pinned-dir").unwrap();
+    c.retention_rules().pin(GROUP, "pinned-dir").unwrap();
     lease(&c, "live", "leased.bin", 3600);
     lease(&c, "expired", "was-leased.bin", -3600);
     let policy = ingest_policy_for(&c);
@@ -66,12 +69,47 @@ fn a_pinned_or_leased_item_is_copied_into_the_store() {
     assert_eq!(policy.ingest_for("another-group", "pinned-dir", LARGE), Ingest::FileOnly);
 }
 
+/// Only the pin term follows the rule table: an online-only rule nearer than a keep above it takes
+/// the pin away, and a custody lease, a store-mode request and an unreadable state still keep the
+/// version in the store.
+#[test]
+fn an_online_only_rule_ends_only_the_pin_term_of_keeping_in_the_store() {
+    use yadorilink_sync_sqlite::Rule;
+    let c = coordinator(true);
+    c.retention_rules().set(GROUP, "kept", Some(Rule::Keep)).unwrap();
+    c.retention_rules().set(GROUP, "kept/free", Some(Rule::OnlineOnly)).unwrap();
+    lease(&c, "live", "kept/free/leased.bin", 3600);
+    let policy = ingest_policy_for(&c);
+
+    assert_eq!(policy.ingest_for(GROUP, "kept/x.bin", LARGE), Ingest::Store);
+    assert_eq!(
+        policy.ingest_for(GROUP, "kept/free/x.bin", LARGE),
+        Ingest::FileOnly,
+        "the online-only exception is not kept by the pin term"
+    );
+    assert_eq!(
+        policy.ingest_for(GROUP, "kept/free/leased.bin", LARGE),
+        Ingest::Store,
+        "a leased version under an online-only rule is still kept in the store"
+    );
+    assert!(!must_keep_in_store(&c, GROUP, "kept/free/x.bin"));
+    assert!(must_keep_in_store(&c, GROUP, "kept/free/leased.bin"));
+
+    let hold = c.store_mode_requests().hold(GROUP, std::time::Duration::from_secs(60));
+    assert_eq!(
+        ingest_policy_for(&c).ingest_for(GROUP, "kept/free/x.bin", LARGE),
+        Ingest::Store,
+        "a store-mode request keeps everything, whatever the rules say"
+    );
+    drop(hold);
+}
+
 /// The predicate itself, which the receive side will share.
 #[test]
 fn must_keep_in_store_is_the_pin_or_lease_question_alone() {
     let c = coordinator(true);
     assert!(!must_keep_in_store(&c, GROUP, "a.bin"));
-    c.pinned_item_repository().pin(GROUP, "a.bin").unwrap();
+    c.retention_rules().pin(GROUP, "a.bin").unwrap();
     assert!(must_keep_in_store(&c, GROUP, "a.bin"));
     lease(&c, "l", "b.bin", 3600);
     assert!(must_keep_in_store(&c, GROUP, "b.bin"));

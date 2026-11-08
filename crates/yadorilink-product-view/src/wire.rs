@@ -96,8 +96,11 @@ impl ProductStatusSummary {
                 .availability
                 .update_required_device_ids
                 .clone(),
+            availability_newer_peer_device_ids: self.availability.newer_peer_device_ids.clone(),
             protection: self.protection.protection.to_wire() as i32,
             protection_device_ids: self.protection.device_ids.clone(),
+            // The daemon's status read stamps it; a summary holds no clock.
+            last_synced_unix: None,
         }
     }
 
@@ -119,6 +122,7 @@ impl ProductStatusSummary {
                 reachable_device_ids: wire.availability_reachable_device_ids.clone(),
                 offline_device_ids: wire.availability_offline_device_ids.clone(),
                 update_required_device_ids: wire.availability_update_required_device_ids.clone(),
+                newer_peer_device_ids: wire.availability_newer_peer_device_ids.clone(),
             },
             protection: ProtectionSummary {
                 protection: Protection::from_wire(wire.protection()),

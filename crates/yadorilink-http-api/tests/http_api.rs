@@ -551,6 +551,7 @@ async fn conflicts_endpoint_returns_real_per_file_detail() {
     let rows = conflicts["conflicts"].as_array().unwrap();
     assert_eq!(rows.len(), 1, "expected exactly the one seeded conflicted-copy file: {conflicts}");
     assert_eq!(rows[0]["path"], conflict_path);
+    assert_eq!(rows[0]["absolute_path"], folder.join(conflict_path).to_string_lossy().to_string());
     assert_eq!(rows[0]["local_path"], folder.to_string_lossy().to_string());
     assert_eq!(rows[0]["size"], conflict_content.len());
     assert_eq!(rows[0]["kind"], "ENTRY_KIND_FILE");
@@ -1492,7 +1493,7 @@ async fn a_timed_pause_reports_its_deadline_and_an_unknown_length_is_refused() {
     let resp = post_json(
         &ts,
         "/api/pause",
-        serde_json::json!({ "path": local_path, "duration": "PAUSE_DURATION_ONE_HOUR" }),
+        serde_json::json!({ "path": local_path, "duration": "PAUSE_DURATION_TWO_HOURS" }),
     )
     .await;
     assert_eq!(resp.status(), 200);
@@ -1509,7 +1510,7 @@ async fn a_timed_pause_reports_its_deadline_and_an_unknown_length_is_refused() {
     let until = links["links"][0]["paused_until_unix"].as_i64().unwrap();
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
         as i64;
-    assert!(until > now + 3000 && until <= now + 3700, "until={until} now={now}");
+    assert!(until > now + 7000 && until <= now + 7300, "until={until} now={now}");
 }
 
 #[tokio::test]
@@ -1588,6 +1589,17 @@ async fn the_new_routes_need_the_token_same_origin_and_a_json_post() {
         "/api/update/check",
         "/api/link/preflight",
         "/api/link",
+        "/api/unlink",
+        "/api/conflicts/resolve",
+        "/api/trash/restore",
+        "/api/share/invite",
+        "/api/share/delete",
+        "/api/retained/free",
+        "/api/share/revoke",
+        "/api/transfers/cancel",
+        "/api/transfers/retry",
+        "/api/devices/remove",
+        "/api/preserved/action",
         "/api/share/create",
         "/api/share/join",
         "/api/invite/accept",
@@ -1676,12 +1688,20 @@ async fn the_port_file_is_replaced_atomically_and_stays_owner_only() {
     assert!(!names.iter().any(|n| n.ends_with(".tmp")), "no temp file left: {names:?}");
 }
 
+/// The session secret the test dialler sends with its streams, and the bearer
+/// value the page would present for it.
+const PEER_SECRET: [u8; 32] = [9u8; 32];
+
+fn peer_bearer() -> String {
+    format!("Authorization: Bearer {}\r\n", hex::encode(PEER_SECRET))
+}
+
 /// Sends one raw request over a device-authorized stream (what the daemon
 /// hands the adapter after the device connection is authorized) and returns
 /// the whole response.
 async fn peer_request(peer: &yadorilink_http_api::PeerStreams, request: &str) -> String {
     let (mut client, server) = tokio::io::duplex(64 * 1024);
-    assert!(peer.offer(Box::new(server)), "the dashboard takes the stream");
+    assert!(peer.offer(Box::new(server), PEER_SECRET), "the dashboard takes the stream");
     client.write_all(request.as_bytes()).await.unwrap();
     // Headers, then exactly `Content-Length` body bytes: the server may keep
     // the stream open after answering.
@@ -1713,16 +1733,19 @@ async fn peer_request(peer: &yadorilink_http_api::PeerStreams, request: &str) ->
 }
 
 /// The managing device's browser talks to a loopback port of its own, which
-/// the adapter cannot know, and it never has the token: the device
-/// connection already proved who is asking.
+/// the adapter cannot know. It does not have this run's token; it has the
+/// session secret its dialler sent with the stream.
 #[tokio::test]
-async fn a_device_authorized_stream_needs_no_token_and_any_loopback_port() {
+async fn a_device_authorized_stream_takes_the_session_secret_on_any_loopback_port() {
     let _guard = TEST_MUTEX.lock().await;
     let ts = start().await;
     for host in ["127.0.0.1:54321", "localhost:49152", "[::1]:60000"] {
         let response = peer_request(
             &ts.peer,
-            &format!("GET /api/status HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"),
+            &format!(
+                "GET /api/status HTTP/1.1\r\nHost: {host}\r\n{}Connection: close\r\n\r\n",
+                peer_bearer()
+            ),
         )
         .await;
         assert!(response.starts_with("HTTP/1.1 200"), "{host}: {response}");
@@ -1733,6 +1756,80 @@ async fn a_device_authorized_stream_needs_no_token_and_any_loopback_port() {
     )
     .await;
     assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+}
+
+/// Being a device-authorized stream is not enough: another program on the
+/// managing computer can reach the loopback listener too. It has no session
+/// secret, so the API refuses it -- without one, with a wrong one, with this
+/// run's TCP token (a different credential), and with a forged `Origin`
+/// whatever else it sends.
+#[tokio::test]
+async fn a_device_authorized_stream_without_the_session_secret_gets_no_api() {
+    let _guard = TEST_MUTEX.lock().await;
+    let ts = start().await;
+    let host = "127.0.0.1:54321";
+    let wrong = format!("Authorization: Bearer {}\r\n", "0".repeat(64));
+    let tcp_token = format!("Authorization: Bearer {}\r\n", ts.token);
+    for auth in ["", wrong.as_str(), tcp_token.as_str()] {
+        let response = peer_request(
+            &ts.peer,
+            &format!("GET /api/status HTTP/1.1\r\nHost: {host}\r\n{auth}Connection: close\r\n\r\n"),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 401"), "{auth:?}: {response}");
+    }
+    // The forged Origin is refused even when the secret is right, and when it is not.
+    for auth in [peer_bearer(), wrong.clone(), String::new()] {
+        let response = peer_request(
+            &ts.peer,
+            &format!(
+                "GET /api/status HTTP/1.1\r\nHost: {host}\r\nOrigin: http://evil.example\r\n{auth}Connection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 403"), "{auth:?}: {response}");
+    }
+    // The shell page holds nothing and needs no secret, as on the TCP listener.
+    let page = peer_request(
+        &ts.peer,
+        &format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"),
+    )
+    .await;
+    assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+}
+
+/// Each stream carries its own dialler's secret: one session's secret does not
+/// open another session's stream.
+#[tokio::test]
+async fn each_device_stream_checks_its_own_session_secret() {
+    let _guard = TEST_MUTEX.lock().await;
+    let ts = start().await;
+    let host = "127.0.0.1:54321";
+    let other: [u8; 32] = [3u8; 32];
+    let request = |secret: &[u8; 32]| {
+        format!(
+            "GET /api/status HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            hex::encode(secret)
+        )
+    };
+    for (stream_secret, presented, ok) in [
+        (PEER_SECRET, PEER_SECRET, true),
+        (other, other, true),
+        (PEER_SECRET, other, false),
+        (other, PEER_SECRET, false),
+    ] {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        assert!(ts.peer.offer(Box::new(server), stream_secret));
+        client.write_all(request(&presented).as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), client.read_to_end(&mut response))
+            .await
+            .expect("response in time")
+            .unwrap();
+        let response = String::from_utf8_lossy(&response).into_owned();
+        let expected = if ok { "HTTP/1.1 200" } else { "HTTP/1.1 401" };
+        assert!(response.starts_with(expected), "{ok}: {response}");
+    }
 }
 
 /// DNS rebinding stays closed on the device path: a page whose name merely
@@ -1754,7 +1851,7 @@ async fn a_device_authorized_stream_still_refuses_a_non_loopback_host() {
     }
 }
 
-/// With no token behind it, `Origin` is what keeps other pages in the
+/// `Origin` is what keeps other pages in the
 /// managing device's browser out: it must be this page's own, and a
 /// state-changing request must carry it.
 #[tokio::test]
@@ -1774,7 +1871,8 @@ async fn a_device_authorized_stream_refuses_foreign_origins_and_originless_chang
     }
     let body = r#"{"path":"/not/linked"}"#;
     let own = format!(
-        "POST /api/pause HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST /api/pause HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\n{}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        peer_bearer(),
         body.len()
     );
     let response = peer_request(&ts.peer, &own).await;
@@ -1821,7 +1919,10 @@ async fn peer_streams_report_the_dashboard_stopped() {
     let _ = task.await;
     assert!(!peer.is_serving(), "a stopped dashboard must not look available");
     let (_client, server) = tokio::io::duplex(64);
-    assert!(!peer.offer(Box::new(server)), "nothing takes a stream after the dashboard stopped");
+    assert!(
+        !peer.offer(Box::new(server), PEER_SECRET),
+        "nothing takes a stream after the dashboard stopped"
+    );
 }
 
 /// Stopping the dashboard ends the device streams it was already serving,
@@ -1842,7 +1943,7 @@ async fn a_stopped_dashboard_ends_the_streams_it_was_serving() {
     let task = tokio::spawn(yadorilink_http_api::run(handle));
 
     let (mut client, server) = tokio::io::duplex(64 * 1024);
-    assert!(peer.offer(Box::new(server)));
+    assert!(peer.offer(Box::new(server), PEER_SECRET));
     client.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1:54321\r\n\r\n").await.unwrap();
     let mut chunk = [0u8; 4096];
     let n = tokio::time::timeout(Duration::from_secs(10), client.read(&mut chunk))
@@ -1875,6 +1976,17 @@ async fn every_state_changing_route_needs_origin_on_a_device_authorized_stream()
     for path in [
         "/api/pause",
         "/api/resume",
+        "/api/unlink",
+        "/api/conflicts/resolve",
+        "/api/trash/restore",
+        "/api/share/invite",
+        "/api/share/delete",
+        "/api/retained/free",
+        "/api/share/revoke",
+        "/api/transfers/cancel",
+        "/api/transfers/retry",
+        "/api/devices/remove",
+        "/api/preserved/action",
         "/api/evict",
         "/api/restore",
         "/api/update/check",
@@ -1893,4 +2005,591 @@ async fn every_state_changing_route_needs_origin_on_a_device_authorized_stream()
         .await;
         assert!(response.starts_with("HTTP/1.1 403"), "{path}: {response}");
     }
+}
+
+#[tokio::test]
+async fn unlink_is_refused_for_a_wrong_group_and_for_the_last_complete_copy() {
+    let _guard = TEST_MUTEX.lock().await;
+    let ts = start().await;
+    let folder = ts._dir.path().join("shared");
+    seed_linked_file(&ts.state, &folder, b"hello world");
+    let local_path = folder.to_string_lossy().to_string();
+
+    let resp = post_json(
+        &ts,
+        "/api/unlink",
+        serde_json::json!({ "path": local_path, "group_id": "some-other-group" }),
+    )
+    .await;
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("different group"), "{body}");
+
+    // The seeded folder is this account's only complete copy: the daemon's
+    // own guard refuses, and the page cannot override it.
+    let resp = post_json(&ts, "/api/unlink", serde_json::json!({ "path": local_path })).await;
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("complete copy"), "{body}");
+    let links: serde_json::Value = ts
+        .client
+        .get(ts.url("/api/links"))
+        .bearer_auth(&ts.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(links["links"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn resolving_a_conflict_needs_a_known_resolution_and_a_real_conflict_copy() {
+    let _guard = TEST_MUTEX.lock().await;
+    let ts = start().await;
+    let folder = ts._dir.path().join("shared");
+    seed_linked_file(&ts.state, &folder, b"hello world");
+    let copy = folder.join("notes.txt").to_string_lossy().to_string();
+
+    let resp = post_json(
+        &ts,
+        "/api/conflicts/resolve",
+        serde_json::json!({ "path": copy, "resolution": "delete_everything" }),
+    )
+    .await;
+    assert_eq!(resp.status(), 400);
+
+    // An ordinary file is not a conflict copy: the daemon refuses.
+    let resp = post_json(
+        &ts,
+        "/api/conflicts/resolve",
+        serde_json::json!({ "path": copy, "resolution": "keep_this" }),
+    )
+    .await;
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["error"].is_string(), "{body}");
+}
+
+#[tokio::test]
+async fn trash_lists_and_restore_refuses_what_is_not_trashed() {
+    let _guard = TEST_MUTEX.lock().await;
+    let ts = start().await;
+    let folder = ts._dir.path().join("shared");
+    seed_linked_file(&ts.state, &folder, b"hello world");
+
+    let trash: serde_json::Value = ts
+        .client
+        .get(ts.url("/api/trash"))
+        .bearer_auth(&ts.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(trash["files"].as_array().unwrap().is_empty());
+
+    let path = folder.join("notes.txt").to_string_lossy().to_string();
+    for whole in [false, true] {
+        let resp = post_json(
+            &ts,
+            "/api/trash/restore",
+            serde_json::json!({ "path": path, "whole_operation": whole }),
+        )
+        .await;
+        assert_eq!(resp.status(), 400, "whole_operation={whole}");
+    }
+}
+
+#[tokio::test]
+async fn invite_and_device_removal_need_their_ids() {
+    let _guard = TEST_MUTEX.lock().await;
+    let ts = start().await;
+    let resp = post_json(&ts, "/api/share/invite", serde_json::json!({ "group_id": "" })).await;
+    assert_eq!(resp.status(), 400);
+    let resp = post_json(&ts, "/api/devices/remove", serde_json::json!({ "device_id": "" })).await;
+    assert_eq!(resp.status(), 400);
+    let resp = post_json(&ts, "/api/share/delete", serde_json::json!({ "group_id": "" })).await;
+    assert_eq!(resp.status(), 400);
+    for body in [
+        serde_json::json!({ "group_id": "", "device_id": "d" }),
+        serde_json::json!({ "group_id": "g", "device_id": "" }),
+    ] {
+        let resp = post_json(&ts, "/api/share/revoke", body).await;
+        assert_eq!(resp.status(), 400);
+    }
+    let resp = post_json(
+        &ts,
+        "/api/share/revoke",
+        serde_json::json!({ "group_id": "g", "device_id": "d" }),
+    )
+    .await;
+    assert!(resp.status().is_client_error(), "{}", resp.status());
+    // Listing members needs the coordination plane too.
+    let resp = ts.client.get(ts.url("/api/shares")).bearer_auth(&ts.token).send().await.unwrap();
+    assert!(resp.status().is_client_error(), "{}", resp.status());
+    for (path, body) in [
+        ("/api/transfers/cancel", serde_json::json!({ "transfer_id": "" })),
+        ("/api/transfers/retry", serde_json::json!({ "transfer_id": "" })),
+        ("/api/transfers/retry", serde_json::json!({ "transfer_id": "t" })),
+        ("/api/transfers/retry", serde_json::json!({ "transfer_id": "t", "direction": "any" })),
+    ] {
+        assert_eq!(post_json(&ts, path, body).await.status(), 400, "{path}");
+    }
+    // An unknown id is the daemon's refusal, not a server error.
+    let resp =
+        post_json(&ts, "/api/transfers/cancel", serde_json::json!({ "transfer_id": "nope" })).await;
+    assert!(resp.status().is_client_error(), "{}", resp.status());
+    // Without coordination access the daemon refuses rather than the adapter failing.
+    let resp = post_json(&ts, "/api/share/delete", serde_json::json!({ "group_id": "g" })).await;
+    assert!(resp.status().is_client_error(), "{}", resp.status());
+    // Without coordination access the daemon refuses rather than the adapter failing.
+    let resp =
+        post_json(&ts, "/api/devices/remove", serde_json::json!({ "device_id": "nope" })).await;
+    assert!(resp.status().is_client_error(), "{}", resp.status());
+}
+
+#[tokio::test]
+async fn preserved_items_list_empty_and_actions_validate() {
+    let _guard = TEST_MUTEX.lock().await;
+    let ts = start().await;
+    let list: serde_json::Value = ts
+        .client
+        .get(ts.url("/api/preserved"))
+        .bearer_auth(&ts.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(list["items"].as_array().unwrap().is_empty());
+
+    let resp = post_json(
+        &ts,
+        "/api/preserved/action",
+        serde_json::json!({ "group_id": "g", "item_id": "i", "action": "explode" }),
+    )
+    .await;
+    assert_eq!(resp.status(), 400);
+    let resp = post_json(
+        &ts,
+        "/api/preserved/action",
+        serde_json::json!({ "group_id": "g", "item_id": "missing", "action": "discard" }),
+    )
+    .await;
+    assert!(resp.status().is_client_error(), "{}", resp.status());
+}
+
+#[tokio::test]
+async fn the_device_list_needs_the_account_and_the_token() {
+    let _guard = TEST_MUTEX.lock().await;
+    let ts = start().await;
+    let resp = ts.client.get(ts.url("/api/devices")).send().await.unwrap();
+    assert_eq!(resp.status(), 401);
+    // The test daemon has no coordination service: the daemon says so.
+    let resp = ts.client.get(ts.url("/api/devices")).bearer_auth(&ts.token).send().await.unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("coordination"), "{body}");
+}
+
+#[tokio::test]
+async fn transfers_list_is_refused_without_coordination_not_a_server_error() {
+    let _guard = TEST_MUTEX.lock().await;
+    let ts = start().await;
+    // Track Send needs the coordination plane; the page ignores the refusal and shows no card.
+    let resp = ts.client.get(ts.url("/api/transfers")).bearer_auth(&ts.token).send().await.unwrap();
+    assert!(resp.status().is_client_error(), "{}", resp.status());
+}
+
+#[tokio::test]
+async fn retained_originals_list_empty_and_release_validates() {
+    let _guard = TEST_MUTEX.lock().await;
+    let ts = start().await;
+    let list: serde_json::Value = ts
+        .client
+        .get(ts.url("/api/retained"))
+        .bearer_auth(&ts.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list, serde_json::json!({ "items": [] }));
+    let resp = post_json(&ts, "/api/retained/free", serde_json::json!({ "group_id": "" })).await;
+    assert_eq!(resp.status(), 400);
+    // A group with nothing kept releases nothing, and is not an error.
+    let resp = post_json(&ts, "/api/retained/free", serde_json::json!({ "group_id": "g" })).await;
+    assert!(resp.status().is_success() || resp.status().is_client_error(), "{}", resp.status());
+}
+
+// ---------------------------------------------------------------------
+// Success paths through a real watcher. The daemon crate covers these end
+// to end through its control socket; these cover the adapter in front of it
+// (request validation, the daemon's answer mapped to JSON).
+// ---------------------------------------------------------------------
+
+/// Polls `condition` every 50 ms for up to 30 s.
+async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !condition() {
+        assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn current_size(state: &DaemonState, group: &str, path: &str) -> Option<u64> {
+    use yadorilink_replica_domain::session_state::VersionState;
+    state
+        .replica_coordinator
+        .sqlite()
+        .dag_list_versions(group, path)
+        .unwrap_or_default()
+        .iter()
+        .find(|v| v.state == VersionState::Current && !v.deleted)
+        .map(|v| v.size)
+}
+
+/// Waits until capture has recorded everything on disk at `path`: a current
+/// version of the disk's size and the path no longer journaled dirty.
+async fn wait_recorded(state: &DaemonState, group: &str, folder: &std::path::Path, path: &str) {
+    wait_until(path, || {
+        let dirty = state
+            .replica_coordinator
+            .dirty_path_repository()
+            .is_path_dirty(group, path)
+            .unwrap_or(true);
+        let disk = std::fs::metadata(folder.join(path)).map(|m| m.len()).ok();
+        !dirty && disk.is_some() && current_size(state, group, path) == disk
+    })
+    .await;
+}
+
+/// A watched folder holding `plan.txt` ("mine") and a conflicted copy of it
+/// ("theirs!"), both captured. Returns the folder and the copy's name.
+async fn watched_conflict(ts: &TestServer, group: &str) -> (std::path::PathBuf, &'static str) {
+    const COPY: &str = "plan (conflicted copy, 2026-01-01-000000, device-b).txt";
+    let folder = ts._dir.path().join("watched");
+    std::fs::create_dir_all(&folder).unwrap();
+    yadorilink_daemon::test_support::watch_link(&ts.state, &folder.to_string_lossy(), group);
+    std::fs::write(folder.join("plan.txt"), "mine").unwrap();
+    std::fs::write(folder.join(COPY), "theirs!").unwrap();
+    wait_recorded(&ts.state, group, &folder, "plan.txt").await;
+    wait_recorded(&ts.state, group, &folder, COPY).await;
+    // Events reach the watcher in order, so a file created now is captured only
+    // after the echo of everything written before it: Keep this refuses while
+    // an earlier write is still journaled.
+    std::fs::write(folder.join("barrier.txt"), "b").unwrap();
+    wait_recorded(&ts.state, group, &folder, "barrier.txt").await;
+    (folder, COPY)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resolving_a_conflict_keep_this_replaces_the_original() {
+    let _guard = TEST_MUTEX.lock().await;
+    let ts = start().await;
+    let (folder, copy) = watched_conflict(&ts, "http-keep-this").await;
+    let resp = post_json(
+        &ts,
+        "/api/conflicts/resolve",
+        serde_json::json!({ "path": folder.join(copy), "resolution": "keep_this" }),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["kept_path"], folder.join("plan.txt").to_string_lossy().to_string());
+    assert_eq!(std::fs::read_to_string(folder.join("plan.txt")).unwrap(), "theirs!");
+    assert_eq!(std::fs::read_to_string(folder.join(copy)).unwrap(), "theirs!", "the copy stays");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resolving_a_conflict_keep_both_moves_the_copy_to_its_own_name() {
+    let _guard = TEST_MUTEX.lock().await;
+    let ts = start().await;
+    let (folder, copy) = watched_conflict(&ts, "http-keep-both").await;
+    let resp = post_json(
+        &ts,
+        "/api/conflicts/resolve",
+        serde_json::json!({ "path": folder.join(copy), "resolution": "keep_both" }),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let kept = std::path::PathBuf::from(body["kept_path"].as_str().unwrap());
+    assert_eq!(kept, folder.join("plan (other version).txt"));
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), "theirs!");
+    assert_eq!(std::fs::read_to_string(folder.join("plan.txt")).unwrap(), "mine");
+    assert!(!folder.join(copy).exists(), "the copy moved");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resolving_a_conflict_the_daemon_refuses_answers_its_reason() {
+    let _guard = TEST_MUTEX.lock().await;
+    let ts = start().await;
+    let (folder, copy) = watched_conflict(&ts, "http-keep-refused").await;
+    // Capture of the original is held, so the edit stays unrecorded however long
+    // the request takes: the daemon must refuse, changing nothing.
+    ts.state
+        .replica_coordinator
+        .paused_item_repository()
+        .pause("http-keep-refused", "plan.txt")
+        .unwrap();
+    std::fs::write(folder.join("plan.txt"), "edited after the listing").unwrap();
+    let resp = post_json(
+        &ts,
+        "/api/conflicts/resolve",
+        serde_json::json!({ "path": folder.join(copy), "resolution": "keep_this" }),
+    )
+    .await;
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("not synced yet"), "{body}");
+    assert_eq!(
+        std::fs::read_to_string(folder.join("plan.txt")).unwrap(),
+        "edited after the listing"
+    );
+    assert_eq!(std::fs::read_to_string(folder.join(copy)).unwrap(), "theirs!");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deleted_file_is_listed_in_the_trash_and_restores() {
+    let _guard = TEST_MUTEX.lock().await;
+    let ts = start().await;
+    let group = "http-trash";
+    let folder = ts._dir.path().join("watched");
+    std::fs::create_dir_all(&folder).unwrap();
+    yadorilink_daemon::test_support::watch_link(&ts.state, &folder.to_string_lossy(), group);
+    std::fs::write(folder.join("gone.txt"), "bring me back").unwrap();
+    wait_recorded(&ts.state, group, &folder, "gone.txt").await;
+    std::fs::remove_file(folder.join("gone.txt")).unwrap();
+    wait_until("the delete to be captured", || {
+        current_size(&ts.state, group, "gone.txt").is_none()
+    })
+    .await;
+
+    let trash: serde_json::Value = ts
+        .client
+        .get(ts.url("/api/trash"))
+        .bearer_auth(&ts.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let files = trash["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1, "{trash}");
+    assert_eq!(files[0]["path"], "gone.txt");
+    let absolute = files[0]["absolute_path"].as_str().unwrap().to_string();
+    assert_eq!(absolute, folder.join("gone.txt").to_string_lossy().to_string());
+
+    let resp = post_json(
+        &ts,
+        "/api/trash/restore",
+        serde_json::json!({ "path": absolute, "whole_operation": false }),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    wait_until("the file to be back", || folder.join("gone.txt").exists()).await;
+    assert_eq!(std::fs::read_to_string(folder.join("gone.txt")).unwrap(), "bring me back");
+}
+
+// --- the account-level success paths, over a stand-in coordination plane ---
+
+async fn plane(ts: &TestServer) -> wiremock::MockServer {
+    let server = wiremock::MockServer::start().await;
+    yadorilink_daemon::test_support::use_coordination(&ts.state, &server.uri());
+    server
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_device_list_and_the_folder_members_come_from_the_account() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let _guard = TEST_MUTEX.lock().await;
+    let ts = start().await;
+    let plane = plane(&ts).await;
+    Mock::given(method("GET"))
+        .and(path("/devices"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "devices": [
+            { "deviceId": "device-under-test", "deviceName": "NAS", "online": false,
+              "signingPublicKeyBase64": "", "signedOut": false },
+            { "deviceId": "laptop", "deviceName": "Laptop", "online": true,
+              "signingPublicKeyBase64": "", "signedOut": false },
+            { "deviceId": "old", "deviceName": "Old", "online": false,
+              "signingPublicKeyBase64": "", "signedOut": true },
+        ] })))
+        .mount(&plane)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/shares"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "edges": [
+            { "edgeId": "e1", "groupId": "g1", "deviceId": "laptop", "state": "active" },
+            { "edgeId": "e2", "groupId": "g1", "deviceId": "phone", "state": "pending_approval" },
+        ] })))
+        .mount(&plane)
+        .await;
+
+    let devices: serde_json::Value = ts
+        .client
+        .get(ts.url("/api/devices"))
+        .bearer_auth(&ts.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = devices["devices"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "a signed-out device is not listed: {devices}");
+    assert_eq!(rows[0]["device_name"], "NAS");
+    assert_eq!(rows[0]["is_this_device"], true);
+    assert_eq!(rows[0]["online"], true, "this device is always shown online");
+    assert_eq!(rows[1]["device_id"], "laptop");
+    assert_eq!(rows[1]["is_this_device"], false);
+
+    let shares: serde_json::Value = ts
+        .client
+        .get(ts.url("/api/shares"))
+        .bearer_auth(&ts.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let edges = shares["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 2, "{shares}");
+    assert_eq!(edges[1]["state"], "pending_approval");
+    assert_eq!(edges[0]["device_id"], "laptop");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invite_is_minted_and_its_code_returned() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let _guard = TEST_MUTEX.lock().await;
+    let ts = start().await;
+    let plane = plane(&ts).await;
+    Mock::given(method("POST"))
+        .and(path("/shares/groups/g1/invites"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": "ABC-123", "inviteId": "i1", "groupId": "g1", "role": "viewer",
+            "expiresAtUnix": 4102444800i64, "requiresApproval": true,
+        })))
+        .mount(&plane)
+        .await;
+    let resp = post_json(
+        &ts,
+        "/api/share/invite",
+        serde_json::json!({ "group_id": "g1", "role": "viewer", "requires_approval": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "ABC-123");
+    assert_eq!(body["requires_approval"], true);
+    let sent = plane.received_requests().await.unwrap();
+    let sent: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+    assert_eq!(sent["role"], "viewer");
+    assert_eq!(sent["mintingDeviceId"], "device-under-test");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_folder_group_reaches_the_plane_and_a_refusal_comes_back_verbatim() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let _guard = TEST_MUTEX.lock().await;
+    let ts = start().await;
+    let plane = plane(&ts).await;
+    Mock::given(method("DELETE"))
+        .and(path("/shares/groups/g-ok"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&plane)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/shares/groups/g-shared"))
+        .respond_with(
+            ResponseTemplate::new(409).set_body_string("acknowledge cross-account members"),
+        )
+        .mount(&plane)
+        .await;
+    let resp = post_json(&ts, "/api/share/delete", serde_json::json!({ "group_id": "g-ok" })).await;
+    assert_eq!(resp.status(), 200);
+    let resp =
+        post_json(&ts, "/api/share/delete", serde_json::json!({ "group_id": "g-shared" })).await;
+    assert!(resp.status().is_client_error(), "{}", resp.status());
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("acknowledge cross-account members"),
+        "{body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_a_device_that_holds_no_folder_alone_commits_and_answers_ok() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let _guard = TEST_MUTEX.lock().await;
+    let ts = start().await;
+    let plane = plane(&ts).await;
+    // The device is the only complete copy of no folder, so nothing needs handing off.
+    Mock::given(method("GET"))
+        .and(path("/devices/laptop/eager-groups"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "groupIds": [] })),
+        )
+        .mount(&plane)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/devices/laptop"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&plane)
+        .await;
+    let resp =
+        post_json(&ts, "/api/devices/remove", serde_json::json!({ "device_id": "laptop" })).await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body, serde_json::json!({ "ok": true, "handoffs": [] }));
+    let removed = plane
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.method.as_str() == "DELETE")
+        .count();
+    assert_eq!(removed, 1, "the plane was asked to remove the device once");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revoke_that_would_leave_the_member_s_data_without_another_copy_is_refused() {
+    use wiremock::matchers::any;
+    use wiremock::{Mock, ResponseTemplate};
+    let _guard = TEST_MUTEX.lock().await;
+    let ts = start().await;
+    let plane = plane(&ts).await;
+    Mock::given(any()).respond_with(ResponseTemplate::new(404)).mount(&plane).await;
+    let resp = post_json(
+        &ts,
+        "/api/share/revoke",
+        serde_json::json!({ "group_id": "g1", "device_id": "laptop" }),
+    )
+    .await;
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("another complete copy is not ready"),
+        "{body}"
+    );
+    let revoked = plane
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|r| r.url.path().ends_with("/revoke") || r.method.as_str() == "DELETE");
+    assert!(!revoked, "nothing was committed on the plane");
 }

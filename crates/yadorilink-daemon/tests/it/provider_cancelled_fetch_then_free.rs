@@ -23,7 +23,8 @@ use std::time::{Duration, SystemTime};
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::test_support::provider_evict_harness::{
-    materialize_temp, materialize_temp_resumed, HostReply, ProviderEvictHarness, RangedOutcome,
+    materialize_temp, materialize_temp_abandoned_at, materialize_temp_resumed, HostReply,
+    ProviderEvictHarness, RangedOutcome,
 };
 use yadorilink_local_storage::{
     BlockStore, ContentHash, GcReport, LocallyHashedBlock, SegmentBlockStore, StorageError,
@@ -212,7 +213,22 @@ struct Device {
 }
 
 impl Device {
+    /// A device with the engine's defaults.
     fn new(id: &'static str, policy: MaterializationPolicy) -> Device {
+        Device::with_tuning(id, policy, None)
+    }
+
+    /// A device whose fetched blocks go through the block store: how a Windows device receives,
+    /// and how any device receives an item that is pinned.
+    fn store_first(id: &'static str, policy: MaterializationPolicy) -> Device {
+        Device::with_tuning(id, policy, Some(support::store_first_tuning()))
+    }
+
+    fn with_tuning(
+        id: &'static str,
+        policy: MaterializationPolicy,
+        tuning: Option<yadorilink_daemon::engine_tuning::EngineTuning>,
+    ) -> Device {
         support::ensure_isolated_config_dir();
         let store_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(HoldingStore {
@@ -225,9 +241,13 @@ impl Device {
             writes_in_flight: std::sync::atomic::AtomicUsize::new(0),
         });
         let index_dir = tempfile::tempdir().unwrap();
-        let coordinator = yadorilink_daemon::replica_coordinator::ReplicaCoordinator::open(
-            index_dir.path().join("index.db"),
-        )
+        let index_path = index_dir.path().join("index.db");
+        let coordinator = match tuning {
+            Some(tuning) => yadorilink_daemon::replica_coordinator::ReplicaCoordinator::open_with(
+                index_path, tuning,
+            ),
+            None => yadorilink_daemon::replica_coordinator::ReplicaCoordinator::open(index_path),
+        }
         .unwrap();
         let state =
             support::fast_daemon_state(id.to_string(), Arc::new(coordinator), store.clone());
@@ -310,6 +330,9 @@ enum CancelAt {
     BlockStore,
     /// While the verified blocks are being read into the staging file.
     Assembly,
+    /// While the file is being written as its blocks arrive (a device that receives in place).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Arriving,
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -324,9 +347,19 @@ async fn a_fetch_cancelled_while_assembling_does_not_block_freeing_or_fetching_o
     cancel_then_free(CancelAt::Assembly).await;
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fetch_cancelled_while_its_file_is_being_written_does_not_block_freeing_or_fetching_other_files(
+) {
+    cancel_then_free(CancelAt::Arriving).await;
+}
+
 async fn cancel_then_free(at: CancelAt) {
     let a = Device::new("device-a", MaterializationPolicy::Eager);
-    let b = Device::new("device-b", MaterializationPolicy::OnDemand);
+    let b = match at {
+        CancelAt::Arriving => Device::new("device-b", MaterializationPolicy::OnDemand),
+        _ => Device::store_first("device-b", MaterializationPolicy::OnDemand),
+    };
     a.start();
     b.start();
     let (_handles, _link) = support::connect_two_daemons_with_link(
@@ -369,23 +402,31 @@ async fn cancel_then_free(at: CancelAt) {
     assert_eq!(staged(&b.state, "small-0.bin", out.path(), "s0").await, small[0]);
     host.host_holds(items[0]);
 
-    // The large fetch is cancelled while one of its blocks is being stored.
-    b.store.arm(matches!(at, CancelAt::Assembly));
-    let cancelled = {
-        let (state, path) = (b.state.clone(), out.path().join("big-cancelled"));
-        tokio::spawn(async move {
-            let _ = materialize_temp(&state, GROUP, "big.bin", &path, None, None).await;
-        })
-    };
-    support::wait_until_with_context(
-        || b.store.reached(),
-        Duration::from_secs(60),
-        || "the large fetch never reached the cancel point".into(),
-    )
-    .await;
-    cancelled.abort();
-    let _ = cancelled.await;
-    b.store.release();
+    // The large fetch is cancelled in the middle of its transfer.
+    if matches!(at, CancelAt::Arriving) {
+        assert!(
+            materialize_temp_abandoned_at(&b.state, GROUP, "big.bin", &out.path().join("big-x"), 5)
+                .await,
+            "the fetch finished before it could be cancelled"
+        );
+    } else {
+        b.store.arm(matches!(at, CancelAt::Assembly));
+        let cancelled = {
+            let (state, path) = (b.state.clone(), out.path().join("big-cancelled"));
+            tokio::spawn(async move {
+                let _ = materialize_temp(&state, GROUP, "big.bin", &path, None, None).await;
+            })
+        };
+        support::wait_until_with_context(
+            || b.store.reached(),
+            Duration::from_secs(60),
+            || "the large fetch never reached the cancel point".into(),
+        )
+        .await;
+        cancelled.abort();
+        let _ = cancelled.await;
+        b.store.release();
+    }
 
     // Freeing the other file frees its blocks.
     host.reply_next(HostReply::Evicted);
@@ -427,7 +468,7 @@ async fn cancel_then_free(at: CancelAt) {
 #[cfg_attr(windows, ignore = "block reclaim is retain-only on Windows")]
 async fn a_reissued_fetch_resumes_after_the_blocks_an_interrupted_one_stored() {
     let a = Device::new("device-a", MaterializationPolicy::Eager);
-    let b = Device::new("device-b", MaterializationPolicy::OnDemand);
+    let b = Device::store_first("device-b", MaterializationPolicy::OnDemand);
     a.start();
     b.start();
     let (_handles, _link) = support::connect_two_daemons_with_link(
@@ -508,4 +549,107 @@ async fn a_reissued_fetch_resumes_after_the_blocks_an_interrupted_one_stored() {
         materialize_temp_resumed(&b.state, GROUP, "big.bin", &out.path().join("third")).await;
     assert!(matches!(third.expect("the third fetch"), RangedOutcome::Assembled { .. }));
     assert_eq!(resumed, Some(big.len() as u64));
+}
+
+/// Two connected devices: A (a full replica) holds `name`, B (on demand) has adopted it.
+#[cfg_attr(not(unix), allow(dead_code))]
+async fn pair_holding(
+    b: Device,
+    name: &str,
+    bytes: &[u8],
+) -> (Device, Device, impl Sized, impl Sized) {
+    let a = Device::new("device-a", MaterializationPolicy::Eager);
+    a.start();
+    b.start();
+    let (handles, link) = support::connect_two_daemons_with_link(
+        &a.state,
+        a.id,
+        &b.state,
+        b.id,
+        std::slice::from_ref(&GROUP.to_string()),
+    )
+    .await;
+    b.state.authority.set_peer_group_full_replica(a.id, GROUP, true);
+    b.state.install_p2p_custody_confirmer();
+    let staging = tempfile::tempdir_in(a.root.path().parent().unwrap()).unwrap();
+    std::fs::write(staging.path().join(name), bytes).unwrap();
+    std::fs::rename(staging.path().join(name), a.root.path().join(name)).unwrap();
+    support::wait_until_with_context(
+        || b.indexed_size(name) == Some(bytes.len() as u64),
+        Duration::from_secs(120),
+        || "device B never adopted the file".into(),
+    )
+    .await;
+    b.controller.stop(&b.local_path()).await;
+    (a, b, handles, link)
+}
+
+/// A large file a device that receives in place fetches for the provider is written into its
+/// staging file as its blocks arrive: the bytes are right and the block store never holds them.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_large_provider_fetch_is_written_into_its_staging_file_and_not_into_the_store() {
+    let big = content(21, 24 * MIB);
+    let b = Device::new("device-b", MaterializationPolicy::OnDemand);
+    let (_a, b, _handles, _link) = pair_holding(b, "big.bin", &big).await;
+    let _host = ProviderEvictHarness::declare(&b.state, GROUP);
+    let out = tempfile::tempdir().unwrap();
+
+    assert!(staged(&b.state, "big.bin", out.path(), "big").await == big, "the bytes differ");
+    assert_eq!(b.held_blocks("big.bin"), 0, "a received file must not be copied into the store");
+    let leftovers = std::fs::read_dir(out.path()).unwrap().count();
+    assert_eq!(leftovers, 1, "only the assembled file is left in the staging directory");
+}
+
+/// An item the user pinned keeps its versions in the store, whichever way the device receives.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pinned_item_is_fetched_into_the_store_by_a_device_that_receives_in_place() {
+    let big = content(22, 24 * MIB);
+    let b = Device::new("device-b", MaterializationPolicy::OnDemand);
+    let (_a, b, _handles, _link) = pair_holding(b, "big.bin", &big).await;
+    let _host = ProviderEvictHarness::declare(&b.state, GROUP);
+    b.state.replica_coordinator.retention_rules().pin(GROUP, "big.bin").unwrap();
+    let out = tempfile::tempdir().unwrap();
+
+    assert!(staged(&b.state, "big.bin", out.path(), "big").await == big, "the bytes differ");
+    let record = b
+        .state
+        .replica_coordinator
+        .file_index_repository()
+        .get_file(GROUP, "big.bin")
+        .unwrap()
+        .unwrap();
+    assert_eq!(b.held_blocks("big.bin"), record.blocks.len(), "every block is in the store");
+}
+
+/// A fetch of a file being written in place that ends before the file is whole keeps the blocks it
+/// wrote for the next attempt of the same version in this process: the next one starts after them
+/// and fetches no more than the rest.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interrupted_provider_fetch_resumes_after_the_blocks_it_wrote_into_its_file() {
+    let big = content(23, 64 * MIB);
+    let b = Device::new("device-b", MaterializationPolicy::OnDemand);
+    let (_a, b, _handles, _link) = pair_holding(b, "big.bin", &big).await;
+    let _host = ProviderEvictHarness::declare(&b.state, GROUP);
+    let out = tempfile::tempdir().unwrap();
+
+    assert!(
+        materialize_temp_abandoned_at(&b.state, GROUP, "big.bin", &out.path().join("first"), 5)
+            .await,
+        "the fetch finished before it could be interrupted"
+    );
+    let (second, resumed) =
+        materialize_temp_resumed(&b.state, GROUP, "big.bin", &out.path().join("second")).await;
+    let RangedOutcome::Assembled { file, .. } = second.expect("the resumed fetch") else {
+        panic!("not assembled")
+    };
+    assert!(std::fs::read(file).unwrap() == big, "the resumed file differs");
+    let resumed = resumed.expect("the attempt knew what it had to fetch");
+    assert!(resumed > 0, "the blocks the first attempt wrote were counted");
+    assert!(resumed < big.len() as u64, "the interrupted attempt did not finish the file");
+    assert_eq!(b.held_blocks("big.bin"), 0, "nothing of the file was put into the store");
+    let leftovers = std::fs::read_dir(out.path()).unwrap().count();
+    assert_eq!(leftovers, 1, "the first attempt's file became the second's, nothing else is left");
 }

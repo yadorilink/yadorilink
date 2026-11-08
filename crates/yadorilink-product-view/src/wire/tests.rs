@@ -17,6 +17,7 @@ fn full() -> ProductStatusSummary {
             reachable_device_ids: vec!["a".into()],
             offline_device_ids: vec!["b".into()],
             update_required_device_ids: vec!["c".into()],
+            newer_peer_device_ids: vec!["c".into()],
         },
         protection: ProtectionSummary {
             protection: Protection::Pending,

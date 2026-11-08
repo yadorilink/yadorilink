@@ -183,7 +183,10 @@ async fn a_keeper_that_finds_another_session_standing_takes_over_once_it_goes() 
         .expect("a session can be opened in the keeper's place");
 
     // End the connection: the keeper reconnects, and finds that session.
-    alice_stack.link_to(BOB).await.expect("the live link").close();
+    // Every connection to Bob goes, not just the current one: the keeper's session may be on
+    // the other of two links a crossed dial left (the kept one is current), and a restart
+    // ends them all.
+    alice_stack.endpoint().drop_links(BOB);
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert!(
         pair.alice.peers.session(BOB).is_some_and(|current| Arc::ptr_eq(&current, &standing)),
@@ -420,7 +423,10 @@ async fn cannot_fetch_now_clears_within_seconds_of_the_session_returning_after_a
     );
     assert!(pair.alice.peers.remove_if_current(BOB, &old));
     let alice_stack = pair.alice.peer_session_driver().unwrap().stack().clone();
-    alice_stack.link_to(BOB).await.expect("the live link").close();
+    // Every connection to Bob goes, not just the current one: the keeper's session may be on
+    // the other of two links a crossed dial left (the kept one is current), and a restart
+    // ends them all.
+    alice_stack.endpoint().drop_links(BOB);
     assert!(
         within(Duration::from_secs(60), || {
             fetch_availability(&pair.alice)
@@ -430,4 +436,101 @@ async fn cannot_fetch_now_clears_within_seconds_of_the_session_returning_after_a
         "'fetch not confirmed' must clear without waiting for the 90 s sweep"
     );
     drop(roots);
+}
+
+/// A peer's session is the peer's, not one link's: when the connection it opened on closes while
+/// another live link to the peer is held (a crossed dial leaves two), the same session carries on
+/// instead of being torn down and rebuilt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_survives_the_loss_of_its_link_while_another_link_is_live() {
+    let pair = pair(true).await;
+    assert!(
+        within(STEP, || pair.alice.peers.has_session(BOB) && pair.bob.peers.has_session(ALICE))
+            .await,
+        "precondition"
+    );
+    let session = pair.alice.peers.session(BOB).expect("alice's session");
+    let alice_stack = pair.alice.peer_session_driver().unwrap().stack().clone();
+    let bob_stack = pair.bob.peer_session_driver().unwrap().stack().clone();
+    // Whichever of these the session opened on, it is among them.
+    let originals = alice_stack.endpoint().links.live_links_for_tests(BOB);
+    assert!(!originals.is_empty());
+
+    // Bob opens a second connection to Alice: the pair now holds two.
+    let alice_id = bob_stack.endpoint().peer_id_of(ALICE).expect("bob pins alice");
+    let second = bob_stack.runtime_for_tests().connect(alice_id).await.expect("a second dial");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    for link in &originals {
+        link.close();
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let after = pair.alice.peers.session(BOB).expect("alice still has a session for bob");
+    assert!(Arc::ptr_eq(&session, &after), "the session was rebuilt instead of carried on");
+    assert!(second.is_alive());
+}
+
+/// A keeper that has failed for a while is sleeping a backoff of seconds. A person asking for
+/// content from a peer that has no session ends that wait: the session comes in far less than
+/// the rest of the backoff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_for_content_ends_the_keepers_backoff() {
+    let (alice, _alice_dir) = device(ALICE, 11);
+    let (bob, _bob_dir) = device(BOB, 22);
+    pin(&alice, BOB, 22);
+    pin(&bob, ALICE, 11);
+    let alice_stack = Arc::new(
+        SyncStack::spawn(alice.clone(), NetworkConfig::direct_only())
+            .await
+            .expect("alice's stack starts"),
+    );
+    let bob_stack = Arc::new(
+        SyncStack::spawn(bob.clone(), NetworkConfig::direct_only())
+            .await
+            .expect("bob's stack starts"),
+    );
+    SyncStack::teach_each_other_for_tests(&alice_stack, &bob_stack);
+    // Every dial fails at first, on both sides, so only the keepers' own timing is under test.
+    let fail = std::sync::atomic::Ordering::SeqCst;
+    alice_stack.dials_fail.store(true, fail);
+    bob_stack.dials_fail.store(true, fail);
+    alice.install_peer_session_driver(PeerSessionDriver::start(alice.clone(), alice_stack.clone()));
+    bob.install_peer_session_driver(PeerSessionDriver::start(bob.clone(), bob_stack.clone()));
+
+    // Backoffs of 1, 2 and 4 s have passed: the keeper now sleeps 8 s.
+    assert!(
+        !within(Duration::from_secs(8), || alice.peers.has_session(BOB)).await,
+        "no session may form while every dial fails"
+    );
+    alice_stack.dials_fail.store(false, fail);
+    bob_stack.dials_fail.store(false, fail);
+    alice.peers.demand_connections(GROUP);
+    assert!(
+        within(Duration::from_secs(3), || alice.peers.has_session(BOB)).await,
+        "a request for content must not wait out the backoff"
+    );
+}
+
+/// A request for a folder wakes the keepers of the peers that share it, and only those.
+#[tokio::test(start_paused = true)]
+async fn a_wake_is_for_the_peers_of_the_folder_asked_for() {
+    let (alice, _dir) = device(ALICE, 11);
+    pin(&alice, BOB, 22);
+    let mut demand = alice.peers.subscribe_to_demand();
+    let groups = || Some(alice.authority.authorized_groups_for_peer(BOB));
+
+    // Another folder: the keeper for BOB stays asleep, however often it is asked.
+    alice.peers.demand_connections("other-folder");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), demand.wanted(groups)).await.is_err(),
+        "a request for another folder is no reason to dial this peer"
+    );
+
+    // The folder BOB shares, asked for inside the window: held, then sent.
+    alice.peers.demand_connections(GROUP);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), demand.wanted(groups)).await.is_ok(),
+        "a request for the folder wakes the keeper once the window ends"
+    );
 }

@@ -236,11 +236,7 @@ fn version_is_protected(
     group_id: &str,
     path: &str,
 ) -> Result<bool, SyncSqliteError> {
-    let pinned: Vec<String> = tx
-        .prepare_cached("SELECT path FROM pinned_items WHERE group_id = ?1")?
-        .query_map([group_id], |r| r.get::<_, String>(0))?
-        .collect::<Result<_, _>>()?;
-    if crate::pinned_items::path_is_covered(&pinned, path) {
+    if crate::retention_rules::read_rules(tx, group_id)?.is_kept(path) {
         return Ok(true);
     }
     let now_unix_seconds = std::time::SystemTime::now()
@@ -557,11 +553,11 @@ mod tests {
         let (a, b, c) = (skipped(&db, "a"), skipped(&db, "b"), skipped(&db, "dir/c"));
         db.write_immediate::<_, SyncSqliteError>(|tx| {
             tx.execute(
-                "INSERT INTO pinned_items (group_id, path, pinned_at_unix_nanos) VALUES (?1, 'a', 0)",
+                "INSERT INTO retention_rules (group_id, path, rule, generation, set_at_unix_nanos) VALUES (?1, 'a', 'keep', 1, 0)",
                 [GROUP],
             )?;
             tx.execute(
-                "INSERT INTO pinned_items (group_id, path, pinned_at_unix_nanos) VALUES (?1, 'dir', 0)",
+                "INSERT INTO retention_rules (group_id, path, rule, generation, set_at_unix_nanos) VALUES (?1, 'dir', 'keep', 1, 0)",
                 [GROUP],
             )?;
             let now = std::time::SystemTime::now()

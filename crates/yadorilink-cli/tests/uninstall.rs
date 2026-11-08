@@ -32,7 +32,7 @@ fn another_channels_install_is_refused_with_its_own_uninstall_steps() {
     let before = listing(dir.path());
     let out = uninstall(dir.path(), &["--yes", "--purge-data"]);
     assert_eq!(out.status.code(), Some(19));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("brew uninstall --cask yadorilink"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("brew uninstall yadorilink"));
     assert_eq!(listing(dir.path()), before);
 }
 

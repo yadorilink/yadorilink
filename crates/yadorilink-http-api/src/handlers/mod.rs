@@ -79,7 +79,9 @@ pub fn link_status_json(l: &LinkStatus) -> Value {
     value["waiting_for_disk_space"] = json!(l.waiting_for_disk_space);
     value["degraded_cause"] = json!(l.degraded_cause().as_str_name());
     value["pending_approvals"] = json!(l.pending_approvals);
+    value["pending_local_changes"] = json!(l.pending_local_changes);
     value["reclaimable_bytes"] = json!(l.reclaimable_bytes);
+    value["availability_newer_peer_device_ids"] = json!(l.availability_newer_peer_device_ids);
     value["unreadable_files"] = l
         .unreadable_files
         .iter()
@@ -107,4 +109,15 @@ pub fn local_state_json(s: Option<&LocalState>) -> Value {
         "current_content_present": s.is_some_and(|s| s.current_content_present),
         "word": yadorilink_ipc_proto::daemonctl::local_state_word(s),
     })
+}
+
+#[cfg(test)]
+mod pending_changes_tests {
+    use super::*;
+
+    #[test]
+    fn a_link_reports_the_changes_no_other_device_holds_yet() {
+        let link = LinkStatus { pending_local_changes: 3, ..Default::default() };
+        assert_eq!(link_status_json(&link)["pending_local_changes"], 3);
+    }
 }

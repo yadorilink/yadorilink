@@ -32,6 +32,7 @@ use crate::daemon_state::{
 };
 use crate::maintenance::degraded_link_recheck::DegradedLinkRecheckJob;
 use crate::maintenance::disk_reconcile_backstop::DiskReconcileBackstopJob;
+use crate::maintenance::drift_detector::DriftDetectorJob;
 use crate::maintenance::durability_confirmation::DurabilityConfirmationJob;
 use crate::maintenance::gc_idle::GcIdleJob;
 use crate::maintenance::link_volume::LinkVolumeJob;
@@ -202,8 +203,8 @@ pub(crate) fn start(
             move || crate::convergence::engine::run(convergence_engine.clone()),
         );
     }
-    // A dedicated, short-interval poll for every currently-Degraded
-    // link whose backoff window has elapsed. The whole point of
+    // A dedicated re-check of every currently-Degraded link whose backoff
+    // window has elapsed, run when one is due (not on a fixed poll). The whole point of
     // `BackoffConfig::DEGRADED_LINK_RECHECK`'s 5s *initial* interval is
     // a link that degrades and recovers quickly getting checked again
     // promptly, so this must not be folded into a slower housekeeping
@@ -212,7 +213,7 @@ pub(crate) fn start(
         let degraded_link_recheck_job = DegradedLinkRecheckJob::new(controller.clone());
         supervise::spawn_logged("daemon-state-degraded-link-recheck", async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                degraded_link_recheck_job.wait_until_due().await;
                 degraded_link_recheck_job.run_once();
             }
         });
@@ -385,6 +386,9 @@ pub(crate) fn start(
             }
         });
     }
+    // The slow drift check under the watcher (modify/delete/re-create of an indexed file that no
+    // event reported); off when YADORILINK_DRIFT_RESCAN_INTERVAL_SECS is 0.
+    spawn_drift_detector(controller.clone(), state.tuning().drift_rescan_interval);
     // Publishes the native deltas a refused checkpoint flush left pending; idle until a
     // flush is refused (see `maintenance::publication_retry`).
     {
@@ -406,6 +410,20 @@ pub(crate) fn start(
         });
     }
     recovery_job
+}
+
+/// Starts the drift check's loop (see `maintenance::drift_detector`); nothing when it is switched off.
+fn spawn_drift_detector(
+    controller: Arc<LinkRuntimeController>,
+    interval: Option<std::time::Duration>,
+) {
+    let Some(job) = DriftDetectorJob::new(controller, interval) else { return };
+    supervise::spawn_logged("daemon-state-drift-detector", async move {
+        loop {
+            tokio::time::sleep(crate::maintenance::drift_detector::TICK).await;
+            job.run_once().await;
+        }
+    });
 }
 
 /// Runs one role-loss reconciliation pass through the same service the

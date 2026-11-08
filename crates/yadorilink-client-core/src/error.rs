@@ -15,8 +15,9 @@ pub enum LimitKind {
     /// A per-account quota (`quota_exceeded`): remove something first, or
     /// ask an operator to raise the ceiling.
     Quota,
-    /// An abuse budget (`rate_limited`): wait and retry.
-    RateLimited,
+    /// An abuse budget (`rate_limited`): wait and retry. `retry_after_secs` is the service's own
+    /// wait when it gave one.
+    RateLimited { retry_after_secs: Option<u64> },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -139,6 +140,8 @@ pub enum CoreError {
         message: String,
         group_ids: Vec<String>,
         operation_id: Option<String>,
+        /// Set with `ApplicationErrorCode::UnsupportedDrive`.
+        drive: Option<UnsupportedDrive>,
     },
 
     /// The operation would leave a folder group without a confirmed-ready
@@ -301,6 +304,8 @@ pub enum Hint {
     AlreadyEnrolled,
     /// A sign-in did not arrive in time: start it again.
     SignInAgain,
+    /// Signed in, but this computer is not registered as a device yet: register it.
+    RegisterDevice,
     /// No folder group of that name is visible: create one or accept an invitation to one.
     CreateOrAcceptShare,
     /// No joinable folder group of that name: list what the account can join.
@@ -449,6 +454,7 @@ impl CoreError {
             message: error.message,
             group_ids: error.group_ids,
             operation_id: (!error.operation_id.is_empty()).then_some(error.operation_id),
+            drive: UnsupportedDrive::from_wire(error.drive_reason, error.file_system),
         }
     }
 
@@ -496,7 +502,9 @@ impl From<yadorilink_fapi_client::Error> for CoreError {
                     None => "Too many attempts from this network; wait a minute and try again"
                         .to_owned(),
                 },
-                kind: LimitKind::RateLimited,
+                kind: LimitKind::RateLimited {
+                    retry_after_secs: retry_after.map(|wait| wait.as_secs().max(1)),
+                },
             },
             FapiError::Response { status: 429 | 500..=599, .. } => {
                 CoreError::CoordinationPlaneUnreachable(e.to_string())
@@ -608,7 +616,11 @@ pub enum DaemonUnavailableReason {
 #[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
 pub enum NetworkErrorKind {
     Unreachable,
-    RateLimited,
+    /// The service's abuse budget refused the request: wait, then retry. `retry_after_secs` is
+    /// the service's own wait when it gave one; apps show it and never parse `message`.
+    RateLimited {
+        retry_after_secs: Option<u64>,
+    },
     /// A create or join whose activation could not be confirmed; the daemon
     /// settles it on its own.
     ActivationPendingReconciliation,
@@ -635,6 +647,43 @@ pub enum PermissionDeniedReason {
     /// again as this installation (the step-up sign-in; the browser shows the consent screen);
     /// the installation, its device and its folders are kept and work again afterwards.
     TermsConsentRequired,
+}
+
+/// Why a drive cannot be synced into yet (`DesktopError::UnsupportedDrive`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum UnsupportedDriveReason {
+    /// ReFS, including a Dev Drive.
+    Refs,
+    ExFat,
+    /// FAT or FAT32.
+    Fat,
+    /// A network share or a removable drive.
+    NotLocalFixed,
+    /// Any other file system; the error's `file_system` names it.
+    Other,
+}
+
+/// The drive of an unsupported-drive refusal: the machine reason and the file system's name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnsupportedDrive {
+    pub reason: UnsupportedDriveReason,
+    pub file_system: String,
+}
+
+impl UnsupportedDrive {
+    fn from_wire(reason: i32, file_system: String) -> Option<Self> {
+        use yadorilink_ipc_proto::daemonctl::UnsupportedDriveReason as Wire;
+        let reason = match Wire::try_from(reason).unwrap_or(Wire::Unspecified) {
+            Wire::Unspecified => return None,
+            Wire::Refs => UnsupportedDriveReason::Refs,
+            Wire::Exfat => UnsupportedDriveReason::ExFat,
+            Wire::Fat => UnsupportedDriveReason::Fat,
+            Wire::NotLocalFixed => UnsupportedDriveReason::NotLocalFixed,
+            Wire::Other => UnsupportedDriveReason::Other,
+        };
+        Some(Self { reason, file_system })
+    }
 }
 
 /// What a daemon refusal of a link or an invite acceptance says, for a front
@@ -723,6 +772,11 @@ pub enum RefusalReason {
     PrimaryTransferConflict,
     /// No such folder or offer for this account.
     PrimaryTransferNotFound,
+    /// The list of files in a Send link does not open with the link's code (altered, or sealed
+    /// for another link), so it is not shown. The link itself is still valid and can be redeemed;
+    /// say that the list could not be verified. Declared last so the other reasons keep their
+    /// wire order.
+    SendPreviewUnverified,
 }
 
 /// The one error a desktop front end sees. Eight cases, each with a typed
@@ -757,6 +811,11 @@ pub enum DesktopError {
     /// `reason`. Declared last so the other cases keep their wire order.
     #[error("{message}")]
     Refused { message: String, reason: RefusalReason },
+    /// A folder was refused because its drive cannot be synced into yet. `message` is the
+    /// English sentence (command line, logs); a front end words `reason` (and `file_system` for
+    /// `Other`) in its own language. Declared last, like `Refused`.
+    #[error("{message}")]
+    UnsupportedDrive { message: String, reason: UnsupportedDriveReason, file_system: String },
 }
 
 impl DesktopError {
@@ -791,9 +850,12 @@ impl DesktopError {
             CoreError::CoordinationPlaneUnreachable(_) => {
                 DesktopError::Network { message, kind: NetworkErrorKind::Unreachable }
             }
-            CoreError::LimitExceeded { kind: LimitKind::RateLimited, .. } => {
-                DesktopError::Network { message, kind: NetworkErrorKind::RateLimited }
-            }
+            CoreError::LimitExceeded {
+                kind: LimitKind::RateLimited { retry_after_secs }, ..
+            } => DesktopError::Network {
+                message,
+                kind: NetworkErrorKind::RateLimited { retry_after_secs },
+            },
             CoreError::LimitExceeded { kind: LimitKind::Quota, .. } => {
                 denied(message, PermissionDeniedReason::QuotaExceeded)
             }
@@ -858,8 +920,8 @@ impl DesktopError {
             CoreError::InvalidArgument(argument) => {
                 DesktopError::InvalidInput { message, field: Some(argument.field().to_owned()) }
             }
-            CoreError::DaemonCommand { code, group_ids, operation_id, .. } => {
-                from_command(code, message, group_ids, operation_id, can_force)
+            CoreError::DaemonCommand { code, group_ids, operation_id, drive, .. } => {
+                from_command(code, message, group_ids, operation_id, drive, can_force)
             }
             CoreError::EngineMismatch { detail, .. } => DesktopError::DaemonUnavailable {
                 message,
@@ -919,10 +981,18 @@ fn from_command(
     message: String,
     group_ids: Vec<String>,
     operation_id: Option<String>,
+    drive: Option<UnsupportedDrive>,
     can_force: bool,
 ) -> DesktopError {
     use ApplicationErrorCode as Code;
     match code {
+        Code::UnsupportedDrive => match drive {
+            Some(UnsupportedDrive { reason, file_system }) => {
+                DesktopError::UnsupportedDrive { message, reason, file_system }
+            }
+            // A daemon that named no reason is still a refused path.
+            None => DesktopError::Refused { message, reason: RefusalReason::PathNotAllowed },
+        },
         // The daemon has no local identity: this device was never registered,
         // and setup is where that is fixed.
         Code::LocalIdentityUnavailable => DesktopError::NotSignedIn { message },
@@ -977,6 +1047,9 @@ fn from_command(
         }
         Code::SendLinksDisabled => {
             DesktopError::Refused { message, reason: RefusalReason::SendLinksDisabled }
+        }
+        Code::SendPreviewUnverified => {
+            DesktopError::Refused { message, reason: RefusalReason::SendPreviewUnverified }
         }
         Code::SendLocalNetworkBlocked => {
             DesktopError::Refused { message, reason: RefusalReason::SendLocalNetworkBlocked }

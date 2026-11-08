@@ -125,7 +125,7 @@ fn scripted_session(
 ) -> (Arc<LoginSession>, tokio::sync::oneshot::Sender<()>) {
     let (release_write, gate) = tokio::sync::oneshot::channel::<()>();
     let inner = core::session::LoginSession::with_flow(
-        LoginOptions { flow: LoginFlow::Loopback, overall_timeout: None },
+        LoginOptions { flow: LoginFlow::Loopback, overall_timeout: None, device_name: None },
         Box::new(|| Ok(())),
         Box::new(move |sink| {
             Box::pin(async move {

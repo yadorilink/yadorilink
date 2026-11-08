@@ -95,8 +95,8 @@ pub(crate) struct TestObservers {
     /// Runs when a batched open is about to open its transaction, before
     /// anything is written.
     pub open_batch_gate: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
-    /// Overrides `YADORILINK_RECEIVE_ASYNC_COMMIT` for this coordinator:
-    /// 0 = the environment, 1 = on, 2 = off.
+    /// Pins whether receive commits are offloaded for this coordinator:
+    /// 0 = on (the default), 1 = on, 2 = off.
     pub async_commit_override: std::sync::atomic::AtomicU8,
 }
 

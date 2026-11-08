@@ -279,7 +279,7 @@ async fn slots_are_free(mac: &SubstrateNode, nas: &SubstrateNode) {
         let mut held = Vec::new();
         let mut all = true;
         for _ in 0..SLOTS {
-            match connection.open_stream().await {
+            match connection.open_stream(&[7u8; 32]).await {
                 Ok(stream) => held.push(stream),
                 Err(NasAdminError::Busy) => {
                     all = false;

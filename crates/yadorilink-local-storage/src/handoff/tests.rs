@@ -272,6 +272,7 @@ impl Env {
                 home: self.home.clone(),
                 system_root: self.home.join("win"),
                 app_bundles: vec![self.app.clone()],
+                store_startup_enabled: false,
             },
             stop_deadline: Duration::from_secs(1),
             lock_wait: Duration::from_millis(300),
@@ -468,6 +469,8 @@ async fn an_app_launcher_left_registered_cannot_start_the_apps_daemon_after_a_ro
 #[tokio::test]
 async fn commit_verifies_the_apps_daemon_and_otherwise_leaves_the_hand_off_open() {
     let env = Env::new();
+    std::fs::create_dir_all(&env.config).unwrap();
+    std::fs::write(env.config.join("credentials.json"), b"{}").unwrap();
     env.release().await.unwrap();
     // No daemon answers yet.
     let refused = env.commit().await.unwrap_err();
@@ -483,9 +486,18 @@ async fn commit_verifies_the_apps_daemon_and_otherwise_leaves_the_hand_off_open(
         "{refused:?}"
     );
     assert!(matches!(env.journal(), JournalState::Present(_)));
+    assert!(env.config.join("credentials.json").exists(), "a refused commit removed the file");
     drop(env.host.0.daemon.lock().unwrap().take());
     env.host.start(DaemonKind::App).unwrap();
+    assert!(env.config.join("credentials.json").exists(), "a refused commit kept the file");
+    // A script install's file-stored sign-in stays until the hand-off cannot be rolled back,
+    // and is gone once it is committed: the app signs in again in its own store.
+    std::fs::write(env.config.join("credentials.lock"), b"").unwrap();
+    std::fs::write(env.config.join("credentials.json.entry-lock"), b"").unwrap();
     assert_eq!(env.commit().await, Ok(Outcome::Committed));
+    for name in ["credentials.json", "credentials.lock", "credentials.json.entry-lock"] {
+        assert!(!env.config.join(name).exists(), "{name} outlived the hand-off");
+    }
     // Nothing is open any more.
     assert_eq!(env.commit().await.unwrap_err(), HandoffError::Refused(Refused::NothingToDo));
 }
@@ -1444,4 +1456,22 @@ async fn a_previous_install_that_ships_no_identity_declares_nothing_and_rolls_ba
     released_and_restamped(&env).await;
     declare_previous_state(&env, None);
     assert_eq!(env.rollback().await, Ok(Outcome::RolledBack(PreviousDaemon::Restarted)));
+}
+
+#[tokio::test]
+async fn a_crash_after_the_journal_is_gone_cannot_roll_back_to_a_signed_out_script_install() {
+    let env = Env::new();
+    env.release().await.unwrap();
+    env.host.start(DaemonKind::App).unwrap();
+    std::fs::write(env.config.join("credentials.json"), b"{}").unwrap();
+    // The commit crashes right after closing the hand-off, before deleting the files.
+    // (The commit's first and only point.)
+    env.host.crash_at(Some(0));
+    assert_eq!(env.commit().await, Err(HandoffError::Crashed));
+    env.host.crash_at(None);
+    assert_eq!(env.journal(), JournalState::Missing);
+    // Nothing can be rolled back, and the leftover file is only unused, not a sign-in the
+    // script install would be restored without.
+    assert_eq!(env.rollback().await.unwrap_err(), HandoffError::Refused(Refused::NothingToDo));
+    assert!(env.config.join("credentials.json").exists());
 }

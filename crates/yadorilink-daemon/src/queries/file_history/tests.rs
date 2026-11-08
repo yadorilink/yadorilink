@@ -138,6 +138,77 @@ fn list_activity_spans_linked_folders_and_splits_by_device() {
     assert_eq!(others[0].event.path, "theirs.txt");
 }
 
+/// A conflict event names the other side of the conflict: the device that authored the version
+/// holding the original path now. Other events, and a conflict whose original is gone, name nobody.
+#[test]
+fn a_conflict_event_names_the_device_that_holds_the_original_path() {
+    use yadorilink_sync_sqlite::activity::{ActivityKind, ActivityQuery};
+
+    let coordinator = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+    coordinator.link_repository().add_link("/home/alice/Photos", "group-1").unwrap();
+    let record = |path: &str, deleted: bool| FileRecord {
+        path: path.into(),
+        size: 10,
+        mtime_unix_nanos: 0,
+        blocks: vec![yadorilink_replica_domain::file::BlockInfo {
+            hash: vec![1; 32],
+            offset: 0,
+            size: 10,
+        }],
+        deleted,
+    };
+    let permit = RootCommitPermit::for_tests();
+    let files = coordinator.file_index_repository();
+    let copy = "notes (conflicted copy, 2026-01-01-000000, device-c).txt";
+    // device-b's version holds the original path; the copy holds device-c's version.
+    files
+        .upsert_file_with_origin("group-1", &record("notes.txt", false), "device-b", &permit)
+        .unwrap();
+    files.upsert_file_with_origin("group-1", &record(copy, false), "device-c", &permit).unwrap();
+    let service = FileHistoryQueryService::new(
+        coordinator.clone(),
+        Arc::new(LinkedPathResolver::new(coordinator.clone(), std::path::PathBuf::from("unused"))),
+        "device-a".into(),
+        empty_store().1,
+    );
+    let page = |service: &FileHistoryQueryService| {
+        service.list_activity(ActivityQuery { limit: 10, ..Default::default() }).unwrap()
+    };
+    let by_kind = |views: &[ActivityView], kind| {
+        views.iter().find(|v| v.event.kind == kind).expect("an event of the kind").clone()
+    };
+
+    let events = page(&service);
+    let conflict = by_kind(&events, ActivityKind::Conflict);
+    assert_eq!(conflict.event.origin_device_id.as_deref(), Some("device-c"), "the copy's author");
+    assert_eq!(conflict.other_origin_device_id.as_deref(), Some("device-b"), "the kept side");
+    assert_eq!(by_kind(&events, ActivityKind::Added).other_origin_device_id, None);
+
+    // A copy of a copy: its name does not say which path it was made from, so nobody is named.
+    let copy_of_copy = "notes (conflicted copy, 2026-01-01-000000, device-c) (conflicted copy, 2026-01-02-000000, device-d).txt";
+    files
+        .upsert_file_with_origin("group-1", &record(copy_of_copy, false), "device-d", &permit)
+        .unwrap();
+    let at_path = |views: &[ActivityView], path: &str| {
+        views.iter().find(|v| v.event.path == path).expect("an event for the path").clone()
+    };
+    let events = page(&service);
+    let second = at_path(&events, copy_of_copy);
+    assert_eq!(second.event.kind, ActivityKind::Conflict);
+    assert_eq!(second.other_origin_device_id, None, "a copy of a copy names the wrong side");
+    assert_eq!(
+        at_path(&events, copy).other_origin_device_id.as_deref(),
+        Some("device-b"),
+        "the singly marked copy still names the kept side"
+    );
+
+    // The original removed since: nobody holds it, so nobody is named.
+    files
+        .upsert_file_with_origin("group-1", &record("notes.txt", true), "device-b", &permit)
+        .unwrap();
+    assert_eq!(at_path(&page(&service), copy).other_origin_device_id, None);
+}
+
 mod version_content {
     use yadorilink_replica_domain::file::BlockInfo;
     use yadorilink_replica_domain::session_state::VersionState;

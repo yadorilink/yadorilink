@@ -721,7 +721,7 @@ fn assert_recovered(f: &Fixture, window: &Window) {
 /// Crash after the temp files are synced, before any rename: the stray temps
 /// and in-flight rows are what a single file leaves, once per file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_crash_after_the_temp_fsyncs_of_a_window_is_rebuilt_from_the_blocks() {
+async fn a_crash_after_the_temp_fsyncs_of_a_window_is_finished_from_its_temps() {
     let (f, engine) = ready_fixture().await;
     let window = admit_window(&f, "t", 3, multi_block());
     let probe = crate::local_convergence::OverlapProbe::new(
@@ -750,11 +750,12 @@ async fn a_crash_after_the_temp_fsyncs_of_a_window_is_rebuilt_from_the_blocks() 
         assert!(!any_proof_row(&f, name) && !hydrated(&f, name) && intent_open(&f, name));
         assert_eq!(obligation(&f, name).as_ref(), Some(claimed));
     }
+    // The temps the intents name wait for repair, which finishes each write from its temp.
     let strays = f.state.replica_coordinator.remove_recorded_temp_files(GROUP, &f.root).unwrap();
-    assert_eq!(strays.len(), 3, "one recorded temp per file: {strays:?}");
+    assert!(strays.is_empty(), "temps named by an intent are not swept first: {strays:?}");
 
     let report = repair(&f);
-    assert_eq!(report.reconstructed.len(), 3, "rebuilt from the blocks: {report:?}");
+    assert_eq!(report.reconstructed.len(), 3, "finished from the temps: {report:?}");
     assert!(report.offline_deleted.is_empty(), "an interrupted write is not an offline delete");
     drive_until(&f, &engine, "the window closes", |f| {
         window.names.iter().all(|n| obligation(f, n).is_none())
@@ -1009,7 +1010,7 @@ async fn a_crash_after_the_open_before_any_byte(mode: u8) -> (Vec<String>, Vec<S
         crash_state.push(format!("{name} {:?}", rows_of(&f, name)));
     }
     let strays = reopened.remove_recorded_temp_files(GROUP, &f.root).unwrap();
-    assert_eq!(strays.len(), 3, "one recorded temp per file: {strays:?}");
+    assert!(strays.is_empty(), "temps named by an intent are not swept first: {strays:?}");
     let store = crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
         f.state.block_store.clone(),
     );
@@ -1023,7 +1024,7 @@ async fn a_crash_after_the_open_before_any_byte(mode: u8) -> (Vec<String>, Vec<S
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
-    assert_eq!(report.reconstructed.len(), 3, "rebuilt from the blocks: {report:?}");
+    assert_eq!(report.reconstructed.len(), 3, "finished from the temps: {report:?}");
     assert!(report.offline_deleted.is_empty(), "an interrupted open is not an offline delete");
     drive_until(&f, &engine, "the window closes", |f| {
         window.names.iter().all(|n| obligation(f, n).is_none())

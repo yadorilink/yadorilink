@@ -24,7 +24,11 @@ use super::*;
 const GROUP: &str = "group-1";
 
 pub(super) fn state_with_root() -> (Arc<DaemonState>, String) {
-    let store = Arc::new(SegmentBlockStore::new(tempfile::tempdir().unwrap().keep()).unwrap());
+    let store_dir = tempfile::tempdir().unwrap().keep();
+    let store = Arc::new(
+        SegmentBlockStore::new(&store_dir)
+            .unwrap_or_else(|error| panic!("opening a block store at {store_dir:?}: {error:?}")),
+    );
     let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     // Its own state directory: the governance config (a headroom override) is per state.
     let state = DaemonState::new_in(
@@ -757,16 +761,16 @@ impl crate::provider_eager::EagerEnvironment for AlwaysAvailable {
     }
 }
 
-fn next_downloads_message(root_id: &[u8], exclude: &[[u8; 16]], max: u32) -> ShellIpcMessage {
-    ShellIpcMessage {
-        payload: Some(Payload::NextProviderDownloadsRequest(
-            yadorilink_ipc_proto::shellipc::NextProviderDownloadsRequest {
-                root_id: root_id.to_vec(),
-                exclude_item_ids: exclude.iter().map(|i| i.to_vec()).collect(),
-                max,
-                request_id: Vec::new(),
-            },
-        )),
+fn next_downloads_message(
+    root_id: &[u8],
+    exclude: &[[u8; 16]],
+    max: u32,
+) -> yadorilink_ipc_proto::shellipc::NextProviderDownloadsRequest {
+    yadorilink_ipc_proto::shellipc::NextProviderDownloadsRequest {
+        root_id: root_id.to_vec(),
+        exclude_item_ids: exclude.iter().map(|i| i.to_vec()).collect(),
+        max,
+        request_id: Vec::new(),
     }
 }
 
@@ -797,11 +801,14 @@ async fn the_eager_query_round_trip_over_the_host_connection() {
     let (host, mut host_rx) = tokio::sync::mpsc::unbounded_channel::<ShellIpcMessage>();
     let (stray, mut stray_rx) = tokio::sync::mpsc::unbounded_channel::<ShellIpcMessage>();
     assert!(context.provider_host.try_attach(host.clone()));
+    let context = Arc::new(context);
+    let lane = super::eager_lane::EagerLane::spawn(context.clone(), host.clone());
+    let stray_lane = super::eager_lane::EagerLane::spawn(context.clone(), stray.clone());
     // The host's complete snapshot (nothing materialized yet) makes the query answerable.
     provider_channel_message(&context, &host, &report_message(&root_id, 1, 1, true, 0, &[])).await;
     let _ack = next_payload(&mut host_rx).await;
 
-    provider_channel_message(&context, &host, &next_downloads_message(&root_id, &[], 2)).await;
+    lane.submit(next_downloads_message(&root_id, &[], 2));
     let Payload::NextProviderDownloadsResponse(response) = next_payload(&mut host_rx).await else {
         panic!("no answer")
     };
@@ -812,7 +819,7 @@ async fn the_eager_query_round_trip_over_the_host_connection() {
     );
 
     // With `a` outstanding, only `b` is offered; `a` stays unsettled.
-    provider_channel_message(&context, &host, &next_downloads_message(&root_id, &[a], 1)).await;
+    lane.submit(next_downloads_message(&root_id, &[a], 1));
     let Payload::NextProviderDownloadsResponse(response) = next_payload(&mut host_rx).await else {
         panic!("no answer")
     };
@@ -833,7 +840,7 @@ async fn the_eager_query_round_trip_over_the_host_connection() {
         },
     )
     .await;
-    provider_channel_message(&context, &host, &next_downloads_message(&root_id, &[a], 2)).await;
+    lane.submit(next_downloads_message(&root_id, &[a], 2));
     let Payload::NextProviderDownloadsResponse(response) = next_payload(&mut host_rx).await else {
         panic!("no answer")
     };
@@ -844,8 +851,99 @@ async fn the_eager_query_round_trip_over_the_host_connection() {
     );
 
     // A connection that is not the attached host is not answered.
-    provider_channel_message(&context, &stray, &next_downloads_message(&root_id, &[], 2)).await;
+    stray_lane.submit(next_downloads_message(&root_id, &[], 2));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert!(stray_rx.try_recv().is_err());
+}
+
+/// A fixture for the held Eager answers: an attached host with a complete (empty) snapshot, a lane
+/// holding a quiet answer for `hold`.
+async fn held_eager_fixture(
+    hold: std::time::Duration,
+) -> (
+    Arc<DaemonState>,
+    Vec<u8>,
+    super::eager_lane::EagerLane,
+    tokio::sync::mpsc::UnboundedReceiver<ShellIpcMessage>,
+    (Arc<ShellContext>, tempfile::TempDir),
+) {
+    let (state, root) = state_with_root();
+    let root_id = hex::decode(&root).unwrap();
+    send(&state, domain_state(&root_id, true)).await;
+    send(&state, handshake(&root_id)).await;
+    let staging = tempfile::tempdir().unwrap();
+    let context = Arc::new(
+        ShellContext::from_state(state.clone())
+            .with_handoff_root(Some(
+                crate::provider_handoff::HandoffRoot::open(staging.path()).unwrap(),
+            ))
+            .with_eager(Arc::new(crate::provider_eager::EagerDriver::new(
+                Arc::new(AlwaysAvailable),
+                crate::provider_eager::EagerConfig {
+                    hold,
+                    hold_step: std::time::Duration::from_millis(20),
+                    ..Default::default()
+                },
+            ))),
+    );
+    let (host, mut host_rx) = tokio::sync::mpsc::unbounded_channel::<ShellIpcMessage>();
+    assert!(context.provider_host.try_attach(host.clone()));
+    provider_channel_message(&context, &host, &report_message(&root_id, 1, 1, true, 0, &[])).await;
+    let _ack = next_payload(&mut host_rx).await;
+    let lane = super::eager_lane::EagerLane::spawn(context.clone(), host);
+    (state, root_id, lane, host_rx, (context, staging))
+}
+
+/// A query with nothing to say is held, and answered as soon as a slot's item settles: the host
+/// does not wait for its next poll to refill the slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quiet_eager_query_is_answered_when_an_outstanding_item_settles() {
+    let (state, root_id, lane, mut host_rx, (context, _staging)) =
+        held_eager_fixture(std::time::Duration::from_secs(20)).await;
+    commit(&state, "a.bin", 1, 10);
+    commit(&state, "b.bin", 1, 20);
+    let root = hex::encode(&root_id);
+    let a = state.replica_coordinator.provider_repository().mint_item(&root, "a.bin").unwrap();
+    // `a` is outstanding at the host and there is no room: nothing to offer, nothing settled.
+    lane.submit(next_downloads_message(&root_id, &[a], 0));
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(host_rx.try_recv().is_err(), "nothing to say yet: the answer is held");
+
+    let started = std::time::Instant::now();
+    context.eager.record_rejection(&state.replica_coordinator, &root, &a);
+    let Payload::NextProviderDownloadsResponse(response) = next_payload(&mut host_rx).await else {
+        panic!("no answer")
+    };
+    assert_eq!(response.settled_item_ids, [a.to_vec()]);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "answered at the change");
+}
+
+/// A held answer ends with the hold, empty, and answers leave in the order the queries came (the
+/// host pairs them by position).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn held_eager_answers_end_with_the_hold_and_keep_their_order() {
+    use yadorilink_ipc_proto::shellipc::DriverState;
+    let hold = std::time::Duration::from_millis(300);
+    let (state, root_id, lane, mut host_rx, _keep) = held_eager_fixture(hold).await;
+    commit(&state, "a.bin", 1, 10);
+    let root = hex::encode(&root_id);
+    let a = state.replica_coordinator.provider_repository().mint_item(&root, "a.bin").unwrap();
+    let started = std::time::Instant::now();
+    for tag in [1u8, 2] {
+        let mut query = next_downloads_message(&root_id, &[a], 0);
+        query.request_id = vec![tag];
+        lane.submit(query);
+    }
+    for tag in [1u8, 2] {
+        let Payload::NextProviderDownloadsResponse(response) = next_payload(&mut host_rx).await
+        else {
+            panic!("no answer")
+        };
+        assert_eq!(response.request_id, [tag], "answers leave in query order");
+        assert!(response.downloads.is_empty() && response.settled_item_ids.is_empty());
+        assert_eq!(DriverState::try_from(response.state).unwrap(), DriverState::Running);
+    }
+    assert!(started.elapsed() >= hold * 2 - std::time::Duration::from_millis(60));
 }
 
 /// Only a CONFIRMED removal replaces a root: an unknown state (the OS domain list could not be

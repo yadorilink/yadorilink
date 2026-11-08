@@ -1027,19 +1027,30 @@ impl ReplicaCoordinator {
             .map_err(PeerSessionError::from)
     }
 
-    /// Opens the durable write intent of one in-place hydration, before the
-    /// path's mutation fence is bumped, so a crash after the bump leaves the
-    /// old bytes readable as the pre-image of an unfinished write.
-    pub(crate) fn open_hydration_write_intent<'a>(
+    /// Opens the durable write intent of one in-place hydration and bumps the path's mutation
+    /// fence, in one transaction: a crash after the bump leaves the old bytes readable as the
+    /// pre-image of an unfinished write. Returns the intent's guard and the bumped fence.
+    pub(crate) fn open_hydration_write<'a>(
         &'a self,
         group_id: &'a str,
         path: &'a str,
         target: &[u8],
         permit: &'a RootCommitPermit<'a>,
-    ) -> Result<crate::materialization_intent::MaterializationIntentGuard<'a>, SyncError> {
-        Ok(crate::materialization_intent::MaterializationIntentGuard::open(
-            self, group_id, path, target, permit,
-        )?)
+    ) -> Result<(crate::materialization_intent::MaterializationIntentGuard<'a>, i64), SyncError>
+    {
+        let fence = self.materialization_intent_repository().open_write_and_bump_fence(
+            group_id,
+            path,
+            target,
+            "hydration_write",
+            permit,
+        )?;
+        Ok((
+            crate::materialization_intent::MaterializationIntentGuard::opened(
+                self, group_id, path, permit,
+            ),
+            fence,
+        ))
     }
 
     /// Records, inside the caller's open write transaction, the blocks it has
@@ -1066,6 +1077,55 @@ impl ReplicaCoordinator {
         path: &str,
     ) -> Result<bool, SyncError> {
         Ok(self.sqlite().dag_usable_proof_names_current_version(group_id, path)?)
+    }
+
+    /// Files below this size are hashed again by the watcher's echo as before: reading them is
+    /// cheaper than the pause [`Self::prepare_verified_echo`] may take.
+    const VERIFIED_ECHO_MIN_BYTES: u64 = 1 << 20;
+
+    /// Before the identity of a freshly written file is observed for its verification: pauses (at
+    /// most the racy-clean window, 100 ms) until the file's timestamps are older than that window,
+    /// and returns the moment to pass to [`Self::note_verified_echo`]. `None`: no entry will be
+    /// made for this file (small, whole-second timestamps, a volume not known to be local), and
+    /// nothing was waited for.
+    pub async fn prepare_verified_echo(
+        &self,
+        out_path: &Path,
+        size: u64,
+    ) -> Option<std::time::SystemTime> {
+        if size < Self::VERIFIED_ECHO_MIN_BYTES {
+            return None;
+        }
+        let wait = yadorilink_fs_platform::verified_echo::settle_wait(out_path)?;
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+        Some(std::time::SystemTime::now())
+    }
+
+    /// Remembers that the file at `out_path` was just written and verified as `version`, with the
+    /// `identity` observed before that verification at `observed_at` (from
+    /// [`Self::prepare_verified_echo`]), so the watcher event for the write does not read it again
+    /// (see `yadorilink_fs_platform::verified_echo`).
+    pub fn note_verified_echo(
+        &self,
+        group_id: &str,
+        path: &str,
+        version: yadorilink_replica_domain::ids::VersionHash,
+        identity: &yadorilink_fs_platform::fs_identity::FileIdentity,
+        out_path: &Path,
+        observed_at: std::time::SystemTime,
+    ) {
+        self.verified_echoes.note(
+            yadorilink_fs_platform::verified_echo::VerifiedWrite {
+                group_id,
+                path,
+                version,
+                identity,
+                out_path,
+            },
+            observed_at,
+        );
     }
 
     /// `SqliteSyncStore::disk_is_untouched_proven_write_at`
@@ -1715,7 +1775,7 @@ impl ReplicaCoordinator {
         let to_session =
             |e: yadorilink_sync_sqlite::SyncSqliteError| PeerSessionError::from(SyncError::from(e));
         let Some(record) =
-            self.file_index_repository().get_file(group_id, path).map_err(to_session)?
+            self.file_index_repository().get_file_shared(group_id, path).map_err(to_session)?
         else {
             return Ok(None);
         };
@@ -1757,7 +1817,7 @@ impl yadorilink_peer_session::ports::BlockServeAuthorizationPort for ReplicaCoor
             // Without a store copy this device may still hold the block in the file the current
             // record of the requested path describes: that record, present on this device, is the
             // claim (the bytes are checked against the hash before they leave).
-            if self.tuning().file_block_source {
+            if self.tuning().file_mode.serves_from_files() {
                 if let Some(size) = self.present_file_block_size(group_id, path, block_hash)? {
                     return Ok(BlockServeAuthorization::Allowed { declared_size: Some(size) });
                 }

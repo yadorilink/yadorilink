@@ -77,6 +77,7 @@ fn trashed_and_conflicted_protos_carry_record_kind() {
 
     let conflicted =
         conflicted_file_view_to_proto(crate::queries::file_history::ConflictedFileView {
+            group_id: "g".into(),
             local_path: "/tmp/photos".into(),
             path: "link (conflicted copy, 2026-01-01-000000, device-b)".into(),
             size: 4,

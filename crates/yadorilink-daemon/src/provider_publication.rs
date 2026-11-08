@@ -313,7 +313,7 @@ impl Shared {
             Ok(Some(group)) => group,
             _ => return,
         };
-        let new_root = match repo.rebootstrap_root(&group) {
+        let new_root = match self.coordinator.provider_writes().rebootstrap_root(&group) {
             Ok(new_root) => new_root,
             Err(error) => {
                 tracing::warn!(root_id, %error, "could not rebootstrap a provider root");
@@ -524,7 +524,7 @@ impl Shared {
         if !self.host.signal(root_id, revision, Vec::new(), vec![Vec::new()]).await {
             return false;
         }
-        repo.mark_announced(root_id, changes).is_ok()
+        self.coordinator.provider_writes().mark_announced(root_id, changes).is_ok()
     }
 
     /// One try at publishing one item, bound to ONE version: the version current when it starts.
@@ -550,6 +550,7 @@ impl Shared {
 
     async fn attempt(&self, root_id: &str, item: ItemId) -> Attempt {
         let repo = self.coordinator.provider_repository();
+        let writes = self.coordinator.provider_writes();
         // Only corrupt state loses the root; any other read error is retried with backoff.
         let lost = |error: yadorilink_sync_sqlite::SyncSqliteError| match error {
             yadorilink_sync_sqlite::SyncSqliteError::CorruptState(_) => {
@@ -564,7 +565,7 @@ impl Shared {
         let now = || (self.config.now_ms)();
         // The timer is checked first: a version announced long enough ago is released whatever
         // the signals did. A newer version committed meanwhile starts a new episode.
-        match repo.release_expired(root_id, &item, now(), after_ms) {
+        match writes.release_expired(root_id, &item, now(), after_ms) {
             Ok(true) => return Attempt::Restart,
             Ok(false) => {}
             Err(error) => return lost(error),
@@ -605,7 +606,7 @@ impl Shared {
         // The announcement and its change event are durable BEFORE the signal, in one
         // transaction: whenever the OS asks for changes the event exists and the shown view is
         // the new version. The event's sequence is the revision the signal carries.
-        let announced = match repo.announce_version(root_id, &item, target, now()) {
+        let announced = match writes.announce_version(root_id, &item, target, now()) {
             Ok(Some(announced)) => announced,
             Ok(None) => return Attempt::Restart,
             Err(_) => return Attempt::Retry,
@@ -621,7 +622,7 @@ impl Shared {
         // Published by a handoff of the announced version (provenance), by the timer,
         // or still pending: then the next attempt is when the timer is due or the next re-signal,
         // whichever is first.
-        match repo.release_expired(root_id, &item, now(), after_ms) {
+        match writes.release_expired(root_id, &item, now(), after_ms) {
             Ok(true) => return Attempt::Restart,
             Ok(false) => {}
             Err(error) => return lost(error),

@@ -85,7 +85,10 @@ pub enum AttentionItem {
     WaitingForDiskSpace,
     /// The folder group is linked at more than one place, so nothing syncs.
     LinkedTwice,
-    OwnershipLost,
+    /// The folder takes no part in sync until it is linked again: its ownership marker is gone,
+    /// or it is not joined to its folder group (start over could not join it again, or its
+    /// authorization is gone). Its files are kept.
+    FolderNeedsRelink,
     /// The folder is no longer on the disk it was set up on.
     VolumeChanged,
     /// The folder's disk cannot be recognised after it was mounted again (a
@@ -93,7 +96,6 @@ pub enum AttentionItem {
     VolumeUnconfirmed,
     /// No second copy of the data exists anywhere.
     NoSafeCopy,
-    SafeCopyUnconfirmed,
     /// Files that are not here cannot be fetched now.
     ContentUnavailable,
     ContentAvailabilityUnknown,
@@ -128,6 +130,9 @@ pub enum AttentionItem {
     /// release line's minimum supported version (scope: general). Either way the fix is to
     /// update, not to wait: the device is online, it just cannot sync until versions match.
     UpdateRequired,
+    /// A device runs a newer version than this one (scope: the device): this device is the one
+    /// to update. The device is online; it just cannot sync until versions match.
+    UpdateThisDevice,
     /// The Windows host read its sync-root record from an older generation because the newest
     /// one is torn; folders added since may be missing from what it serves until it is rewritten.
     ProviderRegistryRestored,
@@ -135,10 +140,6 @@ pub enum AttentionItem {
     /// under its identity. The engine never reuses the old author state: the device starts over as
     /// a new device (`ProductAction::StartOverAsNewDevice`), keeping its files.
     DatabaseRestored,
-    /// The folder is not joined to its folder group (start over could not join it again, or its
-    /// authorization is gone): it takes no part in sync, its files are kept, and only joining the
-    /// group again (a new invite) or unlinking the folder settles it.
-    NotJoined,
     /// This device cannot open the identity it signs its changes with (for example the record
     /// that detects a restored database cannot be written), so nothing it edits syncs.
     AuthorUnavailable,
@@ -146,6 +147,9 @@ pub enum AttentionItem {
     /// group, and the service has not confirmed the new device yet. Retried automatically; status
     /// is never healthy meanwhile. Keyed-only, like the items above.
     ReplacementUnconfirmed,
+    /// The person has not yet acknowledged that changes made after the backup may be missing,
+    /// which the confirmation above waits for.
+    ReplacementAcknowledge,
     /// The confirmation above was refused for lack of a valid sign-in: signing in again lets it go
     /// through.
     ReplacementSignInRequired,
@@ -188,6 +192,21 @@ impl AttentionScope {
 }
 
 impl AttentionItem {
+    /// The step of a start-over follow-up (the `step` argument of `replacement_unconfirmed`):
+    /// `confirming` (the service has not confirmed yet), `waiting` (it cannot yet, and says why),
+    /// `acknowledge` (the person has to acknowledge possible loss) or `sign_in`. `None` for every
+    /// other item.
+    #[must_use]
+    pub fn step(self) -> Option<&'static str> {
+        match self {
+            Self::ReplacementUnconfirmed => Some("confirming"),
+            Self::ReplacementWaiting => Some("waiting"),
+            Self::ReplacementAcknowledge => Some("acknowledge"),
+            Self::ReplacementSignInRequired => Some("sign_in"),
+            _ => None,
+        }
+    }
+
     /// Stable snake_case id for platform resource lookup.
     #[must_use]
     pub fn key(self) -> &'static str {
@@ -196,11 +215,10 @@ impl AttentionItem {
             Self::WaitingForDiskSpace => "waiting_for_disk_space",
             Self::FileWatchLimit => "file_watch_limit",
             Self::LinkedTwice => "linked_twice",
-            Self::OwnershipLost => "ownership_lost",
+            Self::FolderNeedsRelink => "folder_needs_relink",
             Self::VolumeChanged => "volume_changed",
             Self::VolumeUnconfirmed => "volume_unconfirmed",
             Self::NoSafeCopy => "no_safe_copy",
-            Self::SafeCopyUnconfirmed => "safe_copy_unconfirmed",
             Self::ContentUnavailable => "content_unavailable",
             Self::ContentAvailabilityUnknown => "content_availability_unknown",
             Self::ConflictNeedsReview => "conflict_needs_review",
@@ -219,13 +237,14 @@ impl AttentionItem {
             Self::RetryableFailure => "retryable_failure",
             Self::UpdateFailed => "update_failed",
             Self::UpdateRequired => "update_required",
+            Self::UpdateThisDevice => "update_this_device",
             Self::ProviderRegistryRestored => "provider_registry_restored",
             Self::DatabaseRestored => "database_restored",
             Self::AuthorUnavailable => "author_unavailable",
-            Self::ReplacementUnconfirmed => "replacement_unconfirmed",
-            Self::ReplacementSignInRequired => "replacement_unconfirmed_sign_in_required",
-            Self::ReplacementWaiting => "replacement_unconfirmed_waiting",
-            Self::NotJoined => "not_joined",
+            Self::ReplacementUnconfirmed
+            | Self::ReplacementAcknowledge
+            | Self::ReplacementSignInRequired
+            | Self::ReplacementWaiting => "replacement_unconfirmed",
             Self::TermsConsentRequired => "terms_consent_required",
             Self::SignInRequired => "sign_in_required",
             Self::AccountDeletionRequested => "account_deletion_requested",
@@ -241,8 +260,7 @@ impl AttentionItem {
     #[must_use]
     pub fn kind(self) -> AttentionKind {
         match self {
-            Self::SafeCopyUnconfirmed
-            | Self::ContentUnavailable
+            Self::ContentUnavailable
             | Self::ContentAvailabilityUnknown
             | Self::ReplacementUnconfirmed
             | Self::ReplacementWaiting
@@ -253,8 +271,7 @@ impl AttentionItem {
             | Self::RetryableFailure
             | Self::UpdateFailed => AttentionKind::Retryable,
             Self::LinkedTwice
-            | Self::OwnershipLost
-            | Self::NotJoined
+            | Self::FolderNeedsRelink
             | Self::FileWatchLimit
             | Self::VolumeChanged
             | Self::VolumeUnconfirmed
@@ -273,6 +290,7 @@ impl AttentionItem {
             | Self::DatabaseRestored
             | Self::AuthorUnavailable
             | Self::ReplacementSignInRequired
+            | Self::ReplacementAcknowledge
             | Self::TermsConsentRequired
             | Self::SignInRequired
             | Self::AccountDeletionRequested
@@ -283,6 +301,7 @@ impl AttentionItem {
             | Self::DiskFull
             | Self::DiskLow
             | Self::UpdateRequired
+            | Self::UpdateThisDevice
             | Self::Unrecognized => AttentionKind::Permanent,
         }
     }
@@ -292,8 +311,7 @@ impl AttentionItem {
         match self {
             Self::FolderStopped
             | Self::LinkedTwice
-            | Self::OwnershipLost
-            | Self::NotJoined
+            | Self::FolderNeedsRelink
             | Self::FileWatchLimit
             | Self::NoSafeCopy
             | Self::IndexDamaged
@@ -320,16 +338,14 @@ impl AttentionItem {
             }
             Self::UnsupportedFilename | Self::FileNotReadable => ProductAction::RevealPath,
             Self::ProviderNotReady | Self::ProviderOrphan => ProductAction::OpenSettings,
-            Self::UpdateRequired => ProductAction::DownloadUpdate,
+            Self::UpdateRequired | Self::UpdateThisDevice => ProductAction::DownloadUpdate,
             Self::TermsConsentRequired | Self::SignInRequired => ProductAction::SignIn,
             Self::VolumeUnconfirmed => ProductAction::ConfirmDisk,
             Self::LinkedTwice
-            | Self::OwnershipLost
-            | Self::NotJoined
+            | Self::FolderNeedsRelink
             | Self::FileWatchLimit
             | Self::VolumeChanged
             | Self::NoSafeCopy
-            | Self::SafeCopyUnconfirmed
             | Self::ContentUnavailable
             | Self::ContentAvailabilityUnknown
             | Self::FileHeld
@@ -342,6 +358,7 @@ impl AttentionItem {
             | Self::ReplacementUnconfirmed
             | Self::ReplacementWaiting
             | Self::ReplacementSignInRequired
+            | Self::ReplacementAcknowledge
             | Self::EditsKeptBeside
             | Self::PeerUnavailable
             | Self::AccountDeletionRequested
@@ -397,15 +414,13 @@ impl Attention {
             "waiting_for_disk_space" => folder(AttentionItem::WaitingForDiskSpace),
             "file_watch_limit" => folder(AttentionItem::FileWatchLimit),
             "ambiguous" => folder(AttentionItem::LinkedTwice),
-            "ownership_lost" => folder(AttentionItem::OwnershipLost),
-            "not_joined" => folder(AttentionItem::NotJoined),
+            "folder_needs_relink" => folder(AttentionItem::FolderNeedsRelink),
             "unreadable_files" => folder(AttentionItem::UnreadableFiles),
             "index_damaged" => folder(AttentionItem::IndexDamaged),
             "rebuild_needed" => folder(AttentionItem::RebuildNeeded),
             "volume_changed" => folder(AttentionItem::VolumeChanged),
             "volume_unconfirmed" => folder(AttentionItem::VolumeUnconfirmed),
             "durability_at_risk" => folder(AttentionItem::NoSafeCopy),
-            "durability_unknown" => folder(AttentionItem::SafeCopyUnconfirmed),
             "fetch_unavailable" => folder(AttentionItem::ContentUnavailable),
             "fetch_availability_unknown" => folder(AttentionItem::ContentAvailabilityUnknown),
             "conflict" | "conflict_pending" => folder(AttentionItem::ConflictNeedsReview),
@@ -426,6 +441,8 @@ impl Attention {
             "peer_update_required" => {
                 (AttentionItem::UpdateRequired, AttentionScope::Device(subject))
             }
+            // A peer on a newer version: this device is the one to update.
+            "peer_newer" => (AttentionItem::UpdateThisDevice, AttentionScope::Device(subject)),
             // This device is older than the minimum supported version.
             "update_required" => (AttentionItem::UpdateRequired, AttentionScope::General),
             "recent_error" => (AttentionItem::RetryableFailure, AttentionScope::General),
@@ -436,10 +453,15 @@ impl Attention {
             "database_restored" => (AttentionItem::DatabaseRestored, AttentionScope::General),
             "author_unavailable" => (AttentionItem::AuthorUnavailable, AttentionScope::General),
             "replacement_unconfirmed" => {
-                (AttentionItem::ReplacementUnconfirmed, AttentionScope::General)
-            }
-            "replacement_unconfirmed_waiting" => {
-                (AttentionItem::ReplacementWaiting, AttentionScope::General)
+                // The subject is `step[:detail]`; none is the first step.
+                let step = subject.split_once(':').map_or(subject.as_str(), |(step, _)| step);
+                let item = match step {
+                    "waiting" => AttentionItem::ReplacementWaiting,
+                    "acknowledge" => AttentionItem::ReplacementAcknowledge,
+                    "sign_in" => AttentionItem::ReplacementSignInRequired,
+                    _ => AttentionItem::ReplacementUnconfirmed,
+                };
+                (item, AttentionScope::General)
             }
             "terms_consent_required" => {
                 (AttentionItem::TermsConsentRequired, AttentionScope::General)
@@ -453,9 +475,6 @@ impl Attention {
             }
             "account_deletion_urgent" => {
                 (AttentionItem::AccountDeletionUrgent, AttentionScope::General)
-            }
-            "replacement_unconfirmed_sign_in_required" => {
-                (AttentionItem::ReplacementSignInRequired, AttentionScope::General)
             }
             _ => (AttentionItem::Unrecognized, AttentionScope::General),
         };

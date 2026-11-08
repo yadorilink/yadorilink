@@ -67,8 +67,8 @@ pub enum BrowserPurpose {
 /// Loopback flow: `Enrolling`, `OpenBrowser{ApproveDevice}`,
 /// `WaitingForApproval`, `OpenBrowser{SignIn}`, `WaitingForAuthorization`,
 /// `SignedIn`. Device-code flow: `Enrolling`, `OpenBrowser{ApproveDevice}`,
-/// `WaitingForApproval`, `ShowDeviceCode`, `SignedIn`. A failure ends the
-/// flow with an error instead of `SignedIn`.
+/// `WaitingForApproval`, `ShowDeviceCode`, `SignedIn`. Both end with
+/// `DeviceRegistered`. A failure ends the flow with an error instead of `SignedIn`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LoginEvent {
     /// The loopback listener is bound and the enrolment request is in flight.
@@ -90,6 +90,9 @@ pub enum LoginEvent {
     /// Signed in; the credential store now holds this installation's
     /// credential.
     SignedIn { client_id: String },
+    /// This computer was registered as a device of the account under `device_name`; signing in
+    /// ends with this, so a signed-in computer always has its device identity.
+    DeviceRegistered { device_name: String },
 }
 
 /// Enrols this installation and signs it in, reporting each step to `sink`.
@@ -103,9 +106,16 @@ pub enum LoginEvent {
 /// registration still needs a loopback `redirect_uris` entry, so a loopback
 /// listener is still bound during enrolment, but it is never dialed on this
 /// path and is dropped immediately after.
-pub async fn login(device: bool, sink: impl FnMut(LoginEvent)) -> Result<(), CoreError> {
+pub async fn login(
+    device: bool,
+    device_name: Option<String>,
+    launch: &crate::dto::DaemonLaunch,
+    sink: impl FnMut(LoginEvent),
+) -> Result<(), CoreError> {
     let dir = credential_store::process_dir()?;
-    login_in(&dir, &credential_store::CredentialSettings::from_env(&dir)?, device, sink).await
+    let settings = named(credential_store::CredentialSettings::from_env(&dir)?, device_name);
+    login_in(&dir, &settings, device, sink).await?;
+    adopt_in_running_daemon(launch).await
 }
 
 /// [`login`] for the state directory `dir`: the credential store and the device-supersede record
@@ -128,7 +138,8 @@ pub async fn login_in(
         return Err(already_enrolled());
     }
 
-    enrol_and_sign_in(dir, settings, store, Enrol::Browser { device }, &mut sink).await
+    enrol_and_sign_in(dir, settings, store, Enrol::Browser { device }, &mut sink).await?;
+    register_this_device(dir, settings, &mut sink).await
 }
 
 /// Enrols this installation with a pairing code from the account's web page and signs it in,
@@ -146,16 +157,44 @@ pub async fn login_in(
 /// sent, when this installation is already signed in.
 pub async fn login_with_pairing_code(
     code: PairingCode,
+    device_name: Option<String>,
+    launch: &crate::dto::DaemonLaunch,
     sink: impl FnMut(LoginEvent),
 ) -> Result<(), CoreError> {
     let dir = credential_store::process_dir()?;
-    login_with_pairing_code_in(
-        &dir,
-        &credential_store::CredentialSettings::from_env(&dir)?,
-        code,
-        sink,
-    )
-    .await
+    let settings = named(credential_store::CredentialSettings::from_env(&dir)?, device_name);
+    login_with_pairing_code_in(&dir, &settings, code, sink).await?;
+    adopt_in_running_daemon(launch).await
+}
+
+/// `settings` with the device name the person chose, when they chose one; the machine's own name
+/// otherwise.
+pub(crate) fn named(
+    mut settings: credential_store::CredentialSettings,
+    device_name: Option<String>,
+) -> credential_store::CredentialSettings {
+    if let Some(name) = device_name.filter(|name| !name.trim().is_empty()) {
+        settings.host_name = Some(name.trim().to_owned());
+    }
+    settings
+}
+
+/// A running daemon read the state directory at startup and would keep acting as an unregistered
+/// device until restarted; sign-in is done and stays done, so a restart that cannot be confirmed
+/// is reported as that.
+async fn adopt_in_running_daemon(launch: &crate::dto::DaemonLaunch) -> Result<(), CoreError> {
+    // No device (a start over is mid-way, or the sign-in was a re-sign-in of an unregistered
+    // installation): there is nothing for a daemon to adopt.
+    let Ok(device_id) = crate::coordination::device_config::load().map(|c| c.device_id) else {
+        return Ok(());
+    };
+    crate::ops::daemon::restart_if_running_with(launch).await.map_err(|e| {
+        crate::ops::devices::restart_failed_after_registration(
+            &device_id,
+            e,
+            crate::ops::daemon::startup_refusal(),
+        )
+    })
 }
 
 /// [`login_with_pairing_code`] for the state directory `dir`.
@@ -170,7 +209,50 @@ pub async fn login_with_pairing_code_in(
     if store.load()?.is_some() {
         return Err(already_enrolled());
     }
-    enrol_and_sign_in(dir, settings, store, Enrol::Pairing(&code), &mut sink).await
+    enrol_and_sign_in(dir, settings, store, Enrol::Pairing(&code), &mut sink).await?;
+    register_this_device(dir, settings, &mut sink).await
+}
+
+/// The last step of a first sign-in: registers this computer as a device under its own name, so
+/// a signed-in computer always has `device.json`. The sign-in is done and stays done when this
+/// fails; the error says so and carries [`Hint::RegisterDevice`].
+///
+/// Nothing is registered when a device already exists here, when `device.json` cannot be read
+/// (registering again over it would create a second identity), or while a start over is mid-way:
+/// that flow registers the replacement device itself, under the name the person chose.
+async fn register_this_device(
+    dir: &std::path::Path,
+    settings: &credential_store::CredentialSettings,
+    sink: &mut impl FnMut(LoginEvent),
+) -> Result<(), CoreError> {
+    match crate::coordination::device_config::load_in(dir) {
+        Ok(_) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    if crate::ops::start_over::pending_in(dir) {
+        return Ok(());
+    }
+    let device_name = settings
+        .host_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map_or_else(crate::ops::devices::suggested_device_name, str::to_owned);
+    crate::ops::devices::register_device_in(dir, settings, device_name.clone()).await.map_err(
+        |e| {
+            e.with_context(
+                |why| {
+                    format!(
+                        "signed in, but this computer could not be registered as a device: {why}"
+                    )
+                },
+                Some(Hint::RegisterDevice),
+            )
+        },
+    )?;
+    sink(LoginEvent::DeviceRegistered { device_name });
+    Ok(())
 }
 
 /// How an installation without an identity gets one.

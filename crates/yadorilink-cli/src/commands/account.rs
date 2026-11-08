@@ -13,6 +13,7 @@ use yadorilink_client_core::ops::account as ops;
 use yadorilink_client_core::error::CoreError;
 
 use crate::error::CliError;
+use crate::i18n::{tr, trf};
 
 use yadorilink_client_core::ops::account::DeletionStatus;
 use yadorilink_client_core::wording::LOCAL_FIRST_NOTICE;
@@ -32,7 +33,7 @@ pub async fn delete_request(force: bool, device: bool) -> Result<(), CliError> {
     // there is none this signs in again as this installation (no new device)
     // and asks once more.
     let step_up = || async {
-        println!("Deleting your account needs a fresh sign-in.");
+        println!("{}", tr("Deleting your account needs a fresh sign-in."));
         yadorilink_client_core::ops::auth::reauthenticate(device, |event| {
             for line in yadorilink_client_core::wording::login_event_lines(&event) {
                 println!("{line}");
@@ -53,11 +54,12 @@ pub async fn delete_request(force: bool, device: bool) -> Result<(), CliError> {
         other => other?,
     };
     println!("{LOCAL_FIRST_NOTICE}\n");
-    println!("Account deletion requested. Nothing is deleted yet. To confirm, run:\n");
+    println!("{}\n", tr("Account deletion requested. Nothing is deleted yet. To confirm, run:"));
     println!("    yadorilink account delete confirm {}\n", requested.confirmation_token);
     println!(
-        "This confirmation token is shown only once. After you confirm, a grace period \
-starts during which you can still cancel with `yadorilink account delete cancel`."
+        "{}",
+        tr("This confirmation token is shown only once. After you confirm, a grace period \
+starts during which you can still cancel with `yadorilink account delete cancel`.")
     );
     Ok(())
 }
@@ -67,15 +69,19 @@ pub async fn delete_confirm(confirmation_token: String) -> Result<(), CliError> 
     println!("{LOCAL_FIRST_NOTICE}\n");
     println!("{}", status_line(&status));
     println!(
-        "You can still cancel with `yadorilink account delete cancel` until the grace period ends; \
-only finalization is irreversible."
+        "{}",
+        tr("You can still cancel with `yadorilink account delete cancel` until the grace period ends; \
+only finalization is irreversible.")
     );
     Ok(())
 }
 
 pub async fn delete_cancel() -> Result<(), CliError> {
     let status = ops::cancel_deletion().await?;
-    println!("Account deletion cancelled. Your account is {}.", status.state);
+    println!(
+        "{}",
+        trf!("Account deletion cancelled. Your account is {state}.", state = status.state)
+    );
     Ok(())
 }
 
@@ -92,13 +98,17 @@ pub async fn export(output_path: Option<PathBuf>) -> Result<(), CliError> {
     match output_path {
         Some(path) => {
             std::fs::write(&path, pretty)?;
-            println!("Wrote your account data export to {}.", path.display());
+            println!(
+                "{}",
+                trf!("Wrote your account data export to {path}.", path = path.display())
+            );
         }
         None => println!("{pretty}"),
     }
     println!(
-        "\nThis export contains only your coordination-plane records -- never your file \
-contents, file or folder names, or paths, which the server never holds."
+        "\n{}",
+        tr("This export contains only your coordination-plane records -- never your file \
+contents, file or folder names, or paths, which the server never holds.")
     );
     Ok(())
 }

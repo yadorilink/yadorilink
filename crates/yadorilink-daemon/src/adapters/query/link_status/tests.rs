@@ -141,9 +141,14 @@ async fn requested_content_counts_fetches_and_queued_opens_but_not_eviction() {
     };
     assert_eq!(requested(&state), 0);
 
-    let queued = state.requested_opens.begin(GROUP);
+    let mut queued = state.requested_opens.begin(GROUP, b"queued");
     assert_eq!(requested(&state), 1);
+    queued.served();
     drop(queued);
+    // The file keeps counting for a moment after its last request (it is not yet reported as
+    // downloaded); once that has passed nothing is requested.
+    assert_eq!(requested(&state), 1);
+    state.requested_opens.end_lingering();
     assert_eq!(requested(&state), 0);
 
     upsert_file(&state, "open.bin", false);
@@ -512,7 +517,7 @@ async fn paused_eager_requests_nothing_and_a_hydrating_open_is_counted_once() {
     let state = on_demand_state();
     upsert_file(&state, "open.bin", false);
     set_state(&state, "open.bin", MaterializationState::Hydrating);
-    let _open = state.requested_opens.begin(GROUP);
+    let _open = state.requested_opens.begin(GROUP, b"open");
     assert_eq!(reader_for(state).list_links().unwrap()[0].requested_content_count, 1);
 }
 
@@ -621,21 +626,21 @@ async fn each_degraded_state_reports_its_own_typed_cause() {
     state.replica_coordinator.link_repository().add_link(PATH, GROUP).unwrap();
     assert_eq!(cause_of(&state), (false, Wire::Unspecified, false));
 
-    state.mark_link_waiting_for_disk_space(PATH, "any wording".into());
+    state.wait_for_disk_space(PATH, "any wording".into());
     assert_eq!(cause_of(&state), (true, Wire::WaitingForDiskSpace, true));
-    state.clear_link_degraded(PATH);
+    state.recover_link(PATH);
 
-    state.mark_link_degraded(PATH, DegradedCause::NotJoined, "Waiting for disk space".into());
+    state.degrade_link(PATH, DegradedCause::NotJoined, "Waiting for disk space".into());
     assert_eq!(cause_of(&state), (true, Wire::NotJoined, false));
-    state.clear_link_degraded(PATH);
+    state.recover_link(PATH);
 
-    assert!(state.mark_link_ownership_lost(PATH));
+    assert!(state.lose_ownership(PATH));
     assert_eq!(cause_of(&state), (true, Wire::OwnershipLost, false));
     state.links.clear_ownership_lost(PATH);
 
     // The watch limit outranks the other causes.
     state.links.record_watch_limit_startup_failure(PATH);
-    state.mark_link_waiting_for_disk_space(PATH, "x".into());
+    state.wait_for_disk_space(PATH, "x".into());
     assert_eq!(cause_of(&state), (true, Wire::FileWatchLimit, false));
 }
 

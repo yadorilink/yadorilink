@@ -36,7 +36,7 @@ use yadorilink_replica_domain::file::FileRecord;
 use yadorilink_replica_domain::session_state::LinkGate;
 use yadorilink_root_authority::root_commit::{RootCommitPermit, RootLease};
 
-use yadorilink_fs_platform::ignore_patterns::{is_ignore_file_relative_path, EffectiveIgnoreSet};
+use yadorilink_fs_platform::ignore_patterns::{EffectiveIgnoreSet, IgnoreRulesStore};
 use yadorilink_peer_session::hazard;
 use yadorilink_peer_session::peer_session::RootCommitAuthorityProvider;
 
@@ -55,6 +55,8 @@ pub struct LocalConvergenceExecutor {
     /// the session only because the code that consulted it did.
     pub(crate) ignore_sets:
         StdMutex<HashMap<String, (Arc<EffectiveIgnoreSet>, std::time::Instant)>>,
+    /// Where each group's ignore rules are stored.
+    ignore_rules: IgnoreRulesStore,
     /// Forces a path's pending local debounce entry into the index before
     /// this device reconciles it.
     ///
@@ -103,6 +105,10 @@ pub struct LocalConvergenceExecutor {
     /// a test can land a local write in exactly that window.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) between_assemble_and_persist_hook: StdMutex<Option<AssembleHook>>,
+    /// Test-only, one-shot: runs after the pre-publish check and immediately before the
+    /// replacement, so a test can land a local write after the last check.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) after_check_before_publish_hook: StdMutex<Option<AssembleHook>>,
     /// Test-only, one-shot: runs after an eager write's bytes and metadata
     /// are on disk and before the proof observes the object, so a test can
     /// land a local write in the window the proof would otherwise absorb.
@@ -283,14 +289,14 @@ pub mod types;
 use types::*;
 pub mod call_timer;
 mod completion_window;
-pub(crate) use completion_window::{parse_batch_completion, parse_deferred_flush};
+pub(crate) use completion_window::parse_deferred_flush;
 mod knobs;
 mod materialize;
 pub mod obligation_claims;
-mod receive_write_gate;
+pub(crate) mod receive_write_gate;
 pub(crate) use receive_write_gate::parse_permits;
-mod filled_temps;
-mod large_file_sink;
+pub(crate) mod filled_temps;
+pub(crate) mod large_file_sink;
 mod received_flush_barrier;
 pub(crate) mod retention_batch;
 pub(crate) mod version_retention;
@@ -307,8 +313,7 @@ pub(crate) fn path_is_ignored(
     group_id: &str,
     path: &str,
 ) -> bool {
-    is_ignore_file_relative_path(path)
-        || set.is_ignored(path, false)
+    set.is_ignored(path, false)
         || (set.is_ignored(path, true)
             && matches!(
                 state.desired_path_state(group_id, path),
@@ -331,6 +336,10 @@ mod own_head_recapture_tests;
 /// pre-write commit publishing nothing.
 #[cfg(test)]
 mod receive_content_write_tests;
+#[cfg(all(test, unix))]
+mod write_op_failpoint_tests;
+#[cfg(all(test, unix))]
+mod write_op_matrix_tests;
 
 /// A removal is projected only over what it superseded; an
 /// unobserved local edit survives as a head.
@@ -435,7 +444,7 @@ mod hazard_index_equivalence_tests;
 mod require_physical_kind_matches_tests;
 
 /// Liveness regression for `ignore_sets`'s bounded-staleness reload: a
-/// `.yadorilinkignore` edit must eventually take effect for incoming records
+/// ignore-rules change must eventually take effect for incoming records
 /// on a peer session that never gets reconstructed, not stay frozen for the
 /// session's whole lifetime. Rewinds the cached entry's own `Instant`
 /// (`rewind_ignore_set_cache_for_tests`) instead of sleeping the real
@@ -539,6 +548,7 @@ impl LocalConvergenceExecutor {
             dyn yadorilink_peer_session::peer_session::BlockWriteActivityProvider,
         >,
         headroom: HeadroomPolicy,
+        ignore_rules: IgnoreRulesStore,
     ) -> Arc<Self> {
         // Seeded from the roots known at construction. A root that cannot be
         // canonicalized — an external volume that is not mounted — is simply
@@ -568,19 +578,21 @@ impl LocalConvergenceExecutor {
             root_commit_authority_provider,
             ignore_sets: StdMutex::new(
                 sync_roots
-                    .iter()
-                    .map(|(group_id, root)| {
+                    .keys()
+                    .map(|group_id| {
                         // A load failure -- an I/O error other than "file not
-                        // found", which `load_for_link_root` already handles
+                        // found", which the store already handles as no rules
                         // -- falls back to the built-in defaults rather than
                         // to no filtering, so a transient read error never
                         // widens what this device projects.
-                        let set = EffectiveIgnoreSet::load_for_link_root(root)
+                        let set = ignore_rules
+                            .load(group_id)
                             .unwrap_or_else(|_| EffectiveIgnoreSet::defaults_only());
                         (group_id.clone(), (Arc::new(set), std::time::Instant::now()))
                     })
                     .collect(),
             ),
+            ignore_rules,
             pending_local_change_flush,
             canonical_sync_roots,
             store,
@@ -594,6 +606,8 @@ impl LocalConvergenceExecutor {
             transfer_progress: std::sync::OnceLock::new(),
             #[cfg(any(test, feature = "test-support"))]
             between_assemble_and_persist_hook: StdMutex::new(None),
+            #[cfg(any(test, feature = "test-support"))]
+            after_check_before_publish_hook: StdMutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
             after_write_before_proof_hook: StdMutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
@@ -1346,6 +1360,15 @@ impl LocalConvergenceExecutor {
         // `path_lock` alone still serializes writers of this path.
         let (delete_intent_guard, mutation_generation) =
             self.state.open_tombstone_delete(group_id, &record.path, root_commit_permit)?;
+        crate::write_op::trace::emit_at(
+            group_id,
+            &record.path,
+            crate::write_op::StepEvent::Prepared,
+        );
+        crate::write_op::failpoint::hit(
+            crate::write_op::failpoint::WriteOpFailpoint::AfterPrepare,
+            &record.path,
+        )?;
         // `std::fs::remove_file` on a
         // symlink path is a plain `unlink` of that directory entry
         // — it removes the link itself and never follows it to
@@ -1358,6 +1381,20 @@ impl LocalConvergenceExecutor {
         // `symlink_tombstone_removes_link_but_never_its_target` for
         // a real assertion of this against an actual target file.
         let removal = self.remove_for_tombstone(group_id, &record.path, &out_path)?;
+        crate::write_op::trace::emit_at(
+            group_id,
+            &record.path,
+            // A removal is not a rename: there is no name to land, so nothing is marked.
+            crate::write_op::StepEvent::Published { names_deferred: false, landed_marked: false },
+        );
+        crate::write_op::failpoint::hit(
+            crate::write_op::failpoint::WriteOpFailpoint::AfterPublish,
+            &record.path,
+        )?;
+        crate::write_op::failpoint::hit(
+            crate::write_op::failpoint::WriteOpFailpoint::BeforeProve,
+            &record.path,
+        )?;
         // Settle: clear any hold, record the deletion in the index, and
         // only then clear the intent -- see the settle operations' own doc
         // comments. A retained directory settles the same way: the entry is
@@ -1398,6 +1435,25 @@ impl LocalConvergenceExecutor {
                 root_commit_permit,
             )?;
         }
+        crate::write_op::trace::emit_at(
+            group_id,
+            &record.path,
+            crate::write_op::StepEvent::Proven {
+                outcome: if matches!(removal, TombstoneRemoval::Retained { .. }) {
+                    crate::write_op::ProofOutcome::Retained
+                } else if inherits {
+                    crate::write_op::ProofOutcome::Absent
+                } else {
+                    crate::write_op::ProofOutcome::LocallyErased
+                },
+                intent: crate::write_op::IntentSettlement::Cleared,
+                obligation_closed: false,
+            },
+        );
+        crate::write_op::failpoint::hit(
+            crate::write_op::failpoint::WriteOpFailpoint::AfterProve,
+            &record.path,
+        )?;
         if let TombstoneRemoval::Retained { reason, removable } = removal {
             self.keep_directory_a_delete_found_not_empty(
                 group_id,
@@ -1926,11 +1982,16 @@ impl LocalConvergenceExecutor {
             }
         }
         match self.sync_root(group_id) {
-            Ok(root) => {
-                let set = Arc::new(
-                    EffectiveIgnoreSet::load_for_link_root(&root)
-                        .unwrap_or_else(|_| EffectiveIgnoreSet::defaults_only()),
-                );
+            Ok(_) => {
+                // A rules file that cannot be read keeps the set already in force: falling back
+                // to the defaults would let paths the rules excluded be projected.
+                let set = match self.ignore_rules.load(group_id) {
+                    Ok(set) => Arc::new(set),
+                    Err(_) => cache.get(group_id).map_or_else(
+                        || Arc::new(EffectiveIgnoreSet::defaults_only()),
+                        |(set, _)| set.clone(),
+                    ),
+                };
                 cache.insert(group_id.to_string(), (set.clone(), std::time::Instant::now()));
                 Some(set)
             }
@@ -1940,7 +2001,7 @@ impl LocalConvergenceExecutor {
 
     /// Whether `path` matches this device's
     /// own effective ignore pattern set for `group_id` (built-in defaults
-    /// plus this device's `.yadorilinkignore`, if any). A group with no
+    /// plus this device's ignore rules for the group, if any). A group with no
     /// entry in `ignore_sets` (not one of `sync_roots`) is never ignored
     /// by this check — that shouldn't happen for a group this session
     /// actually shares, since `ignore_sets` is derived from the same

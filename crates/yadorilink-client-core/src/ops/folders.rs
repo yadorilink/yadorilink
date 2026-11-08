@@ -31,9 +31,9 @@ pub async fn pause_folder(
 ) -> Result<(), CoreError> {
     let duration = match duration {
         PauseDuration::UntilResumed => WirePauseDuration::Unspecified,
-        PauseDuration::ThirtyMinutes => WirePauseDuration::ThirtyMinutes,
-        PauseDuration::OneHour => WirePauseDuration::OneHour,
-        PauseDuration::UntilTomorrow => WirePauseDuration::UntilTomorrow,
+        PauseDuration::TwoHours => WirePauseDuration::TwoHours,
+        PauseDuration::EightHours => WirePauseDuration::EightHours,
+        PauseDuration::TwentyFourHours => WirePauseDuration::TwentyFourHours,
     };
     control::send(ReqPayload::Pause(PauseRequest {
         local_path,
@@ -60,17 +60,19 @@ pub async fn resume_folder(
 /// Pauses every currently linked folder. The control protocol tracks pause
 /// per link, so this lists the links and pauses each, rather than adding a
 /// "pause everything" daemon request.
-pub async fn pause_all(duration: PauseDuration) -> Result<(), CoreError> {
-    for link in list_links().await? {
-        pause_folder(link.local_path, duration, None).await?;
+pub async fn pause_all(duration: PauseDuration) -> Result<usize, CoreError> {
+    let links = list_links().await?;
+    for link in &links {
+        pause_folder(link.local_path.clone(), duration, None).await?;
     }
-    Ok(())
+    Ok(links.len())
 }
 
-/// Resumes every currently linked folder.
-pub async fn resume_all() -> Result<(), CoreError> {
-    for link in list_links().await? {
-        resume_folder(link.local_path, None).await?;
+/// Resumes every currently linked folder; returns how many there were.
+pub async fn resume_all() -> Result<usize, CoreError> {
+    let links = list_links().await?;
+    for link in &links {
+        resume_folder(link.local_path.clone(), None).await?;
     }
-    Ok(())
+    Ok(links.len())
 }

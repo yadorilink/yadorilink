@@ -10,21 +10,31 @@
 //! # Shape
 //!
 //! ```text
-//! connect(ALPN = yadorilink/nas-admin/v1)    TLS: both sides prove their device key
+//! connect(ALPN = yadorilink/nas-admin/v2)    TLS: both sides prove their device key
 //!   answerer: authorize(peer)                refused -> close(1, "unauthorized device")
 //! per browser TCP connection, one stream:
-//!   dialler -> open_bi(), 1 byte OpenService(NAS_ADMIN)
+//!   dialler -> open_bi(), 1 byte OpenService(NAS_ADMIN) + 32 bytes session secret
 //!   answerer -> 1 status byte                Ready / Unavailable / Busy
 //!   Ready: raw bytes both ways until either side finishes
 //!   otherwise: answerer finishes; nothing else is sent
 //! ```
 //!
-//! Those two bytes are the whole protocol. The dialler's byte names the
-//! service, and only one value is defined; it exists because a QUIC stream
-//! is invisible to the peer until its opener sends something, and a dialler
-//! checking availability has nothing else to send yet. Nothing after the
+//! Those are the whole protocol. The dialler's byte names the service, and
+//! only one value is defined; it exists because a QUIC stream is invisible
+//! to the peer until its opener sends something. The 32 bytes after it are
+//! the dialler's session secret (see "Session secret"). Nothing after the
 //! status byte is read or framed here; HTTP, keep-alive, WebSocket and
 //! server-sent events pass through as bytes.
+//!
+//! # Session secret
+//!
+//! The device key says which machine is managing, not which program on that
+//! machine: the dialler lends the connection to a loopback listener, and
+//! any local OS user can connect to that. So the dialler makes a random
+//! secret for the session and sends it with every stream; the answerer hands
+//! it to the local service with the stream ([`NasAdminStream::secret`]), and
+//! the service refuses requests that do not present it. The secret travels
+//! only inside the authenticated, encrypted device connection.
 //!
 //! # Versions
 //!
@@ -56,8 +66,12 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use crate::address::PeerAddress;
 use crate::peer::PeerId;
 
-/// ALPN for NAS management. The `v1` is the protocol version.
-pub const YADORI_NAS_ADMIN_ALPN: &[u8] = b"yadorilink/nas-admin/v1";
+/// ALPN for NAS management. The `v2` is the protocol version: v2 opens every stream with the
+/// dialler's session secret, which the dashboard then requires as its bearer.
+pub const YADORI_NAS_ADMIN_ALPN: &[u8] = b"yadorilink/nas-admin/v2";
+
+/// Length of the session secret the dialler sends after the open byte.
+pub const NAS_ADMIN_SECRET_LEN: usize = 32;
 
 /// Close code for a remote that authenticated but may not manage this
 /// device. Same value and meaning as every other protocol's refusal.
@@ -186,10 +200,16 @@ impl NasAdminConnection {
     ///
     /// Only a `Ready` stream is returned; every other answer is an error and
     /// the stream is dropped.
-    pub async fn open_stream(&self) -> Result<NasAdminStream, NasAdminError> {
+    pub async fn open_stream(
+        &self,
+        secret: &[u8; NAS_ADMIN_SECRET_LEN],
+    ) -> Result<NasAdminStream, NasAdminError> {
         let (mut send, mut recv) =
             self.connection.open_bi().await.map_err(|err| self.classify_closed(&err))?;
-        if send.write_all(&[OPEN_NAS_ADMIN]).await.is_err() {
+        let mut open = [0u8; 1 + NAS_ADMIN_SECRET_LEN];
+        open[0] = OPEN_NAS_ADMIN;
+        open[1..].copy_from_slice(secret);
+        if send.write_all(&open).await.is_err() {
             return Err(self.closed_reason().unwrap_or(NasAdminError::Failed));
         }
         let mut status = [0u8; 1];
@@ -197,7 +217,9 @@ impl NasAdminConnection {
             return Err(self.closed_reason().unwrap_or(NasAdminError::Failed));
         }
         match NasAdminStatus::from_byte(status[0]) {
-            Some(NasAdminStatus::Ready) => Ok(NasAdminStream { send, recv, _slot: None }),
+            Some(NasAdminStatus::Ready) => {
+                Ok(NasAdminStream { send, recv, secret: None, _slot: None })
+            }
             Some(NasAdminStatus::Unavailable) => Err(NasAdminError::Unavailable),
             Some(NasAdminStatus::Busy) => Err(NasAdminError::Busy),
             None => Err(NasAdminError::Failed),
@@ -240,7 +262,26 @@ impl NasAdminConnection {
 pub struct NasAdminStream {
     send: iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
+    /// The dialler's session secret: set on the answering side only.
+    secret: Option<SessionSecret>,
     _slot: Option<Slot>,
+}
+
+impl NasAdminStream {
+    /// The session secret the dialler sent with this stream (answering side
+    /// only). The local service must require it of every request.
+    pub fn secret(&self) -> Option<&[u8; NAS_ADMIN_SECRET_LEN]> {
+        self.secret.as_ref().map(|secret| &secret.0)
+    }
+}
+
+/// A session secret that never prints.
+struct SessionSecret([u8; NAS_ADMIN_SECRET_LEN]);
+
+impl std::fmt::Debug for SessionSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionSecret(..)")
+    }
 }
 
 impl AsyncRead for NasAdminStream {
@@ -357,7 +398,7 @@ impl NasAdminService {
             refuse_connection(connection);
             return;
         }
-        let mut open = [0u8; 1];
+        let mut open = [0u8; 1 + NAS_ADMIN_SECRET_LEN];
         match tokio::time::timeout(OPEN_TIMEOUT, recv.read_exact(&mut open)).await {
             Ok(Ok(_)) if open[0] == OPEN_NAS_ADMIN => {}
             _ => {
@@ -365,6 +406,8 @@ impl NasAdminService {
                 return;
             }
         }
+        let mut secret = [0u8; NAS_ADMIN_SECRET_LEN];
+        secret.copy_from_slice(&open[1..]);
         // No fallback: an absent service is reported, never substituted.
         // Asked before taking a slot, so refusals never occupy one.
         if !self.endpoint.available() {
@@ -378,7 +421,12 @@ impl NasAdminService {
         if send.write_all(&[NasAdminStatus::Ready.to_byte()]).await.is_err() {
             return;
         }
-        self.endpoint.deliver(NasAdminStream { send, recv, _slot: Some(slot) });
+        self.endpoint.deliver(NasAdminStream {
+            send,
+            recv,
+            secret: Some(SessionSecret(secret)),
+            _slot: Some(slot),
+        });
     }
 
     fn take_slot(&self, peer: PeerId) -> Option<Slot> {

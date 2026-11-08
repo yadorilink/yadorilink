@@ -40,7 +40,7 @@ exclude = ["crates/yadorilink-shell-ext-windows"]
 
 [workspace.lints.rust]
 # Hoisted verbatim from the member crates, which all carried this same block.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(turmoil)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(turmoil)", "cfg(fuzzing)"] }
 
 [workspace.lints.clippy]
 # `excessive_nesting` is warn-by-default already; it only starts firing once
@@ -49,7 +49,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(turmoil)"] }
 too_many_lines = "warn"
 
 [workspace.package]
-version = "0.1.0-beta.9"
+version = "0.1.0-beta.10"
 edition = "2021"
 license = "AGPL-3.0-only"
 repository = "https://github.com/yadorilink/yadorilink"

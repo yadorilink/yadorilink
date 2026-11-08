@@ -351,7 +351,8 @@ async fn a_management_stream_reaches_the_running_dashboard_without_a_token() {
     let exchange = |request: String| {
         let connection = connection.clone();
         async move {
-            let mut stream = connection.open_stream().await.expect("the dashboard is ready");
+            let mut stream =
+                connection.open_stream(&TEST_SECRET).await.expect("the dashboard is ready");
             stream.write_all(request.as_bytes()).await.unwrap();
             let mut response = Vec::new();
             tokio::time::timeout(Duration::from_secs(15), stream.read_to_end(&mut response))
@@ -365,15 +366,29 @@ async fn a_management_stream_reaches_the_running_dashboard_without_a_token() {
     let page =
         exchange(format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")).await;
     assert!(page.starts_with("HTTP/1.1 200"), "{page}");
-    let api =
-        exchange(format!("GET /api/status HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"))
-            .await;
+    let bearer = test_bearer();
+    let api = exchange(format!(
+        "GET /api/status HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {bearer}\r\nConnection: close\r\n\r\n"
+    ))
+    .await;
     assert!(
         !api.starts_with("HTTP/1.1 401") && !api.starts_with("HTTP/1.1 403"),
-        "no token is asked of a device-authorized request: {api}"
+        "the session secret admits a device-authorized request: {api}"
     );
+    // Without the secret, or with a wrong one, the API answers 401: being a
+    // device-authorized stream is not enough.
+    let none =
+        exchange(format!("GET /api/status HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"))
+            .await;
+    assert!(none.starts_with("HTTP/1.1 401"), "{none}");
+    let wrong = exchange(format!(
+        "GET /api/status HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+        "0".repeat(64)
+    ))
+    .await;
+    assert!(wrong.starts_with("HTTP/1.1 401"), "{wrong}");
     let change = exchange(format!(
-        "POST /api/pause HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+        "POST /api/pause HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {bearer}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
     ))
     .await;
     assert!(change.starts_with("HTTP/1.1 403"), "{change}");
@@ -382,7 +397,7 @@ async fn a_management_stream_reaches_the_running_dashboard_without_a_token() {
     serving.abort();
     let _ = serving.await;
     assert_eq!(
-        connection.open_stream().await.err(),
+        connection.open_stream(&TEST_SECRET).await.err(),
         Some(yadorilink_sync_substrate::NasAdminError::Unavailable)
     );
 }
@@ -409,7 +424,7 @@ async fn refused_from(
 ) {
     use yadorilink_sync_substrate::NasAdminError;
     let refusal = match mac.connect_nas_admin(&nas.local_address()).await {
-        Ok(connection) => connection.open_stream().await.err(),
+        Ok(connection) => connection.open_stream(&TEST_SECRET).await.err(),
         Err(error) => Some(error),
     };
     assert_eq!(refusal, Some(NasAdminError::Unauthorized));
@@ -427,6 +442,13 @@ struct ManagedNas {
 }
 
 const PERIOD: Duration = Duration::from_millis(300);
+
+/// The session secret the test dialler sends with its streams.
+const TEST_SECRET: [u8; 32] = [7u8; 32];
+
+fn test_bearer() -> String {
+    hex::encode(TEST_SECRET)
+}
 
 impl ManagedNas {
     async fn start(seed: u8) -> Self {
@@ -500,7 +522,7 @@ impl ManagedNas {
     async fn held_stream(&self) -> NasAdminStream {
         let connection =
             self.mac.connect_nas_admin(&self.nas.local_address()).await.expect("connects");
-        connection.open_stream().await.expect("admitted")
+        connection.open_stream(&TEST_SECRET).await.expect("admitted")
     }
 
     /// The Mac's next management connection is refused.
@@ -598,7 +620,7 @@ async fn only_a_daemon_that_offers_management_accepts_its_protocol() {
         .await
         .expect("the headless stack starts");
     let answered = match mac.connect_nas_admin(&headless.local_address()).await {
-        Ok(connection) => connection.open_stream().await.err(),
+        Ok(connection) => connection.open_stream(&TEST_SECRET).await.err(),
         Err(error) => Some(error),
     };
     assert_eq!(answered, Some(NasAdminError::Unauthorized), "accepted, then authorized");

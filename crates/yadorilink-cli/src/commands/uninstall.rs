@@ -95,7 +95,7 @@ fn gate_on_record(record: &RecordState, exe: &Path) -> Result<(), CliError> {
 
 /// The installer prefix of `exe`, which must be the installer's layout.
 fn prefix_of(exe: &Path) -> Result<PathBuf, CliError> {
-    super::update::prefix_from_exe(exe, false).ok_or_else(|| {
+    super::update::prefix_from_exe(exe).ok_or_else(|| {
         CliError::Other(format!(
             "this `yadorilink` does not run from an installer layout (<prefix>/share/yadorilink/…), \
              so nothing was removed. To remove this copy: {}. Your synced folders and YadoriLink's \
@@ -556,8 +556,8 @@ async fn hold_credential_store(
 pub async fn uninstall(dry_run: bool, yes: bool, purge_data: bool) -> Result<(), CliError> {
     if cfg!(windows) {
         return Err(CliError::Other(
-            "on Windows, remove a script install with the installer: `& ([scriptblock]::Create((irm \
-             https://yadori.link/install.ps1))) -Uninstall`. Your synced folders and data are kept."
+            "on Windows, remove YadoriLink from Settings > Apps (it is installed from the Microsoft \
+             Store). Your synced folders and data are kept."
                 .into(),
         ));
     }
@@ -638,6 +638,9 @@ pub async fn uninstall(dry_run: bool, yes: bool, purge_data: bool) -> Result<(),
     }
 
     daemon::stop_and_wait(STOP_BUDGET).await?;
+    if let Err(e) = yadorilink_client_core::ops::autostart::remove() {
+        eprintln!("warning: the start-at-login entry was not removed: {e}");
+    }
     let held = hold_credential_store(purge_data, || {
         let backend = yadorilink_fapi_client::store::Backend::from_env(&layout.config_dir)?;
         Ok(CredentialStore::with_backend(backend, &layout.config_dir))

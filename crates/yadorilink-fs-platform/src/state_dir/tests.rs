@@ -15,7 +15,7 @@ fn windows_default_is_outside_appdata_for_every_install_type() {
     for packaged in [false, true] {
         let env = win(packaged);
         let dir = default_dir_for(&env, true).unwrap();
-        assert_eq!(dir, PathBuf::from(r"C:\Users\ann").join(".yadorilink"));
+        assert_eq!(dir, PathBuf::from(r"C:\Users\ann").join(format!(".{STATE_DIR_NAME}")));
         check_placement(&env, &dir).unwrap();
     }
 }
@@ -39,7 +39,10 @@ fn packaged_refuses_appdata_in_any_spelling() {
     ] {
         let err = check_placement(&env, Path::new(dir)).unwrap_err();
         assert!(matches!(err, StateDirError::UnderAppDataWhilePackaged { .. }), "{dir}");
-        assert!(err.to_string().contains(r".yadorilink"), "names the way out: {err}");
+        assert!(
+            err.to_string().contains(&format!(".{STATE_DIR_NAME}")),
+            "names the way out: {err}"
+        );
     }
 }
 
@@ -83,7 +86,7 @@ fn endpoint_names_follow_the_directory() {
 fn unix_default_is_the_per_os_data_dir() {
     let env = Env { home: Some("/home/u".into()), ..Env::default() };
     let dir = default_dir_for(&env, false).unwrap();
-    assert!(dir.ends_with("yadorilink"));
+    assert!(dir.ends_with(STATE_DIR_NAME));
     assert!(dir.starts_with("/home/u"));
 }
 
@@ -393,7 +396,7 @@ fn a_non_ascii_profile_resolves_and_is_placed_outside_appdata() {
         ..Env::default()
     };
     let dir = default_dir_for(&env, true).unwrap();
-    assert_eq!(dir, PathBuf::from(r"C:\Users\日本語").join(".yadorilink"));
+    assert_eq!(dir, PathBuf::from(r"C:\Users\日本語").join(format!(".{STATE_DIR_NAME}")));
     check_placement(&env, &dir).unwrap();
     for under in [
         r"C:\Users\日本語\AppData\Roaming\yadorilink",
@@ -448,4 +451,150 @@ fn an_earlier_builds_sync_root_record_is_found_only_while_it_holds_roots() {
     assert!(legacy_sync_roots_notice(&record).contains("--unregister-legacy-roots"));
     assert!(!legacy_sync_roots_notice(&record).contains("  "));
     assert_eq!(legacy_sync_roots_record(&Env::default()), None);
+}
+
+/// A build that names no state directory keeps the product's: the default string is exactly
+/// `yadorilink`, so an installed product's data is found where it always was. (A build that sets
+/// `YADORILINK_STATE_DIR_NAME` is a different identity and skips this.)
+#[test]
+fn the_product_build_keeps_the_default_state_directory_name() {
+    if option_env!("YADORILINK_STATE_DIR_NAME").is_none() {
+        assert_eq!(STATE_DIR_NAME, "yadorilink");
+        let env = Env { home: Some("/home/ann".into()), ..Default::default() };
+        assert!(default_dir_for(&env, false).unwrap().ends_with("yadorilink"));
+        let win = Env { userprofile: Some(r"C:\Users\ann".into()), ..Default::default() };
+        assert_eq!(
+            default_dir_for(&win, true).unwrap(),
+            PathBuf::from(r"C:\Users\ann").join(".yadorilink")
+        );
+    }
+}
+
+/// Whatever name a build gives, the state directory is its own: it is never the production
+/// directory's name under a case-insensitive file system (macOS's default), and the product's
+/// other places that name the product do not collide with it.
+#[test]
+fn a_named_build_never_shares_the_production_state_directory() {
+    let name = STATE_DIR_NAME.to_ascii_lowercase();
+    if option_env!("YADORILINK_STATE_DIR_NAME").is_some() {
+        assert_ne!(name, "yadorilink", "a named build must not use the production directory");
+    }
+    assert!(!name.is_empty() && !name.contains(['/', '\\']), "{name}");
+}
+
+fn named_env(home: &Path) -> Env {
+    Env { home: Some(home.into()), ..Default::default() }
+}
+
+/// A build with its own state directory name refuses to be pointed at the installed product's
+/// data, spelled in any case, with a trailing separator or inside it; its own default and an
+/// unrelated directory are fine.
+#[cfg(unix)]
+#[test]
+fn a_named_build_refuses_the_production_state_directory_as_an_override() {
+    let home = tempfile::tempdir().unwrap();
+    let env = named_env(home.path());
+    let production = default_dir_named(&env, false, PRODUCT_STATE_DIR_NAME).unwrap();
+    let refuse = |p: &Path| refuse_production_area("yadorilink-staging", &env, p, "TEST_VAR");
+
+    assert!(matches!(
+        refuse(&production),
+        Err(StateDirError::NamedBuildOverridesProduction { .. })
+    ));
+    let upper = production.with_file_name(PRODUCT_STATE_DIR_NAME.to_uppercase());
+    assert!(refuse(&upper).is_err(), "a case-insensitive file system names the same directory");
+    let mut slash = production.clone().into_os_string();
+    slash.push("/");
+    assert!(refuse(Path::new(&slash)).is_err());
+    assert!(refuse(&production.join("blocks")).is_err(), "inside the product's directory");
+
+    let own = default_dir_named(&env, false, "yadorilink-staging").unwrap();
+    assert!(refuse(&own).is_ok(), "the build's own default");
+    assert!(refuse(&home.path().join("elsewhere")).is_ok());
+    let err = refuse(&production).unwrap_err().to_string();
+    assert!(err.contains("TEST_VAR") && err.contains("yadorilink-staging"), "{err}");
+}
+
+/// A symbolic link to the product's directory is still the product's directory.
+#[cfg(unix)]
+#[test]
+fn a_named_build_refuses_a_symbolic_link_to_the_production_directory() {
+    let home = tempfile::tempdir().unwrap();
+    let env = named_env(home.path());
+    let production = default_dir_named(&env, false, PRODUCT_STATE_DIR_NAME).unwrap();
+    std::fs::create_dir_all(&production).unwrap();
+    let alias = home.path().join("alias");
+    std::os::unix::fs::symlink(&production, &alias).unwrap();
+
+    assert!(refuse_production_area("yadorilink-staging", &env, &alias, "TEST_VAR").is_err());
+    assert!(
+        refuse_production_area("yadorilink-staging", &env, &alias.join("db"), "TEST_VAR").is_err()
+    );
+}
+
+/// The installed product's own build is not restricted: it uses its directory.
+#[test]
+fn the_product_build_may_use_the_production_directory() {
+    let home = tempfile::tempdir().unwrap();
+    let env = named_env(home.path());
+    let production = default_dir_named(&env, false, PRODUCT_STATE_DIR_NAME).unwrap();
+    assert!(refuse_production_area(PRODUCT_STATE_DIR_NAME, &env, &production, "V").is_ok());
+    assert!(refuse_production_area("YadoriLink", &env, &production, "V").is_ok());
+}
+
+/// On macOS the product's install witness and log directories are its data too.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_named_build_refuses_the_production_witness_and_log_directories() {
+    let home = tempfile::tempdir().unwrap();
+    let env = named_env(home.path());
+    for dir in ["Library/Caches/YadoriLink", "Library/Logs/yadorilink"] {
+        let path = home.path().join(dir);
+        assert!(refuse_production_area("yadorilink-staging", &env, &path, "V").is_err(), "{dir}");
+    }
+}
+
+/// The resolver and every per-path override apply the guard in a named build: the configured
+/// state directory and each of the six overrides is refused when it is the product's directory,
+/// relative spellings (`..`) included, and a named build's own places are allowed.
+#[cfg(unix)]
+#[test]
+fn a_named_build_applies_the_guard_to_the_state_dir_and_every_override() {
+    let home = tempfile::tempdir().unwrap();
+    let production =
+        default_dir_named(&named_env(home.path()), false, PRODUCT_STATE_DIR_NAME).unwrap();
+    let dotdot = production.join("blocks").join("..");
+    let own = home.path().join("own");
+
+    let with_config =
+        |dir: &Path| Env { config_dir: Some(dir.as_os_str().to_owned()), ..named_env(home.path()) };
+    assert!(matches!(
+        resolve_for("yadorilink-staging", &with_config(&production)),
+        Err(StateDirError::NamedBuildOverridesProduction { .. })
+    ));
+    assert!(resolve_for("yadorilink-staging", &with_config(&dotdot)).is_err());
+    assert_eq!(resolve_for("yadorilink-staging", &with_config(&own)).unwrap(), own);
+    // The product's own build keeps resolving it.
+    assert_eq!(resolve_for(PRODUCT_STATE_DIR_NAME, &with_config(&production)).unwrap(), production);
+
+    for which in PathOverride::ALL {
+        let mut env = named_env(home.path());
+        env.overrides[which.index()] = Some(production.join("x").into_os_string());
+        assert!(
+            matches!(
+                checked_override_for("yadorilink-staging", &env, which),
+                Err(StateDirError::NamedBuildOverridesProduction { .. })
+            ),
+            "{which:?}"
+        );
+        env.overrides[which.index()] = Some(own.join("x").into_os_string());
+        assert!(checked_override_for("yadorilink-staging", &env, which).is_ok(), "{which:?}");
+    }
+}
+
+/// The name a build gives is one directory name (also checked when the crate is compiled).
+#[test]
+fn the_build_time_state_directory_name_is_one_directory_name() {
+    assert!(!STATE_DIR_NAME.is_empty());
+    assert!(!STATE_DIR_NAME.contains(['/', '\\']));
 }

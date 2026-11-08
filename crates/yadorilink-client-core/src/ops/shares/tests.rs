@@ -138,6 +138,29 @@ fn joinable_group_info_deserializes_the_coordination_planes_camelcase_shape() {
         serde_json::from_str(r#"{"groupId":"g-1","name":"photos"}"#).unwrap();
     assert_eq!(parsed.group_id, "g-1");
     assert_eq!(parsed.name, "photos");
+    assert!(parsed.created_by_device.is_none());
+}
+
+#[test]
+fn a_group_carries_the_device_it_was_created_on_when_the_service_names_one() {
+    let parsed: JoinableGroupInfo = serde_json::from_str(
+        r#"{"groupId":"g-1","name":"photos","createdByDevice":{"deviceId":"d-1","name":"Desk","platform":"windows"}}"#,
+    )
+    .unwrap();
+    let device: GroupCreatorDevice = parsed.created_by_device.unwrap().into();
+    assert_eq!(
+        device,
+        GroupCreatorDevice {
+            device_id: "d-1".into(),
+            name: Some("Desk".into()),
+            platform: Some("windows".into())
+        }
+    );
+    let removed: JoinableGroupInfo = serde_json::from_str(
+        r#"{"groupId":"g-1","name":"photos","createdByDevice":{"deviceId":"d-1","name":null,"platform":null}}"#,
+    )
+    .unwrap();
+    assert_eq!(removed.created_by_device.unwrap().name, None);
 }
 
 /// The coordination plane's route handlers read camelCase JSON keys, so these
@@ -296,6 +319,7 @@ fn revoke_error(
             message: message.to_string(),
             group_ids: vec!["group-1".to_string()],
             operation_id: String::new(),
+            ..Default::default()
         },
     ))
 }

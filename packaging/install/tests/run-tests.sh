@@ -10,6 +10,8 @@
 # never touched. Needs python3, curl, unzip; uses OpenSSL 3 as a second
 # Ed25519 engine when one is on PATH or at the Homebrew location.
 set -u
+# The installer speaks the language of the environment; the expectations below are English.
+LC_ALL=C; export LC_ALL
 INSTALL_SH=${INSTALL_SH:-sh}
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -61,7 +63,7 @@ pub() { cat "$SRV/$1/pubkey.hex"; }
 # and which hash is pinned.
 inst() {
     name=$1; keyfrom=$2; shift 2
-    env HOME="$H" SHELL=/bin/sh \
+    env HOME="$H" SHELL=/bin/sh LC_ALL="${TLANG:-C}" \
         YADORILINK_INSTALL_TEST=1 \
         YADORILINK_INSTALL_PUBKEY_HEX="$(pub "$keyfrom")" \
         YADORILINK_INSTALL_KEY_ID="$(cat "$SRV/$keyfrom/key_id")" \
@@ -100,13 +102,43 @@ sys.exit(1 if bad else 0)
 PY
 then ok "override variables are read only in the test branch"; else bad "override variables outside the test branch"; fi
 
+# --- Japanese text: every message has a Japanese text with the same conversions, none is unused
+if python3 - "$INSTALL" <<'PY'
+import re, sys
+s = open(sys.argv[1]).read()
+asked = set(re.findall(r"\b(?:tsay|terr|tdie|trefuse \S+|tf) '([^']*)'", s))
+have = dict(re.findall(r"^        '([^']*)'\) printf '%s' '([^']*)' ;;$", s, re.M))
+problems = []
+problems += ["no Japanese text: " + m for m in sorted(asked - set(have))]
+problems += ["unused Japanese text: " + m for m in sorted(set(have) - asked)]
+problems += ["conversions differ: " + m for m in sorted(asked & set(have)) if m.count("%s") != have[m].count("%s")]
+print("\n".join(problems))
+sys.exit(1 if problems else 0)
+PY
+then ok "every installer message has a Japanese text"; else bad "installer Japanese texts"; fi
+
 # --- 1 success (default engine order), key properties
 newhome 1; fx s1
 inst s1 s1
 if [ $RC = 0 ] && version_is 0.2.0 && has "Manifest signature verified" && has "Installed YadoriLink 0.2.0" &&
     grep -q '^install_source=script$' "$H/prefix/share/yadorilink/install-receipt" &&
-    grep -q 'yadorilink (' "$H/.profile" && has "yadorilink daemon start"; then ok "success: install, receipt, PATH, next steps"; else bad "success" "$T/out"; fi
+    grep -q 'yadorilink (' "$H/.profile" && has "YadoriLink is running." && has "yadorilink login"; then ok "success: install, receipt, PATH, next steps"; else bad "success" "$T/out"; fi
 [ -x "$H/prefix/bin/yadorilink-daemon" ] && ok "daemon linked" || bad "daemon linked"
+
+# --- the same install under a Japanese locale: human text is Japanese, commands and exit status are not
+newhome 190; fx sj
+TLANG=ja_JP.UTF-8; inst sj sj; TLANG=C
+if [ $RC = 0 ] && version_is 0.2.0 && has "インストールしました" && has "yadorilink login" && ! has "Installed YadoriLink"; then ok "Japanese locale: Japanese text, same commands"; else bad "Japanese locale" "$T/out"; fi
+
+# --- the installer starts the daemon, and says the one next step
+newhome 90; fx st1
+inst st1 st1 --no-start
+{ [ $RC = 0 ] && has "was not started (--no-start)" && has "yadorilink daemon start" && has "yadorilink login"; } && ok "--no-start leaves the daemon alone and says how to start it" || bad "--no-start" "$T/out"
+newhome 91; fx st2
+export YL_FAKE_START_FAILS=1
+inst st2 st2
+unset YL_FAKE_START_FAILS
+{ [ $RC = 0 ] && has "could not be started" && has "yadorilink daemon start" && has "yadorilink login"; } && ok "a daemon that does not start does not fail the install" || bad "start fails" "$T/out"
 
 # --- verifier handling
 newhome 2
@@ -354,6 +386,14 @@ inst r1 r1; rb
 inst r2 r1; rb
 { [ $RC = 0 ] && has "Rolled back to YadoriLink 0.2.0" && version_is 0.2.0 && grep -q '^version=0.2.0$' "$RS/install-receipt" && grep -q '^previous_version=0.3.0$' "$RS/install-receipt"; } && ok "rollback switches to the previous version and swaps the receipt" || bad "rollback" "$T/out"
 rb; { [ $RC = 0 ] && version_is 0.3.0; } && ok "a second rollback goes forward again" || bad "rollback forward" "$T/out"
+# a rollback does not read the receipt while another install holds the lock
+# (a receipt whose previous tree is gone would otherwise be refused as "files are gone" first)
+before=$(cat "$RS/install-receipt"); sed 's|^previous_dir=.*|previous_dir='"$RS"'/versions/gone|' "$RS/install-receipt" > "$T/receipt.edit"
+cp "$T/receipt.edit" "$RS/install-receipt"; mkdir "$RS/.lock"; echo $$ > "$RS/.lock/pid"
+rb
+printf '%s\n' "$before" > "$T/receipt.before"
+{ [ $RC != 0 ] && has "another yadorilink install is running" && version_is 0.3.0 && ! has "are gone"; } && ok "rollback reads nothing while another install holds the lock" || bad "rollback lock" "$T/out"
+rm -rf "$RS/.lock"; cp "$T/receipt.before" "$RS/install-receipt"
 prevd=$(sed -n 's/^previous_dir=//p' "$RS/install-receipt")
 cp "$prevd/yadorilink" "$T/prev.bak"; chmod u+w "$prevd/yadorilink"; echo tampered >> "$prevd/yadorilink"
 rb
@@ -578,7 +618,11 @@ owner_record() { mkdir -p "$H/cfg"; printf '{\n  "owner": "%s",\n  "install_sour
 for pair in gui:app_bundle gui:microsoft_store cli:apt cli:homebrew cli:standalone; do
     newhome 73; owner_record "${pair%%:*}" "${pair#*:}"
     YADORILINK_INSTALL_FAIL_RECEIPT=0 YADORILINK_CONFIG_DIR=$H/cfg inst o1 o1
-    { [ $RC = 19 ] && has "Nothing was installed" && nothing_installed; } && ok "owner ${pair} refused with 19" || bad "owner $pair" "$T/out"
+    { [ $RC = 19 ] && has "Nothing was installed" && has "delete $H/cfg/install-owner.json, then run the installer again" && nothing_installed; } && ok "owner ${pair} refused with 19" || bad "owner $pair" "$T/out"
+    case $pair in
+        gui:microsoft_store) { has "Settings > Apps > Installed apps"; } && ok "Store app refusal says how to remove it" || bad "store hint" "$T/out" ;;
+        cli:standalone) { has "has no installer or updater" && ! has "own updater"; } && ok "standalone record refusal says what to do" || bad "standalone hint" "$T/out" ;;
+    esac
 done
 newhome 74; mkdir -p "$H/cfg"; echo 'not json' > "$H/cfg/install-owner.json"
 YADORILINK_INSTALL_FAIL_RECEIPT=0 YADORILINK_CONFIG_DIR=$H/cfg inst o1 o1
@@ -589,6 +633,36 @@ YADORILINK_INSTALL_FAIL_RECEIPT=0 YADORILINK_CONFIG_DIR=$H/cfg inst o1 o1
 newhome 76
 YADORILINK_INSTALL_FAIL_RECEIPT=0 YADORILINK_CONFIG_DIR=$H/cfg inst o1 o1
 { [ $RC = 0 ] && version_is 0.2.0; } && ok "no ownership record installs" || bad "no record" "$T/out"
+
+# --- a running daemon of the install being replaced is stopped first, or the install refuses
+# The fake CLI answers `status` and `daemon stop` from the file named by YL_FAKE_DAEMON.
+newhome 60; fx dm1 --version 0.2.0; fx dm2 --version 0.3.0; fx dm3 --version 0.4.0; fx dm4 --version 0.5.0
+DS=$H/prefix/share/yadorilink
+DST=$T/daemon-state
+export YL_FAKE_DAEMON=$DST
+rm -f "$DST"; inst dm1 dm1
+{ [ $RC = 0 ] && version_is 0.2.0; } && ok "daemon: first install, nothing to stop" || bad "daemon: first install" "$T/out"
+echo running > "$DST"; inst dm2 dm1
+{ [ $RC = 0 ] && version_is 0.3.0 && has "Stopping the running YadoriLink daemon" && [ ! -e "$DST" ] && has "old daemon was stopped"; } && ok "upgrade stops the running daemon of the old install before switching" || bad "upgrade stops daemon" "$T/out"
+rm -f "$DST"; inst dm3 dm1
+{ [ $RC = 0 ] && version_is 0.4.0 && ! has "Stopping the running"; } && ok "upgrade with no daemon running does not mention stopping" || bad "upgrade without daemon" "$T/out"
+echo running > "$DST"; export YL_FAKE_STOP_FAILS=1; inst dm4 dm1; unset YL_FAKE_STOP_FAILS
+{ [ $RC = 1 ] && has "could not be stopped" && has "yadorilink daemon stop" && version_is 0.4.0 && grep -q '^version=0.4.0$' "$DS/install-receipt" && [ -e "$DST" ]; } && ok "a daemon that cannot be stopped refuses with the stop command, nothing changed" || bad "stop fails" "$T/out"
+fx dmbad --version 0.6.0 --broken-bin
+echo running > "$DST"; inst dmbad dm1
+{ [ $RC != 0 ] && version_is 0.4.0 && [ -e "$DST" ]; } && ok "a bundle that fails before activation does not stop the daemon" || bad "broken bundle leaves daemon" "$T/out"
+echo mismatch > "$DST"; inst dm4 dm1
+{ [ $RC = 1 ] && has "cannot reach" && version_is 0.4.0 && grep -q '^version=0.4.0$' "$DS/install-receipt"; } && ok "a daemon its own CLI cannot reach refuses, nothing changed" || bad "mismatch refuses" "$T/out"
+echo running > "$DST"
+rb() { env HOME="$H" SHELL=/bin/sh $INSTALL_SH "$INSTALL" --prefix "$H/prefix" --rollback > "$T/out" 2>&1; RC=$?; }
+rb
+{ [ $RC = 0 ] && version_is 0.3.0 && has "daemon was stopped" && [ ! -e "$DST" ]; } && ok "rollback stops the running daemon first" || bad "rollback stops daemon" "$T/out"
+echo running > "$DST"; export YL_FAKE_STOP_FAILS=1; rb; unset YL_FAKE_STOP_FAILS
+{ [ $RC = 1 ] && has "could not be stopped" && version_is 0.3.0; } && ok "rollback with an unstoppable daemon refuses, nothing changed" || bad "rollback refuses" "$T/out"
+rm -f "$DST"
+echo running > "$DST"; inst dm4 dm1 --uninstall
+{ [ $RC = 0 ] && [ ! -e "$DST" ] && [ ! -e "$H/prefix/bin/yadorilink" ]; } && ok "uninstall stops the running daemon" || bad "uninstall stops daemon" "$T/out"
+unset YL_FAKE_DAEMON
 
 # --- cross-check: the fixture signer (RFC 8032 reference) agrees with OpenSSL 3
 if [ -n "$OPENSSL3" ]; then

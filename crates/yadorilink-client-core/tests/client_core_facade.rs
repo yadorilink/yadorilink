@@ -153,6 +153,7 @@ async fn an_unforced_unlink_refused_for_durability_offers_the_override() {
                 .into(),
             group_ids: vec!["g1".into()],
             operation_id: String::new(),
+            ..Default::default()
         })
     });
     std::env::set_var("YADORILINK_CONTROL_SOCKET", &socket);

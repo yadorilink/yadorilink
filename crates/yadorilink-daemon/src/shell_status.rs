@@ -165,6 +165,12 @@ pub fn shell_badge(
     {
         return ShellBadge::OnlineOnly;
     }
+    // Content being fetched right now is syncing, whatever the row says.
+    if state != ShellSyncState::Unspecified
+        && local.is_some_and(|l| l.transition() == LocalTransition::Hydrating)
+    {
+        return ShellBadge::Syncing;
+    }
     match state {
         ShellSyncState::Synced => ShellBadge::Synced,
         ShellSyncState::Syncing => ShellBadge::Syncing,
@@ -225,10 +231,7 @@ pub fn resolve_status_detail(sync_state: &ReplicaCoordinator, absolute_path: &st
         Err(_) => return ShellStatus::of(ShellSyncState::Unspecified),
     };
     if let Some(record) = own_row.as_ref().filter(|record| !record.deleted) {
-        if yadorilink_replica_domain::conflict::is_conflict_copy_path(&record.path) {
-            return ShellStatus::of(ShellSyncState::Error);
-        }
-        return ShellStatus::of(aggregate_status(sync_state, &group_id, rel_path));
+        return live_entry_status(sync_state, &group_id, rel_path, &record.path);
     }
     match sync_state.sqlite().retained_directory_reason(&group_id, rel_path) {
         Ok(Some(reason)) => {
@@ -250,6 +253,43 @@ pub fn resolve_status_detail(sync_state: &ReplicaCoordinator, absolute_path: &st
         Ok(false) => ShellStatus::of(ShellSyncState::Pending),
         Err(_) => ShellStatus::of(ShellSyncState::Unspecified),
     }
+}
+
+/// The status of an entry that has a live row: an error for a conflict copy or a file this device
+/// holds back (a name another system cannot hold, which needs the person), else what is indexed
+/// below it decides.
+fn live_entry_status(
+    sync_state: &ReplicaCoordinator,
+    group_id: &str,
+    rel_path: &str,
+    row_path: &str,
+) -> ShellStatus {
+    if yadorilink_replica_domain::conflict::is_conflict_copy_path(row_path) {
+        return ShellStatus::of(ShellSyncState::Error);
+    }
+    match sync_state.get_held_state(group_id, rel_path) {
+        Ok(Some(held)) => ShellStatus { state: ShellSyncState::Error, detail: Some(held.reason) },
+        Ok(None) => ShellStatus::of(aggregate_status(sync_state, group_id, rel_path)),
+        Err(_) => ShellStatus::of(ShellSyncState::Unspecified),
+    }
+}
+
+/// The badge of a FILE the provider shows, through the same `shell_badge` rule a path status uses:
+/// the status of its live row and what the engine holds of it. Folders are not asked (their status
+/// walks everything below them), so a folder has no badge here.
+pub fn provider_file_badge(
+    sync_state: &ReplicaCoordinator,
+    group_id: &str,
+    rel_path: &str,
+    local: Option<&yadorilink_ipc_proto::shellipc::LocalState>,
+) -> yadorilink_ipc_proto::shellipc::ShellBadge {
+    // A path without a live row (a peer just deleted it) has no status, as in a path status.
+    match sync_state.file_index_repository().get_file(group_id, rel_path) {
+        Ok(Some(record)) if !record.deleted => {}
+        _ => return yadorilink_ipc_proto::shellipc::ShellBadge::Unspecified,
+    }
+    let status = live_entry_status(sync_state, group_id, rel_path, rel_path);
+    shell_badge(status.state, local)
 }
 
 /// The status a directory at `rel_path` (the link root when empty) takes

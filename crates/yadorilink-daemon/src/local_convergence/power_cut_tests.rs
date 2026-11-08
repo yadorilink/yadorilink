@@ -67,7 +67,7 @@ pub(super) enum Cut {
     Missing,
 }
 
-const EVERY_CUT: [Cut; 6] =
+pub(super) const EVERY_CUT: [Cut; 6] =
     [Cut::Old, Cut::New, Cut::Partial, Cut::PartialRestamped, Cut::Zero, Cut::Missing];
 
 /// What of a file reached stable storage when the power went.
@@ -160,6 +160,28 @@ impl Scenario {
                 (Barrier::Survives, false) | (Barrier::CutInFiles, false) => Durable::Neither,
                 (Barrier::CutInFiles, true) | (Barrier::CutBeforeDirFlush, _) => Durable::DataOnly,
             },
+        }
+    }
+
+    /// The crash state of the write operation this scenario cuts the power in (the verdict
+    /// table of the design). A cut before the rename leaves the old file where it was: with a
+    /// prior version that is the pre-image of a prepared write (X1), without one the name is
+    /// simply missing and the sweep reads it as a rename that was not recorded (X3). Then renamed
+    /// but unrecorded or unflushed (X3), proven with the flush owed (X5), diverged by a user edit
+    /// (X7), or settled (X0).
+    pub(super) fn crash_state(&self) -> yadorilink_replica_domain::crash_state::CrashState {
+        use yadorilink_replica_domain::crash_state::CrashState as X;
+        match (self.stage, self.barrier) {
+            (Stage::BeforeRename, _) if self.prior => X::X1Prepared,
+            (Stage::BeforeRename, _) => X::X3RenamedUnrecorded,
+            (Stage::BeforeCommit, _) => X::X3RenamedUnrecorded,
+            (Stage::Committed, _) if !matches!(self.user_edit, UserEdit::None) => X::X7Diverged,
+            (Stage::Committed, Barrier::CutInFiles | Barrier::CutBeforeDirFlush) => {
+                X::X3RenamedUnrecorded
+            }
+            (Stage::Committed, Barrier::CutBeforeClear) => X::X5ProvenFlushPending,
+            (Stage::Committed, Barrier::Survives) if self.flushed.iter().all(|f| *f) => X::X0Idle,
+            (Stage::Committed, Barrier::Survives) => X::X5ProvenFlushPending,
         }
     }
 
@@ -627,7 +649,7 @@ pub(super) async fn run_scenario(scenario: &Scenario) -> Result<(), String> {
 
 static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-fn base(files: usize, stage: Stage, barrier: Barrier) -> Scenario {
+pub(super) fn base(files: usize, stage: Stage, barrier: Barrier) -> Scenario {
     Scenario {
         uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         files,

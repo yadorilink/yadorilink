@@ -27,7 +27,8 @@
 //!    request to this origin, cross-origin page or not; a header is not).
 //!
 //! Streams the daemon authorized as another device on the same account
-//! (`Access::Peer`, see `peer.rs`) skip layer 3, accept any loopback `Host`
+//! (`Access::Peer`, see `peer.rs`) check layer 3 against the session secret
+//! their dialler sent, accept any loopback `Host`
 //! port in layer 1, and in layer 2 need `Origin` to be exactly their own
 //! `http://<Host>`, present on every state-changing request.
 //!
@@ -135,10 +136,6 @@ pub async fn require_bearer_token(
     req: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    // A stream the daemon already authorized as a same-account device.
-    if state.access == Access::Peer {
-        return Ok(next.run(req).await);
-    }
     // RFC 7235 says the auth-scheme token ("Bearer") is compared
     // case-insensitively; `str::strip_prefix` alone is not, so this splits
     // the scheme off explicitly instead.
@@ -147,9 +144,18 @@ pub async fn require_bearer_token(
             let (scheme, rest) = v.split_once(' ')?;
             scheme.eq_ignore_ascii_case("bearer").then_some(rest)
         });
-    let ok = match presented {
-        Some(presented) => constant_time_eq(presented.as_bytes(), state.token.as_bytes()),
-        None => false,
+    // A device-authorized stream (`Access::Peer`) is checked against the
+    // session secret its dialler sent with it; a request with no secret on
+    // record (no extension) is refused. The TCP listener uses this run's token.
+    let expected: Option<&str> = match state.access {
+        Access::Peer => req.extensions().get::<crate::peer::SessionBearer>().map(|b| b.0.as_str()),
+        _ => Some(&*state.token),
+    };
+    let ok = match (presented, expected) {
+        (Some(presented), Some(expected)) => {
+            constant_time_eq(presented.as_bytes(), expected.as_bytes())
+        }
+        _ => false,
     };
     if !ok {
         return Err(ApiError::Unauthorized);

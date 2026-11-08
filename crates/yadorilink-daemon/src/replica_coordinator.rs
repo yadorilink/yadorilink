@@ -30,6 +30,7 @@
 
 mod block_reclamation;
 pub mod engine_ports;
+mod link_admission;
 pub mod local_commit;
 mod local_mutation;
 mod materialization_execution;
@@ -74,6 +75,8 @@ pub(crate) use materialization_owner::{
     ContentWriteClose, ContentWriteCloseItem, OwnedContentWriteOpen,
 };
 mod peer_replica_state;
+mod provider_writes;
+pub(crate) use provider_writes::ProviderWrites;
 
 // Test-only: lets `gc.rs`/`hydration.rs`'s own unit tests reach
 // `materialization_execution`'s Windows-native-dehydrate bypass without
@@ -145,12 +148,15 @@ pub struct ReplicaCoordinator {
     offline_group_policy_log_repository: yadorilink_sync_sqlite::OfflineGroupPolicyLogRepository,
     dirty_path_repository: yadorilink_sync_sqlite::DirtyPathRepository,
     paused_item_repository: yadorilink_sync_sqlite::PausedItemRepository,
-    pinned_item_repository: yadorilink_sync_sqlite::PinnedItemRepository,
+    retention_rules: yadorilink_sync_sqlite::RetentionRuleRepository,
     held_path_repository: yadorilink_sync_sqlite::HeldPathRepository,
     restore_operation_repository: yadorilink_sync_sqlite::RestoreOperationRepository,
     rewind_run_repository: yadorilink_sync_sqlite::RewindRunRepository,
     /// Groups whose retention expiry is held off (see [`Self::pause_retention`]).
     retention_pauses: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Files this device just wrote and verified, so the watcher event for the write does not hash
+    /// them again (`yadorilink_fs_platform::verified_echo`).
+    verified_echoes: Arc<yadorilink_fs_platform::verified_echo::VerifiedEchoes>,
     handoff_lease_repository: yadorilink_sync_sqlite::HandoffLeaseRepository,
     remote_custody_lease_repository: yadorilink_sync_sqlite::RemoteCustodyLeaseRepository,
     remote_custody_hold_repository: yadorilink_sync_sqlite::RemoteCustodyHoldRepository,
@@ -188,6 +194,9 @@ pub struct ReplicaCoordinator {
     store_mode_requests: crate::ingest_policy::StoreModeRequests,
     /// Concurrent receive file assemblies of this engine, sized by the tuning.
     receive_write_gate: Arc<tokio::sync::Semaphore>,
+    /// Large files a provider fetch was writing into their staging files when it was interrupted,
+    /// kept for the next attempt of the same version in this process.
+    hydration_partial_temps: Arc<crate::local_convergence::filled_temps::PartialTemps>,
     /// Set while the author identity is refused because the database was
     /// restored or copied (`install_witness`); what status reports.
     database_restored: Mutex<Option<crate::install_witness::Restored>>,
@@ -305,7 +314,7 @@ impl ReplicaCoordinator {
         startup_readiness: Arc<StartupReadinessRegistry>,
         tuning: crate::engine_tuning::EngineTuning,
     ) -> Result<Self, yadorilink_sqlite_runtime::DatabaseError> {
-        let tuning = Arc::new(tuning.coherent());
+        let tuning = Arc::new(tuning);
         let sqlite = Arc::new(yadorilink_sync_sqlite::SqliteSyncStore::new(database.clone()));
         // Closes that outstanding removal tickets hold, back in place before
         // anything can ask for a custody lease.
@@ -347,9 +356,7 @@ impl ReplicaCoordinator {
             paused_item_repository: yadorilink_sync_sqlite::PausedItemRepository::new(
                 database.clone(),
             ),
-            pinned_item_repository: yadorilink_sync_sqlite::PinnedItemRepository::new(
-                database.clone(),
-            ),
+            retention_rules: yadorilink_sync_sqlite::RetentionRuleRepository::new(database.clone()),
             held_path_repository: yadorilink_sync_sqlite::HeldPathRepository::new(database.clone()),
             restore_operation_repository: yadorilink_sync_sqlite::RestoreOperationRepository::new(
                 database.clone(),
@@ -358,6 +365,7 @@ impl ReplicaCoordinator {
                 database.clone(),
             ),
             retention_pauses: Arc::default(),
+            verified_echoes: Arc::default(),
             store_mode_requests: Default::default(),
             handoff_lease_repository: yadorilink_sync_sqlite::HandoffLeaseRepository::new(
                 database.clone(),
@@ -380,6 +388,7 @@ impl ReplicaCoordinator {
             local_policy_head_provider: Mutex::new(None),
             local_author: Mutex::new(None),
             receive_write_gate: Arc::new(tokio::sync::Semaphore::new(tuning.receive_write_permits)),
+            hydration_partial_temps: Arc::default(),
             tuning,
             database_restored: Mutex::new(None),
             author_unavailable: Mutex::new(false),
@@ -460,8 +469,18 @@ impl ReplicaCoordinator {
     // --- Accessors needed by the port impls below, so callers can reach
     // individual repositories without the fields themselves being public. ---
 
+    /// The provider-state writes: roots, items, announcements and download evidence.
+    pub(crate) fn provider_writes(&self) -> provider_writes::ProviderWrites<'_> {
+        provider_writes::ProviderWrites(&self.provider_repository)
+    }
+
     pub fn provider_repository(&self) -> &yadorilink_sync_sqlite::provider::ProviderRepository {
         &self.provider_repository
+    }
+
+    /// The link-row writes: add, remove, pause and re-policy a link.
+    pub(crate) fn link_admission(&self) -> link_admission::LinkAdmission<'_> {
+        link_admission::LinkAdmission(&self.link_repository)
     }
 
     pub fn link_repository(&self) -> &yadorilink_sync_sqlite::link::LinkRepository {
@@ -529,6 +548,13 @@ impl ReplicaCoordinator {
         &self.materialization_state_repository
     }
 
+    /// The partly written staging files of interrupted provider fetches (see the field).
+    pub(crate) fn hydration_partial_temps(
+        &self,
+    ) -> &Arc<crate::local_convergence::filled_temps::PartialTemps> {
+        &self.hydration_partial_temps
+    }
+
     /// The semaphore bounding this engine's concurrent receive file assemblies.
     pub(crate) fn receive_write_gate(&self) -> Arc<tokio::sync::Semaphore> {
         self.receive_write_gate.clone()
@@ -548,8 +574,7 @@ impl ReplicaCoordinator {
 
     /// Whether the receive path's commits run on the blocking pool while the
     /// awaiting task keeps polling (see `SyncDatabase::write_immediate_offloaded`):
-    /// on unless the engine's tuning turned it off. A/B knob for the measurement, to be deleted
-    /// afterwards.
+    /// always, except where a test pins it off.
     pub(crate) fn async_commit(&self) -> bool {
         #[cfg(test)]
         match self.test_observers.async_commit_override.load(std::sync::atomic::Ordering::Relaxed) {
@@ -557,7 +582,7 @@ impl ReplicaCoordinator {
             2 => return false,
             _ => {}
         }
-        self.tuning.receive_async_commit
+        true
     }
 
     pub fn sqlite(&self) -> &yadorilink_sync_sqlite::SqliteSyncStore {
@@ -812,9 +837,9 @@ impl ReplicaCoordinator {
     }
 
     /// The items kept on this device by the user's choice -- see
-    /// `yadorilink_sync_sqlite::pinned_items` for what a pin means.
-    pub fn pinned_item_repository(&self) -> &yadorilink_sync_sqlite::PinnedItemRepository {
-        &self.pinned_item_repository
+    /// `yadorilink_sync_sqlite::retention_rules` for what a rule means.
+    pub fn retention_rules(&self) -> &yadorilink_sync_sqlite::RetentionRuleRepository {
+        &self.retention_rules
     }
 
     /// The held paths whose disk state has not yet been reconciled -- see `yadorilink_sync_sqlite::held_path`.
@@ -1210,15 +1235,26 @@ impl ReplicaCoordinator {
         if paused.contains(group_id) {
             return Ok(0);
         }
-        let now_unix_seconds = now_unix_nanos / 1_000_000_000;
-        let pinned = self
-            .handoff_lease_repository
-            .leased_version_keys_for_group(group_id, now_unix_seconds)?;
-        Ok(self.file_index_repository.expire_superseded_and_trashed_versions(
-            group_id,
-            now_unix_nanos,
-            &pinned,
-        )?)
+        Ok(self
+            .file_index_repository
+            .expire_superseded_and_trashed_versions(group_id, now_unix_nanos)?)
+    }
+}
+
+impl ReplicaCoordinator {
+    /// Drops the oldest kept versions of every folder while the bytes only kept versions hold
+    /// exceed `budget_bytes` (see `yadorilink_sync_sqlite::history_budget`). Versions pinned by a
+    /// handoff lease stay (read inside the trimming transaction). Trims nothing while any folder's retention is paused, like the expiry.
+    pub fn trim_history_over_budget(
+        &self,
+        budget_bytes: u64,
+        now_unix_nanos: i64,
+    ) -> Result<usize, SyncError> {
+        let paused = self.retention_pauses.lock().unwrap_or_else(|p| p.into_inner());
+        if !paused.is_empty() {
+            return Ok(0);
+        }
+        Ok(self.file_index_repository.trim_history_over_budget(budget_bytes, now_unix_nanos)?)
     }
 }
 

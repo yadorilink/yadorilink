@@ -341,6 +341,8 @@ pub(crate) struct AccountCommands {
     /// new start over without a journal would read that stale report as a fresh refusal and
     /// retire the identity just registered. Cleared by the restart (a new engine, a new value).
     restart_required: std::sync::atomic::AtomicBool,
+    /// The signed-in account's email, read once per sign-in of this engine.
+    email: yadorilink_client_core::account_email::AccountEmailMemo,
 }
 
 impl AccountCommands {
@@ -358,6 +360,7 @@ impl AccountCommands {
             sign_in: Mutex::new(None),
             identity: tokio::sync::Mutex::new(()),
             restart_required: std::sync::atomic::AtomicBool::new(false),
+            email: yadorilink_client_core::account_email::AccountEmailMemo::new(),
         }
     }
 
@@ -404,12 +407,30 @@ impl AccountCommands {
     }
 
     /// `has_linked_folders` is the engine's answer, which only the caller has.
-    pub(crate) fn account_status_with(&self, has_linked_folders: Option<bool>) -> AccountStatus {
-        yadorilink_client_core::account_status_in(
+    pub(crate) async fn account_status_with(
+        &self,
+        has_linked_folders: Option<bool>,
+    ) -> AccountStatus {
+        let mut status = yadorilink_client_core::account_status_in(
             &self.config_dir,
             &self.settings,
             has_linked_folders,
-        )
+        );
+        if let (yadorilink_client_core::dto::SignInState::SignedIn, Some(client_id)) =
+            (&status.sign_in, &status.client_id)
+        {
+            let info = self
+                .email
+                .read(client_id, async {
+                    let auth = require_auth_in(&self.config_dir, &self.settings).await?;
+                    ops::account::account_info_with(&auth).await
+                })
+                .await;
+            status.email = info.email;
+            status.sign_in_provider = info.sign_in_provider;
+            status.display_name = info.display_name;
+        }
+        status
     }
 
     /// The start over over `ports`, one at a time with the other identity commands.
@@ -465,7 +486,7 @@ impl AccountCommands {
         let settings = &self.settings;
         Ok(match command {
             AccountCommand::Status => {
-                CommandOutput::Account(Box::new(self.account_status_with(None)))
+                CommandOutput::Account(Box::new(self.account_status_with(None).await))
             }
             AccountCommand::BeginSignIn(begin) => self.begin_session(|| {
                 (self.sign_in_factory)(
@@ -473,6 +494,7 @@ impl AccountCommands {
                     LoginOptions {
                         flow: LoginFlow::DeviceCode,
                         overall_timeout: begin.overall_timeout,
+                        device_name: None,
                     },
                     begin.reauthenticate,
                 )
@@ -490,6 +512,7 @@ impl AccountCommands {
                         LoginOptions {
                             flow: LoginFlow::Loopback,
                             overall_timeout: begin.overall_timeout,
+                            device_name: None,
                         },
                     )
                 })?
@@ -585,6 +608,7 @@ impl AccountCommands {
                         .map(|g| yadorilink_client_core::dto::GroupSummary {
                             group_id: g.group_id,
                             name: g.name,
+                            created_by_device: g.created_by_device,
                         })
                         .collect(),
                 )

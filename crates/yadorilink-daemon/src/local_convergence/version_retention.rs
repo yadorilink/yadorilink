@@ -415,7 +415,7 @@ pub(crate) fn ingest_replacement_proof<E>(
             }
         }
         crate::file_block_source::Opened::Gone => Ok(RetentionProof::NoLocalBytes(row)),
-        crate::file_block_source::Opened::Unavailable => Err(ProofError::FileUnavailable),
+        crate::file_block_source::Opened::Unavailable(_) => Err(ProofError::FileUnavailable),
     }
 }
 

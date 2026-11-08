@@ -14,6 +14,7 @@ use yadorilink_client_core::attention as view;
 
 use crate::commands::device_names::DeviceNames;
 use crate::error::CliError;
+use crate::i18n::{tr, trf};
 
 /// Same "best-effort canonicalize, fall back to the given string"
 /// resolution `materialization.rs`'s own `absolute_path` helper uses — a
@@ -32,7 +33,7 @@ pub async fn versions(local_path: String) -> Result<(), CliError> {
     let absolute_path = absolute_path(&local_path)?;
     let history = files::list_version_history(absolute_path).await?;
     if history.versions.is_empty() && history.not_kept.is_empty() {
-        println!("No retained versions for {local_path}.");
+        println!("{}", trf!("No retained versions for {local_path}.", local_path = local_path));
         return Ok(());
     }
     let devices = DeviceNames::load().await;
@@ -57,6 +58,7 @@ fn not_kept_lines(spans: &[NotKeptSpan]) -> Vec<String> {
     let words = |reason: &str| match reason {
         "LowSpace" => Some("the disk was nearly full"),
         "Expired" => Some("the retention period ended"),
+        "OverBudget" => Some("the space set aside for older versions was full"),
         _ => None,
     };
     let mut sorted: Vec<&NotKeptSpan> =
@@ -147,7 +149,7 @@ pub async fn restore(local_path: String, version: Option<i64>) -> Result<(), Cli
 pub async fn trash_list() -> Result<(), CliError> {
     let trashed = files::list_trash(None).await?;
     if trashed.is_empty() {
-        println!("Trash is empty.");
+        println!("{}", tr("Trash is empty."));
         return Ok(());
     }
     let devices = DeviceNames::load().await;
@@ -191,7 +193,7 @@ fn folder_operation_label(deleted_by_operation: &str) -> Option<&str> {
 async fn conflicts_list() -> Result<(), CliError> {
     let conflicts = files::list_conflicts(None).await?;
     if conflicts.is_empty() {
-        println!("No conflicted files.");
+        println!("{}", tr("No conflicted files."));
         return Ok(());
     }
     let devices = DeviceNames::load().await;
@@ -269,7 +271,7 @@ fn format_local_time(unix_nanos: i64) -> String {
 pub async fn trash_restore(local_path: String) -> Result<(), CliError> {
     let absolute_path = absolute_path(&local_path)?;
     files::restore_from_trash(absolute_path).await?;
-    println!("Restored {local_path} from trash");
+    println!("{}", trf!("Restored {local_path} from trash", local_path = local_path));
     Ok(())
 }
 

@@ -6,11 +6,11 @@ use yadorilink_ipc_proto::daemonctl::{
     GroupDurabilityStatus, HandoffResult, HeldFile as WireHeldFile, InboxFileSummary,
     InboxTransfer, LinkStatus, LocalState as WireLocalState, LocalStorageState as WireLocal,
     LocalTransition as WireTransition, MaterializationStatusResponse, MembershipHandoffResult,
-    MintedInviteInfo, PeerReachability as WireReach, PeerStatus, PinItemResponse, RecentSyncError,
+    MintedInviteInfo, PeerReachability as WireReach, PeerStatus, RecentSyncError,
     ReplicaMembershipCommandOutcome, RetentionPolicy as WireRetention,
-    RetentionState as WireRetentionState, RouteKind as WireRoute, StatusResponse, TrashedFileInfo,
-    UnreachableCategory as WireUnreach, UpdateConfigResponse, UpdateInstallResponse,
-    UpdateStatusResponse, VolumeFreeSpace,
+    RetentionState as WireRetentionState, RouteKind as WireRoute, SetRetentionRuleResponse,
+    StatusResponse, TrashedFileInfo, UnreachableCategory as WireUnreach, UpdateConfigResponse,
+    UpdateInstallResponse, UpdateStatusResponse, VolumeFreeSpace,
 };
 use yadorilink_ipc_proto::daemonctl::{
     ProviderRootStatus as WireProviderRoot, StuckFile as WireStuck,
@@ -56,6 +56,9 @@ fn account(device_id: Option<&str>) -> AccountStatus {
         default_device_name: "box".into(),
         has_linked_folders: Some(true),
         start_over_pending: false,
+        email: None,
+        sign_in_provider: None,
+        display_name: None,
     }
 }
 
@@ -105,7 +108,6 @@ fn every_rollup_category_is_recognized_and_an_unknown_one_is_kept_raw() {
     let expected = [
         ("degraded", AttentionCategory::Degraded),
         ("durability_at_risk", AttentionCategory::DurabilityAtRisk),
-        ("durability_unknown", AttentionCategory::DurabilityUnknown),
         ("fetch_unavailable", AttentionCategory::FetchUnavailable),
         ("fetch_availability_unknown", AttentionCategory::FetchAvailabilityUnknown),
         ("conflict", AttentionCategory::Conflict),
@@ -117,9 +119,10 @@ fn every_rollup_category_is_recognized_and_an_unknown_one_is_kept_raw() {
         ("recent_error", AttentionCategory::RecentError),
         ("update_failed", AttentionCategory::UpdateFailed),
         ("peer_update_required", AttentionCategory::UpdateRequired),
+        ("peer_newer", AttentionCategory::UpdateRequired),
         ("update_required", AttentionCategory::UpdateRequired),
         ("ambiguous", AttentionCategory::Ambiguous),
-        ("ownership_lost", AttentionCategory::OwnershipLost),
+        ("folder_needs_relink", AttentionCategory::OwnershipLost),
         ("volume_changed", AttentionCategory::VolumeChanged),
         ("volume_unconfirmed", AttentionCategory::VolumeUnconfirmed),
         ("provider_not_ready", AttentionCategory::ProviderNotReady),
@@ -147,13 +150,28 @@ fn a_restored_provider_registry_reaches_shells_by_key_and_severity() {
     );
 }
 
+/// The start-over follow-up is one key; the step (and a wait's reason) are its arguments, and the
+/// identity differs per step so a new step notifies again.
+#[test]
+fn the_replacement_follow_up_carries_its_step_as_an_argument() {
+    let arg = |name: &str, value: &str| AttentionArg { name: name.into(), value: value.into() };
+    let confirming = attention_reason("replacement_unconfirmed", &[], &[]);
+    assert_eq!(confirming.key, "replacement_unconfirmed");
+    assert_eq!(confirming.args, vec![arg("step", "confirming")]);
+    let waiting = attention_reason("replacement_unconfirmed:waiting:g1: startup", &[], &[]);
+    assert_eq!(waiting.key, "replacement_unconfirmed");
+    assert_eq!(waiting.args, vec![arg("step", "waiting"), arg("reason", "g1: startup")]);
+    let sign_in = attention_reason("replacement_unconfirmed:sign_in", &[], &[]);
+    assert_eq!(sign_in.args, vec![arg("step", "sign_in")]);
+    assert_ne!(sign_in.identity, waiting.identity);
+}
+
 #[test]
 fn keyed_only_items_reach_shells_as_unrecognized_with_their_own_key() {
     for (raw, key) in [
         ("provider_registry_restored:older_generation", "provider_registry_restored"),
         ("database_restored:older_generation", "database_restored"),
         ("author_unavailable:x", "author_unavailable"),
-        ("not_joined:g1", "not_joined"),
         ("unreadable_files:g1", "unreadable_files"),
         ("approval_pending:g1", "approval_pending"),
         ("waiting_for_disk_space:g1", "waiting_for_disk_space"),
@@ -783,7 +801,6 @@ fn preflight_issues_follow_the_reports_own_order() {
             relation: WireNested::Ancestor,
         }],
         risky_location: Some(RiskyLocation::CloudProviderFolder("Dropbox")),
-        ignore_rules_unreadable: true,
         reserved_namespace_blocked_paths: vec![".yadorilink-x".into()],
         ..Default::default()
     };
@@ -802,7 +819,6 @@ fn preflight_issues_follow_the_reports_own_order() {
     assert_eq!(
         result.issues,
         vec![
-            PreflightIssue::IgnoreRulesUnreadable,
             PreflightIssue::NotEmpty { entry_count: 3, scan_truncated: true },
             PreflightIssue::CriticalFreeSpace { available_bytes: 5, headroom_bytes: 10 },
             PreflightIssue::NestedLink {
@@ -862,6 +878,7 @@ fn updates_map_states_modes_and_outcomes() {
         ("checking", UpdateState::Checking),
         ("available", UpdateState::Available),
         ("held_back", UpdateState::HeldBack),
+        ("state_incompatible", UpdateState::StateIncompatible),
         ("kill_switched", UpdateState::KillSwitched),
         ("downloading", UpdateState::Downloading),
         ("downloaded", UpdateState::Downloaded),
@@ -987,9 +1004,12 @@ fn account_deletion_and_transfers_parse_their_states() {
         offered_at_unix_nanos: 4_000_000_000,
         status: "in_progress".into(),
         failure: String::new(),
+        files_done: 0,
+        files_total: 1,
         ..Default::default()
     });
     assert_eq!(inbox.status, IncomingTransferStatus::InProgress);
+    assert_eq!((inbox.files_done, inbox.files_total), (0, 1));
     assert_eq!(inbox.offered_at, Some(secs(4)));
     assert_eq!(inbox.files, vec![IncomingFile { relative_path: "a".into(), size: 1 }]);
     assert_eq!((inbox.failure.clone(), inbox.can_retry), (None, false));
@@ -1085,6 +1105,13 @@ fn retention_is_reported_apart_from_the_materialization_state() {
         file_retention(Some(&inherited)),
         FileRetention { policy: RetentionPolicy::Pinned, inherited: true }
     );
+    // An online-only rule is its own policy, and inherited when a folder above sets it.
+    let online_only =
+        WireRetentionState { policy: WireRetention::OnlineOnly as i32, explicit: false };
+    assert_eq!(
+        file_retention(Some(&online_only)),
+        FileRetention { policy: RetentionPolicy::OnlineOnly, inherited: true }
+    );
     // An unreadable value is not "kept".
     let unknown = WireRetentionState { policy: 99, explicit: true };
     assert_eq!(file_retention(Some(&unknown)).policy, RetentionPolicy::Reclaimable);
@@ -1093,14 +1120,15 @@ fn retention_is_reported_apart_from_the_materialization_state() {
 #[test]
 fn a_pin_outcome_carries_the_download_failure_without_dropping_the_pin() {
     let kept = WireRetentionState { policy: WireRetention::Pinned as i32, explicit: true };
-    let failed = pin_outcome(&PinItemResponse {
+    let failed = pin_outcome(&SetRetentionRuleResponse {
         retention: Some(kept),
         download_error: "no peer has the content".into(),
         ..Default::default()
     });
     assert_eq!(failed.retention.policy, RetentionPolicy::Pinned);
     assert_eq!(failed.download_error.as_deref(), Some("no peer has the content"));
-    let done = pin_outcome(&PinItemResponse { retention: Some(kept), ..Default::default() });
+    let done =
+        pin_outcome(&SetRetentionRuleResponse { retention: Some(kept), ..Default::default() });
     assert_eq!(done.download_error, None, "an empty wire string is no error");
     assert_eq!(done.history_not_kept_reason, None, "an empty wire string is no reason");
 }
@@ -1110,7 +1138,7 @@ fn a_pin_outcome_carries_the_download_failure_without_dropping_the_pin() {
 #[test]
 fn a_pin_outcome_carries_the_history_not_kept_reason() {
     let kept = WireRetentionState { policy: WireRetention::Pinned as i32, explicit: true };
-    let pending = pin_outcome(&PinItemResponse {
+    let pending = pin_outcome(&SetRetentionRuleResponse {
         retention: Some(kept),
         history_not_kept_reason: "changing_retry".into(),
         ..Default::default()
@@ -1171,6 +1199,8 @@ fn dimensions_json_carries_both_dimensions_per_folder_and_overall() {
         ..Default::default()
     };
     let json = status_dimensions_json(&computed(status));
+    assert_eq!(json["paused_on_metered"], false);
+    assert_eq!(json["network_cost_known"], false);
     assert_eq!(json["overall_state"], "healthy");
     assert_eq!(json["availability"]["state"], "waiting_for_peer");
     assert_eq!(json["availability"]["offline_device_ids"][0], "dev-b");
@@ -1800,7 +1830,9 @@ fn a_sent_transfer_carries_its_status_reason_and_retry_offer() {
         status: "offered".into(),
         failure: "unreachable".into(),
         can_retry: true,
+        bytes_sent: 2,
     });
+    assert_eq!(entry.bytes_sent, 2);
     assert_eq!(entry.failure, Some(TransferFailure::Unreachable));
     // An accepted transfer whose other device stopped reading keeps its own closed reason, not
     // the open fallback; a code this build does not know stays `Other`.
@@ -2012,6 +2044,7 @@ fn activity_page_names_devices_and_pages_by_cursor() {
         origin_device_id: origin.into(),
         is_this_device: origin.is_empty(),
         at_unix_nanos: 1_000_000_000,
+        other_origin_device_id: String::new(),
     };
     let names = std::collections::HashMap::from([("dev-b".to_string(), "Laptop".to_string())]);
     let events = [event(9, "dev-b", Wire::Updated), event(8, "", Wire::Added)];
@@ -2059,6 +2092,7 @@ fn every_send_link_state_maps_and_an_unknown_one_does_not() {
         state,
         receiver_device_name: String::new(),
         transfer_id: String::new(),
+        failure: String::new(),
     };
     let cases = [
         (Wire::Waiting, SendLinkState::Waiting),
@@ -2085,9 +2119,11 @@ fn every_send_link_state_maps_and_an_unknown_one_does_not() {
             state: Wire::Redeemed as i32,
             receiver_device_name: "Kai's iPhone".into(),
             transfer_id: "t-1".into(),
+            failure: "sender_canceled".into(),
         },
     )
     .unwrap();
+    assert_eq!(named.failure, Some(TransferFailure::SenderCanceled));
     assert_eq!(named.receiver_device_name.as_deref(), Some("Kai's iPhone"));
     assert_eq!(named.transfer_id.as_deref(), Some("t-1"));
 }
@@ -2142,4 +2178,123 @@ fn a_primary_transfer_listing_converts_with_times_direction_and_status() {
     assert_eq!(summary.expires_at, UNIX_EPOCH + Duration::from_secs(200));
     let odd = primary_transfer_summary(&PrimaryTransfer { status: "expired".into(), ..wire });
     assert_eq!(odd.status, PrimaryTransferStatus::Other { raw: "expired".into() });
+}
+
+#[test]
+fn last_synced_reaches_the_snapshot_and_the_folder() {
+    let mut response =
+        computed(StatusResponse { links: vec![link("/a", "g")], ..Default::default() });
+    response.product.as_mut().unwrap().last_synced_unix = Some(1_700_000_000);
+    response.links[0].product.as_mut().unwrap().last_synced_unix = Some(1_600_000_000);
+    let snapshot = status_snapshot(&response, account(None), secs(1));
+    assert_eq!(snapshot.product.last_synced, Some(secs(1_700_000_000)));
+    assert_eq!(snapshot.folders[0].product.last_synced, Some(secs(1_600_000_000)));
+
+    response.product.as_mut().unwrap().last_synced_unix = None;
+    assert_eq!(status_snapshot(&response, account(None), secs(1)).product.last_synced, None);
+}
+
+/// The count of changes no other device holds yet reaches the shells as the daemon reported it.
+#[test]
+fn a_folder_carries_the_daemons_pending_local_changes() {
+    let pending = LinkStatus { pending_local_changes: 7, ..link("/f/Docs", "g1") };
+    assert_eq!(folder_summary(&pending, &[], &[]).pending_local_changes, 7);
+    assert_eq!(folder_summary(&link("/f/Docs", "g1"), &[], &[]).pending_local_changes, 0);
+}
+
+#[test]
+fn debug_output_of_a_created_send_link_never_shows_the_code() {
+    let link = SendLink { link_id: "link-1".into(), code: "SECRETCODE".into(), expires_at: None };
+    let text = format!("{link:?}");
+    assert!(!text.contains("SECRETCODE"), "{text}");
+    assert!(text.contains("link-1"));
+}
+
+#[test]
+fn a_folder_carries_the_daemons_retention_apply_state_and_counts_as_they_are() {
+    use yadorilink_ipc_proto::daemonctl::RetentionApplyState as Wire;
+    let applying = LinkStatus {
+        retention_rule_count: 3,
+        retention_apply_state: Wire::Pending as i32,
+        retention_done_count: 12,
+        retention_skipped_count: 4,
+        retention_retryable_count: 2,
+        ..link("/f/Docs", "g1")
+    };
+    assert_eq!(
+        folder_summary(&applying, &[], &[]).retention,
+        RetentionApplySummary {
+            rule_count: 3,
+            state: RetentionApplyState::Pending,
+            freed: 12,
+            left_on_purpose: 4,
+            to_retry: 2,
+        }
+    );
+    let done = LinkStatus { retention_apply_state: Wire::Done as i32, ..applying };
+    assert_eq!(folder_summary(&done, &[], &[]).retention.state, RetentionApplyState::Done);
+    // No online-only rule, or a daemon that does not say, reads as nothing to show; the counts of
+    // a folder with no rules are zero.
+    for state in [Wire::None, Wire::Unspecified] {
+        let idle = LinkStatus { retention_apply_state: state as i32, ..link("/f/Docs", "g1") };
+        assert_eq!(
+            folder_summary(&idle, &[], &[]).retention,
+            RetentionApplySummary {
+                rule_count: 0,
+                state: RetentionApplyState::None,
+                freed: 0,
+                left_on_purpose: 0,
+                to_retry: 0,
+            }
+        );
+    }
+}
+
+#[test]
+fn a_folder_carries_the_device_its_newest_change_came_from_and_is_named_from_the_device_list() {
+    let from_b =
+        LinkStatus { last_change_origin_device_id: "device-b".into(), ..link("/f/A", "g1") };
+    let mut folders = vec![
+        folder_summary(&from_b, &[], &[]),
+        folder_summary(&link("/f/B", "g2"), &[], &[]), // newest change made here, or author unknown
+    ];
+    assert_eq!(folders[0].last_change_origin_device_id.as_deref(), Some("device-b"));
+    assert_eq!(folders[0].last_change_origin_device_name, None, "named by the caller");
+    assert_eq!(folders[1].last_change_origin_device_id, None);
+
+    let names =
+        std::collections::HashMap::from([("device-b".to_string(), "MacBook Air".to_string())]);
+    name_last_change_devices(&mut folders, &names);
+    assert_eq!(folders[0].last_change_origin_device_name.as_deref(), Some("MacBook Air"));
+    assert_eq!(folders[1].last_change_origin_device_name, None);
+    // A device the list does not have stays unnamed; the id is still there.
+    name_last_change_devices(&mut folders, &std::collections::HashMap::new());
+    assert_eq!(folders[0].last_change_origin_device_name, None);
+    assert_eq!(folders[0].last_change_origin_device_id.as_deref(), Some("device-b"));
+}
+
+#[test]
+fn a_conflict_event_names_both_devices_and_other_events_name_one() {
+    use yadorilink_ipc_proto::daemonctl::{ActivityEventInfo, ActivityKind as Wire};
+    let names = std::collections::HashMap::from([
+        ("device-b".to_string(), "MacBook Air".to_string()),
+        ("device-c".to_string(), "Studio".to_string()),
+    ]);
+    let conflict = ActivityEventInfo {
+        kind: Wire::Conflict as i32,
+        origin_device_id: "device-c".into(),
+        other_origin_device_id: "device-b".into(),
+        ..Default::default()
+    };
+    let added = ActivityEventInfo {
+        kind: Wire::Added as i32,
+        origin_device_id: "device-c".into(),
+        ..Default::default()
+    };
+    let page = activity_page(10, &[conflict, added], &names);
+    let (conflict, added) = (&page.events[0], &page.events[1]);
+    assert_eq!(conflict.origin_device_name.as_deref(), Some("Studio"));
+    assert_eq!(conflict.other_origin_device_id.as_deref(), Some("device-b"));
+    assert_eq!(conflict.other_origin_device_name.as_deref(), Some("MacBook Air"));
+    assert_eq!((&added.other_origin_device_id, &added.other_origin_device_name), (&None, &None));
 }

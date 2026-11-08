@@ -506,7 +506,7 @@ async fn a_rename_does_not_author_an_entry_at_an_ignored_new_name() {
     if !yadorilink_fs_platform::fs_capabilities::temp_dir_proves_object_identity_for_test() {
         return;
     }
-    let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
+    let (proc, state, _emitter, store_dir, root_dir) = processor_with_emitter();
     let root = canonical_root(&root_dir);
     adopt_root(&state, GROUP, &root);
     std::fs::create_dir(root.join("d")).unwrap();
@@ -516,7 +516,7 @@ async fn a_rename_does_not_author_an_entry_at_an_ignored_new_name() {
         event(&proc, &root, &root.join(rel), FsChangeKind::CreatedOrModified).await;
     }
 
-    std::fs::write(root.join(".yadorilinkignore"), b"e/secret.txt\n").unwrap();
+    IgnoreRulesStore::new(store_dir.path().join("config")).write(GROUP, "e/secret.txt\n").unwrap();
     std::fs::rename(root.join("d"), root.join("e")).unwrap();
     flush(
         &proc,

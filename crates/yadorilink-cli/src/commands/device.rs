@@ -3,6 +3,7 @@
 use yadorilink_client_core::ops::devices as ops;
 
 use crate::error::CliError;
+use crate::i18n::{tr, trf};
 
 use yadorilink_client_core::ops::devices::DeviceInfo;
 
@@ -11,7 +12,7 @@ pub async fn register(device_name: String) -> Result<(), CliError> {
     let device_id =
         ops::register_device(device_name, &yadorilink_client_core::ops::daemon::default_launch())
             .await?;
-    println!("Registered device: {device_id}");
+    println!("{}", trf!("Registered device: {device_id}", device_id = device_id));
     Ok(())
 }
 
@@ -39,15 +40,16 @@ pub async fn list() -> Result<(), CliError> {
 /// line.
 pub async fn remove(device_id: String, force: bool, yes: bool) -> Result<(), CliError> {
     super::confirm_destructive(
-        &format!(
+        &trf!(
             "Remove device {device_id} and revoke its access to every folder group? Files \
-             already on that device stay on its disk."
+             already on that device stay on its disk.",
+            device_id = device_id
         ),
         yes,
     )?;
     let outcome = ops::remove_device(&device_id, force).await?;
     crate::commands::membership_render::render_membership_outcome("remove", &outcome);
-    println!("Removed device: {device_id}");
+    println!("{}", trf!("Removed device: {device_id}", device_id = device_id));
     Ok(())
 }
 
@@ -57,9 +59,9 @@ pub async fn start_over(name: String, yes: bool) -> Result<(), CliError> {
     use yadorilink_client_core::ops::start_over::{start_over, StartOverProgress};
     if !yadorilink_client_core::ops::start_over::pending() {
         super::confirm_destructive(
-            "Start over as a new device? This computer is signed out and gets a new device \
-             identity; its old device stays on your account, signed out. Files on this computer \
-             and its synced history are kept, and the folders you linked are joined again.",
+            &tr("Start over as a new device? This computer is signed out and gets a new device \
+                 identity; its old device stays on your account, signed out. Files on this computer \
+                 and its synced history are kept, and the folders you linked are joined again."),
             yes,
         )?;
     }
@@ -69,21 +71,36 @@ pub async fn start_over(name: String, yes: bool) -> Result<(), CliError> {
     match start_over(&ports, true, name).await? {
         StartOverProgress::SignInRequired { retired_device_id } => {
             println!(
-                "The old device identity {retired_device_id} is retired and this computer is \
-                 signed out. Run `yadorilink login`, then `yadorilink device start-over` again \
-                 to register it as a new device."
+                "{}",
+                trf!(
+                    "The old device identity {retired_device_id} is retired and this computer is \
+                     signed out. Run `yadorilink login`, then `yadorilink device start-over` again \
+                     to register it as a new device.",
+                    retired_device_id = retired_device_id
+                )
             );
         }
         StartOverProgress::Finished(report) => {
             println!(
-                "Registered new device {} (replacing {}).",
-                report.new_device_id, report.retired_device_id
+                "{}",
+                trf!(
+                    "Registered new device {new_id} (replacing {old_id}).",
+                    new_id = report.new_device_id,
+                    old_id = report.retired_device_id
+                )
             );
             for path in &report.rejoined {
-                println!("Joined again: {path}");
+                println!("{}", trf!("Joined again: {path}", path = path));
             }
             for failed in &report.not_rejoined {
-                println!("Not joined: {} ({})", failed.local_path, failed.message);
+                println!(
+                    "{}",
+                    trf!(
+                        "Not joined: {path} ({message})",
+                        path = failed.local_path,
+                        message = failed.message
+                    )
+                );
             }
             if !report.complete {
                 return Err(CliError::Other(
@@ -93,9 +110,12 @@ pub async fn start_over(name: String, yes: bool) -> Result<(), CliError> {
                 ));
             }
             println!(
-                "The old device {} is still listed on your account as signed out. Remove it with \
-                 `yadorilink device remove {} --force` once the new device has your folders.",
-                report.retired_device_id, report.retired_device_id
+                "{}",
+                trf!(
+                    "The old device {old_id} is still listed on your account as signed out. Remove it with \
+                     `yadorilink device remove {old_id} --force` once the new device has your folders.",
+                    old_id = report.retired_device_id
+                )
             );
         }
     }
@@ -107,18 +127,21 @@ pub async fn start_over(name: String, yes: bool) -> Result<(), CliError> {
 pub fn acknowledge_replacement(yes: bool) -> Result<(), CliError> {
     use yadorilink_client_core::ops::start_over::acknowledge_possible_loss;
     super::confirm_destructive(
-        "This computer was restored from a backup and cannot check whether changes made after \
-         that backup are missing. Confirm the replacement anyway? Anything changed after the \
-         backup may be gone for good if no other device holds it.",
+        &tr(
+            "This computer was restored from a backup and cannot check whether changes made after \
+             that backup are missing. Confirm the replacement anyway? Anything changed after the \
+             backup may be gone for good if no other device holds it.",
+        ),
         yes,
     )?;
     if acknowledge_possible_loss()? {
         println!(
-            "Acknowledged. The replacement is confirmed once every folder is complete on this \
-             computer."
+            "{}",
+            tr("Acknowledged. The replacement is confirmed once every folder is complete on this \
+                computer.")
         );
     } else {
-        println!("No replacement is waiting for confirmation.");
+        println!("{}", tr("No replacement is waiting for confirmation."));
     }
     Ok(())
 }
@@ -129,25 +152,44 @@ pub fn acknowledge_replacement(yes: bool) -> Result<(), CliError> {
 pub async fn manage(device_id: String) -> Result<(), CliError> {
     use yadorilink_client_core::ops::nas_admin::{open_nas_admin, NasAdminOpen};
     use yadorilink_client_core::wording::nas_admin_failure_message;
-    match open_nas_admin(device_id).await? {
+    match open_nas_admin(device_id.clone()).await? {
         NasAdminOpen::Failed(failure) => {
             Err(CliError::Other(nas_admin_failure_message(failure).to_string()))
         }
         NasAdminOpen::Opened(session) => {
             println!("{}", session.local_url());
-            eprintln!("Open the address above in a browser. Press Ctrl-C to close it.");
+            eprintln!("{}", manage_notice(&device_id));
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => session.close(),
-                () = session.ended() => eprintln!("The management session ended."),
+                () = session.ended() => eprintln!("{}", tr("The management session ended.")),
             }
             Ok(())
         }
     }
 }
 
+/// What `device manage` says under the address it prints. The address carries a
+/// secret (after the `#`), so the line says what holding it allows.
+fn manage_notice(device_id: &str) -> String {
+    format!(
+        "Open the address above in a browser. This link lets anyone on this computer manage \
+         {device_id} until you close it (Ctrl-C), so do not share or save it."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_manage_notice_says_the_address_is_a_credential() {
+        let notice = manage_notice("nas-1");
+        assert!(
+            notice.contains("lets anyone on this computer manage nas-1 until you close it"),
+            "{notice}"
+        );
+        assert!(notice.contains("Ctrl-C"), "{notice}");
+    }
 
     #[test]
     fn device_line_is_pinned_verbatim() {

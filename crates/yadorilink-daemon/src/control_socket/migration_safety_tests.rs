@@ -2,7 +2,8 @@
 
 use std::sync::Arc;
 
-use super::{enrollment_error_to_proto, membership_error_to_proto};
+use super::enrollment_error_to_proto;
+use crate::membership_wire::membership_error_to_proto;
 use crate::queries::link_status::LinkStatusReadPort;
 use crate::replica_coordinator::ReplicaCoordinator;
 use yadorilink_replica_domain::session_state::EnrollmentKind;
@@ -19,7 +20,12 @@ use crate::daemon_state::DaemonState;
 fn test_state() -> Arc<DaemonState> {
     let store = Arc::new(SegmentBlockStore::new(tempfile::tempdir().unwrap().keep()).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
-    let state = DaemonState::new("device-a".into(), sync_state, store);
+    let state = DaemonState::new_in(
+        tempfile::tempdir().unwrap().keep(),
+        "device-a".into(),
+        sync_state,
+        store,
+    );
     // A registered device with no signing key fails closed (see
     // `open_group_author`) --
     // any test driving a link watch start needs one wired.
@@ -69,8 +75,8 @@ fn enrollment_compensation_pending_preserves_operation_identity() {
 /// the link and the marker atomically (see
 /// `SyncState::add_link_with_pending_enrollment`), but `start_link_watch`
 /// runs *after* that commit and can still fail. Forced here by making
-/// `.yadorilinkignore` itself a directory rather than a file, so
-/// `EffectiveIgnoreSet::load_for_link_root` -- the first fallible step
+/// the group's ignore-rules file a directory rather than a file, so
+/// loading the rules -- the first fallible step
 /// inside `start_link_watch`, run before anything is registered in
 /// `DaemonState`'s in-memory maps -- hits a real (non-`NotFound`) I/O
 /// error reading it. `link` must roll the already-committed link and
@@ -82,8 +88,11 @@ fn enrollment_compensation_pending_preserves_operation_identity() {
 #[tokio::test]
 async fn link_rolls_back_the_link_and_marker_when_a_post_commit_step_fails() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir(dir.path().join(".yadorilinkignore")).unwrap();
     let state = test_state();
+    let rules_file =
+        yadorilink_fs_platform::ignore_patterns::IgnoreRulesStore::new(state.config_dir())
+            .path("group-1");
+    std::fs::create_dir_all(&rules_file).unwrap();
     let request = LinkRequest {
         local_path: dir.path().to_string_lossy().to_string(),
         group_id: "group-1".to_string(),
@@ -99,7 +108,7 @@ async fn link_rolls_back_the_link_and_marker_when_a_post_commit_step_fails() {
 
     assert!(
         result.is_err(),
-        "a directory named .yadorilinkignore must fail to load as the ignore file"
+        "a directory in place of the rules file must fail to load as the rules"
     );
     assert!(
         state.replica_coordinator.link_repository().list_links().unwrap().is_empty(),

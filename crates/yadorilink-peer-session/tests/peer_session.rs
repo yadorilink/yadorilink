@@ -130,6 +130,62 @@ async fn session_construction_never_creates_a_missing_sync_root() {
     );
 }
 
+/// A block transport whose streams never open, as to a peer that vanished without closing.
+struct SilentBlocks {
+    unresponsive: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl yadorilink_peer_session::ports::BlockStreamTransport for SilentBlocks {
+    async fn open(
+        &self,
+        _group_id: &str,
+    ) -> Result<
+        Box<dyn yadorilink_peer_session::ports::PeerBlockStream>,
+        yadorilink_transport::TransportError,
+    > {
+        std::future::pending().await
+    }
+
+    fn peer_unresponsive(&self) {
+        self.unresponsive.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A block request that gets no answer at all marks the peer unreachable and drops its
+/// connection once, so reads stop waiting on it and the keeper dials afresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_silent_peer_is_marked_unreachable_and_its_connection_dropped() {
+    let device_b = Device::new("device-b").await;
+    let peer_transports = device_b.node.transports_for("device-a");
+    let unresponsive = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let replica_engine =
+        yadorilink_daemon::replica_coordinator::engine_ports::build_peer_replica_engine(
+            &device_b.state,
+            device_b.store.clone(),
+        );
+    let session = PeerSyncSession::over_substrate(
+        device_b.device_id.clone(),
+        "device-a".to_string(),
+        device_b.state.clone()
+            as Arc<dyn yadorilink_peer_session::ports::BlockServeAuthorizationPort>,
+        replica_engine,
+        device_b.store.clone(),
+        vec![GROUP.to_string()],
+        yadorilink_peer_session::ports::SessionTransports {
+            blocks: Arc::new(SilentBlocks { unresponsive: unresponsive.clone() }),
+            service: peer_transports,
+        },
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps::denied(),
+    );
+    assert!(!session.is_unreachable());
+
+    let _ = session.fetch_block_answer(GROUP, "f.bin", &[7u8; 32], 10).await;
+
+    assert!(session.is_unreachable(), "no answer at all: the peer is unreachable");
+    assert_eq!(unresponsive.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
 /// Security regression test: a session must ignore index/block messages
 /// for a folder group it wasn't constructed with (the ACL-verified
 /// intersection from the coordination plane), even if a peer sends them —
@@ -1692,4 +1748,69 @@ async fn a_peer_answering_from_another_generation_or_with_an_unknown_kind_never_
         assert!(!present.is_held(), "an unusable answer must never read as present");
         assert_eq!(session_b.session.rpc_version_mismatch(), is_generation_mismatch);
     }
+}
+
+/// A fetch abandoned in the middle of a transfer (the extension cancelled the read) must neither
+/// make the next fetch from the same peer fail nor read as the peer going silent: the peer is
+/// answering, the abandoned streams were only reset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_abandoned_fetch_does_not_make_the_next_one_mark_the_peer_silent() {
+    let device_a = Device::new("device-a").await;
+    let device_b = device_a.peer("device-b").await;
+
+    // Incompressible content of many blocks, so the transfer is long enough to be cut.
+    let mut content = vec![0u8; 24 * 1024 * 1024];
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    for byte in &mut content {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        *byte = state as u8;
+    }
+    let file_path = device_a.root_path().join("big.bin");
+    std::fs::write(&file_path, &content).unwrap();
+    let record = expect_file_changed(
+        device_a
+            .processor()
+            .process_event(
+                GROUP,
+                &device_a.root_path(),
+                &FsChangeEvent { path: file_path, kind: FsChangeKind::CreatedOrModified },
+            )
+            .await
+            .unwrap(),
+    );
+    device_a.publish_pending();
+    assert!(record.blocks.len() >= 4, "{} blocks", record.blocks.len());
+    let _session_a = spawn_session(&device_a, "device-b");
+    let session_b = spawn_session(&device_b, "device-a");
+    let session = session_b.session.clone();
+
+    // Every block asked for at once, the first answer waited for, the rest abandoned.
+    let blocks = record.blocks.clone();
+    let mut tasks = Vec::new();
+    for block in &blocks {
+        let (session, hash, size) = (session.clone(), block.hash.clone(), block.size as u64);
+        tasks.push(tokio::spawn(async move {
+            session.fetch_block_answer(GROUP, "big.bin", &hash, size).await
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    for task in &tasks {
+        task.abort();
+    }
+    // At once, on the same peer.
+    let last = blocks.last().unwrap();
+    let answer = tokio::time::timeout(
+        Duration::from_secs(10),
+        session.fetch_block_answer(GROUP, "big.bin", &last.hash, last.size as u64),
+    )
+    .await
+    .expect("the fetch after an abandoned one hung")
+    .unwrap();
+    assert!(
+        matches!(answer, yadorilink_peer_session::peer_session::BlockFetchAnswer::Found(_)),
+        "the fetch after an abandoned one got no block"
+    );
+    assert!(!session.is_unreachable(), "an abandoned fetch made the peer read as silent");
 }

@@ -566,3 +566,60 @@ fn the_store_package_family_is_read_from_the_protected_path_only() {
         r"C:\Program Files\WindowsApps\YadoriLink_0.1.9.0_x64__abc123\x.exe"
     ));
 }
+
+fn script_version(install_dir: &Path, name: &str) -> String {
+    let dir = install_dir.join("versions").join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("engine-identity.json"),
+        identity_json(yadorilink_ipc_proto::PROVIDER_HOST_API_VERSION),
+    )
+    .unwrap();
+    dir.join("yadorilink-daemon").display().to_string()
+}
+
+#[test]
+fn a_script_self_update_moves_the_install_root_to_its_new_version_tree() {
+    let config = tempfile::tempdir().unwrap();
+    let install = tempfile::tempdir().unwrap();
+    let old = script_version(install.path(), "0.1.0.1700000000.11");
+    let new = script_version(install.path(), "0.1.1.1700000100.12");
+    identity(&old, "script", Some(config.path())).gate_start(config.path()).unwrap();
+    let updated = identity(&new, "script", Some(config.path()));
+    updated.gate_start(config.path()).unwrap();
+    assert_eq!(record_of(config.path()).install_root, updated.report().install_root);
+    assert!(record_of(config.path()).install_root.contains("0.1.1.1700000100.12"));
+}
+
+#[test]
+fn a_script_install_in_another_directory_does_not_take_the_root_even_with_the_same_layout() {
+    let config = tempfile::tempdir().unwrap();
+    let (first_dir, second_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = script_version(first_dir.path(), "0.1.0.1.1");
+    let b = script_version(second_dir.path(), "0.1.0.1.1");
+    identity(&a, "script", Some(config.path())).gate_start(config.path()).unwrap();
+    let first = record_of(config.path());
+    identity(&b, "script", Some(config.path())).gate_start(config.path()).unwrap();
+    assert_eq!(record_of(config.path()).install_root, first.install_root);
+}
+
+#[test]
+fn the_script_install_directory_is_the_one_holding_versions() {
+    assert!(ownership::is_same_script_install(
+        "/h/.local/share/yadorilink/versions/1.a/bin",
+        "/h/.local/share/yadorilink/versions/2.b/bin"
+    ));
+    assert!(ownership::is_same_script_install(r"C:\u\y\versions\1.a", r"C:\u\y\versions\2.b"));
+    assert!(!ownership::is_same_script_install("/h/a/versions/1", "/h/b/versions/1"));
+    assert!(!ownership::is_same_script_install("/h/a/bin", "/h/a/bin2"));
+    assert!(!ownership::is_same_script_install("/versions/1", "/versions/2"));
+    // a parent directory called `versions` is not the install's own
+    assert!(!ownership::is_same_script_install(
+        "/srv/versions/a/share/yadorilink/versions/v1/bin",
+        "/srv/versions/b/share/yadorilink/versions/v2/bin"
+    ));
+    assert!(ownership::is_same_script_install(
+        "/srv/versions/a/share/yadorilink/versions/v1/bin",
+        "/srv/versions/a/share/yadorilink/versions/v2/bin"
+    ));
+}

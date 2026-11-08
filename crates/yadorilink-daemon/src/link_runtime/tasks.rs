@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use tokio::task::JoinHandle;
 use yadorilink_filesystem_sync::debounce::{self, DebounceFlush};
-use yadorilink_fs_platform::ignore_patterns::{is_ignore_file_relative_path, EffectiveIgnoreSet};
+use yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet;
 use yadorilink_local_capture::LocalChangeProcessor;
 use yadorilink_root_authority::root_identity::RootVerificationStatePort;
 
@@ -191,7 +191,7 @@ fn post_scan_convergence(
                     ) {
                         if let Err(error) = deps
                             .replica_coordinator
-                            .link_repository()
+                            .link_admission()
                             .resolve_duplicate_recovery_path(group_id, &row.path)
                         {
                             tracing::warn!(group_id = %group_id, path = %row.path, error = %error, "could not persist duplicate-recovery path progress");
@@ -204,7 +204,7 @@ fn post_scan_convergence(
     );
     if outcome == DuplicateRecoveryOutcome::Complete {
         if let Err(e) =
-            deps.replica_coordinator.link_repository().set_suppress_tombstones(local_path, false)
+            deps.replica_coordinator.link_admission().set_suppress_tombstones(local_path, false)
         {
             tracing::warn!(
                 local_path = %local_path,
@@ -447,8 +447,6 @@ pub(crate) fn spawn_executor_task(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut executor_ignore_set = executor_ignore_set;
-        let executor_canonical_root =
-            executor_root.canonicalize().unwrap_or_else(|_| executor_root.clone());
         // Resolves this group's startup barrier exactly once: `Ready` on the
         // normal path just before the live flush loop below, or `Failed` on any
         // path that does not complete — a caught scan/redrive error, a scan
@@ -623,27 +621,16 @@ pub(crate) fn spawn_executor_task(
                 "executor flush received"
             );
             let burst_fallback = matches!(flush, DebounceFlush::RescanRequired);
-            let ignore_file_changed = flush_touches_ignore_file(&executor_canonical_root, &flush);
-            if burst_fallback || ignore_file_changed {
-                match EffectiveIgnoreSet::load_for_link_root(&executor_root) {
-                    Ok(updated) => executor_ignore_set = Arc::new(updated),
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        local_path = %executor_local_path,
-                        "failed to reload ignore patterns; using the previous effective set"
-                    ),
-                }
-            }
-            let flush = if ignore_file_changed {
-                tracing::info!(
+            // The rules are read again for every flush: an edit made through the API takes
+            // effect with the next flush, and the file is small.
+            match executor_deps.ignore_rules.load(&executor_group_id) {
+                Ok(updated) => executor_ignore_set = Arc::new(updated),
+                Err(e) => tracing::warn!(
+                    error = %e,
                     local_path = %executor_local_path,
-                    group_id = %executor_group_id,
-                    "ignore patterns changed; running a full reconciliation scan"
-                );
-                DebounceFlush::RescanRequired
-            } else {
-                flush
-            };
+                    "failed to reload ignore rules; using the previous effective set"
+                ),
+            }
             if burst_fallback {
                 // Every fallback trigger is logged, not silent. A large but
                 // fully-known event burst no longer reaches `RescanRequired`
@@ -854,13 +841,6 @@ pub(crate) fn spawn_executor_task(
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, local_path = %executor_local_path, "failed to process a local-change batch");
-                        // A rescan forced by an ignore-file change journals nothing of its own
-                        // either; if a safe-stop pause refused it, it must run again.
-                        if ignore_file_changed
-                            && matches!(e, yadorilink_local_capture::LocalCaptureError::Paused)
-                        {
-                            wait_out_pause_then_rescan(&mut rescan_retry).await;
-                        }
                     }
                 }
             }
@@ -916,20 +896,6 @@ pub(crate) fn spawn_dirty_journal_task(
             }
         }
     })
-}
-
-/// Moved here from the daemon's own `LinkRuntimeController` alongside `spawn_executor_task` --
-/// its only caller -- as part of the same relocation: byte-identical
-/// logic, `pub(crate)` only because the daemon's own `LinkRuntimeController`'s own test module
-/// still exercises the live-watch path this feeds into, not because
-/// anything outside this module tree calls it directly.
-pub(crate) fn flush_touches_ignore_file(root: &std::path::Path, flush: &DebounceFlush) -> bool {
-    match flush {
-        DebounceFlush::Paths(paths) => paths.iter().any(|(path, _, _)| {
-            path.strip_prefix(root).ok().is_some_and(is_ignore_file_relative_path)
-        }),
-        DebounceFlush::RescanRequired => false,
-    }
 }
 
 /// Committed-but-not-yet-announced chunks a full rescan may buffer. Each

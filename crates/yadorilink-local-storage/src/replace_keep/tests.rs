@@ -170,15 +170,44 @@ fn a_published_replacement_keeps_the_replaced_files_mode() {
     let out = put(dir.path(), "doc", 0o640);
     let tmp = dir.path().join("doc.tmp");
     std::fs::write(&tmp, b"new content").unwrap();
-    persist_reconstructed_file_durable(&tmp, &out, &NoTempLedger, Durability::Full).unwrap();
+    persist_reconstructed_file_durable(&tmp, &out, &NoTempLedger, Durability::Full, None).unwrap();
     assert_eq!(std::fs::read(&out).unwrap(), b"new content");
     assert_eq!(mode(&out), 0o640);
 
     let fresh = dir.path().join("fresh");
     let tmp = dir.path().join("fresh.tmp");
     std::fs::write(&tmp, b"a").unwrap();
-    persist_reconstructed_file_durable(&tmp, &fresh, &NoTempLedger, Durability::Full).unwrap();
+    persist_reconstructed_file_durable(&tmp, &fresh, &NoTempLedger, Durability::Full, None)
+        .unwrap();
     assert_eq!(std::fs::read(&fresh).unwrap(), b"a");
+}
+
+/// The replicated execute flag is applied to the temp after the carry-over (which drops every
+/// execute bit) and before the rename: the published file has the final mode, whether the
+/// replaced file was executable or not, and the replaced file's other bits are kept.
+#[test]
+fn the_execute_flag_is_on_the_file_when_it_is_published() {
+    use crate::materialize_write::{persist_reconstructed_file_durable, Durability, NoTempLedger};
+    let dir = tempfile::tempdir().unwrap();
+    for (name, old_mode, exec, expected) in [
+        ("plain-to-exec", 0o640, true, 0o750),
+        ("exec-to-plain", 0o755, false, 0o644),
+        ("exec-stays", 0o700, true, 0o700),
+    ] {
+        let out = put(dir.path(), name, old_mode);
+        let tmp = dir.path().join(format!("{name}.tmp"));
+        std::fs::write(&tmp, b"new content").unwrap();
+        persist_reconstructed_file_durable(&tmp, &out, &NoTempLedger, Durability::Full, Some(exec))
+            .unwrap();
+        assert_eq!(mode(&out), expected, "{name}");
+    }
+    // A free name has nothing to carry over; the flag still lands before the rename.
+    let fresh = dir.path().join("fresh-exec");
+    let tmp = dir.path().join("fresh-exec.tmp");
+    std::fs::write(&tmp, b"a").unwrap();
+    persist_reconstructed_file_durable(&tmp, &fresh, &NoTempLedger, Durability::Full, Some(true))
+        .unwrap();
+    assert_ne!(mode(&fresh) & 0o100, 0);
 }
 
 /// A staged file that inherited an access ACL (a directory default ACL) loses it when the replaced file

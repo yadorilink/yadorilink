@@ -29,7 +29,7 @@ jobs:
           set -euo pipefail
           mkdir sample
           printf 'int main(void) { return 0; }\n' > sample/rehearsal.c
-          cc -arch arm64 -mmacosx-version-min=27.0 -o sample/yadorilink-rehearsal sample/rehearsal.c
+          cc -arch arm64 "-mmacosx-version-min=$(tr -d '[:space:]' < .github/release/macos-minimum-version)" -o sample/yadorilink-rehearsal sample/rehearsal.c
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

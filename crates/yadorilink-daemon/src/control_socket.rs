@@ -36,21 +36,22 @@ use yadorilink_ipc_proto::daemonctl::{
     ListQueueItemsResponse, ListRecoveryOperationsResponse, ListSentTransfersResponse,
     ListTrashResponse, ListVersionsResponse, LocalState as WireLocalState,
     LocalTransition as WireLocalTransition, MarkLinkNotRejoinedResponse,
-    MaterializationStatusResponse, MembershipHandoffResult, MintInviteCommandResponse,
-    MintedInviteInfo, NasAdminFailureKind, ObtainHandoffTicketResponse, OpenNasAdminResponse,
-    PauseResponse, PendingEnrollmentKind, PinItemResponse, PreviewSpaceReclaimResponse, QueueItem,
-    ReadoptVolumeResponse, ReceiveTransferResponse, RedeemSendLinkResponse, RefusedWithNextStep,
+    MaterializationStatusResponse, MintInviteCommandResponse, MintedInviteInfo,
+    NasAdminFailureKind, ObtainHandoffTicketResponse, OpenNasAdminResponse, PauseResponse,
+    PendingEnrollmentKind, PreviewSpaceReclaimResponse, QueueItem, ReadoptVolumeResponse,
+    ReceiveTransferResponse, RedeemSendLinkResponse, RefusedWithNextStep,
     ReleaseHandoffTicketResponse, RemoveDeviceCommandResponse, RemovePendingEnrollmentResponse,
-    ReplicaMembershipCommandOutcome, ReportingConsentState, ReportingStatusResponse,
-    RequestHandoffLeaseResponse, RestoreTrashOperationFailure, RestoreTrashOperationResponse,
-    RestoreTrashResponse, RestoreVersionResponse, ResumeResponse, RetentionPolicy,
-    RetentionState as WireRetentionState, RetryTransferResponse, RevokeDeviceCommandResponse,
-    RevokeEdgeCommandResponse, RewindActionCounts as WireRewindActionCounts, RewindExecuteResponse,
+    ReportingConsentState, ReportingStatusResponse, RequestHandoffLeaseResponse,
+    RestoreTrashOperationFailure, RestoreTrashOperationResponse, RestoreTrashResponse,
+    RestoreVersionResponse, ResumeResponse, RetentionPolicy, RetentionState as WireRetentionState,
+    RetryTransferResponse, RevokeDeviceCommandResponse, RevokeEdgeCommandResponse,
+    RewindActionCounts as WireRewindActionCounts, RewindExecuteResponse,
     RewindPathEntry as WireRewindPathEntry, RewindPlanStale, RewindPreviewResponse, RewindRefused,
     RewindRenameCandidate as WireRewindRenameCandidate, RewindRun as WireRewindRun,
     RewindRunStarted, RewindStatusResponse, SendFileResponse, SendLinkStatusResponse,
-    SetSpaceManagementResponse, SetStorageModeResponse, ShowQueueItemResponse, ShutdownResponse,
-    SpaceReclaimPreviewItem, TaskLiveness, TrashedFileInfo, UnlinkResponse, UnpinItemResponse,
+    SetRetentionRuleResponse, SetSpaceManagementResponse, SetStorageModeResponse,
+    ShowQueueItemResponse, ShutdownResponse, SpaceReclaimPreviewItem, TaskLiveness,
+    TrashedFileInfo, UnlinkResponse,
 };
 use yadorilink_ipc_proto::framing::{read_message, write_message};
 
@@ -66,6 +67,7 @@ fn send_failure_payload(failure: crate::send_transfer::SendFailure) -> RespPaylo
             message: failure.message,
             group_ids: Vec::new(),
             operation_id: String::new(),
+            ..Default::default()
         }),
         None => RespPayload::Error(failure.message),
     }
@@ -299,6 +301,13 @@ pub mod windows_transport {
         }
     }
 
+    /// How many pipe instances listen at once. A client that finds every instance connected is
+    /// refused with `ERROR_PIPE_BUSY` until the daemon creates the next one, so a burst of clients
+    /// (an app opens a status watch and several reads together) must not be able to outnumber
+    /// the instances for the time that takes. Each listener is its own task, so one slow to
+    /// loop back leaves the others accepting.
+    const LISTENING_INSTANCES: usize = 4;
+
     /// `pipe_name` should look like `\\.\pipe\yadorilink-ctl-<user>`.
     ///
     /// Verified against a real Windows 11 VM: an earlier version of this
@@ -308,24 +317,54 @@ pub mod windows_transport {
     /// client connecting concurrently in that window got `ERROR_PIPE_BUSY`
     /// ("All pipe instances are busy"), caught by
     /// `windows_pipe_tests::two_concurrent_clients_are_both_served`.
-    /// Creating the next instance *before* awaiting the current one's
-    /// `connect` closes that window — there are always at least two
-    /// listening instances in existence except right at startup.
+    /// Each listener now creates its replacement instance right after its
+    /// `connect` returns, before the accepted connection is served, and
+    /// [`LISTENING_INSTANCES`] listeners run side by side, so at least that
+    /// many instances minus one are listening at every moment.
     pub async fn serve(pipe_name: &str, context: Arc<ControlContext>) -> std::io::Result<()> {
         tracing::info!(pipe_name, "control socket listening (named pipe)");
-        let mut server = create_first_pipe_server(pipe_name)?;
         let connection_slots = Arc::new(Semaphore::new(super::MAX_CONTROL_CONNECTIONS));
+        let mut listeners = tokio::task::JoinSet::new();
+        listeners.spawn(accept_loop(
+            create_first_pipe_server(pipe_name)?,
+            pipe_name.to_owned(),
+            connection_slots.clone(),
+            context.clone(),
+        ));
+        for _ in 1..LISTENING_INSTANCES {
+            listeners.spawn(accept_loop(
+                create_next_pipe_server(pipe_name)?,
+                pipe_name.to_owned(),
+                connection_slots.clone(),
+                context.clone(),
+            ));
+        }
+        // A listener only ends on an error, which is the server's.
+        match listeners.join_next().await {
+            Some(Ok(result)) => result,
+            Some(Err(error)) => Err(std::io::Error::other(error.to_string())),
+            None => Ok(()),
+        }
+    }
 
+    async fn accept_loop(
+        mut server: NamedPipeServer,
+        pipe_name: String,
+        connection_slots: Arc<Semaphore>,
+        context: Arc<ControlContext>,
+    ) -> std::io::Result<()> {
         loop {
+            server.connect().await?;
+            // The replacement listens before the accepted connection is served.
+            let next_server = create_next_pipe_server(&pipe_name)?;
+            let connected = std::mem::replace(&mut server, next_server);
+            // At the cap the accepted client waits here for a slot; the other listeners keep
+            // accepting, and no more than MAX_CONTROL_CONNECTIONS connections are served at once.
             let connection_slot = connection_slots
                 .clone()
                 .acquire_owned()
                 .await
                 .map_err(|_| std::io::Error::other("control socket semaphore closed"))?;
-            let next_server = create_next_pipe_server(pipe_name)?;
-            server.connect().await?;
-            let connected = server;
-            server = next_server;
 
             let context = context.clone();
             tokio::spawn(async move {
@@ -337,13 +376,6 @@ pub mod windows_transport {
         }
     }
 }
-
-#[cfg(windows)]
-const PROVIDER_LOCAL_STATE: &str =
-    "this item is in a provider folder: the OS holds its local state";
-#[cfg(not(windows))]
-const PROVIDER_LOCAL_STATE: &str =
-    "this item is in a File Provider folder: the OS holds its local state";
 
 /// A request's `expected_group_id`: empty means the caller named no group to check.
 fn expected_group(wire: &str) -> Option<&str> {
@@ -357,6 +389,7 @@ fn group_mismatch_response(local_path: String) -> RespPayload {
         message: format!("the folder at {local_path} now belongs to a different group"),
         group_ids: Vec::new(),
         operation_id: String::new(),
+        ..Default::default()
     })
 }
 
@@ -388,7 +421,29 @@ fn provider_local_state(absolute_path: &str) -> Option<WireLocalState> {
     Some(local_state_from_flags(stat.st_flags))
 }
 
-#[cfg(not(target_vendor = "apple"))]
+/// The local state a Cloud Files item's attributes show: present on this device unless the platform
+/// marks its content as remote. The same reading the provider host and the checked publish use
+/// ([`yadorilink_fs_platform::cloud_files`]).
+#[cfg(any(windows, test))]
+fn local_state_from_attributes(attributes: u32) -> WireLocalState {
+    let present = !yadorilink_fs_platform::cloud_files::content_is_remote(attributes);
+    WireLocalState {
+        local_object_present: present,
+        current_content_present: present,
+        transition: yadorilink_ipc_proto::daemonctl::LocalTransition::None as i32,
+    }
+}
+
+/// The state of an item of a Cloud Files folder, read from its attributes (which never recall the
+/// content). `None` where the item cannot be read. The caller must know the provider is connected:
+/// with it gone the platform hides the bits this reads.
+#[cfg(windows)]
+fn provider_local_state(absolute_path: &str) -> Option<WireLocalState> {
+    yadorilink_fs_platform::cloud_files::attributes_of(std::path::Path::new(absolute_path))
+        .map(local_state_from_attributes)
+}
+
+#[cfg(not(any(target_vendor = "apple", windows)))]
 fn provider_local_state(_absolute_path: &str) -> Option<WireLocalState> {
     None
 }
@@ -419,6 +474,7 @@ fn terms_consent_response(error: impl std::fmt::Display) -> RespPayload {
         message: error.to_string(),
         group_ids: Vec::new(),
         operation_id: String::new(),
+        ..Default::default()
     })
 }
 
@@ -435,1463 +491,261 @@ fn wire_step(step: NextStep) -> yadorilink_ipc_proto::daemonctl::NextStep {
     }
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "single exhaustive `match req.payload` dispatch table over every \
-              `DaemonControlRequest` payload variant; each arm is one IPC verb's \
-              call into an application service plus its response mapping. Kept in \
-              one match so the compiler's exhaustiveness check is what proves every \
-              wire verb is handled -- splitting it into per-group helpers would \
-              require catch-all arms and let a newly added verb compile unhandled."
-)]
+/// The refusal for a request whose protocol version is not exactly this daemon's.
+///
+/// This repository has not shipped a public release yet, so the CLI, desktop app, and daemon are
+/// always built and deployed as one unit — a genuine version skew has no supported recovery path
+/// and must fail clearly before touching any daemon state, not be executed anyway and only
+/// surface as a mismatch once the CLI inspects the response. A request that leaves
+/// `protocol_version` unset decodes as 0, which is `!= CONTROL_PROTOCOL_VERSION` and thus
+/// rejected the same as any other mismatch.
+fn refuse_version_skew(client_version: u32) -> Option<DaemonControlResponse> {
+    use yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION;
+    if client_version == CONTROL_PROTOCOL_VERSION {
+        return None;
+    }
+    let message = if client_version > CONTROL_PROTOCOL_VERSION {
+        format!(
+            "this daemon (protocol version {CONTROL_PROTOCOL_VERSION}) does not support this \
+             request (client is protocol version {client_version}); upgrade the daemon and try \
+             again"
+        )
+    } else {
+        format!(
+            "this daemon requires exactly protocol version {CONTROL_PROTOCOL_VERSION} (client is \
+             protocol version {client_version}); this is a pre-release build with no \
+             client/daemon compatibility path — run matching CLI and daemon binaries"
+        )
+    };
+    Some(DaemonControlResponse {
+        payload: Some(RespPayload::Error(message)),
+        daemon_protocol_version: CONTROL_PROTOCOL_VERSION,
+    })
+}
+
+/// The dispatch table over every `DaemonControlRequest` payload variant: each arm is one call
+/// into the verb's family module. It stays one exhaustive `match`, so the compiler proves every
+/// wire verb is handled; a catch-all arm would let a new verb compile unhandled.
 async fn handle_request(
     context: &crate::control_context::ControlContext,
     req: DaemonControlRequest,
 ) -> DaemonControlResponse {
-    // This repository has not shipped a public release yet, so the CLI,
-    // desktop app, and daemon are always built and deployed as one unit —
-    // a genuine version skew has no supported recovery path and must fail
-    // clearly before touching any daemon state, not be executed anyway and
-    // only surface as a mismatch once the CLI inspects the response. Absent
-    // on a request that leaves it unset, `protocol_version`
-    // decodes as 0, which is `!= CONTROL_PROTOCOL_VERSION` and thus rejected
-    // the same as any other mismatch.
-    if req.protocol_version != yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION {
-        let message =
-            if req.protocol_version > yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION {
-                format!(
-                    "this daemon (protocol version {}) does not support this request (client is \
-                 protocol version {}); upgrade the daemon and try again",
-                    yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
-                    req.protocol_version,
-                )
-            } else {
-                format!(
-                    "this daemon requires exactly protocol version {} (client is protocol version \
-                 {}); this is a pre-release build with no client/daemon compatibility path — run \
-                 matching CLI and daemon binaries",
-                    yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
-                    req.protocol_version,
-                )
-            };
-        return DaemonControlResponse {
-            payload: Some(RespPayload::Error(message)),
-            daemon_protocol_version: yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
-        };
+    if let Some(refusal) = refuse_version_skew(req.protocol_version) {
+        return refusal;
     }
     let changes_state = !is_polled_read(&req.payload);
     let payload = match req.payload {
-        Some(ReqPayload::Link(r)) => {
-            match enrollment_commands::require_risks_acknowledged(
-                &context.application.link_lifecycle,
-                &r.local_path,
-                r.acknowledge_risks,
-            )
-            .await
-            {
-                Err(error) => link_failure_payload(&error),
-                Ok(()) => match decode_link_command(r) {
-                    Err(message) => RespPayload::Error(message),
-                    Ok(command) => match context.application.link_lifecycle.link(command).await {
-                        Ok(_) => RespPayload::Link(LinkResponse {}),
-                        Err(e) => link_failure_payload(&e),
-                    },
-                },
-            }
-        }
+        Some(ReqPayload::Link(r)) => links::link(context, r).await,
 
-        // Served by `serve_nas_admin` on its own connection before this
-        // dispatch is reached; here only for exhaustiveness.
-        Some(ReqPayload::OpenNasAdmin(_)) => {
-            RespPayload::Error("a management session is opened on its own connection".to_string())
-        }
-        Some(ReqPayload::LinkPreflight(r)) => match link_preflight(context, &r.local_path).await {
-            Ok(response) => RespPayload::LinkPreflight(response),
-            Err(message) => RespPayload::Error(message),
-        },
+        Some(ReqPayload::OpenNasAdmin(_)) => links::open_nas_admin(context).await,
+        Some(ReqPayload::LinkPreflight(r)) => links::link_preflight(context, r).await,
 
-        Some(ReqPayload::Unlink(r)) => {
-            let application = context.application.clone();
-            match application
-                .replica_role
-                .unlink(&r.local_path, r.force, expected_group(&r.expected_group_id))
-                .await
-            {
-                Ok(outcome) => RespPayload::Unlink(UnlinkResponse {
-                    handoff_result: outcome.handoff.map(|h| HandoffResult {
-                        target_device_id: h.target_device_id,
-                        root_digest: h.root_digest.to_vec(),
-                        membership_generation: h.membership_generation,
-                        lease_id: h.lease_id.unwrap_or_default(),
-                    }),
-                }),
-                Err(crate::application::UnlinkError::NotProtected(message)) => {
-                    RespPayload::CommandError(ApplicationCommandError {
-                        code: ApplicationErrorCode::NotProtected as i32,
-                        message,
-                        group_ids: Vec::new(),
-                        operation_id: String::new(),
-                    })
-                }
-                Err(crate::application::UnlinkError::TermsConsentRequired) => {
-                    terms_consent_response(crate::application::UnlinkError::TermsConsentRequired)
-                }
-                Err(crate::application::UnlinkError::GroupMismatch(message)) => {
-                    group_mismatch_response(message)
-                }
-                Err(crate::application::UnlinkError::Other(message)) => RespPayload::Error(message),
-            }
-        }
+        Some(ReqPayload::Unlink(r)) => links::unlink(context, r).await,
 
-        Some(ReqPayload::ReadoptVolume(r)) => {
-            match context.application.pause_resume.readopt_volume(&r.local_path).await {
-                Ok(()) => RespPayload::ReadoptVolume(ReadoptVolumeResponse {}),
-                Err(e @ crate::sync_error::SyncError::FolderNotStarted { .. }) => {
-                    refused(&e.to_string(), NextStep::CheckLinkStatus)
-                }
-                Err(e) => RespPayload::Error(e.to_string()),
-            }
-        }
+        Some(ReqPayload::ReadoptVolume(r)) => links::readopt_volume(context, r).await,
 
-        Some(ReqPayload::MarkLinkNotRejoined(r)) => {
-            match context.application.link_lifecycle.mark_not_rejoined(&r.local_path).await {
-                Ok(()) => RespPayload::MarkLinkNotRejoined(MarkLinkNotRejoinedResponse {}),
-                Err(e) => RespPayload::Error(e.to_string()),
-            }
-        }
+        Some(ReqPayload::MarkLinkNotRejoined(r)) => links::mark_link_not_rejoined(context, r).await,
 
-        Some(ReqPayload::ListLinks(_)) => match context.status_hub.list_links().await {
-            Ok(links) => RespPayload::ListLinks(ListLinksResponse {
-                links: links
-                    .into_iter()
-                    .map(encode_link_status)
-                    .map(|mut link| {
-                        // The state and the action only: a listing has no peers to read
-                        // availability or protection from.
-                        link.product = Some(
-                            yadorilink_product_view::ProductStatusSummary::for_folder(&link)
-                                .to_wire(),
-                        );
-                        link
-                    })
-                    .collect(),
-            }),
-            Err(message) => RespPayload::Error(message),
-        },
+        Some(ReqPayload::ListLinks(_)) => links::list_links(context).await,
 
-        Some(ReqPayload::Pause(r)) => {
-            let duration =
-                match yadorilink_ipc_proto::daemonctl::PauseDuration::try_from(r.duration) {
-                    Ok(WirePauseDuration::ThirtyMinutes) => PauseDuration::ThirtyMinutes,
-                    Ok(WirePauseDuration::OneHour) => PauseDuration::OneHour,
-                    Ok(WirePauseDuration::UntilTomorrow) => PauseDuration::UntilTomorrow,
-                    Ok(WirePauseDuration::Unspecified) | Err(_) => PauseDuration::UntilResumed,
-                };
-            match context.application.pause_resume.pause(
-                &r.local_path,
-                duration,
-                expected_group(&r.expected_group_id),
-            ) {
-                Ok(()) => RespPayload::Pause(PauseResponse {}),
-                Err(crate::sync_error::SyncError::GroupMismatch(path)) => {
-                    group_mismatch_response(path)
-                }
-                Err(e) => RespPayload::Error(e.to_string()),
-            }
-        }
+        Some(ReqPayload::Pause(r)) => links::pause(context, r).await,
 
-        Some(ReqPayload::Resume(r)) => {
-            match context
-                .application
-                .pause_resume
-                .resume(&r.local_path, expected_group(&r.expected_group_id))
-                .await
-            {
-                Ok(()) => RespPayload::Resume(ResumeResponse {}),
-                Err(crate::sync_error::SyncError::GroupMismatch(path)) => {
-                    group_mismatch_response(path)
-                }
-                Err(e) => RespPayload::Error(e.to_string()),
-            }
-        }
+        Some(ReqPayload::Resume(r)) => links::resume(context, r).await,
 
-        // Drops a pending-enrollment marker once `share create`/`share
-        // join` has confirmed its own activate call directly -- an
-        // optimization over waiting for the next `pending_enrollment::
-        // reconcile` sweep to notice the same thing. Always succeeds: a
-        // marker that's already gone (this device's own sweep beat the
-        // caller to it) is a no-op, matching `remove_pending_enrollment`'s
-        // own idempotent delete.
         Some(ReqPayload::RemovePendingEnrollment(r)) => {
-            match context.application.enrollment_recovery.acknowledge_activation(&r.operation_id) {
-                Ok(()) => RespPayload::RemovePendingEnrollment(RemovePendingEnrollmentResponse {}),
-                Err(e) => RespPayload::Error(e.to_string()),
-            }
+            links::remove_pending_enrollment(context, r).await
         }
 
-        // `yadorilink versions <path>`.
-        Some(ReqPayload::ListVersions(r)) => {
-            match context.queries.file_history.list_versions(&r.absolute_path) {
-                Ok(Some(versions)) => {
-                    match context.queries.file_history.not_kept_spans(&r.absolute_path) {
-                        Ok(spans) => RespPayload::ListVersions(ListVersionsResponse {
-                            versions: versions.into_iter().map(version_to_proto).collect(),
-                            not_kept: spans
-                                .unwrap_or_default()
-                                .into_iter()
-                                .map(not_kept_to_proto)
-                                .collect(),
-                        }),
-                        Err(e) => RespPayload::Error(e.to_string()),
-                    }
-                }
-                Ok(None) => RespPayload::Error("path is not under any linked folder".into()),
-                Err(e) => RespPayload::Error(e.to_string()),
-            }
-        }
+        Some(ReqPayload::ListVersions(r)) => history::list_versions(context, r).await,
 
-        // `yadorilink restore <path> [--version <id>]`. An
-        // absent `version_seq` resolves to the most recent superseded
-        // version (spec "Restore without a version defaults to the most
-        // recent superseded version") via `VersionRestoreService`; there
-        // being none to restore to is reported as a clear error rather
-        // than silently no-op'ing.
-        Some(ReqPayload::RestoreVersion(r)) => {
-            match context.queries.linked_path.resolve_any(&r.absolute_path) {
-                Some((group_id, path)) => {
-                    match context
-                        .application
-                        .version_restore
-                        .restore_version(&group_id, &path, r.version_seq)
-                        .await
-                    {
-                        Ok(true) => RespPayload::RestoreVersion(RestoreVersionResponse {}),
-                        Ok(false) => {
-                            RespPayload::Error("no superseded version to restore to".into())
-                        }
-                        Err(e) => RespPayload::Error(e.to_string()),
-                    }
-                }
-                None => RespPayload::Error("path is not under any linked folder".into()),
-            }
-        }
+        Some(ReqPayload::RestoreVersion(r)) => history::restore_version(context, r).await,
 
-        // `yadorilink trash list`. Unlike the per-file requests
-        // above, this spans every linked folder at once (no `absolute_path`
-        // to resolve) — mirrors `list_link_statuses`'s own per-link
-        // iteration below.
-        Some(ReqPayload::ListTrash(_)) => match context.queries.file_history.list_trash() {
-            Ok(files) => RespPayload::ListTrash(ListTrashResponse {
-                files: files.into_iter().map(trashed_file_view_to_proto).collect(),
-            }),
-            Err(e) => RespPayload::Error(e.to_string()),
-        },
+        Some(ReqPayload::ListTrash(_)) => history::list_trash(context).await,
 
-        // `yadorilink conflicts list`. Same "spans every linked folder at
-        // once" shape as `ListTrash` above.
-        Some(ReqPayload::ListConflicts(_)) => match context.queries.file_history.list_conflicts() {
-            Ok(files) => RespPayload::ListConflicts(ListConflictsResponse {
-                files: files.into_iter().map(conflicted_file_view_to_proto).collect(),
-            }),
-            Err(e) => RespPayload::Error(e.to_string()),
-        },
+        Some(ReqPayload::ListConflicts(_)) => history::list_conflicts(context).await,
 
-        // The Activity page: recent file events across every linked folder.
-        Some(ReqPayload::ListActivity(r)) => {
-            match context
-                .queries
-                .file_history
-                .list_activity(crate::queries::file_history::activity_query_from_proto(&r))
-            {
-                Ok(events) => RespPayload::ListActivity(ListActivityResponse {
-                    events: events
-                        .into_iter()
-                        .map(crate::queries::file_history::activity_view_to_proto)
-                        .collect(),
-                }),
-                Err(e) => RespPayload::Error(e.to_string()),
-            }
-        }
+        Some(ReqPayload::ListActivity(r)) => history::list_activity(context, r).await,
 
-        // Keep this / Keep both: the daemon decides and performs it.
-        Some(ReqPayload::ResolveConflict(r)) => {
-            RespPayload::ResolveConflict(resolve_conflict(context, &r).await)
-        }
+        Some(ReqPayload::ResolveConflict(r)) => history::resolve_conflict(context, r).await,
 
-        // Track Send: `yadorilink send <source_path>... <target_device>`.
-        Some(ReqPayload::SendFile(r)) => {
-            match context.application.send_transfer.send(&r.source_paths, &r.target_device).await {
-                Ok(outcome) => RespPayload::SendFile(SendFileResponse {
-                    transfer_id: outcome.transfer_id,
-                    files_offered: outcome.files_offered,
-                    total_size: outcome.total_size,
-                }),
-                Err(e) => send_failure_payload(e),
-            }
-        }
+        Some(ReqPayload::SendFile(r)) => send::send_file(context, r).await,
 
-        // Cross-account one-shot Send links: create, redeem, cancel.
-        Some(ReqPayload::CreateSendLink(r)) => {
-            match context
-                .application
-                .send_transfer
-                .create_link(r.ttl_seconds, &r.source_paths)
-                .await
-            {
-                Ok(link) => RespPayload::CreateSendLink(CreateSendLinkResponse {
-                    link_id: link.link_id,
-                    code: link.code,
-                    expires_at_unix: link.expires_at_unix,
-                }),
-                Err(e) => send_failure_payload(e),
-            }
-        }
-        Some(ReqPayload::RedeemSendLink(r)) => {
-            match context
-                .application
-                .send_transfer
-                .redeem_link(&r.code, &r.receiver_device_id, &r.destination_dir)
-                .await
-            {
-                Ok((link_id, destination_dir)) => {
-                    RespPayload::RedeemSendLink(RedeemSendLinkResponse { link_id, destination_dir })
-                }
-                Err(e) => send_failure_payload(e),
-            }
-        }
-        Some(ReqPayload::CancelSendLink(r)) => {
-            match context.application.send_transfer.cancel_link(&r.link_id).await {
-                Ok(()) => RespPayload::CancelSendLink(CancelSendLinkResponse {}),
-                Err(e) => send_failure_payload(e),
-            }
-        }
-        Some(ReqPayload::PreviewSendLink(r)) => {
-            match context.application.send_transfer.preview_link(&r.code).await {
-                Ok(preview) => RespPayload::PreviewSendLink(
-                    yadorilink_ipc_proto::daemonctl::PreviewSendLinkResponse {
-                        sender_name: preview.sender_name,
-                        files: preview
-                            .files
-                            .into_iter()
-                            .map(|(name, size)| yadorilink_ipc_proto::daemonctl::SendLinkFile {
-                                name,
-                                size,
-                            })
-                            .collect(),
-                        expires_at_unix: preview.expires_at_unix,
-                    },
-                ),
-                Err(e) => send_failure_payload(e),
-            }
-        }
-        Some(ReqPayload::SendLinkStatus(r)) => {
-            match context.application.send_transfer.link_status(&r.link_id).await {
-                Ok(view) => RespPayload::SendLinkStatus(SendLinkStatusResponse {
-                    state: view.state as i32,
-                    receiver_device_name: view.receiver_device_name,
-                    transfer_id: view.transfer_id,
-                }),
-                Err(e) => send_failure_payload(e),
-            }
-        }
+        Some(ReqPayload::CreateSendLink(r)) => send::create_send_link(context, r).await,
+        Some(ReqPayload::RedeemSendLink(r)) => send::redeem_send_link(context, r).await,
+        Some(ReqPayload::CancelSendLink(r)) => send::cancel_send_link(context, r).await,
+        Some(ReqPayload::PreviewSendLink(r)) => send::preview_send_link(context, r).await,
+        Some(ReqPayload::SendLinkStatus(r)) => send::send_link_status(context, r).await,
 
-        // Track Send: `yadorilink inbox`.
-        Some(ReqPayload::ListInbox(_)) => match context.queries.inbox.list() {
-            Ok(transfers) => RespPayload::ListInbox(ListInboxResponse {
-                transfers: transfers
-                    .into_iter()
-                    .map(crate::send_transfer::inbox_entry_to_proto)
-                    .collect(),
-            }),
-            Err(e) => RespPayload::Error(e),
-        },
+        Some(ReqPayload::ListInbox(_)) => send::list_inbox(context).await,
 
-        // Track Send: the transfers this device sent.
-        Some(ReqPayload::ListSentTransfers(_)) => match context.queries.inbox.list_sent() {
-            Ok(transfers) => RespPayload::ListSentTransfers(ListSentTransfersResponse {
-                transfers: transfers
-                    .into_iter()
-                    .map(crate::send_transfer::sent_entry_to_proto)
-                    .collect(),
-            }),
-            Err(e) => RespPayload::Error(e),
-        },
+        Some(ReqPayload::ListSentTransfers(_)) => send::list_sent_transfers(context).await,
+        Some(ReqPayload::CancelTransfer(r)) => send::cancel_transfer(context, r).await,
+        Some(ReqPayload::RetryTransfer(r)) => send::retry_transfer(context, r).await,
 
-        Some(ReqPayload::CancelTransfer(r)) => {
-            match context.application.send_transfer.cancel(&r.transfer_id) {
-                Ok(()) => RespPayload::CancelTransfer(CancelTransferResponse {}),
-                Err(e) => RespPayload::Error(e),
-            }
-        }
+        Some(ReqPayload::GetNetworkPolicy(_)) => network::get_network_policy(context).await,
+        Some(ReqPayload::SetSyncOnMetered(r)) => network::set_sync_on_metered(context, r).await,
+        Some(ReqPayload::ReportNetworkCost(r)) => network::report_network_cost(context, r).await,
+        Some(ReqPayload::IgnoreRulesGet(r)) => ignore_rules::ignore_rules_get(context, r).await,
+        Some(ReqPayload::IgnoreRulesSet(r)) => ignore_rules::ignore_rules_set(context, r).await,
+        Some(ReqPayload::GetSpaceManagement(_)) => space::get_space_management(context).await,
+        Some(ReqPayload::SetSpaceManagement(r)) => space::set_space_management(context, r).await,
+        Some(ReqPayload::PreviewSpaceReclaim(_)) => space::preview_space_reclaim(context).await,
+        Some(ReqPayload::ReceiveTransfer(r)) => send::receive_transfer(context, r).await,
+        Some(ReqPayload::RestoreTrash(r)) => history::restore_trash(context, r).await,
 
-        Some(ReqPayload::RetryTransfer(r)) => {
-            match context.application.send_transfer.retry(&r.transfer_id, r.direction()).await {
-                Ok(crate::send_transfer::RetryOutcome::Received(outcome)) => {
-                    RespPayload::RetryTransfer(RetryTransferResponse {
-                        destination_dir: outcome.destination_dir.to_string_lossy().into_owned(),
-                        files_received: outcome.files_received,
-                        bytes_received: outcome.bytes_received,
-                        ..Default::default()
-                    })
-                }
-                Ok(crate::send_transfer::RetryOutcome::Offered(outcome)) => {
-                    RespPayload::RetryTransfer(RetryTransferResponse {
-                        offered: true,
-                        files_offered: outcome.files_offered,
-                        total_size: outcome.total_size,
-                        ..Default::default()
-                    })
-                }
-                Err(e) => RespPayload::Error(e),
-            }
-        }
-
-        // The setting is a small local file; an unreadable one reads as Off.
-        Some(ReqPayload::GetSpaceManagement(_)) => {
-            let config = crate::space_management_config::SpaceManagementStore::new(
-                context.config_dir.clone(),
-            )
-            .load_or_off();
-            RespPayload::GetSpaceManagement(GetSpaceManagementResponse {
-                settings: Some(space_settings_to_proto(&config)),
-            })
-        }
-        Some(ReqPayload::SetSpaceManagement(r)) => match r.settings {
-            None => RespPayload::Error("no setting given".into()),
-            Some(settings) => match crate::space_management_config::SpaceManagementStore::new(
-                context.config_dir.clone(),
-            )
-            .set(settings.enabled)
-            {
-                Ok(config) => RespPayload::SetSpaceManagement(SetSpaceManagementResponse {
-                    settings: Some(space_settings_to_proto(&config)),
-                }),
-                Err(e) => RespPayload::Error(format!("could not save the setting: {e}")),
-            },
-        },
-        Some(ReqPayload::PreviewSpaceReclaim(_)) => match context.auto_reclaim.preview().await {
-            Some(scan) => RespPayload::PreviewSpaceReclaim(PreviewSpaceReclaimResponse {
-                items: scan
-                    .entries
-                    .iter()
-                    .map(|e| SpaceReclaimPreviewItem {
-                        group_id: e.group_id.clone(),
-                        path: e.path.clone(),
-                        verdict: e.verdict.to_wire() as i32,
-                    })
-                    .collect(),
-                unreadable_roots: scan.unreadable_roots as u32,
-            }),
-            None => RespPayload::Error(
-                "automatic space management is not available in this daemon".into(),
-            ),
-        },
-
-        // Track Send: `yadorilink receive <transfer_id> [--to <dir>]`.
-        Some(ReqPayload::ReceiveTransfer(r)) => {
-            let destination_dir =
-                if r.destination_dir.is_empty() { None } else { Some(r.destination_dir.as_str()) };
-            match context.application.send_transfer.receive(&r.transfer_id, destination_dir).await {
-                Ok(outcome) => RespPayload::ReceiveTransfer(ReceiveTransferResponse {
-                    destination_dir: outcome.destination_dir.to_string_lossy().into_owned(),
-                    files_received: outcome.files_received,
-                    bytes_received: outcome.bytes_received,
-                }),
-                Err(e) => send_failure_payload(e),
-            }
-        }
-
-        // `yadorilink trash restore <path>`.
-        Some(ReqPayload::RestoreTrash(r)) => {
-            match context.queries.linked_path.resolve_any(&r.absolute_path) {
-                Some((group_id, path)) => {
-                    match context
-                        .application
-                        .version_restore
-                        .restore_trashed(&group_id, &path)
-                        .await
-                    {
-                        Ok(()) => RespPayload::RestoreTrash(RestoreTrashResponse {}),
-                        Err(e) => RespPayload::Error(e.to_string()),
-                    }
-                }
-                None => RespPayload::Error("path is not under any linked folder".into()),
-            }
-        }
-
-        // `yadorilink trash restore --folder <path>`.
         Some(ReqPayload::RestoreTrashOperation(r)) => {
-            match context.queries.linked_path.resolve_any(&r.absolute_path) {
-                Some((group_id, path)) => {
-                    match context
-                        .application
-                        .version_restore
-                        .restore_trashed_operation(&group_id, &path)
-                        .await
-                    {
-                        Ok(outcome) => {
-                            RespPayload::RestoreTrashOperation(RestoreTrashOperationResponse {
-                                restored_paths: outcome.restored,
-                                failed: outcome
-                                    .failed
-                                    .into_iter()
-                                    .map(|(path, error)| RestoreTrashOperationFailure {
-                                        path,
-                                        error,
-                                    })
-                                    .collect(),
-                                partial: outcome.partial,
-                            })
-                        }
-                        Err(e) => RespPayload::Error(e.to_string()),
-                    }
-                }
-                None => RespPayload::Error("path is not under any linked folder".into()),
-            }
+            history::restore_trash_operation(context, r).await
         }
 
-        // What a rebootstrap set aside: list it, restore a version as one ordinary write,
-        // discard an item.
-        Some(ReqPayload::ListPreserved(_)) => match context.application.preserved.list().await {
-            Ok(items) => {
-                RespPayload::ListPreserved(yadorilink_ipc_proto::daemonctl::ListPreservedResponse {
-                    items: items.into_iter().map(preserved_item_to_proto).collect(),
-                })
-            }
-            Err(e) => RespPayload::Error(e.to_string()),
-        },
-        Some(ReqPayload::RestorePreserved(r)) => {
-            match context.application.preserved.restore(r.group_id, r.item_id).await {
-                Ok(()) => RespPayload::RestorePreserved(
-                    yadorilink_ipc_proto::daemonctl::RestorePreservedResponse {},
-                ),
-                Err(e) => RespPayload::Error(e.to_string()),
-            }
-        }
-        Some(ReqPayload::RetryPreserved(r)) => {
-            match context.application.preserved.retry(r.group_id, r.item_id).await {
-                Ok(()) => RespPayload::RetryPreserved(
-                    yadorilink_ipc_proto::daemonctl::RetryPreservedResponse {},
-                ),
-                Err(e) => RespPayload::Error(e.to_string()),
-            }
-        }
-        Some(ReqPayload::DiscardPreserved(r)) => {
-            match context.application.preserved.discard(r.group_id, r.item_id).await {
-                Ok(()) => RespPayload::DiscardPreserved(
-                    yadorilink_ipc_proto::daemonctl::DiscardPreservedResponse {},
-                ),
-                Err(e) => RespPayload::Error(e.to_string()),
-            }
-        }
+        Some(ReqPayload::ListPreserved(_)) => history::list_preserved(context).await,
+        Some(ReqPayload::RestorePreserved(r)) => history::restore_preserved(context, r).await,
+        Some(ReqPayload::RetryPreserved(r)) => history::retry_preserved(context, r).await,
+        Some(ReqPayload::DiscardPreserved(r)) => history::discard_preserved(context, r).await,
 
         Some(ReqPayload::ListRetainedOriginals(_)) => {
-            match context.application.preserved.list_retained().await {
-                Ok(items) => RespPayload::ListRetainedOriginals(
-                    yadorilink_ipc_proto::daemonctl::ListRetainedOriginalsResponse {
-                        items: items
-                            .into_iter()
-                            .map(|item| yadorilink_ipc_proto::daemonctl::RetainedOriginal {
-                                group_id: item.group_id,
-                                group_removed: item.group_removed,
-                                path: item.path,
-                                recovery_id: item.recovery_id,
-                                size: item.size,
-                                reachable: item.reachable,
-                            })
-                            .collect(),
-                    },
-                ),
-                Err(e) => RespPayload::Error(e.to_string()),
-            }
+            history::list_retained_originals(context).await
         }
         Some(ReqPayload::ReleaseRetainedOriginals(r)) => {
-            match context.application.preserved.release_retained(r.group_id).await {
-                Ok(outcomes) => RespPayload::ReleaseRetainedOriginals(
-                    yadorilink_ipc_proto::daemonctl::ReleaseRetainedOriginalsResponse {
-                        releases: outcomes
-                            .into_iter()
-                            .map(|(path, outcome)| retained_release_to_proto(path, outcome))
-                            .collect(),
-                    },
-                ),
-                Err(e) => RespPayload::Error(e.to_string()),
-            }
+            history::release_retained_originals(context, r).await
         }
 
         Some(ReqPayload::ListProviderPending(r)) => {
-            match context.provider_status.pending_items(r.limit) {
-                Ok(items) => RespPayload::ListProviderPending(
-                    yadorilink_ipc_proto::daemonctl::ListProviderPendingResponse { items },
-                ),
-                Err(error) => RespPayload::Error(error),
-            }
+            history::list_provider_pending(context, r).await
         }
 
-        Some(ReqPayload::Status(_)) => match context.status_hub.status().await {
-            Ok(response) => RespPayload::Status(response),
-            Err(message) => RespPayload::Error(message),
-        },
+        Some(ReqPayload::Status(_)) => daemon::status(context).await,
 
-        Some(ReqPayload::LimitsSet(r)) => {
-            match context
-                .application
-                .governance
-                .set_limits(r.upload_bytes_per_sec, r.download_bytes_per_sec)
-            {
-                Ok(limits) => RespPayload::LimitsSet(LimitsSetResponse {
-                    upload_bytes_per_sec: limits.upload_bytes_per_sec,
-                    download_bytes_per_sec: limits.download_bytes_per_sec,
-                }),
-                Err(e) => RespPayload::Error(e.to_string()),
-            }
+        Some(ReqPayload::LimitsSet(r)) => space::limits_set(context, r).await,
+
+        Some(ReqPayload::LimitsShow(_)) => space::limits_show(context).await,
+
+        Some(ReqPayload::ListAccountDevices(_)) => {
+            membership_commands::list_account_devices(context).await
         }
 
-        Some(ReqPayload::LimitsShow(_)) => {
-            let config = context.queries.governance.limits();
-            RespPayload::LimitsShow(LimitsShowResponse {
-                upload_bytes_per_sec: config.upload_limit_bytes_per_sec,
-                download_bytes_per_sec: config.download_limit_bytes_per_sec,
-            })
-        }
+        Some(ReqPayload::ListShareEdges(_)) => membership_commands::list_share_edges(context).await,
 
-        // The folder a command line names, a plain linked folder or a File Provider folder at its
-        // place in the file manager: the one resolver, and only the folder itself.
-        Some(ReqPayload::ResolveFolder(r)) => {
-            use crate::queries::linked_path::FolderPath;
-            match context.queries.linked_path.resolve_folder(&r.path) {
-                FolderPath::Folder(group_id) => RespPayload::ResolveFolder(
-                    yadorilink_ipc_proto::daemonctl::ResolveFolderResponse { group_id },
-                ),
-                FolderPath::Inside(_) => RespPayload::Error(format!(
-                    "{} is inside a linked folder, not the folder itself: name the folder",
-                    r.path
-                )),
-                FolderPath::NotLinked => {
-                    RespPayload::Error(format!("{} is not a linked folder", r.path))
-                }
-            }
-        }
-        Some(ReqPayload::Hydrate(r)) => match context.queries.linked_path.resolve(&r.absolute_path)
-        {
-            Some((group_id, path)) => {
-                let application = context.application.clone();
-                match application.materialization.hydrate(&group_id, &path).await {
-                    Ok(downloaded) => RespPayload::Hydrate(HydrateResponse { downloaded }),
-                    Err(e) => RespPayload::Error(e.to_string()),
-                }
-            }
-            None if context.queries.linked_path.resolve_provider(&r.absolute_path).is_some() => {
-                refused(PROVIDER_DOWNLOAD, NextStep::KeepItemOnDevice)
-            }
-            None => RespPayload::Error("path is not under any linked folder".into()),
-        },
+        Some(ReqPayload::ResolveFolder(r)) => items::resolve_folder(context, r).await,
+        Some(ReqPayload::Hydrate(r)) => items::hydrate(context, r).await,
 
-        Some(ReqPayload::Evict(r)) => match context.queries.linked_path.resolve(&r.absolute_path) {
-            Some((group_id, path)) => {
-                let application = context.application.clone();
-                match application.materialization.evict(&group_id, &path) {
-                    Ok(outcome) => RespPayload::Evict(EvictResponse {
-                        dehydrated: outcome.dehydrated,
-                        blocks_reclaimed: outcome.blocks_reclaimed,
-                        bytes_reclaimed: outcome.bytes_reclaimed,
-                        not_freed_reason: outcome.not_freed.map(str::to_owned).unwrap_or_default(),
-                        ..Default::default()
-                    }),
-                    Err(e) => RespPayload::Error(e.to_string()),
-                }
-            }
-            None => match context.queries.linked_path.resolve_provider(&r.absolute_path) {
-                // A file in a provider folder: the host drops the OS copy, and the daemon frees
-                // its cached blocks when a full replica holds a durable lease on the version.
-                Some((group_id, path)) => {
-                    match context.provider_evict.evict(&group_id, &path).await {
-                        Ok(outcome) => RespPayload::Evict(EvictResponse {
-                            dehydrated: outcome.dehydrated,
-                            blocks_reclaimed: outcome.reclaimed.blocks,
-                            bytes_reclaimed: outcome.reclaimed.bytes,
-                            retained_reason: outcome
-                                .retained
-                                .map(|why| why.code().to_owned())
-                                .unwrap_or_default(),
-                            not_freed_reason: String::new(),
-                        }),
-                        Err(e) => RespPayload::Error(e.to_string()),
-                    }
-                }
-                None => RespPayload::Error("path is not under any linked folder".into()),
-            },
-        },
+        Some(ReqPayload::Evict(r)) => items::evict(context, r).await,
 
-        // The retention policy is local state keyed by (group, relative path), so a file in a
-        // provider folder is as pinnable as one in a plain folder.
-        Some(ReqPayload::PinItem(r)) => match resolve_item(context, &r.absolute_path) {
-            Some((group_id, path)) => {
-                let application = context.application.clone();
-                match application.materialization.pin(&group_id, &path).await {
-                    Ok(outcome) => RespPayload::PinItem(PinItemResponse {
-                        retention: Some(retention_to_proto(outcome.retention)),
-                        download_error: outcome.download_error.unwrap_or_default(),
-                        history_not_kept_reason: outcome
-                            .history_not_kept_reason
-                            .unwrap_or_default()
-                            .to_owned(),
-                    }),
-                    Err(e) => RespPayload::Error(e.to_string()),
-                }
-            }
-            None => RespPayload::Error("path is not under any linked folder".into()),
-        },
-
-        Some(ReqPayload::UnpinItem(r)) => match resolve_item(context, &r.absolute_path) {
-            Some((group_id, path)) => {
-                match context.application.materialization.unpin(&group_id, &path) {
-                    Ok(retention) => RespPayload::UnpinItem(UnpinItemResponse {
-                        retention: Some(retention_to_proto(retention)),
-                    }),
-                    Err(e) => RespPayload::Error(e.to_string()),
-                }
-            }
-            None => RespPayload::Error("path is not under any linked folder".into()),
-        },
+        Some(ReqPayload::SetRetentionRule(r)) => items::set_retention_rule(context, r).await,
 
         Some(ReqPayload::MaterializationStatus(r)) => {
-            // A provider folder's items live in the OS's File Provider location, and the daemon
-            // does not track their local state per item: name that, rather than "not linked".
-            if context.queries.linked_path.resolve(&r.absolute_path).is_none()
-                && context.queries.linked_path.resolve_provider(&r.absolute_path).is_some()
-            {
-                // On macOS the OS marks a not-downloaded item `dataless` in the file's flags;
-                // reading them does not download it.
-                match provider_local_state(&r.absolute_path) {
-                    Some(local_state) => {
-                        let retention = context
-                            .queries
-                            .linked_path
-                            .resolve_provider(&r.absolute_path)
-                            .map_or(Ok(None), |(group_id, path)| {
-                                context
-                                    .application
-                                    .materialization
-                                    .retention(&group_id, &path)
-                                    .map(Some)
-                            });
-                        match retention {
-                            Ok(retention) => {
-                                // The operating system downloads and removes downloads in a
-                                // provider folder, so the root's eviction gate is open by
-                                // construction.
-                                let available_actions = item_actions(ItemActionInputs {
-                                    path: &r.absolute_path,
-                                    local_state: Some(&local_state),
-                                    retention,
-                                    provider_folder: true,
-                                    reclaim_gate_open: true,
-                                });
-                                RespPayload::MaterializationStatus(MaterializationStatusResponse {
-                                    known: true,
-                                    local_state: Some(local_state),
-                                    retention: retention.map(retention_to_proto),
-                                    available_actions,
-                                })
-                            }
-                            Err(e) => RespPayload::Error(e.to_string()),
-                        }
-                    }
-                    None => refused(PROVIDER_LOCAL_STATE, NextStep::ShowProviderLocalState),
-                }
-            } else {
-                match context.queries.linked_path.resolve(&r.absolute_path) {
-                    Some((group_id, path)) => {
-                        let application = context.application.clone();
-                        // The policy is a standing choice, so it is reported for an unindexed
-                        // path too; one that cannot be read fails the query rather than
-                        // reading as "reclaimable".
-                        let materialization = &application.materialization;
-                        match materialization.retention(&group_id, &path).and_then(|retention| {
-                            materialization.status(&group_id, &path).map(|s| (retention, s))
-                        }) {
-                            Ok((retention, Some(status))) => {
-                                let local_state = local_state_to_proto(status.state);
-                                let available_actions = item_actions(ItemActionInputs {
-                                    path: &r.absolute_path,
-                                    local_state: Some(&local_state),
-                                    retention: Some(retention),
-                                    provider_folder: false,
-                                    reclaim_gate_open: materialization.evict_supported(&group_id),
-                                });
-                                RespPayload::MaterializationStatus(MaterializationStatusResponse {
-                                    known: true,
-                                    local_state: Some(local_state),
-                                    retention: Some(retention_to_proto(retention)),
-                                    available_actions,
-                                })
-                            }
-                            Ok((retention, None)) => {
-                                RespPayload::MaterializationStatus(MaterializationStatusResponse {
-                                    known: false,
-                                    local_state: None,
-                                    retention: Some(retention_to_proto(retention)),
-                                    available_actions: Vec::new(),
-                                })
-                            }
-                            Err(e) => RespPayload::Error(e.to_string()),
-                        }
-                    }
-                    None => RespPayload::Error("path is not under any linked folder".into()),
-                }
-            }
+            items::materialization_status(context, r).await
         }
 
-        Some(ReqPayload::Shutdown(request)) => {
-            tracing::info!("shutdown requested via control socket");
-            // route through the same graceful-shutdown path
-            // `main.rs` uses for SIGTERM/SIGINT instead of calling
-            // `std::process::exit` directly here — that used to skip
-            // aborting watcher tasks, draining in-flight broadcasts, and
-            // removing socket files. `main.rs`'s top-level `select!` holds
-            // the matching receiver and does the actual teardown/exit
-            // once it observes this; a `send` error just means every
-            // receiver (i.e. `main.rs` itself) is already gone, which
-            // only happens if the process is already on its way out.
-            if request.restart {
-                context.application.lifecycle.request_shutdown_to_restart();
-            } else {
-                context.application.lifecycle.request_shutdown();
-            }
-            RespPayload::Shutdown(ShutdownResponse {})
-        }
+        Some(ReqPayload::Shutdown(request)) => daemon::shutdown(context, request).await,
 
         Some(ReqPayload::RequestSafeStop(request)) => {
-            let outcome = context
-                .application
-                .lifecycle
-                .request_safe_stop(crate::application::ports::safe_stop_deadline(
-                    request.deadline_secs,
-                ))
-                .await;
-            RespPayload::RequestSafeStop(encode_safe_stop(outcome))
+            daemon::request_safe_stop(context, request).await
         }
 
-        Some(ReqPayload::Identify(_)) => RespPayload::Identify(context.identity.report()),
+        Some(ReqPayload::Identify(_)) => daemon::identify(context).await,
 
-        Some(ReqPayload::Health(_)) => {
-            RespPayload::Health(encode_health(context.queries.health.snapshot()))
-        }
+        Some(ReqPayload::Health(_)) => daemon::health(context).await,
 
-        // Dispatch into `reporting_ipc`, which owns the actual
-        // translation to/from `yadorilink_reporting`/`crate::reporting`
-        // types.
-        Some(ReqPayload::ReportingStatus(_)) => RespPayload::ReportingStatus(
-            encode_reporting_status(context.queries.reporting.status()),
-        ),
-        Some(ReqPayload::GenerateUsageReport(_)) => RespPayload::GenerateUsageReport(
-            reporting_ipc::generate_usage_report(&*context.application.reporting),
-        ),
+        Some(ReqPayload::ReportingStatus(_)) => reporting::reporting_status(context).await,
+        Some(ReqPayload::GenerateUsageReport(_)) => reporting::generate_usage_report(context).await,
         Some(ReqPayload::GenerateLastErrorReport(r)) => {
-            match reporting_ipc::generate_last_error_report(
-                &*context.application.reporting,
-                r.report_id,
-            ) {
-                Ok(resp) => RespPayload::GenerateLastErrorReport(resp),
-                Err(e) => RespPayload::Error(e),
-            }
+            reporting::generate_last_error_report(context, r).await
         }
-        Some(ReqPayload::ListQueueItems(_)) => match context.queries.reporting.list_queue_items() {
-            Ok(items) => RespPayload::ListQueueItems(ListQueueItemsResponse {
-                items: items.into_iter().map(encode_queue_item).collect(),
-            }),
-            Err(e) => RespPayload::Error(e),
-        },
-        Some(ReqPayload::ShowQueueItem(r)) => {
-            match context.queries.reporting.show_queue_item(&r.report_id) {
-                Ok(Some(report_json)) => {
-                    RespPayload::ShowQueueItem(ShowQueueItemResponse { report_json })
-                }
-                Ok(None) => {
-                    RespPayload::Error(format!("no queued report found with id `{}`", r.report_id))
-                }
-                Err(e) => RespPayload::Error(e),
-            }
-        }
-        Some(ReqPayload::DeleteQueueItem(r)) => {
-            match reporting_ipc::delete_queue_item(&*context.application.reporting, &r.report_id) {
-                Ok(resp) => RespPayload::DeleteQueueItem(resp),
-                Err(e) => RespPayload::Error(e),
-            }
-        }
-        Some(ReqPayload::FlushQueue(_)) => {
-            match reporting_ipc::flush_queue(&*context.application.reporting) {
-                Ok(resp) => RespPayload::FlushQueue(resp),
-                Err(e) => RespPayload::Error(e),
-            }
-        }
-        Some(ReqPayload::SubmitReport(r)) => {
-            match reporting_ipc::submit_report(&*context.application.reporting, &r.report_json)
-                .await
-            {
-                Ok(resp) => RespPayload::SubmitReport(resp),
-                Err(e @ SubmitReportError::NotEnabled) => {
-                    refused(&e.to_string(), NextStep::EnableReportSubmission)
-                }
-                Err(e @ SubmitReportError::Failed(_)) => RespPayload::Error(e.to_string()),
-            }
-        }
-        Some(ReqPayload::UpdateConsent(r)) => {
-            match reporting_ipc::update_consent(&*context.application.reporting, r) {
-                Ok(resp) => RespPayload::UpdateConsent(resp),
-                Err(e) => RespPayload::Error(e),
-            }
-        }
+        Some(ReqPayload::ListQueueItems(_)) => reporting::list_queue_items(context).await,
+        Some(ReqPayload::ShowQueueItem(r)) => reporting::show_queue_item(context, r).await,
+        Some(ReqPayload::DeleteQueueItem(r)) => reporting::delete_queue_item(context, r).await,
+        Some(ReqPayload::FlushQueue(_)) => reporting::flush_queue(context).await,
+        Some(ReqPayload::SubmitReport(r)) => reporting::submit_report(context, r).await,
+        Some(ReqPayload::UpdateConsent(r)) => reporting::update_consent(context, r).await,
 
-        // Dispatch into `context.application.update`/`context.queries.
-        // update_status`; `update_ipc` only translates to/from the wire
-        // types — mirrors `reporting_ipc`'s own dispatch pattern above.
-        Some(ReqPayload::UpdateStatus(_)) => RespPayload::UpdateStatus(
-            crate::update_ipc::encode_update_status(context.queries.update_status.snapshot()),
-        ),
-        Some(ReqPayload::UpdateCheck(_)) => {
-            context.application.update.check().await;
-            RespPayload::UpdateCheck(crate::update_ipc::encode_check_response(
-                context.queries.update_status.snapshot(),
-            ))
-        }
-        Some(ReqPayload::UpdateVersionCheck(r)) => {
-            match crate::update_ipc::decode_version_check(r) {
-                Ok((kind, version)) => {
-                    let outcome = context.application.update.version_check(kind, version).await;
-                    RespPayload::UpdateVersionCheck(
-                        crate::update_ipc::encode_version_check_response(outcome),
-                    )
-                }
-                Err(e) => RespPayload::Error(e),
-            }
-        }
-        Some(ReqPayload::UpdateVerifiedEntry(r)) => {
-            match crate::update_ipc::decode_verified_entry(r) {
-                Ok((item, phase)) => RespPayload::UpdateVerifiedEntry(
-                    crate::update_ipc::encode_verified_entry_response(
-                        context.queries.update_status.verified_entry(&item, phase),
-                    ),
-                ),
-                Err(e) => RespPayload::Error(e),
-            }
-        }
-        Some(ReqPayload::UpdateInstall(_)) => {
-            RespPayload::UpdateInstall(crate::update_ipc::encode_download_response(
-                context.application.update.download_guidance(),
-                context.application.update.download_page_url(),
-            ))
-        }
-        Some(ReqPayload::UpdateConfig(r)) => {
-            match context.application.update.config(crate::update_ipc::decode_config_request(r)) {
-                Ok(policy) => {
-                    RespPayload::UpdateConfig(crate::update_ipc::encode_config_response(policy))
-                }
-                Err(e) => RespPayload::Error(e),
-            }
-        }
+        Some(ReqPayload::UpdateStatus(_)) => update::update_status(context).await,
+        Some(ReqPayload::UpdateCheck(_)) => update::update_check(context).await,
+        Some(ReqPayload::UpdateVersionCheck(r)) => update::update_version_check(context, r).await,
+        Some(ReqPayload::UpdateVerifiedEntry(r)) => update::update_verified_entry(context, r).await,
+        Some(ReqPayload::UpdateInstall(_)) => update::update_install(context).await,
+        Some(ReqPayload::UpdateConfig(r)) => update::update_config(context, r).await,
 
-        // Dispatch into `connection_trace`.
         Some(ReqPayload::ListConnectionTraces(r)) => {
-            let peer_device_id =
-                (!r.peer_device_id.is_empty()).then_some(r.peer_device_id.as_str());
-            let traces = context
-                .queries
-                .diagnostics
-                .recent_connection_traces(peer_device_id)
-                .into_iter()
-                .map(|trace| ConnectionAttemptTrace {
-                    peer_device_id: trace.peer_device_id,
-                    candidate_source: trace.candidate_source.to_string(),
-                    address_class: trace.address_class.to_string(),
-                    outcome: trace.outcome.to_string(),
-                    latency_ms: trace.latency_ms,
-                    failure_category: trace.failure_category,
-                    selected: trace.selected,
-                    authorization_decision: trace.authorization_decision.to_string(),
-                    recorded_at_unix_nanos: trace.recorded_at_unix_nanos,
-                })
-                .collect();
-            RespPayload::ListConnectionTraces(ListConnectionTracesResponse { traces })
+            reporting::list_connection_traces(context, r).await
         }
 
-        Some(ReqPayload::ConnectivityDoctor(_)) => {
-            let categories = context
-                .queries
-                .diagnostics
-                .connectivity_doctor()
-                .into_iter()
-                .map(|c| ConnectivityDoctorCategory {
-                    name: c.name.to_string(),
-                    status: c.status.to_string(),
-                    detail: c.detail,
-                })
-                .collect();
-            RespPayload::ConnectivityDoctor(ConnectivityDoctorResponse { categories })
-        }
+        Some(ReqPayload::ConnectivityDoctor(_)) => reporting::connectivity_doctor(context).await,
 
-        // Dispatch into `diagnostics_ipc`, which owns the actual bundle
-        // assembly (from existing status/config/update/recent-error
-        // sources) and the bounded-time-budget handling -- mirrors
-        // `reporting_ipc`/`update_ipc`'s own dispatch pattern above.
-        // Preview and Export both request the exact same daemon-side
-        // bundle; only the CLI-side disposition of the result differs.
-        Some(ReqPayload::DiagnosticsPreview(_)) => RespPayload::DiagnosticsPreview(
-            crate::diagnostics_ipc::build_bundle(&context.queries.diagnostics_bundle).await,
-        ),
-        Some(ReqPayload::DiagnosticsExport(_)) => RespPayload::DiagnosticsExport(
-            crate::diagnostics_ipc::build_bundle(&context.queries.diagnostics_bundle).await,
-        ),
+        Some(ReqPayload::DiagnosticsPreview(_)) => reporting::diagnostics_preview(context).await,
+        Some(ReqPayload::DiagnosticsExport(_)) => reporting::diagnostics_export(context).await,
 
-        // Dispatch into `gc::run_sweep`, which owns the actual
-        // mark-and-sweep, daemon-wide mutual-exclusion, and
-        // never-mid-burst logic -- this arm only translates to/from the
-        // wire types, mirroring
-        // `reporting_ipc`/`update_ipc`/`diagnostics_ipc`'s own dispatch
-        // pattern above. `GcTriggerError`'s `Display` (already a clear,
-        // actionable message for `AlreadyRunning`/`SyncBurstInProgress`)
-        // is surfaced directly as `DaemonControlResponse.error`, same as
-        // every other fallible request in this match.
-        Some(ReqPayload::Gc(r)) => match context.application.gc.run_sweep(r.dry_run).await {
-            Ok(report) => {
-                let usage = if r.dry_run {
-                    context.queries.file_history.kept_history_usage().ok()
-                } else {
-                    None
-                };
-                let (kept_history_bytes, kept_history_versions) = match usage {
-                    Some((bytes, versions)) => (Some(bytes), Some(versions)),
-                    None => (None, None),
-                };
-                RespPayload::Gc(GcResponse {
-                    blocks_deleted: report.blocks_deleted,
-                    bytes_reclaimed: report.bytes_reclaimed,
-                    kept_history_bytes,
-                    kept_history_versions,
-                })
-            }
-            Err(e) => RespPayload::Error(e.to_string()),
-        },
+        Some(ReqPayload::Gc(r)) => daemon::gc(context, r).await,
 
-        // `yadorilink rewind <group> --at <timestamp>`: Folder Rewind's
-        // read-only preview. Nothing here mutates anything -- no signed
-        // change, no filesystem write, no obligation -- so it goes through
-        // `queries`, not `application`, like every other read-only handler.
-        Some(ReqPayload::RewindPreview(r)) => {
-            match context
-                .queries
-                .rewind
-                .preview(&r.group_id, r.at_unix_nanos, r.include_unchanged)
-                .await
-            {
-                Ok(preview) => RespPayload::RewindPreview(rewind_preview_to_proto(preview)),
-                Err(e) => RespPayload::Error(e.to_string()),
-            }
-        }
+        Some(ReqPayload::RewindPreview(r)) => rewind::rewind_preview(context, r).await,
 
-        // `yadorilink rewind ... --execute`: answered once the run is
-        // recorded (or refused before anything is); the run itself goes on
-        // in the background and is read back through `RewindStatus`.
-        Some(ReqPayload::RewindExecute(r)) => match <[u8; 32]>::try_from(r.plan_id.as_slice()) {
-            Err(_) => RespPayload::Error("plan id must be 32 bytes".to_string()),
-            Ok(plan_id) => {
-                let request = crate::rewind::RewindExecuteRequest {
-                    group_id: r.group_id,
-                    target_unix_nanos: r.target_unix_nanos,
-                    plan_id: yadorilink_replica_domain::rewind::RewindPlanId(plan_id),
-                };
-                match context.application.rewind.execute(request).await {
-                    Ok(run_id) => RespPayload::RewindExecute(RewindExecuteResponse {
-                        outcome: Some(RewindExecuteOutcome::Started(RewindRunStarted { run_id })),
-                    }),
-                    Err(error) => rewind_execute_refusal(error),
-                }
-            }
-        },
+        Some(ReqPayload::RewindExecute(r)) => rewind::rewind_execute(context, r).await,
 
-        Some(ReqPayload::RewindStatus(r)) => match context.queries.rewind.status(&r.group_id) {
-            Ok(run) => RespPayload::RewindStatus(RewindStatusResponse {
-                run: run.map(rewind_run_to_proto),
-            }),
-            Err(e) => RespPayload::Error(e.to_string()),
-        },
+        Some(ReqPayload::RewindStatus(r)) => rewind::rewind_status(context, r).await,
 
-        // Read-only pre-check for `yadorilink share set-storage-mode`: never
-        // mutates anything, local or remote (see
-        // `DaemonState::another_full_replica_is_ready`'s doc comment). The
-        // authoritative, fail-closed re-check happens again in
-        // `SetStorageMode` below, right before the local flip commits.
         Some(ReqPayload::CheckFullReplicaHandoffReady(r)) => {
-            RespPayload::CheckFullReplicaHandoffReady(CheckFullReplicaHandoffReadyResponse {
-                ready: context.queries.handoff_readiness.ready(&r.group_id).await,
-            })
+            handoff::check_full_replica_handoff_ready(context, r).await
         }
 
-        Some(ReqPayload::SetStorageMode(r)) => {
-            let application = context.application.clone();
-            match application.replica_role.set_storage_mode(&r.group_id, r.on_demand).await {
-                // `root_digest` is this device's own locally-computed
-                // durability-root digest at commit time -- never sent to or
-                // read back from the coordination service (see
-                // `HandoffCommitResult`'s doc comment), same as
-                // `UnlinkResponse`'s construction above.
-                Ok(handoff_result) => RespPayload::SetStorageMode(SetStorageModeResponse {
-                    handoff_result: handoff_result.map(|(hr, root_digest)| HandoffResult {
-                        target_device_id: hr.target_device_id,
-                        root_digest: root_digest.to_vec(),
-                        membership_generation: hr.membership_generation,
-                        lease_id: hr.lease_id.unwrap_or_default(),
-                    }),
-                }),
-                Err(StorageModeError::OnDemandUnavailable) => {
-                    refused(crate::provider_gate::ON_DEMAND_REFUSAL, NextStep::CreateProviderFolder)
-                }
-                Err(StorageModeError::Advised { message, step }) => refused(&message, step),
-                Err(e @ StorageModeError::TermsConsentRequired) => terms_consent_response(e),
-                Err(e @ StorageModeError::Failed(_)) => RespPayload::Error(e.to_string()),
-            }
-        }
+        Some(ReqPayload::SetStorageMode(r)) => handoff::set_storage_mode(context, r).await,
 
-        // Read-only durability pre-check for `yadorilink share revoke`/
-        // `yadorilink device remove`, run by the acting device's own daemon
-        // BEFORE the CLI ever calls the coordination plane. See
-        // `full_replica_handoff_not_ready_excluding`'s doc comment for the
-        // empty-`group_id` "every affected group this daemon can see"
-        // semantics and the "partial view, not a distributed proof" caveat.
         Some(ReqPayload::CheckFullReplicaHandoffReadyExcluding(r)) => {
-            match context
-                .queries
-                .handoff_readiness
-                .not_ready_excluding(&r.group_id, &r.excluded_device_id)
-                .await
-            {
-                Ok(not_ready_group_ids) => RespPayload::CheckFullReplicaHandoffReadyExcluding(
-                    CheckFullReplicaHandoffReadyExcludingResponse {
-                        ready: not_ready_group_ids.is_empty(),
-                        not_ready_group_ids,
-                    },
-                ),
-                Err(e) => RespPayload::Error(format!(
-                    "cannot verify complete-copy durability because the local link table could not be read: {e}"
-                )),
-            }
+            handoff::check_full_replica_handoff_ready_excluding(context, r).await
         }
 
-        // Durable post-force durability-status latch for the
-        // CLI-orchestrated force paths (`durability_force.rs`'s revoke/
-        // device-remove) -- see the request's proto doc comment. Persistence
-        // failure is returned rather than acknowledging a latch that would
-        // disappear on restart.
         Some(ReqPayload::LatchGroupDurabilityUnknown(r)) => {
-            match context.application.durability.latch_group_durability_unknown(&r.group_id) {
-                Ok(()) => {
-                    RespPayload::LatchGroupDurabilityUnknown(LatchGroupDurabilityUnknownResponse {})
-                }
-                Err(error) => RespPayload::Error(error.to_string()),
-            }
+            handoff::latch_group_durability_unknown(context, r).await
         }
 
-        // Full-replica-handoff lease request (target-side) -- see the
-        // request's proto doc comment and `DaemonState::request_handoff_
-        // lease` for the local-check-then-coordination-plane-request-then-
-        // local-record round trip this drives.
         Some(ReqPayload::RequestHandoffLease(r)) => {
-            match context.application.handoff.request_lease(&r.group_id).await {
-                Ok(grant) => RespPayload::RequestHandoffLease(RequestHandoffLeaseResponse {
-                    requested: true,
-                    lease_id: grant.lease_id,
-                    expires_at_unix: grant.expires_at_unix,
-                    not_requested_reason: String::new(),
-                }),
-                Err(refusal) => RespPayload::RequestHandoffLease(RequestHandoffLeaseResponse {
-                    requested: false,
-                    lease_id: String::new(),
-                    expires_at_unix: 0,
-                    not_requested_reason: match refusal {
-                        LeaseRefusal::ChangingRetry => "changing_retry".to_owned(),
-                        LeaseRefusal::Unspecified => String::new(),
-                    },
-                }),
-            }
+            handoff::request_handoff_lease(context, r).await
         }
 
-        // Removed-device handoff-ticket request (operating-device-side) --
-        // see the request's proto doc comment and `DaemonState::obtain_
-        // handoff_ticket_from_device` for the peer round trip (offline/
-        // unreachable, timeout, and "the device could not attest its own
-        // roots" all collapse to `granted = false` here, matching that
-        // method's own doc comment).
         Some(ReqPayload::ObtainHandoffTicket(r)) => {
-            match context.application.handoff.obtain_ticket(&r.group_id, &r.device_id).await {
-                Some(grant) => RespPayload::ObtainHandoffTicket(ObtainHandoffTicketResponse {
-                    granted: true,
-                    lease_id: grant.lease_id,
-                    expires_at_unix: grant.expires_at_unix,
-                    target_device_id: grant.target_device_id,
-                }),
-                None => RespPayload::ObtainHandoffTicket(ObtainHandoffTicketResponse {
-                    granted: false,
-                    lease_id: String::new(),
-                    expires_at_unix: 0,
-                    target_device_id: String::new(),
-                }),
-            }
+            handoff::obtain_handoff_ticket(context, r).await
         }
 
         Some(ReqPayload::ReleaseHandoffTicket(r)) => {
-            context
-                .application
-                .handoff
-                .release_ticket(&r.group_id, &r.device_id, &r.target_device_id, &r.lease_id)
-                .await;
-            RespPayload::ReleaseHandoffTicket(ReleaseHandoffTicketResponse {})
+            handoff::release_handoff_ticket(context, r).await
         }
 
         Some(ReqPayload::RemoveDeviceCommand(r)) => {
-            let application = context.application.clone();
-            let result = application
-                .membership
-                .remove_device(crate::application::RemoveDeviceCommand {
-                    device_id: r.device_id,
-                    force: r.force,
-                })
-                .await;
-            RespPayload::RemoveDeviceCommand(RemoveDeviceCommandResponse {
-                result: Some(match result {
-                    Ok(outcome) => remove_device_command_response::Result::Outcome(
-                        membership_outcome_to_proto(outcome),
-                    ),
-                    Err(error) => remove_device_command_response::Result::Error(
-                        membership_error_to_proto(error),
-                    ),
-                }),
-            })
+            membership_commands::remove_device_command(context, r).await
         }
 
         Some(ReqPayload::RevokeDeviceCommand(r)) => {
-            let application = context.application.clone();
-            let result = application
-                .membership
-                .revoke_device(crate::application::RevokeDeviceCommand {
-                    group_id: r.group_id,
-                    device_id: r.device_id,
-                    force: r.force,
-                })
-                .await;
-            RespPayload::RevokeDeviceCommand(RevokeDeviceCommandResponse {
-                result: Some(match result {
-                    Ok(outcome) => revoke_device_command_response::Result::Outcome(
-                        membership_outcome_to_proto(outcome),
-                    ),
-                    Err(error) => revoke_device_command_response::Result::Error(
-                        membership_error_to_proto(error),
-                    ),
-                }),
-            })
+            membership_commands::revoke_device_command(context, r).await
         }
 
         Some(ReqPayload::RevokeEdgeCommand(r)) => {
-            let application = context.application.clone();
-            let result = application.membership.revoke_edge(r.edge_id, r.force).await;
-            RespPayload::RevokeEdgeCommand(RevokeEdgeCommandResponse {
-                result: Some(match result {
-                    Ok(outcome) => revoke_edge_command_response::Result::Outcome(
-                        membership_outcome_to_proto(outcome),
-                    ),
-                    Err(error) => revoke_edge_command_response::Result::Error(
-                        membership_error_to_proto(error),
-                    ),
-                }),
-            })
+            membership_commands::revoke_edge_command(context, r).await
         }
 
         Some(ReqPayload::DeleteGroupCommand(r)) => {
-            let application = context.application.clone();
-            let result = application
-                .group_admin
-                .delete_folder_group(&r.group_id, r.acknowledge_cross_account_members)
-                .await;
-            RespPayload::DeleteGroupCommand(DeleteGroupCommandResponse {
-                result: Some(match result {
-                    Ok(()) => delete_group_command_response::Result::Ok(true),
-                    Err(error) => delete_group_command_response::Result::Error(error),
-                }),
-            })
+            membership_commands::delete_group_command(context, r).await
         }
 
         Some(ReqPayload::CreateAndLinkCommand(r)) => {
-            let result = enrollment_commands::create_and_link(
-                &context.application,
-                enrollment_commands::CreateShare {
-                    group_name: r.group_name,
-                    local_path: r.local_path,
-                    create_local_path_if_missing: r.create_local_path_if_missing,
-                    on_demand: r.on_demand,
-                    acknowledge_risks: r.acknowledge_risks,
-                    provider_display_name: r.provider_display_name,
-                    request_token: r.request_token,
-                },
-            )
-            .await;
-            RespPayload::CreateAndLinkCommand(CreateAndLinkCommandResponse {
-                result: Some(match result {
-                    Ok(outcome) => create_and_link_command_response::Result::Outcome(
-                        enrollment_outcome_to_proto(context, outcome),
-                    ),
-                    Err(error) => create_and_link_command_response::Result::Error(
-                        enrollment_error_to_proto(error),
-                    ),
-                }),
-            })
+            membership_commands::create_and_link_command(context, r).await
         }
 
         Some(ReqPayload::JoinAndLinkCommand(r)) => {
-            let result = enrollment_commands::join_and_link(
-                &context.application,
-                enrollment_commands::JoinGroup {
-                    group_id: r.group_id,
-                    group_name: r.group_name,
-                    local_path: r.local_path,
-                    on_demand: r.on_demand,
-                    acknowledge_risks: r.acknowledge_risks,
-                    provider_display_name: r.provider_display_name,
-                    request_token: r.request_token,
-                },
-            )
-            .await;
-            RespPayload::JoinAndLinkCommand(JoinAndLinkCommandResponse {
-                result: Some(match result {
-                    Ok(outcome) => join_and_link_command_response::Result::Outcome(
-                        enrollment_outcome_to_proto(context, outcome),
-                    ),
-                    Err(error) => join_and_link_command_response::Result::Error(
-                        enrollment_error_to_proto(error),
-                    ),
-                }),
-            })
+            membership_commands::join_and_link_command(context, r).await
         }
 
         Some(ReqPayload::AcceptInviteCommand(r)) => {
-            let result = enrollment_commands::accept_invite(
-                &context.application,
-                enrollment_commands::AcceptInvite {
-                    code: r.code,
-                    local_path: r.local_path,
-                    on_demand: r.on_demand,
-                    acknowledge_risks: r.acknowledge_risks,
-                    provider_display_name: r.provider_display_name,
-                    request_token: r.request_token,
-                },
-            )
-            .await;
-            RespPayload::AcceptInviteCommand(AcceptInviteCommandResponse {
-                result: Some(match result {
-                    Ok(outcome) => accept_invite_command_response::Result::Outcome(
-                        enrollment_outcome_to_proto(context, outcome),
-                    ),
-                    Err(error) => accept_invite_command_response::Result::Error(
-                        enrollment_error_to_proto(error),
-                    ),
-                }),
-            })
+            membership_commands::accept_invite_command(context, r).await
         }
 
         Some(ReqPayload::MintInviteCommand(r)) => {
-            let application = context.application.clone();
-            let role = if r.role.is_empty() { None } else { Some(r.role.as_str()) };
-            let ttl_secs = if r.ttl_secs == 0 { None } else { Some(r.ttl_secs) };
-            let result = application
-                .enrollment
-                .mint_invite(&r.group_id, role, ttl_secs, r.requires_approval)
-                .await;
-            RespPayload::MintInviteCommand(MintInviteCommandResponse {
-                result: Some(match result {
-                    Ok(invite) => mint_invite_command_response::Result::Outcome(MintedInviteInfo {
-                        code: invite.code,
-                        invite_id: invite.invite_id,
-                        group_id: invite.group_id,
-                        role: invite.role,
-                        expires_at_unix: invite.expires_at_unix,
-                        // Echoed from the coordination plane's own response,
-                        // never from the request: what the caller renders must
-                        // describe the invite that exists.
-                        requires_approval: invite.requires_approval,
-                    }),
-                    Err(error) => {
-                        let code = match error {
-                            crate::application::model::MintInviteError::TermsConsentRequired(_) => {
-                                ApplicationErrorCode::TermsConsentRequired
-                            }
-                            crate::application::model::MintInviteError::Rejected(_) => {
-                                ApplicationErrorCode::CoordinationRejected
-                            }
-                        };
-                        mint_invite_command_response::Result::Error(ApplicationCommandError {
-                            code: code as i32,
-                            message: error.to_string(),
-                            group_ids: Vec::new(),
-                            operation_id: String::new(),
-                        })
-                    }
-                }),
-            })
+            membership_commands::mint_invite_command(context, r).await
         }
 
-        // `yadorilink recovery list`/`show`.
-        Some(ReqPayload::ListRecoveryOperations(_)) => match context.queries.recovery.list() {
-            Ok(inv) => RespPayload::ListRecoveryOperations(ListRecoveryOperationsResponse {
-                operations: inv
-                    .valid
-                    .iter()
-                    .map(crate::recovery_diagnosis::ipc::recovery_summary_to_proto)
-                    .collect(),
-                invalid: inv
-                    .invalid
-                    .iter()
-                    .map(crate::recovery_diagnosis::ipc::invalid_recovery_operation_to_proto)
-                    .collect(),
-            }),
-            Err(e) => RespPayload::Error(e.to_string()),
-        },
+        Some(ReqPayload::ListRecoveryOperations(_)) => {
+            recovery::list_recovery_operations(context).await
+        }
 
-        // `show` returns a stable diagnosis (local
-        // evidence + exactly one remote lookup + a pure recommendation),
-        // not just the local journal row. `domain` is required and
-        // unambiguous -- see `ShowRecoveryOperationRequest`'s own doc
-        // comment in the proto file.
         Some(ReqPayload::ShowRecoveryOperation(r)) => {
-            let Some(domain) =
-                yadorilink_replica_domain::recovery::RecoveryDomain::try_from_str(&r.domain)
-            else {
-                return DaemonControlResponse {
-                    payload: Some(RespPayload::Error(format!(
-                        "unknown recovery domain {:?}; expected one of \"enrollment\", \
-                         \"membership\", \"role-loss\"",
-                        r.domain
-                    ))),
-                    daemon_protocol_version:
-                        yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
-                };
-            };
-            let key = crate::recovery::RecoveryOperationKey {
-                domain,
-                operation_id: r.operation_id.clone(),
-            };
-            match context.queries.recovery.diagnose(&key).await {
-                Ok(crate::queries::recovery::DiagnoseOutcome::Diagnosis(outcome)) => {
-                    RespPayload::ShowRecoveryOperation(
-                        crate::recovery_diagnosis::ipc::stable_diagnosis_outcome_to_proto(&outcome),
-                    )
-                }
-                Ok(crate::queries::recovery::DiagnoseOutcome::CoordinationNotConfigured) => {
-                    RespPayload::Error(
-                        "coordination-plane address/access token not configured on this device"
-                            .to_string(),
-                    )
-                }
-                Err(e) => RespPayload::Error(e.to_string()),
-            }
+            recovery::show_recovery_operation(context, r).await
         }
 
         None => RespPayload::Error("empty request".to_string()),
@@ -1919,82 +773,38 @@ fn is_polled_read(payload: &Option<ReqPayload>) -> bool {
                 | ReqPayload::Health(_)
                 | ReqPayload::Identify(_)
                 | ReqPayload::ListConflicts(_)
+                | ReqPayload::ListAccountDevices(_)
+                | ReqPayload::ListTrash(_)
+                | ReqPayload::ListPreserved(_)
+                | ReqPayload::ListShareEdges(_)
         )
     )
+}
+
+#[cfg(test)]
+mod polled_read_tests {
+    use super::*;
+    use yadorilink_ipc_proto::daemonctl::{
+        ListAccountDevicesRequest, ListPreservedRequest, ListTrashRequest, PauseRequest,
+    };
+
+    /// The web page asks for these on load and after actions; a read must not
+    /// bump the status epoch (it would rebuild the status for every shell).
+    #[test]
+    fn the_dashboard_lists_are_polled_reads_and_a_command_is_not() {
+        assert!(is_polled_read(&Some(ReqPayload::ListAccountDevices(
+            ListAccountDevicesRequest::default()
+        ))));
+        assert!(is_polled_read(&Some(ReqPayload::ListTrash(ListTrashRequest::default()))));
+        assert!(is_polled_read(&Some(ReqPayload::ListPreserved(ListPreservedRequest::default()))));
+        assert!(!is_polled_read(&Some(ReqPayload::Pause(PauseRequest::default()))));
+    }
 }
 
 // `classify_link_failure`/`enrollment_link_to_request` live in
 // `crate::adapters::runtime::enrollment_link::DaemonEnrollmentLinkAdapter`
 // -- `application::EnrollmentService` calls `link()` through that port
 // instead of a callback into this module.
-
-fn membership_outcome_to_proto(
-    outcome: crate::application::ReplicaMembershipOutcome,
-) -> ReplicaMembershipCommandOutcome {
-    ReplicaMembershipCommandOutcome {
-        handoffs: outcome
-            .handoffs
-            .into_iter()
-            .map(|handoff| MembershipHandoffResult {
-                group_id: handoff.group_id,
-                target_device_id: handoff.target_device_id,
-                lease_id: handoff.lease_id,
-                membership_generation: handoff.membership_generation,
-            })
-            .collect(),
-        forced_group_ids: outcome.forced_group_ids,
-        unknown_scope_operation_id: outcome.unknown_scope_operation_id.unwrap_or_default(),
-    }
-}
-
-fn membership_error_to_proto(
-    error: crate::application::ReplicaMembershipError,
-) -> ApplicationCommandError {
-    use crate::application::ReplicaMembershipError as Error;
-    let (code, group_ids, operation_id) = match &error {
-        Error::LocalIdentityUnavailable => {
-            (ApplicationErrorCode::LocalIdentityUnavailable, Vec::new(), String::new())
-        }
-        Error::TargetNotFound => (ApplicationErrorCode::TargetNotFound, Vec::new(), String::new()),
-        Error::ReplicaNotReady { group_ids } => {
-            (ApplicationErrorCode::ReplicaNotReady, group_ids.clone(), String::new())
-        }
-        Error::TicketUnavailable { group_id } => {
-            (ApplicationErrorCode::TicketUnavailable, vec![group_id.clone()], String::new())
-        }
-        Error::CoordinationRejected { .. } => {
-            (ApplicationErrorCode::CoordinationRejected, Vec::new(), String::new())
-        }
-        Error::TermsConsentRequired { .. } => {
-            (ApplicationErrorCode::TermsConsentRequired, Vec::new(), String::new())
-        }
-        Error::CoordinationAmbiguous { .. } => {
-            (ApplicationErrorCode::CoordinationAmbiguous, Vec::new(), String::new())
-        }
-        Error::DurabilityLatchFailed { group_ids, .. } => {
-            (ApplicationErrorCode::DurabilityLatchFailed, group_ids.clone(), String::new())
-        }
-        Error::RecoveryPending { operation_id, .. } => {
-            (ApplicationErrorCode::RecoveryPending, Vec::new(), operation_id.clone())
-        }
-        Error::CoordinationTransport { .. } => {
-            (ApplicationErrorCode::CoordinationTransport, Vec::new(), String::new())
-        }
-        Error::Persistence(_) => (ApplicationErrorCode::Persistence, Vec::new(), String::new()),
-        Error::OperationConflict { operation_id, .. } => {
-            (ApplicationErrorCode::OperationConflict, Vec::new(), operation_id.clone())
-        }
-        Error::RecoveryJournalUnavailable { operation_id, .. } => {
-            (ApplicationErrorCode::RecoveryJournalUnavailable, Vec::new(), operation_id.clone())
-        }
-    };
-    ApplicationCommandError {
-        code: code as i32,
-        message: error.to_string(),
-        group_ids,
-        operation_id,
-    }
-}
 
 /// `LinkPreflightRequest`: the same report the share and link commands check before they
 /// proceed, for a client to show before it asks for the acknowledgement.
@@ -2039,11 +849,14 @@ fn enrollment_error_to_proto(
     error: crate::application::EnrollmentError,
 ) -> ApplicationCommandError {
     let (code, operation_id) = enrollment_commands::enrollment_error_code(&error);
+    let (drive_reason, file_system) = enrollment_commands::enrollment_drive_detail(&error);
     ApplicationCommandError {
         code: code as i32,
         message: error.to_string(),
         group_ids: Vec::new(),
         operation_id,
+        drive_reason,
+        file_system,
     }
 }
 
@@ -2051,12 +864,17 @@ fn enrollment_error_to_proto(
 /// nothing specific to say stay the plain-text `error`.
 fn link_failure_payload(error: &crate::error::DaemonError) -> RespPayload {
     match error.link_refusal() {
-        Some(refusal) => RespPayload::CommandError(ApplicationCommandError {
-            code: link_refusal_code(refusal) as i32,
-            message: error.to_string(),
-            group_ids: Vec::new(),
-            operation_id: String::new(),
-        }),
+        Some(refusal) => {
+            let (drive_reason, file_system) = enrollment_commands::drive_detail(Some(&refusal));
+            RespPayload::CommandError(ApplicationCommandError {
+                code: link_refusal_code(&refusal) as i32,
+                message: error.to_string(),
+                group_ids: Vec::new(),
+                operation_id: String::new(),
+                drive_reason,
+                file_system,
+            })
+        }
         None => match error {
             crate::error::DaemonError::Advised { message, step } => refused(message, *step),
             _ => RespPayload::Error(error.to_string()),
@@ -2423,6 +1241,7 @@ async fn resolve_conflict(
             message,
             group_ids: Vec::new(),
             operation_id: String::new(),
+            ..Default::default()
         })
     };
     let choice = match ConflictResolution::try_from(request.resolution) {
@@ -2521,11 +1340,14 @@ fn item_actions(inputs: ItemActionInputs<'_>) -> Vec<i32> {
             .local_state
             .is_some_and(|s| s.transition() != WireLocalTransition::None),
         is_file: std::fs::symlink_metadata(inputs.path).is_ok_and(|m| m.is_file()),
+        is_folder: std::fs::symlink_metadata(inputs.path).is_ok_and(|m| m.is_dir()),
         provider_folder: inputs.provider_folder,
         reclaim_gate_open: inputs.reclaim_gate_open,
-        retention: inputs
-            .retention
-            .map(|r| crate::file_actions::Retention { pinned: r.pinned, explicit: r.explicit }),
+        retention: inputs.retention.map(|r| crate::file_actions::Retention {
+            pinned: r.pinned,
+            online_only: r.online_only,
+            explicit: r.explicit,
+        }),
     };
     crate::file_actions::available_actions(&facts).into_iter().map(|a| a as i32).collect()
 }
@@ -2534,6 +1356,8 @@ fn retention_to_proto(retention: crate::application::ports::RetentionState) -> W
     WireRetentionState {
         policy: if retention.pinned {
             RetentionPolicy::Pinned
+        } else if retention.online_only {
+            RetentionPolicy::OnlineOnly
         } else {
             RetentionPolicy::Reclaimable
         } as i32,
@@ -2569,6 +1393,21 @@ pub(crate) fn encode_health(view: crate::queries::health::HealthView) -> HealthR
 // crate::recovery_diagnosis::ipc, not here -- see that module's own doc
 // comment.
 
+mod daemon;
+mod handoff;
+mod history;
+mod ignore_rules;
+mod items;
+mod links;
+mod membership_commands;
+mod network;
+mod recovery;
+mod reporting;
+mod rewind;
+mod send;
+mod space;
+mod update;
+
 #[cfg(test)]
 mod rewind_execute_wire_tests;
 #[cfg(test)]
@@ -2584,6 +1423,48 @@ mod provider_flags_tests {
         assert_eq!(local_state_word(Some(&local_state_from_flags(SF_DATALESS))), "remote");
         assert_eq!(local_state_word(Some(&local_state_from_flags(0))), "local-current");
         assert_eq!(local_state_word(Some(&local_state_from_flags(0x20))), "local-current");
+    }
+
+    /// The real reader, on a real file: an ordinary file carries no recall mark, so it reads as
+    /// present, and a name that does not exist reads as unknown rather than as anything.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_reader_gives_a_real_file_a_state_and_a_missing_one_none() {
+        let dir = std::env::temp_dir().join(format!("yl-localstate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let state = provider_local_state(file.to_str().unwrap()).expect("a state");
+        assert_eq!(local_state_word(Some(&state)), "local-current");
+        assert!(provider_local_state(dir.join("missing").to_str().unwrap()).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cloud_files_item_reads_as_remote_when_any_recall_mark_is_set_and_otherwise_as_present() {
+        use yadorilink_fs_platform::cloud_files::{
+            OFFLINE, PINNED, RECALL_ON_DATA_ACCESS, RECALL_ON_OPEN, REPARSE_POINT,
+        };
+        for remote in [
+            OFFLINE,
+            RECALL_ON_OPEN,
+            RECALL_ON_DATA_ACCESS,
+            0x20 | RECALL_ON_DATA_ACCESS | REPARSE_POINT,
+        ] {
+            assert_eq!(
+                local_state_word(Some(&local_state_from_attributes(remote))),
+                "remote",
+                "{remote:#x}"
+            );
+        }
+        // A hydrated placeholder (reparse point, no recall mark) and a pinned one are on this PC.
+        for local in [0x20, 0x20 | REPARSE_POINT, 0x20 | PINNED] {
+            assert_eq!(
+                local_state_word(Some(&local_state_from_attributes(local))),
+                "local-current",
+                "{local:#x}"
+            );
+        }
     }
 }
 
@@ -2637,3 +1518,128 @@ mod identify_wire_tests;
 
 #[cfg(test)]
 mod safe_stop_wire_tests;
+
+#[cfg(test)]
+mod network_wire_tests;
+
+#[cfg(test)]
+mod unsupported_drive_wire_tests {
+    use super::*;
+    use yadorilink_fs_platform::durable_dir::{DriveReason, UnsupportedDrive};
+    use yadorilink_ipc_proto::daemonctl::UnsupportedDriveReason;
+
+    /// A link refused because of its drive goes over the socket as its own typed code with the
+    /// machine reason and the file system, plus the English sentence for the command line.
+    #[test]
+    fn a_link_refused_for_its_drive_carries_the_reason_key_and_the_sentence() {
+        let error = crate::error::DaemonError::UnsupportedDrive(UnsupportedDrive {
+            reason: DriveReason::Refs,
+            file_system: "ReFS".into(),
+        });
+        let RespPayload::CommandError(wire) = link_failure_payload(&error) else {
+            panic!("a typed command error");
+        };
+        assert_eq!(wire.code, ApplicationErrorCode::UnsupportedDrive as i32);
+        assert_eq!(wire.drive_reason, UnsupportedDriveReason::Refs as i32);
+        assert_eq!(wire.file_system, "ReFS");
+        assert!(
+            wire.message.contains("ReFS / Dev Drive") && wire.message.contains("NTFS"),
+            "{}",
+            wire.message
+        );
+    }
+}
+
+#[cfg(test)]
+mod unpublished_edits_wire_tests {
+    use std::sync::Arc;
+
+    use crate::daemon_state::DaemonState;
+    use crate::replica_coordinator::ReplicaCoordinator;
+    use crate::runtime_telemetry::UnpublishedReason;
+
+    /// Status carries the saved edits that are not published, by why: the service did not answer
+    /// (a publish attempt that got no answer, or a disk edit journaled while the group's policy is
+    /// not available) or this device may no longer publish.
+    #[tokio::test]
+    async fn status_counts_the_saved_edits_by_why_they_are_not_published() {
+        let config = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            yadorilink_local_storage::SegmentBlockStore::new(tempfile::tempdir().unwrap().keep())
+                .unwrap(),
+        );
+        let state = DaemonState::new_in(
+            config.path().to_path_buf(),
+            "device-a".into(),
+            Arc::new(ReplicaCoordinator::open_in_memory().unwrap()),
+            store,
+        );
+        let folder = tempfile::tempdir().unwrap();
+        let _canonical =
+            crate::test_support::sync_stack_fixture::link_folder(&state, folder.path());
+        let context = crate::control_context::ControlContext::from_state(state.clone());
+        let status = |context: &crate::control_context::ControlContext| {
+            crate::status_report::build_status(&context.status_sources).unwrap()
+        };
+        state.telemetry.pretend_started_ago_for_tests(std::time::Duration::from_secs(120));
+        let none = status(&context);
+        assert_eq!(
+            (none.unpublished_edits_service_unreachable, none.unpublished_edits_not_authorized),
+            (0, 0)
+        );
+
+        // A disk edit journaled while the group's policy is not available.
+        state
+            .replica_coordinator
+            .dirty_path_repository()
+            .record_dirty_path(
+                crate::native_test_support::GROUP,
+                "a.txt",
+                "created_or_modified",
+                1,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        // A publish attempt that got no answer.
+        state.telemetry.set_unpublished(
+            crate::native_test_support::GROUP,
+            UnpublishedReason::ServiceUnreachable,
+            2,
+        );
+        let waiting = status(&context);
+        assert_eq!(waiting.unpublished_edits_service_unreachable, 3, "2 pending + 1 journaled");
+        assert_eq!(waiting.unpublished_edits_not_authorized, 0);
+
+        // The service answered that this device may not publish.
+        state.telemetry.set_unpublished(
+            crate::native_test_support::GROUP,
+            UnpublishedReason::NotAuthorized,
+            2,
+        );
+        let refused = status(&context);
+        assert_eq!(refused.unpublished_edits_not_authorized, 2);
+        assert_eq!(refused.unpublished_edits_service_unreachable, 1, "only the journaled edit");
+
+        // The service answered but would not publish (the Terms, a refused credential).
+        state.telemetry.set_unpublished(
+            crate::native_test_support::GROUP,
+            UnpublishedReason::Rejected,
+            4,
+        );
+        let rejected = status(&context);
+        assert_eq!(rejected.unpublished_edits_rejected, 4);
+        assert_eq!(rejected.unpublished_edits_not_authorized, 0);
+
+        // A group that is no longer linked has nothing waiting to publish, whatever its last
+        // attempt said.
+        state.telemetry.set_unpublished("gone-group", UnpublishedReason::ServiceUnreachable, 5);
+        assert_eq!(
+            status(&context).unpublished_edits_service_unreachable,
+            1,
+            "only the journaled edit"
+        );
+
+        state.telemetry.clear_unpublished(crate::native_test_support::GROUP);
+        assert_eq!(status(&context).unpublished_edits_not_authorized, 0);
+    }
+}

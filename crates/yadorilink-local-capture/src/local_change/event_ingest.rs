@@ -11,7 +11,6 @@ use yadorilink_replica_domain::local_op::Op;
 use yadorilink_replica_domain::session_state::MaterializationState;
 
 use yadorilink_fs_platform::fs_identity::disk_race_fingerprint_or_stat;
-use yadorilink_fs_platform::ignore_patterns::{is_ignore_file_relative_path, EffectiveIgnoreSet};
 use yadorilink_sync_sqlite::file_index::ImportedActualState;
 
 use super::disk_observation::{
@@ -26,6 +25,7 @@ use super::record_builder::{metadata_columns_for, record_of_row};
 use super::scan::CaptureAuthority;
 use super::semantic_delete::{Removal, SemanticDelete};
 use super::{now_unix_nanos, LocalChangeOutcome, LocalChangeProcessor};
+use yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet;
 
 /// `process_event_with_ignore_at`'s outcome once batching exists: either
 /// the event was fully classified and its mutation committed synchronously,
@@ -55,7 +55,7 @@ impl LocalChangeProcessor {
         root: &Path,
         event: &FsChangeEvent,
     ) -> Result<LocalChangeOutcome, LocalCaptureError> {
-        let ignore_set = EffectiveIgnoreSet::load_for_link_root(root)?;
+        let ignore_set = self.ignore_set_for(group_id)?;
         self.process_event_with_ignore(group_id, root, event, &ignore_set).await
     }
 
@@ -203,9 +203,6 @@ impl LocalChangeProcessor {
             return Ok(EventOutcome::Ready(LocalChangeOutcome::None));
         };
         if rel_path.is_empty() {
-            return Ok(EventOutcome::Ready(LocalChangeOutcome::None));
-        }
-        if is_ignore_file_relative_path(Path::new(&rel_path)) {
             return Ok(EventOutcome::Ready(LocalChangeOutcome::None));
         }
         // Live events from a nested mount are not ours either (see

@@ -163,3 +163,31 @@ fn provider_folder_read_only_round_trips_and_defaults_to_writable() {
     let old = ProviderFolder { display_name: "Docs".into(), ..Default::default() };
     assert!(!ProviderFolder::decode(old.encode_to_vec().as_slice()).unwrap().read_only);
 }
+
+#[test]
+fn share_edge_listing_round_trips() {
+    use crate::daemonctl::{ListShareEdgesRequest, ListShareEdgesResponse, ShareEdgeInfo};
+    let request = DaemonControlRequest {
+        payload: Some(ReqPayload::ListShareEdges(ListShareEdgesRequest {})),
+        protocol_version: crate::daemonctl::CONTROL_PROTOCOL_VERSION,
+    };
+    let decoded = DaemonControlRequest::decode(request.encode_to_vec().as_slice()).unwrap();
+    assert!(matches!(decoded.payload, Some(ReqPayload::ListShareEdges(_))));
+
+    let response = DaemonControlResponse {
+        payload: Some(daemon_control_response::Payload::ListShareEdges(ListShareEdgesResponse {
+            edges: vec![ShareEdgeInfo {
+                edge_id: "e1".into(),
+                group_id: "g1".into(),
+                device_id: "d1".into(),
+                state: "active".into(),
+            }],
+        })),
+        daemon_protocol_version: crate::daemonctl::CONTROL_PROTOCOL_VERSION,
+    };
+    let decoded = DaemonControlResponse::decode(response.encode_to_vec().as_slice()).unwrap();
+    let Some(daemon_control_response::Payload::ListShareEdges(list)) = decoded.payload else {
+        panic!("wrong payload")
+    };
+    assert_eq!(list.edges[0].state, "active");
+}

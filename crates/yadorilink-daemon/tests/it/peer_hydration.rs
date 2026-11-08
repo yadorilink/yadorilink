@@ -381,6 +381,81 @@ async fn hydrate_file_fetches_and_materializes_placeholder_content() {
     }
 }
 
+/// A large placeholder is hydrated by writing its blocks into a temp beside it as they arrive:
+/// the content is right, the row is `Present`, and the block store never holds a copy.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hydrate_file_writes_a_large_file_in_place_without_a_store_copy() {
+    let device_a = Device::new("device-a").await;
+    let device_b = device_a.peer("device-b").await;
+    let root_b = device_b.root_path().to_string_lossy().to_string();
+    link_with_completed_startup(&device_b.state, &root_b);
+    device_b
+        .state
+        .link_repository()
+        .set_materialization_policy(
+            &root_b,
+            yadorilink_replica_domain::session_state::MaterializationPolicy::OnDemand,
+        )
+        .unwrap();
+
+    let mut x = 0x9e3779b97f4a7c15u64;
+    let content: Vec<u8> = (0..12 * 1024 * 1024)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8
+        })
+        .collect();
+    let file_path = device_a.root_path().join("large.bin");
+    std::fs::write(&file_path, &content).unwrap();
+    let record = expect_file_changed(
+        device_a
+            .processor()
+            .process_event(
+                GROUP,
+                &device_a.root_path(),
+                &FsChangeEvent { path: file_path, kind: FsChangeKind::CreatedOrModified },
+            )
+            .await
+            .unwrap(),
+    );
+    device_a.publish_pending();
+    let _session_a = spawn_session(&device_a, "device-b");
+    let session_b = spawn_session(&device_b, "device-a");
+    adopt_as_placeholder(&device_b, &record);
+
+    session_b.hydrate_file(GROUP, "large.bin").await.unwrap();
+
+    assert_eq!(
+        device_b
+            .state
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, "large.bin")
+            .unwrap(),
+        Some(yadorilink_replica_domain::session_state::MaterializationState::Present)
+    );
+    assert!(std::fs::read(device_b.root_path().join("large.bin")).unwrap() == content);
+    let record =
+        device_b.state.file_index_repository().get_file(GROUP, "large.bin").unwrap().unwrap();
+    assert!(record.blocks.len() > 1, "the file has several blocks");
+    for block in &record.blocks {
+        let hash_hex = hex::encode(&block.hash);
+        assert!(
+            !yadorilink_local_storage::BlockStore::exists(device_b.store.as_ref(), &hash_hex)
+                .unwrap(),
+            "a received file's block must not be copied into the store"
+        );
+    }
+    let leftovers: Vec<_> = std::fs::read_dir(device_b.root_path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|name| name != ".yadorilink-root")
+        .collect();
+    assert_eq!(leftovers, ["large.bin"], "no temp is left beside the file");
+}
+
 /// Convergence rehydration (`hydrate_file`, and the audit's `Equal`/`After`
 /// rehydrate arms that share its body) judges what it finds at the path
 /// when it starts, exactly as access hydration does: an edit written at a
@@ -571,6 +646,61 @@ async fn hydrate_file_without_any_connected_peer_fails_immediately() {
             .unwrap(),
         Some(yadorilink_replica_domain::session_state::MaterializationState::Remote)
     );
+}
+
+/// A peer that vanished without closing: its connection looks alive but nothing comes back.
+/// The first read fails after one block timeout; the next one does not wait on the peer again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_silent_peer_costs_one_block_timeout_once() {
+    let device_a = Device::new("device-a").await;
+    let device_b = device_a.peer("device-b").await;
+    let root_b = device_b.root_path().to_string_lossy().to_string();
+    link_with_completed_startup(&device_b.state, &root_b);
+    let session_b = spawn_session(&device_b, "device-a");
+    device_b
+        .state
+        .file_index_repository()
+        .upsert_file(
+            GROUP,
+            &yadorilink_replica_domain::file::FileRecord {
+                path: "silent.bin".into(),
+                size: 100,
+                mtime_unix_nanos: 0,
+                blocks: vec![yadorilink_replica_domain::file::BlockInfo {
+                    hash: vec![0xCDu8; 32],
+                    offset: 0,
+                    size: 100,
+                }],
+                deleted: false,
+            },
+            &RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    device_b
+        .state
+        .materialization_state_repository()
+        .set_materialization_state(
+            GROUP,
+            "silent.bin",
+            yadorilink_replica_domain::session_state::MaterializationState::Remote,
+            &RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let result = session_b.hydrate_file(GROUP, "silent.bin").await;
+    let waited = started.elapsed();
+    eprintln!("first read from a silent peer failed after {waited:?}");
+    assert!(result.is_err());
+    assert!(waited < Duration::from_secs(12), "the read waited {waited:?}");
+
+    // The peer is known silent now: a second read does not wait on it again.
+    let started = std::time::Instant::now();
+    let result = session_b.hydrate_file(GROUP, "silent.bin").await;
+    let second = started.elapsed();
+    eprintln!("second read failed after {second:?}");
+    assert!(result.is_err());
+    assert!(second < Duration::from_secs(1), "the second read waited {second:?}");
 }
 
 /// hydrate → evict → re-hydrate must round-trip

@@ -31,7 +31,8 @@ async fn login_on_an_enrolled_installation_refuses_rather_than_enrolling_twice()
     drop(lock);
 
     let mut events = Vec::new();
-    let result = login(false, |event| events.push(event)).await;
+    let result =
+        login(false, None, &crate::ops::daemon::default_launch(), |event| events.push(event)).await;
     std::env::remove_var("YADORILINK_CREDENTIAL_FILE");
     std::env::remove_var("YADORILINK_CREDENTIAL_STORE");
 
@@ -743,6 +744,7 @@ mod pairing {
         start_bodies: Vec<serde_json::Value>,
         par_state: Option<String>,
         par_redirect: Option<String>,
+        register_bodies: Vec<serde_json::Value>,
     }
 
     /// Where the resumed authorization request ends.
@@ -873,12 +875,33 @@ mod pairing {
             .mount(&server)
             .await;
 
+        // The server rotates the refresh token on every refresh, as the real one does.
         Mock::given(method("POST"))
             .and(path("/token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "at-paired", "token_type": "DPoP", "expires_in": 300,
-                "refresh_token": "rt-paired", "scope": "openid offline_access",
-            })))
+            .respond_with(|request: &Request| {
+                let refreshing = url::form_urlencoded::parse(&request.body)
+                    .any(|(k, v)| k == "grant_type" && v == "refresh_token");
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "at-paired", "token_type": "DPoP", "expires_in": 300,
+                    "refresh_token": if refreshing { "rt-rotated" } else { "rt-paired" },
+                    "scope": "openid offline_access",
+                }))
+            })
+            .mount(&server)
+            .await;
+        // The device registration that ends every first sign-in.
+        let recorder = seen.clone();
+        Mock::given(method("POST"))
+            .and(path("/devices/register"))
+            .respond_with(move |request: &Request| {
+                recorder
+                    .lock()
+                    .expect("lock")
+                    .register_bodies
+                    .push(request.body_json().expect("JSON"));
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "deviceId": "dev-paired" }))
+            })
             .mount(&server)
             .await;
         (server, seen)
@@ -920,15 +943,25 @@ mod pairing {
 
         assert_eq!(
             events,
-            vec![LoginEvent::Enrolling, LoginEvent::SignedIn { client_id: CLIENT_ID.to_owned() }]
+            vec![
+                LoginEvent::Enrolling,
+                LoginEvent::SignedIn { client_id: CLIENT_ID.to_owned() },
+                LoginEvent::DeviceRegistered { device_name: "nas".to_owned() },
+            ]
         );
+        // Signing in ends with the device registered and its identity on disk.
+        let device = crate::coordination::device_config::load_in(dir.path()).expect("device.json");
+        assert_eq!(device.device_id, "dev-paired");
         let stored = credential_store::installation_in(dir.path(), &settings)
             .expect("store")
             .expect("enrolled");
         assert_eq!(stored.client_id(), CLIENT_ID);
-        assert_eq!(stored.refresh_token(), "rt-paired");
+        // Registering refreshed the session once; the server rotated the token.
+        assert_eq!(stored.refresh_token(), "rt-rotated");
         assert_eq!(stored.issuer(), server.uri());
         let seen = seen.lock().expect("lock");
+        assert_eq!(seen.register_bodies.len(), 1);
+        assert_eq!(seen.register_bodies[0]["deviceName"], "nas");
         assert_eq!(seen.start_bodies.len(), 1);
         assert_eq!(seen.start_bodies[0]["pairing_code"], "BCDFGHJKLMNP");
     }
@@ -975,15 +1008,20 @@ mod pairing {
             .await
             .expect_err("limited");
 
-        let CoreError::LimitExceeded { message, kind: crate::error::LimitKind::RateLimited } =
-            &error
+        let CoreError::LimitExceeded {
+            message,
+            kind: crate::error::LimitKind::RateLimited { retry_after_secs: Some(42) },
+        } = &error
         else {
             panic!("a rate limit, got {error:?}")
         };
         assert!(message.contains("42 seconds"), "{message}");
         assert!(matches!(
             DesktopError::from(error),
-            DesktopError::Network { kind: crate::error::NetworkErrorKind::RateLimited, .. }
+            DesktopError::Network {
+                kind: crate::error::NetworkErrorKind::RateLimited { retry_after_secs: Some(42) },
+                ..
+            }
         ));
     }
 
@@ -1037,4 +1075,53 @@ mod pairing {
             "the second code was not sent"
         );
     }
+}
+
+/// The registration that ends a first sign-in is skipped when the directory already holds a
+/// device: signing in again must not mint a second identity.
+#[tokio::test]
+async fn a_sign_in_over_an_existing_device_registers_nothing() {
+    let dir = tempfile::tempdir().expect("dir");
+    let settings = credential_store::CredentialSettings::from_env(dir.path()).expect("settings");
+    crate::coordination::device_config::save_in(
+        dir.path(),
+        &crate::coordination::device_config::DeviceConfig {
+            device_id: "dev-1".to_owned(),
+            coordination_addr: settings.coordination_addr(),
+            signing_public_key: "k".to_owned(),
+            config_version: crate::coordination::device_config::CONFIG_VERSION,
+        },
+    )
+    .expect("device.json");
+    let mut events = Vec::new();
+    register_this_device(dir.path(), &settings, &mut |event| events.push(event))
+        .await
+        .expect("nothing to register");
+    assert!(events.is_empty(), "no device was registered: {events:?}");
+}
+
+/// A `device.json` that cannot be read is not "no device": registering over it would create a
+/// second identity, so the sign-in's last step reports the problem instead.
+#[tokio::test]
+async fn a_sign_in_over_an_unreadable_device_file_registers_nothing() {
+    let dir = tempfile::tempdir().expect("dir");
+    let settings = credential_store::CredentialSettings::from_env(dir.path()).expect("settings");
+    std::fs::write(dir.path().join("device.json"), "not json").expect("device.json");
+    let mut events = Vec::new();
+    register_this_device(dir.path(), &settings, &mut |event| events.push(event))
+        .await
+        .expect_err("an unreadable device file is an error");
+    assert!(events.is_empty(), "{events:?}");
+}
+
+#[test]
+fn a_chosen_device_name_replaces_the_machines_own() {
+    let dir = tempfile::tempdir().expect("dir");
+    let base = credential_store::CredentialSettings::from_env(dir.path()).expect("settings");
+    assert_eq!(
+        named(base.clone(), Some("  my-nas ".to_owned())).host_name.as_deref(),
+        Some("my-nas")
+    );
+    assert_eq!(named(base.clone(), Some("  ".to_owned())).host_name, base.host_name);
+    assert_eq!(named(base.clone(), None).host_name, base.host_name);
 }

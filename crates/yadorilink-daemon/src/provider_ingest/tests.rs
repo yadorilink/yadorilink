@@ -219,6 +219,37 @@ fn the_ingest_sweep_never_removes_a_journaled_upload() {
     assert!(!ingest_dir.join("unclaimed").exists());
 }
 
+/// An ingest copy is aged by when it arrived (its status-change time), never by the modification
+/// time it carries: an extension copy that keeps the user's old mtime is not aged out early, and a
+/// future mtime does not keep an abandoned copy forever.
+#[cfg(unix)]
+#[test]
+fn the_ingest_sweep_ignores_the_modification_time_a_copy_carries() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = crate::provider_handoff::HandoffRoot::open(dir.path()).unwrap();
+    let ingest_dir = root.ingest_dir().to_path_buf();
+    let set_mtime = |name: &str, at: std::time::SystemTime| {
+        put_file(&ingest_dir, name, b"x");
+        std::fs::File::options()
+            .write(true)
+            .open(ingest_dir.join(name))
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    };
+    let year = std::time::Duration::from_secs(3600 * 24 * 365);
+    set_mtime(".fresh.partial", std::time::SystemTime::now() - year);
+    set_mtime("abandoned", std::time::SystemTime::now() + year);
+    let keep: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let hours = |h: u64| std::time::SystemTime::now() + std::time::Duration::from_secs(h * 3600);
+
+    root.sweep_ingest_at(Some(&keep), hours(2));
+    assert!(ingest_dir.join(".fresh.partial").exists(), "an old mtime aged a fresh partial copy");
+    assert!(ingest_dir.join("abandoned").exists());
+    root.sweep_ingest_at(Some(&keep), hours(30 * 24));
+    assert!(!ingest_dir.join("abandoned").exists(), "a future mtime kept an abandoned copy");
+}
+
 /// (step 6) The temp root's layout: every directory is created 0700, a looser mode is tightened, and
 /// a symlink or a non-directory in place of one refuses the root.
 #[cfg(unix)]

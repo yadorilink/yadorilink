@@ -22,17 +22,18 @@ Download `yadorilink-linux-amd64.deb` (and its `.sha256`) from
 ```bash
 sha256sum -c yadorilink-linux-amd64.deb.sha256
 sudo apt install ./yadorilink-linux-amd64.deb
-systemctl --user enable --now yadorilink-daemon
+yadorilink daemon start   # also starts it at every login (a systemd --user entry)
 ```
 
 First run:
 
 ```bash
 yadorilink login
-yadorilink device register --name "my-box"
 yadorilink share create my-share --path ~/some/folder
 yadorilink status
 ```
+
+`login` also adds the computer to the account, under its host name.
 
 If something needs attention, `yadorilink status` and `yadorilink doctor`
 show what the daemon sees, and `yadorilink preserved list` / `restore` /
@@ -76,9 +77,8 @@ installing the `.deb`:
 
 ```bash
 sudo /usr/share/yadorilink/headless/install-headless.sh        # account, directories, unit; starts nothing
-sudo yadorilink-svc login --device                             # approve the printed code on another device
+sudo yadorilink-svc login --device --device-name my-nas        # approve the printed code on another device; the name is optional (default: host name)
 # or: sudo yadorilink-svc login --code                         # a code from your account's Devices page (Add device)
-sudo yadorilink-svc device register --name my-nas
 sudo systemctl start yadorilink-headless
 sudo install -d -o yadorilink -g yadorilink -m 0750 /srv/yadorilink/<group>   # the folder must exist first
 sudo yadorilink-svc share join <group> --path /srv/yadorilink/<group>   # keeps a complete copy

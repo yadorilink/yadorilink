@@ -270,3 +270,20 @@ fn a_bundle_with_the_store_receipt_is_an_app_store_install_and_one_without_is_no
     assert_eq!(refine("standalone".into(), &exe, None), "app_store");
     assert_eq!(manual_update_page("app_store"), None);
 }
+
+#[test]
+fn the_formula_marker_beside_the_prefix_marks_a_homebrew_install() {
+    let prefix = tempfile::tempdir().unwrap();
+    let exe = prefix.path().join("bin/yadorilink-daemon");
+    assert_eq!(refine("standalone".into(), &exe, None), "standalone");
+
+    let marker = prefix.path().join(HOMEBREW_PREFIX_MARKER);
+    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    std::fs::write(&marker, "homebrew\n").unwrap();
+    assert_eq!(refine("standalone".into(), &exe, None), "homebrew");
+    // It never overrides a stronger signal.
+    assert_eq!(refine("apt".into(), &exe, None), "apt");
+
+    std::fs::write(&marker, "script").unwrap();
+    assert_eq!(refine("standalone".into(), &exe, None), "standalone");
+}

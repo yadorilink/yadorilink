@@ -32,6 +32,7 @@ pub mod file_identity_codec;
 pub mod file_index;
 pub mod handoff_lease;
 pub mod held_path;
+pub mod history_budget;
 pub mod history_freed;
 pub mod link;
 pub mod local_author;
@@ -57,6 +58,7 @@ pub mod native_closure;
 pub mod native_contest_candidates;
 pub mod native_desired_state;
 pub mod native_history_floor;
+pub mod native_namespace;
 #[cfg(test)]
 mod native_prepare_count_tests;
 pub mod native_publication;
@@ -86,7 +88,7 @@ mod new_path_settlement_tests;
 pub mod offline_group_policy_log;
 pub mod offline_peer_authorization;
 pub mod paused_items;
-pub mod pinned_items;
+pub mod peer_progress;
 pub mod policy_watermark;
 pub mod projection_obligations;
 pub mod provider;
@@ -100,6 +102,7 @@ mod replica_schema;
 pub mod replica_tables;
 pub mod restore_operation;
 pub mod retention;
+pub mod retention_rules;
 pub mod rewind_commit;
 pub mod rewind_plan;
 pub mod rewind_run;
@@ -118,10 +121,9 @@ pub use error::SyncSqliteError;
 pub use handoff_lease::HandoffLeaseRepository;
 pub use held_path::HeldPathRepository;
 pub use materialization_intent_repository::{
-    clear_flush_pending_in_tx, flush_pending_proof_identity, list_temp_witnesses,
-    record_temp_witnesses_in_tx, write_landed_unproven, write_removal_facts, IntentDisposition,
-    MaterializationIntentRepository, MaterializationTempLedger, TempReleaseQueue,
-    WriteRemovalFacts,
+    clear_flush_pending_in_tx, flush_pending_proof_identity, write_landed_unproven,
+    IntentDisposition, MaterializationIntentRepository, MaterializationTempLedger,
+    TempReleaseQueue,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use materialization_state::{fail_placeholder_reads_for_path, fail_state_reads_for_path};
@@ -135,12 +137,15 @@ pub use offline_peer_authorization::{
     OfflinePeerAuthorization, OfflinePeerAuthorizationRepository, OfflineSnapshotVersions,
 };
 pub use paused_items::PausedItemRepository;
-pub use pinned_items::{PinnedItemRepository, Retention, RetentionPolicy};
 pub use policy_watermark::{PolicyWatermark, PolicyWatermarkRepository};
 pub use remote_custody_hold::RemoteCustodyHoldRepository;
 pub use remote_custody_lease::RemoteCustodyLeaseRepository;
 pub use replica_schema::{init_replica_schema, ReplicaSchemaError};
 pub use restore_operation::RestoreOperationRepository;
+pub use retention_rules::{
+    ApplyCounts, PendingRule, Retention, RetentionPolicy, RetentionRuleRepository, Rule, RuleClaim,
+    RuleRow, RuleSet, RuleSummary,
+};
 pub use rewind_run::{RewindRunRepository, RewindRunStart};
 pub use role_loss_operation::RoleLossOperationRepository;
 

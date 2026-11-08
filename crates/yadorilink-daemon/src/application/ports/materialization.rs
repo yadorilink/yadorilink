@@ -203,8 +203,19 @@ pub(crate) enum TempOutcome {
 pub(crate) struct RetentionState {
     /// Local space for the path must not be reclaimed.
     pub pinned: bool,
-    /// The pin was set at exactly this path; otherwise it is inherited from a folder above.
+    /// The folder holds no copy of the path (an `online_only` rule).
+    pub online_only: bool,
+    /// The rule was set at exactly this path; otherwise it is inherited from a folder above.
     pub explicit: bool,
+}
+
+/// What a person chose for a path's copy on this device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuleChoice {
+    Keep,
+    OnlineOnly,
+    /// Remove the rule at the path.
+    Default,
 }
 
 /// What pinning a path did.
@@ -254,18 +265,19 @@ pub(crate) trait MaterializationPort: Send + Sync {
         path: &str,
     ) -> Result<Option<MaterializationStatusSummary>, SyncError>;
 
-    /// Marks `path` "always keep on this device" and fetches what is not here yet through the
-    /// ordinary hydration path. The pin is recorded first and stands even when the download
-    /// fails. A provider folder's content is fetched by the OS, so there it only records.
-    fn pin<'a>(
+    /// Sets the retention rule at `path`. `Keep` marks it "always keep on this device" and
+    /// fetches what is not here yet through the ordinary hydration path: the rule is recorded
+    /// first and stands even when the download fails (a provider folder's content is fetched by
+    /// the OS, so there it only records). `OnlineOnly` (provider folders only) records the rule;
+    /// the apply pass frees the copies. `Default` removes the rule set at exactly `path`, touching
+    /// no content. Every rule beneath a set rule is replaced, and setting the rule already in
+    /// force changes nothing. The outcome carries the rule in force afterwards.
+    fn set_rule<'a>(
         &'a self,
         group_id: &'a str,
         path: &'a str,
+        rule: RuleChoice,
     ) -> BoxFuture<'a, Result<PinOutcome, SyncError>>;
-
-    /// Removes the pin set at exactly `path`, touching no content, and reports the policy in
-    /// force afterwards (still pinned when a folder above is).
-    fn unpin(&self, group_id: &str, path: &str) -> Result<RetentionState, SyncError>;
 
     fn retention(&self, group_id: &str, path: &str) -> Result<RetentionState, SyncError>;
 }

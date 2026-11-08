@@ -792,12 +792,16 @@ fn a_reconstructed_file_is_published_by_a_durable_move_and_its_record_released()
     assert!(!tmp.exists());
     assert!(ledger.held.lock().unwrap().is_empty());
     let steps = trace::take();
-    assert!(
-        steps
-            .iter()
-            .any(|e| matches!(e, Event::Move { from, to, .. } if *from == tmp && *to == out)),
-        "{steps:?}"
-    );
+    // Either the rename onto the target, or (where the replaced file is captured by an exchange)
+    // the staged file moved aside to a reserved name for the exchange. On Windows the replace
+    // captures the old file under a backup name in one call, and what is traced is the removal of
+    // that backup once the captured file was verified to be the expected one.
+    let published = steps.iter().any(|e| matches!(e, Event::Move { from, .. } if *from == tmp));
+    let replaced_with_a_backup = cfg!(windows)
+        && steps.iter().any(
+            |e| matches!(e, Event::Remove { path } if path.to_string_lossy().contains("-backup.")),
+        );
+    assert!(published || replaced_with_a_backup, "{steps:?}");
 }
 
 /// A kill right before the move leaves the old file and a recorded temp file; right
@@ -833,7 +837,8 @@ fn a_symlink_is_published_by_a_durable_move() {
     let (out, ledger) = (dir.path().join("l"), HeldLedger::default());
     trace::take();
 
-    materialize_symlink_in(&out, b"target", &ledger).unwrap();
+    materialize_symlink_in(&out, b"target", &ledger, TargetExpectation::observe(&out).unwrap())
+        .unwrap();
 
     assert!(fs::symlink_metadata(&out).unwrap().file_type().is_symlink());
     assert!(ledger.held.lock().unwrap().is_empty());
@@ -1331,7 +1336,7 @@ fn a_deferred_publish_keeps_the_temp_record_for_the_batch() {
             durability,
         )
         .unwrap();
-        persist_reconstructed_file_durable(&tmp, &out, &ledger, durability).unwrap();
+        persist_reconstructed_file_durable(&tmp, &out, &ledger, durability, None).unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), b"hello");
         assert!(!tmp.exists());
         assert_eq!(ledger.held.lock().unwrap().len(), held);
@@ -1485,7 +1490,7 @@ fn file_flushed_names_deferred_flushes_the_data_inside_the_write() {
         )
         .unwrap();
         assert_eq!(io_diag::thread_file_fsyncs() - before, fsyncs, "{durability:?}");
-        persist_reconstructed_file_durable(&tmp, &out, &ledger, durability).unwrap();
+        persist_reconstructed_file_durable(&tmp, &out, &ledger, durability, None).unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), b"hello");
     }
     io_diag::set_enabled(false);
@@ -1662,10 +1667,272 @@ fn a_failed_deferred_publish_keeps_its_temp_and_a_failed_full_publish_removes_it
         let tmp = dir.path().join(".yadorilink-tmp.0123456789abcdef");
         std::fs::write(&tmp, b"received").unwrap();
 
-        let result = persist_reconstructed_file_durable(&tmp, &target, &NoTempLedger, durability);
+        let result =
+            persist_reconstructed_file_durable(&tmp, &target, &NoTempLedger, durability, None);
 
         assert!(result.is_err(), "{durability:?}: the publish should fail");
         assert_eq!(tmp.exists(), temp_stays, "{durability:?}");
         assert!(target.join("child").exists(), "{durability:?}: the occupant is untouched");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_crash_left_temp_is_used_only_while_it_holds_the_blocks_under_one_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let content = b"exactly the version";
+    let block = BlockInfo {
+        hash: hex::decode(crate::traits::hash_block_bytes(content).as_bytes()).unwrap(),
+        offset: 0,
+        size: content.len() as u32,
+    };
+    let blocks = std::slice::from_ref(&block);
+    let tmp = dir.path().join(".yadorilink-tmp.aa");
+    fs::write(&tmp, content).unwrap();
+    assert!(VerifiedTemp::open(&tmp, blocks).is_some());
+
+    // Torn: not the version.
+    fs::write(&tmp, &content[..4]).unwrap();
+    assert!(VerifiedTemp::open(&tmp, blocks).is_none());
+
+    // Another name for the same bytes: someone else's file could change what was verified.
+    fs::write(&tmp, content).unwrap();
+    fs::hard_link(&tmp, dir.path().join("elsewhere")).unwrap();
+    assert!(VerifiedTemp::open(&tmp, blocks).is_none());
+    fs::remove_file(dir.path().join("elsewhere")).unwrap();
+
+    // A symlink at the name is never followed.
+    let target = dir.path().join("target");
+    fs::write(&target, content).unwrap();
+    fs::remove_file(&tmp).unwrap();
+    std::os::unix::fs::symlink(&target, &tmp).unwrap();
+    assert!(VerifiedTemp::open(&tmp, blocks).is_none());
+
+    // Replaced after the check: the name no longer leads to the verified object.
+    fs::remove_file(&tmp).unwrap();
+    fs::write(&tmp, content).unwrap();
+    let verified = VerifiedTemp::open(&tmp, blocks).unwrap();
+    fs::remove_file(&tmp).unwrap();
+    fs::write(&tmp, content).unwrap();
+    assert!(!verified.is_still_at_its_path());
+}
+
+/// A write that decided what it may replace publishes only over that: an object that changed
+/// since (here: an in-place edit) or a name that appeared where none stood is kept as the user
+/// left it, and the temp is left for the caller.
+#[cfg(unix)]
+#[test]
+fn a_checked_publish_replaces_only_what_the_writer_decided_to_replace() {
+    for durability in [Durability::Full, Durability::DeferredToBatch] {
+        let dir = tempfile::tempdir().unwrap();
+        let new_temp = |name: &str| {
+            let tmp = dir.path().join(name);
+            std::fs::write(&tmp, b"the new version").unwrap();
+            tmp
+        };
+
+        // The object that was classified is still there: replaced.
+        let out = dir.path().join("same.txt");
+        std::fs::write(&out, b"the previous version").unwrap();
+        let expected = TargetExpectation::observe(&out).unwrap();
+        let tmp = new_temp("t1");
+        persist_reconstructed_file_checked(&tmp, &out, &NoTempLedger, durability, None, expected)
+            .unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"the new version");
+
+        // The object was edited in place after it was classified: kept.
+        let out = dir.path().join("edited.txt");
+        std::fs::write(&out, b"the previous version").unwrap();
+        let expected = TargetExpectation::observe(&out).unwrap();
+        std::fs::write(&out, b"edited, and longer").unwrap();
+        let tmp = new_temp("t2");
+        let result = persist_reconstructed_file_checked(
+            &tmp,
+            &out,
+            &NoTempLedger,
+            durability,
+            None,
+            expected,
+        );
+        assert!(matches!(result, Err(StorageError::TargetChanged(_))), "{result:?}");
+        assert_eq!(std::fs::read(&out).unwrap(), b"edited, and longer");
+        assert!(tmp.exists(), "the temp is the caller's");
+
+        // The object was replaced by another after it was classified: kept.
+        let out = dir.path().join("swapped.txt");
+        std::fs::write(&out, b"the previous version").unwrap();
+        let expected = TargetExpectation::observe(&out).unwrap();
+        std::fs::remove_file(&out).unwrap();
+        std::fs::write(&out, b"a different file").unwrap();
+        let tmp = new_temp("t3");
+        let result = persist_reconstructed_file_checked(
+            &tmp,
+            &out,
+            &NoTempLedger,
+            durability,
+            None,
+            expected,
+        );
+        assert!(matches!(result, Err(StorageError::TargetChanged(_))), "{result:?}");
+        assert_eq!(std::fs::read(&out).unwrap(), b"a different file");
+
+        // Nothing stood there, and a file appeared: kept.
+        let out = dir.path().join("appeared.txt");
+        let expected = TargetExpectation::observe(&out).unwrap();
+        assert_eq!(expected, TargetExpectation::Absent);
+        std::fs::write(&out, b"saved just now").unwrap();
+        let tmp = new_temp("t4");
+        let result = persist_reconstructed_file_checked(
+            &tmp,
+            &out,
+            &NoTempLedger,
+            durability,
+            None,
+            expected,
+        );
+        assert!(matches!(result, Err(StorageError::TargetChanged(_))), "{result:?}");
+        assert_eq!(std::fs::read(&out).unwrap(), b"saved just now");
+        assert!(tmp.exists(), "a refused publish keeps the temp, which may be the only copy");
+
+        // Nothing stood there and nothing appeared: published.
+        let out = dir.path().join("fresh.txt");
+        let tmp = new_temp("t5");
+        persist_reconstructed_file_checked(
+            &tmp,
+            &out,
+            &NoTempLedger,
+            durability,
+            None,
+            TargetExpectation::Absent,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"the new version");
+    }
+}
+
+/// A symlink replaces only what the writer decided to replace: a regular file saved at the name,
+/// or the link replaced by another object, after the decision is kept, and no temp link stays.
+#[cfg(unix)]
+#[test]
+fn a_symlink_is_placed_only_over_what_was_decided() {
+    let dir = tempfile::tempdir().unwrap();
+    let strays = |dir: &Path| {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".yadorilink-tmp"))
+            .count()
+    };
+
+    // Nothing stood there, and a file appeared: kept.
+    let out = dir.path().join("appeared");
+    let expected = TargetExpectation::observe(&out).unwrap();
+    std::fs::write(&out, b"saved just now").unwrap();
+    let result = materialize_symlink_in(&out, b"target", &NoTempLedger, expected);
+    assert!(matches!(result, Err(StorageError::TargetChanged(_))), "{result:?}");
+    assert_eq!(std::fs::read(&out).unwrap(), b"saved just now");
+    assert_eq!(strays(dir.path()), 0);
+
+    // A link stood there, and a regular file replaced it: kept.
+    let out = dir.path().join("replaced");
+    std::os::unix::fs::symlink("old-target", &out).unwrap();
+    let expected = TargetExpectation::observe(&out).unwrap();
+    std::fs::remove_file(&out).unwrap();
+    std::fs::write(&out, b"a file now").unwrap();
+    let result = materialize_symlink_in(&out, b"target", &NoTempLedger, expected);
+    assert!(matches!(result, Err(StorageError::TargetChanged(_))), "{result:?}");
+    assert_eq!(std::fs::read(&out).unwrap(), b"a file now");
+    assert_eq!(strays(dir.path()), 0);
+
+    // The link that was decided on is still there: replaced.
+    let out = dir.path().join("same");
+    std::os::unix::fs::symlink("old-target", &out).unwrap();
+    let expected = TargetExpectation::observe(&out).unwrap();
+    materialize_symlink_in(&out, b"target", &NoTempLedger, expected).unwrap();
+    assert_eq!(std::fs::read_link(&out).unwrap(), std::path::Path::new("target"));
+    assert_eq!(strays(dir.path()), 0);
+}
+
+/// `reconstruct_file` replaces only what stood at the path as it started: a save made during the
+/// assembly is kept, and no temp file is left behind.
+#[test]
+fn a_reconstruct_does_not_replace_a_save_made_during_its_assembly_and_leaves_no_temp() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use yadorilink_replica_domain::file::BlockInfo;
+    /// Saves to the target when the assembly records its temp, which is the first thing it does.
+    struct SavesWhileAssembling {
+        target: PathBuf,
+        saved: AtomicBool,
+    }
+    impl TempFileLedger for SavesWhileAssembling {
+        fn record(&self, _tmp_path: &Path) -> Result<(), StorageError> {
+            if !self.saved.swap(true, Ordering::SeqCst) {
+                std::fs::write(&self.target, b"saved while the file was being assembled").unwrap();
+            }
+            Ok(())
+        }
+        fn release(&self, _tmp_path: &Path) {}
+        fn strand(&self, _dir_path: &Path) -> Result<(), StorageError> {
+            Ok(())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = crate::SegmentBlockStore::new(store_dir.path()).unwrap();
+    let content = b"the version being reconstructed";
+    let hash = crate::BlockStore::put(&store, content).unwrap();
+    let blocks = vec![BlockInfo {
+        hash: hex::decode(&hash).unwrap(),
+        offset: 0,
+        size: content.len() as u32,
+    }];
+    let target = dir.path().join("f");
+    std::fs::write(&target, b"the previous version").unwrap();
+    let ledger = SavesWhileAssembling { target: target.clone(), saved: AtomicBool::new(false) };
+
+    let result = reconstruct_file_in(&store, &target, &blocks, 0, &ledger);
+
+    assert!(matches!(result, Err(StorageError::TargetChanged(_))), "{result:?}");
+    assert_eq!(std::fs::read(&target).unwrap(), b"saved while the file was being assembled");
+    let names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["f"], "no temp file is left behind");
+}
+
+/// A temp the caller borrowed (a crashed write's, finished from after it was read back) may be the
+/// only local copy of the bytes: a publish that fails for any reason other than the target having
+/// changed leaves it where it is. A temp the writer made itself is removed.
+#[test]
+fn a_failed_publish_removes_its_own_temp_but_never_a_borrowed_one() {
+    let dir = tempfile::tempdir().unwrap();
+    // The target's directory does not exist, so the publish fails before the rename.
+    let out = dir.path().join("missing").join("target.txt");
+
+    let own = dir.path().join("own.tmp");
+    std::fs::write(&own, b"bytes").unwrap();
+    let result = persist_reconstructed_file_checked(
+        &own,
+        &out,
+        &NoTempLedger,
+        Durability::Full,
+        None,
+        TargetExpectation::Absent,
+    );
+    assert!(result.is_err() && !matches!(result, Err(StorageError::TargetChanged(_))));
+    assert!(!own.exists(), "a temp the writer made is removed when the publish fails");
+
+    let borrowed = dir.path().join("borrowed.tmp");
+    std::fs::write(&borrowed, b"bytes").unwrap();
+    let result = persist_borrowed_temp_checked(
+        &borrowed,
+        &out,
+        &NoTempLedger,
+        None,
+        TargetExpectation::Absent,
+    );
+    assert!(result.is_err() && !matches!(result, Err(StorageError::TargetChanged(_))));
+    assert_eq!(std::fs::read(&borrowed).unwrap(), b"bytes", "a borrowed temp stays");
 }

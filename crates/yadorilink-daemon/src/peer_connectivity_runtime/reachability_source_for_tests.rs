@@ -38,19 +38,23 @@ pub fn dialing(state: &DaemonState, peer_device_id: &str) {
 
 /// A connection to `peer_device_id` is up with a direct path selected.
 pub fn connected_directly(state: &DaemonState, peer_device_id: &str) {
-    state.peer_connectivity.record_link_up(peer_device_id, Some(Carrier::Direct));
+    state.peer_connectivity.record_link_up(peer_device_id, Some(Carrier::Direct), 0);
 }
 
 /// A connection to `peer_device_id` is up, and the only path it has is
 /// through a relay server.
 pub fn relay_only(state: &DaemonState, peer_device_id: &str) {
-    state.peer_connectivity.record_link_up(peer_device_id, Some(Carrier::Relay));
+    state.peer_connectivity.record_link_up(peer_device_id, Some(Carrier::Relay), 0);
 }
 
 /// The connection to `peer_device_id` carried a lane hello of another protocol version: the
 /// device is reachable and cannot sync. Needs a connection to be up, as in production.
 pub fn version_incompatible(state: &DaemonState, peer_device_id: &str) {
-    state.peer_connectivity.record_version_incompatible(peer_device_id);
+    state.peer_connectivity.record_version_incompatible(
+        peer_device_id,
+        0,
+        crate::peer_connectivity_runtime::VersionSkew::PeerNewer,
+    );
 }
 
 /// Every path to `peer_device_id` was tried and none answered: whatever

@@ -162,7 +162,7 @@ async fn without_room_an_unprotected_version_is_given_up_and_the_sync_goes_on() 
 async fn without_room_a_pinned_version_is_never_given_up_and_waits_like_any_write() {
     let f = fixture(false).await;
     let scene = scene(&f);
-    f.state.replica_coordinator.pinned_item_repository().pin(GROUP, scene.path).unwrap();
+    f.state.replica_coordinator.retention_rules().pin(GROUP, scene.path).unwrap();
     space(&f, MIB);
 
     let refused = f.executor.proofs_before_replacing(GROUP, &scene.next).await;

@@ -942,7 +942,7 @@ pub(super) fn track_disk_space_wait(
 ) {
     let Some(local_path) = live_link_path(state, group_id) else { return };
     if let Some(wait) = &attempt.disk_pressure {
-        state.mark_link_waiting_for_disk_space(
+        state.wait_for_disk_space(
             &local_path,
             crate::link_registry::waiting_for_disk_space_reason(
                 &wait.volume,
@@ -954,7 +954,7 @@ pub(super) fn track_disk_space_wait(
         // Settling something is not proof the space is back: confirm on the volume. Paths still
         // in `retry` are retried for their own reasons; had they been refused for space, the
         // attempt would carry `disk_pressure`.
-        state.clear_link_degraded_if_space_recovered(&local_path);
+        state.recover_link_if_space_recovered(&local_path);
     }
 }
 
@@ -962,7 +962,7 @@ pub(super) fn track_disk_space_wait(
 /// the volume like every other clear.
 pub(super) fn note_obligation_completed(state: &Arc<DaemonState>, group_id: &str) {
     if let Some(local_path) = live_link_path(state, group_id) {
-        state.clear_link_degraded_if_space_recovered(&local_path);
+        state.recover_link_if_space_recovered(&local_path);
     }
 }
 

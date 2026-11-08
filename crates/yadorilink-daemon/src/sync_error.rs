@@ -239,6 +239,11 @@ pub enum SyncError {
     )]
     UnsupportedSchemaDowngrade { on_disk_version: i32, supported_version: i32 },
 
+    /// The database was written by an older build and there is no migration
+    /// (see `yadorilink_sqlite_runtime::DatabaseError::SchemaTooOld`).
+    #[error("{}", yadorilink_sqlite_runtime::DatabaseError::SchemaTooOld { on_disk_version: *on_disk_version, supported_version: *supported_version })]
+    SchemaTooOld { on_disk_version: i32, supported_version: i32 },
+
     /// A local edit could not be stamped with a real authorization context
     /// because the group's policy is unavailable: its most recent policy
     /// snapshot failed verification, so the group is *stale* and change
@@ -360,7 +365,9 @@ impl SyncError {
             SyncError::EvictionOutcomeAmbiguous(_) => "policy",
             SyncError::PathEscapesRoot(_) => "permission",
             SyncError::DiskPressure { .. } => "disk_pressure",
-            SyncError::UnsupportedSchemaDowngrade { .. } => "storage",
+            SyncError::UnsupportedSchemaDowngrade { .. } | SyncError::SchemaTooOld { .. } => {
+                "storage"
+            }
             SyncError::PolicyUnavailable => "policy",
             SyncError::ReservedNamespaceCollision(_) => "permission",
             SyncError::NonPortablePath(_) => "invalid_input",
@@ -377,6 +384,10 @@ impl From<yadorilink_sqlite_runtime::DatabaseError> for SyncError {
                 on_disk_version,
                 supported_version,
             } => SyncError::UnsupportedSchemaDowngrade { on_disk_version, supported_version },
+            yadorilink_sqlite_runtime::DatabaseError::SchemaTooOld {
+                on_disk_version,
+                supported_version,
+            } => SyncError::SchemaTooOld { on_disk_version, supported_version },
             yadorilink_sqlite_runtime::DatabaseError::CorruptSchema(msg) => {
                 SyncError::CorruptState(msg)
             }
@@ -401,6 +412,10 @@ impl From<yadorilink_sync_sqlite::SyncSqliteError> for SyncError {
             }
             yadorilink_sync_sqlite::SyncSqliteError::CorruptState(msg) => {
                 SyncError::CorruptState(msg)
+            }
+            // A root read that no flush preceded: a caller's bug, reported like corrupt state.
+            behind @ yadorilink_sync_sqlite::SyncSqliteError::NamespaceBehind => {
+                SyncError::CorruptState(behind.to_string())
             }
             // `materialization_jobs::transition`/`mark_backoff`/
             // `reschedule_after_skip`'s illegal-job-state-transition guard --

@@ -245,6 +245,11 @@ fn a_store_of_the_previous_layout_is_refused_with_the_way_to_save_what_is_set_as
     let Err(err) = open_stamped(&previous) else {
         panic!("a store of the previous layout must not open");
     };
+    assert!(
+        matches!(&err, StorageError::AnotherLayout { found, expected, .. }
+            if *found == STORE_FORMAT_VERSION - 1 && *expected == STORE_FORMAT_VERSION),
+        "{err:?}"
+    );
     let message = err.to_string();
     for needed in [
         "pre-release builds do not migrate",

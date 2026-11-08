@@ -13,7 +13,7 @@
 //! `reconstruct_file_journaled` and the live peer materialize path both
 //! bracket their writes with) lives in `yadorilink-daemon`'s
 //! `materialization_intent` module -- the same reason
-//! `open_materialization_intent_guard`
+//! `open_repair_write`
 //! itself is a narrow delegate rather than a trait object constructor (see
 //! `materialization_execution.rs`'s own doc comment). This module never names
 //! that struct -- it only ever sees the guard through the
@@ -21,20 +21,28 @@
 
 use std::path::Path;
 
+use crate::repair_failpoint::{hit, RepairFailpoint};
+
 use yadorilink_local_storage::{
     apply_file_metadata, create_or_defer_placeholder, disk_bytes_match_indexed_blocks,
-    disk_matches_expected_object, intent_target_hash, persist_reconstructed_file_in,
+    disk_matches_expected_object, intent_target_hash, persist_reconstructed_file_checked,
     reconstruct_file_to_temp_in, verify_write_target_within_root, BlockContentStore,
-    DiskContentComparison, ExpectedObject,
+    DiskContentComparison, Durability, ExpectedObject,
 };
 use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 use yadorilink_root_authority::root_identity::VerifiedRoot;
 
+use crate::crash_facts::{observed_crash_facts, DiskSeen};
+use crate::repair_trace::RowTrace;
+use yadorilink_replica_domain::crash_state::{
+    classify, verdict, DiskObservation, IntentKind, RecoveryAction, RepairInputs,
+};
+
 use crate::materialization_execution::{
     GroupStructuralLedger, MaterializationExecutionError, MaterializationExecutionPort,
-    MaterializationIntentKind, RepairRowSnapshot, WriteRemovalEvidence,
+    MaterializationIntentKind, RepairRowSnapshot,
 };
 use yadorilink_replica_domain::session_state::RestoreCommitOutcome;
 
@@ -353,6 +361,7 @@ fn repair_interrupted_materializations_inner(
     // object would otherwise read as divergent bytes to quarantine.
     let held_paths: std::collections::HashSet<String> =
         state.list_held_paths(group_id)?.into_iter().map(|hold| hold.path).collect();
+    let trace = RowTrace::new();
     let mut repair_one_path = |path: String,
                                snapshot_mstate: MaterializationState|
      -> Result<(), MaterializationExecutionError> {
@@ -426,9 +435,10 @@ fn repair_interrupted_materializations_inner(
                 &path,
                 mode,
                 permit,
-                &outstanding_intents,
+                &parents_stood_at_start,
                 &row,
                 &mut report,
+                &trace,
             )?;
             return Ok(());
         }
@@ -445,9 +455,10 @@ fn repair_interrupted_materializations_inner(
                 &path,
                 mode,
                 permit,
-                &outstanding_intents,
+                &parents_stood_at_start,
                 &row,
                 &mut report,
+                &trace,
             )?;
             return Ok(());
         }
@@ -487,6 +498,9 @@ fn repair_interrupted_materializations_inner(
 
         let out_path = root.join(&path);
         diag_disk_compared += 1;
+        // What stood at the path when this row's decisions began. A rebuild that replaces an
+        // object may replace only this one; nothing later is trusted to be the same.
+        let first_seen = yadorilink_local_storage::TargetExpectation::observe(&out_path)?;
         let on_disk_size = std::fs::metadata(&out_path).ok().map(|m| m.len());
         let bytes_match_index = on_disk_size == Some(record.size)
             && disk_bytes_match_indexed_blocks(&out_path, &record.blocks)?;
@@ -518,7 +532,73 @@ fn repair_interrupted_materializations_inner(
         // capture then authors the metadata change).
         let disk_matches_index = bytes_match_index
             && yadorilink_local_storage::exec_already_matches_disk(&out_path, row.exec)?;
-        if disk_matches_index {
+        // The facts the classifier places this row by, and the inputs that choose between the
+        // actions its state allows. The verdict is the action: the arms below carry it out (or,
+        // for `Leave`, hand the path on) and decide nothing about the row themselves.
+        hit(RepairFailpoint::AfterRowSnapshot)?;
+        let intent_kind = state.materialization_intent_kind(group_id, &path)?;
+        let proof_now = state.has_usable_materialized_generation(group_id, &path)?;
+        let facts = observed_crash_facts(
+            state,
+            group_id,
+            &path,
+            &out_path,
+            row_state,
+            intent_kind,
+            match (on_disk_size, disk_matches_index) {
+                (None, _) => DiskSeen::Absent,
+                (Some(_), true) => DiskSeen::Spec,
+                (Some(_), false) => DiskSeen::Present,
+            },
+            proof_relation(proof_now),
+        )?;
+        let mut inputs = RepairInputs::default();
+        let is_write = facts.intent.is_some_and(|i| i.kind == IntentKind::Write);
+        // The name is gone and its directory stood when the pass began: a removal, which needs
+        // neither a temp nor the blocks.
+        if is_write
+            && facts.disk == DiskObservation::Absent
+            && name_removed_by_user(
+                state,
+                group_id,
+                &path,
+                parents_stood_at_start.contains(&path),
+                proof_now,
+            )?
+        {
+            inputs.removed_by_user = true;
+        }
+        // A delete intent over a missing name is the delete lane's, whatever could be written.
+        let left_to_the_delete = facts.intent.is_some_and(|i| i.kind == IntentKind::Delete)
+            && facts.disk == DiskObservation::Absent;
+        let reads_the_version = !inputs.removed_by_user && !left_to_the_delete;
+        // A temp file the intent names that holds exactly the version finishes the write with no
+        // refetch. The name is only a pointer: the file is read back against the record's
+        // blocks, and the path must be empty or hold the untouched pre-image the write was going
+        // to replace.
+        let finish_from_temp = if reads_the_version
+            && is_write
+            && matches!(facts.disk, DiskObservation::Absent | DiskObservation::PreImage)
+        {
+            match state.write_intent_tmp_path(group_id, &path)? {
+                Some(tmp) if tmp.parent() == out_path.parent() => {
+                    yadorilink_local_storage::VerifiedTemp::open(&tmp, &record.blocks)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if finish_from_temp.is_some() {
+            inputs.finishable_temp = true;
+        }
+        if reads_the_version && facts.intent.is_some() && facts.disk != DiskObservation::Spec {
+            let hashes: Vec<String> = record.blocks.iter().map(|b| hex::encode(&b.hash)).collect();
+            inputs.blocks_here = store.present_blocks(&hashes)?.iter().all(|&p| p);
+        }
+        let action = verdict(classify(&facts), &facts, inputs);
+        trace.set_row(facts, action);
+        if action == RecoveryAction::Prove {
             // The write completed and disk holds the version. What is
             // left is whatever the interrupted attempt did not finish: a
             // proof that no longer stands, a row still in the transient
@@ -594,6 +674,7 @@ fn repair_interrupted_materializations_inner(
                 permit,
             )?;
             if committed {
+                trace.act(RecoveryAction::Prove);
                 if !proof_stands {
                     report.reproven.push(path.clone());
                 }
@@ -643,19 +724,22 @@ fn repair_interrupted_materializations_inner(
         // through to the reconstruct path below, as does any present-but-
         // divergent file.)
         //
-        // Which intent it is decides that, not only whether one is open. A
-        // tombstone delete opens its own intent before it removes the file,
-        // and a crash between that removal and its settle leaves the row
-        // live, the file gone and that intent open. The missing file is
-        // where that delete was heading, not an interrupted write:
-        // rebuilding it would resurrect the deleted file. Leave the path,
-        // intent included, to the outstanding delete, which settles it.
-        let intent_kind = state.materialization_intent_kind(group_id, &path)?;
-        if on_disk_size.is_none() && intent_kind == Some(MaterializationIntentKind::Delete) {
+        // Which intent it is decides that, not only whether one is open: the verdict knows. A
+        // tombstone delete opens its own intent before it removes the file, and a crash between
+        // that removal and its settle leaves the row live, the file gone and that intent open. The
+        // missing file is where that delete was heading, not an interrupted write, and rebuilding
+        // it would resurrect the deleted file: the verdict for that state (X8) is to leave it.
+        //
+        // That is the general rule for a `Leave` with an operation's intent open, a missing file
+        // or not (a delete not yet settled, a present file under such a delete, an eviction or a
+        // restore, a write in a state the table does not place): the operation's own lane finishes
+        // it, so this sweep touches neither the path nor the intent.
+        if action == RecoveryAction::Leave && intent_kind.is_some() {
             tracing::debug!(
                 group_id,
                 path = %path,
-                "a Hydrated file is missing under an open delete intent; leaving it to that delete"
+                "an open intent the verdict leaves to its lane (a delete that has not settled is \
+                 the main case)"
             );
             return Ok(());
         }
@@ -666,29 +750,25 @@ fn repair_interrupted_materializations_inner(
         // capture and the write is closed over no identity, as the live
         // receive closes a file removed before its commit. Capture then
         // authors the delete of the `Present` row.
-        if on_disk_size.is_none()
-            && intent_kind == Some(MaterializationIntentKind::Materialize)
-            && name_removed_by_user(
-                state,
-                group_id,
-                &path,
-                &out_path,
-                parents_stood_at_start.contains(&path),
-            )?
-        {
-            // Only a name that is really not there is a removal: a stat that failed for another
-            // reason, or a dangling symlink, says nothing about the path, so it waits.
-            if !matches!(
+        if action == RecoveryAction::RecordRemoval {
+            // A delete that had already taken the recorded object from the name is done, and what
+            // is at the name now is a person's: it stays exactly as it is and capture takes it as
+            // a new local change. For a write, only a name that is really not there is a removal:
+            // a stat that failed for another reason, or a dangling symlink, says nothing about the
+            // path, so it waits.
+            let delete_is_done = intent_kind == Some(MaterializationIntentKind::Delete);
+            let name_is_gone = matches!(
                 std::fs::symlink_metadata(&out_path),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound
-            ) {
+            );
+            if !delete_is_done && !name_is_gone {
                 return Ok(());
             }
             if let Some(version) = row.current_version {
                 state.record_dirty_path(
                     group_id,
                     &path,
-                    "removed",
+                    if name_is_gone { "removed" } else { "created_or_modified" },
                     repair_now_unix_nanos(),
                     permit,
                 )?;
@@ -703,7 +783,10 @@ fn repair_interrupted_materializations_inner(
                     permit,
                 )?;
                 if committed {
-                    report.offline_deleted.push(path);
+                    trace.act(RecoveryAction::RecordRemoval);
+                    if name_is_gone {
+                        report.offline_deleted.push(path);
+                    }
                 }
             }
             return Ok(());
@@ -793,23 +876,27 @@ fn repair_interrupted_materializations_inner(
         // equal bytes is not covered. Only a path WITH an intent that disk
         // cannot explain is quarantined below.
         if on_disk_size.is_some() && !has_intent {
-            state.record_dirty_path(
-                group_id,
-                &path,
-                "created_or_modified",
-                repair_now_unix_nanos(),
-                permit,
-            )?;
+            // A file that already is the version is nothing to hand on. It gets here when the
+            // intent the pass's early snapshot saw finished before this decision read it: the
+            // row is settled, and journaling the unchanged file would author a change nobody made.
+            if !disk_matches_index {
+                state.record_dirty_path(
+                    group_id,
+                    &path,
+                    "created_or_modified",
+                    repair_now_unix_nanos(),
+                    permit,
+                )?;
+            }
             return Ok(());
         }
         // Computed unconditionally, and reused below by the reconstruct
         // arm too, rather than declared twice: the quarantine-window
-        // guard just below and `reconstruct_file_journaled`'s own guard
-        // (opened separately, further down) target the same eventual
-        // content, and `open_materialization_intent_guard`'s underlying
-        // write is an `INSERT ... ON CONFLICT DO UPDATE` upsert keyed on
-        // `(group_id, path)` -- opening it twice with the same hash for
-        // the same row is idempotent, not a conflict.
+        // guard just below and the reconstruct's own guard (opened
+        // separately, further down) target the same eventual content,
+        // and the intent write is an `INSERT ... ON CONFLICT DO UPDATE`
+        // upsert keyed on `(group_id, path)` -- opening it twice with the
+        // same hash for the same row is idempotent, not a conflict.
         let target_hash = intent_target_hash(&record.blocks);
         // Opened BEFORE the quarantine rename below, not after -- matching
         // `MaterializationIntentGuard::open`'s own "before the bytes are
@@ -845,16 +932,7 @@ fn repair_interrupted_materializations_inner(
         // so the bytes are the lost flush's, not an edit. Rebuilt in place from
         // the blocks, with nothing to quarantine. Any other divergence under an
         // open intent is quarantined as before.
-        let rebuild_in_place = on_disk_size.is_some()
-            && intent_kind == Some(MaterializationIntentKind::Materialize)
-            && match state.flush_pending_proof_identity(group_id, &path)? {
-                Some(Some(proof)) => {
-                    yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&out_path)
-                        .is_ok_and(|observed| observed == proof)
-                }
-                _ => false,
-            };
-        if rebuild_in_place {
+        if facts.disk == DiskObservation::TornSpec && action == RecoveryAction::Rebuild {
             tracing::warn!(
                 group_id,
                 path = %path,
@@ -871,17 +949,7 @@ fn repair_interrupted_materializations_inner(
         // to in-flight with its intent open, the old object stays where it is (capture already
         // withholds it as the pre-image of an open write), and the materialization lane fetches
         // and places the version.
-        if on_disk_size.is_some()
-            && intent_kind == Some(MaterializationIntentKind::Materialize)
-            && !rebuild_in_place
-            && !store
-                .present_blocks(
-                    &record.blocks.iter().map(|b| hex::encode(&b.hash)).collect::<Vec<_>>(),
-                )?
-                .iter()
-                .all(|&p| p)
-            && state.disk_is_untouched_pre_image(group_id, &path, &out_path)?
-        {
+        if action == RecoveryAction::StandDown {
             if row_state != MaterializationState::Hydrating
                 && state.stand_down_over_pre_image(
                     group_id,
@@ -896,16 +964,29 @@ fn repair_interrupted_materializations_inner(
                     path = %path,
                     "a write was interrupted over the previous version and the new bytes are                      not on this device; the previous version stays and the new one is fetched"
                 );
+                trace.act(RecoveryAction::StandDown);
                 report.stood_down.push(path);
             }
             return Ok(());
         }
-        let quarantine_intent_guard = if on_disk_size.is_some() {
+        // Reaching here over an untouched pre-image means the version's blocks are all here (the
+        // stand-down above took the rest): the object is this device's own earlier write, not an
+        // edit, so the rebuild replaces it in place and there is no conflict copy to make.
+        // Any other verdict is not this arm's to carry out (a `Leave` with an intent open has
+        // already returned above; one without an intent has gone through the hand-offs).
+        if !matches!(
+            action,
+            RecoveryAction::Rebuild | RecoveryAction::Quarantine | RecoveryAction::Demote
+        ) {
+            return Ok(());
+        }
+        let moves_aside = action == RecoveryAction::Quarantine;
+        let quarantine_intent_guard = if moves_aside {
             Some(state.open_repair_quarantine(group_id, &path, &target_hash, permit)?)
         } else {
             None
         };
-        if on_disk_size.is_some() && !rebuild_in_place {
+        if moves_aside {
             match quarantine_dirty_disk_file(
                 root,
                 &path,
@@ -932,6 +1013,7 @@ fn repair_interrupted_materializations_inner(
                         "local disk bytes diverged from the index during repair; quarantined \
                          its current bytes as a conflict copy before healing the canonical path"
                     );
+                    trace.act(RecoveryAction::Quarantine);
                     report.quarantined_dirty.push((path.clone(), quarantine_path));
                 }
                 Ok(None) => {}
@@ -951,18 +1033,32 @@ fn repair_interrupted_materializations_inner(
         // borrowed by this guard, and every remaining branch below (the
         // reconstruct arms and the placeholder arms) eventually moves
         // `path` into `report`. From this point on the row is protected
-        // either by `reconstruct_file_journaled`'s own freshly-opened
+        // either by the reconstruct's own freshly-opened
         // guard (targeting the identical hash, an idempotent re-upsert of
         // the same row -- see this guard's own opening comment) or by a
         // placeholder arm's `clear_materialization_intent` call (or, when
         // the row was superseded first, by leaving the intent open), so
         // holding this one any longer buys nothing.
         drop(quarantine_intent_guard);
+        // What the rebuild may replace: nothing (the quarantine moved what stood there aside, or
+        // nothing did), or the very object seen when the decisions above began. A save landing
+        // at any point after that is not replaced.
+        let expected_target = if moves_aside {
+            yadorilink_local_storage::TargetExpectation::Absent
+        } else {
+            first_seen
+        };
 
-        let hashes: Vec<String> = record.blocks.iter().map(|b| hex::encode(&b.hash)).collect();
-        let present = store.present_blocks(&hashes)?;
-        // Vacuously true for an empty file: there is nothing to fetch.
-        if present.iter().all(|&p| p) {
+        // The verdict says whether the version is written (its blocks, or a temp that holds it,
+        // are here) or the row goes back to a placeholder; a quarantine is followed by the same
+        // choice over the now-empty name. Vacuously the blocks are here for an empty file:
+        // there is nothing to fetch.
+        let writes_version = match action {
+            RecoveryAction::Rebuild => true,
+            RecoveryAction::Quarantine => inputs.blocks_here || inputs.finishable_temp,
+            _ => false,
+        };
+        if writes_version {
             verify_write_target_within_root(
                 &out_path,
                 root,
@@ -990,8 +1086,13 @@ fn repair_interrupted_materializations_inner(
             // adoption would mint a second epoch that no concurrent mutator
             // could make it lose against, and would publish a proof with no
             // version.
-            let repair_mutation_generation =
-                state.dag_bump_mutation_fence(group_id, &path, "repair_reconstruct")?;
+            let (repair_mutation_generation, intent) = state.open_repair_write(
+                group_id,
+                &path,
+                &target_hash,
+                "repair_reconstruct",
+                permit,
+            )?;
             match reconstruct_file_journaled(JournaledReconstruction {
                 state,
                 store,
@@ -1000,13 +1101,16 @@ fn repair_interrupted_materializations_inner(
                 out_path: &out_path,
                 root,
                 blocks: &record.blocks,
+                durable_temp: finish_from_temp.as_ref(),
+                expected_target,
                 mtime_unix_nanos: record.mtime_unix_nanos,
                 exec: row.exec,
-                target_version_hash: &target_hash,
                 mutation_generation: repair_mutation_generation,
+                intent,
                 permit,
             }) {
                 Ok(()) => {
+                    trace.act(RecoveryAction::Rebuild);
                     // Publish the proof this reconstruct owes, or, when it
                     // cannot be published, demote the row it was about.
                     if !state.settle_repair_reconstruct(
@@ -1028,9 +1132,31 @@ fn repair_interrupted_materializations_inner(
                     // the intent still open, rather than writing a placeholder onto the bare
                     // mountpoint.
                     state.verify_root(root, group_id)?;
+                    // The path changed under the rebuild: whatever stands there now is not
+                    // this write's to judge. The row, the intent and the temp stay as they
+                    // are, so the next pass classifies what is there and keeps it.
+                    if e.is_target_changed() {
+                        tracing::warn!(
+                            group_id,
+                            path = %path,
+                            "the path changed while the repair assembled its version; \
+                             leaving what is there for the next pass"
+                        );
+                        return Ok(());
+                    }
+                    // A temp this write was finishing from may be the only local copy of the
+                    // version. Falling back to a placeholder would clear the intent that names
+                    // it and the sweep after the repair would remove it, so the row, the intent
+                    // and the temp stay and the next pass finishes from it again.
+                    // The failure is returned, not absorbed: a path-local one lands in
+                    // `report.failed` and any other aborts the pass, so the startup never treats
+                    // the repair as complete while this path is unfinished.
+                    if finish_from_temp.as_ref().is_some_and(|temp| temp.path().exists()) {
+                        return Err(e);
+                    }
                     // `reconstruct_file_journaled` leaves its intent open on
-                    // every failure, including a failed `apply_unix_mode` or
-                    // `apply_xattrs` after the bytes landed, so this arm is
+                    // every failure, including a landed mark that could not be
+                    // recorded after the bytes landed, so this arm is
                     // what decides the path's fate: it replaces the content
                     // with a placeholder and only then clears the intent,
                     // except when the placeholder write is deferred (below),
@@ -1041,19 +1167,19 @@ fn repair_interrupted_materializations_inner(
                         error = %e,
                         "repair reconstruct failed with all blocks present; leaving retriable placeholder"
                     );
-                    // The failure can come after the bytes were renamed into
-                    // place (the mode or the replicated xattrs could not be
-                    // applied). The path was emptied before this write (the
-                    // divergent object, if any, was quarantined), so an object
-                    // standing there now is this attempt's: it is no `Remote`
-                    // row. The row keeps its state and the intent stays open,
-                    // which is what keeps the path from reading as an offline
-                    // delete and what makes the next pass retry the metadata.
+                    // An object standing at the path is no `Remote` row: either the
+                    // bytes were renamed into place and a later step failed (the landed
+                    // mark could not be recorded), or the publish never happened and
+                    // the pre-image of an interrupted write is still there (the
+                    // execute flag could not be applied to the temp, which was then
+                    // discarded). Either way the row keeps its state and the intent
+                    // stays open, which keeps the path from reading as an offline
+                    // delete and makes the next pass retry.
                     if std::fs::symlink_metadata(&out_path).is_ok() {
                         tracing::warn!(
                             group_id,
                             path = %path,
-                            "the rebuilt object stands but its metadata could not be applied; \
+                            "an object stands at the path after the failed reconstruct; \
                              keeping the row and the intent for the next pass"
                         );
                         return Ok(());
@@ -1120,6 +1246,7 @@ fn repair_interrupted_materializations_inner(
                         // misread as a crash to reconstruct.
                         state.clear_materialization_intent(group_id, &path, permit)?;
                     }
+                    trace.act(RecoveryAction::Demote);
                     report.demoted_to_placeholder.push(path);
                 }
             }
@@ -1159,6 +1286,7 @@ fn repair_interrupted_materializations_inner(
                 // no in-progress intent.
                 state.clear_materialization_intent(group_id, &path, permit)?;
             }
+            trace.act(RecoveryAction::Demote);
             report.demoted_to_placeholder.push(path);
         }
         Ok(())
@@ -1185,7 +1313,10 @@ fn repair_interrupted_materializations_inner(
         if settled.contains(&path) {
             continue;
         }
-        if let Err(error) = repair_one_path(path.clone(), snapshot_mstate) {
+        trace.begin_row();
+        let repaired = repair_one_path(path.clone(), snapshot_mstate);
+        trace.finish_row();
+        if let Err(error) = repaired {
             if !error.is_path_local() {
                 return Err(error);
             }
@@ -1227,6 +1358,14 @@ fn repair_interrupted_materializations_inner(
     Ok(report)
 }
 
+fn proof_relation(stands: bool) -> yadorilink_replica_domain::crash_state::ProofRelation {
+    if stands {
+        yadorilink_replica_domain::crash_state::ProofRelation::Current
+    } else {
+        yadorilink_replica_domain::crash_state::ProofRelation::NotCurrent
+    }
+}
+
 /// Both placeholder demotion arms, when the row moved off the one this pass
 /// read before the demotion could claim it: the row belongs to whoever
 /// superseded it, so this pass writes nothing -- a placeholder sized and
@@ -1250,11 +1389,10 @@ fn log_superseded_placeholder_demotion(group_id: &str, path: &str) {
 /// offline-delete-vs-interrupted-write disambiguation (`has_intent`) and
 /// live-mode dirty-journal deferral.
 ///
-/// Deliberately does NOT attempt the file arm's "quarantine a diverged
-/// on-disk object as a conflict copy" repair: a symlink present on disk
-/// but not matching the recorded target, with no repair intent, is left
-/// untouched rather than silently overwritten -- a real, scoped
-/// limitation, not an oversight.
+/// Under an open write intent it carries out the same verdict as the file arm, quarantine
+/// included (a person's directory at a symlink's name is the one object never moved aside); a
+/// symlink or other object present on disk but not matching the recorded target, with no repair
+/// intent, is left untouched rather than silently overwritten.
 // Each parameter is an independently-meaningful piece of repair context
 // (state handle, path identity, emitter, mode, permit, snapshot, report
 // sink); grouping them into a params struct here would not reduce the
@@ -1269,6 +1407,11 @@ fn log_superseded_placeholder_demotion(group_id: &str, path: &str) {
 // only where nothing else stands: something other than a directory at its
 // path may be a user's, and is never replaced.
 #[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one decision table shared by symlinks and directories; splitting it would separate \
+              the arms that read the same observations"
+)]
 fn repair_one_interrupted_single_object(
     kind: RecordKind,
     state: &dyn MaterializationExecutionPort,
@@ -1277,16 +1420,18 @@ fn repair_one_interrupted_single_object(
     path: &str,
     mode: RepairMode,
     permit: &RootCommitPermit,
-    // See the caller's own `outstanding_intents` comment: the whole-pass
-    // snapshot of which paths actually carry an intent.
-    outstanding_intents: &std::collections::HashSet<String>,
+    // Which paths' parent directories stood when the pass began (see the caller): a name lost
+    // with its directory is not one a person removed.
+    parents_stood_at_start: &std::collections::HashSet<String>,
     // The caller's single-statement read of this row. Everything about
     // the row comes from here -- the target included, which used to be a
     // separate `get_symlink_target` and so could describe a different
     // incarnation than the version this function then proves.
     row: &RepairRowSnapshot,
     report: &mut MaterializationRepairReport,
+    trace: &RowTrace,
 ) -> Result<(), MaterializationExecutionError> {
+    trace.set_kind(if kind == RecordKind::Symlink { "symlink" } else { "directory" });
     let target = if kind == RecordKind::Symlink {
         let Some(target) = row.symlink_target.clone() else {
             // No target recorded at all -- matches `materialize_symlink_at`'s
@@ -1356,6 +1501,9 @@ fn repair_one_interrupted_single_object(
     };
 
     let out_path = root.join(path);
+    // What stood at the path when this row's decisions began; the rebuild replaces that object
+    // and nothing else (nothing, if the quarantine below moved it aside).
+    let first_seen = yadorilink_local_storage::TargetExpectation::observe(&out_path)?;
     let lstat_result = std::fs::symlink_metadata(&out_path);
     // Only a name that is really not there counts as absent: a stat that failed for another
     // reason (permissions, I/O) says nothing about whether the object stands.
@@ -1376,78 +1524,119 @@ fn repair_one_interrupted_single_object(
             lstat.as_ref().is_some_and(|m| m.is_dir())
         }
     };
-    if on_disk_matches {
-        // The link on disk is exactly what the row says it should be, so
-        // what is left is whatever the interrupted attempt did not
-        // finish. This used to drop the intent and stop -- publishing no
-        // proof at all, on a lane where no other pass publishes one
-        // either. A symlink row could therefore sit `Present` with its
-        // proof already dead (the live path bumps the fence before
-        // writing) and no intent left to mark it, which nothing would
-        // ever heal: the file arm's re-proving lane is `RecordKind::File`
-        // only, and so is `hydrate`'s.
-        //
-        // Healthy rows still write nothing, same as the file arm.
-        let proof_stands = state.has_usable_materialized_generation(group_id, path)?;
-        let intent_outstanding = outstanding_intents.contains(path);
-        let row_state = row.materialization_state;
-        if proof_stands && row_state == Some(MaterializationState::Present) && !intent_outstanding {
-            return Ok(());
-        }
-        let (Some(version), Some(state_now)) = (row.current_version, row_state) else {
-            return Ok(());
-        };
-        let identity =
-            yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&out_path).ok();
-        let committed = commit_recovered_object(
-            state, group_id, path, kind, version, identity, state_now, permit,
-        )?;
-        if committed && !proof_stands {
-            report.reproven.push(path.to_string());
-        }
-        return Ok(());
-    }
-
     let intent_kind = state.materialization_intent_kind(group_id, path)?;
-    let on_disk_exists = lstat.is_some();
-    // An open delete intent is a tombstone delete interrupted around its
-    // removal, not an interrupted write: see the regular-file arm. Never
-    // rebuild the link, whether the path is missing or something a user
-    // put there since; the delete settles it.
-    if intent_kind == Some(MaterializationIntentKind::Delete) {
-        tracing::debug!(
-            group_id,
-            path = %path,
-            "a Hydrated symlink is under an open delete intent; leaving it to that delete"
-        );
+    let proof_stands = state.has_usable_materialized_generation(group_id, path)?;
+    let Some(row_state) = row.materialization_state else {
         return Ok(());
-    }
-    // A write that recorded its placement (durably) and was not proven since: the name is
-    // missing because the user removed or moved it after the write placed it. It is a delete
-    // the write never saw, so it is not rebuilt (see the regular-file arm).
+    };
+    let on_disk_exists = lstat.is_some();
+    // The facts the classifier places this row by, and the inputs that choose between the actions
+    // its state allows. The verdict is the action: the code below carries it out (or, for `Leave`,
+    // hands the path on) and decides nothing about the row itself. A symlink or a directory has no
+    // blocks that could be missing, so a rebuild is always possible; the removal input is the one
+    // a write that landed or never began leaves.
+    let facts = observed_crash_facts(
+        state,
+        group_id,
+        path,
+        &out_path,
+        row_state,
+        intent_kind,
+        match (on_disk_exists, on_disk_matches) {
+            (false, _) => DiskSeen::Absent,
+            (true, true) => DiskSeen::Spec,
+            (true, false) => DiskSeen::Present,
+        },
+        proof_relation(proof_stands),
+    )?;
+    let mut inputs = RepairInputs { blocks_here: true, ..RepairInputs::default() };
     if lstat_not_found
         && intent_kind == Some(MaterializationIntentKind::Materialize)
-        && state.write_landed_unproven(group_id, path)?
+        && name_removed_by_user(
+            state,
+            group_id,
+            path,
+            parents_stood_at_start.contains(path),
+            proof_stands,
+        )?
     {
-        if let (Some(version), Some(state_now)) = (row.current_version, row.materialization_state) {
-            state.record_dirty_path(group_id, path, "removed", repair_now_unix_nanos(), permit)?;
-            if commit_recovered_object(
-                state, group_id, path, kind, version, None, state_now, permit,
-            )? {
-                report.offline_deleted.push(path.to_string());
+        inputs.removed_by_user = true;
+    }
+    let action = verdict(classify(&facts), &facts, inputs);
+    trace.set_row(facts, action);
+
+    if on_disk_matches {
+        // The object on disk is what the row says it is: only a proof is owed, and only when the
+        // verdict says so.
+        if action == RecoveryAction::Prove {
+            let Some(version) = row.current_version else {
+                return Ok(());
+            };
+            let identity =
+                yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&out_path).ok();
+            let committed = commit_recovered_object(
+                state, group_id, path, kind, version, identity, row_state, permit,
+            )?;
+            if committed {
+                trace.act(RecoveryAction::Prove);
+                if !proof_stands {
+                    report.reproven.push(path.to_string());
+                }
             }
         }
         return Ok(());
     }
-    // Only a symlink is this arm's to replace: a regular file or directory
-    // at the path may be a user's, and is never overwritten (as for the
-    // directory arm below).
-    if target.is_some() && lstat.as_ref().is_some_and(|m| !m.file_type().is_symlink()) {
+    if action == RecoveryAction::RecordRemoval {
+        // The recorded object is gone from the name. A write that landed or never began: the
+        // person removed it, and capture authors the removal. A delete that had already taken it:
+        // the delete is done, and whatever is at the name now is a person's, left exactly as it is
+        // for capture to take as a new local change. Either way the intent closes over the
+        // recorded object.
+        let delete_is_done = intent_kind == Some(MaterializationIntentKind::Delete);
+        if !delete_is_done && !lstat_not_found {
+            return Ok(());
+        }
+        if let Some(version) = row.current_version {
+            state.record_dirty_path(
+                group_id,
+                path,
+                if lstat_not_found { "removed" } else { "created_or_modified" },
+                repair_now_unix_nanos(),
+                permit,
+            )?;
+            if commit_recovered_object(
+                state, group_id, path, kind, version, None, row_state, permit,
+            )? {
+                trace.act(RecoveryAction::RecordRemoval);
+                if lstat_not_found {
+                    report.offline_deleted.push(path.to_string());
+                }
+            }
+        }
+        return Ok(());
+    }
+    if intent_kind.is_none()
+        && target.is_some()
+        && lstat.as_ref().is_some_and(|m| !m.file_type().is_symlink())
+    {
+        // No write is in flight, so nothing explains what is here: a person's object at a
+        // symlink's name is left exactly as it is, not even journaled (the scan and the watcher
+        // see it as the local change it is).
         tracing::warn!(
             group_id,
             path,
-            "a symlink's path holds something that is not a symlink; left untouched rather \
-             than replaced"
+            "a symlink's path holds something that is not a symlink; left untouched rather than \
+             replaced"
+        );
+        return Ok(());
+    }
+    if action == RecoveryAction::Leave && intent_kind.is_some() {
+        // An operation is in flight and the verdict is not to touch what it left (a delete that
+        // has not settled is the main case): its own lane finishes it.
+        tracing::debug!(
+            group_id,
+            path = %path,
+            "a symlink or directory has an open intent the verdict leaves to its lane"
         );
         return Ok(());
     }
@@ -1526,14 +1715,85 @@ fn repair_one_interrupted_single_object(
         return Ok(());
     }
 
-    // Either missing with an intent (a genuine crash mid-write), or
-    // present-but-wrong with an intent (a genuine interrupted overwrite)
-    // -- both are safe to reconstruct from the durably recorded row.
+    // Something other than the recorded target stands at the path under an open write. It is
+    // replaced only if it is the very symlink this device put there before the write (the
+    // write's pre-image); any other object is the user's and is moved aside first, as for a
+    // file.
+    // Any other verdict is not this function's to carry out (a `Leave` with an intent open has
+    // already returned above; one without an intent has gone through the hand-offs).
+    if !matches!(action, RecoveryAction::Rebuild | RecoveryAction::Quarantine) {
+        return Ok(());
+    }
+    let mut moved_aside = false;
+    if action == RecoveryAction::Quarantine {
+        // A person's directory is never moved aside to make room for a link or a file: its
+        // contents are not a single conflict copy's worth of bytes.
+        if lstat.as_ref().is_some_and(|m| m.is_dir()) && kind != RecordKind::Directory {
+            tracing::warn!(
+                group_id,
+                path,
+                "a directory stands where a symlink was being written; left untouched rather \
+                 than moved aside"
+            );
+            return Ok(());
+        }
+        moved_aside = true;
+        let target_hash = match &target {
+            Some(target) => yadorilink_local_storage::intent_target_hash_for_bytes(target),
+            None => yadorilink_local_storage::intent_target_hash(&[]),
+        };
+        let quarantine_intent_guard =
+            state.open_repair_quarantine(group_id, path, &target_hash, permit)?;
+        match quarantine_dirty_disk_file(root, path, &GroupStructuralLedger::new(state, group_id)) {
+            Ok(Some((quarantine_path, observed_at_unix_nanos))) => {
+                state.record_dirty_path(
+                    group_id,
+                    &quarantine_path,
+                    "created_or_modified",
+                    observed_at_unix_nanos,
+                    permit,
+                )?;
+                tracing::warn!(
+                    group_id,
+                    path,
+                    quarantine_path = %quarantine_path,
+                    "an object that this device did not place stood where an interrupted write \
+                     was recreating a symlink or a directory; moved it aside as a conflict copy"
+                );
+                trace.act(RecoveryAction::Quarantine);
+                report.quarantined_dirty.push((path.to_string(), quarantine_path));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    group_id,
+                    path,
+                    error = %e,
+                    "failed to move aside an object that diverged from the index during repair; \
+                     skipping this path rather than overwriting it"
+                );
+                return Ok(());
+            }
+        }
+        drop(quarantine_intent_guard);
+    }
     let mut placed_by_this_call = true;
     let (mutation_generation, intent_guard) = match &target {
         Some(target) => {
+            let expected_target = if moved_aside {
+                yadorilink_local_storage::TargetExpectation::Absent
+            } else {
+                first_seen
+            };
             let Some(opened) = rebuild_interrupted_symlink(
-                state, root, group_id, path, &out_path, target, permit,
+                state,
+                root,
+                group_id,
+                path,
+                &out_path,
+                target,
+                expected_target,
+                permit,
             )?
             else {
                 return Ok(());
@@ -1541,7 +1801,7 @@ fn repair_one_interrupted_single_object(
             opened
         }
         None => {
-            if lstat.as_ref().is_some_and(|m| !m.is_dir()) {
+            if !moved_aside && lstat.as_ref().is_some_and(|m| !m.is_dir()) {
                 tracing::warn!(
                     group_id,
                     path,
@@ -1579,6 +1839,8 @@ fn repair_one_interrupted_single_object(
     // write was in flight, and no proof has landed. Dropping the guard
     // unclear is inert -- the commit owns the clear.
     drop(intent_guard);
+    // A symlink's target and a directory have no blocks to be missing.
+    trace.act(RecoveryAction::Rebuild);
     let Some(version) = row.current_version else {
         tracing::warn!(
             group_id,
@@ -1622,6 +1884,10 @@ type OpenIntent<'a> =
 /// The symlink half of [`repair_one_interrupted_single_object`]'s rebuild:
 /// the write-policy check, then the journaled write of the recorded
 /// target. `None` when policy declines the write.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is something the sweep already established for this row"
+)]
 fn rebuild_interrupted_symlink<'a>(
     state: &'a dyn MaterializationExecutionPort,
     root: &Path,
@@ -1629,6 +1895,7 @@ fn rebuild_interrupted_symlink<'a>(
     path: &'a str,
     out_path: &Path,
     target: &[u8],
+    expected_target: yadorilink_local_storage::TargetExpectation,
     permit: &'a RootCommitPermit<'a>,
 ) -> Result<Option<(i64, OpenIntent<'a>)>, MaterializationExecutionError> {
     #[cfg(unix)]
@@ -1660,18 +1927,37 @@ fn rebuild_interrupted_symlink<'a>(
         &target_hash,
         permit,
     )?;
+    hit(RepairFailpoint::BeforePublish)?;
+    // A target that changed since it was classified is left as it is, with the intent open: the
+    // next pass classifies what is there now.
     #[cfg(unix)]
-    yadorilink_local_storage::materialize_symlink_in(
+    let placed = yadorilink_local_storage::materialize_symlink_in(
         out_path,
         target,
         &crate::materialization_execution::GroupTempLedger::new(state, group_id),
-    )?;
+        expected_target,
+    );
     #[cfg(windows)]
-    yadorilink_local_storage::materialize_symlink_windows_in(
+    let placed = yadorilink_local_storage::materialize_symlink_windows_in(
         out_path,
         target,
         &crate::materialization_execution::GroupTempLedger::new(state, group_id),
-    )?;
+        expected_target,
+    );
+    #[cfg(any(unix, windows))]
+    if let Err(error) = placed {
+        let error = MaterializationExecutionError::from(error);
+        if error.is_target_changed() {
+            tracing::warn!(
+                group_id,
+                path,
+                "the path changed while the repair placed its symlink; leaving what is there \
+                 for the next pass"
+            );
+            return Ok(None);
+        }
+        return Err(error);
+    }
     Ok(Some(opened))
 }
 
@@ -1679,13 +1965,12 @@ fn rebuild_interrupted_symlink<'a>(
 /// materialization intent, so a crash *during this write itself* is recoverable
 /// (the intent is still present on the next repair pass) rather than being
 /// misread as an offline deletion of a `Present` file. Brackets the write with
-/// `MaterializationExecutionPort::open_materialization_intent_guard`'s
-/// returned guard — the same single seam the live peer materialize path uses
-/// (through its own `yadorilink-peer-session::ports::OpenMaterializationIntent`
-/// marker) — so the intent is durable before the temp-write-then-rename
-/// begins. It is left open on every outcome: the caller's proof commit clears
-/// it atomically with the proof and the `Present` stamp. This module never
-/// names the concrete guard type (`yadorilink-daemon`'s
+/// the guard `MaterializationExecutionPort::open_repair_write` returned to the
+/// caller (opened together with the fence bump) — the same single seam the live
+/// peer materialize path uses — so the intent is durable before the
+/// temp-write-then-rename begins. It is left open on every outcome: the
+/// caller's proof commit clears it atomically with the proof and the `Present`
+/// stamp. This module never names the concrete guard type (`yadorilink-daemon`'s
 /// `MaterializationIntentGuard`) — only the opaque
 /// `Box<dyn OpenMaterializationIntent + Send + '_>` the port method returns.
 ///
@@ -1705,111 +1990,70 @@ struct JournaledReconstruction<'a> {
     /// assembled file is renamed into it.
     root: &'a Path,
     blocks: &'a [yadorilink_replica_domain::file::BlockInfo],
+    /// A temp file already holding exactly `blocks` (verified by the caller), published instead of
+    /// assembling a new one from the block store.
+    durable_temp: Option<&'a yadorilink_local_storage::VerifiedTemp>,
+    /// What the sweep saw at `out_path` when it decided what this write may replace; the publish
+    /// replaces nothing else.
+    expected_target: yadorilink_local_storage::TargetExpectation,
     mtime_unix_nanos: i64,
     /// The execute flag to stamp on the reconstructed file, from the caller's own single-statement row
-    /// read -- the same incarnation `blocks`, `mtime_unix_nanos` and `target_version_hash` come from.
+    /// read -- the same incarnation `blocks` and `mtime_unix_nanos` come from.
     exec: bool,
-    target_version_hash: &'a [u8],
-    /// The fence value the caller bumped for this write, the one a landed mark names.
+    /// The fence value the caller's prepare bumped for this write, the one a landed mark names.
     mutation_generation: i64,
+    /// The write's open intent, opened in the same transaction as that bump. Left open on every
+    /// outcome: the caller's proof commit clears it.
+    intent: OpenIntent<'a>,
     permit: &'a RootCommitPermit<'a>,
 }
 
-// Test-only: makes the next reconstructs on this thread fail right after
-// their bytes were renamed into place, as a failed mode or xattr apply does.
-#[cfg(any(test, feature = "test-support"))]
-thread_local! {
-    static FAIL_AFTER_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Arms (or disarms) the failure described on `FAIL_AFTER_RENAME`.
-#[cfg(any(test, feature = "test-support"))]
-pub fn set_fail_after_rename_for_test(armed: bool) {
-    FAIL_AFTER_RENAME.with(|cell| cell.set(armed));
-}
-
-/// What the directory shows of a write's witnessed temp.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WitnessedTemp {
-    /// Still there: the rename did not reach stable storage.
-    Present,
-    /// Not there: renamed away (durably, since the temp's own entry was flushed before).
-    Gone,
-    /// Could not be looked at.
-    Unknown,
-}
-
-/// The one verdict for a MISSING name under an open write intent: removed by the user (or moved
-/// away), so the delete stands, rather than lost with a rename that never reached stable storage,
-/// so the file is rebuilt. It is decided by what the intent durably recorded, for every
-/// combination:
+/// The verdict for a MISSING name under an open write intent: removed by the user (or moved
+/// away), so the delete stands, or lost with a rename that never reached stable storage, so the
+/// file is rebuilt. Only a write that recorded its placement as landed (the rename reached stable
+/// storage) and was not proven since says the former. A write whose rename is left unflushed for a
+/// batch never lands before its proof, so a name removed in that window and lost to a power cut is
+/// rebuilt: the safe direction, no bytes are lost.
 ///
-/// | landed | witness | witnessed temp | verdict |
-/// |---|---|---|---|
-/// | yes | any | any | the user's: the placement reached stable storage |
-/// | no | yes | gone | the user's: renamed durably (the temp's own entry was flushed before), then removed |
-/// | no | yes | present or unknown | rebuild: the rename was lost, or cannot be told |
-/// | no | no | - | rebuild: nothing says the rename happened |
-///
-/// All rows presume the name's directory stood when the repair pass began; if it did not, the
-/// verdict is always to rebuild (a directory lost with the cut makes every entry in it look
-/// gone, and one this pass re-creates is empty). Link start also withdraws the witness of every
-/// intent whose directory is already missing, before any step that could re-create it, so the
-/// later (scheduled) passes rebuild too. A directory lost with the cut and re-created by another
-/// program before the daemon starts cannot be told from one that stood: no directory identity is
-/// kept, and that is the residual risk of this rule.
-///
-/// "Landed" is the mark every writer records right after a durable placement; the other rows are
-/// for a rename that was left unflushed for the window's batch.
-fn missing_name_is_the_users(evidence: &WriteRemovalEvidence, temp: Option<WitnessedTemp>) -> bool {
-    if evidence.landed_unproven {
-        return true;
-    }
-    evidence.temp_witness.is_some() && temp == Some(WitnessedTemp::Gone)
-}
-
-/// [`missing_name_is_the_users`] for `path`: reads the intent's facts and looks at the witnessed
-/// temp beside `out_path` only when the verdict depends on it.
+/// The name's own directory must have been there when the pass began to say anything about the
+/// name: a missing directory (never flushed itself, or removed) makes every entry in it look
+/// gone, and flushing a directory is not promised to persist the directory's own entry. This holds
+/// for a landed file as well: it is rebuilt, and the directory comes back with it.
 fn name_removed_by_user(
     state: &dyn MaterializationExecutionPort,
     group_id: &str,
     path: &str,
-    out_path: &Path,
     parent_stood_at_start: bool,
+    proof_stands: bool,
 ) -> Result<bool, MaterializationExecutionError> {
-    let Some(evidence) = state.write_removal_evidence(group_id, path)? else {
-        return Ok(false);
-    };
-    // The name's own directory must have been there when the pass began to say anything about
-    // the name: a missing directory (never flushed itself, or removed) makes every entry in it
-    // look gone, and flushing a directory is not promised to persist the directory's own entry.
-    // This holds for the landed mark as well: a landed file whose directory is missing is
-    // rebuilt (the directory comes back with it).
     if !parent_stood_at_start {
         return Ok(false);
     }
-    let temp = match &evidence.temp_witness {
-        Some(name) if !evidence.landed_unproven => {
-            Some(match std::fs::symlink_metadata(out_path.with_file_name(name)) {
-                Ok(_) => WitnessedTemp::Present,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => WitnessedTemp::Gone,
-                Err(_) => WitnessedTemp::Unknown,
-            })
-        }
-        _ => None,
-    };
-    Ok(missing_name_is_the_users(&evidence, temp))
+    Ok(state.write_landed_unproven(group_id, path)?
+        || write_never_began(state, group_id, path, proof_stands)?)
+}
+
+/// Whether the write open on `path` never began: a proof stands under the live fence, and every
+/// prepare bumps the fence, so a proof that survived the intent's opening means nothing of this
+/// write reached the disk (the lane that opened it recording a version without its content over
+/// an older object, or a healing lane, left the intent behind). A missing name is then someone's
+/// removal of what the proof describes, not a crash to rebuild from.
+fn write_never_began(
+    state: &dyn MaterializationExecutionPort,
+    group_id: &str,
+    path: &str,
+    proof_stands: bool,
+) -> Result<bool, MaterializationExecutionError> {
+    // Not a write waiting for its batch flush: that one publishes its proof BEFORE its rename is
+    // durable, so a power cut can lose the name under a proof that stands, and the file is
+    // rebuilt, not read as a removal.
+    Ok(proof_stands && state.flush_pending_proof_identity(group_id, path)?.is_none())
 }
 
 fn reconstruct_file_journaled(
     request: JournaledReconstruction<'_>,
 ) -> Result<(), MaterializationExecutionError> {
-    let guard = request.state.open_materialization_intent_guard(
-        request.group_id,
-        request.path,
-        request.target_version_hash,
-        request.permit,
-    )?;
+    let guard = request.intent;
     // Never cleared here. Every `?` below returns with `guard` still live, and
     // the success path drops it uncleared too: the intent stays open through
     // the bytes, the mode and the xattrs, and is cleared only by the caller's
@@ -1818,24 +2062,78 @@ fn reconstruct_file_journaled(
     // opens a window with neither an intent nor a proof, in which a crash or
     // a failed metadata write or commit leaves nothing recording that this
     // write was ever in flight.
+    hit(RepairFailpoint::AfterPrepare)?;
     let ledger =
         crate::materialization_execution::GroupTempLedger::new(request.state, request.group_id);
-    let tmp_path = reconstruct_file_to_temp_in(
-        request.store,
-        request.out_path,
-        request.blocks,
-        request.mtime_unix_nanos,
-        &ledger,
-    )?;
+    let tmp_path = match request.durable_temp {
+        Some(temp) => {
+            temp.prepare_for_publish(request.mtime_unix_nanos)?;
+            temp.path().to_path_buf()
+        }
+        None => reconstruct_file_to_temp_in(
+            request.store,
+            request.out_path,
+            request.blocks,
+            request.mtime_unix_nanos,
+            &ledger,
+        )?,
+    };
+    // A temp this write made is removed when the write fails; one finished from belongs to the
+    // crashed write that made it and may be the only local copy of the version.
+    let discard_unless_borrowed = |tmp: &Path| {
+        if request.durable_temp.is_none() {
+            yadorilink_local_storage::discard_temp_file(tmp, &ledger);
+        }
+    };
+    if let Err(error) = hit(RepairFailpoint::AfterStage) {
+        discard_unless_borrowed(&tmp_path);
+        return Err(error);
+    }
     // The assembly takes time proportional to the file, long enough for the
     // volume under the root to go away and leave a bare mountpoint. Prove the
     // root's identity again immediately before the rename, so nothing is
     // published onto the parent filesystem and no Present row follows.
     if let Err(error) = request.state.verify_root(request.root, request.group_id) {
-        yadorilink_local_storage::discard_temp_file(&tmp_path, &ledger);
+        discard_unless_borrowed(&tmp_path);
         return Err(error);
     }
-    persist_reconstructed_file_in(&tmp_path, request.out_path, &ledger)?;
+    if let Err(error) = hit(RepairFailpoint::BeforePublish) {
+        discard_unless_borrowed(&tmp_path);
+        return Err(error);
+    }
+    // `reconstruct_file` assembles into a fresh temp file, which gets default permissions, so the
+    // execute flag the index recorded goes onto the temp inside the publish (after what the
+    // replaced file's person set is carried over, before the rename): a repaired POSIX executable
+    // is never visible with a default mode, exactly as the live peer materialize path leaves it.
+    // The flag comes from the caller's payload, not from a fresh read here: the target version
+    // hash -- the version the proof this arm publishes names -- is a hash over it, so reading it
+    // back off the row would stamp one incarnation's metadata onto bytes proven as another's.
+    // A temp finished from must still be the object that was verified.
+    if let Some(temp) = request.durable_temp {
+        if !temp.is_still_at_its_path() {
+            return Err(MaterializationExecutionError::from(std::io::Error::other(
+                "the temp file was replaced after it was verified",
+            )));
+        }
+    }
+    if request.durable_temp.is_some() {
+        yadorilink_local_storage::persist_borrowed_temp_checked(
+            &tmp_path,
+            request.out_path,
+            &ledger,
+            Some(request.exec),
+            request.expected_target,
+        )?;
+    } else {
+        persist_reconstructed_file_checked(
+            &tmp_path,
+            request.out_path,
+            &ledger,
+            Durability::Full,
+            Some(request.exec),
+            request.expected_target,
+        )?;
+    }
     // The placement is durable: a missing name from here is the user's doing, which the open
     // intent alone cannot tell from a crash before the rename. A mark that cannot be recorded
     // fails the reconstruction with its intent still open.
@@ -1845,29 +2143,7 @@ fn reconstruct_file_journaled(
         request.mutation_generation,
         request.permit,
     )?;
-    #[cfg(any(test, feature = "test-support"))]
-    if FAIL_AFTER_RENAME.with(std::cell::Cell::get) {
-        return Err(MaterializationExecutionError::CorruptState(
-            "injected failure after the rename".to_string(),
-        ));
-    }
-    // `reconstruct_file` assembles into a fresh temp file, which gets default
-    // permissions — so the assembled result does NOT carry the exec bit the
-    // index recorded for this path, and a repaired POSIX executable would come
-    // back as a plain file if this call were skipped. `local_change.rs`'s
-    // content-only self-echo suppression now compares the on-disk exec bit
-    // against the index too (alongside `reconstruct_file`'s own mtime
-    // stamping), so a later local scan would eventually notice and
-    // self-heal the divergence rather than leaving it silent. Still not a reason to
-    // skip this call: repair's own contract (this function's doc comment
-    // above) is that a path it reports `reconstructed` was left exactly as
-    // the live peer materialize path would have left it, exec bit included,
-    // not merely "eventually correct once some other pass notices."
-    //
-    // The flag comes from the caller's payload, not from a fresh read here: `target_version_hash` -- the
-    // version the proof this arm publishes names -- is a hash over it, so reading it back off the row at
-    // this point would stamp one incarnation's metadata onto bytes proven as another's.
-    yadorilink_local_storage::apply_file_metadata(request.out_path, request.exec)?;
+    hit(RepairFailpoint::AfterPublish)?;
     drop(guard);
     Ok(())
 }
@@ -2157,34 +2433,6 @@ fn quarantine_dirty_disk_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Every combination of what a write intent durably records and what the witnessed temp
-    /// shows has exactly one verdict, and it is the one in the table on
-    /// [`missing_name_is_the_users`].
-    #[test]
-    fn a_missing_name_has_one_verdict_for_every_combination_of_the_durable_facts() {
-        for landed in [false, true] {
-            for witness in [false, true] {
-                for temp in [
-                    None,
-                    Some(WitnessedTemp::Present),
-                    Some(WitnessedTemp::Gone),
-                    Some(WitnessedTemp::Unknown),
-                ] {
-                    let evidence = WriteRemovalEvidence {
-                        landed_unproven: landed,
-                        temp_witness: witness.then(|| ".yadorilink-tmp.x".to_owned()),
-                    };
-                    let expected = landed || (witness && temp == Some(WitnessedTemp::Gone));
-                    assert_eq!(
-                        missing_name_is_the_users(&evidence, temp),
-                        expected,
-                        "landed={landed} witness={witness} temp={temp:?}"
-                    );
-                }
-            }
-        }
-    }
 
     /// Quarantining moves bytes aside and creates no directory.
     struct NoLedger;

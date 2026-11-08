@@ -16,6 +16,10 @@ use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::session_state::VersionState;
 use yadorilink_sync_sqlite::provider::ItemId;
 
+use yadorilink_ipc_proto::daemonctl::{
+    RestoreTrashOperationFailure, RestoreTrashOperationResponse,
+};
+
 use super::{CommandError, EngineCommands};
 
 /// How many deleted items one listing returns, newest first; `truncated` says there are more.
@@ -124,7 +128,7 @@ fn group_of(
     coordinator
         .provider_repository()
         .group_of_root(root)
-        .map_err(|e| CommandError::failed(e.to_string()))?
+        .map_err(|e| CommandError::from_error(&e))?
         .ok_or_else(|| CommandError::failed("unknown provider root"))
 }
 
@@ -155,12 +159,12 @@ impl EngineCommands {
         let (path, live) = coordinator
             .provider_repository()
             .path_for_item(&root, &item)
-            .map_err(|e| CommandError::failed(e.to_string()))?
+            .map_err(|e| CommandError::from_error(&e))?
             .ok_or_else(|| CommandError::failed("unknown item"))?;
         let versions = coordinator
             .sqlite()
             .dag_list_versions(&group, &path)
-            .map_err(|e| CommandError::failed(e.to_string()))?;
+            .map_err(|e| CommandError::from_error(&e))?;
         Ok(ItemHistory {
             path,
             live,
@@ -182,6 +186,39 @@ impl EngineCommands {
         })
     }
 
+    /// Brings back everything the folder delete or rename that removed the entry at `path` (a
+    /// [`DeletedItem::path`]) removed, each placed as one deleted file's restore places it. An
+    /// entry that fails does not stop the others; the answer names each failure, and says when
+    /// parts of the operation have not reached this device.
+    ///
+    /// # Errors
+    /// [`CommandError`] when the root is unknown, `path` is not deleted, or it was deleted on its
+    /// own rather than by a folder operation.
+    pub async fn restore_deleted_operation(
+        &self,
+        root_id: &[u8],
+        path: &str,
+    ) -> Result<RestoreTrashOperationResponse, CommandError> {
+        let root = hex::encode(root_id);
+        let group = group_of(&self.shell.replica_coordinator, &root)?;
+        let outcome = self
+            .context
+            .application
+            .version_restore
+            .restore_trashed_operation(&group, path)
+            .await
+            .map_err(|e| CommandError::from_error(&e))?;
+        Ok(RestoreTrashOperationResponse {
+            restored_paths: outcome.restored,
+            failed: outcome
+                .failed
+                .into_iter()
+                .map(|(path, error)| RestoreTrashOperationFailure { path, error })
+                .collect(),
+            partial: outcome.partial,
+        })
+    }
+
     /// The deleted files and folders of one provider folder that can still be brought back,
     /// newest deletion first. Read-only.
     ///
@@ -192,8 +229,7 @@ impl EngineCommands {
         let repo = coordinator.provider_repository();
         let root = hex::encode(root_id);
         let group = group_of(coordinator, &root)?;
-        let failed =
-            |e: yadorilink_sync_sqlite::SyncSqliteError| CommandError::failed(e.to_string());
+        let failed = |e: yadorilink_sync_sqlite::SyncSqliteError| CommandError::from_error(&e);
         let mut trashed =
             coordinator.file_index_repository().list_trashed(&group).map_err(failed)?;
         let truncated = trashed.len() > MAX_DELETED_ITEMS;
@@ -231,7 +267,11 @@ impl EngineCommands {
                     });
                 if live_folder {
                     DeletedParent::Item(
-                        repo.mint_item(&root, parent_path).map_err(failed)?.to_vec(),
+                        coordinator
+                            .provider_writes()
+                            .mint_item(&root, parent_path)
+                            .map_err(failed)?
+                            .to_vec(),
                     )
                 } else {
                     DeletedParent::Gone

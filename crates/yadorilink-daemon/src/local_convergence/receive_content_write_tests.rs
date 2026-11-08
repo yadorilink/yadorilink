@@ -144,6 +144,49 @@ async fn a_local_edit_after_the_pre_write_commit_is_kept_and_publishes_nothing()
     assert_published_nothing(&h, "edited.bin", "local edit");
 }
 
+/// A save lands after the pre-publish check, in the instant before the replacement: nothing stood
+/// at the name, and the save is kept, not replaced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_save_after_the_pre_publish_check_is_kept_over_a_missing_name() {
+    let h = Harness::new(false);
+    admit_received(&h, "late.bin", b"the peer's bytes").await;
+    *h.convergence.after_check_before_publish_hook.lock().unwrap() =
+        Some(Box::new(|out_path| std::fs::write(out_path, b"saved at the last moment").unwrap()));
+
+    project(&h, "late.bin").await;
+
+    assert_eq!(std::fs::read(h.path("late.bin")).unwrap(), b"saved at the last moment");
+    assert_published_nothing(&h, "late.bin", "late save");
+    assert!(h.state.is_path_dirty(GROUP, "late.bin").unwrap(), "the save is journaled");
+}
+
+/// The same over an existing file: an in-place edit of the file the write was based on, made
+/// after the pre-publish check, is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_save_after_the_pre_publish_check_is_kept_over_an_existing_file() {
+    let h = Harness::new(false);
+    std::fs::write(h.path("scratch.bin"), b"the peer's v2 bytes").unwrap();
+    assert!(matches!(h.capture("scratch.bin").await, LocalChangeOutcome::FileChanged(_)));
+    let v2 = VersionHash(h.own_head("scratch.bin").content.unwrap().version_hash);
+    let stored = h.state.dag_get_file_version(GROUP, &v2).unwrap().expect("stored");
+    std::fs::write(h.path("notes.txt"), b"captured v1 bytes").unwrap();
+    assert!(matches!(h.capture("notes.txt").await, LocalChangeOutcome::FileChanged(_)));
+    let own = yadorilink_replica_domain::ids::DeltaHash(h.own_head("notes.txt").change_hash);
+    crate::test_support::remote_admission_fixture::admit_remote(
+        &h.state,
+        GROUP,
+        "device-remote",
+        vec![put("notes.txt", v2, vec![own])],
+        &[stored],
+    );
+    *h.convergence.after_check_before_publish_hook.lock().unwrap() =
+        Some(Box::new(|out_path| std::fs::write(out_path, b"edited after the check").unwrap()));
+
+    project(&h, "notes.txt").await;
+
+    assert_eq!(std::fs::read(h.path("notes.txt")).unwrap(), b"edited after the check");
+}
+
 /// On a volume that cannot answer the change time / USN (simulated through the
 /// fingerprint seam; a no-op on macOS, where the stat fingerprint itself shows
 /// the rewrite), a same-size rewrite that restores the mtime lands during the
@@ -283,6 +326,28 @@ async fn a_user_edit_between_the_write_and_its_proof_is_captured_not_absorbed() 
     assert_eq!(std::fs::read(h.path("absorbed.bin")).unwrap(), b"user edit right after");
 }
 
+/// A `chmod` landing after the daemon's write and before the proof observes the object is a
+/// local edit, not the daemon's own flag: nothing is proven, the path is dirty, and capture
+/// authors the new execute flag.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_chmod_between_the_write_and_its_proof_is_captured_not_absorbed() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::new(false);
+    admit_received(&h, "mode.sh", b"#!/bin/sh\n").await;
+    *h.convergence.after_write_before_proof_hook.lock().unwrap() = Some(Box::new(|out_path| {
+        std::fs::set_permissions(out_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }));
+
+    project(&h, "mode.sh").await;
+
+    assert_eq!(proven_version(&h, "mode.sh"), None, "no proof for a flag that was changed");
+    assert!(h.state.is_path_dirty(GROUP, "mode.sh").unwrap(), "the chmod is journaled");
+    assert!(matches!(h.capture("mode.sh").await, LocalChangeOutcome::FileChanged(_)));
+    let mode = std::fs::metadata(h.path("mode.sh")).unwrap().permissions().mode();
+    assert_eq!(mode & 0o100, 0o100, "the user's flag survives");
+}
+
 /// The user deletes the file after the daemon's write and before the proof
 /// observes it. The write completed, so it is closed (the row settles
 /// `Present` with a proof and no open intent) and the delete is indexed
@@ -342,4 +407,127 @@ async fn an_untouched_write_is_still_proven_and_not_dirty() {
     assert_eq!(proven_version(&h, "clean.bin"), Some(version.version_hash));
     assert!(!h.state.is_path_dirty(GROUP, "clean.bin").unwrap());
     assert!(!h.state.has_materialization_intent(GROUP, "clean.bin").unwrap());
+}
+
+// The order of a write's durable steps, as the write operation records it.
+// These pin the order the eager lane has always had (open the write, place the
+// bytes, prove them in one commit) so a change to the lane's structure that
+// reorders it shows up here.
+
+use crate::write_op::trace::StepTrace;
+use crate::write_op::{IntentSettlement, ProofOutcome, StepEvent};
+
+const PREPARED_PUBLISHED_PROVEN: [StepEvent; 3] = [
+    StepEvent::Prepared,
+    StepEvent::Published { names_deferred: false, landed_marked: true },
+    StepEvent::Proven {
+        outcome: ProofOutcome::Exact,
+        intent: IntentSettlement::Cleared,
+        obligation_closed: false,
+    },
+];
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_file_goes_prepared_published_proven() {
+    let h = Harness::new(false);
+    admit_received(&h, "trace-new.bin", b"a file this device has never held").await;
+
+    project(&h, "trace-new.bin").await;
+
+    assert_eq!(StepTrace::of(GROUP, "trace-new.bin"), PREPARED_PUBLISHED_PROVEN);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_file_goes_prepared_published_proven() {
+    let h = Harness::new(false);
+    admit_received(&h, "trace-empty.bin", b"").await;
+
+    project(&h, "trace-empty.bin").await;
+
+    assert_eq!(StepTrace::of(GROUP, "trace-empty.bin"), PREPARED_PUBLISHED_PROVEN);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replacing_write_goes_prepared_published_proven() {
+    let h = Harness::new(false);
+    std::fs::write(h.path("trace-new-bytes.bin"), b"the peer's newer bytes").unwrap();
+    assert!(matches!(h.capture("trace-new-bytes.bin").await, LocalChangeOutcome::FileChanged(_)));
+    let v2 = VersionHash(h.own_head("trace-new-bytes.bin").content.unwrap().version_hash);
+    let stored = h.state.dag_get_file_version(GROUP, &v2).unwrap().expect("stored");
+    std::fs::write(h.path("trace-replaced.txt"), b"captured older bytes").unwrap();
+    assert!(matches!(h.capture("trace-replaced.txt").await, LocalChangeOutcome::FileChanged(_)));
+    let own =
+        yadorilink_replica_domain::ids::DeltaHash(h.own_head("trace-replaced.txt").change_hash);
+    admit_remote(
+        &h.state,
+        GROUP,
+        "device-remote",
+        vec![put("trace-replaced.txt", v2, vec![own])],
+        &[stored],
+    );
+
+    project(&h, "trace-replaced.txt").await;
+
+    assert_eq!(std::fs::read(h.path("trace-replaced.txt")).unwrap(), b"the peer's newer bytes");
+    assert_eq!(StepTrace::of(GROUP, "trace-replaced.txt"), PREPARED_PUBLISHED_PROVEN);
+}
+
+/// A write that loses the target to a local save is opened and never published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_that_meets_a_local_edit_stops_after_prepared() {
+    let h = Harness::new(false);
+    admit_received(&h, "trace-edited.bin", b"the peer's bytes").await;
+    *h.convergence.between_assemble_and_persist_hook.lock().unwrap() =
+        Some(Box::new(|out_path| std::fs::write(out_path, b"saved locally meanwhile").unwrap()));
+
+    project(&h, "trace-edited.bin").await;
+
+    assert_eq!(StepTrace::of(GROUP, "trace-edited.bin"), [StepEvent::Prepared]);
+}
+
+/// A proof that loses its fence is published and never proven.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_proof_that_loses_its_fence_stops_after_published() {
+    let h = Harness::new(false);
+    admit_received(&h, "trace-raced.bin", b"bytes whose proof loses its fence").await;
+    let state = h.state.clone();
+    *h.convergence.between_assemble_and_persist_hook.lock().unwrap() = Some(Box::new(move |_| {
+        state.dag_bump_mutation_fence(GROUP, "trace-raced.bin", "local_capture").unwrap();
+    }));
+
+    project(&h, "trace-raced.bin").await;
+
+    assert_eq!(
+        StepTrace::of(GROUP, "trace-raced.bin"),
+        [StepEvent::Prepared, PREPARED_PUBLISHED_PROVEN[1]]
+    );
+    // The fence moved before the rename, so the landed mark is refused: the intent stays
+    // `prepared` and the re-driven write decides.
+    #[cfg(unix)]
+    assert_eq!(
+        super::receive_deferred_flush_tests::intent_phase(&h, "trace-raced.bin").as_deref(),
+        Some("prepared")
+    );
+}
+
+/// The watcher journals the path as dirty while the bytes are assembled, though
+/// nothing the stat fingerprint covers has moved yet: that alone refuses the rename.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_path_journaled_dirty_during_assembly_is_not_renamed_over() {
+    let h = Harness::new(false);
+    admit_received(&h, "dirtied.bin", b"the peer's bytes").await;
+    let (state, lease) = (h.state.clone(), h.root_lease());
+    *h.convergence.between_assemble_and_persist_hook.lock().unwrap() = Some(Box::new(move |_| {
+        let guard = lease.begin_operation().unwrap();
+        state
+            .dirty_path_repository()
+            .record_dirty_path(GROUP, "dirtied.bin", "created_or_modified", 1, &guard.permit())
+            .unwrap();
+    }));
+
+    project(&h, "dirtied.bin").await;
+
+    assert!(!h.path("dirtied.bin").exists(), "nothing was renamed into place");
+    assert_published_nothing(&h, "dirtied.bin", "dirty journal");
 }

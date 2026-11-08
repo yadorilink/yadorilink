@@ -328,6 +328,68 @@ message ProviderEvictDone {
   string error = 4;
 }
 
+// What the person's choice for an item asks of the operating system's pin.
+enum PinChoice {
+  PIN_CHOICE_UNSPECIFIED = 0;
+  PIN_CHOICE_KEEP = 1;         // pin the item (a folder: everything beneath it) and make its content local
+  PIN_CHOICE_ONLINE_ONLY = 2;  // mark it online only (unpinned): the daemon frees its local copy itself
+  PIN_CHOICE_CLEAR = 3;        // no choice: neither pinned nor unpinned
+}
+
+// daemon -> app (push): apply the person's choice for an item in the operating system. The daemon has
+// already recorded the choice; this only asks the host to make the OS agree. An empty item_id names the
+// root folder itself.
+message ProviderPinRequest {
+  bytes root_id = 1;
+  bytes item_id = 2;
+  bytes request_id = 3;
+  PinChoice choice = 4;
+}
+
+enum PinResult {
+  PIN_RESULT_UNSPECIFIED = 0;
+  PIN_RESULT_DONE = 1;         // the pin is set and the content is already on this device (or nothing to fetch)
+  PIN_RESULT_DOWNLOADING = 2;  // the pin is set and the operating system is fetching the content
+  PIN_RESULT_NOT_FOUND = 3;    // the item is not shown in the folder (yet): nothing was changed
+  PIN_RESULT_UNSUPPORTED = 4;  // this host cannot pin: nothing was changed
+  PIN_RESULT_ERROR = 5;
+}
+
+// app -> daemon. A wire reply only: the daemon never persists the result.
+message ProviderPinDone {
+  bytes root_id = 1;
+  bytes request_id = 2;
+  PinResult result = 3;
+  string error = 4;
+}
+
+// daemon -> app (push, not acknowledged): the pins the daemon's retention rules ask for, one entry per
+// explicit rule, shallowest first. The host makes the operating system agree with each: an entry whose item
+// already is as asked changes nothing, one for an item the host does not show (yet) is skipped, and the daemon
+// sends the plan again when the host attaches and after each namespace signal completes, so a choice made
+// while the host was away, or for an item that appeared later, is applied then. An empty item_id names the
+// root folder itself. Items under no rule are not mentioned and are left as they are.
+message ProviderPinPlanEntry {
+  bytes item_id = 1;
+  PinChoice choice = 2;
+}
+
+message ProviderPinPlan {
+  bytes root_id = 1;
+  repeated ProviderPinPlanEntry entries = 2;
+}
+
+// app -> daemon (not acknowledged): the pin mark of an item changed in the operating system and the host did
+// not cause it, which is how a person's "always keep on this device" or "free up space" in the file manager
+// reaches the engine. A raw reading: the host decides nothing, the daemon turns it into a retention rule when it
+// differs from the rule that already holds. The choice is the one the daemon's own pin requests use: KEEP is
+// the pinned mark, ONLINE_ONLY the unpinned mark, CLEAR neither. An empty item_id never occurs here.
+message ProviderPinObserved {
+  bytes root_id = 1;
+  bytes item_id = 2;
+  PinChoice choice = 3;
+}
+
 // daemon -> app (push): committed changes exist; signalEnumerator for these items. A message
 // naming a root the app does not know (and no items) means the set of provider folders changed
 // (a root was replaced): list the provider folders again and reconcile the domains.
@@ -755,6 +817,8 @@ enum ProviderApplyFailure {
   PROVIDER_APPLY_FAILURE_STALE_VIEW = 17;          // a generation does not match: nothing authored, retry after refresh
   // A restore's version is not retained any more, or its bytes are held by no reachable device.
   PROVIDER_APPLY_FAILURE_VERSION_UNAVAILABLE = 18;
+  // The root is publish-only on this device: a modify or delete is refused, a create is not.
+  PROVIDER_APPLY_FAILURE_PUBLISH_ONLY = 19;
 }
 
 enum ProviderApplyOutcome {
@@ -854,6 +918,10 @@ message ProviderItem {
   // "unknown", never as "not here". `content_pending` is separate: a newer version is fenced.
   optional LocalState local_state = 15;
   bool exec = 16;                         // the item is executable
+  // The badge to draw for this item: the same daemon decision a path status carries (`ShellBadge`),
+  // for files; UNSPECIFIED for a folder or when the status cannot be read. A change of the badge
+  // changes `metadata_version`, so the OS redraws the item.
+  ShellBadge badge = 17;
 }
 
 enum EnumerateFailure {
@@ -1000,5 +1068,9 @@ message ShellIpcMessage {
     ListLinkedRootsRequest list_linked_roots_request = 50;
     ListLinkedRootsResponse list_linked_roots_response = 51;
     MaterializeProgress materialize_progress = 52;
+    ProviderPinRequest provider_pin_request = 53;
+    ProviderPinDone provider_pin_done = 54;
+    ProviderPinPlan provider_pin_plan = 55;
+    ProviderPinObserved provider_pin_observed = 56;
   }
 }

@@ -1767,6 +1767,39 @@ fn a_blocked_journal_keeps_its_complete_area_and_resumes_when_it_reads_back() {
     assert_eq!(rebootstrap_status(&w.b, &group()).unwrap(), None);
 }
 
+/// The journal says `preserved` only once the area has been verified: a check that fails never
+/// writes it, not even for a moment, and one that holds writes it once.
+#[cfg(unix)]
+#[test]
+fn a_blocked_journal_never_reads_preserved_before_its_area_verifies() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = scenario(|b1, h1| vec![put_op("x", 2, vec![rem(b1, 1, h1)])]);
+    let root = private_tempdir();
+    let bundle = built(&w.sealer);
+    let first = begin_with(&w.b, bundle.clone(), root.path(), &mut no_hook).unwrap();
+    let manifest = first.dir.join("manifest.json");
+    fs::set_permissions(&manifest, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(blocked_as_inconsistent(&w.b, root.path()));
+
+    w.b.execute_batch(
+        "CREATE TABLE preserved_writes (n INTEGER); \
+         CREATE TRIGGER log_preserved AFTER UPDATE OF state ON native_rebootstrap_journal \
+         WHEN NEW.state = 'preserved' BEGIN INSERT INTO preserved_writes VALUES (1); END;",
+    )
+    .unwrap();
+    let writes = |c: &Connection| -> i64 {
+        c.query_row("SELECT COUNT(*) FROM preserved_writes", [], |r| r.get(0)).unwrap()
+    };
+
+    let blocked = begin_with(&w.b, bundle.clone(), root.path(), &mut no_hook);
+    assert!(matches!(blocked, Err(BeginError::Blocked(_))), "{blocked:?}");
+    assert_eq!(writes(&w.b), 0, "a failing check wrote `preserved`");
+
+    fs::set_permissions(&manifest, fs::Permissions::from_mode(0o600)).unwrap();
+    begin_with(&w.b, bundle, root.path(), &mut no_hook).unwrap();
+    assert_eq!(writes(&w.b), 1, "a check that holds writes it once");
+}
+
 /// A flip-flopping peer cannot make the replica start over: a candidate the
 /// preserved target covers is not taken.
 #[test]

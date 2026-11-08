@@ -657,6 +657,10 @@ pub(crate) struct SymlinkMaterialization<'a> {
     /// What this write says about the version its row replaces.
     pub(crate) retention: yadorilink_sync_sqlite::retention::Retention<'a>,
     pub(crate) permit: &'a RootCommitPermit<'a>,
+    /// What stood at the target when the caller classified it (declined a write that would
+    /// destroy uncaptured state, or found nothing to protect): the link replaces this object and
+    /// nothing else, so a save landing after that is kept.
+    pub(crate) expected_target: yadorilink_local_storage::TargetExpectation,
 }
 
 /// What `materialize_symlink_at` actually accomplished on disk. A bare
@@ -715,6 +719,10 @@ pub(crate) enum SymlinkMaterializeOutcome {
     /// failure gets; the still-open intent is what records that a write
     /// really did happen.
     CommitRejected,
+    /// Something was written to the target after the caller classified it, so the link replaced
+    /// nothing: the path is journaled for capture, the write's intent stays open, and the caller
+    /// retries once capture has taken the edit.
+    TargetChanged,
 }
 
 pub(crate) fn materialize_symlink_at(
@@ -734,6 +742,7 @@ pub(crate) fn materialize_symlink_at(
         authoring,
         retention,
         permit,
+        expected_target,
     } = context;
     let out_path = root.join(&record.path);
     // A free function, not a `PeerSyncSession` method, so it cannot go
@@ -817,6 +826,17 @@ pub(crate) fn materialize_symlink_at(
     // target written below came from somewhere else entirely, so the two
     // could describe different versions of this path.
     let written = written_version.clone();
+    if mutation_generation.is_some() {
+        crate::write_op::trace::emit_at(
+            group_id,
+            &record.path,
+            crate::write_op::StepEvent::Prepared,
+        );
+        crate::write_op::failpoint::hit(
+            crate::write_op::failpoint::WriteOpFailpoint::AfterPrepare,
+            &record.path,
+        )?;
+    }
 
     if !write_eligible {
         if target.is_none() {
@@ -839,20 +859,32 @@ pub(crate) fn materialize_symlink_at(
     let target = target.expect("write_eligible is only true when target.is_some()");
 
     #[cfg(unix)]
-    {
+    let published = {
         let _ = windows_opt_in; // only meaningful on Windows
         yadorilink_local_storage::materialize_symlink_in(
             &out_path,
             &target,
             &state.temp_ledger(group_id),
-        )?;
-    }
+            expected_target,
+        )
+    };
     #[cfg(windows)]
-    yadorilink_local_storage::materialize_symlink_windows_in(
+    let published = yadorilink_local_storage::materialize_symlink_windows_in(
         &out_path,
         &target,
         &state.temp_ledger(group_id),
-    )?;
+        expected_target,
+    );
+    if matches!(published, Err(yadorilink_local_storage::StorageError::TargetChanged(_))) {
+        state.journal_uncaptured_local_edit(
+            group_id,
+            &record.path,
+            std::fs::symlink_metadata(&out_path).is_ok(),
+            permit,
+        )?;
+        return Ok(SymlinkMaterializeOutcome::TargetChanged);
+    }
+    published?;
 
     let mutation_generation =
         mutation_generation.expect("write_eligible implies the fence was bumped above");
@@ -860,10 +892,19 @@ pub(crate) fn materialize_symlink_at(
     // The link was published durably: from here a missing name is the user's, which the open
     // intent alone cannot tell from a crash before the publish. A mark that cannot be recorded
     // fails the attempt and leaves the intent open, so the path stays unsettled.
-    state
+    let landed_marked = state
         .materialization_intent_repository()
         .mark_write_landed(group_id, &record.path, mutation_generation, permit)
         .map_err(crate::sync_error::SyncError::from)?;
+    crate::write_op::trace::emit_at(
+        group_id,
+        &record.path,
+        crate::write_op::StepEvent::Published { names_deferred: false, landed_marked },
+    );
+    crate::write_op::failpoint::hit(
+        crate::write_op::failpoint::WriteOpFailpoint::AfterPublish,
+        &record.path,
+    )?;
 
     #[cfg(test)]
     placed_hook::run(&out_path);
@@ -891,6 +932,10 @@ pub(crate) fn materialize_symlink_at(
     // `Drop` behaviour of its own; the commit below owns the clear.
     let version = written.version_hash;
     let identity = yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&out_path).ok();
+    crate::write_op::failpoint::hit(
+        crate::write_op::failpoint::WriteOpFailpoint::BeforeProve,
+        &record.path,
+    )?;
     if !state.commit_internal_materialized_state_if_fence_current(
         group_id,
         &record.path,
@@ -921,6 +966,19 @@ pub(crate) fn materialize_symlink_at(
         return Ok(SymlinkMaterializeOutcome::CommitRejected);
     }
     drop(intent_guard);
+    crate::write_op::trace::emit_at(
+        group_id,
+        &record.path,
+        crate::write_op::StepEvent::Proven {
+            outcome: crate::write_op::ProofOutcome::Exact,
+            intent: crate::write_op::IntentSettlement::Cleared,
+            obligation_closed: false,
+        },
+    );
+    crate::write_op::failpoint::hit(
+        crate::write_op::failpoint::WriteOpFailpoint::AfterProve,
+        &record.path,
+    )?;
     Ok(SymlinkMaterializeOutcome::WrittenExact { mutation_generation, written: Box::new(written) })
 }
 
@@ -1143,6 +1201,19 @@ pub(crate) fn try_apply_metadata_only_update(
         state.dag_snapshot_mutation_fence(group_id, &record.path)?
     } else {
         let fence = state.dag_bump_mutation_fence(group_id, &record.path, "metadata_repair")?;
+        // This write needs no intent: the row upsert above already retired the old proof (a
+        // usable proof must name the current version) and the bytes equal the row, so a crash
+        // before or inside the in-place stamps is re-proven or has its metadata rebuilt by
+        // repair, and no name is at stake. The engine proves the result afterwards.
+        crate::write_op::trace::emit_at(
+            group_id,
+            &record.path,
+            crate::write_op::StepEvent::Prepared,
+        );
+        crate::write_op::failpoint::hit(
+            crate::write_op::failpoint::WriteOpFailpoint::AfterPrepare,
+            &record.path,
+        )?;
         // The mtime stamp opens the file, so it goes before the final mode,
         // which may deny the owner read access (0o200).
         yadorilink_local_storage::stamp_mtime_at_path(
@@ -1150,6 +1221,15 @@ pub(crate) fn try_apply_metadata_only_update(
             desired_version.meta.mtime_unix_nanos,
         )?;
         yadorilink_local_storage::apply_file_metadata(&out_path, exec)?;
+        crate::write_op::trace::emit_at(
+            group_id,
+            &record.path,
+            crate::write_op::StepEvent::Published { names_deferred: false, landed_marked: false },
+        );
+        crate::write_op::failpoint::hit(
+            crate::write_op::failpoint::WriteOpFailpoint::AfterPublish,
+            &record.path,
+        )?;
         fence
     };
     Ok(Some(MetadataOnlyUpdate { mutation_generation }))
@@ -1344,31 +1424,61 @@ impl Drop for TempGuard {
     }
 }
 
+/// Why a checked publish did not place the file.
+pub(crate) enum PublishRefusal {
+    /// The target is no longer what the write was based on (a local save landed after the last
+    /// check): nothing was replaced and the temp is still the caller's.
+    TargetChanged,
+    Failed(PeerSessionError),
+}
+
+impl From<PublishRefusal> for PeerSessionError {
+    fn from(refusal: PublishRefusal) -> Self {
+        match refusal {
+            PublishRefusal::TargetChanged => PeerSessionError::HydrationFailed(
+                "the target changed while the content was being placed".into(),
+            ),
+            PublishRefusal::Failed(error) => error,
+        }
+    }
+}
+
 /// The publish half: renames an assembled temp file over `out_path`, off the async runtime,
-/// flushing the directories or leaving that to a batch as `durability` says. Removes the temp
-/// file on failure, so `tmp_path` is spent either way.
+/// flushing the directories or leaving that to a batch as `durability` says. The target is
+/// checked against `expected` inside the replacement itself, so what is replaced is only what the
+/// write was based on. Removes the temp file on failure, except when the target changed (the
+/// temp is then the caller's to abandon).
 pub(crate) async fn persist_reconstructed_file_off_runtime(
     tmp_path: std::path::PathBuf,
     out_path: &std::path::Path,
     ledger: Arc<dyn yadorilink_local_storage::TempFileLedger>,
     durability: yadorilink_local_storage::Durability,
-) -> Result<(), PeerSessionError> {
+    exec: bool,
+    expected: yadorilink_local_storage::TargetExpectation,
+) -> Result<(), PublishRefusal> {
     let out_path = out_path.to_path_buf();
     match spawn_blocking(move || {
-        yadorilink_local_storage::persist_reconstructed_file_durable(
+        yadorilink_local_storage::persist_reconstructed_file_checked(
             &tmp_path,
             &out_path,
             ledger.as_ref(),
             durability,
+            Some(exec),
+            expected,
         )
     })
     .await
     {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(e.into()),
-        Err(join_err) => Err(PeerSessionError::from(std::io::Error::other(format!(
-            "persist_reconstructed_file blocking task panicked: {join_err}"
-        )))),
+        Ok(Err(yadorilink_local_storage::StorageError::TargetChanged(_))) => {
+            Err(PublishRefusal::TargetChanged)
+        }
+        Ok(Err(e)) => Err(PublishRefusal::Failed(e.into())),
+        Err(join_err) => {
+            Err(PublishRefusal::Failed(PeerSessionError::from(std::io::Error::other(format!(
+                "persist_reconstructed_file blocking task panicked: {join_err}"
+            )))))
+        }
     }
 }
 

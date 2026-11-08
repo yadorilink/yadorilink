@@ -1561,3 +1561,152 @@ async fn a_forbidden_upgrade_with_a_late_body_is_not_misread_and_still_backs_off
             < BLOCKED_RECONNECT_DELAY
     );
 }
+
+/// A netmap push that repeats what a peer already has is not a change of authorization, so it must
+/// not move the membership generation: every custody confirmation is stamped with the generation it
+/// was made under and is stale "regardless of its age" once it moves, so a generation that moved on
+/// every push made the folder's protection drop to unknown until the next sweep re-confirmed it,
+/// with no fact changed.
+#[tokio::test]
+async fn a_netmap_push_that_repeats_a_peers_authorization_leaves_the_membership_generation_alone() {
+    let state = test_state();
+    let groups = HashSet::from(["group-1".to_string(), "group-2".to_string()]);
+    let apply = || {
+        apply_authoritative_peer_metadata(
+            &state,
+            "device-b",
+            Some([7; 32]),
+            &groups,
+            &groups,
+            &std::sync::Mutex::new(HashMap::new()),
+        );
+    };
+    apply();
+    assert!(state.authority.peer_is_writer("device-b", "group-1"), "sanity: it was admitted");
+    let generation = state.authority.membership_generation();
+
+    apply();
+    apply();
+    assert_eq!(
+        state.authority.membership_generation(),
+        generation,
+        "a push that changes nothing moved the generation"
+    );
+    // The authorization itself is what the netmap said, throughout.
+    assert!(state.authority.peer_is_writer("device-b", "group-2"));
+    assert!(state.authority.peer_group_is_full_replica("device-b", "group-2"));
+}
+
+/// A peer settled under a key keeps its groups through the seed of the next pass, but a changed
+/// key does not inherit them. The netmap publishes a peer's key before it seeds, so the changed key
+/// is already recorded when the seed looks: the seed must still tell it apart from a repeat.
+#[tokio::test]
+async fn a_changed_signing_key_is_seeded_without_the_peers_groups() {
+    let state = test_state();
+    let groups = HashSet::from(["group-1".to_string()]);
+    let apply = |key: [u8; 32]| {
+        apply_authoritative_peer_metadata(
+            &state,
+            "device-b",
+            Some(key),
+            &groups,
+            &groups,
+            &std::sync::Mutex::new(HashMap::new()),
+        );
+    };
+    apply([7; 32]);
+    assert!(state.authority.peer_is_writer("device-b", "group-1"), "sanity: admitted");
+
+    // The same key again: nothing is withheld in between.
+    state.record_peer_signing_key("device-b", [7; 32]);
+    state.seed_netmap_peer_identity_keeping_settled("device-b", Some([7; 32]), &groups, &groups);
+    assert!(
+        state.authority.peer_is_writer("device-b", "group-1"),
+        "an unchanged key lost its groups"
+    );
+
+    // A different key, published first as the netmap pass does: it starts with nothing.
+    state.record_peer_signing_key("device-b", [8; 32]);
+    state.seed_netmap_peer_identity_keeping_settled("device-b", Some([8; 32]), &groups, &groups);
+    assert!(
+        !state.authority.peer_is_writer("device-b", "group-1"),
+        "a changed key inherited the groups of the old one"
+    );
+    // The settling call admits it once validated.
+    apply([8; 32]);
+    assert!(state.authority.peer_is_writer("device-b", "group-1"));
+}
+
+/// A group the netmap no longer lists for a settled peer is denied at once, not only when the
+/// pass has finished validating: a reader that runs in between must not see it authorized.
+#[tokio::test]
+async fn a_group_the_netmap_dropped_is_denied_while_the_pass_validates() {
+    let state = test_state();
+    let both = HashSet::from(["group-1".to_string(), "group-2".to_string()]);
+    let one = HashSet::from(["group-1".to_string()]);
+    apply_authoritative_peer_metadata(
+        &state,
+        "device-b",
+        Some([7; 32]),
+        &both,
+        &both,
+        &std::sync::Mutex::new(HashMap::new()),
+    );
+    state.seed_netmap_peer_identity_keeping_settled("device-b", Some([7; 32]), &one, &one);
+    assert!(state.authority.peer_is_writer("device-b", "group-1"));
+    assert!(!state.authority.peer_is_writer("device-b", "group-2"), "a dropped group stayed");
+    assert!(!state.authority.peer_group_is_full_replica("device-b", "group-2"));
+}
+
+/// A revocation in a push still takes effect, at the settling call.
+#[tokio::test]
+async fn a_push_that_drops_a_group_from_a_pinned_peer_still_revokes_it() {
+    let state = test_state();
+    let both = HashSet::from(["group-1".to_string(), "group-2".to_string()]);
+    let one = HashSet::from(["group-1".to_string()]);
+    let apply = |groups: &HashSet<String>| {
+        apply_authoritative_peer_metadata(
+            &state,
+            "device-b",
+            Some([7; 32]),
+            groups,
+            groups,
+            &std::sync::Mutex::new(HashMap::new()),
+        );
+    };
+    apply(&both);
+    let generation = state.authority.membership_generation();
+    apply(&one);
+    assert!(state.authority.peer_is_writer("device-b", "group-1"));
+    assert!(!state.authority.peer_is_writer("device-b", "group-2"), "the revoked group stayed");
+    assert!(!state.authority.peer_group_is_full_replica("device-b", "group-2"));
+    assert!(state.authority.membership_generation() > generation, "a revocation is a change");
+}
+
+/// A configured device that no longer exists (its netmap entry carries no usable key) is torn down
+/// by every push; once it holds nothing, that must not move the membership generation either, or
+/// a group that lists one keeps its custody confirmations stale.
+#[tokio::test]
+async fn tearing_down_a_dead_peer_that_holds_nothing_leaves_the_membership_generation_alone() {
+    let state = test_state();
+    let groups = HashSet::from(["group-1".to_string()]);
+    apply_authoritative_peer_metadata(
+        &state,
+        "device-b",
+        Some([7; 32]),
+        &groups,
+        &groups,
+        &std::sync::Mutex::new(HashMap::new()),
+    );
+    let generation = state.authority.membership_generation();
+
+    teardown_peer(&state, "dead-device");
+    teardown_peer(&state, "dead-device");
+
+    assert_eq!(
+        state.authority.membership_generation(),
+        generation,
+        "tearing down a peer with no authorization moved the generation"
+    );
+    assert!(state.authority.peer_is_writer("device-b", "group-1"));
+}

@@ -36,6 +36,7 @@ struct Avail {
     reachable_device_ids: Vec<String>,
     offline_device_ids: Vec<String>,
     update_required_device_ids: Vec<String>,
+    newer_peer_device_ids: Vec<String>,
 }
 
 struct Prot {
@@ -51,6 +52,7 @@ fn dims(link: &LinkStatus, peers: &[PeerStatus]) -> (Avail, Prot) {
             reachable_device_ids: d.reachable_device_ids,
             offline_device_ids: d.offline_device_ids,
             update_required_device_ids: d.update_required_device_ids,
+            newer_peer_device_ids: d.newer_peer_device_ids,
         },
         Prot { protection: d.protection, device_ids: d.protection_device_ids },
     )
@@ -216,7 +218,10 @@ fn the_response_is_filled_link_by_link_and_keeps_its_peers() {
 }
 
 fn incompatible(id: &str) -> PeerStatus {
-    PeerStatus { version_incompatible: true, ..peer(id, Reach::Connected) }
+    PeerStatus {
+        version_skew: yadorilink_ipc_proto::daemonctl::VersionSkew::PeerNewer as i32,
+        ..peer(id, Reach::Connected)
+    }
 }
 
 fn unavailable(holders: &[&str]) -> LinkStatus {
@@ -231,6 +236,18 @@ fn an_online_holder_of_another_version_is_update_required_not_reachable() {
     assert_eq!(a.update_required_device_ids, ["old"]);
     // Protection reads custody, not versions or reachability.
     assert_eq!(p.protection, Protection::Protected);
+}
+
+#[test]
+fn the_newer_peers_are_named_apart_from_the_older_ones() {
+    use yadorilink_ipc_proto::daemonctl::VersionSkew;
+    let older = PeerStatus {
+        version_skew: VersionSkew::PeerOlder as i32,
+        ..peer("older", Reach::Connected)
+    };
+    let (a, _) = dims(&unavailable(&["newer", "older"]), &[incompatible("newer"), older]);
+    assert_eq!(a.update_required_device_ids, ["newer", "older"]);
+    assert_eq!(a.newer_peer_device_ids, ["newer"], "only the peer that is ahead of this device");
 }
 
 #[test]
@@ -251,7 +268,10 @@ fn an_incompatible_holder_does_not_hide_that_content_is_available_now() {
 
 #[test]
 fn an_incompatible_marker_on_an_unreachable_peer_stays_offline() {
-    let stale = PeerStatus { version_incompatible: true, ..peer("old", Reach::Unreachable) };
+    let stale = PeerStatus {
+        version_skew: yadorilink_ipc_proto::daemonctl::VersionSkew::PeerNewer as i32,
+        ..peer("old", Reach::Unreachable)
+    };
     let (a, _) = dims(&unavailable(&["old"]), &[stale]);
     assert_eq!(a.availability, Availability::WaitingForPeer);
     assert_eq!(a.offline_device_ids, ["old"]);

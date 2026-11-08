@@ -1,6 +1,6 @@
 [package]
 name = "yadorilink-shell-ext-windows"
-version = "0.1.0-beta.9"
+version = "0.1.0-beta.10"
 edition = "2021"
 license = "AGPL-3.0-only"
 
@@ -66,7 +66,13 @@ windows-core = "0.58"
 version = "0.58"
 features = [
     "implement",
+    "Foundation",
+    "Storage",
+    "Storage_Provider",
+    "Storage_Streams",
     "Win32_Foundation",
+    "Win32_System_WinRT",
+    "Win32_Security_Authorization",
     "Win32_Security",
     "Win32_Graphics_Gdi",
     "Win32_System_Com",
@@ -117,6 +123,11 @@ features = [
     "Win32_System_Pipes",
     "Win32_System_Threading",
 ]
+
+# The example and the test of what the daemon's checked publish does to a Cloud Files placeholder
+# call the real publish.
+[dev-dependencies]
+yadorilink-local-storage = { path = "../yadorilink-local-storage" }
 
 [profile.release]
 lto = true

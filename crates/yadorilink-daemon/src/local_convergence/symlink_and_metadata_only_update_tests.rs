@@ -120,6 +120,10 @@ fn materialize_link(
             authoring: None,
             retention: yadorilink_sync_sqlite::retention::Retention::OwnEdit,
             permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            expected_target: yadorilink_local_storage::TargetExpectation::observe(
+                &root.join(&record.path),
+            )
+            .unwrap(),
         },
         record,
         &payload_version(record, RecordKind::Symlink, false, Some(payload_target)),
@@ -160,6 +164,165 @@ fn materialize_symlink_at_creates_a_real_symlink_and_upserts_index() {
         state.get_materialization_state("group-1", "link.txt").unwrap(),
         Some(MaterializationState::Present),
     );
+}
+
+/// The steps of a symlink write, as the write operation records them: the intent, row and fence
+/// are prepared together, the link lands, and one commit proves it.
+#[cfg(unix)]
+#[test]
+fn a_symlink_write_goes_prepared_published_proven() {
+    use crate::write_op::trace::StepTrace;
+    use crate::write_op::{IntentSettlement, ProofOutcome, StepEvent};
+    let root = tempfile::tempdir().unwrap();
+    let state = linked_state(root.path());
+    let record = symlink_record("trace-link.txt");
+    seed_symlink_row(&state, &record, b"target.txt");
+
+    materialize_link(&state, root.path(), &record, b"target.txt");
+
+    assert_eq!(
+        StepTrace::of("group-1", "trace-link.txt"),
+        [
+            StepEvent::Prepared,
+            StepEvent::Published { names_deferred: false, landed_marked: true },
+            StepEvent::Proven {
+                outcome: ProofOutcome::Exact,
+                intent: IntentSettlement::Cleared,
+                obligation_closed: false,
+            },
+        ]
+    );
+}
+
+/// A failure injected after the link is placed leaves the write unsettled: the intent stays open
+/// and nothing is proven.
+#[cfg(unix)]
+#[test]
+fn a_failure_after_the_link_was_placed_leaves_its_intent_open() {
+    use crate::write_op::failpoint::{arm, WriteOpFailpoint};
+    let root = tempfile::tempdir().unwrap();
+    let state = linked_state(root.path());
+    let record = symlink_record("fp-link.txt");
+    seed_symlink_row(&state, &record, b"target.txt");
+    let _armed = arm(WriteOpFailpoint::AfterPublish, "fp-link.txt");
+
+    let result = {
+        materialize_symlink_at(
+            SymlinkMaterialization {
+                state: &state,
+                root: root.path(),
+                group_id: "group-1",
+                windows_opt_in: false,
+                origin_device_id: "device-a",
+                authoring: None,
+                retention: yadorilink_sync_sqlite::retention::Retention::OwnEdit,
+                permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+                expected_target: yadorilink_local_storage::TargetExpectation::observe(
+                    &root.path().join(&record.path),
+                )
+                .unwrap(),
+            },
+            &record,
+            &payload_version(&record, RecordKind::Symlink, false, Some(b"target.txt")),
+        )
+    };
+
+    assert!(result.is_err(), "the armed failpoint fails the write");
+    assert!(state.has_materialization_intent("group-1", "fp-link.txt").unwrap());
+}
+
+/// A file is saved at the name after the caller classified it (nothing stood there) and before the
+/// link is placed: the save is kept, nothing is replaced, the path is journaled for capture, and
+/// the write's intent stays open.
+#[cfg(unix)]
+#[test]
+fn a_save_that_lands_before_the_link_is_placed_is_kept() {
+    let root = tempfile::tempdir().unwrap();
+    let state = linked_state(root.path());
+    let record = symlink_record("late-link.txt");
+    seed_symlink_row(&state, &record, b"target.txt");
+    let out = root.path().join(&record.path);
+    let expected = yadorilink_local_storage::TargetExpectation::observe(&out).unwrap();
+    std::fs::write(&out, b"saved a moment ago").unwrap();
+
+    let outcome = materialize_symlink_at(
+        SymlinkMaterialization {
+            state: &state,
+            root: root.path(),
+            group_id: "group-1",
+            windows_opt_in: false,
+            origin_device_id: "device-a",
+            authoring: None,
+            retention: yadorilink_sync_sqlite::retention::Retention::OwnEdit,
+            permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            expected_target: expected,
+        },
+        &record,
+        &payload_version(&record, RecordKind::Symlink, false, Some(b"target.txt")),
+    )
+    .unwrap();
+
+    assert_eq!(outcome, SymlinkMaterializeOutcome::TargetChanged);
+    assert_eq!(std::fs::read(&out).unwrap(), b"saved a moment ago");
+    assert!(state.is_path_dirty("group-1", &record.path).unwrap());
+    assert!(state.has_materialization_intent("group-1", &record.path).unwrap());
+}
+
+/// A symlink write stopped at each of its other transitions leaves no wrong object, and the
+/// retry places the link and settles it.
+#[cfg(unix)]
+#[test]
+fn a_symlink_write_stopped_at_each_other_transition_is_completed_by_the_retry() {
+    use crate::write_op::failpoint::{arm, WriteOpFailpoint};
+    for (i, point) in [
+        WriteOpFailpoint::AfterPrepare,
+        WriteOpFailpoint::BeforeProve,
+        WriteOpFailpoint::AfterProve,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("fp-link-{i}.txt");
+        let root = tempfile::tempdir().unwrap();
+        let state = linked_state(root.path());
+        let record = symlink_record(&name);
+        seed_symlink_row(&state, &record, b"target.txt");
+        {
+            let armed = arm(point, &name);
+            let result = materialize_symlink_at(
+                SymlinkMaterialization {
+                    state: &state,
+                    root: root.path(),
+                    group_id: "group-1",
+                    windows_opt_in: false,
+                    origin_device_id: "device-a",
+                    authoring: None,
+                    retention: yadorilink_sync_sqlite::retention::Retention::OwnEdit,
+                    permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+                    expected_target: yadorilink_local_storage::TargetExpectation::observe(
+                        &root.path().join(&record.path),
+                    )
+                    .unwrap(),
+                },
+                &record,
+                &payload_version(&record, RecordKind::Symlink, false, Some(b"target.txt")),
+            );
+            assert!(result.is_err(), "{point:?}: the armed failpoint fails the write");
+            assert!(armed.fired() >= 1, "{point:?} was reached");
+        }
+        if let Ok(target) = std::fs::read_link(root.path().join(&name)) {
+            assert_eq!(target, std::path::Path::new("target.txt"), "{point:?}");
+        }
+
+        materialize_link(&state, root.path(), &record, b"target.txt");
+
+        assert_eq!(
+            std::fs::read_link(root.path().join(&name)).unwrap(),
+            std::path::Path::new("target.txt"),
+            "{point:?}"
+        );
+        assert!(!state.has_materialization_intent("group-1", &name).unwrap(), "{point:?}");
+    }
 }
 
 /// When the current row names a different target from the payload, what is
@@ -254,6 +417,10 @@ fn materialize_symlink_at_refuses_a_root_whose_marker_no_longer_matches() {
             authoring: None,
             retention: yadorilink_sync_sqlite::retention::Retention::OwnEdit,
             permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            expected_target: yadorilink_local_storage::TargetExpectation::observe(
+                &root.path().join(&record.path),
+            )
+            .unwrap(),
         },
         &record,
         // A payload that genuinely WOULD have written, so the
@@ -315,6 +482,10 @@ fn materialize_symlink_at_creates_no_directories_under_a_root_whose_marker_no_lo
             authoring: None,
             retention: yadorilink_sync_sqlite::retention::Retention::OwnEdit,
             permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            expected_target: yadorilink_local_storage::TargetExpectation::observe(
+                &root.path().join(&record.path),
+            )
+            .unwrap(),
         },
         &record,
         // As above: a payload that genuinely would have written.
@@ -364,6 +535,10 @@ fn materialize_symlink_at_with_no_target_recorded_skips_disk_write_but_still_ind
             authoring: None,
             retention: yadorilink_sync_sqlite::retention::Retention::OwnEdit,
             permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            expected_target: yadorilink_local_storage::TargetExpectation::observe(
+                &root.path().join(&record.path),
+            )
+            .unwrap(),
         },
         &record,
         &payload_version(&record, RecordKind::Symlink, false, None),
@@ -472,6 +647,56 @@ fn metadata_only_fast_path_applies_unix_mode_without_touching_content() {
         "a genuine mode change (0o644 on disk vs. 0o755 desired) must bump the mutation \
          fence, not snapshot it -- a chmod is a real mutating syscall"
     );
+}
+
+/// A metadata-only update that changes the file in place reports prepared (the fence bump) and
+/// published (the in-place stamps). It opens no intent and proves nothing itself: the engine
+/// proves the result afterwards. An update that changes nothing records no step.
+#[cfg(unix)]
+#[test]
+fn a_metadata_only_update_goes_prepared_published_and_a_noop_goes_nowhere() {
+    use crate::write_op::trace::StepTrace;
+    use crate::write_op::StepEvent;
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let state = linked_state(root.path());
+    for (name, disk_mode, exec) in [("trace-meta.sh", 0o644, true), ("trace-noop.sh", 0o755, true)]
+    {
+        let mut local = file_record_with_block(name, 0xAB);
+        local.blocks[0].hash = <sha2::Sha256 as sha2::Digest>::digest(b"hello").to_vec();
+        seed_file(&state, &local);
+        let out_path = root.path().join(name);
+        std::fs::write(&out_path, b"hello").unwrap();
+        std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(disk_mode)).unwrap();
+        let mut incoming = local.clone();
+        // The mtime the disk already has, so the second file changes nothing.
+        incoming.mtime_unix_nanos = if name == "trace-noop.sh" {
+            let modified = std::fs::metadata(&out_path).unwrap().modified().unwrap();
+            modified.duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as i64
+        } else {
+            999
+        };
+        let mut desired = payload_version(&incoming, RecordKind::File, exec, None);
+        desired.meta.mtime_unix_nanos = incoming.mtime_unix_nanos;
+        try_apply_metadata_only_update(
+            state.as_ref(),
+            root.path(),
+            "group-1",
+            &incoming,
+            "device-a",
+            None,
+            &desired,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap()
+        .expect("an identical block list takes the metadata-only fast path");
+    }
+
+    assert_eq!(
+        StepTrace::of("group-1", "trace-meta.sh"),
+        [StepEvent::Prepared, StepEvent::Published { names_deferred: false, landed_marked: false }]
+    );
+    assert_eq!(StepTrace::of("group-1", "trace-noop.sh"), []);
 }
 
 /// The companion of the above: when the indexed mode already matches

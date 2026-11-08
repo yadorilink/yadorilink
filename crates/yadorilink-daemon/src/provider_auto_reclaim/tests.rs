@@ -244,7 +244,7 @@ async fn a_scan_gives_each_downloaded_file_its_verdict_and_deletes_nothing() {
     let rig = Rig::new();
     rig.downloaded("a.bin", 1, 4096);
     rig.downloaded("dir/kept.bin", 4, 4096);
-    rig.fx.state.replica_coordinator.pinned_item_repository().pin(GROUP, "dir").unwrap();
+    rig.fx.state.replica_coordinator.retention_rules().pin(GROUP, "dir").unwrap();
     // Listed with a stale copy: a newer version arrived after the download.
     rig.downloaded("changing.bin", 5, 4096);
     rig.host_reports();
@@ -273,7 +273,7 @@ async fn the_reclaimable_bytes_are_the_eligible_files_and_only_under_pressure() 
     rig.downloaded("a.bin", 1, 4096);
     rig.downloaded("b.bin", 2, 1000);
     rig.downloaded("dir/kept.bin", 4, 8192);
-    rig.fx.state.replica_coordinator.pinned_item_repository().pin(GROUP, "dir").unwrap();
+    rig.fx.state.replica_coordinator.retention_rules().pin(GROUP, "dir").unwrap();
     rig.host_reports();
 
     // Before the first look nothing is offered (fail closed), and a status read never waits.
@@ -507,7 +507,7 @@ async fn pinned_changing_and_busy_files_are_left_even_when_they_are_the_largest(
     rig.downloaded("changing.bin", 3, 30_000);
     rig.downloaded("ok.bin", 4, 1_000);
     rig.host_reports();
-    rig.fx.state.replica_coordinator.pinned_item_repository().pin(GROUP, "pinned.bin").unwrap();
+    rig.fx.state.replica_coordinator.retention_rules().pin(GROUP, "pinned.bin").unwrap();
     rig.fx.commit("changing.bin", 9, &[&data_of(9, 30_000)]);
     let lock = rig.fx.state.replica_coordinator.path_lock(GROUP, "busy.bin");
     let _held = lock.try_lock_owned().unwrap();
@@ -567,7 +567,7 @@ async fn a_change_after_selection_means_nothing_is_evicted() {
     rig.downloaded("a.bin", 1, 4096);
     rig.host_reports();
     let selected = rig.scan().entries;
-    rig.fx.state.replica_coordinator.pinned_item_repository().pin(GROUP, "a.bin").unwrap();
+    rig.fx.state.replica_coordinator.retention_rules().pin(GROUP, "a.bin").unwrap();
     let summary = rig.auto.reclaim_entries(&selected).await;
     assert_eq!(outcome_of(&summary, "a.bin"), Outcome::Skipped(Verdict::Pinned));
     assert!(rig.fx.log.lock().unwrap().is_empty());
@@ -607,7 +607,7 @@ async fn a_pin_or_an_edit_during_the_lease_is_caught_by_the_eviction_itself() {
     let selected = rig.scan().entries;
     let state = rig.fx.state.clone();
     *rig.fx.custody.during_acquire.lock().unwrap() = Some(Box::new(move || {
-        state.replica_coordinator.pinned_item_repository().pin(GROUP, "a.bin").unwrap();
+        state.replica_coordinator.retention_rules().pin(GROUP, "a.bin").unwrap();
     }));
     let summary = rig.auto.reclaim_entries(&selected).await;
     assert_eq!(outcome_of(&summary, "a.bin"), Outcome::Refused(Verdict::Pinned));
@@ -834,7 +834,7 @@ async fn a_pass_names_each_files_outcome() {
         entries.sort_by_key(|e| std::cmp::Reverse(e.size));
         entries
     };
-    rig.fx.state.replica_coordinator.pinned_item_repository().pin(GROUP, "pinned.bin").unwrap();
+    rig.fx.state.replica_coordinator.retention_rules().pin(GROUP, "pinned.bin").unwrap();
     rig.fx.host.answers.lock().unwrap().push_back(HostAnswer::Error("-2008".into()));
 
     let summary = rig.auto.reclaim_entries(&selected).await;

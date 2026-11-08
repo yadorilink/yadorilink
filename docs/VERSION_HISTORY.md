@@ -40,20 +40,20 @@ be kept. `yadorilink versions` marks older versions as `content=kept` or
 `content=not-kept`; restoring one that is `not-kept` has to fetch the content
 from another device and fails if no device has it.
 
-### Always kept: pinned and leased items
+### Always kept: kept and leased items
 
-A file or folder you pin with `yadorilink pin` is kept on this device, and so are the
+A file or folder you keep with `yadorilink keep` is kept on this device, and so are the
 versions a sync replaces (the same 10 versions and 30 days), even when the disk
-is nearly full. A pin set on a folder above the file counts. The same holds
+is nearly full. A rule set on a folder above the file counts. The same holds
 while this device keeps a copy so that another device can free its space.
 
-If a pinned file is changing at the moment you pin it, `pin` says that its
-previous versions are not safely kept yet; run `pin` again once the file has
+If a file is changing at the moment you keep it, `keep` says that its
+previous versions are not safely kept yet; run `keep` again once the file has
 settled.
 
 ### Ignored paths lose their history
 
-When a path matches `.yadorilinkignore`, YadoriLink stops tracking it, and the
+When a path matches the folder's ignore rules, YadoriLink stops tracking it, and the
 path's version history on this device is removed at that moment. The file in
 your folder is not touched.
 

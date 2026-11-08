@@ -91,9 +91,14 @@ impl PartialTemps {
         parked.remove(key)
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn len(&self) -> usize {
         self.lock().len()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Drops what is too old. A parked temp holds its file's disk reservation, so this runs at the

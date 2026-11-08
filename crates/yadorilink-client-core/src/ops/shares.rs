@@ -18,6 +18,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::coordination::http_client::CoordinationAccess;
+use crate::dto::GroupCreatorDevice;
 use serde::{Deserialize, Serialize};
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
@@ -68,6 +69,21 @@ pub fn storage_mode_str(on_demand: bool) -> &'static str {
 struct FolderGroupInfo {
     group_id: String,
     name: String,
+    #[serde(default)]
+    created_by_device: Option<CreatorDeviceInfo>,
+}
+/// The coordination plane's `createdByDevice`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreatorDeviceInfo {
+    device_id: String,
+    name: Option<String>,
+    platform: Option<String>,
+}
+impl From<CreatorDeviceInfo> for GroupCreatorDevice {
+    fn from(d: CreatorDeviceInfo) -> Self {
+        Self { device_id: d.device_id, name: d.name, platform: d.platform }
+    }
 }
 #[derive(Deserialize)]
 struct ListGroupsResponse {
@@ -79,6 +95,7 @@ struct ListGroupsResponse {
 pub struct GroupSummary {
     pub group_id: String,
     pub name: String,
+    pub created_by_device: Option<GroupCreatorDevice>,
 }
 
 /// The folder groups this account OWNS (`GET /shares/groups`).
@@ -88,7 +105,11 @@ pub async fn list_groups() -> Result<Vec<GroupSummary>, CoreError> {
     Ok(resp
         .groups
         .into_iter()
-        .map(|g| GroupSummary { group_id: g.group_id, name: g.name })
+        .map(|g| GroupSummary {
+            group_id: g.group_id,
+            name: g.name,
+            created_by_device: g.created_by_device.map(Into::into),
+        })
         .collect())
 }
 
@@ -1089,6 +1110,8 @@ pub async fn approve(group_name: &str, device_id: &str) -> Result<String, CoreEr
 struct JoinableGroupInfo {
     group_id: String,
     name: String,
+    #[serde(default)]
+    created_by_device: Option<CreatorDeviceInfo>,
 }
 #[derive(Deserialize)]
 struct ListJoinableResponse {
@@ -1110,7 +1133,11 @@ pub async fn list_joinable_groups_with(
     Ok(resp
         .groups
         .into_iter()
-        .map(|g| GroupSummary { group_id: g.group_id, name: g.name })
+        .map(|g| GroupSummary {
+            group_id: g.group_id,
+            name: g.name,
+            created_by_device: g.created_by_device.map(Into::into),
+        })
         .collect())
 }
 

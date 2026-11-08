@@ -112,7 +112,7 @@ def version_le(a: str, b: str) -> bool:
 #     - Generation PROTOCOL_VERSION = 4, RPC_VERSION = 2: first release 0.0.0
 GENERATION_LINE = re.compile(
     r"^\s*[-*]\s+Generation\s+PROTOCOL_VERSION\s*=\s*(\d+)\s*,\s*RPC_VERSION\s*=\s*(\d+)\s*:"
-    r"\s*first release\s+(\d+\.\d+\.\d+)\b"
+    r"\s*first release\s+(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]*[0-9A-Za-z])?)(?![0-9A-Za-z.+-])"
 )
 
 

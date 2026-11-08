@@ -93,8 +93,33 @@ fn headline(status: &StatusResponse, device: &ProductStatusSummary) -> String {
     }
 }
 
+fn capitalized(text: String) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| first.to_uppercase().chain(chars).collect())
+}
+
 fn device_names(ids: &[String], names: &DeviceNames) -> String {
     ids.iter().map(|id| device_label(names, id, false)).collect::<Vec<_>>().join(", ")
+}
+
+/// What to update when devices run another version: this device when a peer is newer, a peer
+/// when it is older. `update_required` is every mismatched device, `newer` the part of it that
+/// runs a newer version than this device; `label` names a list of devices.
+pub(super) fn update_instruction(
+    update_required: &[String],
+    newer: &[String],
+    label: &dyn Fn(&[String]) -> String,
+) -> String {
+    let older: Vec<String> =
+        update_required.iter().filter(|id| !newer.contains(id)).cloned().collect();
+    let mut parts = Vec::new();
+    if !newer.is_empty() {
+        parts.push(format!("update this device ({} runs a newer version)", label(newer)));
+    }
+    if !older.is_empty() {
+        parts.push(format!("update {} (older version)", label(&older)));
+    }
+    parts.join("; ")
 }
 
 /// "Can I open my files right now?" Offline devices carry when they were last seen, which is
@@ -141,12 +166,11 @@ fn availability_line(
         Availability::WaitingForExactContent => {
             "Waiting for a device that has this version".to_string()
         }
-        Availability::UpdateRequired => {
-            format!(
-                "{} needs an update",
-                device_names(&availability.update_required_device_ids, names)
-            )
-        }
+        Availability::UpdateRequired => capitalized(update_instruction(
+            &availability.update_required_device_ids,
+            &availability.newer_peer_device_ids,
+            &|ids| device_names(ids, names),
+        )),
         Availability::Unknown => "Can't tell right now".to_string(),
     }
 }
@@ -191,7 +215,7 @@ fn protection_line(
 fn folder_row(link: &LinkStatus, names: &DeviceNames) -> String {
     let product = ProductStatusSummary::from_wire(&link.product.clone().unwrap_or_default());
     let place = folder_label(link);
-    let detail = match product.state {
+    let mut detail = match product.state {
         ProductState::UpToDate => String::new(),
         ProductState::NeedsAttention => String::new(),
         ProductState::Syncing if link.durability_check_pending => "   (getting ready)".to_string(),
@@ -208,10 +232,11 @@ fn folder_row(link: &LinkStatus, names: &DeviceNames) -> String {
                         device_names(&product.availability.offline_device_ids, names)
                     )
                 }
-                Availability::UpdateRequired => format!(
-                    "{} needs an update",
-                    device_names(&product.availability.update_required_device_ids, names)
-                ),
+                Availability::UpdateRequired => capitalized(update_instruction(
+                    &product.availability.update_required_device_ids,
+                    &product.availability.newer_peer_device_ids,
+                    &|ids| device_names(ids, names),
+                )),
                 Availability::WaitingForExactContent => {
                     "Waiting for a device that has this version".to_string()
                 }
@@ -225,6 +250,12 @@ fn folder_row(link: &LinkStatus, names: &DeviceNames) -> String {
             }
         }
     };
+    // An up to date folder is synced now; any other says when it last was, once it has been.
+    if product.state != ProductState::UpToDate {
+        if let Some(unix) = link.product.as_ref().and_then(|p| p.last_synced_unix) {
+            detail.push_str(&format!("   last synced {}", until_text(unix)));
+        }
+    }
     format!("  {place}   {}{detail}", product.state.label())
 }
 

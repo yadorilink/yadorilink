@@ -80,6 +80,9 @@ yadorilink-local-storage = { path = "../yadorilink-local-storage" }
 yadorilink-replica-domain = { workspace = true }
 yadorilink-root-authority = { path = "../yadorilink-root-authority", features = ["test-support"] }
 tempfile = "3"
+# A stand-in coordination plane for the account-level success paths (devices, shares,
+# invites, group deletion).
+wiremock = "0.6"
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "json",

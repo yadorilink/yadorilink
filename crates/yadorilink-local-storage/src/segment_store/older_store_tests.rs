@@ -36,7 +36,13 @@ fn write_previous_layout_segment(root: &Path, segment_id: u64) {
 
 fn refused(root: &Path) -> String {
     match SegmentBlockStore::new(root) {
-        Err(error) => error.to_string(),
+        Err(error) => {
+            assert!(
+                matches!(error, StorageError::AnotherLayout { .. }),
+                "not the typed refusal: {error}"
+            );
+            error.to_string()
+        }
         Ok(_) => panic!("a store of the previous layout must not open"),
     }
 }
@@ -115,6 +121,81 @@ fn a_marker_of_the_previous_format_version_is_refused_with_the_advice() {
 
     assert_the_advice(&message);
     assert_eq!(snapshot(dir.path()), before);
+}
+
+/// Only a marker that provably names an OLDER format is the typed refusal (the app offers a reset for it): a
+/// torn or garbled marker, a newer build's marker, or one that parses to this build's own version are ordinary
+/// refusals, so no transient or foreign state ever leads a person to wipe their data.
+#[test]
+fn only_a_marker_of_an_older_format_is_the_typed_refusal() {
+    let current = index::STORE_FORMAT_VERSION;
+    for (marker, typed) in [
+        ("format_version=2".to_owned(), true),
+        ("format_version=1".to_owned(), false),
+        ("format_version=12".to_owned(), false),
+        (format!("format_version={}", current + 1), false),
+        (format!("format_version={current} "), false),
+        ("format_version=".to_owned(), false),
+        ("format_version=\u{0}\u{0}".to_owned(), false),
+        ("format_version=x7".to_owned(), false),
+        ("format_version=0".to_owned(), false),
+        ("format_version=-1".to_owned(), false),
+        ("format_version=+2".to_owned(), false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(segment::SEGMENTS_DIR)).unwrap();
+        std::fs::write(
+            dir.path().join(FORMAT_MARKER_FILE),
+            format!("yadorilink-block-store\n{marker}\n"),
+        )
+        .unwrap();
+        let error =
+            refuse_a_store_of_another_layout(dir.path()).expect_err("a foreign marker is refused");
+        assert_eq!(
+            matches!(error, StorageError::AnotherLayout { .. }),
+            typed,
+            "marker {marker:?}: {error:?}"
+        );
+        assert!(
+            typed || matches!(error, StorageError::CorruptStore(_)),
+            "marker {marker:?}: {error:?}"
+        );
+    }
+}
+
+/// Only versions an earlier build shipped are the typed refusal, for the store format and the segment layout alike.
+#[test]
+fn only_shipped_versions_are_the_typed_refusal() {
+    for found in [2, 1, 0, 3, 12, -1] {
+        assert_eq!(
+            index::older_layout(
+                Some(found),
+                index::SHIPPED_STORE_FORMATS,
+                3,
+                "block store format",
+                "x"
+            )
+            .is_some(),
+            found == 2,
+            "store format {found}"
+        );
+    }
+    for found in [1, 0, 2, 3, 99, -1] {
+        assert_eq!(
+            index::older_layout(
+                Some(found),
+                index::SHIPPED_SEGMENT_LAYOUTS,
+                2,
+                "segment layout",
+                "x"
+            )
+            .is_some(),
+            found == 1,
+            "segment layout {found}"
+        );
+    }
+    assert!(index::older_layout(None, index::SHIPPED_STORE_FORMATS, 3, "block store format", "x")
+        .is_none());
 }
 
 /// A segment file that is not a segment at all (foreign bytes, or too short to have a header) is

@@ -98,6 +98,29 @@ pub enum EvictOutcome {
     Error(String),
 }
 
+/// What the person's choice asks of an item's operating-system pin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinWish {
+    /// Pinned: the content is kept on this PC.
+    Keep,
+    /// Unpinned: online only.
+    OnlineOnly,
+    /// Neither: no choice has been made.
+    Clear,
+}
+
+/// How a request to apply the person's keep-on-this-device choice ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PinOutcome {
+    /// The pin is set and the content is on this PC (or the item has none to fetch).
+    Done,
+    /// The pin is set and the operating system is fetching the content.
+    Downloading,
+    /// This host has no operating-system pin to set: nothing was changed.
+    Unsupported,
+    Error(String),
+}
+
 /// The items shown, by item id.
 pub type ShownItems = HashMap<Vec<u8>, ShownItem>;
 

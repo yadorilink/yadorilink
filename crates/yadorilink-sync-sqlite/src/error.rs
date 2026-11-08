@@ -17,6 +17,12 @@ pub enum SyncSqliteError {
     #[error("corrupt state: {0}")]
     CorruptState(String),
 
+    /// Heads changed since the group's stored namespace trie was last brought up to date, so its
+    /// root is not the heads' root. The caller flushes (`native_namespace::flush_all`) and reads
+    /// again; a writer that commits in between makes it ask twice.
+    #[error("namespace trie: heads changed since the trie was last brought up to date")]
+    NamespaceBehind,
+
     /// The link at `local_path` belongs to a different group than the caller expected. Nothing
     /// was changed.
     #[error("the folder at {local_path} belongs to a different group than expected")]

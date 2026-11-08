@@ -21,6 +21,8 @@ pub(crate) struct LinkDimensions {
     pub reachable_device_ids: Vec<String>,
     pub offline_device_ids: Vec<String>,
     pub update_required_device_ids: Vec<String>,
+    /// The members of `update_required_device_ids` that run a newer version than this device.
+    pub newer_peer_device_ids: Vec<String>,
     pub protection: DataProtection,
     pub protection_device_ids: Vec<String>,
 }
@@ -34,6 +36,7 @@ pub(crate) fn fill_link_dimensions(response: &mut StatusResponse) {
         link.availability_reachable_device_ids = dimensions.reachable_device_ids;
         link.availability_offline_device_ids = dimensions.offline_device_ids;
         link.availability_update_required_device_ids = dimensions.update_required_device_ids;
+        link.availability_newer_peer_device_ids = dimensions.newer_peer_device_ids;
         link.protection = dimensions.protection as i32;
         link.protection_device_ids = dimensions.protection_device_ids;
     }
@@ -58,8 +61,12 @@ pub(crate) fn link_dimensions(link: &LinkStatus, peers: &[PeerStatus]) -> LinkDi
     let connected = |id: &String| {
         peers.iter().any(|p| &p.device_id == id && p.reachability() == PeerReachability::Connected)
     };
-    let incompatible =
-        |id: &String| peers.iter().any(|p| &p.device_id == id && p.version_incompatible);
+    let incompatible = |id: &String| {
+        peers.iter().any(|p| {
+            &p.device_id == id
+                && p.version_skew() != yadorilink_ipc_proto::daemonctl::VersionSkew::Unspecified
+        })
+    };
     let (online, offline): (Vec<&String>, Vec<&String>) =
         holders.iter().copied().partition(|id| connected(id));
     let (update_required, reachable): (Vec<&String>, Vec<&String>) =
@@ -112,6 +119,17 @@ pub(crate) fn link_dimensions(link: &LinkStatus, peers: &[PeerStatus]) -> LinkDi
         availability,
         reachable_device_ids: reachable.into_iter().cloned().collect(),
         offline_device_ids: offline.into_iter().cloned().collect(),
+        newer_peer_device_ids: update_required
+            .iter()
+            .filter(|id| {
+                peers.iter().any(|p| {
+                    &&p.device_id == *id
+                        && p.version_skew()
+                            == yadorilink_ipc_proto::daemonctl::VersionSkew::PeerNewer
+                })
+            })
+            .map(|id| (*id).clone())
+            .collect(),
         update_required_device_ids: update_required.into_iter().cloned().collect(),
         protection,
         protection_device_ids: named_devices,

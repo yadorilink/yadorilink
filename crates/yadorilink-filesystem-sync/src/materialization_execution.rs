@@ -68,21 +68,8 @@ pub enum AbandonedEviction {
     PlaceholderMayExist,
 }
 
-/// The durable facts about an open write intent from which startup repair decides whether a
-/// MISSING name was removed by the user (the delete stands) or lost with a rename that never
-/// reached stable storage (the file is rebuilt).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WriteRemovalEvidence {
-    /// The write recorded that its placement reached stable storage and nothing has proven it.
-    pub landed_unproven: bool,
-    /// The name of the temp file (beside the target) whose directory
-    /// entry was flushed before the rename. Present after a power cut, the rename was lost; gone,
-    /// the name was renamed durably and then removed.
-    pub temp_witness: Option<String>,
-}
-
 /// An open, durably-recorded materialization intent for one path, returned
-/// by [`MaterializationExecutionPort::open_materialization_intent_guard`].
+/// by [`MaterializationExecutionPort::open_repair_write`].
 /// Opaque here (the concrete guard is `yadorilink-daemon`'s own
 /// `MaterializationIntentGuard<'_>`, which borrows a concrete
 /// `&ReplicaCoordinator` a trait object can't name) -- the only operation
@@ -231,6 +218,12 @@ pub enum MaterializationExecutionError {
 }
 
 impl MaterializationExecutionError {
+    /// A write refused to replace what stands at its target because that is no longer what it
+    /// decided to replace. The target, the row, the intent and the temp are all as they were.
+    pub fn is_target_changed(&self) -> bool {
+        matches!(self, Self::Storage(yadorilink_local_storage::StorageError::TargetChanged(_)))
+    }
+
     /// Whether this failure belongs to the one path an operation was
     /// working on (its file could not be read, written, renamed or
     /// observed; it was busy, rejected, missing, or escaped the root), so a
@@ -257,7 +250,10 @@ impl MaterializationExecutionError {
             | Self::EvictionOutcomeAmbiguous(_)
             | Self::PathEscapesRoot(_) => true,
             Self::Storage(storage) => {
-                matches!(storage, S::Io(_) | S::InvalidPath(_) | S::PathEscapesRoot(_))
+                matches!(
+                    storage,
+                    S::Io(_) | S::InvalidPath(_) | S::PathEscapesRoot(_) | S::TargetChanged(_)
+                )
             }
             Self::CorruptState(_)
             | Self::PolicyUnavailable
@@ -452,17 +448,6 @@ pub trait MaterializationExecutionPort: Send + Sync {
         Ok(false)
     }
 
-    /// What is durably known about the write intent open on `path` that bears on whether a
-    /// missing name was removed by the user (see [`WriteRemovalEvidence`]). `None` when no write
-    /// intent is open.
-    fn write_removal_evidence(
-        &self,
-        _group_id: &str,
-        _path: &str,
-    ) -> Result<Option<WriteRemovalEvidence>, MaterializationExecutionError> {
-        Ok(None)
-    }
-
     /// Records, durably, that the bytes of the write open on `path` were placed
     /// under fence `mutation_generation` and the placement reached stable
     /// storage (see [`Self::write_landed_unproven`]). Every writer that places an
@@ -547,6 +532,15 @@ pub trait MaterializationExecutionPort: Send + Sync {
         &self,
         group_id: &str,
     ) -> Result<std::collections::HashSet<String>, MaterializationExecutionError>;
+
+    /// The temp file the open write intent of `path` names (see the intent's `tmp_path`): the
+    /// file the interrupted write would have published, which recovery may finish it from once the
+    /// file is verified against the version.
+    fn write_intent_tmp_path(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<std::path::PathBuf>, MaterializationExecutionError>;
 
     /// Clears the durable materialization-write-in-progress intent once the
     /// write + rename + fsync has completed for `(group_id, path)`.
@@ -886,20 +880,19 @@ pub trait MaterializationExecutionPort: Send + Sync {
         group_id: &str,
     ) -> Result<VerifiedRoot, MaterializationExecutionError>;
 
-    /// Opens the single sanctioned materialization-intent seam for
-    /// `(group_id, path)`. Added as a narrow delegate (rather than exposing
-    /// `&ReplicaCoordinator` itself) because the concrete guard borrows a
-    /// concrete `&'a ReplicaCoordinator`, which a trait object can't
-    /// produce; the implementation runs inside `impl
-    /// MaterializationExecutionPort for ReplicaCoordinator`, where `self`
-    /// already is that concrete `&ReplicaCoordinator`.
-    fn open_materialization_intent_guard<'a>(
+    /// Opens the write intent for `(group_id, path)` naming `target_version_hash` and bumps the
+    /// path's mutation fence for `mutation_kind`, in ONE transaction, and returns the bumped fence
+    /// (the epoch the write's proof is published under) with the open intent. Added as a narrow
+    /// delegate (rather than exposing `&ReplicaCoordinator` itself) because the concrete guard
+    /// borrows a concrete `&'a ReplicaCoordinator`, which a trait object can't produce.
+    fn open_repair_write<'a>(
         &'a self,
         group_id: &'a str,
         path: &'a str,
         target_version_hash: &[u8],
+        mutation_kind: &str,
         permit: &'a RootCommitPermit<'a>,
-    ) -> Result<Box<dyn OpenMaterializationIntent + Send + 'a>, MaterializationExecutionError>;
+    ) -> Result<(i64, Box<dyn OpenMaterializationIntent + Send + 'a>), MaterializationExecutionError>;
 
     /// Semantic-operation read replacing `evict_file`'s three unconditional
     /// pre-lock CRUD reads with one snapshot-shaped call. See
@@ -976,18 +969,16 @@ pub trait MaterializationExecutionPort: Send + Sync {
     ) -> Result<i64, MaterializationExecutionError>;
 
     /// Open half of `evict_file`'s placeholder write, after its
-    /// revalidation: marks the row `Evicting` (its own transaction; an
-    /// error here fails the eviction with nothing else touched), then bumps
-    /// the fence for the placeholder write (its own transaction). The
-    /// bump's result is returned inside: the caller chains it into the
-    /// placeholder write and treats its failure as that write's, closing
-    /// the row with [`abandon_eviction`](Self::abandon_eviction).
+    /// revalidation: marks the row `Evicting` and bumps the fence for the
+    /// placeholder write, in ONE transaction. An error here fails the
+    /// eviction with nothing touched; from a successful open on, every
+    /// failure closes the row with [`abandon_eviction`](Self::abandon_eviction).
     fn open_eviction(
         &self,
         group_id: &str,
         path: &str,
         permit: &RootCommitPermit,
-    ) -> Result<Result<i64, MaterializationExecutionError>, MaterializationExecutionError>;
+    ) -> Result<(), MaterializationExecutionError>;
 
     /// Settle half of `evict_file`'s placeholder write: moves the row
     /// `Evicting` -> `Remote` only if it is still `Evicting`
@@ -1050,9 +1041,9 @@ pub trait MaterializationExecutionPort: Send + Sync {
 
     /// Open half of the repair sweep's quarantine of divergent on-disk
     /// bytes: opens the intent naming the content the path will be rebuilt
-    /// to, then bumps the fence for the quarantine rename. Two
-    /// transactions, in that order. The caller holds the returned intent
-    /// across the rename and drops it uncleared.
+    /// to and bumps the fence for the quarantine rename, in one transaction.
+    /// The caller holds the returned intent across the rename and drops it
+    /// uncleared.
     fn open_repair_quarantine<'a>(
         &'a self,
         group_id: &'a str,
@@ -1085,10 +1076,10 @@ pub trait MaterializationExecutionPort: Send + Sync {
 
     /// Open half of the repair sweep's journaled rebuild of a single
     /// object with no block content (a symlink, an explicit directory):
-    /// bumps the fence for the rebuild, then opens the intent naming
-    /// `target_version_hash`. Two transactions, in that order. Returns the
-    /// fence value to publish under and the intent, which the caller drops
-    /// uncleared once the object is written.
+    /// opens the intent naming `target_version_hash` and bumps the fence for
+    /// the rebuild, in one transaction. Returns the fence value to publish
+    /// under and the intent, which the caller drops uncleared once the
+    /// object is written.
     fn open_repair_object_rebuild<'a>(
         &'a self,
         group_id: &'a str,

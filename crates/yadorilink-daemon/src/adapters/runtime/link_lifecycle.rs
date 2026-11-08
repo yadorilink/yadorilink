@@ -72,7 +72,7 @@ impl LinkRepositoryPort for DaemonLinkRepositoryAdapter {
     ) -> Result<LinkRowWrite, SyncError> {
         self.state
             .replica_coordinator
-            .link_repository()
+            .link_admission()
             .add_link(local_path, group_id)
             .map_err(SyncError::from)
     }
@@ -85,7 +85,7 @@ impl LinkRepositoryPort for DaemonLinkRepositoryAdapter {
     ) -> Result<LinkRowWrite, SyncError> {
         self.state
             .replica_coordinator
-            .link_repository()
+            .link_admission()
             .add_provider_link(
                 local_path,
                 group_id,
@@ -149,7 +149,7 @@ impl LinkRepositoryPort for DaemonLinkRepositoryAdapter {
         let undone = self
             .state
             .replica_coordinator
-            .link_repository()
+            .link_admission()
             .undo_link_row(local_path, group_id, write)
             .map_err(SyncError::from)?;
         // A row this attempt inserted is gone again: drop any custody
@@ -195,7 +195,7 @@ impl LinkRepositoryPort for DaemonLinkRepositoryAdapter {
     fn mark_link_orphaned(&self, local_path: &str) -> Result<(), SyncError> {
         self.state
             .replica_coordinator
-            .link_repository()
+            .link_admission()
             .mark_link_orphaned(local_path)
             .map_err(SyncError::from)
     }
@@ -237,7 +237,7 @@ impl LinkWatcherPort for DaemonLinkWatcherAdapter {
                 }
                 self.state
                     .replica_coordinator
-                    .link_repository()
+                    .link_admission()
                     .set_materialization_policy(
                         local_path,
                         yadorilink_replica_domain::session_state::MaterializationPolicy::OnDemand,

@@ -2,10 +2,10 @@
 //!
 //! Every namespace change the product's correctness depends on is expressed as
 //! a [`DurableNamespace::durable_move`]: a rename that is on disk when it
-//! returns. Windows has exactly one documented primitive for that,
-//! `MoveFileExW(MOVEFILE_WRITE_THROUGH)` on one volume: it "does not return
-//! until the file is actually moved on the disk". Only the moved entry itself
-//! is claimed durable by it: not an earlier `mkdir`, not other entries of the
+//! returns. Windows does it with a rename on a handle held open on the
+//! source (the name cannot be swapped between the check and the rename),
+//! followed by `FlushFileBuffers` on both parent directories. Only the moved
+//! entry itself is claimed durable by it: not an earlier `mkdir`, not other entries of the
 //! same directory, not a replace that is half done. The shapes below are
 //! built from that and nothing else:
 //!
@@ -97,6 +97,99 @@ pub fn volume_offers_durable_namespace(dir: Option<&Path>) -> bool {
     dir.is_some_and(|dir| DurableNamespace::open(dir).is_ok())
 }
 
+/// Why a drive cannot be synced into: the machine reason a front end words in its own language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveReason {
+    /// ReFS, including a Dev Drive.
+    Refs,
+    ExFat,
+    /// FAT or FAT32.
+    Fat,
+    /// Not a local fixed disk: a network share or a removable drive.
+    NotLocalFixed,
+    /// Any other file system; [`UnsupportedDrive::file_system`] names it.
+    Other,
+}
+
+impl DriveReason {
+    /// The stable key: `refs`, `exfat`, `fat`, `not_local_fixed`, `other`.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Refs => "refs",
+            Self::ExFat => "exfat",
+            Self::Fat => "fat",
+            Self::NotLocalFixed => "not_local_fixed",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// A drive the product cannot sync into (yet): the reason as a key, the file system's name as
+/// Windows reports it, and the sentence for a command line or a log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedDrive {
+    pub reason: DriveReason,
+    pub file_system: String,
+}
+
+impl UnsupportedDrive {
+    /// The English sentence (CLI and logs); a front end words [`Self::reason`] itself.
+    pub fn message(&self) -> String {
+        let pick = "pick a folder on an NTFS drive";
+        match self.reason {
+            DriveReason::NotLocalFixed => format!(
+                "this drive is not a local fixed disk (a network share or a removable drive) and \
+                 is not supported yet, {pick}"
+            ),
+            DriveReason::Refs => {
+                format!("this drive (ReFS / Dev Drive) is not supported yet, {pick}")
+            }
+            _ => format!(
+                "this drive uses the {} file system, which is not supported yet, {pick}",
+                self.file_system
+            ),
+        }
+    }
+}
+
+/// The drive `path` is on, when it cannot be synced into, or `None` when it can (or when nothing
+/// is known: a probe that could not run is not a refusal). Windows only: the volume probe refuses
+/// every file system but NTFS on a local fixed disk, and without this the refusal reaches the
+/// person as the first publish into the folder failing. `path` may not exist yet: its nearest
+/// existing ancestor is the one judged.
+pub fn unsupported_drive(path: &Path) -> Option<UnsupportedDrive> {
+    #[cfg(windows)]
+    {
+        let existing = path.ancestors().find(|ancestor| ancestor.exists())?;
+        let (file_system, fixed) = probe::local_volume_file_system(existing).ok()?;
+        classify_drive(&file_system, fixed)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+#[cfg(any(windows, test))]
+fn classify_drive(file_system: &str, fixed: bool) -> Option<UnsupportedDrive> {
+    if fixed && file_system.eq_ignore_ascii_case("NTFS") {
+        return None;
+    }
+    let reason = if !fixed {
+        DriveReason::NotLocalFixed
+    } else if file_system.eq_ignore_ascii_case("ReFS") {
+        DriveReason::Refs
+    } else if file_system.eq_ignore_ascii_case("exFAT") {
+        DriveReason::ExFat
+    } else if file_system.eq_ignore_ascii_case("FAT") || file_system.eq_ignore_ascii_case("FAT32") {
+        DriveReason::Fat
+    } else {
+        DriveReason::Other
+    };
+    Some(UnsupportedDrive { reason, file_system: file_system.to_owned() })
+}
+
 /// Whether a move may replace an existing target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Replace {
@@ -177,6 +270,9 @@ pub enum NsError {
     AlreadyExists,
     #[error("the source does not exist")]
     NotFound,
+    /// The caller's last-moment check of the move's precondition said no; nothing moved.
+    #[error("the move's precondition no longer holds")]
+    Refused,
     /// A directory about to be discarded has children. A discard never
     /// removes a non-empty directory.
     #[error("the directory is not empty")]
@@ -201,6 +297,12 @@ pub enum NsError {
 }
 
 impl NsError {
+    /// Whether this is a failpoint's simulated crash (never true outside tests): a crash leaves
+    /// the staged object and its record exactly as they are.
+    pub fn is_simulated_crash(&self) -> bool {
+        is_crash(self)
+    }
+
     fn from_io(error: io::Error) -> Self {
         use io::ErrorKind as K;
         match error.kind() {
@@ -445,9 +547,9 @@ impl DurableNamespace {
     }
 
     /// Moves `from` to `to`; on return the move is on disk. This is the only
-    /// primitive the rest is made of. Windows: `MoveFileExW` with write-through
-    /// and no copy fallback. Unix: the (no-replace) rename and an `fsync` of
-    /// both parent directories. A Unix directory sync that fails after the
+    /// primitive the rest is made of. Windows: a rename on a handle held open on `from`,
+    /// then a flush of both parent directories, and no copy fallback. Unix: the (no-replace)
+    /// rename and an `fsync` of both parent directories. A Unix directory sync that fails after the
     /// rename reports an error although the entry moved; the caller treats the
     /// move as not done.
     ///
@@ -461,10 +563,98 @@ impl DurableNamespace {
         #[cfg(unix)]
         let handles = ops::open_parents(from_parent, to_parent)?;
         hit(NsFailpoint::BeforeMove)?;
+        #[cfg(unix)]
+        ops::move_entry_via(&handles, from, to, replace).map_err(NsError::from_io)?;
+        #[cfg(not(unix))]
         ops::move_entry(from, to, replace).map_err(NsError::from_io)?;
         #[cfg(unix)]
         ops::sync_handles(&handles, from_parent, to_parent)?;
         hit(NsFailpoint::AfterMove)
+    }
+
+    /// [`Self::durable_move`] that asks `still_ok` after the volume check and the parent
+    /// handles, immediately before the rename itself, and moves nothing if it answers `false`
+    /// ([`NsError::Refused`]). With `flush` false it is the rename alone (the caller owes the
+    /// flush of both parents), as [`Self::publish_without_flush`] is. A failed move leaves
+    /// `from` where it is; removing a stage is the caller's.
+    pub fn move_if(
+        &self,
+        from: &Path,
+        to: &Path,
+        replace: Replace,
+        flush: bool,
+        still_ok: &dyn Fn() -> bool,
+    ) -> Result<(), NsError> {
+        let (from_parent, to_parent) = (parent_of(from)?, parent_of(to)?);
+        self.require_validated_volume(&[from_parent, to_parent])?;
+        #[cfg(unix)]
+        let handles = ops::open_parents(from_parent, to_parent)?;
+        hit(NsFailpoint::BeforeMove)?;
+        if !still_ok() {
+            return Err(NsError::Refused);
+        }
+        #[cfg(unix)]
+        ops::move_entry_via(&handles, from, to, replace).map_err(NsError::from_io)?;
+        #[cfg(not(unix))]
+        ops::move_entry(from, to, replace).map_err(NsError::from_io)?;
+        #[cfg(unix)]
+        if flush {
+            ops::sync_handles(&handles, from_parent, to_parent)?;
+        }
+        if flush {
+            hit(NsFailpoint::AfterMove)?;
+        }
+        Ok(())
+    }
+
+    /// Replaces `target` with `staged` only if what `target` names is the object the caller
+    /// decided to replace, with no gap between the decision and the replacement: the two names
+    /// are exchanged in one step (`renameat2(RENAME_EXCHANGE)` / `renamex_np(RENAME_SWAP)`), so
+    /// whatever stood at `target` at that instant is captured at `staged`, and `is_expected` is
+    /// asked about that captured object (at the path it now has). If it is the expected one it
+    /// is removed and the replacement stands; if not, the exchange is undone (the captured
+    /// object is back under `target`, `staged` is as it was) and the result is
+    /// [`NsError::Refused`]. A save made to `target` between the exchange and its undoing is
+    /// never lost: the captured object is then kept beside it under a reserved
+    /// [`ArtefactKind::Retained`] name.
+    ///
+    /// A missing `target` is [`NsError::Refused`] too (nothing was decided to be replaced). On
+    /// a platform or file system without an exchange the checked rename of [`Self::move_if`]
+    /// stands in, with its few-instruction window (on Windows the move opens its source and renames
+    /// with retries, so the window can last a fraction of a second). That is also what replaces a
+    /// symlink on Windows, because `ReplaceFileW` follows links. With `flush` false it is the rename alone
+    /// (the caller owes the flush of both parents), as [`Self::publish_without_flush`] is.
+    pub fn replace_if_unchanged(
+        &self,
+        staged: &Path,
+        target: &Path,
+        flush: bool,
+        is_expected: &dyn Fn(&Path) -> bool,
+    ) -> Result<(), NsError> {
+        let (from_parent, to_parent) = (parent_of(staged)?, parent_of(target)?);
+        self.require_validated_volume(&[from_parent, to_parent])?;
+        #[cfg(unix)]
+        let handles = ops::open_parents(from_parent, to_parent)?;
+        hit(NsFailpoint::BeforeMove)?;
+        #[cfg(unix)]
+        let swapped = swap_in_if_via(&handles, staged, target, is_expected);
+        #[cfg(not(unix))]
+        let swapped = swap_in_if(staged, target, is_expected);
+        match swapped.map_err(NsError::from_io)? {
+            SwapIn::Replaced => {}
+            SwapIn::Refused => return Err(NsError::Refused),
+            SwapIn::Unsupported => {
+                return self.move_if(staged, target, Replace::Yes, flush, &|| is_expected(target));
+            }
+        }
+        #[cfg(unix)]
+        if flush {
+            ops::sync_handles(&handles, from_parent, to_parent)?;
+        }
+        if flush {
+            hit(NsFailpoint::AfterMove)?;
+        }
+        Ok(())
     }
 
     /// Creates `target` with the content `write` produces: a Stage file beside
@@ -828,6 +1018,34 @@ mod relative_path_tests {
     }
 }
 
+#[cfg(test)]
+mod publish_name_tests {
+    use super::*;
+
+    /// A published file is at exactly the name it was published under, whatever that name's
+    /// length: the Windows move once read past names of some lengths.
+    #[test]
+    fn a_published_file_has_exactly_its_name_for_names_of_every_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut expected = Vec::new();
+        for length in 1..=40 {
+            let name = "n".repeat(length);
+            let staged = dir.path().join(format!("{name}.staged"));
+            fs::write(&staged, name.as_bytes()).unwrap();
+            publish_durably(&staged, &dir.path().join(&name), Replace::Yes).unwrap();
+            assert_eq!(fs::read(dir.path().join(&name)).unwrap(), name.as_bytes());
+            expected.push(name);
+        }
+        let mut found: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+        expected.sort();
+        assert_eq!(found, expected);
+    }
+}
+
 /// Moves `from` to `to` and returns once that is durable, for a caller that
 /// owns neither name's content beyond the move (a user file or directory kept
 /// under another name): [`DurableNamespace::durable_move`] where the volume
@@ -957,6 +1175,351 @@ fn parent_of(path: &Path) -> Result<&Path, NsError> {
 static NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A fresh reserved name of `kind` in the same directory as `target`.
+/// What [`swap_in_if`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwapIn {
+    /// The expected object was replaced.
+    Replaced,
+    /// What stood at the target was not the expected object (or nothing stood there); it is
+    /// where it was, and `staged` is untouched.
+    Refused,
+    /// No exchange here; nothing was done.
+    Unsupported,
+}
+
+/// The exchange-and-verify of [`DurableNamespace::replace_if_unchanged`], without the
+/// volume check and the directory flush: for a writer on a volume with no durable move.
+pub fn swap_in_if(
+    staged: &Path,
+    target: &Path,
+    is_expected: &dyn Fn(&Path) -> bool,
+) -> io::Result<SwapIn> {
+    // Only files and links change places: a rename refuses to put a file over a directory (and a
+    // directory over anything but an empty directory), and an exchange would not, so a directory
+    // on either side goes the checked-rename way, which keeps that refusal.
+    let is_dir = |path: &Path| fs::symlink_metadata(path).map(|meta| meta.is_dir());
+    if is_dir(staged)? || is_dir(target).unwrap_or(false) {
+        return Ok(SwapIn::Unsupported);
+    }
+    #[cfg(windows)]
+    {
+        // `ReplaceFileW` follows a link to the file it points at: it fails when the link dangles
+        // and would act on the pointed-at file otherwise, so it cannot replace the link itself. A
+        // link on either side goes the checked-rename way, whose rename replaces the name.
+        let is_link =
+            |path: &Path| fs::symlink_metadata(path).map(|meta| meta.file_type().is_symlink());
+        if is_link(staged)? || is_link(target).unwrap_or(false) {
+            return Ok(SwapIn::Unsupported);
+        }
+        // A Cloud Files placeholder at the target: a dehydrated one has no local bytes for a lost
+        // save to cost, and `ReplaceFileW` would leave its OFFLINE mark on the ordinary file that
+        // replaces it, so it goes the checked-rename way too. Before anything is touched, the
+        // provider has to be there: without it the platform answers every name request in the sync
+        // root with an error, and a swap would leave the names unreadable and the placeholder
+        // under a backup name. That is "not available now", reported as the error it is.
+        // Whether the target sits in a sync root is asked of the platform: once the provider is gone
+        // the attributes of a hydrated placeholder, or of an ordinary file in the root, show nothing.
+        let attributes = cloud_attributes(target);
+        let in_sync_root = raw::under_sync_root(target).unwrap_or(false);
+        if in_sync_root || attributes.is_some_and(|a| a.dehydrated || a.reparse) {
+            require_cloud_provider(target)?;
+        }
+        if attributes.is_some_and(|a| a.dehydrated) {
+            return Ok(SwapIn::Unsupported);
+        }
+        let ours = object_of(staged)?;
+        windows_swap_in_if(staged, target, ours, is_expected)
+    }
+    #[cfg(unix)]
+    {
+        let parents = ops::open_parents(
+            parent_of(staged).map_err(io::Error::from)?,
+            parent_of(target).map_err(io::Error::from)?,
+        )
+        .map_err(io::Error::from)?;
+        swap_in_if_via(&parents, staged, target, is_expected)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (staged, target, is_expected);
+        Ok(SwapIn::Unsupported)
+    }
+}
+
+/// The `HRESULT` of `ERROR_FLT_INVALID_NAME_REQUEST` ("An invalid name request was made. The name
+/// requested cannot be retrieved at this time"), as the raw OS error std reports it.
+const FLT_INVALID_NAME_REQUEST: i32 = 0x801F_0005_u32 as i32;
+/// `ERROR_CLOUD_FILE_PROVIDER_NOT_RUNNING`.
+const CLOUD_FILE_PROVIDER_NOT_RUNNING: i32 = 0x17B;
+
+/// Whether `error` says the provider of a Cloud Files sync root is not connected: the platform
+/// answers name requests in such a root with `ERROR_FLT_INVALID_NAME_REQUEST` (or reports
+/// `ERROR_CLOUD_FILE_PROVIDER_NOT_RUNNING` for data). The path is not wrong and nothing was lost;
+/// it is not available now, and a later attempt may find the provider back.
+pub fn is_cloud_provider_unavailable(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code) if code == FLT_INVALID_NAME_REQUEST || code == CLOUD_FILE_PROVIDER_NOT_RUNNING
+    )
+}
+
+/// What the attributes of a target say about Cloud Files.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+struct CloudAttributes {
+    /// The data is not on this machine (`RECALL_ON_DATA_ACCESS`, `RECALL_ON_OPEN` or `OFFLINE`).
+    dehydrated: bool,
+    /// A reparse point that is not a link (links never get here): possibly a placeholder.
+    reparse: bool,
+}
+
+#[cfg(windows)]
+fn cloud_attributes(target: &Path) -> Option<CloudAttributes> {
+    use crate::cloud_files;
+    let attributes = cloud_files::attributes_of(target)?;
+    Some(CloudAttributes {
+        dehydrated: cloud_files::content_is_remote(attributes),
+        reparse: attributes & cloud_files::REPARSE_POINT != 0,
+    })
+}
+
+/// Creates and removes a throwaway file beside `target`: that is refused, creating nothing, while
+/// the provider of a Cloud Files sync root is not connected (a stat, a directory listing or opening
+/// an existing file are all still answered, and renaming within the root is not a safe probe: the
+/// renamed file's name stops resolving). The error is returned as it came.
+#[cfg(windows)]
+fn require_cloud_provider(target: &Path) -> io::Result<()> {
+    // The platform's own statement first: on a root with population ALWAYS_FULL (every root the
+    // product registers) the create below is answered without a provider, so it cannot tell.
+    if raw::provider_disconnected(target) == Some(true) {
+        return Err(io::Error::from_raw_os_error(CLOUD_FILE_PROVIDER_NOT_RUNNING));
+    }
+    // A name that is taken (the names carry the process, the instant and a counter, so this is
+    // not expected) is a collision with the probe, not a statement about the target: try another.
+    for _ in 0..3 {
+        let name = crate::fs_capabilities::probe_artefact_name("provider")
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let probe = target.parent().unwrap_or(Path::new(".")).join(name);
+        match fs::OpenOptions::new().write(true).create_new(true).open(&probe) {
+            Ok(_) => {
+                let _ = ops::remove_file(&probe);
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::AlreadyExists, "no free probe name beside the target"))
+}
+
+/// [`swap_in_if`] relative to the two parents the caller holds (and will flush): every rename,
+/// the exchange and the removal act in those directories.
+#[cfg(unix)]
+fn swap_in_if_via(
+    parents: &ops::Parents,
+    staged: &Path,
+    target: &Path,
+    is_expected: &dyn Fn(&Path) -> bool,
+) -> io::Result<SwapIn> {
+    let is_dir = |path: &Path| fs::symlink_metadata(path).map(|meta| meta.is_dir());
+    if is_dir(staged)? || is_dir(target).unwrap_or(false) {
+        return Ok(SwapIn::Unsupported);
+    }
+    let ours = object_of(staged)?;
+    unix_swap_in_if(parents, staged, target, ours, is_expected)
+}
+
+#[cfg(unix)]
+fn unix_swap_in_if(
+    parents: &ops::Parents,
+    staged: &Path,
+    target: &Path,
+    ours: ObjectKey,
+    is_expected: &dyn Fn(&Path) -> bool,
+) -> io::Result<SwapIn> {
+    // The replacement is parked under a reserved name no sweep owns before the exchange: the
+    // staged name is the writer's temp name, which the next start removes, and whatever the
+    // exchange captures must never sit under a name that is removed on a guess.
+    let hold = reserved_sibling(target, ArtefactKind::Retained).map_err(io::Error::from)?;
+    ops::move_entry_via(parents, staged, &hold, Replace::No)?;
+    let give_back = || ops::move_back_via(parents, &hold, staged, Replace::No);
+    match ops::exchange_via(parents, &hold, target) {
+        Ok(true) => {}
+        Ok(false) => {
+            give_back()?;
+            return Ok(SwapIn::Unsupported);
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            give_back()?;
+            return Ok(SwapIn::Refused);
+        }
+        Err(error) => {
+            let _ = give_back();
+            return Err(error);
+        }
+    }
+    // `hold` now names what stood at `target`.
+    if is_expected(&hold) {
+        // The replacement stands. If the replaced object cannot be removed it stays under the
+        // reserved name, unswept, rather than being lost.
+        let _ = ops::remove_via(parents, &hold);
+        return Ok(SwapIn::Replaced);
+    }
+    if object_of(target).ok() == Some(ours) {
+        // Our file is still what stands at `target`, unmodified: put the captured object back.
+        match ops::exchange_via(parents, &hold, target) {
+            Ok(true) => {}
+            // The undo itself failed: our file stays published and the captured object stays
+            // under the reserved name. Nothing is lost; the caller sees a refusal.
+            Ok(false) | Err(_) => return Ok(SwapIn::Refused),
+        }
+        if object_of(&hold).ok() == Some(ours) {
+            // A failure to give the replacement back leaves it under the reserved name, with
+            // nothing lost; the caller still sees a refusal.
+            let _ = give_back();
+        }
+        // Otherwise a save landed on `target` between the check and the undo, and the undo
+        // moved it aside: it is the user's and stays under the reserved name, beside the
+        // object that is back under the name.
+        return Ok(SwapIn::Refused);
+    }
+    // `target` is no longer our file (saved over, or written in place): both are the user's
+    // now, so the captured object stays beside it under the reserved name rather than being
+    // swapped under it. The writer's own copy is gone with the save that replaced it: the
+    // caller refetches or rebuilds on the next pass, and the person's newer bytes are the ones
+    // that stand.
+    Ok(SwapIn::Refused)
+}
+
+/// Windows: `ReplaceFileW` captures what the name led to under a backup name (identity, size
+/// and times intact); the undo is two no-replace renames. The name is missing for a moment,
+/// which an exchange does not do; no save is lost.
+#[cfg(windows)]
+fn windows_swap_in_if(
+    staged: &Path,
+    target: &Path,
+    ours: ObjectKey,
+    is_expected: &dyn Fn(&Path) -> bool,
+) -> io::Result<SwapIn> {
+    let backup = reserved_sibling(target, ArtefactKind::Backup).map_err(io::Error::from)?;
+    // The person's marks on the file (read-only, hidden, system): the replace has to clear
+    // read-only to go through, so they are put back whenever the file goes back under a name.
+    let marks = raw::attributes(target);
+    let put_marks_back = |path: &Path| {
+        if let Some(marks) = marks {
+            raw::set_attributes(path, marks);
+        }
+    };
+    const READ_ONLY: u32 = 0x1;
+    if let Some(marks) = marks.filter(|marks| marks & READ_ONLY != 0) {
+        raw::set_attributes(target, marks & !READ_ONLY);
+    }
+    // A move whose flush failed afterwards HAS happened: the undo steps below must see it so, or
+    // the file goes back to one name and the person's file to another with nothing at the real name.
+    let moved = |result: io::Result<()>| match result {
+        Ok(()) => true,
+        Err(error) => raw::moved_but_not_flushed(&error),
+    };
+    match raw::replace_file_capturing(staged, target, &backup) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(SwapIn::Refused),
+        Err(error)
+            if error.raw_os_error() == Some(raw::ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 as i32) =>
+        {
+            // The captured object is under the backup name and a file appeared at `target`
+            // in the gap: put the captured one back if the name is free, else keep both.
+            if moved(ops::move_entry(&backup, target, Replace::No)) {
+                put_marks_back(target);
+            } else {
+                put_marks_back(&keep_beside(&backup, target));
+            }
+            return Ok(SwapIn::Refused);
+        }
+        Err(error) => {
+            put_marks_back(target);
+            return Err(error);
+        }
+    }
+    if is_expected(&backup) {
+        let _ = ops::remove_file(&backup);
+        put_marks_back(target);
+        return Ok(SwapIn::Replaced);
+    }
+    if object_of(target).ok() == Some(ours) {
+        // Our file stands at `target` still, unmodified: it goes back to its staged name and
+        // the captured object to its own. Plain renames, not a second `ReplaceFileW`: that
+        // one needs the replacement not open elsewhere, and the captured object may have a
+        // handle on it. In the moment between the two a save can create `target`; then the
+        // captured object is kept beside it.
+        if !moved(ops::move_entry(target, staged, Replace::No)) {
+            // Our file cannot go back to its staged name: it stays published, and the
+            // captured object stays beside it. Nothing is lost.
+            put_marks_back(&keep_beside(&backup, target));
+            return Ok(SwapIn::Refused);
+        }
+        if object_of(staged).ok() != Some(ours) {
+            // A save was renamed over `target` after the check, and it is what just moved:
+            // it goes back under the name and the captured object is kept beside it.
+            if !moved(ops::move_entry(staged, target, Replace::No)) {
+                keep_beside(staged, target);
+            }
+            put_marks_back(&keep_beside(&backup, target));
+            return Ok(SwapIn::Refused);
+        }
+        if moved(ops::move_entry(&backup, target, Replace::No)) {
+            put_marks_back(target);
+        } else {
+            put_marks_back(&keep_beside(&backup, target));
+        }
+        return Ok(SwapIn::Refused);
+    }
+    put_marks_back(&keep_beside(&backup, target));
+    Ok(SwapIn::Refused)
+}
+
+/// Whether a no-replace move of `from` to `to` happened (a flush that failed after it counts).
+#[cfg(windows)]
+fn moved_entry(from: &Path, to: &Path) -> bool {
+    match ops::move_entry(from, to, Replace::No) {
+        Ok(()) => true,
+        Err(error) => raw::moved_but_not_flushed(&error),
+    }
+}
+
+#[cfg(windows)]
+/// Keeps `captured` next to `target` under a reserved name that no sweep owns, for an object
+/// that must not be lost and cannot go back under its name. Where even that rename fails the
+/// object stays under the (reserved) name it has: nothing is lost either way. The path it ends
+/// up at is returned.
+fn keep_beside(captured: &Path, target: &Path) -> PathBuf {
+    match reserved_sibling(target, ArtefactKind::Retained) {
+        Ok(keep) if moved_entry(captured, &keep) => keep,
+        _ => captured.to_path_buf(),
+    }
+}
+
+/// What a name leads to, as the identity layer sees it (volume and object), with its size and
+/// modification time: a file written in place after it was observed is another key.
+type ObjectKey = (
+    crate::fs_identity::VolumeIdentity,
+    crate::fs_identity::PlatformObjectId,
+    crate::fs_identity::ObjectKind,
+    u64,
+    Option<std::time::SystemTime>,
+);
+
+fn object_of(path: &Path) -> io::Result<ObjectKey> {
+    let identity = crate::fs_identity::FileIdentity::observe_path(path)?;
+    let modified = fs::symlink_metadata(path)?.modified().ok();
+    Ok((
+        identity.volume_identity,
+        identity.object_id,
+        identity.object_kind,
+        identity.observed_size,
+        modified,
+    ))
+}
+
 fn reserved_sibling(target: &Path, kind: ArtefactKind) -> Result<PathBuf, NsError> {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let id = format!(
@@ -1040,8 +1603,27 @@ pub fn disarm_failpoint() {
     ARMED.with(|armed| armed.set(None));
 }
 
+/// Test seam: runs once, at the next [`NsFailpoint::BeforeMove`] (after the parent directories
+/// were opened and before the rename), to change the namespace in the window a path-named
+/// rename would be redirected in.
+#[cfg(any(test, feature = "test-support"))]
+pub fn before_next_move(f: impl FnOnce() + 'static) {
+    BEFORE_MOVE.with(|hook| *hook.borrow_mut() = Some(Box::new(f)));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static BEFORE_MOVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(any(test, feature = "test-support"))]
 fn hit(failpoint: NsFailpoint) -> Result<(), NsError> {
+    if failpoint == NsFailpoint::BeforeMove {
+        if let Some(f) = BEFORE_MOVE.with(|hook| hook.borrow_mut().take()) {
+            f();
+        }
+    }
     if !is_quiet() && ARMED.with(|armed| armed.get()) == Some(failpoint) {
         disarm_failpoint();
         return Err(NsError::Crashed(failpoint));
@@ -1133,29 +1715,131 @@ mod ops {
         removed
     }
 
+    /// The two parent directories of a move, open for the whole of it: the rename is made
+    /// relative to these descriptors and these are the ones flushed, so the directories renamed
+    /// in are exactly the directories made durable.
     #[cfg(unix)]
-    pub(super) fn open_parents(
-        from_parent: &Path,
-        to_parent: &Path,
-    ) -> Result<Vec<super::raw::DirHandle>, NsError> {
-        let mut handles = vec![super::raw::DirHandle::open(to_parent).map_err(NsError::from_io)?];
-        if from_parent != to_parent {
-            handles.push(super::raw::DirHandle::open(from_parent).map_err(NsError::from_io)?);
+    pub(super) struct Parents {
+        to: super::raw::DirHandle,
+        /// `None` when both names live in one directory.
+        from: Option<super::raw::DirHandle>,
+    }
+
+    #[cfg(unix)]
+    impl Parents {
+        fn source_dir(&self) -> &super::raw::DirHandle {
+            self.from.as_ref().unwrap_or(&self.to)
         }
-        Ok(handles)
+
+        /// Whether each descriptor still is the directory its path names now. A parent
+        /// component swapped since the open shows here; for a rename made relative to the
+        /// descriptors it cannot have redirected anything.
+        pub(super) fn still_named(
+            &self,
+            from_parent: &Path,
+            to_parent: &Path,
+        ) -> Result<(), NsError> {
+            for (handle, dir) in [(&self.to, to_parent), (self.source_dir(), from_parent)] {
+                if !handle.is_directory_at(dir).map_err(NsError::from_io)? {
+                    return Err(NsError::from_io(io::Error::other(
+                        "a parent directory changed while the move was prepared",
+                    )));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn open_parents(from_parent: &Path, to_parent: &Path) -> Result<Parents, NsError> {
+        let to = super::raw::DirHandle::open(to_parent).map_err(NsError::from_io)?;
+        let from = if from_parent != to_parent {
+            Some(super::raw::DirHandle::open(from_parent).map_err(NsError::from_io)?)
+        } else {
+            None
+        };
+        let parents = Parents { to, from };
+        parents.still_named(from_parent, to_parent)?;
+        Ok(parents)
     }
 
     #[cfg(unix)]
     pub(super) fn sync_handles(
-        handles: &[super::raw::DirHandle],
+        parents: &Parents,
         from_parent: &Path,
         to_parent: &Path,
     ) -> Result<(), NsError> {
-        let dirs = [to_parent, from_parent];
-        for (handle, dir) in handles.iter().zip(dirs) {
-            handle.sync().map_err(NsError::from_io)?;
-            trace::emit(|| trace::Event::FlushDir { dir: dir.into() });
+        parents.to.sync().map_err(NsError::from_io)?;
+        trace::emit(|| trace::Event::FlushDir { dir: to_parent.into() });
+        if let Some(from) = &parents.from {
+            from.sync().map_err(NsError::from_io)?;
+            trace::emit(|| trace::Event::FlushDir { dir: from_parent.into() });
         }
+        Ok(())
+    }
+
+    /// [`move_entry_via`] the other way: from the target's directory to the source's.
+    #[cfg(unix)]
+    pub(super) fn move_back_via(
+        parents: &Parents,
+        from: &Path,
+        to: &Path,
+        replace: Replace,
+    ) -> io::Result<()> {
+        super::raw::move_entry_at(
+            &parents.to,
+            super::raw::entry_name(from)?,
+            parents.source_dir(),
+            super::raw::entry_name(to)?,
+            replace,
+        )?;
+        trace::emit(|| trace::Event::Move {
+            from: from.into(),
+            to: to.into(),
+            write_through: true,
+        });
+        Ok(())
+    }
+
+    /// Swaps two entries of the target's directory.
+    #[cfg(unix)]
+    pub(super) fn exchange_via(parents: &Parents, a: &Path, b: &Path) -> io::Result<bool> {
+        super::raw::exchange_at(
+            &parents.to,
+            super::raw::entry_name(a)?,
+            &parents.to,
+            super::raw::entry_name(b)?,
+        )
+    }
+
+    /// Removes a non-directory entry of the target's directory.
+    #[cfg(unix)]
+    pub(super) fn remove_via(parents: &Parents, path: &Path) -> io::Result<()> {
+        super::raw::remove_file_at(&parents.to, super::raw::entry_name(path)?)?;
+        trace::emit(|| trace::Event::Remove { path: path.into() });
+        Ok(())
+    }
+
+    /// [`move_entry`] relative to the held parents.
+    #[cfg(unix)]
+    pub(super) fn move_entry_via(
+        parents: &Parents,
+        from: &Path,
+        to: &Path,
+        replace: Replace,
+    ) -> io::Result<()> {
+        super::raw::move_entry_at(
+            parents.source_dir(),
+            super::raw::entry_name(from)?,
+            &parents.to,
+            super::raw::entry_name(to)?,
+            replace,
+        )?;
+        trace::emit(|| trace::Event::Move {
+            from: from.into(),
+            to: to.into(),
+            write_through: true,
+        });
         Ok(())
     }
 

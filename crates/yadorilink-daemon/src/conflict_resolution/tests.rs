@@ -106,3 +106,24 @@ async fn a_copy_below_a_folder_linked_out_of_the_root_is_refused() {
     assert_eq!(std::fs::read_to_string(&outside_copy).unwrap(), "outside the folder");
     assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
 }
+
+/// Keep both moves the copy to its own name; the steps recorded are the fence bump and the move
+/// (capture authors the rows afterwards).
+#[cfg(unix)]
+#[tokio::test]
+async fn keep_both_goes_prepared_published() {
+    use crate::write_op::trace::StepTrace;
+    use crate::write_op::StepEvent;
+    const GROUP: &str = "group-keep-both-trace";
+    const COPY: &str = "tracecb (conflicted copy, 2026-01-01-000000, device-b).txt";
+    let (state, root, _store_dir) = fixture(GROUP, COPY);
+    std::fs::write(root.path().join(COPY), "theirs").unwrap();
+
+    let result = resolve_conflict(&state, GROUP, COPY, ConflictChoice::KeepBoth).await;
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        StepTrace::of(GROUP, "tracecb (other version).txt"),
+        [StepEvent::Prepared, StepEvent::Published { names_deferred: false, landed_marked: false }]
+    );
+}

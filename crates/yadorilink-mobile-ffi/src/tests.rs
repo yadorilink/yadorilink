@@ -9,6 +9,8 @@ use std::task::{Context, Poll, Wake, Waker};
 use yadorilink_ipc_proto::shellipc::shell_ipc_message::Payload;
 use yadorilink_ipc_proto::shellipc::{ListProviderFoldersRequest, ShellIpcMessage};
 
+use yadorilink_embedded_host::dto;
+
 use super::*;
 
 /// Drives a future on the calling thread, the way Swift's executor drives an exported future.
@@ -273,7 +275,7 @@ fn refusals_of_every_family_arrive_typed() {
     // a link that exists, so an unknown link is the plain failure.
     let pause = PauseLinkRequest {
         link_key: "/not/linked".into(),
-        duration: PauseFor::OneHour,
+        duration: PauseFor::TwoHours,
         expected_group_id: None,
     };
     assert!(matches!(
@@ -316,6 +318,22 @@ fn status_space_management_and_the_account_read_through_the_exported_calls() {
 
     let account = host.account_status(&fresh(), Some(30_000)).unwrap();
     assert!(!account.device_registered);
+    host.stop().unwrap();
+}
+
+#[test]
+fn the_metered_policy_pauses_on_a_reported_metered_connection_until_allowed() {
+    let area = area();
+    let host = MobileHost::new(area.config.clone());
+    host.start().unwrap();
+    let policy = host.network_policy(&fresh(), Some(30_000)).unwrap();
+    assert!(!policy.sync_on_metered && !policy.paused_on_metered);
+    assert_eq!(policy.cost, NetworkCost::Unknown);
+
+    let policy = host.report_network_cost(NetworkCost::Metered, &fresh(), Some(30_000)).unwrap();
+    assert!(policy.paused_on_metered, "metered and not allowed: paused");
+    let policy = host.set_sync_on_metered(true, &fresh(), Some(30_000)).unwrap();
+    assert!(!policy.paused_on_metered && policy.sync_on_metered);
     host.stop().unwrap();
 }
 
@@ -467,9 +485,13 @@ fn a_joinable_group_is_the_facades_summary() {
     let group: JoinableGroup = yadorilink_embedded_host::dto::GroupSummary {
         group_id: "g1".into(),
         name: "Photos".into(),
+        created_by_device: None,
     }
     .into();
-    assert_eq!(group, JoinableGroup { group_id: "g1".into(), name: "Photos".into() });
+    assert_eq!(
+        group,
+        JoinableGroup { group_id: "g1".into(), name: "Photos".into(), created_by_device: None }
+    );
 }
 
 /// A step-up of a signed-out engine is refused at its begin, as the step-up's own typed error
@@ -710,6 +732,8 @@ fn activity_records_map_the_facades_dtos() {
             kind: dto::ActivityKind::Updated,
             origin_device_id: Some("d1".into()),
             origin_device_name: Some("Mac".into()),
+            other_origin_device_id: Some("d2".into()),
+            other_origin_device_name: Some("Phone".into()),
             is_this_device: false,
             at: Some(at),
         }],
@@ -726,6 +750,8 @@ fn activity_records_map_the_facades_dtos() {
                 kind: ActivityKind::Updated,
                 origin_device_id: Some("d1".into()),
                 origin_device_name: Some("Mac".into()),
+                other_origin_device_id: Some("d2".into()),
+                other_origin_device_name: Some("Phone".into()),
                 is_this_device: false,
                 at: Some(at),
             }],
@@ -798,6 +824,12 @@ fn send_link_states_and_failures_mirror_the_products() {
     assert_eq!(
         RefusalCode::from(yadorilink_ipc_proto::daemonctl::ApplicationErrorCode::SendLinksDisabled),
         RefusalCode::SendLinksDisabled
+    );
+    assert_eq!(
+        RefusalCode::from(
+            yadorilink_ipc_proto::daemonctl::ApplicationErrorCode::SendPreviewUnverified
+        ),
+        RefusalCode::SendPreviewUnverified
     );
 }
 
@@ -1101,6 +1133,28 @@ fn a_refused_pairing_code_has_its_own_account_error_kind() {
     assert_eq!(error.kind, AccountErrorKind::PairingCodeInvalid);
 }
 
+/// A rate-limited sign-in has its own account error kind with the service's wait as a number,
+/// so an app never parses the message.
+#[test]
+fn a_rate_limit_carries_its_wait_as_a_number() {
+    use crate::app::{AccountError, AccountErrorKind};
+    use yadorilink_embedded_host::{DesktopError, NetworkErrorKind};
+    let limited = |retry_after_secs| {
+        AccountError::from(DesktopError::Network {
+            message: "m".into(),
+            kind: NetworkErrorKind::RateLimited { retry_after_secs },
+        })
+    };
+    let error = limited(Some(42));
+    assert_eq!((error.kind, error.retry_after_secs), (AccountErrorKind::RateLimited, Some(42)));
+    assert_eq!(limited(None).retry_after_secs, None);
+    let down = AccountError::from(DesktopError::Network {
+        message: "m".into(),
+        kind: NetworkErrorKind::Unreachable,
+    });
+    assert_eq!((down.kind, down.retry_after_secs), (AccountErrorKind::Network, None));
+}
+
 /// Each of the seven hand-over refusals has its own account error kind; other refusals stay
 /// `Refused`.
 #[test]
@@ -1270,4 +1324,159 @@ fn the_history_listings_refuse_an_unknown_root() {
         .expect_err("no such root");
     assert!(matches!(refused, CallFailure::Failed { .. }), "{refused:?}");
     host.stop().unwrap();
+}
+
+/// A revoke on an engine with no signed-in identity is refused typed, nothing changed.
+#[test]
+fn revoking_a_member_without_an_identity_is_refused_typed() {
+    let area = area();
+    let host = MobileHost::new(area.config.clone());
+    host.start().unwrap();
+    let refused = host
+        .revoke_member("g1".into(), "d1".into(), false, &fresh(), Some(30_000))
+        .expect_err("no identity");
+    assert!(matches!(&refused, CallFailure::Refused { .. }), "{refused:?}");
+    host.stop().unwrap();
+}
+
+/// A group device carries the member's role and how it relates to the person looking.
+#[test]
+fn a_group_device_carries_role_and_relationship() {
+    let member = |role, relationship| dto::MemberSummary {
+        device_id: "d".into(),
+        device_name: "n".into(),
+        role,
+        relationship,
+        storage: dto::MemberStorage::OnDemand,
+        online: false,
+        last_seen: None,
+    };
+    let invited =
+        GroupDevice::from(member(dto::ShareRole::Viewer, dto::MemberRelationship::Invited));
+    assert_eq!(
+        (invited.role, invited.relationship),
+        (MemberRole::Viewer, MemberRelationship::Invited)
+    );
+    assert!(!invited.can_write && !invited.is_this_device);
+    let owner =
+        GroupDevice::from(member(dto::ShareRole::Owner, dto::MemberRelationship::OwnersDevice));
+    assert_eq!(
+        (owner.role, owner.relationship),
+        (MemberRole::Owner, MemberRelationship::OwnersDevice)
+    );
+    assert!(owner.can_write);
+    let odd = GroupDevice::from(member(
+        dto::ShareRole::Other { raw: "x".into() },
+        dto::MemberRelationship::You,
+    ));
+    assert_eq!(odd.role, MemberRole::Other { raw: "x".into() });
+    assert!(odd.is_this_device);
+}
+
+#[test]
+fn debug_output_of_a_created_send_link_never_shows_the_code() {
+    let link = crate::send::SendLink {
+        link_id: "link-1".into(),
+        code: "SECRETCODE".into(),
+        expires_at: None,
+    };
+    let text = format!("{link:?}");
+    assert!(!text.contains("SECRETCODE"), "{text}");
+    assert!(text.contains("link-1"));
+}
+
+// --- failure reason keys: an app words the key, never the engine's English text ---
+
+#[test]
+fn a_command_failure_carries_the_reason_key_of_its_cause() {
+    use yadorilink_embedded_host::{CallError, CommandError};
+    let full = CommandError::from_error(&std::io::Error::from(std::io::ErrorKind::StorageFull));
+    match CallFailure::from(CallError::Failed(full)) {
+        CallFailure::Failed { reason: FailureReason::DiskFull, .. } => {}
+        other => panic!("{other:?}"),
+    }
+    let denied =
+        CommandError::from_error(&std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    match CallFailure::from(CallError::Failed(denied)) {
+        CallFailure::Failed { reason: FailureReason::AccessDenied, .. } => {}
+        other => panic!("{other:?}"),
+    }
+    // A failure with no recognised cause is a generic one: the key says so and the text is for the log.
+    match CallFailure::from(CallError::Failed(CommandError::failed("unknown item"))) {
+        CallFailure::Failed { reason: FailureReason::Unspecified, message } => {
+            assert_eq!(message, "unknown item");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_folder_not_joined_again_carries_its_reason_key() {
+    use yadorilink_embedded_host::dto;
+    let report = dto::StartOverProgress::Finished {
+        report: dto::StartOverReport {
+            retired_device_id: "old".into(),
+            new_device_id: "new".into(),
+            rejoined: Vec::new(),
+            not_rejoined: vec![
+                dto::NotRejoined {
+                    local_path: "provider://a".into(),
+                    group_id: "g".into(),
+                    message: "engine text".into(),
+                    reason: dto::RejoinReason::ProviderFolder,
+                },
+                dto::NotRejoined {
+                    local_path: "/b".into(),
+                    group_id: "h".into(),
+                    message: "engine text".into(),
+                    reason: dto::RejoinReason::NotGroupOwner,
+                },
+            ],
+            complete: true,
+        },
+    };
+    let crate::app::StartOverProgress::Finished { report } = report.into() else { panic!() };
+    let reasons: Vec<_> = report.not_rejoined.iter().map(|f| f.reason).collect();
+    assert_eq!(
+        reasons,
+        [crate::app::RejoinReason::ProviderFolder, crate::app::RejoinReason::NotGroupOwner]
+    );
+}
+
+/// Every failure an app can receive has a key it words itself; a variant added without one does not
+/// compile here, which is the moment to decide its key (or that `Unspecified` is right).
+#[test]
+fn every_host_visible_failure_names_the_key_an_app_words() {
+    fn call_key(failure: &CallFailure) -> &'static str {
+        match failure {
+            CallFailure::NotRunning { .. } => "case:not_running",
+            CallFailure::HandleUsed => "case:handle_used",
+            CallFailure::Cancelled { .. } => "case:cancelled",
+            CallFailure::DeadlineExceeded { .. } => "case:deadline_exceeded",
+            CallFailure::EngineStopped => "case:engine_stopped",
+            CallFailure::NoChangeSource { .. } => "case:no_change_source",
+            CallFailure::NoFullReplica { .. } => "case:no_full_replica",
+            CallFailure::Refused { .. } => "code:refusal_code",
+            CallFailure::PreservedRefused { .. } => "reason:preserved_refusal",
+            CallFailure::ReadoptRefused { .. } => "reason:readopt_refusal",
+            CallFailure::Account { .. } => "kind:account_error_kind",
+            CallFailure::Failed { .. } => "reason:failure_reason",
+        }
+    }
+    fn host_key(failure: &HostFailure) -> &'static str {
+        match failure {
+            HostFailure::WrongState { .. } => "case:wrong_state",
+            HostFailure::AlreadyRunning { .. } => "case:already_running",
+            HostFailure::SharedCredentialStore { .. } => "case:shared_credential_store",
+            HostFailure::WitnessPlacementRequired => "case:witness_placement_required",
+            HostFailure::WitnessDirUnusable { .. } => "case:witness_dir_unusable",
+            HostFailure::StoreIncompatible { .. } => "case:store_incompatible",
+            HostFailure::StartFailed { .. } => "reason:failure_reason",
+            HostFailure::Runtime { .. } => "case:runtime",
+            HostFailure::Draining => "case:draining",
+            HostFailure::Closed => "case:closed",
+        }
+    }
+    assert_eq!(call_key(&CallFailure::HandleUsed), "case:handle_used");
+    assert_eq!(host_key(&HostFailure::Closed), "case:closed");
 }

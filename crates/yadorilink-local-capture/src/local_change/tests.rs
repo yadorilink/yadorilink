@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind};
 use yadorilink_fs_platform::fs_identity::disk_race_fingerprint;
-use yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet;
+use yadorilink_fs_platform::ignore_patterns::{EffectiveIgnoreSet, IgnoreRulesStore};
 use yadorilink_local_storage::SegmentBlockStore;
 use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::ids::SyncPath;
@@ -21,7 +21,8 @@ use yadorilink_replica_domain::local_op::Op;
 use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_sync_sqlite::SyncSqliteError;
 
-fn processor() -> (LocalChangeProcessor, Arc<TestReplica>, tempfile::TempDir, tempfile::TempDir) {
+pub(super) fn processor(
+) -> (LocalChangeProcessor, Arc<TestReplica>, tempfile::TempDir, tempfile::TempDir) {
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(SegmentBlockStore::new(store_dir.path()).unwrap());
     let state = Arc::new(TestReplica::open_in_memory().unwrap());
@@ -303,7 +304,7 @@ fn build_race_fixture() -> (
 
     std::fs::write(root.join(RACE_PATH), b"offline-local-edit-content").unwrap();
 
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
     (processor, state, root, ignore_set, store_dir, root_dir)
 }
 
@@ -611,7 +612,7 @@ async fn build_toctou_fixture() -> (
         "sanity: nothing must be on disk under this exact name while held"
     );
 
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
     (processor, state, root, ignore_set, store_dir, root_dir, content)
 }
 
@@ -1175,7 +1176,7 @@ async fn a_scanned_offline_deletion_publishes_an_absent_actual_state_proof() {
     // The deletion itself: gone from disk with nothing watching, so
     // only the reconciliation scan can notice it.
     std::fs::remove_file(root.join(OFFLINE_DELETE_PATH)).unwrap();
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
     let records = processor
         .scan_existing_files_with_ignore(OFFLINE_DELETE_GROUP, &root, &ignore_set)
         .unwrap();
@@ -1627,6 +1628,163 @@ async fn unchanged_size_and_mtime_skips_rechunking_entirely() {
         1,
         "no spurious version bump from an unchanged file"
     );
+}
+
+// --- The watcher's report of this device's own just-verified write ---------------------------------
+
+/// Indexes `name` (the first event), then records it as just written and verified, as the
+/// materialization path does, with `now` the moment of that verification.
+#[cfg(unix)]
+async fn indexed_and_noted_as_verified(
+    proc: &LocalChangeProcessor,
+    state: &Arc<TestReplica>,
+    root: &std::path::Path,
+    name: &str,
+    bytes: &[u8],
+    now: std::time::SystemTime,
+) -> std::path::PathBuf {
+    let file_path = root.join(name);
+    std::fs::write(&file_path, bytes).unwrap();
+    expect_file_changed(
+        proc.process_event(
+            "group-1",
+            root,
+            &FsChangeEvent { path: file_path.clone(), kind: FsChangeKind::CreatedOrModified },
+        )
+        .await
+        .unwrap(),
+    );
+    let version =
+        crate::ports::LocalMutationStore::canonical_current_row(&**state, "group-1", name)
+            .unwrap()
+            .unwrap()
+            .version_hash();
+    let identity =
+        yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(&file_path).unwrap();
+    state.verified_echoes.note(
+        yadorilink_fs_platform::verified_echo::VerifiedWrite {
+            group_id: "group-1",
+            path: name,
+            version,
+            identity: &identity,
+            out_path: &file_path,
+        },
+        now,
+    );
+    file_path
+}
+
+#[cfg(unix)]
+async fn event_for(
+    proc: &LocalChangeProcessor,
+    root: &std::path::Path,
+    file_path: &std::path::Path,
+) -> LocalChangeOutcome {
+    proc.process_event(
+        "group-1",
+        root,
+        &FsChangeEvent { path: file_path.to_path_buf(), kind: FsChangeKind::CreatedOrModified },
+    )
+    .await
+    .unwrap()
+}
+
+/// The event for a write this device just verified, with the file untouched since, is a no-op
+/// that does not read the file; the same event without the record of the verification reads it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_just_verified_write_is_not_read_and_hashed_again() {
+    let (proc, state, _store, _store_dir, root_dir) = processor_with_counting_store();
+    let root = canonical_root(&root_dir);
+    adopt_root(&state, "group-1", &root);
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    let file_path = indexed_and_noted_as_verified(
+        &proc,
+        &state,
+        &root,
+        "echo.bin",
+        &vec![b'x'; 300_000],
+        later,
+    )
+    .await;
+    let reads_before = disk_observation::verify_calls::count(&file_path);
+
+    assert_eq!(event_for(&proc, &root, &file_path).await, LocalChangeOutcome::None);
+    assert_eq!(
+        disk_observation::verify_calls::count(&file_path),
+        reads_before,
+        "the echo of a verified write must not read and hash the file again"
+    );
+
+    // Control: forget the verification and the same event reads the file.
+    state.verified_echoes.forget("group-1", "echo.bin");
+    assert_eq!(event_for(&proc, &root, &file_path).await, LocalChangeOutcome::None);
+    assert_eq!(disk_observation::verify_calls::count(&file_path), reads_before + 1);
+}
+
+/// A write whose timestamps are too recent to prove anything later (the racy-clean rule) is not
+/// remembered, so its echo reads the file.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_verified_within_the_timestamp_window_is_read_again() {
+    let (proc, state, _store, _store_dir, root_dir) = processor_with_counting_store();
+    let root = canonical_root(&root_dir);
+    adopt_root(&state, "group-1", &root);
+    let file_path = indexed_and_noted_as_verified(
+        &proc,
+        &state,
+        &root,
+        "fresh.bin",
+        b"just written",
+        std::time::SystemTime::now(),
+    )
+    .await;
+    let reads_before = disk_observation::verify_calls::count(&file_path);
+    assert_eq!(event_for(&proc, &root, &file_path).await, LocalChangeOutcome::None);
+    assert_eq!(disk_observation::verify_calls::count(&file_path), reads_before + 1);
+}
+
+/// An edit that keeps the size and restores the modification time is still caught after the write
+/// was verified: the change time moved, so the file is no longer the verified one.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_same_size_edit_after_a_verified_write_is_still_captured() {
+    let (proc, state, _store, _store_dir, root_dir) = processor_with_counting_store();
+    let root = canonical_root(&root_dir);
+    adopt_root(&state, "group-1", &root);
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    let file_path =
+        indexed_and_noted_as_verified(&proc, &state, &root, "edit.bin", &[b'A'; 4096], later).await;
+
+    overwrite_in_place_preserving_size_and_mtime(&file_path, &[b'B'; 4096]);
+
+    let record = expect_file_changed(event_for(&proc, &root, &file_path).await);
+    assert!(!record.deleted);
+    assert_eq!(
+        std::fs::read(&file_path).unwrap(),
+        vec![b'B'; 4096],
+        "the edit itself is untouched"
+    );
+}
+
+/// A `chmod` after the write was verified is still captured (the change time moves with it).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_chmod_after_a_verified_write_is_still_captured() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (proc, state, _store, _store_dir, root_dir) = processor_with_counting_store();
+    let root = canonical_root(&root_dir);
+    adopt_root(&state, "group-1", &root);
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    let file_path =
+        indexed_and_noted_as_verified(&proc, &state, &root, "tool.sh", b"#!/bin/sh\n", later).await;
+    assert!(!state.file_index_repository().get_exec("group-1", "tool.sh").unwrap());
+
+    std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    expect_file_changed(event_for(&proc, &root, &file_path).await);
+    assert!(state.file_index_repository().get_exec("group-1", "tool.sh").unwrap());
 }
 
 /// DI-3 tail closed: a content edit that preserves BOTH the byte length
@@ -2676,7 +2834,7 @@ async fn deleting_never_indexed_ignored_paths_generates_no_tombstone() {
     let (proc, state, _store_dir, root_dir) = processor();
     let root = canonical_root(&root_dir);
     adopt_root(&state, "group-1", &root);
-    let ignore_set = EffectiveIgnoreSet::from_user_patterns("*.tmp\n");
+    let ignore_set = EffectiveIgnoreSet::from_text("*.tmp\n").unwrap();
 
     let user_ignored = root.join("scratch.tmp");
     let user_outcome = proc
@@ -2830,13 +2988,12 @@ async fn local_edit_while_hydrating_is_captured() {
 fn scan_existing_files_skips_ignored_directories_and_leaf_files() {
     let (proc, state, _store_dir, root_dir) = processor();
     let root = canonical_root(&root_dir);
-    let ignore_set = EffectiveIgnoreSet::from_user_patterns("node_modules/\nsrc/*.log\n");
+    let ignore_set = EffectiveIgnoreSet::from_text("node_modules/\nsrc/*.log\n").unwrap();
     std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("node_modules/pkg/index.js"), b"ignored dependency").unwrap();
     std::fs::write(root.join("src/debug.log"), b"ignored log").unwrap();
     std::fs::write(root.join("src/keep.txt"), b"kept").unwrap();
-    std::fs::write(root.join(".yadorilinkignore"), b"node_modules/\n").unwrap();
 
     let records = proc.scan_existing_files_with_ignore("group-1", &root, &ignore_set).unwrap();
     let paths: Vec<&str> = records.iter().map(|r| r.path.as_str()).collect();
@@ -2849,11 +3006,6 @@ fn scan_existing_files_skips_ignored_directories_and_leaf_files() {
         .unwrap()
         .is_none());
     assert!(state.file_index_repository().get_file("group-1", "src/debug.log").unwrap().is_none());
-    assert!(state
-        .file_index_repository()
-        .get_file("group-1", ".yadorilinkignore")
-        .unwrap()
-        .is_none());
 }
 
 #[test]
@@ -2866,7 +3018,7 @@ fn scan_existing_files_drops_newly_ignored_index_entries_without_tombstones() {
     assert_eq!(first_scan.len(), 2);
     assert!(state.file_index_repository().get_file("group-1", "ignored.txt").unwrap().is_some());
 
-    let ignore_set = EffectiveIgnoreSet::from_user_patterns("ignored.txt\n");
+    let ignore_set = EffectiveIgnoreSet::from_text("ignored.txt\n").unwrap();
     let rescan = proc.scan_existing_files_with_ignore("group-1", &root, &ignore_set).unwrap();
 
     assert!(
@@ -3276,7 +3428,7 @@ fn scan_existing_files_indexes_previously_ignored_file_after_pattern_removal() {
     let (proc, state, _store_dir, root_dir) = processor();
     let root = canonical_root(&root_dir);
     std::fs::write(root.join("build.log"), b"now wanted").unwrap();
-    let ignored = EffectiveIgnoreSet::from_user_patterns("*.log\n");
+    let ignored = EffectiveIgnoreSet::from_text("*.log\n").unwrap();
     let first_scan = proc.scan_existing_files_with_ignore("group-1", &root, &ignored).unwrap();
     assert!(first_scan.is_empty());
     assert!(state.file_index_repository().get_file("group-1", "build.log").unwrap().is_none());
@@ -3818,7 +3970,7 @@ fn repair_errored_boot_suppresses_all_scan_tombstones() {
     index_hydrated_missing_file(&state, "group-1", "deferred.txt");
     // Deliberately NO intent: on a healthy boot this would tombstone. The
     // repair-errored gate must still withhold it.
-    let ignore_set = EffectiveIgnoreSet::from_user_patterns("");
+    let ignore_set = EffectiveIgnoreSet::from_text("").unwrap();
 
     let records =
         proc.scan_existing_files_with_ignore_gated("group-1", &root, &ignore_set, false).unwrap();
@@ -4484,7 +4636,7 @@ async fn batch_commit_failure_leaves_nothing_committed_and_every_dirty_row_survi
     let group = "group-1";
     adopt_root(&state, group, &root);
 
-    let ignore_set = EffectiveIgnoreSet::from_user_patterns("");
+    let ignore_set = EffectiveIgnoreSet::from_text("").unwrap();
     let mut pending = Vec::new();
     for i in 0..3 {
         let name = format!("f-{i}.txt");
@@ -4575,7 +4727,7 @@ async fn a_peer_mutation_between_preparation_and_validation_excludes_the_stale_m
         )
         .unwrap();
 
-    let ignore_set = EffectiveIgnoreSet::from_user_patterns("");
+    let ignore_set = EffectiveIgnoreSet::from_text("").unwrap();
     let mut pending = Vec::new();
     let outcome = proc
         .process_event_with_ignore_at(
@@ -4720,7 +4872,7 @@ async fn a_local_create_over_a_placement_scaffold_is_not_a_descendant_of_the_pee
     let root = canonical_root(&root_dir);
     let group = "group-1";
     adopt_root(&state, group, &root);
-    let ignore_set = EffectiveIgnoreSet::from_user_patterns("");
+    let ignore_set = EffectiveIgnoreSet::from_text("").unwrap();
 
     // A peer's create is admitted, and reconciliation scaffolds the path
     // before its placement is retried.
@@ -4786,7 +4938,7 @@ async fn a_peer_create_admitted_between_capture_and_emit_of_a_new_path_is_not_it
     let root = canonical_root(&root_dir);
     let group = "group-1";
     adopt_root(&state, group, &root);
-    let ignore_set = EffectiveIgnoreSet::from_user_patterns("");
+    let ignore_set = EffectiveIgnoreSet::from_text("").unwrap();
 
     let path = root.join("new.txt");
     std::fs::write(&path, b"created locally").unwrap();
@@ -4901,7 +5053,7 @@ async fn a_raw_disk_write_between_preparation_and_validation_excludes_the_stale_
         )
         .unwrap();
 
-    let ignore_set = EffectiveIgnoreSet::from_user_patterns("");
+    let ignore_set = EffectiveIgnoreSet::from_text("").unwrap();
     let mut pending = Vec::new();
     let outcome = proc
         .process_event_with_ignore_at(
@@ -4957,7 +5109,7 @@ async fn concurrent_overlapping_batches_never_deadlock_regardless_of_preparation
     let path_b = root.join("b.txt");
     std::fs::write(&path_a, b"aaa").unwrap();
     std::fs::write(&path_b, b"bbb").unwrap();
-    let ignore_set = EffectiveIgnoreSet::from_user_patterns("");
+    let ignore_set = EffectiveIgnoreSet::from_text("").unwrap();
 
     let mut batch1 = Vec::new();
     for p in [&path_a, &path_b] {
@@ -5092,19 +5244,17 @@ async fn a_batch_mixing_creates_and_deletes_commits_both_variants_together() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn process_flush_paths_skips_ignored_files_and_ignore_config_file() {
+async fn process_flush_paths_skips_ignored_files() {
     let (proc, state, _store_dir, root_dir) = processor();
     let root = canonical_root(&root_dir);
     adopt_root(&state, "group-1", &root);
-    let ignore_set = EffectiveIgnoreSet::from_user_patterns("*.tmp\n");
+    let ignore_set = EffectiveIgnoreSet::from_text("*.tmp\n").unwrap();
     std::fs::write(root.join("keep.txt"), b"kept").unwrap();
     std::fs::write(root.join("scratch.tmp"), b"ignored").unwrap();
-    std::fs::write(root.join(".yadorilinkignore"), b"*.tmp\n").unwrap();
 
     let flush = yadorilink_filesystem_sync::debounce::DebounceFlush::Paths(vec![
         (root.join("keep.txt"), FsChangeKind::CreatedOrModified, 0),
         (root.join("scratch.tmp"), FsChangeKind::CreatedOrModified, 0),
-        (root.join(".yadorilinkignore"), FsChangeKind::CreatedOrModified, 0),
     ]);
     let outcome =
         proc.process_flush_with_ignore("group-1", &root, flush, &ignore_set, true).await.unwrap();
@@ -5112,11 +5262,6 @@ async fn process_flush_paths_skips_ignored_files_and_ignore_config_file() {
     assert_eq!(outcome.records.len(), 1);
     assert_eq!(outcome.records[0].path, "keep.txt");
     assert!(state.file_index_repository().get_file("group-1", "scratch.tmp").unwrap().is_none());
-    assert!(state
-        .file_index_repository()
-        .get_file("group-1", ".yadorilinkignore")
-        .unwrap()
-        .is_none());
 }
 
 /// A `RescanRequired` flush runs a full reconciliation scan instead of
@@ -5182,7 +5327,7 @@ async fn process_flush_rescan_required_forwards_a_false_emit_tombstones_gate() {
     // Removed "offline" (no daemon in between); a plain RescanRequired
     // scan with the gate left on would tombstone this immediately.
     std::fs::remove_file(&file_path).unwrap();
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
     let outcome = proc
         .process_flush_with_ignore(
             "group-1",
@@ -6576,7 +6721,7 @@ async fn stale_policy_scan_withholds_index_write_then_reemits_offline_edit_once_
     // The restart scan detects the offline edit, but policy is stale: it
     // must withhold both the native delta and the index write and journal the
     // path dirty. The old silent fallback wrote the index here.
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
     let scan_records = proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
     assert!(
         scan_records.is_empty(),
@@ -6653,7 +6798,7 @@ async fn policy_withheld_first_import_leaves_every_path_with_a_usable_generation
         std::fs::write(root.join(name), format!("content of {name}").as_bytes()).unwrap();
     }
 
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
     let scanned = proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
     assert!(
         scanned.is_empty(),
@@ -6723,7 +6868,8 @@ fn processor_with_emitter() -> (
         "device-a".into(),
         std::sync::Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
     )
-    .with_change_emitter(emitter.clone());
+    .with_change_emitter(emitter.clone())
+    .with_ignore_rules(IgnoreRulesStore::new(store_dir.path().join("config")));
     let root_dir = tempfile::tempdir().unwrap();
     (proc, state, emitter, store_dir, root_dir)
 }
@@ -7121,7 +7267,7 @@ async fn offline_edit_after_existing_dag_history_must_append_new_head_on_restart
     // against disk (the real path every linked folder's restart runs),
     // then re-runs the idempotent initial import, mirroring
     // `yadorilink-daemon`'s restart sequence exactly.
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
     let scan_records = proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
     assert!(!scan_records.is_empty(), "sanity: the restart scan must notice the offline edit");
 
@@ -7178,7 +7324,7 @@ async fn offline_delete_after_existing_dag_history_must_append_delete_change() {
     std::fs::remove_file(&file_path).unwrap();
 
     // Restart: scan + re-run the idempotent import, exactly as above.
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
     let scan_records = proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
     assert!(
         scan_records.iter().any(|r| r.path == "report.txt" && r.deleted),
@@ -7237,7 +7383,7 @@ async fn dirty_journal_redrive_must_not_clear_a_change_missing_from_dag() {
     // change to the group's history at scan time. The re-run initial
     // import is a no-op once real history exists.
     std::fs::write(&file_path, b"version two, edited while the daemon was stopped").unwrap();
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
     proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
 
     let heads_after_scan = crate::test_support::native_group_heads(&state, group);
@@ -7342,7 +7488,7 @@ fn scan_emits_symlink_metadata_atomically_with_its_file_version() {
     let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
     let root = canonical_root(&root_dir);
     let group = "group-1";
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
 
     // Establish native history so the scan takes the emitting path.
     std::fs::write(root.join("seed.txt"), b"seed").unwrap();
@@ -7400,7 +7546,7 @@ fn scan_emits_unix_mode_atomically_with_its_file_version() {
     let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
     let root = canonical_root(&root_dir);
     let group = "group-1";
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
 
     std::fs::write(root.join("seed.txt"), b"seed").unwrap();
     proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
@@ -7458,7 +7604,7 @@ async fn an_offline_metadata_only_change_publishes_a_proof_for_the_version_it_em
     let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
     let root = canonical_root(&root_dir);
     let group = "group-1";
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
     adopt_root(&state, group, &root);
 
     // A live capture establishes the group's first history, its index
@@ -7545,7 +7691,7 @@ async fn captured_script() -> (
 ) {
     let (proc, state, _emitter, store_dir, root_dir) = processor_with_emitter();
     let root = canonical_root(&root_dir);
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
     adopt_root(&state, "group-1", &root);
     let file = root.join("tool.sh");
     std::fs::write(&file, b"#!/bin/sh\necho hi\n").unwrap();
@@ -7713,7 +7859,7 @@ fn one_bulk_local_emission_leaves_no_runnable_obligations() {
 
     let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
     let root = canonical_root(&root_dir);
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
 
     // Well under RECONCILE_CHUNK_OP_LIMIT, so the whole scan is ONE
     // change in ONE transaction -- the unit the question is about.
@@ -7776,7 +7922,7 @@ fn a_first_scan_commits_each_row_together_with_the_metadata_it_observed() {
 
     let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
     let root = canonical_root(&root_dir);
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
 
     // Enough paths that a per-path setter loop could not plausibly be
     // mistaken for atomic, with metadata that differs per path so a
@@ -7882,7 +8028,7 @@ fn a_scan_with_no_emitter_still_commits_each_row_with_the_metadata_it_observed()
         "device-a".into(),
         std::sync::Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
     );
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
 
     for i in 0..4 {
         let path = root.join(format!("file{i:02}.sh"));
@@ -7945,7 +8091,7 @@ fn two_concurrent_full_reconcile_requests_author_one_change_per_path() {
     let proc = Arc::new(proc);
     let root = canonical_root(&root_dir);
     const GROUP: &str = "concurrent-reconcile";
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
 
     const FILE_COUNT: usize = 8;
     for i in 0..FILE_COUNT {
@@ -8044,7 +8190,7 @@ async fn a_historical_inadmissible_row_does_not_fail_a_reconciliation_chunk() {
     let root = canonical_root(&root_dir);
     let group = "group-1";
     adopt_root(&state, group, &root);
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
 
     // The row a pre-rule build could have left behind: live, current,
     // and naming a path admission now refuses permanently.
@@ -8201,7 +8347,7 @@ fn bulk_offline_reconcile_chunks_by_op_count_into_a_chain() {
     let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
     let root = canonical_root(&root_dir);
     let group = "group-1";
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
 
     let n = RECONCILE_CHUNK_OP_LIMIT + 3;
     for i in 0..n {
@@ -8259,7 +8405,7 @@ fn streaming_reconciliation_surfaces_each_durable_chunk_before_the_whole_scan_re
     let (proc, _state, _emitter, _store_dir, root_dir) = processor_with_emitter();
     let root = canonical_root(&root_dir);
     let group = "group-1";
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
 
     let n = RECONCILE_CHUNK_OP_LIMIT + 3;
     for i in 0..n {
@@ -8313,7 +8459,7 @@ fn bulk_offline_reconcile_chunks_by_encoded_bytes_into_a_chain() {
     let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
     let root = canonical_root(&root_dir);
     let group = "group-1";
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
 
     std::fs::create_dir(root.join("d")).unwrap();
     // ~289 bytes/op * 1000 ops ~= 282 KiB > 256 KiB, yet 1000 < 1024 ops,
@@ -8759,7 +8905,7 @@ fn the_survivors_first_post_recovery_scan_emits_no_tombstones() {
         .set_suppress_tombstones(&root_a.path().to_string_lossy(), true)
         .unwrap();
 
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(root_a.path()).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
     let emit_tombstones = !state.link_repository().suppress_tombstones_for_group(group).unwrap();
     let out = processor
         .scan_existing_files_with_ignore_gated(group, root_a.path(), &ignore_set, emit_tombstones)
@@ -9517,7 +9663,7 @@ fn streaming_reconciliation_stops_when_the_chunk_consumer_fails() {
     let (proc, _state, _emitter, _store_dir, root_dir) = processor_with_emitter();
     let root = canonical_root(&root_dir);
     let group = "group-1";
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
 
     let n = RECONCILE_CHUNK_OP_LIMIT * 3;
     for i in 0..n {
@@ -9650,7 +9796,7 @@ fn interrupted_streaming_scan(
     };
     let root = canonical_root(&root_dir);
     let group = "group-1";
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
     for i in 0..n {
         std::fs::write(root.join(format!("f{i:05}")), format!("body {i}")).unwrap();
     }
@@ -9868,7 +10014,7 @@ async fn a_write_between_the_batch_fingerprint_check_and_the_identity_observatio
     let path = root.join("b.txt");
     std::fs::write(&path, b"version one!!").unwrap();
 
-    let ignore_set = EffectiveIgnoreSet::from_user_patterns("");
+    let ignore_set = EffectiveIgnoreSet::from_text("").unwrap();
     let mut pending = Vec::new();
     let outcome = proc
         .process_event_with_ignore_at(
@@ -9921,7 +10067,7 @@ async fn prepare_batched_upsert(
 ) -> (std::path::PathBuf, Vec<flush::PendingBatchedCommit>) {
     let path = root.join(name);
     std::fs::write(&path, bytes).unwrap();
-    let ignore_set = EffectiveIgnoreSet::from_user_patterns("");
+    let ignore_set = EffectiveIgnoreSet::from_text("").unwrap();
     let mut pending = Vec::new();
     let outcome = proc
         .process_event_with_ignore_at(
@@ -10027,7 +10173,7 @@ async fn a_batched_delete_is_dropped_when_the_exact_name_exists_at_commit() {
     expect_file_changed(proc.process_event(group, &root, &event).await.unwrap());
 
     std::fs::remove_file(&path).unwrap();
-    let ignore_set = EffectiveIgnoreSet::from_user_patterns("");
+    let ignore_set = EffectiveIgnoreSet::from_text("").unwrap();
     let mut pending = Vec::new();
     let outcome = proc
         .process_event_with_ignore_at(
@@ -10148,7 +10294,7 @@ async fn a_rescan_refused_by_a_pause_reports_it_and_the_repeat_captures_everythi
     adopt_root(&state, "group-1", &root);
     std::fs::write(root.join("gone.txt"), b"to be deleted").unwrap();
     std::fs::write(root.join("kept.txt"), b"v1").unwrap();
-    let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+    let ignore_set = EffectiveIgnoreSet::defaults_only();
     proc.scan_existing_files_with_ignore("group-1", &root, &ignore_set).unwrap();
 
     // Changes the watcher never reported (it overflowed): only a rescan can find them.

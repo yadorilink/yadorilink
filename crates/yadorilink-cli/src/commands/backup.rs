@@ -18,6 +18,7 @@ use yadorilink_ipc_proto::daemonctl::ListLinksRequest;
 use crate::control_client;
 use crate::device_config;
 use crate::error::CliError;
+use crate::i18n::tr;
 
 /// The one-line recovery model every backup surface repeats: identity is
 /// re-established by Google login on a new device, not restored from a file.
@@ -52,13 +53,13 @@ struct NonSensitiveBackup {
 
 pub fn status() -> Result<(), CliError> {
     let inv = BackupInventory::detect()?;
-    println!("Backup readiness (non-sensitive config and link metadata only):");
+    println!("{}", tr("Backup readiness (non-sensitive config and link metadata only):"));
     println!("  device config: {}", present(inv.device_config));
     println!("  link metadata (sync database): {}", present(inv.sync_database));
     println!();
     println!("{}", recovery_guidance());
     println!();
-    println!("Recovery coverage:");
+    println!("{}", tr("Recovery coverage:"));
     println!(
         "  lost one device: sign in with Google on a new device, re-join your folders, and \
 re-fetch their content from the surviving authorized peers that hold it"
@@ -161,7 +162,7 @@ non-sensitive settings from the backup"
                 cfg.coordination_addr = addr;
             }
             device_config::save(&cfg)?;
-            println!("Restored non-sensitive config (coordination address).");
+            println!("{}", tr("Restored non-sensitive config (coordination address)."));
         }
         Err(_) => {
             return Err(CliError::Other(
@@ -174,7 +175,7 @@ backup), then re-run import to apply the saved non-sensitive settings"
     }
 
     if backup.links.is_empty() {
-        println!("No linked-folder metadata was saved in this backup.");
+        println!("{}", tr("No linked-folder metadata was saved in this backup."));
     } else {
         println!(
             "\nRe-join these folders (re-run the link for each once the device is registered):"

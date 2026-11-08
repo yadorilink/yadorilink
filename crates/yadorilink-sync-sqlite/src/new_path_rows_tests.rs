@@ -388,10 +388,11 @@ const VOLATILE_COLUMNS: [&str; 9] = [
     "held_at_unix_nanos",
 ];
 
-/// Change detectors that move on every row write (the root-set counter, and the state token the
-/// native heads' triggers draw at random), so differ by construction: the shortcut writes each new
+/// Change detectors that move on every row write (the root-set counter, and the head-write counter
+/// the native heads' triggers advance), so differ by construction: the shortcut writes each new
 /// row once instead of three times.
-const WRITE_COUNTING_TABLES: [&str; 2] = ["file_root_set_generation", "native_state_generation"];
+const WRITE_COUNTING_TABLES: [&str; 3] =
+    ["file_root_set_generation", "native_namespace_root", "native_namespace_node"];
 
 /// Every column of every table, minus the volatile ones, sorted.
 fn dump_all(conn: &Connection, skip_columns: &[&str]) -> BTreeMap<String, Vec<Vec<String>>> {

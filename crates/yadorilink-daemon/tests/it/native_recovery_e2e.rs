@@ -1355,3 +1355,335 @@ async fn an_item_whose_bytes_are_gone_everywhere_completes_when_they_arrive() {
     preserved_items::restore(shared(&c), GROUP, &items[0].item_id).await.unwrap();
     converge_to(&[&b, &c], &[("x.txt", b"first")], "the completed item restored").await;
 }
+
+// --- a provider-root device: the machine stopped at every point -----------------------------
+
+use yadorilink_replica_domain::session_state::ProviderKind;
+use yadorilink_sync_sqlite::provider::ProviderLinkSpec;
+
+/// A device whose folder is a provider root: a provider link row and its declared root, no
+/// directory and no runtime watching one.
+fn provider_device(name: &str) -> TopologyNode {
+    let node = native_e2e_support::new_node_fast(name);
+    node.state
+        .replica_coordinator
+        .link_repository()
+        .add_provider_link(
+            &format!("provider://{name}"),
+            GROUP,
+            &ProviderLinkSpec {
+                kind: ProviderKind::MacFileProvider,
+                display_name: "Photos".into(),
+                empty_owner: false,
+                on_demand: true,
+                creation_digest: "test".into(),
+            },
+        )
+        .unwrap();
+    node
+}
+
+/// `a` (a folder) and `b` (a provider root) agree on `kept.txt`; then `b` is cut off while `a`
+/// moves on and collects the history `b` would need.
+async fn lagging_provider_pair(prefix: &str) -> (TopologyNode, TopologyNode) {
+    let a = device(&format!("{prefix}-a"), GROUP);
+    let b = provider_device(&format!("{prefix}-b"));
+    pair(&a, &b, GROUP).await;
+    write(&a, "kept.txt", b"kept");
+    state_matches(&b, &a).await;
+    partition(&a, &b).await;
+    for content in [&b"one"[..], b"two", b"three"] {
+        write(&a, "doc.txt", content);
+        captured(&a, GROUP).await;
+    }
+    assert!(collect_replication_log(&a, GROUP) > 0, "superseded deltas were collected");
+    (a, b)
+}
+
+/// What `node` holds of the group's native state, as one comparable value: its author
+/// frontier and the root of the namespace its heads make.
+fn native_frontier(node: &TopologyNode) -> String {
+    let frontier = read(node, |conn| native_store::load_frontier(conn, &group()));
+    let namespace =
+        read(node, |conn| native_store::namespace_root(&native_store::load_state(conn, &group())?));
+    format!("{frontier:?} namespace {namespace:?}")
+}
+
+/// Waits until `node` holds exactly the native state `peer` holds (and some).
+async fn state_matches(node: &TopologyNode, peer: &TopologyNode) {
+    support::wait_until_with_context(
+        || frontier_len(node) > 0 && native_frontier(node) == native_frontier(peer),
+        CONVERGE,
+        || {
+            format!(
+                "{} holds {}, its peer {}",
+                node.device_id,
+                native_frontier(node),
+                native_frontier(peer)
+            )
+        },
+    )
+    .await;
+}
+
+use yadorilink_daemon::embedded_host::{ApplyChange, EngineCommands, StageMode, StageSource};
+use yadorilink_ipc_proto::shellipc::{
+    EntryKind, ProviderApplyChangeRequest, ProviderChangeKind, ProviderContentSource,
+};
+use yadorilink_sync_sqlite::provider::ProviderDeclaration;
+
+/// The user saves `name` into the provider root of the device through the provider write path,
+/// as the OS's file provider reports it. Returns the answer and the staging directory.
+async fn provider_write(
+    state: &Arc<yadorilink_daemon::daemon_state::DaemonState>,
+    name: &str,
+    seq: u64,
+    bytes: &[u8],
+) -> (yadorilink_ipc_proto::shellipc::ProviderApplyChangeResponse, tempfile::TempDir) {
+    use sha2::{Digest, Sha256};
+    let ProviderDeclaration::Provider(root) =
+        state.replica_coordinator.provider_repository().declaration_for_group(GROUP).unwrap()
+    else {
+        panic!("the provider link declares its root");
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let commands = EngineCommands::for_state_with_temp_root_for_test(state.clone(), temp.path());
+    let picked = temp.path().parent().unwrap().join(format!("picked-{}-{name}", state.device_id));
+    std::fs::write(&picked, bytes).unwrap();
+    let staged =
+        commands.stage_upload(StageSource::Path(picked), StageMode::Move).await.expect("staged");
+    let request = ProviderApplyChangeRequest {
+        request_id: format!("attempt-{seq}").into_bytes(),
+        session_id: vec![5; 16],
+        operation_seq: seq,
+        root_id: hex::decode(root.root_id).unwrap(),
+        kind: ProviderChangeKind::Create as i32,
+        name: Some(name.into()),
+        entry_kind: EntryKind::File as i32,
+        content: Some(ProviderContentSource {
+            ingest_name: staged.ingest_name,
+            size: staged.size,
+            sha256: Sha256::digest(bytes).to_vec(),
+        }),
+        ..Default::default()
+    };
+    (commands.apply_change(ApplyChange(request)).await.0, temp)
+}
+
+/// Runs the rebootstrap of the provider device once, stopping the machine at its `stop_at`th
+/// point (counted from 0; none when `None`). Returns every point the machine passed before it
+/// ended or was stopped, and the device afterwards.
+async fn provider_rebootstrap(
+    prefix: &str,
+    stop_at: Option<usize>,
+) -> (Vec<Point>, TopologyNode, TopologyNode, bool) {
+    let (a, b) = lagging_provider_pair(prefix).await;
+    let seen: Arc<std::sync::Mutex<Vec<Point>>> = Arc::default();
+    let stopped = Arc::new(AtomicBool::new(false));
+    b.state.set_rebootstrap_hook_for_test(Some({
+        let (seen, stopped) = (seen.clone(), stopped.clone());
+        let (state, handle) = (b.state.clone(), tokio::runtime::Handle::current());
+        let (edited, staging) = (AtomicBool::new(false), std::sync::Mutex::new(None));
+        Arc::new(move |point| {
+            // The user saves a file through the provider the moment the final capture begins:
+            // the group is frozen, so the write is refused to be retried, not taken and lost.
+            if point == Point::Begin(Failpoint::BeforeCapture)
+                && !edited.swap(true, Ordering::SeqCst)
+            {
+                let (response, temp) =
+                    handle.block_on(provider_write(&state, "during.txt", 2, b"x"));
+                assert!(
+                    !response.ok
+                        && response.failure
+                            == yadorilink_ipc_proto::shellipc::ProviderApplyFailure::Retry as i32,
+                    "a write during the freeze is refused to be retried: {response:?}"
+                );
+                *staging.lock().unwrap() = Some(temp);
+            }
+            let mut seen = seen.lock().unwrap();
+            seen.push(point);
+            if Some(seen.len() - 1) == stop_at {
+                stopped.store(true, Ordering::SeqCst);
+                return Err(Crash);
+            }
+            Ok(())
+        })
+    }));
+    pair(&a, &b, GROUP).await;
+    match stop_at {
+        Some(stop) => {
+            support::wait_until_with_context(
+                || stopped.load(Ordering::SeqCst),
+                CONVERGE,
+                || {
+                    format!(
+                        "the rebootstrap never reached stop point {stop}; it passed {:?}",
+                        seen.lock().unwrap()
+                    )
+                },
+            )
+            .await;
+        }
+        None => {
+            state_matches(&b, &a).await;
+            support::wait_until_with_context(
+                || journal_state(&b).is_none(),
+                CONVERGE,
+                || format!("the journal still says {:?}", journal_state(&b)),
+            )
+            .await;
+        }
+    }
+    let points = seen.lock().unwrap().clone();
+    (points, a, b, stopped.load(Ordering::SeqCst))
+}
+
+/// A provider-root device that fell behind rebuilds itself from a peer's sealed state with no
+/// folder to capture from or set aside, and a stop at any point of the machine leaves a state
+/// the restart continues from to the same end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_provider_root_device_rebuilds_and_survives_a_stop_at_every_point() {
+    setup();
+    let (points, _a, _b, _) = provider_rebootstrap("rb0", None).await;
+    if rebootstrap_is_refused_here() {
+        return;
+    }
+    assert!(
+        points.contains(&Point::Machine(MachinePoint::BeforeReplaying)),
+        "the machine ran to its replay: {points:?}"
+    );
+    for (stop_at, point) in points.iter().enumerate() {
+        let (_, a, b, stopped) =
+            provider_rebootstrap(&format!("pr{}", stop_at + 1), Some(stop_at)).await;
+        assert!(stopped, "stop {stop_at} ({:?}) was reached", point);
+        let b = restart(b, &[&a], GROUP).await;
+        // What the provider projector does when the daemon starts.
+        yadorilink_daemon::test_support::start_provider_rebootstrap_resume(&b.state);
+        // A stop before the barrier is discarded by the restart and the device asks for the
+        // state again, so the end is the device holding the peer's state with no journal.
+        let deadline = std::time::Instant::now() + CONVERGE;
+        let done = |b: &TopologyNode| {
+            journal_state(b).is_none()
+                && frontier_len(b) > 0
+                && native_frontier(b) == native_frontier(&a)
+        };
+        while !done(&b) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            done(&b),
+            "stop {stop_at} ({:?}): journal {:?}, state {} vs {}",
+            point,
+            journal_state(&b),
+            native_frontier(&b),
+            native_frontier(&a)
+        );
+        assert!(!read(&b, |conn| group_frozen(conn, GROUP)), "stop {stop_at}: the group thaws");
+        assert!(!tree(&a).contains_key("during.txt"), "a refused write must not appear");
+    }
+}
+
+// --- a folder device holding rows the target supersedes: the machine stopped at every point --
+
+/// `a` and `b` agree on `kept.txt` and `gone.txt`; then `b` is cut off while `a` rewrites the
+/// first, removes the second and collects the history `b` would need. The rows `b` holds for
+/// both are out of date once it installs `a`'s state.
+async fn lagging_folder_pair(prefix: &str) -> (TopologyNode, TopologyNode) {
+    let a = device(&format!("{prefix}-a"), GROUP);
+    let b = device(&format!("{prefix}-b"), GROUP);
+    pair(&a, &b, GROUP).await;
+    write(&a, "kept.txt", b"kept");
+    write(&a, "gone.txt", b"gone");
+    converge_to(&[&a, &b], &[("kept.txt", b"kept"), ("gone.txt", b"gone")], "initial").await;
+    partition(&a, &b).await;
+    remove(&a, "gone.txt");
+    for content in [&b"one"[..], b"two", b"three"] {
+        write(&a, "kept.txt", content);
+        captured(&a, GROUP).await;
+    }
+    assert!(collect_replication_log(&a, GROUP) > 0, "superseded deltas were collected");
+    (a, b)
+}
+
+async fn folder_rebootstrap(
+    prefix: &str,
+    stop_at: Option<usize>,
+) -> (Vec<Point>, TopologyNode, TopologyNode, bool) {
+    let (a, b) = lagging_folder_pair(prefix).await;
+    let seen: Arc<std::sync::Mutex<Vec<Point>>> = Arc::default();
+    let stopped = Arc::new(AtomicBool::new(false));
+    b.state.set_rebootstrap_hook_for_test(Some({
+        let (seen, stopped) = (seen.clone(), stopped.clone());
+        Arc::new(move |point| {
+            let mut seen = seen.lock().unwrap();
+            seen.push(point);
+            if Some(seen.len() - 1) == stop_at {
+                stopped.store(true, Ordering::SeqCst);
+                return Err(Crash);
+            }
+            Ok(())
+        })
+    }));
+    pair(&a, &b, GROUP).await;
+    match stop_at {
+        Some(stop) => {
+            support::wait_until_with_context(
+                || stopped.load(Ordering::SeqCst),
+                CONVERGE,
+                || {
+                    format!(
+                        "the rebootstrap never reached stop point {stop}; it passed {:?}",
+                        seen.lock().unwrap()
+                    )
+                },
+            )
+            .await;
+        }
+        None => {
+            converge_to(&[&a, &b], &[("kept.txt", b"three")], "the lagging device caught up").await;
+            support::wait_until_with_context(
+                || journal_state(&b).is_none(),
+                CONVERGE,
+                || format!("the journal still says {:?}", journal_state(&b)),
+            )
+            .await;
+        }
+    }
+    let points = seen.lock().unwrap().clone();
+    (points, a, b, stopped.load(Ordering::SeqCst))
+}
+
+/// A folder device that fell behind keeps a database that opens again wherever the machine
+/// stops, though it holds file rows the installed state supersedes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_folder_device_with_superseded_rows_survives_a_stop_at_every_point() {
+    setup();
+    let (points, _a, _b, _) = folder_rebootstrap("fr0", None).await;
+    if rebootstrap_is_refused_here() {
+        return;
+    }
+    for (stop_at, point) in points.iter().enumerate() {
+        let (_, a, b, stopped) =
+            folder_rebootstrap(&format!("fr{}", stop_at + 1), Some(stop_at)).await;
+        assert!(stopped, "stop {stop_at} ({point:?}) was reached");
+        let b = restart(b, &[&a], GROUP).await;
+        converge_to(
+            &[&a, &b],
+            &[("kept.txt", b"three")],
+            &format!("stop {stop_at} ({point:?}): the restarted device finished"),
+        )
+        .await;
+        support::wait_until_with_context(
+            || journal_state(&b).is_none(),
+            CONVERGE,
+            || {
+                format!(
+                    "stop {stop_at} ({point:?}): the journal still says {:?}",
+                    journal_state(&b)
+                )
+            },
+        )
+        .await;
+        assert!(!read(&b, |conn| group_frozen(conn, GROUP)), "stop {stop_at}: the group thaws");
+    }
+}

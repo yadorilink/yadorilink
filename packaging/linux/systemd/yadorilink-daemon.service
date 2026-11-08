@@ -43,6 +43,9 @@ Wants=network-online.target
 Type=simple
 ExecStart=/usr/bin/yadorilink-daemon
 Restart=on-failure
+# 78: another daemon holds the data area (one started by hand) or another owner manages it;
+# starting again cannot help.
+RestartPreventExitStatus=78
 RestartSec=2
 
 [Install]

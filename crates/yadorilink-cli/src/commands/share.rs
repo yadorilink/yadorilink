@@ -9,6 +9,7 @@ use yadorilink_client_core::ops::shares::{self as ops, GrantOutcome, RevokeEdgeO
 use yadorilink_ipc_proto::daemonctl::MintedInviteInfo;
 
 use crate::error::CliError;
+use crate::i18n::trf;
 
 use yadorilink_client_core::ops::shares::{
     GroupMemberInfo, GroupSummary, PendingApproval, PendingInviteInfo, ShareEdgeInfo,
@@ -139,7 +140,7 @@ pub async fn list_invites() -> Result<(), CliError> {
 /// `yadorilink share cancel-invite <invite-id>`.
 pub async fn cancel_invite(invite_id: String) -> Result<(), CliError> {
     ops::cancel_invite(&invite_id).await?;
-    println!("Cancelled invite: {invite_id}");
+    println!("{}", trf!("Cancelled invite: {invite_id}", invite_id = invite_id));
     Ok(())
 }
 
@@ -152,7 +153,15 @@ pub async fn create(group_name: String, path: String, yes: bool) -> Result<(), C
     let (absolute, acknowledged) =
         crate::commands::link::preflight_and_acknowledge(&path, yes).await?;
     let group_id = ops::create_and_link(group_name, absolute, false, acknowledged).await?;
-    println!("Created folder group {group_id} and linked it at {path}");
+    println!(
+        "{}",
+        trf!(
+            "Created folder group {group_id} and linked it at {path}",
+            group_id = group_id,
+            path = path
+        )
+    );
+    println!("{}", crate::commands::link::CHECK_PROGRESS);
     Ok(())
 }
 
@@ -324,7 +333,7 @@ pub async fn revoke_edge(edge_id: String, force: bool, yes: bool) -> Result<(), 
     match ops::revoke_edge(&edge_id, force).await? {
         RevokeEdgeOutcome::Revoked(outcome) => {
             crate::commands::membership_render::render_membership_outcome("revoke", &outcome);
-            println!("Revoked share edge: {edge_id}");
+            println!("{}", trf!("Revoked share edge: {edge_id}", edge_id = edge_id));
         }
         RevokeEdgeOutcome::AlreadyRevoked => println!("Share edge already revoked: {edge_id}"),
     }
@@ -346,7 +355,7 @@ pub async fn delete_group(
         yes,
     )?;
     ops::delete_group(&group_name, acknowledge_cross_account_members).await?;
-    println!("Deleted folder group: {group_name}");
+    println!("{}", trf!("Deleted folder group: {group_name}", group_name = group_name));
     Ok(())
 }
 
@@ -463,6 +472,9 @@ pub async fn join(
     )
     .await?;
     println!("{}", joined_line(&group_name, &local_path, on_demand, outcome.already_linked));
+    if !outcome.already_linked {
+        println!("{}", crate::commands::link::CHECK_PROGRESS);
+    }
     Ok(())
 }
 

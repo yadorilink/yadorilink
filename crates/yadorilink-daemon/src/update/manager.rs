@@ -67,6 +67,13 @@ pub enum VersionCheckKind {
 /// keep failing stops vouching for an entry rather than vouching from old data.
 const VERIFIED_MAX_AGE_SECS: i64 = 12 * 3600;
 
+/// Longest an on-demand check may take before the app is answered with what is known.
+const ON_DEMAND_CHECK_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// An on-demand check is skipped when the last check of any kind started less than this long ago,
+/// so an app that keeps asking cannot turn a failing endpoint into a request loop.
+const ON_DEMAND_CHECK_MIN_GAP: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone)]
 struct VerifiedManifest {
     channel: String,
@@ -240,8 +247,16 @@ fn detect_install_source() -> String {
 
 #[cfg(target_os = "linux")]
 fn detect_install_source() -> String {
-    let exe = install_source::running_exe();
-    install_source::detect_linux_install_source(install_source_runner(), &exe)
+    // Asked once per process: the answer is a property of the running binary, and three callers
+    // ask at start-up (the daemon's identity, its update manager, its entry point), each of which
+    // used to run `dpkg-query -S`, which reads every file list of the package database.
+    static DETECTED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DETECTED
+        .get_or_init(|| {
+            let exe = install_source::running_exe();
+            install_source::detect_linux_install_source(install_source_runner(), &exe)
+        })
+        .clone()
 }
 
 #[cfg(all(target_os = "linux", not(test)))]
@@ -276,6 +291,11 @@ pub struct UpdateManager {
     /// The newest manifest this process verified (or restored from disk, re-verified), for [`UpdateManager::verified_entry`], which
     /// answers from it without touching the network or the replay floor.
     verified: std::sync::Mutex<Option<VerifiedManifest>>,
+    /// Held for the whole of one check, so the periodic job, a user-initiated check and an
+    /// on-demand check from [`UpdateManager::verified_entry_or_check`] never run side by side:
+    /// a caller that waited re-reads the answer the first one produced.
+    check_gate: tokio::sync::Mutex<()>,
+    last_on_demand: std::sync::Mutex<Option<std::time::Instant>>,
     http: reqwest::Client,
     manifest_url: String,
     current_version: semver::Version,
@@ -350,6 +370,8 @@ impl UpdateManager {
             replay: ReplayStore::new(config_dir.as_ref()),
             verified_path: config_dir.as_ref().join(PERSISTED_VERIFIED_FILE),
             verified: std::sync::Mutex::new(None),
+            check_gate: tokio::sync::Mutex::new(()),
+            last_on_demand: std::sync::Mutex::new(None),
             http,
             manifest_url,
             current_version,
@@ -414,6 +436,11 @@ impl UpdateManager {
     /// or installs anything itself. Callable both from the periodic
     /// scheduler and directly from `yadorilink update check`.
     pub async fn check_now(&self) -> Result<Applicability, UpdateError> {
+        let _gate = self.check_gate.lock().await;
+        self.check_now_locked().await
+    }
+
+    async fn check_now_locked(&self) -> Result<Applicability, UpdateError> {
         let _ = self.policy.update(|p| p.state = UpdateState::Checking);
         let result = self.check_now_inner().await;
         match &result {
@@ -648,6 +675,64 @@ impl UpdateManager {
         }
     }
 
+    /// Like [`UpdateManager::verified_entry`], but when the daemon holds nothing it can vouch
+    /// for (no manifest verified yet, or the one it has is stale or expired) it first runs one
+    /// manifest check, bounded by `ON_DEMAND_CHECK_TIMEOUT`, and answers from the result. The
+    /// check needs no account or device: the manifest is public and verified against the pinned
+    /// trust chain, replay floor and channel policy exactly as a periodic check does.
+    ///
+    /// It never loops: at most one check per call, none when another check is already running
+    /// (the caller waits for it and uses its result) or when the last check, whatever its
+    /// outcome, was started less than `ON_DEMAND_CHECK_MIN_GAP` ago.
+    pub async fn verified_entry_or_check(
+        &self,
+        item: &manifest::AppcastItem,
+        phase: manifest::AppcastPhase,
+    ) -> VerifiedEntryAnswer {
+        let needs_check = |a: &VerifiedEntryAnswer| {
+            matches!(
+                &a.verdict,
+                Err(EntryRefusal::CannotConfirm(
+                    CannotConfirm::NotChecked
+                        | CannotConfirm::Stale
+                        | CannotConfirm::Expired { .. }
+                ))
+            )
+        };
+        let answer = self.verified_entry(item, phase);
+        if !needs_check(&answer) {
+            return answer;
+        }
+        // One deadline covers waiting for another check and running this one.
+        let deadline = tokio::time::Instant::now() + ON_DEMAND_CHECK_TIMEOUT;
+        let Ok(_gate) = tokio::time::timeout_at(deadline, self.check_gate.lock()).await else {
+            return answer;
+        };
+        // A check that ran while this call waited may already have settled it.
+        let answer = self.verified_entry(item, phase);
+        if !needs_check(&answer) {
+            return answer;
+        }
+        {
+            // In memory, so a policy file that cannot be written does not turn every question
+            // into another request.
+            let mut last = self.last_on_demand.lock().unwrap_or_else(|e| e.into_inner());
+            if last.is_some_and(|at| at.elapsed() < ON_DEMAND_CHECK_MIN_GAP) {
+                return answer;
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        if tokio::time::timeout_at(deadline, self.check_now_locked()).await.is_err() {
+            let _ = self.policy.update(|p| {
+                p.state = UpdateState::Failed;
+                p.last_error_category = Some("fetch".to_string());
+                p.last_error_message = Some("the update check timed out".to_string());
+                p.last_check_unix = Some(self.now());
+            });
+        }
+        self.verified_entry(item, phase)
+    }
+
     /// The newest manifest generation this install accepted for its channel, for status.
     pub fn accepted_generation(&self) -> Option<AcceptedGeneration> {
         self.replay.accepted(&self.policy.load_or_default().channel)
@@ -735,7 +820,7 @@ impl UpdateManager {
                     p.holdback_reason = Some(reason.clone());
                 }
                 Applicability::StateIncompatible { entry, version, refusal } => {
-                    p.state = UpdateState::HeldBack;
+                    p.state = UpdateState::StateIncompatible;
                     p.available_version = Some(version.to_string());
                     p.available_release_notes_url = Some(entry.release_notes_url.clone());
                     p.mandatory = false;

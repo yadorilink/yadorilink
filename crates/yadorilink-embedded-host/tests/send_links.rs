@@ -28,6 +28,8 @@ enum Plane {
 struct Fake {
     addr: String,
     plane: Arc<Mutex<Plane>>,
+    /// The id the last create request carried, which the service answers with.
+    created: Arc<Mutex<Option<String>>>,
 }
 
 impl Fake {
@@ -36,14 +38,22 @@ impl Fake {
         let addr = format!("http://{}", listener.local_addr().unwrap());
         let plane = Arc::new(Mutex::new(Plane::On));
         let shared = plane.clone();
+        let created: Arc<Mutex<Option<String>>> = Arc::default();
+        let shared_created = created.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { return };
                 let plane = shared.clone();
-                std::thread::spawn(move || serve(&mut stream, &plane));
+                let created = shared_created.clone();
+                std::thread::spawn(move || serve(&mut stream, &plane, &created));
             }
         });
-        Self { addr, plane }
+        Self { addr, plane, created }
+    }
+
+    /// The link id the sender chose for the last link it created.
+    fn created_id(&self) -> String {
+        self.created.lock().unwrap().clone().expect("a link was created")
     }
 
     fn set(&self, plane: Plane) {
@@ -51,7 +61,7 @@ impl Fake {
     }
 }
 
-fn serve(stream: &mut std::net::TcpStream, plane: &Mutex<Plane>) {
+fn serve(stream: &mut std::net::TcpStream, plane: &Mutex<Plane>, created: &Mutex<Option<String>>) {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
     let (head_end, length) = loop {
@@ -80,22 +90,34 @@ fn serve(stream: &mut std::net::TcpStream, plane: &Mutex<Plane>) {
     let head = String::from_utf8_lossy(&buffer[..head_end]).into_owned();
     let mut words = head.split_whitespace();
     let (method, path) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
+    let request_body = String::from_utf8_lossy(&buffer[head_end..]).into_owned();
+    let known = created.lock().unwrap().clone().unwrap_or_default();
     let (status, body) = if !path.starts_with("/send/links") {
-        (404, "{}")
+        (404, "{}".to_owned())
     } else if *plane.lock().unwrap() == Plane::Off {
-        (404, r#"{"error":"send links are not available","code":"send_links_disabled"}"#)
+        (404, r#"{"error":"send links are not available","code":"send_links_disabled"}"#.to_owned())
     } else if *plane.lock().unwrap() == Plane::Forgotten && method == "GET" {
-        (404, r#"{"error":"send link not found"}"#)
+        (404, r#"{"error":"send link not found"}"#.to_owned())
     } else {
         match (method, path) {
             ("POST", "/send/links") => {
-                (200, r#"{"linkId":"link-1","code":"AAAA-BBBB","expiresAt":4102444800}"#)
+                // The service answers with the id the request carried.
+                let id = request_body
+                    .split("\"linkId\":\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .unwrap_or_default()
+                    .to_owned();
+                *created.lock().unwrap() = Some(id.clone());
+                (200, format!(r#"{{"linkId":"{id}","expiresAt":4102444800}}"#))
             }
-            ("GET", "/send/links/link-1") => {
-                (200, r#"{"linkId":"link-1","state":"open","expiresAt":4102444800}"#)
+            ("GET", p) if !known.is_empty() && p == format!("/send/links/{known}") => {
+                (200, format!(r#"{{"linkId":"{known}","state":"open","expiresAt":4102444800}}"#))
             }
-            ("DELETE", "/send/links/link-1") => (200, r#"{"cancelled":true}"#),
-            _ => (404, r#"{"error":"send link is invalid, expired, or already used"}"#),
+            ("DELETE", p) if !known.is_empty() && p == format!("/send/links/{known}") => {
+                (200, r#"{"cancelled":true}"#.to_owned())
+            }
+            _ => (404, r#"{"error":"send link is invalid, expired, or already used"}"#.to_owned()),
         }
     };
     let response = format!(
@@ -149,6 +171,9 @@ fn refusal(result: Result<CommandOutput, CallError>) -> ApplicationErrorCode {
     }
 }
 
+/// A well-formed code that no link was made for.
+const CODE: &str = "AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AA";
+
 fn create() -> Command {
     Command::CreateSendLink { ttl: SendLinkTtl::OneHour, source_paths: Vec::new() }
 }
@@ -161,12 +186,12 @@ fn a_service_with_send_links_off_is_a_typed_refusal_not_an_invalid_link() {
     fake.set(Plane::Off);
     assert_eq!(refusal(host.execute(create(), &within())), ApplicationErrorCode::SendLinksDisabled);
     assert_eq!(
-        refusal(host.execute(Command::PreviewSendLink { code: "X".into() }, &within())),
+        refusal(host.execute(Command::PreviewSendLink { code: CODE.into() }, &within())),
         ApplicationErrorCode::SendLinksDisabled
     );
     assert_eq!(
         refusal(host.execute(
-            Command::RedeemSendLink { code: "X".into(), device_id: None, destination_dir: None },
+            Command::RedeemSendLink { code: CODE.into(), device_id: None, destination_dir: None },
             &within()
         )),
         ApplicationErrorCode::SendLinksDisabled
@@ -176,10 +201,10 @@ fn a_service_with_send_links_off_is_a_typed_refusal_not_an_invalid_link() {
     let CommandOutput::SendLink(link) = host.execute(create(), &within()).unwrap() else {
         panic!("a link")
     };
-    assert_eq!(link.link_id, "link-1");
+    assert_eq!(link.link_id, fake.created_id());
     // An unknown code on a service that has Send links is still just invalid.
     assert_eq!(
-        refusal(host.execute(Command::PreviewSendLink { code: "X".into() }, &within())),
+        refusal(host.execute(Command::PreviewSendLink { code: CODE.into() }, &within())),
         ApplicationErrorCode::SendLinkInvalid
     );
     host.stop().unwrap();
@@ -206,7 +231,7 @@ fn the_senders_link_list_survives_an_engine_restart() {
         panic!("a list")
     };
     assert_eq!(links.len(), 1);
-    assert_eq!(links[0].status.link_id, "link-1");
+    assert_eq!(links[0].status.link_id, fake.created_id());
     assert_eq!(links[0].status.state, SendLinkState::Waiting);
     assert_eq!(links[0].file_count, 0);
 

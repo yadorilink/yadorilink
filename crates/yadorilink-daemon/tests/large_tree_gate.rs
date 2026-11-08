@@ -355,6 +355,8 @@ async fn assert_settled(nodes: &[&TopologyNode], oracle: &Oracle, timeout: Durat
 }
 
 fn native_roots(node: &TopologyNode) -> String {
+    yadorilink_sync_sqlite::native_namespace::flush_all(&node.state.replica_coordinator.database())
+        .unwrap();
     format!(
         "{:?}",
         read(node, |conn| yadorilink_sync_sqlite::native_replication::summary_roots(

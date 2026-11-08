@@ -7,6 +7,11 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::DatabaseError;
 
+/// The oldest schema stamp a build handed to anyone carried (the first development engine, 2026-10-19; the stamp is
+/// bumped by a commit, see the history of this constant). A stamp below this, or negative, was never shipped and
+/// stays a plain `CorruptSchema`: it is never offered as "an older build's data".
+pub const FIRST_SHIPPED_SCHEMA_VERSION: i32 = 132;
+
 /// The on-disk schema's version, stored in SQLite's `PRAGMA user_version`.
 ///
 /// There is one schema, not a ladder: [`init_schema`] creates the current
@@ -18,7 +23,7 @@ use crate::error::DatabaseError;
 /// Bump this whenever the created shape changes at all, since the previous
 /// shape becomes unopenable by this binary and unopenable is the intended
 /// outcome.
-pub const SCHEMA_VERSION: i32 = 138;
+pub const SCHEMA_VERSION: i32 = 151;
 
 /// Reads `PRAGMA user_version` and refuses anything that is not exactly
 /// this binary's [`SCHEMA_VERSION`], in either direction: a newer stamp is
@@ -38,16 +43,16 @@ pub fn check_schema_version_supported(conn: &Connection) -> Result<(), DatabaseE
         });
     }
     if on_disk_version != 0 && on_disk_version < SCHEMA_VERSION {
-        return Err(DatabaseError::CorruptSchema(format!(
-            "index database schema v{on_disk_version} predates this build's v{SCHEMA_VERSION}, \
-             and pre-release builds do not migrate old databases. Before you delete the index \
-             database and re-import the folder, save anything set aside for you: with the \
-             previous version run `yadorilink preserved list`, then `yadorilink preserved \
-             restore <item-id>` or `yadorilink preserved discard <item-id> --yes` for each \
-             item; if that is no longer possible, copy the `recovery-items` folder in the \
-             YadoriLink data directory somewhere safe first. Deleting the index also discards \
-             that folder's contents"
-        )));
+        // Only a stamp an earlier build really wrote is "an older generation"; anything below is damage.
+        if on_disk_version < FIRST_SHIPPED_SCHEMA_VERSION {
+            return Err(DatabaseError::CorruptSchema(format!(
+                "index database schema version {on_disk_version} is not a version any shipped build wrote"
+            )));
+        }
+        return Err(DatabaseError::SchemaTooOld {
+            on_disk_version,
+            supported_version: SCHEMA_VERSION,
+        });
     }
     Ok(())
 }
@@ -511,14 +516,26 @@ fn create_tables_and_links_triggers(conn: &Connection) -> Result<(), DatabaseErr
         -- exit, or at startup and link start when the process died. A path can
         -- carry one row of each kind at once.
         --
-        -- `temp_witness` is, for a write whose rename is left unflushed for a
-        -- batch, the temp file name (beside the target) whose directory entry was
-        -- flushed before the rename. The rename moves that entry away and nothing
-        -- else does, so after a power cut a missing target with the temp gone was
-        -- renamed durably and then removed, while the temp still there means the
-        -- rename was lost. The same directory flush makes the name of an object
-        -- the rename replaces durable too. It is withdrawn whenever the temp is
-        -- abandoned before the rename, and reset by every new open of the intent.
+        -- `kind` also admits `delete`: a tombstone delete's intent, with an empty
+        -- target (a delete has no content to name, and no content hash is empty),
+        -- opened together with the fence bump and cleared with the tombstone. A
+        -- path carries one `write` or `delete` intent at a time; opening either
+        -- replaces the other. `evict`, `restore` and `quarantine` are reserved.
+        --
+        -- `phase` says how far a write got: `prepared` (opened; the fence is
+        -- bumped), `landed` (the rename reached stable storage, so a missing
+        -- name is someone's removal; `mutation_generation` holds the write's
+        -- fence), `flush_pending` (the proof is published but the rename is
+        -- left unflushed for a batch; `mutation_generation` holds the fence the
+        -- proof was published under). A write that does not record a phase
+        -- leaves it NULL, and readers derive the phase of such a row from the
+        -- proof. Every new open of the intent resets it to `prepared`.
+        --
+        -- `tmp_path` is the temp file a write intent will publish, chosen
+        -- before the open and written with it (NULL for an intent with no
+        -- temp). It is a pointer only: recovery verifies the file it names
+        -- against the version's blocks before finishing the write from it,
+        -- and a name that leads nowhere or to different bytes is ignored.
         CREATE TABLE IF NOT EXISTS materialization_intents (
             group_id              TEXT NOT NULL,
             path                  TEXT NOT NULL,
@@ -526,7 +543,8 @@ fn create_tables_and_links_triggers(conn: &Connection) -> Result<(), DatabaseErr
             target_version_hash   BLOB NOT NULL,
             created_at_unix_nanos INTEGER NOT NULL,
             mutation_generation   INTEGER,
-            temp_witness          TEXT,
+            phase                 TEXT,
+            tmp_path              TEXT,
             PRIMARY KEY (group_id, path, kind)
         );
         -- The temp files writers are creating or have not yet renamed away or
@@ -744,7 +762,7 @@ fn create_tables_and_links_triggers(conn: &Connection) -> Result<(), DatabaseErr
             to_unix_nanos    INTEGER,
             from_seq         INTEGER NOT NULL,
             to_seq           INTEGER NOT NULL,
-            reason           TEXT NOT NULL CHECK (reason IN ('Expired', 'LowSpace')),
+            reason           TEXT NOT NULL CHECK (reason IN ('Expired', 'LowSpace', 'OverBudget')),
             recorded_unix    INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_history_freed_path
@@ -1067,6 +1085,8 @@ fn create_provider_tables(conn: &Connection) -> Result<(), DatabaseError> {
             error_description  TEXT,
             -- Set when the root's children are queryable: gates registration.
             namespace_ready    INTEGER NOT NULL DEFAULT 0,
+            -- This device only adds to the root: a modify or delete it authors is refused.
+            publish_only       INTEGER NOT NULL DEFAULT 0,
             -- The daemon's durable, monotonic revision of the namespace it has told the OS
             -- (bumped before each publication; the host persists the highest it acknowledged,
             -- so a restored or rolled-back database is detected by a lower revision).

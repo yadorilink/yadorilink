@@ -511,7 +511,7 @@ pub fn erased_unindexed_paths(
 ///   carries this device's own admission stamp, so it is ordinary
 ///   evidence.)
 /// * history this device erased itself -- the path was excluded from sync
-///   (`.yadorilinkignore`) and its rows dropped, then indexed again. That
+///   (by the ignore rules) and its rows dropped, then indexed again. That
 ///   is recorded per path by [`record_path_history_erased`]; the rows
 ///   admitted since are ordinary evidence, anything before them is gone.
 /// * a row with no recorded admission timestamp -- only possible in a
@@ -595,6 +595,9 @@ pub fn compute_rewind_plan(
                 }
                 crate::history_freed::FreedReason::LowSpace => {
                     RewindUnavailableReason::NotKeptLowSpace
+                }
+                crate::history_freed::FreedReason::OverBudget => {
+                    RewindUnavailableReason::NotKeptOverBudget
                 }
             });
         let action = match at_t.get(now.path.as_str()) {

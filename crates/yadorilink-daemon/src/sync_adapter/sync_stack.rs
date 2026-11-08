@@ -33,6 +33,9 @@ pub enum SyncStackError {
     #[error(transparent)]
     Runtime(#[from] yadorilink_sync_runtime::SyncRuntimeError),
 
+    #[error("peer traffic is paused on a metered network")]
+    PausedOnMeteredNetwork,
+
     #[error("the netmap carries no address for {0}, so it cannot be dialled")]
     Unreachable(String),
 
@@ -103,6 +106,7 @@ impl SyncStack {
                 }),
                 #[cfg(not(feature = "process-model"))]
                 None,
+                &state.network_policy,
                 config,
             )
             .await?;
@@ -189,10 +193,20 @@ impl SyncStack {
         // A peer whose lane hello speaks another protocol version completed the transport: it is
         // online, so it is reported as incompatible, never as offline.
         let incompatible = stack.clone();
-        self.runtime.when_lane_incompatible(Arc::new(move |peer, _theirs, _ours| {
+        self.runtime.when_lane_incompatible(Arc::new(move |link, theirs, ours| {
+            let Some(skew) = crate::peer_connectivity_runtime::VersionSkew::between(theirs, ours)
+            else {
+                return;
+            };
             let Some(stack) = incompatible.upgrade() else { return };
-            if let Some(device) = stack.state.authority.device_id_for_signing_key(peer.as_bytes()) {
-                stack.state.peer_connectivity.record_version_incompatible(&device);
+            if let Some(device) =
+                stack.state.authority.device_id_for_signing_key(link.peer().as_bytes())
+            {
+                stack.state.peer_connectivity.record_version_incompatible(
+                    &device,
+                    link.connection_id(),
+                    skew,
+                );
             }
         }));
 
@@ -332,6 +346,9 @@ impl SyncStack {
     /// Dialled through this stack's runtime, so the dial is seen by the same
     /// observers as a reconciliation's own; cached by the endpoint.
     pub async fn link_to(&self, device_id: &str) -> Result<Arc<PeerLink>, SyncStackError> {
+        if self.state.network_policy.current().paused_on_metered() {
+            return Err(SyncStackError::PausedOnMeteredNetwork);
+        }
         self.endpoint
             .link_to_adopting(
                 device_id,
@@ -437,5 +454,9 @@ impl yadorilink_lane_ports::PeerLinkSource for StackLink {
             .link_to(&self.device_id)
             .await
             .map_err(|error| yadorilink_transport::TransportError::NoRoute(error.to_string()))
+    }
+
+    fn unresponsive(&self) {
+        self.stack.endpoint().drop_links(&self.device_id);
     }
 }

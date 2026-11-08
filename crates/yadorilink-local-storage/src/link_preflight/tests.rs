@@ -19,29 +19,6 @@ fn non_empty_folder_is_risky_with_a_warning() {
     assert!(report.warnings().iter().any(|w| w.contains("not empty")));
 }
 
-/// Fail-closed: an unreadable ignore file (here, invalid UTF-8 in
-/// `.yadorilinkignore`) must be surfaced as a risky condition with its
-/// own warning, not silently swallowed by falling back to defaults —
-/// otherwise files the user meant to exclude could start syncing without
-/// any indication at link time.
-#[test]
-fn unreadable_ignore_file_is_flagged_risky_with_a_warning() {
-    let dir = tempdir();
-    // Invalid UTF-8 makes `load_for_link_root` return an error rather than
-    // `NotFound` (which would legitimately mean "no user patterns").
-    std::fs::write(dir.path().join(".yadorilinkignore"), [0xff, 0xfe, 0xfd]).unwrap();
-
-    let report = run_preflight(dir.path(), &[], Some(0));
-
-    assert!(report.ignore_rules_unreadable);
-    assert!(report.is_risky());
-    assert!(
-        report.warnings().iter().any(|w| w.contains("ignore rules could not be read")),
-        "warnings: {:?}",
-        report.warnings()
-    );
-}
-
 /// An empty folder, with no other risk factors, is not risky.
 #[test]
 fn empty_folder_with_no_other_risk_is_not_risky() {

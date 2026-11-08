@@ -1,0 +1,122 @@
+[package]
+name = "yadorilink-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Not a member of the main workspace: nothing here changes the normal build. Run with
+# `cargo +nightly fuzz run <target>` from this directory (see fuzz/README.md).
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+yadorilink-replica-domain = { path = "../crates/yadorilink-replica-domain" }
+yadorilink-peer-session = { path = "../crates/yadorilink-peer-session" }
+yadorilink-sync-wire = { path = "../crates/yadorilink-sync-wire" }
+yadorilink-sync-protocol = { path = "../crates/yadorilink-sync-protocol" }
+yadorilink-fs-platform = { path = "../crates/yadorilink-fs-platform" }
+yadorilink-daemon = { path = "../crates/yadorilink-daemon" }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "protocol5_message"
+path = "fuzz_targets/protocol5_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol5_proof"
+path = "fuzz_targets/protocol5_proof.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "authorization_checkpoint"
+path = "fuzz_targets/authorization_checkpoint.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "native_delta"
+path = "fuzz_targets/native_delta.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "author_closure"
+path = "fuzz_targets/author_closure.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "native_checkpoint"
+path = "fuzz_targets/native_checkpoint.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "native_checkpoint_seal"
+path = "fuzz_targets/native_checkpoint_seal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "native_row_identity"
+path = "fuzz_targets/native_row_identity.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "service_rpc"
+path = "fuzz_targets/service_rpc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_headers"
+path = "fuzz_targets/block_headers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hello"
+path = "fuzz_targets/hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ignore_rules"
+path = "fuzz_targets/ignore_rules.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy_log"
+path = "fuzz_targets/policy_log.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "send_link_code"
+path = "fuzz_targets/send_link_code.rs"
+test = false
+doc = false
+bench = false

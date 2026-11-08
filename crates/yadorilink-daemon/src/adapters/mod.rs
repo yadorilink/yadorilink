@@ -139,6 +139,7 @@ pub(crate) fn build_application_services(state: Arc<DaemonState>) -> Arc<Applica
     #[cfg(feature = "process-model")]
     let nas_admin = Arc::new(crate::nas_admin_bridge::NasAdminSessions::new(&state));
     let rewind = Arc::new(crate::rewind::RewindService::new(state.clone()));
+    let ignore_rules = Arc::new(crate::ignore_rules::IgnoreRulesService::new(state.clone()));
 
     Arc::new(ApplicationServices {
         enrollment,
@@ -163,6 +164,7 @@ pub(crate) fn build_application_services(state: Arc<DaemonState>) -> Arc<Applica
         #[cfg(feature = "process-model")]
         nas_admin,
         rewind,
+        ignore_rules,
     })
 }
 
@@ -223,6 +225,11 @@ pub(crate) fn build_query_services(state: Arc<DaemonState>) -> Arc<QueryServices
         Arc::new(crate::queries::reporting::ReportingQueryService::new(state.reporting.clone()));
     let coordination_config =
         Arc::new(query::recovery::DaemonCoordinationConfig::new(state.clone()));
+    let account_devices =
+        Arc::new(crate::queries::account_devices::AccountDevicesQueryService::new(
+            coordination_config.clone(),
+            state.device_id.clone(),
+        ));
     let recovery = Arc::new(crate::queries::recovery::RecoveryQueryService::new(
         state.replica_coordinator.clone(),
         coordination_config,
@@ -266,6 +273,7 @@ pub(crate) fn build_query_services(state: Arc<DaemonState>) -> Arc<QueryServices
         governance,
         reporting,
         recovery,
+        account_devices,
         #[cfg(feature = "process-model")]
         diagnostics_bundle,
         handoff_readiness,

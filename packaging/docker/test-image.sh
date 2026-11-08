@@ -72,6 +72,10 @@ ver_out="$(timeout 30 docker run --rm "$IMAGE" --version 2>&1)" && ver_rc=0 || v
   && ok "docker run IMAGE --version prints once and exits" || fail "docker run IMAGE --version (exit $ver_rc): $(printf '%s' "$ver_out" | head -c 200)"
 
 # 2. The command line is on PATH and runs as the daemon's account.
+# The image declares itself a container install, so the daemon reports install_source=container and
+# self-update stays off (the daemon honours this variable and nothing else for the declaration).
+[ "$(docker exec "$PREFIX-main" printenv YADORILINK_INSTALL_SOURCE)" = container ] \
+  && ok "the image declares install_source=container" || fail "YADORILINK_INSTALL_SOURCE is not container"
 docker exec "$PREFIX-main" yadorilink --version >/dev/null && ok "yadorilink --version" || fail "yadorilink --version"
 docker exec "$PREFIX-main" yadorilink-daemon --version >/dev/null && ok "yadorilink-daemon --version" || fail "yadorilink-daemon --version"
 docker exec "$PREFIX-main" yadorilink-daemon --healthcheck && ok "--healthcheck passes in the container" || fail "--healthcheck"

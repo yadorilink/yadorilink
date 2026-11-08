@@ -173,12 +173,12 @@ fn record_provider_evidence(
     root_id: &[u8],
     what: &str,
     record: impl FnOnce(
-        &yadorilink_sync_sqlite::provider::ProviderRepository,
+        crate::replica_coordinator::ProviderWrites<'_>,
         &str,
     ) -> Result<bool, yadorilink_sync_sqlite::SyncSqliteError>,
 ) {
     let root = hex::encode(root_id);
-    match record(context.replica_coordinator.provider_repository(), &root) {
+    match record(context.replica_coordinator.provider_writes(), &root) {
         Ok(true) => {}
         Ok(false) => tracing::warn!(root_id = %root, "{what} for an unknown provider root ignored"),
         Err(error) => tracing::warn!(root_id = %root, %error, "could not record {what}"),
@@ -191,8 +191,8 @@ fn record_provider_evidence(
 fn apply_domain_removal(context: &ShellContext, root_id: &[u8], preserved_location: &str) {
     let repo = context.replica_coordinator.provider_repository();
     let group = repo.group_of_root(&hex::encode(root_id)).ok().flatten();
-    record_provider_evidence(context, root_id, "domain removal", |repo, root| {
-        repo.domain_removed(root, preserved_location)
+    record_provider_evidence(context, root_id, "domain removal", |writes, root| {
+        writes.domain_removed(root, preserved_location)
     });
     match group.and_then(|group| repo.declaration_for_group(&group).ok()) {
         Some(yadorilink_sync_sqlite::provider::ProviderDeclaration::Provider(root)) => {
@@ -220,6 +220,8 @@ where
     let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<Delivery>();
     // When this connection ends while it is the attached host, there is no host and no evidence.
     let _host_gone = HostDisconnect { context: &context, tx: host_tx.clone() };
+    // The Eager queries of this connection, answered in order (see `eager_lane`).
+    let eager_lane = eager_lane::EagerLane::spawn(context.clone(), host_tx.clone());
     loop {
         tokio::select! {
             biased;
@@ -235,6 +237,10 @@ where
                         // status after the answer to a state-changing message shows it. (A
                         // provider apply finishes in its own task and counts there.)
                         let changes_state = !is_polled_read(&msg.payload);
+                        if let Some(Payload::NextProviderDownloadsRequest(request)) = &msg.payload {
+                            eager_lane.submit(request.clone());
+                            continue;
+                        }
                         if materialize_message(&context, &materializations, &reply_tx, &msg)
                             || provider_apply::apply_message(
                                 &context, &materializations, &handshakes, &reply_tx, &msg,
@@ -317,6 +323,72 @@ impl Drop for HostDisconnect<'_> {
     }
 }
 
+/// The person's pin changes, applied one at a time in the order they were reported. A worker task
+/// started with the first one reads this queue; submitting never waits.
+pub(crate) struct PinObservationQueue {
+    sender: tokio::sync::mpsc::UnboundedSender<yadorilink_ipc_proto::shellipc::ProviderPinObserved>,
+}
+
+impl PinObservationQueue {
+    pub(crate) fn start<F, Fut>(handler: F) -> Self
+    where
+        F: Fn(yadorilink_ipc_proto::shellipc::ProviderPinObserved) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(observed) = receiver.recv().await {
+                handler(observed).await;
+            }
+        });
+        Self { sender }
+    }
+
+    pub(crate) fn submit(&self, observed: yadorilink_ipc_proto::shellipc::ProviderPinObserved) {
+        let _ = self.sender.send(observed);
+    }
+}
+
+/// The person changed the pin mark of an item in the file manager: the same retention rule is set
+/// that the app's Keep / Online only would set (so the content is fetched or freed through the same
+/// paths and the same custody guard), unless the rules already say it, and the pins are sent back
+/// the way a rule change always sends them. Anything the host reports that is not an item of a
+/// served root is ignored.
+async fn apply_observed_pin(
+    application: &crate::application::ApplicationServices,
+    evictor: &crate::provider_evict::ProviderEvictor,
+    observed: &yadorilink_ipc_proto::shellipc::ProviderPinObserved,
+) {
+    use yadorilink_ipc_proto::shellipc::PinChoice;
+    let root = hex::encode(&observed.root_id);
+    // An empty id is the sync root itself (the whole folder pinned or freed).
+    let item = if observed.item_id.is_empty() {
+        None
+    } else {
+        match yadorilink_sync_sqlite::provider::ItemId::try_from(observed.item_id.as_slice()) {
+            Ok(item) => Some(item),
+            Err(_) => return,
+        }
+    };
+    let choice = PinChoice::try_from(observed.choice).unwrap_or(PinChoice::Unspecified);
+    let decision = match evictor.rule_for_observed(&root, item.as_ref(), choice) {
+        Ok(decision) => decision,
+        Err(error) => {
+            tracing::debug!(%error, "could not read the rules for an observed pin");
+            return;
+        }
+    };
+    let Some((group_id, path, rule)) = decision else { return };
+    match application.materialization.set_rule(&group_id, &path, rule).await {
+        Ok(_) => {
+            if let Err(error) = evictor.apply_pins(&group_id, &path).await {
+                tracing::debug!(%error, "could not send the pins after an observed pin");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "could not apply the pin the person set to the rules"),
+    }
+}
+
 /// The provider channel's connection-level messages: the host's acknowledgements complete the
 /// publication step that is waiting for them, and the app's domain state attaches this
 /// connection as the host (replaying every pending publication, and detecting a rolled-back
@@ -335,9 +407,39 @@ async fn provider_channel_message(
             }
             true
         }
+        Some(Payload::ProviderPinObserved(observed)) => {
+            if context.provider_host.is_attached(host_tx) && !cfg!(target_vendor = "apple") {
+                // Not inline: setting the rule sends pin requests to this very host and waits for
+                // their acknowledgements, which only this connection's read loop can deliver. And not
+                // a task each: the person's changes are applied one after another in the order the
+                // host reported them, or a later choice could be overtaken by an earlier one.
+                let queue = context.pin_observations.get_or_init(|| {
+                    let (application, evictor) =
+                        (context.application.clone(), context.evictor.clone());
+                    PinObservationQueue::start(move |observed| {
+                        let (application, evictor) = (application.clone(), evictor.clone());
+                        async move { apply_observed_pin(&application, &evictor, &observed).await }
+                    })
+                });
+                queue.submit(observed.clone());
+            }
+            true
+        }
         Some(Payload::ProviderSignalDone(done)) => {
             if context.provider_host.is_attached(host_tx) {
                 context.provider_host.complete_signal(done);
+                // The namespace moved and the host has shown it: an item a rule names may have
+                // appeared, so the pins the rules ask for are sent again (the File Provider host
+                // does not handle the message yet).
+                if done.ok && !cfg!(target_vendor = "apple") {
+                    context.evictor.push_pin_plan(&hex::encode(&done.root_id));
+                }
+            }
+            true
+        }
+        Some(Payload::ProviderPinDone(done)) => {
+            if context.provider_host.is_attached(host_tx) {
+                context.provider_host.complete_pin(done);
             }
             true
         }
@@ -364,23 +466,6 @@ async fn provider_channel_message(
                         context.reclaim_queue.schedule(&root, departed);
                     }
                 }
-            }
-            true
-        }
-        // The Eager driver's query: what should the host ask the OS to download next.
-        Some(Payload::NextProviderDownloadsRequest(request)) => {
-            if context.provider_host.is_attached(host_tx) {
-                let handoff_root = context.handoff.get();
-                let inputs = crate::provider_eager::EagerInputs {
-                    coordinator: &context.replica_coordinator,
-                    membership: &context.membership,
-                    staging_dir: handoff_root.as_ref().map(|h| h.staging_dir()),
-                    host_attached: true,
-                };
-                let response = context.eager.next_downloads(&inputs, request);
-                let _ = host_tx.send(ShellIpcMessage {
-                    payload: Some(Payload::NextProviderDownloadsResponse(response)),
-                });
             }
             true
         }
@@ -444,6 +529,21 @@ async fn provider_channel_message(
                 // A different host took over: what the previous one reported says nothing now.
                 context.membership.clear();
             }
+            // Whether this host serves the root: only a registered domain does.
+            context
+                .provider_host
+                .note_domain_registered(&root, state.evidence() == DomainEvidence::Registered);
+            // A domain the host saw registered and reports removed or missing is lost: nothing the
+            // operating system shows there (the files going away with it) is the person's doing.
+            // Only a definite reading moves it: "registered" clears it, "removed" or "missing" sets
+            // it, and an unknown or not-registered reading (which proves nothing came back) leaves it.
+            match state.evidence() {
+                DomainEvidence::Registered => context.provider_host.note_domain_lost(&root, false),
+                DomainEvidence::Removed | DomainEvidence::Absent => {
+                    context.provider_host.note_domain_lost(&root, true)
+                }
+                _ => {}
+            }
             // The report of a removal is handled with the evidence below; it is neither a rollback
             // check nor a replay.
             if state.evidence() == DomainEvidence::Removed {
@@ -473,8 +573,13 @@ async fn provider_channel_message(
             }
             context.provider_host.clear_absent(&root);
             if state.evidence() == DomainEvidence::Registered {
-                // Reconnect replay: every pending item runs its evict and signal again.
+                // Reconnect replay: every pending item runs its evict and signal again, and the
+                // pins the rules ask for are sent (a choice made while no host was attached was
+                // recorded but could not be applied).
                 context.publication.kick(&root);
+                if !cfg!(target_vendor = "apple") {
+                    context.evictor.push_pin_plan(&root);
+                }
             }
             false
         }
@@ -519,12 +624,14 @@ async fn handle_message(context: &ShellContext, msg: ShellIpcMessage) -> Option<
                             .as_ref()
                             .is_some_and(|s| s.transition() != ShellLocalTransition::None),
                         is_file: std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()),
+                        is_folder: std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()),
                         provider_folder: false,
                         reclaim_gate_open: materialization.evict_supported(&group_id),
                         // A policy that cannot be read offers nothing.
                         retention: materialization.retention(&group_id, &rel_path).ok().map(|r| {
                             crate::file_actions::Retention {
                                 pinned: r.pinned,
+                                online_only: r.online_only,
                                 explicit: r.explicit,
                             }
                         }),
@@ -726,7 +833,7 @@ async fn handle_message(context: &ShellContext, msg: ShellIpcMessage) -> Option<
                         context,
                         &state.root_id,
                         "domain state",
-                        |repo, root| repo.set_domain_registered(root, true),
+                        |writes, root| writes.set_domain_registered(root, true),
                     );
                 }
                 // The removal of a domain: a requested removal is finished (state deleted, the
@@ -743,13 +850,13 @@ async fn handle_message(context: &ShellContext, msg: ShellIpcMessage) -> Option<
                 context,
                 &handshake.root_id,
                 "extension handshake",
-                |repo, root| repo.record_extension_handshake(root, now_unix_nanos()),
+                |writes, root| writes.record_extension_handshake(root, now_unix_nanos()),
             );
             None
         }
         Some(Payload::ProviderError(error)) => {
-            record_provider_evidence(context, &error.root_id, "provider error", |repo, root| {
-                repo.record_provider_error(root, &error.description)
+            record_provider_evidence(context, &error.root_id, "provider error", |writes, root| {
+                writes.record_provider_error(root, &error.description)
             });
             None
         }
@@ -1023,6 +1130,7 @@ mod provider_tests;
 
 mod provider_apply;
 pub(crate) use provider_apply::apply_for_app;
+mod eager_lane;
 mod provider_enumerate;
 mod provider_materialize;
 use provider_materialize::{materialize_message, Delivery, MaterializeRequests};
@@ -1244,22 +1352,56 @@ pub mod windows_transport {
         }
     }
 
+    /// How many pipe instances listen at once (see `control_socket::windows_transport`): shell
+    /// extensions open connections in bursts, and a client that finds every instance connected is
+    /// refused with `ERROR_PIPE_BUSY` until the next one exists.
+    const LISTENING_INSTANCES: usize = 4;
+
     /// `pipe_name` should look like `\\.\pipe\yadorilink-<user>`.
     pub async fn serve(pipe_name: &str, context: Arc<ShellContext>) -> std::io::Result<()> {
         tracing::info!(pipe_name, "shell-integration IPC listening (named pipe)");
-        let mut server = create_first_pipe_server(pipe_name)?;
         let connection_slots = Arc::new(Semaphore::new(super::MAX_SHELL_IPC_CONNECTIONS));
+        let mut listeners = tokio::task::JoinSet::new();
+        listeners.spawn(accept_loop(
+            create_first_pipe_server(pipe_name)?,
+            pipe_name.to_owned(),
+            connection_slots.clone(),
+            context.clone(),
+        ));
+        for _ in 1..LISTENING_INSTANCES {
+            listeners.spawn(accept_loop(
+                create_next_pipe_server(pipe_name)?,
+                pipe_name.to_owned(),
+                connection_slots.clone(),
+                context.clone(),
+            ));
+        }
+        // A listener only ends on an error, which is the server's.
+        match listeners.join_next().await {
+            Some(Ok(result)) => result,
+            Some(Err(error)) => Err(std::io::Error::other(error.to_string())),
+            None => Ok(()),
+        }
+    }
 
+    async fn accept_loop(
+        mut server: NamedPipeServer,
+        pipe_name: String,
+        connection_slots: Arc<Semaphore>,
+        context: Arc<ShellContext>,
+    ) -> std::io::Result<()> {
         loop {
+            server.connect().await?;
+            // The replacement listens before the accepted connection is served.
+            let next_server = create_next_pipe_server(&pipe_name)?;
+            let connected = std::mem::replace(&mut server, next_server);
+            // At the cap the accepted client waits here for a slot; the other listeners keep
+            // accepting, and no more than MAX_SHELL_IPC_CONNECTIONS connections are served at once.
             let connection_slot = connection_slots
                 .clone()
                 .acquire_owned()
                 .await
                 .map_err(|_| std::io::Error::other("shell IPC semaphore closed"))?;
-            let next_server = create_next_pipe_server(pipe_name)?;
-            server.connect().await?;
-            let connected = server;
-            server = next_server;
 
             let context = context.clone();
             tokio::spawn(async move {
@@ -1272,5 +1414,55 @@ pub mod windows_transport {
                 let _ = write_half.shutdown().await;
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod pin_queue_tests {
+    use super::PinObservationQueue;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use yadorilink_ipc_proto::shellipc::ProviderPinObserved;
+
+    struct Probe {
+        done: Mutex<Vec<(u8, bool)>>,
+        running: AtomicUsize,
+        finished: tokio::sync::mpsc::UnboundedSender<()>,
+    }
+
+    /// One handled observation: the first one takes many scheduler turns, the later ones none, and
+    /// whether another was running meanwhile is recorded.
+    async fn handle(probe: Arc<Probe>, observed: ProviderPinObserved) {
+        let overlapped = probe.running.fetch_add(1, Ordering::SeqCst) > 0;
+        let turns = if observed.item_id == [1] { 200 } else { 0 };
+        for _ in 0..turns {
+            tokio::task::yield_now().await;
+        }
+        probe.done.lock().unwrap().push((observed.item_id[0], overlapped));
+        probe.running.fetch_sub(1, Ordering::SeqCst);
+        let _ = probe.finished.send(());
+    }
+
+    /// The person's changes are applied one at a time in the order reported, even when an earlier
+    /// one takes much longer than a later one: a later choice is never overtaken by an earlier.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn observations_are_applied_in_the_order_they_were_reported_one_at_a_time() {
+        let (finished, mut finished_rx) = tokio::sync::mpsc::unbounded_channel();
+        let probe = Arc::new(Probe {
+            done: Mutex::new(Vec::new()),
+            running: AtomicUsize::new(0),
+            finished,
+        });
+        let queue = {
+            let probe = probe.clone();
+            PinObservationQueue::start(move |observed| handle(probe.clone(), observed))
+        };
+        for item in [1u8, 2, 3] {
+            queue.submit(ProviderPinObserved { item_id: vec![item], ..Default::default() });
+        }
+        for _ in 0..3 {
+            finished_rx.recv().await.unwrap();
+        }
+        assert_eq!(*probe.done.lock().unwrap(), vec![(1, false), (2, false), (3, false)]);
     }
 }

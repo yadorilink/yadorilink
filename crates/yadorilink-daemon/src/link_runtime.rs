@@ -133,6 +133,27 @@ impl LinkRuntime {
         self.flush_handle.reconcile_added_files_from_disk(group_id)
     }
 
+    /// The drift detector's per-link look -- see `LinkFlushHandle::detect_drift_from_disk`.
+    pub(crate) fn detect_drift_from_disk(
+        &self,
+        group_id: &str,
+        options: yadorilink_local_capture::DriftOptions,
+    ) -> Option<
+        Result<yadorilink_local_capture::DriftReport, yadorilink_local_capture::LocalCaptureError>,
+    > {
+        self.flush_handle.detect_drift_from_disk(group_id, options)
+    }
+
+    /// Sends one path the drift detector found different through the route a live watcher event
+    /// takes -- see `LinkFlushHandle::capture_local_path_state`.
+    pub(crate) async fn capture_drifted_path(
+        &self,
+        group_id: &str,
+        rel_path: &str,
+    ) -> yadorilink_peer_session::peer_session::PendingLocalFlushOutcome {
+        self.flush_handle.capture_local_path_state(group_id, rel_path).await
+    }
+
     /// Forces a racing peer write's targeted-flush request for one path --
     /// see `LinkFlushHandle::flush_pending_local_change`'s own doc. Reached
     /// from the daemon-wide runtime state's own `PendingLocalChangeFlush`

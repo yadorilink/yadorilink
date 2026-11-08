@@ -219,7 +219,11 @@ fn setup_device(name: &str) -> TestDevice {
         fired: std::sync::atomic::AtomicBool::new(false),
         on_first_store: Mutex::new(None),
     });
-    let (sync_state, index_dir) = support::open_file_backed_replica_coordinator();
+    // These tests inject their edit at the block store (the first fetched block stored, the
+    // first block read back to assemble), so they run the store-first path. The in-place path
+    // writes a large file's blocks into a temp beside it and has its own tests in the library
+    // (`hydration::tests`).
+    let (sync_state, index_dir) = support::open_store_first_replica_coordinator();
     let state = yadorilink_daemon::test_support::isolated_daemon_state(
         name.to_string(),
         Arc::new(sync_state),

@@ -22,7 +22,7 @@ mod unix_socket_tests {
         ResumeRequest, StatusRequest, UnlinkRequest,
     };
     use yadorilink_ipc_proto::daemonctl::{
-        PinItemRequest, RetentionPolicy, RetentionState, UnpinItemRequest,
+        RetentionPolicy, RetentionRule, RetentionState, SetRetentionRuleRequest,
     };
     use yadorilink_ipc_proto::framing::{read_message, write_message};
     use yadorilink_local_storage::SegmentBlockStore;
@@ -328,20 +328,19 @@ mod unix_socket_tests {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
                 as i64;
 
-        pause(PauseDuration::ThirtyMinutes).await;
+        pause(PauseDuration::TwoHours).await;
         let (paused, until) = status(socket_path.clone()).await;
         assert!(paused);
-        assert!((now + 1790..=now + 1810).contains(&until), "30 minutes, got {until} at {now}");
+        assert!((now + 7190..=now + 7210).contains(&until), "2 hours, got {until} at {now}");
 
-        // One hour, not until tomorrow: midnight can be nearer than 30 minutes.
-        pause(PauseDuration::OneHour).await;
+        pause(PauseDuration::EightHours).await;
         let (_, later) = status(socket_path.clone()).await;
-        assert!((now + 3590..=now + 3610).contains(&later), "1 hour, got {later} at {now}");
+        assert!((now + 28790..=now + 28810).contains(&later), "8 hours, got {later} at {now}");
 
         pause(PauseDuration::Unspecified).await;
         assert_eq!(status(socket_path.clone()).await, (true, 0));
 
-        pause(PauseDuration::UntilTomorrow).await;
+        pause(PauseDuration::TwentyFourHours).await;
         let resp = send(
             &socket_path,
             ReqPayload::Resume(ResumeRequest {
@@ -2418,10 +2417,25 @@ mod unix_socket_tests {
         RetentionState { policy: RetentionPolicy::Reclaimable as i32, explicit: false }
     }
 
+    async fn set_rule(
+        socket_path: &std::path::Path,
+        path: &std::path::Path,
+        rule: RetentionRule,
+    ) -> yadorilink_ipc_proto::daemonctl::DaemonControlResponse {
+        send(
+            socket_path,
+            ReqPayload::SetRetentionRule(SetRetentionRuleRequest {
+                absolute_path: path.to_string_lossy().to_string(),
+                rule: rule as i32,
+            }),
+        )
+        .await
+    }
+
     /// The retention policy is a standing choice, reported apart from the
-    /// materialization state, and a folder's pin is inherited beneath it.
+    /// materialization state, and a folder's rule is inherited beneath it.
     #[tokio::test]
-    async fn pin_and_unpin_over_the_control_socket_set_the_policy_and_inherit_by_folder() {
+    async fn keep_and_default_over_the_control_socket_set_the_policy_and_inherit_by_folder() {
         let (socket_path, dir) = start_daemon().await;
         let folder = dir.path().join("shared");
         std::fs::create_dir_all(folder.join("album")).unwrap();
@@ -2431,53 +2445,56 @@ mod unix_socket_tests {
 
         assert_eq!(retention_of(&socket_path, &photo).await, reclaimable());
 
-        // The path is not indexed, so there is nothing to download; the pin stands regardless.
-        let resp = send(
-            &socket_path,
-            ReqPayload::PinItem(PinItemRequest {
-                absolute_path: album.to_string_lossy().to_string(),
-            }),
-        )
-        .await;
-        let Some(RespPayload::PinItem(pin)) = resp.payload else { panic!("{resp:?}") };
-        assert_eq!(pin.retention, Some(pinned(true)));
+        // The path is not indexed, so there is nothing to download; the rule stands regardless.
+        let resp = set_rule(&socket_path, &album, RetentionRule::Keep).await;
+        let Some(RespPayload::SetRetentionRule(set)) = resp.payload else { panic!("{resp:?}") };
+        assert_eq!(set.retention, Some(pinned(true)));
         assert_eq!(retention_of(&socket_path, &album).await, pinned(true));
         assert_eq!(retention_of(&socket_path, &photo).await, pinned(false), "inherited");
 
-        // No per-child override: the child stays pinned and the answer says so.
-        let resp = send(
-            &socket_path,
-            ReqPayload::UnpinItem(UnpinItemRequest {
-                absolute_path: photo.to_string_lossy().to_string(),
-            }),
-        )
-        .await;
-        let Some(RespPayload::UnpinItem(unpin)) = resp.payload else { panic!("{resp:?}") };
-        assert_eq!(unpin.retention, Some(pinned(false)));
+        // Removing a rule that is not set at the child leaves the folder's rule in force.
+        let resp = set_rule(&socket_path, &photo, RetentionRule::Default).await;
+        let Some(RespPayload::SetRetentionRule(set)) = resp.payload else { panic!("{resp:?}") };
+        assert_eq!(set.retention, Some(pinned(false)));
 
-        let resp = send(
-            &socket_path,
-            ReqPayload::UnpinItem(UnpinItemRequest {
-                absolute_path: album.to_string_lossy().to_string(),
-            }),
-        )
-        .await;
-        let Some(RespPayload::UnpinItem(unpin)) = resp.payload else { panic!("{resp:?}") };
-        assert_eq!(unpin.retention, Some(reclaimable()));
+        let resp = set_rule(&socket_path, &album, RetentionRule::Default).await;
+        let Some(RespPayload::SetRetentionRule(set)) = resp.payload else { panic!("{resp:?}") };
+        assert_eq!(set.retention, Some(reclaimable()));
         assert_eq!(retention_of(&socket_path, &photo).await, reclaimable());
     }
 
-    /// A path outside every linked folder has no policy to set.
+    /// A plain folder keeps its files on disk: there is no copy to leave online, and the rule is
+    /// refused rather than recorded and never applied.
     #[tokio::test]
-    async fn pinning_a_path_outside_every_linked_folder_is_an_error() {
+    async fn online_only_is_refused_in_a_plain_folder_and_records_nothing() {
         let (socket_path, dir) = start_daemon().await;
-        let resp = send(
-            &socket_path,
-            ReqPayload::PinItem(PinItemRequest {
-                absolute_path: dir.path().join("elsewhere.txt").to_string_lossy().to_string(),
-            }),
-        )
-        .await;
+        let folder = dir.path().join("shared");
+        std::fs::create_dir_all(folder.join("album")).unwrap();
+        link_folder(&socket_path, &folder, "group-oo").await;
+        let album = folder.join("album");
+
+        let resp = set_rule(&socket_path, &album, RetentionRule::OnlineOnly).await;
+        assert!(matches!(resp.payload, Some(RespPayload::Error(_))), "{resp:?}");
+        assert_eq!(retention_of(&socket_path, &album).await, reclaimable());
+    }
+
+    /// A rule needs a rule: the unspecified one is an error, not a silent no-op.
+    #[tokio::test]
+    async fn an_unspecified_rule_is_an_error() {
+        let (socket_path, dir) = start_daemon().await;
+        let folder = dir.path().join("shared");
+        std::fs::create_dir_all(&folder).unwrap();
+        link_folder(&socket_path, &folder, "group-un").await;
+        let resp = set_rule(&socket_path, &folder, RetentionRule::Unspecified).await;
+        assert!(matches!(resp.payload, Some(RespPayload::Error(_))), "{resp:?}");
+    }
+
+    /// A path outside every linked folder has no rule to set.
+    #[tokio::test]
+    async fn setting_a_rule_outside_every_linked_folder_is_an_error() {
+        let (socket_path, dir) = start_daemon().await;
+        let resp =
+            set_rule(&socket_path, &dir.path().join("elsewhere.txt"), RetentionRule::Keep).await;
         assert!(matches!(resp.payload, Some(RespPayload::Error(_))), "{resp:?}");
     }
 } // mod unix_socket_tests
@@ -2693,5 +2710,63 @@ mod windows_pipe_tests {
         );
         assert!(matches!(resp_a.payload, Some(RespPayload::Link(_))));
         assert!(matches!(resp_b.payload, Some(RespPayload::Link(_))));
+    }
+    /// A burst of clients connecting at once, with one connection already held open (a request in
+    /// flight, as a sharing command is), must find the pipe: the daemon keeps several instances
+    /// listening, so a client is not turned away with `ERROR_PIPE_BUSY` for as long as the daemon
+    /// takes to loop back and create the next instance. Prints how many of the first attempts met
+    /// a busy pipe (the number of instances the daemon had listening is what bounds it), and
+    /// requires that every client connects within two seconds when it retries a busy pipe as
+    /// the client library does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_burst_of_clients_finds_the_pipe_while_a_request_is_in_flight() {
+        use tokio::net::windows::named_pipe::ClientOptions;
+        const ERROR_PIPE_BUSY: i32 = 231;
+        const BURST: usize = 16;
+        let (pipe_name, _dir) = start_daemon().await;
+        // One request in flight: connected, nothing sent yet, so its handler is waiting for it.
+        let _held = ClientOptions::new().open(&pipe_name).unwrap();
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(BURST));
+        let mut clients = Vec::new();
+        for _ in 0..BURST {
+            let (pipe_name, barrier) = (pipe_name.clone(), barrier.clone());
+            clients.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let started = std::time::Instant::now();
+                let mut first_attempt_busy = false;
+                let mut attempts = 0;
+                loop {
+                    attempts += 1;
+                    match ClientOptions::new().open(&pipe_name) {
+                        Ok(client) => return (client, first_attempt_busy, started.elapsed()),
+                        Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                            first_attempt_busy |= attempts == 1;
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                        Err(error) => panic!("connecting: {error}"),
+                    }
+                }
+            }));
+        }
+        let mut busy_first = 0;
+        let mut slowest = std::time::Duration::ZERO;
+        let mut connected = Vec::new();
+        for client in clients {
+            // Bounded: a pipe that stays busy fails here, within seconds, instead of hanging.
+            let (stream, busy, took) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), client)
+                    .await
+                    .expect("a client did not connect within 10 s")
+                    .unwrap();
+            busy_first += usize::from(busy);
+            slowest = slowest.max(took);
+            connected.push(stream);
+        }
+        println!(
+            "BURST {BURST}: first attempt met a busy pipe for {busy_first} clients, slowest connect {} ms",
+            slowest.as_millis()
+        );
+        assert!(slowest < std::time::Duration::from_secs(2), "slowest connect {slowest:?}");
     }
 }

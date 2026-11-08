@@ -133,3 +133,15 @@ fn device_platform_is_one_of_the_coordination_planes_names_and_is_omitted_when_a
     .unwrap();
     assert!(body.get("platform").is_none());
 }
+
+#[tokio::test]
+async fn registering_over_an_existing_device_is_refused() {
+    let dir = tempfile::tempdir().expect("dir");
+    let settings = crate::coordination::credential_store::CredentialSettings::from_env(dir.path())
+        .expect("settings");
+    std::fs::write(dir.path().join("device.json"), "{}").expect("device.json");
+    let error = register_device_in(dir.path(), &settings, "box".to_owned())
+        .await
+        .expect_err("already registered");
+    assert!(error.to_string().contains("already registered"), "{error}");
+}

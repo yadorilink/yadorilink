@@ -46,8 +46,12 @@ fn rate_limited_renders_a_retry_hint() {
         "retryAfterSeconds": 30
     });
     match error_from_body(429, &body) {
-        CoreError::LimitExceeded { message: msg, kind: LimitKind::RateLimited } => {
-            assert!(msg.contains("30s"), "got: {msg}")
+        CoreError::LimitExceeded {
+            message: msg,
+            kind: LimitKind::RateLimited { retry_after_secs },
+        } => {
+            assert!(msg.contains("30s"), "got: {msg}");
+            assert_eq!(retry_after_secs, Some(30));
         }
         other => panic!("expected LimitExceeded, got {other:?}"),
     }

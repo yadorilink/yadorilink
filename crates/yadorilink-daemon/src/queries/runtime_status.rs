@@ -22,8 +22,9 @@ use yadorilink_peer_session::rate_limiter::RateLimiters;
 pub(crate) struct PeerStatusView {
     pub(crate) device_id: String,
     pub(crate) reachability: PeerReachability,
-    /// Reachable, but speaks another protocol version: sync with it is paused until both match.
-    pub(crate) version_incompatible: bool,
+    /// Reachable, but speaks another protocol version (sync with it is paused until both match):
+    /// which end is older.
+    pub(crate) version_skew: Option<crate::peer_connectivity_runtime::VersionSkew>,
     /// The device that replaced this one, when the account replaced it.
     pub(crate) replaced_by_device_id: Option<String>,
     /// The last time a session with this peer was up (now while connected); 0 when never.
@@ -67,6 +68,12 @@ pub(crate) struct BlockStoreUsageView {
     pub(crate) block_count: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct KeptHistoryView {
+    pub(crate) bytes: u64,
+    pub(crate) budget_bytes: u64,
+}
+
 pub(crate) struct RuntimeStatusView {
     pub(crate) links: Vec<LinkStatusView>,
     pub(crate) peers: Vec<PeerStatusView>,
@@ -78,6 +85,18 @@ pub(crate) struct RuntimeStatusView {
     #[cfg(feature = "process-model")]
     pub(crate) update: UpdateStatusView,
     pub(crate) block_store: BlockStoreUsageView,
+    /// The kept-version history's bytes and the byte budget bounding them; `None` when the
+    /// history could not be read.
+    pub(crate) kept_history: Option<KeptHistoryView>,
+    /// Edits saved on this device that could not be published because the coordination service
+    /// did not answer.
+    pub(crate) unpublished_edits_service_unreachable: u64,
+    /// Edits saved on this device that the service refused to publish because this device may
+    /// no longer publish in the folder.
+    pub(crate) unpublished_edits_not_authorized: u64,
+    /// Edits saved on this device that the service answered but would not publish (the Terms, a
+    /// refused credential, a route it does not accept).
+    pub(crate) unpublished_edits_rejected: u64,
     pub(crate) last_gc_unix: i64,
     pub(crate) gc_reclaimable_estimate_bytes: u64,
     pub(crate) active_transfers: Vec<ActiveTransferView>,
@@ -109,8 +128,42 @@ pub(crate) struct RuntimeFacts {
     governance: crate::governance_config::ResourceGovernanceConfig,
     volumes: Vec<VolumeSpaceView>,
     block_store_usage: yadorilink_local_storage::StorageUsage,
+    kept_history: Option<KeptHistoryView>,
+    /// Edits journaled as dirty paths in groups whose policy this device does not have (see
+    /// [`dirty_edits_without_policy`]).
+    dirty_edits_without_policy: u64,
     #[cfg(feature = "process-model")]
     update: UpdateStatusView,
+}
+
+/// Disk edits saved in the dirty journal of groups whose verified policy this device does not
+/// have (a restart while the service is unreachable, before the policy could be restored): they
+/// are captured as deltas only once the policy arrives, so they are neither pending deltas nor
+/// counted by a flush, but they are changes only on this device. Groups whose policy is present
+/// are not counted: their journal is the ordinary moment between a detected edit and its capture.
+///
+/// A count is a lower bound (a journal is read to 10 000 paths per group), and is not made in
+/// the first minute of the engine: the policy is restored as it starts, and a healthy start is not
+/// an outage.
+pub(crate) fn dirty_edits_without_policy(
+    replica: &crate::replica_coordinator::ReplicaCoordinator,
+    uptime: std::time::Duration,
+) -> u64 {
+    const CAP: u32 = 10_000;
+    const STARTUP_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+    if uptime < STARTUP_GRACE {
+        return 0;
+    }
+    let Ok(links) = replica.link_repository().list_links() else { return 0 };
+    let mut groups: Vec<String> =
+        links.into_iter().filter(|l| !l.paused && !l.orphaned).map(|l| l.group_id).collect();
+    groups.sort();
+    groups.dedup();
+    groups
+        .iter()
+        .filter(|group| replica.local_policy_head(group).is_err())
+        .map(|group| replica.dirty_path_repository().count_dirty_paths(group, CAP).unwrap_or(0))
+        .sum()
 }
 
 impl RuntimeFacts {
@@ -193,6 +246,16 @@ impl RuntimeStatusQueryService {
     /// calls this off the request path; [`Self::snapshot_from`] answers a request from the result.
     pub(crate) fn collect(&self) -> Result<RuntimeFacts, crate::sync_error::SyncError> {
         let mut links = self.link_status.collect_links()?;
+        let active_groups: Vec<String> = self
+            .replica
+            .link_repository()
+            .list_links()
+            .map(|all| {
+                all.into_iter().filter(|l| !l.paused && !l.orphaned).map(|l| l.group_id).collect()
+            })
+            .unwrap_or_default();
+        // Edits of a folder that is unlinked or paused are not waiting to be published any more.
+        self.telemetry.retain_unpublished(&active_groups);
         self.audit.refresh(self.replica.file_index_repository(), &mut links);
         let governance = self.governance.load_or_default();
         let volumes = self.volumes_free_space(links.iter().map(|l| l.local_path()), &governance);
@@ -203,7 +266,24 @@ impl RuntimeStatusQueryService {
             #[cfg(feature = "process-model")]
             update: self.update_status.snapshot(),
             block_store_usage: self.block_store.usage().unwrap_or_default(),
+            kept_history: self.kept_history(),
+            dirty_edits_without_policy: dirty_edits_without_policy(
+                &self.replica,
+                self.telemetry.uptime(),
+            ),
         })
+    }
+
+    fn kept_history(&self) -> Option<KeptHistoryView> {
+        let now_unix_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_nanos()).ok())?;
+        let bytes = self.replica.file_index_repository().kept_history_bytes(now_unix_nanos).ok()?;
+        let budget_bytes = crate::adapters::runtime::link_runtime_controller::history_budget_bytes(
+            self.block_store.free_space().ok().flatten().map(|space| space.total_bytes),
+        );
+        Some(KeptHistoryView { bytes, budget_bytes })
     }
 
     /// Joins collected facts with the in-memory ones (peers, transfers, rates, errors). Reads no
@@ -222,7 +302,7 @@ impl RuntimeStatusQueryService {
             // is refused at the lane hello: it stays reachable and is marked incompatible.
             .map(|(device_id, reachability)| PeerStatusView {
                 last_connected_unix: self.peers.last_connected_unix(&device_id),
-                version_incompatible: self.peers.is_version_incompatible(&device_id),
+                version_skew: self.peers.version_skew(&device_id),
                 replaced_by_device_id: self.authority.superseded_by(&device_id),
                 device_id,
                 reachability,
@@ -256,6 +336,7 @@ impl RuntimeStatusQueryService {
                 coarse_context: e.coarse_context,
             })
             .collect();
+        let unpublished = self.telemetry.unpublished_totals();
 
         RuntimeStatusView {
             links,
@@ -274,6 +355,11 @@ impl RuntimeStatusQueryService {
                 total_bytes: block_store_usage.total_bytes,
                 block_count: block_store_usage.block_count,
             },
+            kept_history: facts.kept_history,
+            unpublished_edits_service_unreachable: unpublished.service_unreachable
+                + facts.dirty_edits_without_policy,
+            unpublished_edits_not_authorized: unpublished.not_authorized,
+            unpublished_edits_rejected: unpublished.rejected,
             last_gc_unix: self.gc.last_run_unix(),
             gc_reclaimable_estimate_bytes: self.gc.reclaimable_estimate_bytes(),
             active_transfers,

@@ -14,8 +14,8 @@ use yadorilink_fapi_client::PairingCode;
 
 use crate::coordination::credential_store;
 use crate::dto::{
-    self, AccountStatus, BrowserPurpose, CoreConfig, FolderDetail, LoginEvent, LoginFlow,
-    LoginOptions, SignInState, StatusSnapshot, StatusUpdate,
+    self, AccountStatus, BrowserPurpose, CoreConfig, FolderDetail, FolderSummary, LoginEvent,
+    LoginFlow, LoginOptions, SignInState, StatusSnapshot, StatusUpdate,
 };
 use crate::error::{CoreError, DesktopError};
 use crate::ops;
@@ -96,10 +96,12 @@ impl ClientCore {
     #[must_use]
     pub fn new_login_session(&self, options: LoginOptions) -> Arc<LoginSession> {
         let device = options.flow == LoginFlow::DeviceCode;
+        let device_name = options.device_name.clone();
+        let launch = self.config().daemon_launch.clone();
         Arc::new(LoginSession::with_flow(
             options,
             Box::new(|| ops::auth::ensure_not_enrolled().map_err(DesktopError::from)),
-            Box::new(move |sink| Box::pin(sign_in(device, sink))),
+            Box::new(move |sink| Box::pin(sign_in(device, device_name, launch, sink))),
         ))
     }
 
@@ -122,10 +124,14 @@ impl ClientCore {
         options: LoginOptions,
     ) -> Result<Arc<LoginSession>, DesktopError> {
         let code = parse_pairing_code(&code)?;
+        let device_name = options.device_name.clone();
+        let launch = self.config().daemon_launch.clone();
         Ok(Arc::new(LoginSession::with_flow(
             options,
             Box::new(|| ops::auth::ensure_not_enrolled().map_err(DesktopError::from)),
-            Box::new(move |sink| Box::pin(sign_in_with_pairing_code(code, sink))),
+            Box::new(move |sink| {
+                Box::pin(sign_in_with_pairing_code(code, device_name, launch, sink))
+            }),
         )))
     }
 
@@ -217,7 +223,7 @@ impl ClientCore {
 
     /// Records that the person acknowledged that changes made after the backup may be missing,
     /// which lets the daemon confirm a waiting replacement once every folder is complete here
-    /// (the attention item `replacement_unconfirmed_acknowledgement_required`). Call it only
+    /// (the attention item `replacement_unconfirmed` with step `acknowledge`). Call it only
     /// from an explicit user action ("Acknowledge and finish"); nothing confirms on its own.
     /// `Ok(false)` when no replacement is waiting. Idempotent.
     ///
@@ -254,12 +260,14 @@ impl ClientCore {
     /// `InvalidInput{field: "local_path"}` when no folder is linked there.
     pub async fn folder_detail(&self, local_path: String) -> Result<FolderDetail, DesktopError> {
         let status = ops::folders::status().await?;
-        dto::folder_detail(&status, &local_path).ok_or_else(|| {
+        let mut detail = dto::folder_detail(&status, &local_path).ok_or_else(|| {
             DesktopError::invalid_input(
                 format!("no folder is linked at {local_path}"),
                 "local_path",
             )
-        })
+        })?;
+        name_folder_origins(std::slice::from_mut(&mut detail.summary)).await;
+        Ok(detail)
     }
 
     /// Other devices with access to each linked folder's group, keyed by
@@ -281,7 +289,30 @@ impl ClientCore {
 }
 
 async fn account_status() -> AccountStatus {
-    account_status_with(linked_folders().await)
+    let mut status = account_status_with(linked_folders().await);
+    if status.sign_in == SignInState::SignedIn {
+        let info = signed_in_info(status.client_id.as_deref()).await;
+        status.email = info.email;
+        status.sign_in_provider = info.sign_in_provider;
+        status.display_name = info.display_name;
+    }
+    status
+}
+
+static EMAIL_MEMO: crate::account_email::AccountEmailMemo =
+    crate::account_email::AccountEmailMemo::new();
+
+/// The signed-in account's info for the desktop process; see `account_email::AccountEmailMemo`.
+async fn signed_in_info(client_id: Option<&str>) -> crate::account_email::AccountInfo {
+    let Some(client_id) = client_id else {
+        return crate::account_email::AccountInfo::default();
+    };
+    EMAIL_MEMO
+        .read(client_id, async {
+            let auth = crate::coordination::http_client::require_auth().await?;
+            ops::account::account_info_with(&auth).await
+        })
+        .await
 }
 
 /// Whether any folder is linked here; `None` when the daemon cannot say.
@@ -348,13 +379,16 @@ fn account_status_from(
         default_device_name,
         has_linked_folders,
         start_over_pending,
+        email: None,
+        sign_in_provider: None,
+        display_name: None,
     }
 }
 
 /// A prefill for the device-name field on the desktop: the machine's name from the environment
 /// or the `hostname` command, else a generic one. An embedded host gives its own
 /// (`CredentialSettings::host_name`).
-fn desktop_device_name() -> String {
+pub(crate) fn desktop_device_name() -> String {
     for var in ["COMPUTERNAME", "HOSTNAME", "HOST"] {
         if let Ok(value) = std::env::var(var) {
             if !value.trim().is_empty() {
@@ -381,6 +415,7 @@ pub fn new_login_session_in(
     options: LoginOptions,
 ) -> Arc<LoginSession> {
     let device = options.flow == LoginFlow::DeviceCode;
+    let settings = ops::auth::named(settings, options.device_name.clone());
     let precheck_dir = dir.clone();
     let precheck_settings = settings.clone();
     Arc::new(LoginSession::with_flow(
@@ -413,6 +448,7 @@ pub fn new_pairing_login_session_in(
     code: PairingCode,
     options: LoginOptions,
 ) -> Arc<LoginSession> {
+    let settings = ops::auth::named(settings, options.device_name.clone());
     let precheck_dir = dir.clone();
     let precheck_settings = settings.clone();
     Arc::new(LoginSession::with_flow(
@@ -479,14 +515,19 @@ pub fn new_reauthentication_session_in(
 /// The real sign-in flow: the client layer's enrolment and login, with each
 /// step passed on as a product event.
 ///
-/// Nothing is awaited after the login's credential write: the write and the
-/// flow's completion happen in one poll, and the session's gate makes a cancel
-/// wait for a poll in flight and forbid the next, so a flow that has written is
-/// reported as signed in and a cancelled one writes nothing. The daemon is
-/// therefore asked about linked folders before the login starts.
-async fn sign_in(device: bool, sink: LoginEventSink) -> Result<AccountStatus, DesktopError> {
+/// After the credential write the flow registers this computer and lets a running daemon adopt
+/// it, so a cancel or timeout in that window reports a failed sign-in while the computer is
+/// already enrolled. The account status then says "signed in, not registered", and the host
+/// finishes with [`ClientCore::register_device`] instead of signing in again. The daemon is asked
+/// about linked folders before the login starts.
+async fn sign_in(
+    device: bool,
+    device_name: Option<String>,
+    launch: crate::dto::DaemonLaunch,
+    sink: LoginEventSink,
+) -> Result<AccountStatus, DesktopError> {
     let has_linked_folders = linked_folders().await;
-    ops::auth::login(device, |event| {
+    ops::auth::login(device, device_name, &launch, |event| {
         if let Some(event) = login_event(event) {
             sink.send(event);
         }
@@ -499,10 +540,12 @@ async fn sign_in(device: bool, sink: LoginEventSink) -> Result<AccountStatus, De
 /// product event.
 async fn sign_in_with_pairing_code(
     code: PairingCode,
+    device_name: Option<String>,
+    launch: crate::dto::DaemonLaunch,
     sink: LoginEventSink,
 ) -> Result<AccountStatus, DesktopError> {
     let has_linked_folders = linked_folders().await;
-    ops::auth::login_with_pairing_code(code, |event| {
+    ops::auth::login_with_pairing_code(code, device_name, &launch, |event| {
         if let Some(event) = login_event(event) {
             sink.send(event);
         }
@@ -547,14 +590,78 @@ fn login_event(event: ops::auth::LoginEvent) -> Option<LoginEvent> {
                 user_code,
             }
         }
-        Step::SignedIn { .. } => return None,
+        Step::SignedIn { .. } | Step::DeviceRegistered { .. } => return None,
     })
 }
 
 async fn status_snapshot() -> Result<StatusSnapshot, DesktopError> {
     let status = ops::folders::status().await?;
     let account = account_status_with(Some(!status.links.is_empty()));
-    Ok(dto::status_snapshot(&status, account, SystemTime::now()))
+    let mut snapshot = dto::status_snapshot(&status, account, SystemTime::now());
+    name_folder_origins(&mut snapshot.folders).await;
+    Ok(snapshot)
+}
+
+/// How long the account's device names are reused by the status snapshot, which is polled: the
+/// names change when a device is renamed or added, rarely, and a stale name for a minute is not
+/// worth a coordination call per poll.
+const DEVICE_NAMES_TTL: Duration = Duration::from_secs(60);
+
+/// The account's device names and the identity they were read for.
+struct CachedDeviceNames {
+    at: std::time::Instant,
+    /// The sign-in they were read under. Each sign-in mints a fresh client id, so an id names
+    /// exactly one account: another sign-in, or none, never reuses these names.
+    client_id: String,
+    names: HashMap<String, String>,
+}
+
+impl CachedDeviceNames {
+    /// The kept names, when they were read under this very sign-in and are still fresh.
+    fn names_for(&self, client_id: &str) -> Option<&HashMap<String, String>> {
+        (self.client_id == client_id && self.at.elapsed() < DEVICE_NAMES_TTL).then_some(&self.names)
+    }
+}
+
+static DEVICE_NAMES: std::sync::Mutex<Option<CachedDeviceNames>> = std::sync::Mutex::new(None);
+
+/// Names the device each folder's newest change came from. The account's device list is read (and
+/// kept for [`DEVICE_NAMES_TTL`], for the current sign-in only) when some folder has such a
+/// device; when it cannot be read the devices stay unnamed.
+async fn name_folder_origins(folders: &mut [FolderSummary]) {
+    if folders.iter().all(|f| f.last_change_origin_device_id.is_none()) {
+        return;
+    }
+    // Signed out (or no readable credential): nothing is named, and nothing is kept for the next
+    // sign-in.
+    let Some(client_id) = credential_store::installation()
+        .ok()
+        .flatten()
+        .map(|credentials| credentials.client_id().to_owned())
+    else {
+        *DEVICE_NAMES.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        return;
+    };
+    let cached = DEVICE_NAMES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .and_then(|c| c.names_for(&client_id).cloned());
+    let names = match cached {
+        Some(names) => names,
+        None => {
+            let Ok(devices) = ops::devices::list_devices().await else { return };
+            let names: HashMap<String, String> =
+                devices.into_iter().map(|d| (d.device_id, d.device_name)).collect();
+            *DEVICE_NAMES.lock().unwrap_or_else(|p| p.into_inner()) = Some(CachedDeviceNames {
+                at: std::time::Instant::now(),
+                client_id,
+                names: names.clone(),
+            });
+            names
+        }
+    };
+    dto::name_last_change_devices(folders, &names);
 }
 
 /// Each linked folder group's member list, fetched once per group.

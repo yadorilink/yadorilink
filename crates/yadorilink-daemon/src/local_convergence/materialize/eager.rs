@@ -8,6 +8,9 @@ use yadorilink_replica_domain::session_state::MaterializationState;
 
 use super::super::types::*;
 use super::MaterializationPlan;
+use crate::write_op::{
+    self, IntentSettlement, OpKind, ProofOutcome, Retention, StepEvent, TargetObject, WriteSpec,
+};
 use yadorilink_fs_platform::fs_identity::{
     disk_race_fingerprint_or_stat, disk_race_fingerprint_or_stat_observed, DiskRaceFingerprint,
 };
@@ -69,6 +72,9 @@ struct TargetBaseline {
     /// The target's bytes at the baseline, read only where the fingerprint is
     /// stat-only (it cannot then show a same-size rewrite with a restored mtime).
     disk_bytes: BaselineBytes,
+    /// The object at the target at the same moment: the publish replaces this one and nothing
+    /// else, whatever lands after the pre-publish check.
+    expected: yadorilink_local_storage::TargetExpectation,
 }
 
 /// Removes an assembled temp (and releases its record) if the receive is dropped before the
@@ -84,10 +90,6 @@ struct DiscardTempOnDrop {
     group_id: String,
     root: Option<PathBuf>,
     armed: bool,
-    /// The path whose intent may carry this temp as its witness (a deferred write that went
-    /// through barrier 1): the witness is withdrawn before the temp goes, because a witness
-    /// whose temp is gone must mean "renamed".
-    witness_path: Option<String>,
 }
 
 impl DiscardTempOnDrop {
@@ -97,22 +99,6 @@ impl DiscardTempOnDrop {
 
     fn discard(&mut self) {
         self.armed = false;
-        if let Some(path) = &self.witness_path {
-            if let Err(error) = self
-                .state
-                .materialization_intent_repository()
-                .clear_temp_witness(&self.group_id, path)
-            {
-                // The temp stays: with it there the witness still says "not renamed".
-                tracing::warn!(
-                    group_id = %self.group_id,
-                    path = %path,
-                    %error,
-                    "could not withdraw a temp's witness; the temp is left in place"
-                );
-                return;
-            }
-        }
         match std::fs::symlink_metadata(&self.path) {
             Ok(_) => yadorilink_local_storage::discard_temp_file(&self.path, &self.ledger),
             // Gone: released only if the root is the link's (the check follows the absence, so a
@@ -130,16 +116,6 @@ impl DiscardTempOnDrop {
 impl Drop for DiscardTempOnDrop {
     fn drop(&mut self) {
         if self.armed {
-            if self.witness_path.is_some() {
-                // A receive dropped while it waits for the batch: another participant may be
-                // running the barrier over this very temp and recording its witness right now,
-                // after a removal here. A witnessed temp is therefore left in place on a drop
-                // (which reads as "not renamed", the safe reading); the second startup sweep
-                // removes it once the intent is gone. An explicit `discard` after a refusal
-                // is different: the batch's answer is final then.
-                self.armed = false;
-                return;
-            }
             self.discard();
         }
     }
@@ -149,11 +125,60 @@ impl Drop for DiscardTempOnDrop {
 enum AssembleOutcome {
     /// Published; carries the temp name when the flush was left to the
     /// window's batch barrier.
-    Written(Option<PathBuf>),
+    Written {
+        deferred_tmp: Option<PathBuf>,
+        /// The execute flag the published file carries: the version's, unless the filesystem
+        /// cannot hold it (FAT, some network mounts), which a read-back of the temp shows.
+        published_exec: bool,
+    },
     /// The target changed while the temp file was assembled; nothing was
     /// published.
     LocalEdit,
 }
+
+/// A temp file holding the payload's bytes, flushed as its durability class
+/// requires, not yet checked against the target.
+struct StagedTemp {
+    // Declared first so it is dropped first, as the local it replaces was.
+    /// Keeps the transfer in the status model until the file is in place.
+    _progress_until_placed: Option<crate::transfer_progress::TransferProgressGuard>,
+    tmp_path: PathBuf,
+    ready: Option<crate::local_convergence::filled_temps::TakenReady>,
+    durability: yadorilink_local_storage::Durability,
+    barrier_one_stamp: Option<yadorilink_local_storage::FlushedStamp>,
+    barrier_one_object: Option<yadorilink_local_storage::ObjectKey>,
+}
+
+/// The temp ledger of one write, offering the name its intent already carries as the first
+/// candidate of the temp the writer creates.
+struct PreassignedNameLedger {
+    inner: yadorilink_sync_sqlite::MaterializationTempLedger,
+    name: std::sync::Mutex<Option<PathBuf>>,
+}
+
+impl yadorilink_local_storage::TempFileLedger for PreassignedNameLedger {
+    fn record(
+        &self,
+        tmp_path: &std::path::Path,
+    ) -> Result<(), yadorilink_local_storage::StorageError> {
+        self.inner.record(tmp_path)
+    }
+    fn release(&self, tmp_path: &std::path::Path) {
+        self.inner.release(tmp_path)
+    }
+    fn strand(
+        &self,
+        dir_path: &std::path::Path,
+    ) -> Result<(), yadorilink_local_storage::StorageError> {
+        self.inner.strand(dir_path)
+    }
+    fn preassigned_name(&self) -> Option<PathBuf> {
+        self.name.lock().unwrap_or_else(|p| p.into_inner()).take()
+    }
+}
+
+/// A [`StagedTemp`] that passed the pre-publish check. Publishing takes one.
+struct CheckedTemp(StagedTemp);
 
 /// The row is committed under an open materialization intent, the target is
 /// verified and preflighted, and the mutation fence is bumped for the
@@ -169,6 +194,8 @@ struct PendingContentWrite<'a> {
     /// The completed temp of this version (a large file of a single-pass receive), taken from the
     /// registry; removed if the write never gets as far as renaming it.
     ready: Option<crate::local_convergence::filled_temps::TakenReady>,
+    /// The temp name chosen before the open when there is no completed temp.
+    fresh_tmp: Option<PathBuf>,
 }
 
 /// The outcome of the content write: the payload's bytes are durably
@@ -191,6 +218,8 @@ struct WrittenObject {
     out_path: PathBuf,
     written_version: FileVersion,
     mutation_generation: i64,
+    /// See [`AssembleOutcome::Written`].
+    published_exec: bool,
 }
 
 /// A write whose bytes reached the disk but are not yet closed.
@@ -200,12 +229,7 @@ struct LandedWrite {
     mutation_generation: i64,
 }
 
-/// The written object with this payload's execute flag applied.
-struct AppliedObject {
-    written: WrittenObject,
-}
-
-/// The applied object verified as the exact desired object, with the
+/// The written object verified as the exact desired object, with the
 /// evidence that says so. Only this is committed.
 struct VerifiedObject {
     written: WrittenObject,
@@ -264,9 +288,33 @@ impl super::super::LocalConvergenceExecutor {
             let proofs = self.proofs_before_replacing(plan.group_id, plan.record).await?;
             return self.write_incomplete_content_placeholder(plan, target, &proofs);
         }
+        let spec = WriteSpec {
+            kind: OpKind::Materialize,
+            group_id: plan.group_id.to_owned(),
+            path: plan.record.path.clone(),
+            target: TargetObject::Content(plan.payload.version().version_hash),
+            // `begin_content_write` takes the retention proofs before it opens the write.
+            retention: Retention::Proofs,
+            claimed: plan.claim.is_some(),
+        };
         let pending = self.begin_content_write(plan, target).await?;
+        write_op::trace::emit(&spec, StepEvent::Prepared);
+        write_op::failpoint::hit(
+            write_op::failpoint::WriteOpFailpoint::AfterPrepare,
+            &plan.record.path,
+        )?;
         let written = match self.reconstruct_content(plan, pending).await? {
-            Reconstruction::Written(written) => *written,
+            Reconstruction::Written(written) => {
+                write_op::trace::emit(
+                    &spec,
+                    StepEvent::Published {
+                        names_deferred: written.deferred_tmp.is_some(),
+                        // The landed marker is recorded exactly when the name is durable.
+                        landed_marked: written.deferred_tmp.is_none(),
+                    },
+                );
+                *written
+            }
             Reconstruction::DemotedToPlaceholder | Reconstruction::LocalEditDuringAssembly => {
                 return Ok(MaterializeResult::RetryRequired.into());
             }
@@ -296,16 +344,7 @@ impl super::super::LocalConvergenceExecutor {
             version: written.written_version.version_hash,
             mutation_generation: written.mutation_generation,
         };
-        let applied = match self.apply_written_metadata(plan, written) {
-            Ok(applied) => applied,
-            Err(error) => {
-                return match self.settle_write_removed_by_user(plan, &landed)? {
-                    Some(settled) => Ok(settled),
-                    None => Err(error),
-                };
-            }
-        };
-        let verified = match self.verify_written_object(plan, applied).await {
+        let verified = match self.verify_written_object(plan, written).await {
             Ok(Some(verified)) => verified,
             Ok(None) => {
                 // The bytes landed, but the path has moved on to a version
@@ -326,8 +365,8 @@ impl super::super::LocalConvergenceExecutor {
         };
         // The seam between the disk and the commit. Everything above it
         // is on disk and durable -- the temp file synced, renamed into
-        // place, its parent directory synced (`assemble_and_persist`),
-        // then the payload's metadata applied and the object verified --
+        // place with its metadata already on it, its parent directory synced
+        // (`assemble_and_persist`), and the object verified --
         // and nothing about it is committed: no proof, no `Present`, the
         // intent and the obligation open. A crash here is exactly that
         // state, which repair and the next claim finish without rewriting
@@ -358,8 +397,12 @@ impl super::super::LocalConvergenceExecutor {
                 tokio::time::sleep(std::time::Duration::from_secs(600)).await;
             }
         }
+        write_op::failpoint::hit(
+            write_op::failpoint::WriteOpFailpoint::AfterObserve,
+            &plan.record.path,
+        )?;
         crate::receive_diag::mark(crate::receive_diag::Stage::PreCommit);
-        self.commit_verified_object(plan, verified).await
+        self.commit_verified_object(plan, &spec, verified).await
     }
 
     /// Stage 1: fingerprint the target before any block is requested.
@@ -609,6 +652,9 @@ impl super::super::LocalConvergenceExecutor {
         // pre-rename compare against that hash. The hash is not taken after the
         // decision, which would let it adopt an edit as the baseline.
         let observed = disk_race_fingerprint_or_stat_observed(&out_path_for_race_check);
+        let expected =
+            yadorilink_local_storage::TargetExpectation::observe(&out_path_for_race_check)
+                .map_err(|error| PeerSessionError::HydrationFailed(error.to_string()))?;
         let was_dirty = self.state.is_path_dirty(group_id, &record.path)?;
         let disk_bytes = match observed {
             Some((_, true)) => {
@@ -635,6 +681,7 @@ impl super::super::LocalConvergenceExecutor {
             fingerprint: observed.map(|(fingerprint, _)| fingerprint),
             was_dirty,
             disk_bytes,
+            expected,
         };
         if self.disk_holds_uncaptured_local_bytes(
             group_id,
@@ -791,6 +838,19 @@ impl super::super::LocalConvergenceExecutor {
         // only ask for blocks.
         let retention_proofs = self.proofs_before_replacing(group_id, record).await?;
         crate::receive_diag::mark(crate::receive_diag::Stage::ReadyToOpen);
+        // The temp this write will publish is named before the open and written with the intent,
+        // so a crash after the open can finish the write from that file instead of fetching the
+        // version again. A completed temp already has its name; otherwise one is chosen here and
+        // the writer takes it as its first candidate.
+        let out_path = self.local_file_path(group_id, &record.path)?;
+        let ready =
+            self.take_ready_temp(group_id, &record.path, &payload.version().version_hash.to_hex())?;
+        let fresh_tmp =
+            ready.is_none().then(|| yadorilink_local_storage::random_tmp_path(&out_path));
+        let named_tmp = match &ready {
+            Some(ready) => Some(ready.tmp_path()),
+            None => fresh_tmp.clone(),
+        };
         let (content_write_mutation_generation, intent_guard) = self
             .state
             .open_content_write_via(
@@ -800,6 +860,7 @@ impl super::super::LocalConvergenceExecutor {
                 plan.authoring,
                 &plan.columns,
                 &retention_proofs,
+                named_tmp.as_deref(),
                 &|| self.root_lease_for(group_id),
                 root_commit_permit,
                 |open| async {
@@ -811,7 +872,6 @@ impl super::super::LocalConvergenceExecutor {
             )
             .await?;
         crate::receive_diag::mark(crate::receive_diag::Stage::Opened);
-        let out_path = self.local_file_path(group_id, &record.path)?;
         // defense-in-depth: `is_safe_relative_path` (in
         // `reconcile_files`) already blocks `..`/absolute components,
         // but a *symlink* at an intermediate path component is
@@ -828,8 +888,6 @@ impl super::super::LocalConvergenceExecutor {
         // A completed temp of exactly this version already holds the space it needs (it was
         // reserved when the temp was made): the settle takes that reservation instead of making a
         // second one for the same bytes.
-        let ready =
-            self.take_ready_temp(group_id, &record.path, &payload.version().version_hash.to_hex())?;
         let headroom = match &ready {
             Some(ready) => Arc::clone(ready.reservation()),
             None => Arc::new(self.preflight_disk_headroom(group_id, &out_path, record.size)?),
@@ -867,6 +925,7 @@ impl super::super::LocalConvergenceExecutor {
             baseline: target.baseline,
             headroom,
             ready,
+            fresh_tmp,
         })
     }
 
@@ -887,7 +946,9 @@ impl super::super::LocalConvergenceExecutor {
             baseline,
             headroom,
             ready,
+            fresh_tmp,
         } = pending;
+        let fresh_tmp = std::sync::Mutex::new(fresh_tmp);
         // The first attempt takes the completed temp; a retry (a failed attempt removed it) rebuilds
         // from the block store as before.
         //
@@ -919,14 +980,7 @@ impl super::super::LocalConvergenceExecutor {
         const MAX_RECONSTRUCT_RETRIES: u32 = 20;
         const RECONSTRUCT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
         let mut recon = self
-            .assemble_and_persist(
-                &out_path,
-                plan,
-                &baseline,
-                &headroom,
-                &ready,
-                content_write_mutation_generation,
-            )
+            .assemble_and_persist(&out_path, plan, &baseline, &headroom, &ready, &fresh_tmp)
             .await;
         let mut attempts = 0u32;
         while recon.is_err() && attempts < MAX_RECONSTRUCT_RETRIES && !had_ready_temp {
@@ -946,17 +1000,10 @@ impl super::super::LocalConvergenceExecutor {
             // is not a transient, retriable condition.
             self.verify_write_target(group_id, &out_path)?;
             recon = self
-                .assemble_and_persist(
-                    &out_path,
-                    plan,
-                    &baseline,
-                    &headroom,
-                    &ready,
-                    content_write_mutation_generation,
-                )
+                .assemble_and_persist(&out_path, plan, &baseline, &headroom, &ready, &fresh_tmp)
                 .await;
         }
-        let deferred_tmp = match &recon {
+        let (deferred_tmp, published_exec) = match &recon {
             Ok(AssembleOutcome::LocalEdit) => {
                 // The intent stays open and nothing is proven, as when the
                 // written object fails verification: the path is re-driven
@@ -964,8 +1011,10 @@ impl super::super::LocalConvergenceExecutor {
                 drop(intent_guard);
                 return Ok(Reconstruction::LocalEditDuringAssembly);
             }
-            Ok(AssembleOutcome::Written(tmp)) => tmp.clone(),
-            Err(_) => None,
+            Ok(AssembleOutcome::Written { deferred_tmp, published_exec }) => {
+                (deferred_tmp.clone(), *published_exec)
+            }
+            Err(_) => (None, false),
         };
         if let Err(e) = recon {
             tracing::warn!(
@@ -1022,15 +1071,8 @@ impl super::super::LocalConvergenceExecutor {
         // `MaterializationStateRepository::record_materialized_
         // fingerprint`'s own doc comment for what the daemon's
         // already-`Present` fast path (`hydration.rs::hydrate_inner`)
-        // The temp-write-then-rename completed durably — clear the intent
-        // NOW, before the post-write metadata touch below. Clearing only
-        // after `apply_unix_mode` would leak the intent whenever reading or
-        // applying the exec bit errored (a real `chmod` on POSIX) even though
-        // the file is durably on disk and `Present`; a later genuine offline
-        // delete of that path would then read `missing + intent present` and
-        // wrongly resurrect it from the blocks. This is exactly
-        // `reconstruct_file_journaled`'s "clear right after the rename"
-        // ordering.
+        // The temp-write-then-rename completed (the exec bit went onto the temp before the
+        // rename).
         // The intent is cleared by the commit below, not here:
         // clearing first leaves a window in which the bytes exist,
         // nothing records that a write was in flight, and no proof has
@@ -1064,11 +1106,13 @@ impl super::super::LocalConvergenceExecutor {
             out_path,
             written_version,
             mutation_generation: content_write_mutation_generation,
+            published_exec,
         })))
     }
 
     /// Assembles the payload's bytes into a temp file beside `out_path` and
-    /// publishes it by rename.
+    /// publishes it by rename: [`Self::stage`], [`Self::pre_publish_check`],
+    /// [`Self::publish`], in that order.
     ///
     /// The local-edit guard in `revalidate_target` ran before the assembly,
     /// which reads every block and fsyncs the result -- time proportional to
@@ -1083,9 +1127,63 @@ impl super::super::LocalConvergenceExecutor {
         baseline: &TargetBaseline,
         headroom: &Arc<super::super::reconcile::HeadroomReservation>,
         ready: &std::sync::Mutex<Option<crate::local_convergence::filled_temps::TakenReady>>,
-        mutation_generation: i64,
+        fresh_tmp: &std::sync::Mutex<Option<PathBuf>>,
     ) -> Result<AssembleOutcome, PeerSessionError> {
-        let MaterializationPlan { group_id, record, permit: root_commit_permit, .. } = *plan;
+        let staged = self.stage(out_path, plan, headroom, ready, fresh_tmp).await?;
+        write_op::failpoint::hit(
+            write_op::failpoint::WriteOpFailpoint::AfterStage,
+            &plan.record.path,
+        )?;
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let record_path = &plan.record.path;
+            let hook = self
+                .between_assemble_and_persist_hook
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(hook) = hook {
+                hook(out_path);
+            }
+            let probe =
+                self.overlap_probe.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+            if let Some(probe) = probe {
+                probe.pass(crate::local_convergence::ProbeSeam::BeforeRename, record_path).await;
+            }
+        }
+        let Some(checked) = self.pre_publish_check(out_path, plan, baseline, staged).await? else {
+            return Ok(AssembleOutcome::LocalEdit);
+        };
+        write_op::failpoint::hit(
+            write_op::failpoint::WriteOpFailpoint::BeforePublish,
+            &plan.record.path,
+        )?;
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let hook = self
+                .after_check_before_publish_hook
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(hook) = hook {
+                hook(out_path);
+            }
+        }
+        self.publish(out_path, plan, baseline, checked).await
+    }
+
+    /// Stage: the payload's bytes in a temp file beside `out_path`, flushed as
+    /// far as the write's durability class requires before anything can rename
+    /// it (barrier 1 for content that only the temp holds).
+    async fn stage(
+        &self,
+        out_path: &std::path::Path,
+        plan: &MaterializationPlan<'_>,
+        headroom: &Arc<super::super::reconcile::HeadroomReservation>,
+        ready: &std::sync::Mutex<Option<crate::local_convergence::filled_temps::TakenReady>>,
+        fresh_tmp: &std::sync::Mutex<Option<PathBuf>>,
+    ) -> Result<StagedTemp, PeerSessionError> {
+        let MaterializationPlan { group_id, record, .. } = *plan;
         let ready = ready.lock().unwrap_or_else(|p| p.into_inner()).take();
         // A received file's content is already durable in the block store. When
         // the run's window flushes its files in one batch, neither the file nor
@@ -1127,6 +1225,7 @@ impl super::super::LocalConvergenceExecutor {
             other => other,
         };
         let mut ready = ready;
+        let preassigned = fresh_tmp.lock().unwrap_or_else(|p| p.into_inner()).take();
         let (tmp_path, _progress_until_placed) = match ready.as_mut() {
             Some(ready) => (ready.tmp_path(), ready.take_progress()),
             None => (
@@ -1136,7 +1235,10 @@ impl super::super::LocalConvergenceExecutor {
                     &record.blocks,
                     record.mtime_unix_nanos,
                     Some(headroom.clone()),
-                    Arc::new(self.state.temp_ledger(group_id)),
+                    Arc::new(PreassignedNameLedger {
+                        inner: self.state.temp_ledger(group_id),
+                        name: std::sync::Mutex::new(preassigned),
+                    }),
                     None,
                     write_durability,
                     self.state.receive_write_gate(),
@@ -1161,7 +1263,6 @@ impl super::super::LocalConvergenceExecutor {
         // flush is of the target's directory, so it also makes the name of an object the rename
         // replaces durable: a missing name is then never a replaced object lost with the cut.
         let barrier_one = durability != yadorilink_local_storage::Durability::Full;
-        let witnessed = barrier_one;
         let (barrier_one_stamp, barrier_one_object) = if barrier_one {
             self.run_barrier_one(
                 plan,
@@ -1169,28 +1270,41 @@ impl super::super::LocalConvergenceExecutor {
                 ready.as_mut(),
                 (ready_data_flushed, ready_object),
                 durability,
-                witnessed.then_some(mutation_generation),
             )
             .await?
         } else {
             (None, None)
         };
-        #[cfg(any(test, feature = "test-support"))]
-        {
-            let hook = self
-                .between_assemble_and_persist_hook
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
-            if let Some(hook) = hook {
-                hook(out_path);
-            }
-            let probe =
-                self.overlap_probe.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
-            if let Some(probe) = probe {
-                probe.pass(crate::local_convergence::ProbeSeam::BeforeRename, &record.path).await;
-            }
-        }
+        Ok(StagedTemp {
+            tmp_path,
+            ready,
+            durability,
+            barrier_one_stamp,
+            barrier_one_object,
+            _progress_until_placed,
+        })
+    }
+
+    /// Pre-publish check: the target is what the write was baselined on, the
+    /// root is proven, and the temp is still the object barrier 1 flushed. A
+    /// target that moved is a local edit: the temp goes, the path is journaled
+    /// and nothing is published (`None`). Only this function makes a [`CheckedTemp`].
+    async fn pre_publish_check(
+        &self,
+        out_path: &std::path::Path,
+        plan: &MaterializationPlan<'_>,
+        baseline: &TargetBaseline,
+        staged: StagedTemp,
+    ) -> Result<Option<CheckedTemp>, PeerSessionError> {
+        let MaterializationPlan { group_id, record, permit: root_commit_permit, .. } = *plan;
+        let StagedTemp {
+            tmp_path,
+            ready,
+            durability,
+            barrier_one_stamp,
+            barrier_one_object,
+            _progress_until_placed,
+        } = staged;
         // Where the volume cannot answer the change time / USN, the fingerprint
         // is stat-only and misses a same-size rewrite with a restored mtime, and
         // the watcher may not have journaled it yet. The bytes are asked again,
@@ -1214,7 +1328,7 @@ impl super::super::LocalConvergenceExecutor {
                 match compared {
                     Ok(moved) => moved,
                     Err(error) => {
-                        self.abandon_temp(group_id, &record.path, &tmp_path, witnessed);
+                        self.abandon_temp(group_id, &tmp_path);
                         return Err(PeerSessionError::HydrationFailed(error.to_string()));
                     }
                 }
@@ -1225,7 +1339,7 @@ impl super::super::LocalConvergenceExecutor {
             || fingerprint != baseline.fingerprint
             || (!baseline.was_dirty && self.state.is_path_dirty(group_id, &record.path)?);
         if moved {
-            self.abandon_temp(group_id, &record.path, &tmp_path, witnessed);
+            self.abandon_temp(group_id, &tmp_path);
             self.state.journal_uncaptured_local_edit(
                 group_id,
                 &record.path,
@@ -1238,7 +1352,7 @@ impl super::super::LocalConvergenceExecutor {
                 "the target changed on disk while its content was being assembled; leaving \
                  the local write in place and publishing nothing"
             );
-            return Ok(AssembleOutcome::LocalEdit);
+            return Ok(None);
         }
         // The assembly above runs for time proportional to the file, long
         // enough for the volume under the root to go away and leave a bare
@@ -1246,7 +1360,7 @@ impl super::super::LocalConvergenceExecutor {
         // rename, so the file is never published onto the parent filesystem
         // and no Present row follows; the open intent re-drives the write.
         if let Err(error) = self.verify_write_target(group_id, out_path) {
-            self.abandon_temp(group_id, &record.path, &tmp_path, witnessed);
+            self.abandon_temp(group_id, &tmp_path);
             return Err(error);
         }
         // The temp is still the object barrier 1 flushed: another file put at its name since
@@ -1256,11 +1370,39 @@ impl super::super::LocalConvergenceExecutor {
         if barrier_one_object.is_some()
             && yadorilink_local_storage::object_key(&tmp_path) != barrier_one_object
         {
-            self.abandon_temp(group_id, &record.path, &tmp_path, witnessed);
+            self.abandon_temp(group_id, &tmp_path);
             return Err(PeerSessionError::HydrationFailed(
                 "the temp was replaced after it was flushed".into(),
             ));
         }
+        Ok(Some(CheckedTemp(StagedTemp {
+            tmp_path,
+            ready,
+            durability,
+            barrier_one_stamp,
+            barrier_one_object,
+            _progress_until_placed,
+        })))
+    }
+
+    /// Publish: the checked temp is renamed over the target. A deferred
+    /// write records that its flush is owed to the window's barrier.
+    async fn publish(
+        &self,
+        out_path: &std::path::Path,
+        plan: &MaterializationPlan<'_>,
+        baseline: &TargetBaseline,
+        checked: CheckedTemp,
+    ) -> Result<AssembleOutcome, PeerSessionError> {
+        let MaterializationPlan { group_id, record, .. } = *plan;
+        let StagedTemp {
+            tmp_path,
+            ready,
+            durability,
+            barrier_one_stamp,
+            barrier_one_object,
+            _progress_until_placed,
+        } = checked.0;
         let deferred_tmp =
             (durability != yadorilink_local_storage::Durability::Full).then(|| tmp_path.clone());
         let persisted_tmp = tmp_path.clone();
@@ -1270,22 +1412,57 @@ impl super::super::LocalConvergenceExecutor {
         if let Some(ready) = ready {
             ready.defuse();
         }
+        let published_exec = {
+            let temp = tmp_path.clone();
+            let wanted = plan.payload.version().meta.exec;
+            tokio::task::spawn_blocking(move || {
+                // Applied here as well as by the persist (a repeat is a no-op) so the temp, which
+                // nobody else can reach, shows what the filesystem keeps of the flag.
+                let _ = yadorilink_local_storage::apply_exec(&temp, wanted);
+                std::fs::metadata(&temp)
+                    .map_or(wanted, |m| yadorilink_local_storage::exec_from_metadata(&m))
+            })
+            .await
+            .map_err(|e| PeerSessionError::CorruptState(format!("exec read-back failed: {e}")))?
+        };
         if let Err(error) = persist_reconstructed_file_off_runtime(
             tmp_path,
             out_path,
             Arc::new(self.state.temp_ledger(group_id)),
             durability,
+            // The replicated execute flag goes onto the temp before the rename, so the file
+            // is published with its final mode.
+            plan.payload.version().meta.exec,
+            baseline.expected,
         )
         .await
         {
-            // The deferred publish leaves its temp to us on failure: the witness is withdrawn
-            // first, then the temp goes (and if the witness cannot be withdrawn the temp stays).
+            if matches!(error, super::super::types::PublishRefusal::TargetChanged) {
+                // A save landed after the pre-publish check: nothing was replaced. It is a
+                // local edit like one the check would have seen: the temp goes and the path
+                // is journaled for capture.
+                self.abandon_temp(group_id, &persisted_tmp);
+                self.state.journal_uncaptured_local_edit(
+                    group_id,
+                    &record.path,
+                    std::fs::symlink_metadata(out_path).is_ok(),
+                    plan.permit,
+                )?;
+                tracing::info!(
+                    group_id,
+                    path = %record.path,
+                    "the target changed on disk as the content was being placed; leaving the \
+                     local write in place and publishing nothing"
+                );
+                return Ok(AssembleOutcome::LocalEdit);
+            }
+            // The deferred publish leaves its temp to us on failure.
             // A receive cancelled while the publish ran leaves the temp in place, which says
             // "not renamed", the safe reading.
             if durability != yadorilink_local_storage::Durability::Full {
-                self.abandon_temp(group_id, &record.path, &persisted_tmp, witnessed);
+                self.abandon_temp(group_id, &persisted_tmp);
             }
-            return Err(error);
+            return Err(error.into());
         }
         crate::receive_diag::mark(crate::receive_diag::Stage::Renamed);
         // The file is in place unflushed: its flush is owed to the window's barrier
@@ -1309,13 +1486,15 @@ impl super::super::LocalConvergenceExecutor {
                 });
             }
         }
-        Ok(AssembleOutcome::Written(deferred_tmp))
+        write_op::failpoint::hit(
+            write_op::failpoint::WriteOpFailpoint::AfterPublish,
+            &record.path,
+        )?;
+        Ok(AssembleOutcome::Written { deferred_tmp, published_exec })
     }
 
     /// Barrier 1 for one temp, with the cleanup the wait needs: the temp is removed if the
-    /// receive is dropped while it waits or the barrier refuses it, and a witnessed temp (a
-    /// deferred write, `witness_fence` is the fence its open bumped) is never removed
-    /// before its witness is withdrawn.
+    /// receive is dropped while it waits or the barrier refuses it.
     async fn run_barrier_one(
         &self,
         plan: &MaterializationPlan<'_>,
@@ -1326,7 +1505,6 @@ impl super::super::LocalConvergenceExecutor {
             Option<yadorilink_local_storage::ObjectKey>,
         ),
         durability: yadorilink_local_storage::Durability,
-        witness_fence: Option<i64>,
     ) -> Result<
         (
             Option<yadorilink_local_storage::FlushedStamp>,
@@ -1334,8 +1512,7 @@ impl super::super::LocalConvergenceExecutor {
         ),
         PeerSessionError,
     > {
-        let MaterializationPlan { group_id, record, .. } = *plan;
-        let witnessed = witness_fence.is_some();
+        let MaterializationPlan { group_id, .. } = *plan;
         // A receive cancelled while it waits for the batch removes its temp (a completed
         // temp has its own guard).
         let mut cleanup = DiscardTempOnDrop {
@@ -1345,7 +1522,6 @@ impl super::super::LocalConvergenceExecutor {
             group_id: group_id.to_owned(),
             root: self.sync_root(group_id).ok(),
             armed: true,
-            witness_path: witnessed.then(|| record.path.clone()),
         };
         // The removal of a completed temp is ours while we wait (it keeps the ledger
         // record when the root is lost) and returns to its guard afterwards.
@@ -1354,11 +1530,6 @@ impl super::super::LocalConvergenceExecutor {
         }
         let name_only =
             durability != yadorilink_local_storage::Durability::FileFlushedNamesDeferred;
-        let witness =
-            witness_fence.map(|fence| crate::local_convergence::completion_window::TempWitness {
-                path: record.path.clone(),
-                fence,
-            });
         match self
             .flush_temp_before_rename(
                 group_id,
@@ -1366,20 +1537,13 @@ impl super::super::LocalConvergenceExecutor {
                 ready_data_flushed,
                 ready_object,
                 name_only,
-                witness,
             )
             .await
         {
             Ok(flushed) => {
                 cleanup.armed = false;
-                // A witnessed temp is never removed by a guard that cannot withdraw the witness
-                // first: its removal belongs to `abandon_temp` or the rename. A receive
-                // cancelled from here on leaves the temp in place, which says "not renamed", the
-                // safe reading.
-                if !witnessed {
-                    if let Some(ready) = ready.as_mut() {
-                        ready.set_cleanup_on_drop(true);
-                    }
+                if let Some(ready) = ready.as_mut() {
+                    ready.set_cleanup_on_drop(true);
                 }
                 Ok(flushed)
             }
@@ -1390,30 +1554,8 @@ impl super::super::LocalConvergenceExecutor {
         }
     }
 
-    /// Removes a temp that will not be renamed. A temp that barrier 1 recorded as the witness of a
-    /// new name has the witness withdrawn FIRST, because a witness whose temp is gone means "the
-    /// rename happened": if the witness cannot be withdrawn the temp is left in place (with it
-    /// there the witness still says "not renamed").
-    fn abandon_temp(
-        &self,
-        group_id: &str,
-        path: &str,
-        tmp_path: &std::path::Path,
-        witnessed: bool,
-    ) {
-        if witnessed {
-            if let Err(error) =
-                self.state.materialization_intent_repository().clear_temp_witness(group_id, path)
-            {
-                tracing::warn!(
-                    group_id,
-                    path,
-                    %error,
-                    "could not withdraw a temp's witness; the temp is left in place"
-                );
-                return;
-            }
-        }
+    /// Removes a temp that will not be renamed.
+    fn abandon_temp(&self, group_id: &str, tmp_path: &std::path::Path) {
         yadorilink_local_storage::discard_temp_file(tmp_path, &self.state.temp_ledger(group_id));
     }
 
@@ -1428,7 +1570,6 @@ impl super::super::LocalConvergenceExecutor {
         data_flushed: Option<yadorilink_local_storage::FlushedStamp>,
         verified_object: Option<yadorilink_local_storage::ObjectKey>,
         name_only: bool,
-        witness: Option<crate::local_convergence::completion_window::TempWitness>,
     ) -> Result<
         (
             Option<yadorilink_local_storage::FlushedStamp>,
@@ -1445,7 +1586,6 @@ impl super::super::LocalConvergenceExecutor {
             object: verified_object.or_else(|| yadorilink_local_storage::object_key(tmp_path)),
             data_flushed,
             name_only,
-            witness,
         };
         match super::super::completion_window::current() {
             Some(window) => {
@@ -1522,32 +1662,13 @@ impl super::super::LocalConvergenceExecutor {
         ))
     }
 
-    /// Stage 6: apply this payload's execute flag to the written object.
-    fn apply_written_metadata(
-        &self,
-        plan: &MaterializationPlan<'_>,
-        written: WrittenObject,
-    ) -> Result<AppliedObject, PeerSessionError> {
-        // Apply the execute flag THIS PAYLOAD specifies (POSIX: real chmod;
-        // no-op, no error, on Windows).
-        //
-        // From the payload, not the row: the content above was reconstructed
-        // from the payload's blocks and the proof below names the payload's
-        // version, so a supersession during the (arbitrarily long) fetch and
-        // reconstruct must not leave the flag of the row's newer version
-        // under the payload's content and proof.
-        plan.apply_payload_metadata(&written.out_path)?;
-        Ok(AppliedObject { written })
-    }
-
-    /// Stage 7: verify disk holds the exact object the payload names.
+    /// Stage 6: verify disk holds the exact object the payload names.
     /// `None` when the path has moved on to a version these bytes are not.
     async fn verify_written_object(
         &self,
         plan: &MaterializationPlan<'_>,
-        applied: AppliedObject,
+        written: WrittenObject,
     ) -> Result<Option<VerifiedObject>, PeerSessionError> {
-        let AppliedObject { written } = applied;
         #[cfg(any(test, feature = "test-support"))]
         {
             let hook = self
@@ -1559,6 +1680,11 @@ impl super::super::LocalConvergenceExecutor {
                 hook(&written.out_path);
             }
         }
+        // A freshly written file's timestamps are too young for its identity to vouch for the bytes
+        // read after it; pause briefly (large files only) so that they are not, and take the
+        // moment the identity is observed at.
+        let echo_observed_at =
+            self.state.prepare_verified_echo(&written.out_path, plan.record.size).await;
         let Some(evidence) = self.exact_object_evidence_after_write(
             plan.group_id,
             &plan.record.path,
@@ -1577,10 +1703,19 @@ impl super::super::LocalConvergenceExecutor {
         // anything later changes the identity and anything earlier fails
         // here. A mismatch publishes nothing and journals the path, so
         // capture authors the edit.
+        //
+        // The execute flag is bound the same way: a `chmod` that landed before the identity was
+        // observed is part of that identity, so the proof would call it the daemon's own flag and
+        // the edit would never be captured.
         let (check_path, check_blocks) = (written.out_path.clone(), plan.record.blocks.clone());
+        let expected_exec = written.published_exec;
         let bytes_match = tokio::task::spawn_blocking(move || {
             yadorilink_local_storage::disk_bytes_match_indexed_blocks(&check_path, &check_blocks)
                 .unwrap_or(false)
+                && (!cfg!(unix)
+                    || std::fs::metadata(&check_path).is_ok_and(|metadata| {
+                        yadorilink_local_storage::exec_from_metadata(&metadata) == expected_exec
+                    }))
         })
         .await
         .map_err(|e| PeerSessionError::CorruptState(format!("proof content check failed: {e}")))?;
@@ -1594,20 +1729,38 @@ impl super::super::LocalConvergenceExecutor {
             tracing::info!(
                 group_id = plan.group_id,
                 path = %plan.record.path,
-                "the file changed on disk between the write and its proof; leaving the local \
+                "the file changed on disk (content or execute flag) between the write and its proof; leaving the local \
                  write in place and publishing nothing"
             );
             return Ok(None);
         }
+        // The watcher will report this very write; remember that it was just verified, with the
+        // identity observed before the check, so capture does not read the file again. The entry is
+        // made only when the file's timestamps are old enough to prove a later edit (racy-clean rule).
+        if let (Some(observed_at), SettlementEvidence::ExactObject { identity, .. }) =
+            (echo_observed_at, &evidence)
+        {
+            if let Some(identity) = (**identity).as_ref() {
+                self.state.note_verified_echo(
+                    plan.group_id,
+                    &plan.record.path,
+                    written.written_version.version_hash,
+                    identity,
+                    &written.out_path,
+                    observed_at,
+                );
+            }
+        }
         Ok(Some(VerifiedObject { written, evidence }))
     }
 
-    /// Stage 8: commit the proof, the `Present` stamp, the intent clear and
+    /// Stage 7: commit the proof, the `Present` stamp, the intent clear and
     /// the claimed obligation's completion under the fence this write
     /// bumped, and settle with the evidence.
     async fn commit_verified_object(
         &self,
         plan: &MaterializationPlan<'_>,
+        spec: &WriteSpec,
         verified: VerifiedObject,
     ) -> Result<LocalMaterializeOutcome, PeerSessionError> {
         let MaterializationPlan { group_id, record, permit: root_commit_permit, .. } = *plan;
@@ -1618,6 +1771,7 @@ impl super::super::LocalConvergenceExecutor {
                     out_path,
                     written_version,
                     mutation_generation: content_write_mutation_generation,
+                    ..
                 },
             evidence,
         } = verified;
@@ -1634,7 +1788,9 @@ impl super::super::LocalConvergenceExecutor {
                 version: written_version.version_hash,
                 identity: Box::new(verified_identity),
             };
+        write_op::failpoint::hit(write_op::failpoint::WriteOpFailpoint::BeforeProve, &record.path)?;
         let claim = plan.claim.map(|claim| claim.token());
+        let deferred_flush = deferred_tmp.is_some();
         let closed = match super::super::completion_window::current() {
             // Queued with the run's other files and committed with them. This
             // future keeps its path lock, its root operation and its permit
@@ -1709,9 +1865,25 @@ impl super::super::LocalConvergenceExecutor {
                 }
             }
             crate::replica_coordinator::ContentWriteClose::Published { obligation } => {
+                write_op::trace::emit(
+                    spec,
+                    StepEvent::Proven {
+                        outcome: ProofOutcome::Exact,
+                        intent: if deferred_flush {
+                            IntentSettlement::FlushPending
+                        } else {
+                            IntentSettlement::Cleared
+                        },
+                        obligation_closed: obligation.is_some(),
+                    },
+                );
                 if let (Some(claim), Some(_)) = (plan.claim, obligation) {
                     claim.record_decided(&record.path);
                 }
+                write_op::failpoint::hit(
+                    write_op::failpoint::WriteOpFailpoint::AfterProve,
+                    &record.path,
+                )?;
                 yadorilink_fs_platform::join_timeline::mark(
                     &self.local_device_id,
                     group_id,

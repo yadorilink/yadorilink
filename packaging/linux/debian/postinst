@@ -33,11 +33,11 @@ fi
 cat <<'EOF'
 yadorilink installed: /usr/bin/yadorilink, /usr/bin/yadorilink-daemon
 
-A systemd --user unit was installed but NOT enabled automatically. To
-start the sync daemon now and have it start at every login with
-crash-restart supervision, run this as your normal (non-root) user:
+Start the sync daemon, as your normal (non-root) user. This also makes it
+start at every login, with crash-restart supervision, and sign in:
 
-    systemctl --user enable --now yadorilink-daemon
+    yadorilink daemon start
+    yadorilink login
 
 For an always-on box with no login (NAS, home server), set up the system
 service instead, as root:

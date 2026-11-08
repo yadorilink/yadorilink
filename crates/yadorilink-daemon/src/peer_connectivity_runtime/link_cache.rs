@@ -26,6 +26,12 @@
 //!   current link. A standby it replaces is retired: kept open for a grace
 //!   period (long enough for the peer to move to its own current), then
 //!   closed; at most `MAX_RETIRED` are kept, the oldest closed first.
+//! * Crossed dials: when the live current and standby links are one dialled
+//!   here and one accepted, both sides keep the one dialled by the lower
+//!   endpoint id (bytes compare), which each side can tell without any
+//!   message. Both make it current; the higher-id side closes the other after
+//!   a grace period, unless the preferred link has died by then (the other
+//!   stays, and is promoted). The lower-id side never closes anything.
 //! * Authorization is the caller's: only links already held by the
 //!   endpoint's open-connection registry (admitted, revocable) are offered,
 //!   and a dialled link is held before it is cached, exactly as before.
@@ -78,6 +84,8 @@ impl Drop for Retired {
 }
 
 struct Slot {
+    /// This device's endpoint id: with the peer's, it says whose dial wins a crossing.
+    local: PeerId,
     /// Test-only: ends every retired link's grace period at once.
     #[cfg(test)]
     expire_now: watch::Sender<bool>,
@@ -87,8 +95,9 @@ struct Slot {
 }
 
 impl Slot {
-    fn new() -> Self {
+    fn new(local: PeerId) -> Self {
         Self {
+            local,
             state: Mutex::new(SlotState::default()),
             changed: watch::channel(()).0,
             #[cfg(test)]
@@ -110,6 +119,67 @@ impl Slot {
         if let Some(old) = state.standby.replace(link) {
             self.retire(state, old);
         }
+    }
+
+    /// Resolves crossed dials: if `current` and `standby` are live and one was dialled here and
+    /// the other accepted, the one dialled by the lower endpoint id becomes current, and the
+    /// higher-id side schedules the close of the other.
+    fn settle_crossing(self: &Arc<Self>, state: &mut SlotState, peer: PeerId) {
+        let (Some(current), Some(standby)) = (state.current.clone(), state.standby.clone()) else {
+            return;
+        };
+        let usable = |l: &Arc<PeerLink>| l.is_alive() && l.peer() == peer;
+        if !usable(&current)
+            || !usable(&standby)
+            || current.dialled_here() == standby.dialled_here()
+        {
+            return;
+        }
+        let ours_wins = self.local < peer;
+        if standby.dialled_here() == ours_wins {
+            std::mem::swap(&mut state.current, &mut state.standby);
+        }
+        if ours_wins {
+            return;
+        }
+        let loser = state.standby.clone().expect("the loser is the standby");
+        let grace =
+            std::time::Duration::from_millis(self.grace.load(std::sync::atomic::Ordering::Relaxed));
+        let slot = Arc::downgrade(self);
+        #[cfg(test)]
+        let mut expire_now = self.expire_now.subscribe();
+        tokio::spawn(async move {
+            let mut path = loser.carrier_changes();
+            #[cfg(test)]
+            let expired = async {
+                let _ = expire_now.wait_for(|now| *now).await;
+            };
+            #[cfg(not(test))]
+            let expired = std::future::pending::<()>();
+            tokio::select! {
+                () = tokio::time::sleep(grace) => {}
+                () = expired => {}
+                () = async { while path.next().await.is_some() {} } => return,
+            }
+            let Some(slot) = slot.upgrade() else { return };
+            let mut state = slot.state();
+            // Closed only while the preferred link is still up and current; otherwise the
+            // loser is the peer's remaining connection and stays.
+            let preferred_up = state
+                .current
+                .as_ref()
+                .is_some_and(|c| c.is_alive() && c.connection_id() != loser.connection_id());
+            if preferred_up {
+                if state
+                    .standby
+                    .as_ref()
+                    .is_some_and(|s| s.connection_id() == loser.connection_id())
+                {
+                    state.standby = None;
+                }
+                loser.close();
+            }
+        });
     }
 
     fn retire(self: &Arc<Self>, state: &mut SlotState, link: Arc<PeerLink>) {
@@ -197,6 +267,7 @@ impl Drop for Leading {
 }
 
 pub(super) struct LinkCache {
+    local: PeerId,
     slots: Mutex<HashMap<String, Arc<Slot>>>,
     /// The device id of every authorized peer whose connection to this device was just accepted.
     /// A peer that opens a new connection has just been reachable from where it is, which says
@@ -204,13 +275,11 @@ pub(super) struct LinkCache {
     inbound: tokio::sync::broadcast::Sender<String>,
 }
 
-impl Default for LinkCache {
-    fn default() -> Self {
-        Self { slots: Mutex::default(), inbound: tokio::sync::broadcast::channel(16).0 }
-    }
-}
-
 impl LinkCache {
+    pub(super) fn new(local: PeerId) -> Self {
+        Self { local, slots: Mutex::default(), inbound: tokio::sync::broadcast::channel(16).0 }
+    }
+
     /// Aborts every dial that was left to finish alone, and returns how many. Called when the
     /// network came back: such a dial was started on the network that is gone, can take its
     /// whole handshake deadline (about 33 s) to fail there, and holds the slot's dial turn
@@ -241,7 +310,7 @@ impl LinkCache {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .entry(device_id.to_string())
-            .or_insert_with(|| Arc::new(Slot::new()))
+            .or_insert_with(|| Arc::new(Slot::new(self.local)))
             .clone()
     }
 
@@ -255,6 +324,45 @@ impl LinkCache {
         for retired in std::mem::take(&mut state.retired) {
             retired.link.close();
         }
+    }
+
+    /// A live link to `device_id` if there is one, promoting the standby when the current link
+    /// is gone. Never dials.
+    pub(super) fn live_link(&self, device_id: &str) -> Option<Arc<PeerLink>> {
+        let slot = self.slots.lock().unwrap_or_else(|p| p.into_inner()).get(device_id).cloned()?;
+        let mut state = slot.state();
+        let usable = |l: &Arc<PeerLink>| l.is_alive();
+        if state.current.as_ref().is_some_and(usable) {
+            return state.current.clone();
+        }
+        if state.standby.as_ref().is_some_and(usable) {
+            state.current = state.standby.take();
+            return state.current.clone();
+        }
+        None
+    }
+
+    /// Test-only: every live link held to `device_id`, current and standby.
+    #[cfg(test)]
+    pub(in crate::peer_connectivity_runtime) fn live_links_for_tests(
+        &self,
+        device_id: &str,
+    ) -> Vec<Arc<PeerLink>> {
+        let slot = self.slot(device_id);
+        let state = slot.state();
+        [state.current.clone(), state.standby.clone()]
+            .into_iter()
+            .flatten()
+            .filter(|l| l.is_alive())
+            .collect()
+    }
+
+    /// Closes and forgets every link held to `device_id` (a peer that stopped answering); the
+    /// next caller dials afresh.
+    pub(super) fn drop_links(&self, device_id: &str) {
+        let slot = self.slot(device_id);
+        self.forget(&slot);
+        slot.notify();
     }
 
     /// Test-only: the grace period of every retired link ends now.
@@ -282,8 +390,10 @@ impl LinkCache {
                 return;
             }
             let link = Arc::new(link.clone());
+            let peer = link.peer();
             if Slot::live_current(&mut state, link.peer()).is_some() {
                 slot.set_standby(&mut state, link);
+                slot.settle_crossing(&mut state, peer);
             } else {
                 state.current = Some(link);
             }
@@ -470,7 +580,9 @@ fn finish_dial(
             // peer may be using it as ITS current link (both sides dial at
             // once), and closing it would take that connection away from it.
             slot.set_standby(&mut state, link);
-            current
+            slot.settle_crossing(&mut state, peer);
+            // The answer is whatever is current after the crossing is settled.
+            state.current.clone().unwrap_or(current)
         } else {
             state.current = Some(link.clone());
             link

@@ -218,13 +218,14 @@ async fn an_acquire_waits_out_a_running_block_deletion() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_waiting_acquire_does_not_stall_the_async_runtime() {
     let (a, b, _hash_bytes, vh, blocks) = connected_pair().await;
-    // A sweep, on a thread of its own, holds the deletion guard for a second.
+    // A sweep, on a thread of its own, holds the deletion guard until told to let go.
     let coordinator = a.state.replica_coordinator.clone();
     let (taken, wait_taken) = std::sync::mpsc::channel();
+    let (let_go, wait_let_go) = std::sync::mpsc::channel::<()>();
     let release = std::thread::spawn(move || {
         let _deletion = coordinator.block_liveness_gate().begin_physical_deletion();
         taken.send(()).unwrap();
-        std::thread::sleep(Duration::from_millis(1000));
+        let _ = wait_let_go.recv();
     });
     wait_taken.recv().unwrap();
     let asker = b.state.clone();
@@ -241,13 +242,23 @@ async fn a_waiting_acquire_does_not_stall_the_async_runtime() {
             }
         })
     };
-    tokio::time::sleep(Duration::from_millis(700)).await;
-    let during = ticks.load(std::sync::atomic::Ordering::SeqCst);
+    // If the acquire's wait stalled the only worker, the ticker could not tick
+    // while the guard is held. The test body runs off the worker, so it waits for
+    // a few ticks with a generous deadline instead of a tick count per wall-clock
+    // window, which a loaded machine cannot meet.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while ticks.load(std::sync::atomic::Ordering::SeqCst) < 5 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the runtime stalled while an acquire waited"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert!(!acquire.is_finished(), "acknowledged while a sweep held the deletion guard");
     ticker.abort();
+    let_go.send(()).unwrap();
     release.join().unwrap();
     assert!(acquire.await.unwrap());
-    assert!(during >= 10, "the runtime ran {during} timer ticks in 700ms while an acquire waited");
 }
 
 /// Measurement, not a gate: how long the strong exact-version proof takes at

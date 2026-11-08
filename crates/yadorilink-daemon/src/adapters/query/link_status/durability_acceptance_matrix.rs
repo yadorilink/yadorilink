@@ -14,10 +14,10 @@ fn reader_for(state: std::sync::Arc<DaemonState>) -> DaemonLinkStatusReader {
 #[tokio::test]
 async fn scenario_a_confirmed_direct_peer_is_protected_ondemand_available() {
     let state = test_state();
-    state.replica_coordinator.link_repository().add_link(PATH, GROUP).unwrap();
+    state.replica_coordinator.link_admission().add_link(PATH, GROUP).unwrap();
     state
         .replica_coordinator
-        .link_repository()
+        .link_admission()
         .set_materialization_policy(PATH, MaterializationPolicy::OnDemand)
         .unwrap();
     upsert_file(&state, "a.bin", false);
@@ -75,10 +75,10 @@ async fn scenario_a_confirmed_direct_peer_is_protected_ondemand_available() {
 #[tokio::test]
 async fn scenario_c_confirmed_but_now_unreachable_peer_stays_protected_but_unavailable() {
     let state = test_state();
-    state.replica_coordinator.link_repository().add_link(PATH, GROUP).unwrap();
+    state.replica_coordinator.link_admission().add_link(PATH, GROUP).unwrap();
     state
         .replica_coordinator
-        .link_repository()
+        .link_admission()
         .set_materialization_policy(PATH, MaterializationPolicy::OnDemand)
         .unwrap();
     upsert_file(&state, "a.bin", false);
@@ -120,7 +120,7 @@ async fn scenario_c_confirmed_but_now_unreachable_peer_stays_protected_but_unava
 #[tokio::test]
 async fn scenario_d_no_full_replica_peer_configured_is_at_risk_despite_a_reachable_peer() {
     let state = test_state();
-    state.replica_coordinator.link_repository().add_link(PATH, GROUP).unwrap();
+    state.replica_coordinator.link_admission().add_link(PATH, GROUP).unwrap();
     // NOT locally hydrated, so `fetch_availability` genuinely exercises
     // the peer-dependent path too, not just local content.
     upsert_file(&state, "a.bin", false);
@@ -161,10 +161,10 @@ async fn scenario_d_no_full_replica_peer_configured_is_at_risk_despite_a_reachab
 #[tokio::test]
 async fn scenario_e_configured_but_unconfirmed_peer_is_unknown_despite_connectivity() {
     let state = test_state();
-    state.replica_coordinator.link_repository().add_link(PATH, GROUP).unwrap();
+    state.replica_coordinator.link_admission().add_link(PATH, GROUP).unwrap();
     state
         .replica_coordinator
-        .link_repository()
+        .link_admission()
         .set_materialization_policy(PATH, MaterializationPolicy::OnDemand)
         .unwrap();
     // NOT locally hydrated, so `fetch_availability` genuinely exercises
@@ -202,7 +202,7 @@ async fn scenario_e_configured_but_unconfirmed_peer_is_unknown_despite_connectiv
 #[tokio::test]
 async fn a_freshly_linked_group_is_checking_until_its_first_custody_round() {
     let state = test_state();
-    state.replica_coordinator.link_repository().add_link(PATH, GROUP).unwrap();
+    state.replica_coordinator.link_admission().add_link(PATH, GROUP).unwrap();
     upsert_file(&state, "a.bin", true);
 
     let views = reader_for(state.clone()).list_links().unwrap();
@@ -223,7 +223,7 @@ async fn a_freshly_linked_group_is_checking_until_its_first_custody_round() {
 #[tokio::test]
 async fn scenario_f_local_full_replica_still_catching_up_is_protecting() {
     let state = test_state();
-    state.replica_coordinator.link_repository().add_link(PATH, GROUP).unwrap();
+    state.replica_coordinator.link_admission().add_link(PATH, GROUP).unwrap();
     // Eager (the default materialization policy) + a peer full
     // replica configured (so the structural AtRisk check doesn't
     // preempt Protecting) + still-partial local hydration.
@@ -250,7 +250,7 @@ async fn scenario_f_local_full_replica_still_catching_up_is_protecting() {
 #[tokio::test]
 async fn scenario_g_local_full_copy_alone_does_not_imply_group_protection() {
     let state = test_state();
-    state.replica_coordinator.link_repository().add_link(PATH, GROUP).unwrap();
+    state.replica_coordinator.link_admission().add_link(PATH, GROUP).unwrap();
     upsert_file(&state, "a.bin", true); // fully hydrated locally
     state.refresh_custody_confirmation(GROUP).await; // no peer -> not confirmed
 
@@ -274,10 +274,10 @@ async fn scenario_g_local_full_copy_alone_does_not_imply_group_protection() {
 #[tokio::test]
 async fn scenario_k_route_transitions_change_availability_never_durability() {
     let state = test_state();
-    state.replica_coordinator.link_repository().add_link(PATH, GROUP).unwrap();
+    state.replica_coordinator.link_admission().add_link(PATH, GROUP).unwrap();
     state
         .replica_coordinator
-        .link_repository()
+        .link_admission()
         .set_materialization_policy(PATH, MaterializationPolicy::OnDemand)
         .unwrap();
     upsert_file(&state, "a.bin", false);

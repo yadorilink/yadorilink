@@ -182,6 +182,37 @@ impl PeerSyncSession {
     /// when that bound is exceeded, mirroring how they already reassign a
     /// timed-out block to another candidate (e.g.
     /// `BlockWorkQueue::mark_timed_out`).
+    /// Whether the peer answered nothing to a block request and nothing else since. A caller
+    /// picking fetch candidates skips such a session; its connection has been dropped and the
+    /// keeper replaces the session, so the mark is never cleared.
+    pub fn is_unreachable(&self) -> bool {
+        self.unreachable.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A request sent at `sent` went unanswered. If no other block request is still in flight
+    /// (one may be streaming a large reply) and the peer answered nothing since this one was
+    /// sent, it is silent, not merely slow on one block: mark it unreachable and drop the
+    /// connection, which also ends the session so reads fail over or report it at once.
+    fn note_silent_since(&self, sent: std::time::Instant) {
+        let heard = self.last_block_reply.lock().unwrap_or_else(|p| p.into_inner());
+        let alone = self.in_flight_block_fetches.load(std::sync::atomic::Ordering::Relaxed) <= 1;
+        if *heard < sent
+            && alone
+            && !self.unreachable.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            let since_last_reply_ms =
+                u64::try_from(heard.elapsed().as_millis()).unwrap_or(u64::MAX);
+            drop(heard);
+            tracing::warn!(
+                peer = %self.peer_device_id,
+                waited_ms = u64::try_from(sent.elapsed().as_millis()).unwrap_or(u64::MAX),
+                since_last_reply_ms,
+                "no answer to a block request and nothing else from the peer; dropping its connection"
+            );
+            self.transports.blocks.peer_unresponsive();
+        }
+    }
+
     pub fn record_fetch_timeout(&self) {
         self.adaptive_window.on_timeout();
     }
@@ -677,6 +708,12 @@ impl PeerSyncSession {
         .await
         {
             Ok(payload) => {
+                // Only the peer itself answering counts: a request that failed locally
+                // (`Lost`) says nothing about it.
+                if !matches!(payload, FetchOutcome::Lost | FetchOutcome::TimedOut) {
+                    *self.last_block_reply.lock().unwrap_or_else(|p| p.into_inner()) =
+                        std::time::Instant::now();
+                }
                 // `Busy` in particular must NEVER reach `on_success`: the
                 // peer answered quickly, but explicitly said it could NOT
                 // serve this request right now -- a fast `Busy` reply is
@@ -702,6 +739,7 @@ impl PeerSyncSession {
             }
             Err(_elapsed) => {
                 self.adaptive_window.on_timeout();
+                self.note_silent_since(started_at);
                 FetchOutcome::TimedOut
             }
         };

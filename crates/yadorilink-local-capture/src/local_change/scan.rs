@@ -568,7 +568,7 @@ impl LocalChangeProcessor {
         group_id: &str,
         root: &Path,
     ) -> Result<Vec<FileRecord>, LocalCaptureError> {
-        let ignore_set = EffectiveIgnoreSet::load_for_link_root(root)?;
+        let ignore_set = self.ignore_set_for(group_id)?;
         self.scan_existing_files_with_ignore(group_id, root, &ignore_set)
     }
 
@@ -650,7 +650,7 @@ impl LocalChangeProcessor {
 
     /// The full reconciliation scan `DebounceFlush::RescanRequired` drives
     /// from the LIVE flush loop -- a watcher-channel/OS overflow, or
-    /// simply editing this link's own `.yadorilinkignore`, both ordinary
+    /// simply replacing this link's ignore rules, both ordinary
     /// triggers requiring no crash -- once this link's startup barrier has
     /// already resolved. Unlike `scan_existing_files_with_ignore[_gated/
     /// _streaming]` above (the one-time initial scan
@@ -808,7 +808,7 @@ impl LocalChangeProcessor {
         group_id: &str,
         root: &Path,
     ) -> Result<Vec<FileRecord>, LocalCaptureError> {
-        let ignore_set = EffectiveIgnoreSet::load_for_link_root(root)?;
+        let ignore_set = self.ignore_set_for(group_id)?;
         self.reconcile_added_files_with_ignore(group_id, root, &ignore_set)
     }
 
@@ -1105,7 +1105,7 @@ impl LocalChangeProcessor {
             // A reload failure falls back to the caller's set -- a rerun
             // with slightly stale patterns is still strictly better than no
             // rerun.
-            let reloaded = EffectiveIgnoreSet::load_for_link_root(root.path()).ok();
+            let reloaded = self.ignore_set_for(group_id).ok();
             let rerun_ignore_set = reloaded.as_ref().unwrap_or(ignore_set);
             records.extend(self.reconcile_disk_pass(
                 group_id,

@@ -79,19 +79,54 @@ impl Custody for FakeCustody {
     }
 }
 
+/// The entries of one pin plan: the item (`None`: the folder itself) and the choice.
+pub(crate) type PinPlanEntries = Vec<(Option<ItemId>, yadorilink_ipc_proto::shellipc::PinChoice)>;
+
 pub(crate) struct FakeHost {
     state: Arc<DaemonState>,
     pub(crate) log: Log,
     /// Whether the item's path lock was held while the host was being asked.
     pub(crate) lock_held_during_evict: AtomicBool,
     pub(crate) connected: AtomicBool,
+    /// Whether the host serves the root (it reported the root registered).
+    pub(crate) serves: AtomicBool,
     pub(crate) answers: Mutex<VecDeque<HostAnswer>>,
     pub(crate) targets: Mutex<Vec<[u8; 32]>>,
+    /// The pin requests the host was asked for, and what it answers to them.
+    pub(crate) pins: Mutex<Vec<(Option<ItemId>, yadorilink_ipc_proto::shellipc::PinChoice)>>,
+    pub(crate) pin_answer: Mutex<crate::provider_host_link::PinAnswer>,
+    /// The pin plans the host was sent.
+    pub(crate) plans: Mutex<Vec<PinPlanEntries>>,
 }
 
 impl EvictHost for FakeHost {
     fn connected(&self) -> bool {
         self.connected.load(Ordering::SeqCst)
+    }
+
+    fn serves_root(&self, _root_id: &str) -> bool {
+        self.serves.load(Ordering::SeqCst)
+    }
+
+    fn send_pin_plan(
+        &self,
+        _root_id: &str,
+        entries: Vec<(Option<ItemId>, yadorilink_ipc_proto::shellipc::PinChoice)>,
+    ) -> bool {
+        self.plans.lock().unwrap().push(entries);
+        true
+    }
+
+    fn pin_item<'a>(
+        &'a self,
+        _root_id: &'a str,
+        item: Option<ItemId>,
+        choice: yadorilink_ipc_proto::shellipc::PinChoice,
+    ) -> BoxFuture<'a, crate::provider_host_link::PinAnswer> {
+        Box::pin(async move {
+            self.pins.lock().unwrap().push((item, choice));
+            self.pin_answer.lock().unwrap().clone()
+        })
     }
 
     fn evict_shown_version<'a>(
@@ -171,8 +206,12 @@ impl Fx {
             log: log.clone(),
             lock_held_during_evict: AtomicBool::new(false),
             connected: AtomicBool::new(true),
+            serves: AtomicBool::new(true),
             answers: Mutex::default(),
             targets: Mutex::default(),
+            pins: Mutex::default(),
+            pin_answer: Mutex::new(crate::provider_host_link::PinAnswer::Done),
+            plans: Mutex::default(),
         });
         Self {
             state,
@@ -537,7 +576,7 @@ async fn a_pin_recorded_after_the_lease_keeps_the_blocks() {
     let reclaim = fx.reclaim();
     let prepared = reclaim.prepare(GROUP, "a.bin", None).await.expect("a lease was granted");
 
-    fx.state.replica_coordinator.pinned_item_repository().pin(GROUP, "a.bin").unwrap();
+    fx.state.replica_coordinator.retention_rules().pin(GROUP, "a.bin").unwrap();
     let freed = reclaim.reclaim(prepared).await.unwrap();
 
     assert_eq!(freed.blocks, 0);

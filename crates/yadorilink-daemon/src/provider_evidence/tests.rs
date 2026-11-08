@@ -670,3 +670,64 @@ async fn a_full_snapshot_after_a_reset_manufactures_no_departure() {
     expected.sort();
     assert_eq!(gone, expected);
 }
+
+/// The count of items the OS holds is the length of the complete snapshot, kept by the reports as
+/// they arrive: it follows additions and removals without a walk, and there is none until a complete
+/// snapshot of the current connection exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_held_count_follows_the_reports_and_is_unknown_without_a_complete_snapshot() {
+    let fx = Fx::new();
+    assert_eq!(fx.membership.held_count(&fx.root), None, "no report yet");
+    let (a, b, c) = (fx.item("a.txt", 1), fx.item("b.txt", 1), fx.item("c.txt", 1));
+
+    fx.report(1, 1, true, 0, &[a, b], &[]);
+    assert_eq!(fx.membership.held_count(&fx.root), Some(2));
+    // A delta adds one and drops another.
+    fx.report(1, 2, false, 0, &[c], &[a]);
+    assert_eq!(fx.membership.held_count(&fx.root), Some(2));
+    fx.report(1, 3, false, 0, &[], &[b, c]);
+    assert_eq!(fx.membership.held_count(&fx.root), Some(0));
+
+    // A host that went away says nothing about the OS.
+    fx.membership.clear();
+    assert_eq!(fx.membership.held_count(&fx.root), None);
+}
+
+/// Whether one item is held follows the same complete snapshot the count does: the status uses it to
+/// leave a file the host already reports out of the downloading count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn whether_an_item_is_held_follows_the_complete_snapshot() {
+    let fx = Fx::new();
+    let (a, b) = (fx.item("a.txt", 1), fx.item("b.txt", 1));
+    assert!(!fx.membership.is_held(&fx.root, &a), "no report yet");
+
+    fx.report(1, 1, true, 0, &[a], &[]);
+    assert!(fx.membership.is_held(&fx.root, &a));
+    assert!(!fx.membership.is_held(&fx.root, &b));
+    assert!(!fx.membership.is_held(&fx.root, b"not an item id"));
+
+    fx.report(1, 2, false, 0, &[b], &[a]);
+    assert!(!fx.membership.is_held(&fx.root, &a) && fx.membership.is_held(&fx.root, &b));
+
+    fx.membership.clear();
+    assert!(!fx.membership.is_held(&fx.root, &b), "a host that went away says nothing");
+}
+
+/// The downloading count of a provider folder leaves out a file that only lingers after its last
+/// request once the host reports it as on this computer, and always counts a request in flight.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_downloading_count_leaves_out_a_finished_file_the_host_reports_as_held() {
+    let fx = Fx::new();
+    let (done, going) = (fx.item("done.bin", 1), fx.item("going.bin", 1));
+    let opens = std::sync::Arc::new(crate::requested_opens::RequestedOpens::default());
+    let mut window = opens.begin("g", &done);
+    window.served();
+    drop(window);
+    let _going = opens.begin("g", &going);
+    // The host has not reported the finished file yet: both read as downloading.
+    fx.report(1, 1, true, 0, &[], &[]);
+    assert_eq!(fx.membership.opening_count(&opens, "g", &fx.root), 2);
+    // It has: only the file still in flight is downloading.
+    fx.report(1, 2, false, 0, &[done], &[]);
+    assert_eq!(fx.membership.opening_count(&opens, "g", &fx.root), 1);
+}

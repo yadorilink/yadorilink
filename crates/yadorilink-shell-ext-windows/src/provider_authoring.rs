@@ -186,6 +186,12 @@ impl Local for WindowsLocal {
         std::fs::symlink_metadata(path)
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
     }
+
+    fn root_registered(&self, root_path: &Path) -> bool {
+        // Anything but a sync root of this host reads as not registered: a registration that cannot
+        // be read authorizes no delete.
+        matches!(crate::cfapi::registered_root_identity(root_path), Ok(Some(_)))
+    }
 }
 
 #[cfg(test)]

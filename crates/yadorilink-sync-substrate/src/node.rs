@@ -552,6 +552,9 @@ pub struct SubstrateNode {
     /// Counts the arrivals that followed a loss of addresses: the network went away and came
     /// back. See [`SubstrateNode::watch_restored`].
     restored: tokio::sync::watch::Receiver<u64>,
+    /// The senders behind `arrivals` and `restored`, so [`SubstrateNode::network_resumed`] can
+    /// move them without an address change.
+    network_signals: std::sync::Arc<NetworkSignals>,
     /// Told about every connection this node dials; the accept side holds
     /// its own clone.
     observer: Option<crate::observe::LinkObserver>,
@@ -682,7 +685,8 @@ impl SubstrateNode {
         }
         let router = router.spawn();
 
-        let (address, arrivals, restored) = spawn_address_watch(router_endpoint_of(&router));
+        let (address, arrivals, restored, network_signals) =
+            spawn_address_watch(router_endpoint_of(&router));
 
         Ok((
             Self {
@@ -690,6 +694,7 @@ impl SubstrateNode {
                 address,
                 arrivals,
                 restored,
+                network_signals,
                 observer: config.link_observer,
                 track_send_open,
                 native_replication_open,
@@ -778,6 +783,33 @@ impl SubstrateNode {
         self.restored.clone()
     }
 
+    /// Reports that the network may have changed without this node's addresses showing it
+    /// (the machine woke from sleep, a Wi-Fi roam kept every address): the same event as an
+    /// address arriving after a loss, so everything that reacts to [`Self::watch_restored`] and
+    /// [`Self::watch_arrivals`] reacts to this too, through the same path. The transport is told
+    /// as well (`Endpoint::network_change`), so it re-probes its network and re-evaluates its
+    /// paths now instead of when its own monitor notices, which it may not for a change that
+    /// leaves every address alone.
+    ///
+    /// Must be called from inside a tokio runtime.
+    pub fn network_resumed(&self) {
+        self.network_signals.arrivals.send_modify(|n| *n += 1);
+        self.network_signals.restored.send_modify(|n| *n += 1);
+        let endpoint = router_endpoint_of(&self.router);
+        let signals = self.network_signals.clone();
+        tokio::spawn(async move {
+            endpoint.network_change().await;
+            signals.transport_notified.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+
+    /// How many times the transport has been told, and has taken the notice, that the network may
+    /// have changed by [`Self::network_resumed`].
+    #[cfg(feature = "test-support")]
+    pub fn transport_network_change_requests(&self) -> u64 {
+        self.network_signals.transport_notified.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Dial a peer on the Yadori sync ALPN, using address information the
     /// coordination plane supplied.
     pub async fn connect(&self, peer: PeerId) -> Result<PeerLink, SubstrateError> {
@@ -859,10 +891,28 @@ impl SubstrateNode {
     /// dropped implicitly, because restart semantics are part of the protocol
     /// contract: after a restart, reconciliation resumes from the durable
     /// verified sets and from nothing else.
+    ///
+    /// Closing the endpoint tells reachable peers in a few milliseconds, but it also waits on
+    /// datagrams still queued for a peer that cannot be reached, which can take several
+    /// seconds. That wait is bounded by [`SHUTDOWN_BOUND`]: the close carries on in the
+    /// background, and a peer that was not told finds out when its own connection times out.
     pub async fn shutdown(&self) {
-        let _ = self.router.shutdown().await;
+        // The close runs in a task of its own: giving up on the wait must not cancel it.
+        let router = self.router.clone();
+        let mut closing = tokio::spawn(async move {
+            let _ = router.shutdown().await;
+        });
+        if tokio::time::timeout(SHUTDOWN_BOUND, &mut closing).await.is_err() {
+            tracing::warn!(
+                bound_ms = SHUTDOWN_BOUND.as_millis() as u64,
+                "closing the peer endpoint is taking long (a peer is unreachable); continuing"
+            );
+        }
     }
 }
+
+/// How long [`SubstrateNode::shutdown`] waits for the endpoint to close.
+const SHUTDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// What a failed dial says about the peer, in the terms a user is shown.
 pub(crate) fn dial_failure(err: &iroh::endpoint::ConnectError) -> crate::observe::DialFailure {
@@ -897,11 +947,19 @@ fn spawn_address_watch(
     tokio::sync::watch::Receiver<PeerAddress>,
     tokio::sync::watch::Receiver<u64>,
     tokio::sync::watch::Receiver<u64>,
+    std::sync::Arc<NetworkSignals>,
 ) {
     let (tx, rx) = tokio::sync::watch::channel(peer_address_of(&endpoint));
     let (arrivals_tx, arrivals_rx) = tokio::sync::watch::channel(0u64);
     let (restored_tx, restored_rx) = tokio::sync::watch::channel(0u64);
+    let signals = std::sync::Arc::new(NetworkSignals {
+        arrivals: arrivals_tx,
+        restored: restored_tx,
+        transport_notified: std::sync::atomic::AtomicU64::new(0),
+    });
+    let task_signals = signals.clone();
     tokio::spawn(async move {
+        let (arrivals_tx, restored_tx) = (&task_signals.arrivals, &task_signals.restored);
         use iroh::Watcher as _;
         let mut watcher = endpoint.watch_addr();
         // A direct address went away and has not come back yet.
@@ -942,7 +1000,16 @@ fn spawn_address_watch(
             }
         }
     });
-    (rx, arrivals_rx, restored_rx)
+    (rx, arrivals_rx, restored_rx, signals)
+}
+
+/// The counters behind [`SubstrateNode::watch_arrivals`] and [`SubstrateNode::watch_restored`].
+#[derive(Debug)]
+struct NetworkSignals {
+    arrivals: tokio::sync::watch::Sender<u64>,
+    restored: tokio::sync::watch::Sender<u64>,
+    /// Times the transport was told of a possible network change (read by tests).
+    transport_notified: std::sync::atomic::AtomicU64,
 }
 
 /// How the direct addresses moved between two publications, given whether a loss is still

@@ -184,3 +184,26 @@ async fn a_relayed_link_reports_the_relay_as_its_carrier() {
     let mut changes = link.carrier_changes();
     assert_eq!(changes.next().await, Some(Some(Carrier::Relay)));
 }
+
+/// A resume the addresses do not show (wake from sleep, a roam that kept every address) is
+/// reported as the network coming back: both counters move, with no address change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reported_resume_moves_the_arrival_and_restored_counters() {
+    let book = SharedAddressBook::new();
+    let (observer, _seen) = recording();
+    let (node, _inbound) = spawn(NetworkConfig::direct_only(), &book, observer).await;
+    let (mut arrivals, mut restored) = (node.watch_arrivals(), node.watch_restored());
+    let (arrivals_before, restored_before) =
+        (*arrivals.borrow_and_update(), *restored.borrow_and_update());
+
+    node.network_resumed();
+
+    arrivals.changed().await.expect("arrivals moved");
+    restored.changed().await.expect("restored moved");
+    assert!(*arrivals.borrow() > arrivals_before, "a late address discovery may add more");
+    eventually("the transport is told to re-probe its network too", || {
+        node.transport_network_change_requests() == 1
+    })
+    .await;
+    assert_eq!(*restored.borrow(), restored_before + 1);
+}

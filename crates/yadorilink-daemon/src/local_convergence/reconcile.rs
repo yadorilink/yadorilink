@@ -863,6 +863,11 @@ pub(crate) struct HeadroomReservation {
 }
 
 impl HeadroomReservation {
+    /// A reservation that holds no space: for a write on a volume where headroom is not enforced.
+    pub(crate) fn unreserved() -> Self {
+        Self { held: None }
+    }
+
     #[cfg(test)]
     pub(crate) fn for_tests(volume: &str, bytes: u64) -> Self {
         let ledger = headroom_ledger_for(volume);

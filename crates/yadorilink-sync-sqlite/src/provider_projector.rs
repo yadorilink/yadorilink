@@ -11,12 +11,13 @@
 //! (a changed published item has published != current), so rows, events and fence commit
 //! together. A crash loses at most the open batch; the unfinished obligations are the cursor.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::OptionalExtension;
 use yadorilink_replica_domain::file::{FileRecord, RecordKind};
-use yadorilink_replica_domain::ids::{FolderGroupId, SyncPath};
-use yadorilink_replica_domain::native_plan::{NativePlannedNode, NativeRowIdentity};
+use yadorilink_replica_domain::ids::FolderGroupId;
+use yadorilink_replica_domain::native_plan::NativeRowIdentity;
+use yadorilink_replica_domain::provider_plan::{provider_actions, ProviderAction};
 
 use crate::error::SyncSqliteError;
 use crate::provider_write::{block_infos, meta_columns};
@@ -83,25 +84,15 @@ pub fn project_batch_in_tx(
     }
     for (parent, names) in &by_parent {
         let plan = crate::native_desired_state::native_plan_nodes(tx, group_id, parent, names)?;
-        // The level plan is indexed ONCE by the source path each node stands for, so applying a
-        // batch visits every node once (a flat level of 100k names would otherwise cost one
-        // pass over the whole plan per name).
-        let mut by_source: HashMap<&str, Vec<(&SyncPath, &NativePlannedNode)>> = HashMap::new();
-        let mut structural: HashSet<&str> = HashSet::new();
-        for (physical, node) in &plan.nodes {
-            match node {
-                NativePlannedNode::Entry { head, .. }
-                | NativePlannedNode::ExplicitDirectory { head } => {
-                    by_source.entry(head.source_path.as_str()).or_default().push((physical, node));
+        for action in provider_actions(names, &plan) {
+            match action {
+                ProviderAction::WriteRow { physical, head } => {
+                    write_row(tx, group_id, physical.as_str(), &head)?;
                 }
-                NativePlannedNode::StructuralDirectory => {
-                    structural.insert(physical.as_str());
+                ProviderAction::Retire { source, structural } => {
+                    retire_row(tx, group_id, &source, structural)?;
                 }
             }
-        }
-        for name in names {
-            let nodes = by_source.get(name.as_str()).map_or(&[][..], Vec::as_slice);
-            project_path(tx, group_id, name, nodes, structural.contains(name.as_str()))?;
         }
     }
     for (path, generation) in &pending {
@@ -115,39 +106,23 @@ pub fn project_batch_in_tx(
     Ok(pending.len())
 }
 
-/// Writes the row the plan gives for `source`, and tombstones the row at `source` when the plan
-/// holds nothing there any more.
+/// Tombstones the row at `source`, which the plan holds nothing for any more.
 ///
 /// A tombstone here is PROJECTION, never a semantic delete: it writes only the group's own rows
 /// (the same way any projected row is written) and authors no change and no tombstone head for
 /// peers.
-fn project_path(
+fn retire_row(
     tx: &rusqlite::Transaction<'_>,
     group_id: &str,
     source: &str,
-    nodes: &[(&SyncPath, &NativePlannedNode)],
     structural: bool,
 ) -> Result<(), SyncSqliteError> {
-    let mut holds_source_path = false;
-    for (physical, node) in nodes {
-        let (NativePlannedNode::Entry { head, .. } | NativePlannedNode::ExplicitDirectory { head }) =
-            node
-        else {
-            continue;
-        };
-        if physical.as_str() == source {
-            holds_source_path = true;
-        }
-        write_row(tx, group_id, physical.as_str(), head)?;
-    }
-    if !holds_source_path {
-        let was_row = tombstone_if_live(tx, group_id, source)?;
-        // An explicit directory whose head left while descendants remain becomes a structural
-        // one: the old explicit row is retired, the folder item stays, and its generation
-        // advances with an event, so a token of the explicit directory is stale.
-        if was_row && structural {
-            yadorilink_sqlite_runtime::note_item_replaced(tx, group_id, source)?;
-        }
+    let was_row = tombstone_if_live(tx, group_id, source)?;
+    // An explicit directory whose head left while descendants remain becomes a structural
+    // one: the old explicit row is retired, the folder item stays, and its generation
+    // advances with an event, so a token of the explicit directory is stale.
+    if was_row && structural {
+        yadorilink_sqlite_runtime::note_item_replaced(tx, group_id, source)?;
     }
     Ok(())
 }
@@ -193,7 +168,9 @@ fn write_row(
         tx,
         group_id,
         &record,
-        "",
+        // The row names the device that wrote the head, so a version adopted from a peer is
+        // attributed to its author on this device too.
+        &head.head.dot.author.device.0,
         Some(&identity),
         crate::retention::Retention::StoreBacked,
     )?;

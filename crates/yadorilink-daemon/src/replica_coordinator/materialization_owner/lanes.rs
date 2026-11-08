@@ -27,14 +27,6 @@ pub(crate) type RowAuthority<'a> =
 /// A materialization intent a lane holds across its physical write.
 pub(crate) type LaneIntent<'a> = Box<dyn OpenMaterializationIntent + Send + 'a>;
 
-/// The target a tombstone delete's intent names. A delete has no content to
-/// name, so the target is a marker, and one no content can have: every
-/// content target is a 32-byte SHA-256, this is not 32 bytes. The hash of
-/// an empty block list would not do, since that is also the ordinary target
-/// of an empty file. Only this module reads or writes it; everything else
-/// sees [`MaterializationIntentKind`].
-const TOMBSTONE_DELETE_INTENT_TARGET: &[u8] = b"yadorilink:tombstone-delete";
-
 impl ReplicaCoordinator {
     /// Writes `record` into the index with its origin, and its authoring
     /// identity when one is known, under a root operation begun from
@@ -122,7 +114,7 @@ impl ReplicaCoordinator {
     /// - A step that fails rolls every earlier one back: there is either no
     ///   intent, row, state or fence change at all, or all of them.
     /// - The commit runs on the blocking pool while the caller's task keeps
-    ///   polling its siblings (unless `YADORILINK_RECEIVE_ASYNC_COMMIT=0`).
+    ///   polling its siblings.
     ///   The caller's frames (path lock, lane operation, claim) and this
     ///   frame (the row's operation) stay alive until the outcome is
     ///   decided, even when the awaiting task is dropped mid-commit: see
@@ -151,6 +143,7 @@ impl ReplicaCoordinator {
             authoring,
             meta,
             &yadorilink_sync_sqlite::retention::RetentionProofs::new(),
+            None,
             row_authority,
             permit,
             |open| self.commit_open_single(open),
@@ -178,6 +171,7 @@ impl ReplicaCoordinator {
         authoring: Option<&yadorilink_replica_domain::native_plan::NativeRowIdentity>,
         meta: &yadorilink_replica_domain::session_state::LocalFileMetaColumns,
         retention_proofs: &yadorilink_sync_sqlite::retention::RetentionProofs,
+        tmp_path: Option<&std::path::Path>,
         row_authority: RowAuthority<'_>,
         permit: &'a RootCommitPermit<'a>,
         commit: F,
@@ -202,6 +196,7 @@ impl ReplicaCoordinator {
             meta: meta.clone(),
             retention_proofs: retention_proofs.clone(),
             intent_target_hash: yadorilink_local_storage::intent_target_hash(&record.blocks),
+            tmp_path: tmp_path.and_then(|p| p.to_str()).map(str::to_owned),
             now: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos() as i64)
@@ -234,8 +229,8 @@ impl ReplicaCoordinator {
 
     /// The open of one file in a transaction of its own: on the blocking pool
     /// (the awaiting future holds a job fence, see
-    /// `SyncDatabase::write_immediate_offloaded`) or, with
-    /// `YADORILINK_RECEIVE_ASYNC_COMMIT=0`, inline in this poll.
+    /// `SyncDatabase::write_immediate_offloaded`) or, in tests that
+    /// turn offloading off, inline in this poll.
     pub(crate) async fn commit_open_single(
         &self,
         open: OwnedContentWriteOpen,
@@ -706,11 +701,11 @@ impl ReplicaCoordinator {
 
     /// Open half of a symlink write (`materialize_symlink_at`). When there
     /// is a `write_target` (the caller decided the link will really be
-    /// written): bump the fence (tx), then open the intent naming the
-    /// target (tx). Then upsert the row (tx) unless this exact authored
-    /// version is already current (a read), and, for a real write, mark the
-    /// row in flight (tx). Returns the fence value and the intent for a
-    /// real write, `None` for a policy skip (which still upserts).
+    /// written): open the intent naming the target, upsert the row unless
+    /// this exact authored version is already current (a read), mark the row
+    /// in flight and bump the fence, all in one tx. Returns the fence value
+    /// and the intent for a real write, `None` for a policy skip (which
+    /// still upserts, in a tx of its own).
     // One argument per input of the persisted row.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_symlink_write<'a>(
@@ -739,9 +734,9 @@ impl ReplicaCoordinator {
 
     /// Open half of an explicit directory's write (the directory lane):
     /// exactly [`Self::open_symlink_write`]'s steps for an object with no
-    /// content -- bump the fence (tx), open the intent (tx), upsert the row
-    /// unless this authored version is already current, mark it in flight
-    /// (tx). The intent names the empty content, which classifies it as a
+    /// content -- open the intent, upsert the row unless this authored
+    /// version is already current, mark it in flight and bump the fence, in
+    /// one tx. The intent names the empty content, which classifies it as a
     /// write, so repair recreates a directory it finds missing under it.
     #[allow(clippy::too_many_arguments)] // one argument per input of the persisted row
     pub(crate) fn open_directory_write<'a>(
@@ -831,76 +826,74 @@ impl ReplicaCoordinator {
         retention: yadorilink_sync_sqlite::retention::Retention<'_>,
         permit: &'a RootCommitPermit<'a>,
     ) -> Result<Option<(i64, LaneIntent<'a>)>, PeerSessionError> {
-        let opened = match write_target {
-            Some(target) => {
-                let mutation_generation =
-                    self.dag_bump_mutation_fence(group_id, &record.path, fence_reason)?;
-                let target_hash = yadorilink_local_storage::intent_target_hash_for_bytes(target);
-                let intent_guard = self.open_materialization_intent_guard(
+        let Some(target) = write_target else {
+            // A permanently policy-skipped symlink (no target recorded, or a Windows peer that
+            // has not opted in) retries this whole write on a capped backoff that is never
+            // dead-lettered. The row is still upserted so a later correction syncs, but not
+            // when this exact authored version is already current: `upsert_file_in_tx`'s own
+            // `INSERT` supersedes the current row and inserts a fresh version row on every
+            // call, so a long-lived policy skip would otherwise accumulate one per retry. A
+            // caller with no authoring identity to compare against gets no dedup.
+            let already_current = authoring.is_some_and(|identity| {
+                self.row_authoring(group_id, &record.path).ok().flatten().as_ref() == Some(identity)
+            });
+            if !already_current {
+                self.upsert_file_with_origin_and_authoring(
                     group_id,
-                    &record.path,
-                    &target_hash,
+                    record,
+                    origin_device_id,
+                    authoring,
+                    Some(meta),
+                    retention,
                     permit,
                 )?;
-                Some((mutation_generation, intent_guard))
             }
-            None => None,
+            return Ok(None);
         };
-
-        // A permanently policy-skipped symlink (no target recorded, or a
-        // Windows peer that has not opted in) retries this whole write on a
-        // capped backoff that is never dead-lettered -- every retry used to
-        // unconditionally re-upsert `record` even when nothing had changed
-        // since the previous attempt. `upsert_file_in_tx`'s own `INSERT` is
-        // unconditional too: it flips the current row to `superseded`/
-        // `trashed` and inserts a fresh `version_seq` row every single call,
-        // so a long-lived policy skip accumulated an unbounded number of
-        // these no-op version rows over the process's lifetime -- purely
-        // from retrying, with the actual desired state never once changing.
-        // Skip the upsert when this exact authored version is already the
-        // current one; whether this is a real write is unaffected either
-        // way.
-        // `is_some_and` means a `None` authoring identity always yields
-        // `false` here -- a caller with no head to compare against
-        // gets no dedup at all, and still accumulates a version row on every
-        // retry exactly as before this fix. At least one caller does pass
-        // `None` (the tombstone-materialize call in the deletion path) --
-        // not confirmed reachable for a retry-prone policy-skipped SYMLINK
-        // specifically (a tombstone is `record.deleted`, a different
-        // dispatch branch), but not proven unreachable either.
-        let already_current = authoring.is_some_and(|identity| {
-            self.row_authoring(group_id, &record.path).ok().flatten().as_ref() == Some(identity)
-        });
-        if !already_current {
-            self.upsert_file_with_origin_and_authoring(
-                group_id,
-                record,
-                origin_device_id,
-                authoring,
-                Some(meta),
-                retention,
-                permit,
-            )?;
-        }
-
-        // The row this write targets is established; mark it as a
-        // materialization in flight before the syscall, and leave the exact
-        // claim to the commit that can prove it. `upsert_file_with_origin`
-        // above carries the previous version's `materialization_state`
-        // forward, so an existing `Present` symlink would otherwise still
-        // read `Present` here -- with its old proof already dead, because
-        // the fence was bumped above, and the new one not yet published.
-        // Same discipline the projected-upserts batch uses, for the same
-        // window.
-        if opened.is_some() {
-            self.set_materialization_state(
+        // A real write: the intent, the row (unless this authored version is already current),
+        // the in-flight mark and the fence bump are ONE transaction. A crash leaves all of them
+        // or none, never a bumped fence with no intent, or an intent with a row the fence has
+        // not retired the old proof of.
+        let target_hash = yadorilink_local_storage::intent_target_hash_for_bytes(target);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        let request = yadorilink_sync_sqlite::content_write_open::OpenSingleObjectRequest {
+            group_id,
+            record,
+            origin_device_id,
+            authoring,
+            meta,
+            intent_target_hash: &target_hash,
+            in_flight_state: yadorilink_peer_session::ports::MATERIALIZATION_IN_FLIGHT_STATE,
+            fence_reason,
+            now_unix_nanos: now,
+            retention,
+        };
+        let mutation_generation = self
+            .database
+            .write_immediate::<_, yadorilink_sync_sqlite::SyncSqliteError>(|tx| {
+                permit.verify()?;
+                let fence =
+                    yadorilink_sync_sqlite::content_write_open::open_single_object_write_in_tx(
+                        tx, &request,
+                    )?;
+                permit.verify()?;
+                Ok(fence)
+            })
+            .map_err(crate::sync_error::SyncError::from)?;
+        #[cfg(test)]
+        self.test_observers.fire_armed_upsert_supersession(group_id, &record.path);
+        Ok(Some((
+            mutation_generation,
+            Box::new(crate::materialization_intent::MaterializationIntentGuard::opened(
+                self,
                 group_id,
                 &record.path,
-                yadorilink_peer_session::ports::MATERIALIZATION_IN_FLIGHT_STATE,
                 permit,
-            )?;
-        }
-        Ok(opened)
+            )),
+        )))
     }
 
     /// The hazard hold (`hold_record`): adopt `record` into the index with
@@ -1100,32 +1093,33 @@ impl ReplicaCoordinator {
         )))
     }
 
-    /// Open half of a single-path tombstone delete: open the intent with
-    /// the delete marker as its target (tx), then bump the fence (tx).
-    /// Returns the intent the lane holds across the removal, and the fence
-    /// value the removal's evidence names. The lane verifies the delete
-    /// target before this and removes the file after it.
+    /// Open half of a single-path tombstone delete: open the delete intent
+    /// and bump the fence, in one tx. The live row is left as it is (the
+    /// tombstone is committed only after the verified removal). Returns the
+    /// intent the lane holds across the removal, and the fence value the
+    /// removal's evidence names. The lane verifies the delete target before
+    /// this and removes the file after it.
     pub(crate) fn open_tombstone_delete<'a>(
         &'a self,
         group_id: &'a str,
         path: &'a str,
         permit: &'a RootCommitPermit<'a>,
     ) -> Result<(LaneIntent<'a>, i64), PeerSessionError> {
-        let delete_intent_guard = self.open_materialization_intent_guard(
-            group_id,
-            path,
-            TOMBSTONE_DELETE_INTENT_TARGET,
-            permit,
-        )?;
-        let mutation_generation =
-            self.dag_bump_mutation_fence(group_id, path, "tombstone_delete")?;
-        Ok((delete_intent_guard, mutation_generation))
+        let mutation_generation = self
+            .materialization_intent_repository()
+            .open_delete_and_bump_fence(group_id, path, permit)
+            .map_err(crate::sync_error::SyncError::from)?;
+        Ok((
+            Box::new(crate::materialization_intent::MaterializationIntentGuard::opened(
+                self, group_id, path, permit,
+            )),
+            mutation_generation,
+        ))
     }
 
-    /// What the intent open on `path` is for, if one is open: a delete when
-    /// it names the tombstone delete's marker, a write of content
-    /// otherwise. Repair decides a missing file by this, never by the raw
-    /// target.
+    /// What the intent open on `path` is for, if one is open: a delete or a
+    /// write of content. Repair decides a missing file by this, never by the
+    /// raw target.
     pub(crate) fn materialization_intent_kind(
         &self,
         group_id: &str,
@@ -1133,9 +1127,9 @@ impl ReplicaCoordinator {
     ) -> Result<Option<MaterializationIntentKind>, yadorilink_sync_sqlite::SyncSqliteError> {
         Ok(self
             .materialization_intent_repository()
-            .materialization_intent_target(group_id, path)?
-            .map(|target| {
-                if target == TOMBSTONE_DELETE_INTENT_TARGET {
+            .materialization_intent_row_kind(group_id, path)?
+            .map(|kind| {
+                if kind == "delete" {
                     MaterializationIntentKind::Delete
                 } else {
                     MaterializationIntentKind::Materialize
@@ -1336,6 +1330,8 @@ pub(crate) struct OwnedContentWriteOpen {
     /// blocking pool.
     pub(crate) retention_proofs: yadorilink_sync_sqlite::retention::RetentionProofs,
     pub(crate) intent_target_hash: Vec<u8>,
+    /// The temp file the write will publish (see the intent's `tmp_path`).
+    pub(crate) tmp_path: Option<String>,
     pub(crate) now: i64,
     pub(crate) lane_check: yadorilink_root_authority::root_commit::OwnedPermitCheck,
     pub(crate) row_check: yadorilink_root_authority::root_commit::OwnedPermitCheck,
@@ -1361,6 +1357,7 @@ impl OwnedContentWriteOpen {
             intent_target_hash: &self.intent_target_hash,
             in_flight_state: yadorilink_peer_session::ports::MATERIALIZATION_IN_FLIGHT_STATE,
             now_unix_nanos: self.now,
+            tmp_path: self.tmp_path.as_deref(),
             retention: yadorilink_sync_sqlite::retention::Retention::Proofs(&self.retention_proofs),
         }
     }

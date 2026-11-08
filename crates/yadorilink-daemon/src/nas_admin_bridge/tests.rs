@@ -110,8 +110,14 @@ fn quick() -> BridgeLimits {
 /// One HTTP exchange with `Connection: close`, as a browser would send it to
 /// the page address.
 async fn http_get(addr: SocketAddr, path: &str) -> String {
+    http_get_with(addr, path, "").await
+}
+
+/// [`http_get`] with extra header lines (each ending in `\r\n`).
+async fn http_get_with(addr: SocketAddr, path: &str, headers: &str) -> String {
     let mut tcp = TcpStream::connect(addr).await.expect("the session accepts");
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n{headers}Connection: close\r\n\r\n");
     tcp.write_all(request.as_bytes()).await.unwrap();
     let mut response = Vec::new();
     tokio::time::timeout(STEP, tcp.read_to_end(&mut response))
@@ -157,17 +163,44 @@ async fn the_local_page_address_serves_the_nas_dashboard_on_loopback() {
     let addr = session.local_addr();
     assert_eq!(addr.ip(), std::net::IpAddr::from(Ipv4Addr::LOCALHOST), "loopback only");
     assert_ne!(addr.port(), 0);
-    assert_eq!(session.local_url(), format!("http://127.0.0.1:{}/", addr.port()));
+    let url = session.local_url();
+    let prefix = format!("http://127.0.0.1:{}/#", addr.port());
+    let secret = url.strip_prefix(&prefix).unwrap_or_else(|| panic!("the page address: {url}"));
+    assert_eq!(secret.len(), 64, "32 random bytes, hex");
+    assert!(secret.bytes().all(|b| b.is_ascii_hexdigit()), "{secret}");
     tokio::spawn(session.serve(std::future::pending()));
 
     let page = http_get(addr, "/").await;
     assert!(page.starts_with("HTTP/1.1 200"), "{page}");
     assert!(page.contains("<html") || page.contains("<!doctype"), "the dashboard page: {page}");
-    let api = http_get(addr, "/api/status").await;
+    let api =
+        http_get_with(addr, "/api/status", &format!("Authorization: Bearer {secret}\r\n")).await;
     assert!(
         !api.starts_with("HTTP/1.1 401") && !api.starts_with("HTTP/1.1 403"),
-        "a device-authorized request needs no token: {api}"
+        "the session secret from the page address admits the request: {api}"
     );
+
+    // Another program on this computer reaches the same loopback port. It has
+    // the page shell, which holds nothing, and no API: not with no secret, not
+    // with a wrong one, and not with a forged Origin either.
+    let stranger = http_get(addr, "/api/status").await;
+    assert!(stranger.starts_with("HTTP/1.1 401"), "{stranger}");
+    let guess = http_get_with(
+        addr,
+        "/api/status",
+        &format!("Authorization: Bearer {}\r\n", "0".repeat(64)),
+    )
+    .await;
+    assert!(guess.starts_with("HTTP/1.1 401"), "{guess}");
+    let forged = http_get_with(addr, "/api/status", "Origin: http://evil.example\r\n").await;
+    assert!(forged.starts_with("HTTP/1.1 403"), "a forged Origin is refused: {forged}");
+    let forged_with_guess = http_get_with(
+        addr,
+        "/api/status",
+        &format!("Origin: http://evil.example\r\nAuthorization: Bearer {}\r\n", "0".repeat(64)),
+    )
+    .await;
+    assert!(forged_with_guess.starts_with("HTTP/1.1 403"), "{forged_with_guess}");
 }
 
 /// Echoes every text and binary frame of one WebSocket connection.
@@ -528,7 +561,7 @@ async fn a_failing_accept_backs_off_instead_of_spinning() {
     let until = tokio::time::sleep(Duration::from_millis(600));
     tokio::time::timeout(
         STEP,
-        serve_on(connection, FailingAccept(attempts.clone()), limits, until),
+        serve_on(connection, FailingAccept(attempts.clone()), limits, Secret::random(), until),
     )
     .await
     .expect("the session ends when asked, whatever accept does");

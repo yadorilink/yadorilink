@@ -40,8 +40,8 @@ pub(crate) use link_lifecycle::{
 #[allow(unused_imports)]
 pub(crate) use materialization::{
     AssemblyProgress, ByteRange, EvictOutcome, LocalPresence, LocalTransition, MaterializationPort,
-    MaterializationStatusSummary, PinOutcome, RetentionState, TempAssembly, TempMaterialization,
-    TempOutcome,
+    MaterializationStatusSummary, PinOutcome, RetentionState, RuleChoice, TempAssembly,
+    TempMaterialization, TempOutcome,
 };
 #[allow(unused_imports)]
 pub(crate) use membership::{

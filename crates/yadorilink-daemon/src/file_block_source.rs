@@ -114,7 +114,7 @@ impl FileBlockSource {
         let sync =
             |e: yadorilink_sync_sqlite::SyncSqliteError| PeerSessionError::from(SyncError::from(e));
         let Some(record) =
-            coordinator.file_index_repository().get_file(group_id, path).map_err(sync)?
+            coordinator.file_index_repository().get_file_shared(group_id, path).map_err(sync)?
         else {
             return Ok(FileBlockRead::Absent);
         };
@@ -143,7 +143,7 @@ impl FileBlockSource {
         };
         let file = match open_source(&resolved) {
             Opened::File(file) => file,
-            Opened::Unavailable => return Ok(FileBlockRead::Absent),
+            Opened::Unavailable(_) => return Ok(FileBlockRead::Absent),
             Opened::Gone => {
                 self.mark_changed(group_id, path, REMOVED);
                 return Ok(FileBlockRead::Changed);
@@ -178,14 +178,16 @@ fn read_verified(
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(error) => return Err(error),
     }
-    let digest = yadorilink_local_storage::LocallyHashedBlock::from_bytes(data.clone());
-    Ok((digest.hash().as_bytes() == hex::encode(hash).as_bytes()).then_some(data))
+    // Hashed in place: the bytes are only checked here, not kept as a store block, so no copy of them is made.
+    let digest = yadorilink_local_storage::hash_block_bytes(&data);
+    Ok((digest.as_bytes() == hex::encode(hash).as_bytes()).then_some(data))
 }
 
 pub(crate) enum Opened {
     File(std::fs::File),
-    /// The file cannot be read as a source right now and nothing is wrong with it.
-    Unavailable,
+    /// The file cannot be read as a source right now. Carries the operating system's refusal
+    /// when there was one (a busy or provider-owned file has none).
+    Unavailable(Option<std::io::ErrorKind>),
     /// There is no such file.
     Gone,
 }
@@ -220,7 +222,7 @@ pub(crate) fn open_source(path: &Path) -> Opened {
     {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Opened::Gone,
-        Err(_) => return Opened::Unavailable,
+        Err(error) => return Opened::Unavailable(Some(error.kind())),
     };
     // apple-cfg: macos-only the desktop daemon's serving path; the iOS host wires its own sessions
     #[cfg(target_os = "macos")]
@@ -230,7 +232,7 @@ pub(crate) fn open_source(path: &Path) -> Opened {
         const SF_DATALESS: u32 = 0x4000_0000;
         match file.metadata() {
             Ok(metadata) if metadata.st_flags() & SF_DATALESS == 0 => {}
-            _ => return Opened::Unavailable,
+            _ => return Opened::Unavailable(None),
         }
     }
     Opened::File(file)
@@ -261,7 +263,7 @@ pub(crate) fn open_source(path: &Path) -> Opened {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Opened::Gone,
         // A sharing violation or an access refusal: the file is busy, not changed.
-        Err(_) => return Opened::Unavailable,
+        Err(error) => return Opened::Unavailable(Some(error.kind())),
     };
     let not_a_source = FILE_ATTRIBUTE_REPARSE_POINT
         | FILE_ATTRIBUTE_OFFLINE
@@ -269,7 +271,7 @@ pub(crate) fn open_source(path: &Path) -> Opened {
         | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
     match file.metadata() {
         Ok(metadata) if metadata.file_attributes() & not_a_source == 0 => Opened::File(file),
-        _ => Opened::Unavailable,
+        _ => Opened::Unavailable(None),
     }
 }
 

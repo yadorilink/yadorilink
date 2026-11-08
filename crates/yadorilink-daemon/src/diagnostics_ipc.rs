@@ -140,6 +140,7 @@ fn encode_bundle_json(snapshot: DiagnosticsBundleSnapshot) -> serde_json::Value 
                 "link_id": format!("link:{:03}", i + 1),
                 "group_id": format!("group:{:03}", i + 1),
                 "state": link.state_label,
+                "blockers": link.blockers,
                 // The folder path is user data (names of clients, matters,
                 // people); pattern redaction cannot promise to remove all of
                 // it, so only a token that distinguishes the links is kept.
@@ -170,7 +171,7 @@ fn encode_bundle_json(snapshot: DiagnosticsBundleSnapshot) -> serde_json::Value 
         "yadorilink_version": env!("CARGO_PKG_VERSION"),
         "platform": {
             "os_family": std::env::consts::OS,
-            "os_version_bucket": "unknown",
+            "os_version_bucket": yadorilink_reporting::local_store::environment::os_version_bucket(),
             "arch": std::env::consts::ARCH,
         },
         "daemon": {

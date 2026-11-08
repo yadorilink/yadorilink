@@ -86,12 +86,12 @@ type BoxFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
 /// with the peer and the group its hello named.
 pub type LaneStreamHook = Arc<dyn Fn(PeerId, GroupId, Lane, LaneStream) -> BoxFuture + Send + Sync>;
 
-/// Told that a peer opened a lane whose hello speaks another protocol version: `(peer, theirs,
-/// ours)`.
+/// Told that a peer opened a lane, on `link`, whose hello speaks another protocol version:
+/// `(link, theirs, ours)`.
 ///
 /// The peer completed the transport, so it is reachable; it just cannot sync. Without this the
 /// mismatch would only be a debug log and the peer would read as healthy or offline.
-pub type IncompatibleLaneHook = Arc<dyn Fn(PeerId, u32, u32) + Send + Sync>;
+pub type IncompatibleLaneHook = Arc<dyn Fn(&PeerLink, u32, u32) + Send + Sync>;
 
 /// Owns the transport endpoint and routes what arrives on it.
 pub struct SyncRuntime {
@@ -280,7 +280,7 @@ async fn serve_link(
                         tracing::warn!(%peer, theirs, ours, "peer speaks another protocol version; its lane is refused");
                         let hook = incompatible.lock().expect("incompatible hook poisoned").clone();
                         if let Some(hook) = hook {
-                            hook(peer, *theirs, *ours);
+                            hook(&link, *theirs, *ours);
                         }
                     } else {
                         tracing::debug!(%peer, ?kind, %error, "peer opened a lane without a usable hello");

@@ -108,15 +108,16 @@ pub(crate) mod support {
     }
 
     /// Every row of every native table, and the identity of each projection
-    /// obligation (without its timestamps), in a canonical order. The state
-    /// token is left out: it is random per write, so two databases that hold
-    /// the same state never hold the same token.
+    /// obligation (without its timestamps), in a canonical order. The
+    /// namespace root row is left out: it counts head writes, so two databases that hold
+    /// the same state need not hold the same counters (the node rows, a function of the
+    /// state, are kept).
     pub(crate) fn dump_native(c: &Connection) -> Vec<String> {
         let mut tables: Vec<String> = c
             .prepare(
                 "SELECT name FROM sqlite_master WHERE type = 'table' \
                  AND name LIKE 'native\\_%' ESCAPE '\\' \
-                 AND name <> 'native_state_generation' ORDER BY name",
+                 AND name <> 'native_namespace_root' ORDER BY name",
             )
             .unwrap()
             .query_map([], |row| row.get(0))

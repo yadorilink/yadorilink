@@ -12,7 +12,7 @@ use ed25519_dalek::VerifyingKey;
 use crate::codec::{put_str, ChangeError};
 use crate::ids::{SyncPath, VersionHash};
 use crate::limits::{MAX_PATH_BYTES, MAX_PATH_SEGMENTS};
-use crate::reserved_paths::{IGNORE_FILE_NAME, ROOT_MARKER_FILE_NAME};
+use crate::reserved_paths::ROOT_MARKER_FILE_NAME;
 
 /// One captured operation. `Move` is a rename *hint*, not a distinct identity
 /// operation: it is semantically exactly `Delete { from }` plus
@@ -147,7 +147,7 @@ pub(crate) fn validate_path(path: &str) -> Result<(), ChangeError> {
     }
     let is_sep = |c: char| c == '/' || c == '\\';
     let first_segment = path.split(is_sep).next().unwrap_or(path);
-    if first_segment == ROOT_MARKER_FILE_NAME || first_segment == IGNORE_FILE_NAME {
+    if first_segment == ROOT_MARKER_FILE_NAME {
         return Err(ChangeError::Malformed(
             "path targets a reserved sync-root control file".into(),
         ));

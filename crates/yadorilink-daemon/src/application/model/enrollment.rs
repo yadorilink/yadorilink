@@ -5,10 +5,17 @@
 
 /// Why linking a folder was refused, when a client can tell the person
 /// something specific about it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LinkRefusal {
     DiskFull,
     PathNotAllowed,
+    /// The folder is on a drive the product cannot sync into yet (ReFS / Dev Drive, exFAT/FAT, a
+    /// network share, a removable drive): the machine reason and the file system's name, for a
+    /// front end to word in its own language.
+    UnsupportedDrive {
+        reason: yadorilink_fs_platform::durable_dir::DriveReason,
+        file_system: String,
+    },
     /// The operating system refused this program access to the folder (macOS privacy
     /// protection, a Windows ACL, ordinary permissions).
     AccessDenied,

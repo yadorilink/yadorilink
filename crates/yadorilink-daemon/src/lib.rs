@@ -38,6 +38,8 @@ pub(crate) mod custody_wait;
 pub mod daemon_state;
 #[cfg(feature = "process-model")]
 pub mod data_compat;
+#[cfg(feature = "process-model")]
+pub mod data_volume_watch;
 pub mod device_config;
 #[cfg(feature = "process-model")]
 pub mod diagnostics_ipc;
@@ -53,6 +55,7 @@ pub mod exe_replaced;
 pub mod exe_watch;
 pub mod fd_limit;
 pub(crate) mod file_block_source;
+pub(crate) mod folder_state;
 pub mod gc;
 pub mod gc_state;
 pub mod governance_config;
@@ -75,9 +78,11 @@ pub mod local_convergence;
 #[cfg(feature = "process-model")]
 pub mod log_roll;
 pub mod log_throttle;
+pub(crate) mod membership_wire;
 pub(crate) mod store_residency;
 #[cfg(feature = "process-model")]
 pub use yadorilink_local_storage::mac_claim;
+pub mod ignore_rules;
 pub mod machine_fingerprint;
 pub(crate) mod maintenance;
 pub mod maintenance_coordinator;
@@ -97,6 +102,7 @@ pub mod native_replication_runtime;
 pub mod native_replication_session;
 #[cfg(test)]
 mod native_test_support;
+pub mod network_policy;
 #[cfg(test)]
 pub(crate) mod obligation_tick_metrics;
 pub mod path_witness_sink;
@@ -134,6 +140,7 @@ pub(crate) mod status_facts;
 pub(crate) mod status_report;
 pub mod sync_adapter;
 pub mod sync_runtime;
+pub(crate) mod wake_detector;
 // Exclusive OS locks on the block-store root and sync-state database.
 pub(crate) mod conflict_resolution;
 pub(crate) mod file_actions;
@@ -159,6 +166,8 @@ pub(crate) mod provider_stage;
 pub(crate) mod provider_status;
 pub(crate) mod provider_writer;
 pub(crate) mod requested_opens;
+pub(crate) mod retention_apply;
+pub(crate) mod retention_store_fill;
 pub mod send_transfer;
 pub mod shell_context;
 pub mod shell_ipc;
@@ -184,3 +193,4 @@ pub(crate) mod windows_fs_security;
 #[cfg(windows)]
 pub mod windows_pipe_security;
 pub(crate) mod windows_sync_roots;
+pub mod write_op;

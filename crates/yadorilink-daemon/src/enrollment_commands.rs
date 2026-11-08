@@ -97,12 +97,18 @@ pub(crate) async fn create_and_link(
         Some(detail) => Some(EnrollmentError::PreparationRejected { detail }),
         None if request.provider_display_name.is_empty() => {
             let created = if request.create_local_path_if_missing {
-                yadorilink_fs_platform::durable_dir::create_dir_all_durably(std::path::Path::new(
-                    &request.local_path,
-                ))
-                .map_err(|e| EnrollmentError::PreparationRejected {
-                    detail: format!("could not create {}: {e}", request.local_path),
-                })
+                crate::error::refuse_unsupported_drive(std::path::Path::new(&request.local_path))
+                    .map_err(risks_refusal)
+                    .and_then(|()| {
+                        yadorilink_fs_platform::durable_dir::create_dir_all_durably(
+                            std::path::Path::new(&request.local_path),
+                        )
+                        .map_err(|e| {
+                            EnrollmentError::PreparationRejected {
+                                detail: format!("could not create {}: {e}", request.local_path),
+                            }
+                        })
+                    })
             } else {
                 Ok(())
             };
@@ -252,7 +258,7 @@ pub(crate) fn enrollment_error_code(error: &EnrollmentError) -> (ApplicationErro
             (ApplicationErrorCode::LocalLinkFailed, String::new())
         }
         Error::LocalLinkFailed { refusal: Some(refusal), .. }
-        | Error::LinkRefused { refusal, .. } => (link_refusal_code(*refusal), String::new()),
+        | Error::LinkRefused { refusal, .. } => (link_refusal_code(refusal), String::new()),
         Error::InviteRefused { reason, .. } => (
             match reason {
                 crate::application::model::InviteRefusal::Expired => {
@@ -287,13 +293,47 @@ pub(crate) fn enrollment_error_code(error: &EnrollmentError) -> (ApplicationErro
 }
 
 pub(crate) fn link_refusal_code(
-    refusal: crate::application::model::LinkRefusal,
+    refusal: &crate::application::model::LinkRefusal,
 ) -> ApplicationErrorCode {
     use crate::application::model::LinkRefusal;
     match refusal {
+        LinkRefusal::UnsupportedDrive { .. } => ApplicationErrorCode::UnsupportedDrive,
         LinkRefusal::DiskFull => ApplicationErrorCode::DiskFull,
         LinkRefusal::PathNotAllowed => ApplicationErrorCode::PathNotAllowed,
         LinkRefusal::AccessDenied => ApplicationErrorCode::AccessDenied,
+    }
+}
+
+/// The machine reason and file system of a refusal because of the drive, in the control socket's
+/// fields (unspecified and empty for any other failure).
+pub(crate) fn drive_detail(
+    refusal: Option<&crate::application::model::LinkRefusal>,
+) -> (i32, String) {
+    use crate::application::model::LinkRefusal;
+    use yadorilink_fs_platform::durable_dir::DriveReason;
+    use yadorilink_ipc_proto::daemonctl::UnsupportedDriveReason as Wire;
+    match refusal {
+        Some(LinkRefusal::UnsupportedDrive { reason, file_system }) => {
+            let wire = match reason {
+                DriveReason::Refs => Wire::Refs,
+                DriveReason::ExFat => Wire::Exfat,
+                DriveReason::Fat => Wire::Fat,
+                DriveReason::NotLocalFixed => Wire::NotLocalFixed,
+                DriveReason::Other => Wire::Other,
+            };
+            (wire as i32, file_system.clone())
+        }
+        _ => (Wire::Unspecified as i32, String::new()),
+    }
+}
+
+/// [`drive_detail`] of an enrollment failure.
+pub(crate) fn enrollment_drive_detail(error: &EnrollmentError) -> (i32, String) {
+    use EnrollmentError as Error;
+    match error {
+        Error::LocalLinkFailed { refusal, .. } => drive_detail(refusal.as_ref()),
+        Error::LinkRefused { refusal, .. } => drive_detail(Some(refusal)),
+        _ => drive_detail(None),
     }
 }
 
@@ -427,5 +467,44 @@ mod tests {
             (creation.display_name.as_str(), creation.request_token.as_str()),
             ("Photos", "token")
         );
+    }
+}
+
+#[cfg(test)]
+mod unsupported_drive_tests {
+    use super::*;
+    use crate::application::model::LinkRefusal;
+    use yadorilink_fs_platform::durable_dir::DriveReason;
+    use yadorilink_ipc_proto::daemonctl::UnsupportedDriveReason as Wire;
+
+    fn refs() -> LinkRefusal {
+        LinkRefusal::UnsupportedDrive { reason: DriveReason::Refs, file_system: "ReFS".into() }
+    }
+
+    /// The refusal because of the drive has its own code and carries the machine reason and the
+    /// file system, so a front end words it in its own language; every other failure carries none.
+    #[test]
+    fn the_drive_refusal_has_its_own_code_and_machine_reason() {
+        assert_eq!(link_refusal_code(&refs()), ApplicationErrorCode::UnsupportedDrive);
+        assert_eq!(drive_detail(Some(&refs())), (Wire::Refs as i32, "ReFS".to_owned()));
+        let error = EnrollmentError::LinkRefused { refusal: refs(), detail: "x".into() };
+        assert_eq!(enrollment_error_code(&error).0, ApplicationErrorCode::UnsupportedDrive);
+        assert_eq!(enrollment_drive_detail(&error), (Wire::Refs as i32, "ReFS".to_owned()));
+        let local = EnrollmentError::LocalLinkFailed { detail: "x".into(), refusal: Some(refs()) };
+        assert_eq!(enrollment_drive_detail(&local).0, Wire::Refs as i32);
+        assert_eq!(
+            drive_detail(Some(&LinkRefusal::DiskFull)),
+            (Wire::Unspecified as i32, String::new())
+        );
+        assert_eq!(drive_detail(None), (Wire::Unspecified as i32, String::new()));
+        for (reason, wire) in [
+            (DriveReason::ExFat, Wire::Exfat),
+            (DriveReason::Fat, Wire::Fat),
+            (DriveReason::NotLocalFixed, Wire::NotLocalFixed),
+            (DriveReason::Other, Wire::Other),
+        ] {
+            let refusal = LinkRefusal::UnsupportedDrive { reason, file_system: "fs".into() };
+            assert_eq!(drive_detail(Some(&refusal)).0, wire as i32);
+        }
     }
 }

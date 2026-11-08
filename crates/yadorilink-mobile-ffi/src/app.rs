@@ -15,7 +15,10 @@ use crate::{options, CallFailure, CancelHandle, MobileHost};
 /// A command returned an output of another kind than it must: a bug of the bridge, reported
 /// as a failure rather than a crash.
 fn unexpected(command: &str, output: &host::CommandOutput) -> CallFailure {
-    CallFailure::Failed { message: format!("{command} returned {output:?}") }
+    CallFailure::Failed {
+        reason: crate::FailureReason::Unspecified,
+        message: format!("{command} returned {output:?}"),
+    }
 }
 
 // ---- errors ----------------------------------------------------------------------------
@@ -68,6 +71,9 @@ pub enum RefusalCode {
     /// This device's operating system refused to send to the local network (macOS Local Network
     /// privacy, a firewall, a VPN); a device on the same network could not be reached.
     SendLocalNetworkBlocked,
+    /// The file list of a Send link does not open with its code (altered, or sealed for another
+    /// link): do not show a list. The link itself is still valid and can be redeemed.
+    SendPreviewUnverified,
 }
 
 impl From<yadorilink_ipc_proto::daemonctl::ApplicationErrorCode> for RefusalCode {
@@ -95,7 +101,9 @@ impl From<yadorilink_ipc_proto::daemonctl::ApplicationErrorCode> for RefusalCode
             C::UnrecordedLocalChanges => Self::UnrecordedLocalChanges,
             C::ConflictNotResolvable => Self::ConflictNotResolvable,
             C::DiskFull => Self::DiskFull,
-            C::PathNotAllowed => Self::PathNotAllowed,
+            // A phone links no plain folder, so a refused drive never reaches it; the nearest
+            // existing refusal if it ever does.
+            C::PathNotAllowed | C::UnsupportedDrive => Self::PathNotAllowed,
             C::NotProtected => Self::NotProtected,
             C::InviteExpired => Self::InviteExpired,
             C::InviteAlreadyUsed => Self::InviteAlreadyUsed,
@@ -111,6 +119,7 @@ impl From<yadorilink_ipc_proto::daemonctl::ApplicationErrorCode> for RefusalCode
             C::SendInterrupted => Self::SendInterrupted,
             C::SendLinksDisabled => Self::SendLinksDisabled,
             C::SendLocalNetworkBlocked => Self::SendLocalNetworkBlocked,
+            C::SendPreviewUnverified => Self::SendPreviewUnverified,
         }
     }
 }
@@ -214,6 +223,9 @@ pub enum AccountErrorKind {
     PrimaryTransferConflict,
     /// No such folder or offer for this account.
     PrimaryTransferNotFound,
+    /// The service's abuse budget refused the request: wait `retry_after_secs` (when present),
+    /// then repeat. Nothing changed. Declared last so the other kinds keep their order.
+    RateLimited,
 }
 
 /// The typed error of an account command.
@@ -224,17 +236,29 @@ pub struct AccountError {
     /// The groups a `DurabilityBlocked` refusal is about.
     pub group_ids: Vec<String>,
     pub can_force: bool,
+    /// For `RateLimited`: the service's own wait in seconds, when it gave one.
+    pub retry_after_secs: Option<u64>,
 }
 
 impl From<host::DesktopError> for AccountError {
     fn from(error: host::DesktopError) -> Self {
         use host::DesktopError as E;
-        let plain = |kind, message| Self { kind, message, group_ids: Vec::new(), can_force: false };
+        let plain = |kind, message| Self {
+            kind,
+            message,
+            group_ids: Vec::new(),
+            can_force: false,
+            retry_after_secs: None,
+        };
         match error {
             E::NotSignedIn { message } => plain(AccountErrorKind::NotSignedIn, message),
             E::DaemonUnavailable { message, .. } => {
                 plain(AccountErrorKind::DaemonUnavailable, message)
             }
+            E::Network {
+                message,
+                kind: host::NetworkErrorKind::RateLimited { retry_after_secs },
+            } => Self { retry_after_secs, ..plain(AccountErrorKind::RateLimited, message) },
             E::Network { message, .. } => plain(AccountErrorKind::Network, message),
             E::PermissionDenied {
                 message,
@@ -247,11 +271,16 @@ impl From<host::DesktopError> for AccountError {
             E::PermissionDenied { message, .. } => {
                 plain(AccountErrorKind::PermissionDenied, message)
             }
-            E::DurabilityBlocked { message, group_ids, can_force, .. } => {
-                Self { kind: AccountErrorKind::DurabilityBlocked, message, group_ids, can_force }
-            }
+            E::DurabilityBlocked { message, group_ids, can_force, .. } => Self {
+                kind: AccountErrorKind::DurabilityBlocked,
+                message,
+                group_ids,
+                can_force,
+                retry_after_secs: None,
+            },
             E::InvalidInput { message, .. } => plain(AccountErrorKind::InvalidInput, message),
             E::Internal { message, .. } => plain(AccountErrorKind::Internal, message),
+            E::UnsupportedDrive { message, .. } => plain(AccountErrorKind::Refused, message),
             E::Refused { message, reason: host::RefusalReason::StartOverRestartRequired } => {
                 plain(AccountErrorKind::StartOverRestartRequired, message)
             }
@@ -420,11 +449,63 @@ pub struct CreateShareRequest {
 pub struct JoinableGroup {
     pub group_id: String,
     pub name: String,
+    /// The device the group was created on; `None` for a group created before it was recorded.
+    pub created_by_device: Option<GroupCreatorDevice>,
+}
+
+/// The device a group was created on.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GroupCreatorDevice {
+    pub device_id: String,
+    /// `None` once that device was removed.
+    pub name: Option<String>,
+    pub platform: Option<String>,
+}
+
+/// An invite just minted: what the service created, not what was asked.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MintedInvite {
+    pub invite_id: String,
+    pub code: String,
+    /// The link that carries the code.
+    pub url: String,
+    pub group_id: String,
+    /// `owner`, `editor` or `viewer`; any other role the service names comes as it wrote it.
+    pub role: String,
+    pub expires_at: SystemTime,
+    pub requires_approval: bool,
+}
+
+impl From<dto::InviteSummary> for MintedInvite {
+    fn from(invite: dto::InviteSummary) -> Self {
+        Self {
+            invite_id: invite.invite_id,
+            code: invite.code,
+            url: invite.url,
+            group_id: invite.group_id,
+            role: match invite.role {
+                dto::ShareRole::Owner => "owner".into(),
+                dto::ShareRole::Editor => "editor".into(),
+                dto::ShareRole::Viewer => "viewer".into(),
+                dto::ShareRole::Other { raw } => raw,
+            },
+            expires_at: invite.expires_at,
+            requires_approval: invite.requires_approval,
+        }
+    }
 }
 
 impl From<dto::GroupSummary> for JoinableGroup {
     fn from(group: dto::GroupSummary) -> Self {
-        Self { group_id: group.group_id, name: group.name }
+        Self {
+            group_id: group.group_id,
+            name: group.name,
+            created_by_device: group.created_by_device.map(|d| GroupCreatorDevice {
+                device_id: d.device_id,
+                name: d.name,
+                platform: d.platform,
+            }),
+        }
     }
 }
 
@@ -444,6 +525,53 @@ pub struct GroupDevice {
     pub last_seen_unix: Option<u64>,
     /// This device itself.
     pub is_this_device: bool,
+    /// The member's role in the group.
+    pub role: MemberRole,
+    /// How the member relates to the person looking: the same rule as the desktop's member list.
+    pub relationship: MemberRelationship,
+}
+
+/// What a membership removal did. Show the data-loss warning when `forced_group_ids` is not
+/// empty, and a pending-recovery warning when `unknown_scope_operation_id` is set.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MembershipOutcome {
+    /// Groups left without a confirmed complete copy by a forced removal.
+    pub forced_group_ids: Vec<String>,
+    pub unknown_scope_operation_id: Option<String>,
+}
+
+impl From<dto::MembershipOutcome> for MembershipOutcome {
+    fn from(outcome: dto::MembershipOutcome) -> Self {
+        Self {
+            forced_group_ids: outcome.forced_group_ids,
+            unknown_scope_operation_id: outcome.unknown_scope_operation_id,
+        }
+    }
+}
+
+/// A member's role in a folder group.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum MemberRole {
+    Owner,
+    Editor,
+    Viewer,
+    /// A role this build does not know; shown as it came.
+    Other {
+        raw: String,
+    },
+}
+
+/// How a member relates to the person looking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum MemberRelationship {
+    /// This device.
+    You,
+    /// Another device of the person's account.
+    YourOtherDevice,
+    /// A device of the account that owns the group (its primary owner).
+    OwnersDevice,
+    /// A device of another account that was invited.
+    Invited,
 }
 
 impl From<dto::MemberSummary> for GroupDevice {
@@ -459,6 +587,18 @@ impl From<dto::MemberSummary> for GroupDevice {
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs()),
             is_this_device: member.relationship == dto::MemberRelationship::You,
+            role: match member.role {
+                dto::ShareRole::Owner => MemberRole::Owner,
+                dto::ShareRole::Editor => MemberRole::Editor,
+                dto::ShareRole::Viewer => MemberRole::Viewer,
+                dto::ShareRole::Other { raw } => MemberRole::Other { raw },
+            },
+            relationship: match member.relationship {
+                dto::MemberRelationship::You => MemberRelationship::You,
+                dto::MemberRelationship::YourOtherDevice => MemberRelationship::YourOtherDevice,
+                dto::MemberRelationship::OwnersDevice => MemberRelationship::OwnersDevice,
+                dto::MemberRelationship::Invited => MemberRelationship::Invited,
+            },
         }
     }
 }
@@ -502,6 +642,11 @@ pub struct ActivityEvent {
     pub origin_device_id: Option<String>,
     /// Its name, when the account's device list could be read.
     pub origin_device_name: Option<String>,
+    /// For a conflict: the device whose version holds the original path now (the other side of the
+    /// conflict). `None` for any other event or when it is not known here.
+    pub other_origin_device_id: Option<String>,
+    /// Its name, when the account's device list could be read.
+    pub other_origin_device_name: Option<String>,
     pub is_this_device: bool,
     pub at: Option<SystemTime>,
 }
@@ -564,6 +709,8 @@ impl From<dto::ActivityPage> for ActivityPage {
                     kind: e.kind.into(),
                     origin_device_id: e.origin_device_id,
                     origin_device_name: e.origin_device_name,
+                    other_origin_device_id: e.other_origin_device_id,
+                    other_origin_device_name: e.other_origin_device_name,
                     is_this_device: e.is_this_device,
                     at: e.at,
                 })
@@ -619,25 +766,90 @@ impl From<host::ShareOutcome> for ShareOutcome {
     }
 }
 
+// ---- network policy -------------------------------------------------------------------
+
+fn policy_call(
+    app: &MobileHost,
+    name: &str,
+    command: host::Command,
+    cancel: &CancelHandle,
+    deadline_ms: Option<u64>,
+) -> Result<NetworkPolicy, CallFailure> {
+    match app.run(command, cancel, deadline_ms)? {
+        host::CommandOutput::NetworkPolicy(state) => Ok(state.into()),
+        other => Err(unexpected(name, &other)),
+    }
+}
+
+/// What the OS says the connection is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum NetworkCost {
+    /// The host cannot tell; treated as not metered.
+    Unknown,
+    Unmetered,
+    /// Cellular or otherwise metered.
+    Metered,
+}
+
+impl From<NetworkCost> for host::NetworkCost {
+    fn from(cost: NetworkCost) -> Self {
+        match cost {
+            NetworkCost::Unknown => Self::Unknown,
+            NetworkCost::Unmetered => Self::Unmetered,
+            NetworkCost::Metered => Self::Metered,
+        }
+    }
+}
+
+impl From<host::NetworkCost> for NetworkCost {
+    fn from(cost: host::NetworkCost) -> Self {
+        match cost {
+            host::NetworkCost::Unknown => Self::Unknown,
+            host::NetworkCost::Unmetered => Self::Unmetered,
+            host::NetworkCost::Metered => Self::Metered,
+        }
+    }
+}
+
+/// Whether peer traffic may flow on the connection the host reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct NetworkPolicy {
+    /// The user's setting: sync even on a metered connection. Off by default.
+    pub sync_on_metered: bool,
+    /// What the host last reported (`Unknown` until it does, and after an engine restart).
+    pub cost: NetworkCost,
+    /// Sync with peers is paused right now because the connection is metered.
+    pub paused_on_metered: bool,
+}
+
+impl From<host::PolicyState> for NetworkPolicy {
+    fn from(state: host::PolicyState) -> Self {
+        Self {
+            sync_on_metered: state.sync_on_metered,
+            cost: state.cost.into(),
+            paused_on_metered: state.paused_on_metered(),
+        }
+    }
+}
+
 // ---- link lifecycle --------------------------------------------------------------------
 
 /// How long a pause lasts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum PauseFor {
     UntilResumed,
-    ThirtyMinutes,
-    OneHour,
-    /// Until the next local midnight.
-    UntilTomorrow,
+    TwoHours,
+    EightHours,
+    TwentyFourHours,
 }
 
 impl From<PauseFor> for host::PauseFor {
     fn from(duration: PauseFor) -> Self {
         match duration {
             PauseFor::UntilResumed => Self::UntilResumed,
-            PauseFor::ThirtyMinutes => Self::ThirtyMinutes,
-            PauseFor::OneHour => Self::OneHour,
-            PauseFor::UntilTomorrow => Self::UntilTomorrow,
+            PauseFor::TwoHours => Self::TwoHours,
+            PauseFor::EightHours => Self::EightHours,
+            PauseFor::TwentyFourHours => Self::TwentyFourHours,
         }
     }
 }
@@ -777,6 +989,10 @@ pub struct FolderStatus {
     pub hydrated_file_count: u64,
     pub placeholder_file_count: u64,
     pub degraded: bool,
+    /// The other device the folder's newest recorded change came from, when known here.
+    pub last_change_origin_device_id: Option<String>,
+    /// Its name, when the account's device list could be read.
+    pub last_change_origin_device_name: Option<String>,
 }
 
 /// The engine's status.
@@ -869,6 +1085,8 @@ impl From<dto::StatusSnapshot> for StatusSummary {
                     hydrated_file_count: folder.hydrated_file_count,
                     placeholder_file_count: folder.placeholder_file_count,
                     degraded: folder.degraded,
+                    last_change_origin_device_id: folder.last_change_origin_device_id,
+                    last_change_origin_device_name: folder.last_change_origin_device_name,
                 })
                 .collect(),
             account: snapshot.account.into(),
@@ -1000,6 +1218,12 @@ pub struct AccountStatus {
     /// A start over was begun and is not finished: sign in if signed out, then call
     /// `start_over` again (it registers this device as a new one).
     pub start_over_pending: bool,
+    /// The signed-in account's email; `None` when signed out, not read yet, or not given.
+    pub email: Option<String>,
+    /// `"google"` or `"apple"`: which provider the account signs in with; `None` when unknown.
+    pub sign_in_provider: Option<String>,
+    /// The name Apple delivered at the first sign-in; `None` otherwise.
+    pub display_name: Option<String>,
 }
 
 impl From<dto::AccountStatus> for AccountStatus {
@@ -1018,6 +1242,9 @@ impl From<dto::AccountStatus> for AccountStatus {
             default_device_name: status.default_device_name,
             has_linked_folders: status.has_linked_folders,
             start_over_pending: status.start_over_pending,
+            email: status.email,
+            sign_in_provider: status.sign_in_provider,
+            display_name: status.display_name,
         }
     }
 }
@@ -1188,7 +1415,34 @@ pub struct NotRejoined {
     /// The folder's identity key (a locator for a provider folder).
     pub local_path: String,
     pub group_id: String,
+    /// The engine's English sentence, for the log only: never shown. Word `reason`.
     pub message: String,
+    pub reason: RejoinReason,
+}
+
+/// Why a linked folder was not joined to its group again after a start over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum RejoinReason {
+    /// A provider folder: it is joined again from the provider folder list.
+    ProviderFolder,
+    /// This host does not join a folder again by itself: accept an invite to its group again,
+    /// or unlink the folder.
+    HostCannotRejoin,
+    /// This account does not own the folder group: accept a new invite to it.
+    NotGroupOwner,
+    /// Joining the group again failed; start over again retries it.
+    JoinFailed,
+}
+
+impl From<dto::RejoinReason> for RejoinReason {
+    fn from(reason: dto::RejoinReason) -> Self {
+        match reason {
+            dto::RejoinReason::ProviderFolder => Self::ProviderFolder,
+            dto::RejoinReason::HostCannotRejoin => Self::HostCannotRejoin,
+            dto::RejoinReason::NotGroupOwner => Self::NotGroupOwner,
+            dto::RejoinReason::JoinFailed => Self::JoinFailed,
+        }
+    }
 }
 
 impl From<dto::StartOverProgress> for StartOverProgress {
@@ -1209,6 +1463,7 @@ impl From<dto::StartOverProgress> for StartOverProgress {
                             local_path: f.local_path,
                             group_id: f.group_id,
                             message: f.message,
+                            reason: f.reason.into(),
                         })
                         .collect(),
                     complete: report.complete,
@@ -1377,6 +1632,30 @@ impl MobileHost {
         match self.run(command, cancel, deadline_ms)? {
             host::CommandOutput::Shared(outcome) => Ok(outcome.into()),
             other => Err(unexpected("join_group", &other)),
+        }
+    }
+
+    /// Takes a device's access to a folder group away (the caller must be the group's owner or
+    /// an owner-role member). Without `force` it is refused `Refused` with `ReplicaNotReady`,
+    /// nothing changed, when the group would be left without another confirmed complete copy;
+    /// `force` is a data-loss override that the person confirms, never a retry convenience.
+    /// `forced_group_ids` of the answer names groups left unprotected.
+    ///
+    /// # Errors
+    /// `Refused` (`ReplicaNotReady`, `CoordinationRejected`, `TermsConsentRequired`,
+    /// `RecoveryPending`, ...) and `Account` with `NotSignedIn`; the other [`CallFailure`] cases.
+    pub fn revoke_member(
+        &self,
+        group_id: String,
+        device_id: String,
+        force: bool,
+        cancel: &CancelHandle,
+        deadline_ms: Option<u64>,
+    ) -> Result<MembershipOutcome, CallFailure> {
+        let command = host::Command::RevokeMember { group_id, device_id, force };
+        match self.run(command, cancel, deadline_ms)? {
+            host::CommandOutput::MemberRevoked(outcome) => Ok(outcome.into()),
+            other => Err(unexpected("revoke_member", &other)),
         }
     }
 
@@ -1569,6 +1848,28 @@ impl MobileHost {
         }
     }
 
+    /// Mints a one-use invite to a folder group. `role` is `viewer`, `editor` or `owner`; `None`
+    /// and a `None` lifetime take the service's defaults.
+    ///
+    /// # Errors
+    /// `Refused` with `TermsConsentRequired` when the terms must be accepted first, or
+    /// `CoordinationRejected`; the other [`CallFailure`] cases.
+    pub fn mint_invite(
+        &self,
+        group_id: String,
+        role: Option<String>,
+        ttl_secs: Option<u64>,
+        requires_approval: bool,
+        cancel: &CancelHandle,
+        deadline_ms: Option<u64>,
+    ) -> Result<MintedInvite, CallFailure> {
+        let command = host::Command::MintInvite { group_id, role, ttl_secs, requires_approval };
+        match self.run(command, cancel, deadline_ms)? {
+            host::CommandOutput::Invite(invite) => Ok(invite.into()),
+            other => Err(unexpected("mint_invite", &other)),
+        }
+    }
+
     /// Pauses a linked folder.
     ///
     /// # Errors
@@ -1753,6 +2054,25 @@ impl MobileHost {
         )
     }
 
+    /// Asks the engine to try a preserved item again; the item stays until it is restored or
+    /// discarded.
+    ///
+    /// # Errors
+    /// As `restore_preserved`.
+    pub fn retry_preserved(
+        &self,
+        item: PreservedRef,
+        cancel: &CancelHandle,
+        deadline_ms: Option<u64>,
+    ) -> Result<(), CallFailure> {
+        self.done(
+            "retry_preserved",
+            host::Command::RetryPreserved(item.into()),
+            cancel,
+            deadline_ms,
+        )
+    }
+
     /// Whether automatic space management is on. Read-only; Off when never set.
     ///
     /// # Errors
@@ -1782,6 +2102,60 @@ impl MobileHost {
             host::CommandOutput::SpaceManagement(setting) => Ok(setting.enabled),
             other => Err(unexpected("set_space_management", &other)),
         }
+    }
+
+    /// The metered-network policy. Read-only.
+    ///
+    /// # Errors
+    /// A [`CallFailure`].
+    pub fn network_policy(
+        &self,
+        cancel: &CancelHandle,
+        deadline_ms: Option<u64>,
+    ) -> Result<NetworkPolicy, CallFailure> {
+        policy_call(self, "network_policy", host::Command::NetworkPolicy, cancel, deadline_ms)
+    }
+
+    /// Allows (`true`) or pauses (`false`, the default) sync on a metered connection; returns
+    /// the policy now in force.
+    ///
+    /// # Errors
+    /// `Failed` when it cannot be saved.
+    pub fn set_sync_on_metered(
+        &self,
+        enabled: bool,
+        cancel: &CancelHandle,
+        deadline_ms: Option<u64>,
+    ) -> Result<NetworkPolicy, CallFailure> {
+        policy_call(
+            self,
+            "set_sync_on_metered",
+            host::Command::SetSyncOnMetered { enabled },
+            cancel,
+            deadline_ms,
+        )
+    }
+
+    /// Tells the engine what the connection is. Call it when the engine starts and whenever the
+    /// OS reports a change (iOS: the path is expensive or constrained, i.e. cellular; the engine
+    /// does not guess). While the connection is metered and sync on metered is off, no peer is
+    /// dialled or served.
+    ///
+    /// # Errors
+    /// A [`CallFailure`].
+    pub fn report_network_cost(
+        &self,
+        cost: NetworkCost,
+        cancel: &CancelHandle,
+        deadline_ms: Option<u64>,
+    ) -> Result<NetworkPolicy, CallFailure> {
+        policy_call(
+            self,
+            "report_network_cost",
+            host::Command::ReportNetworkCost { cost: cost.into() },
+            cancel,
+            deadline_ms,
+        )
     }
 
     /// Sign-in, registration and linked-folder state. Read-only.
@@ -2025,7 +2399,7 @@ impl MobileHost {
 
     /// Records that the person acknowledged that changes made after the backup may be missing,
     /// which lets the engine confirm a replacement the service called unconfirmed (status item
-    /// `replacement_unconfirmed_acknowledgement_required`). Only from an explicit user action.
+    /// `replacement_unconfirmed` with step `acknowledge`). Only from an explicit user action.
     /// `false`: no replacement was waiting. Idempotent.
     ///
     /// # Errors

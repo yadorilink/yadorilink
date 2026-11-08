@@ -225,6 +225,10 @@ fn login_event_lines_are_pinned_verbatim() {
         login_event_lines(&LoginEvent::SignedIn { client_id: "ylk-1".into() }),
         vec!["Logged in. This computer is enrolled as ylk-1.".to_string()]
     );
+    assert_eq!(
+        login_event_lines(&LoginEvent::DeviceRegistered { device_name: "box".into() }),
+        vec!["Added this computer to your account as \"box\".".to_string()]
+    );
 }
 
 #[test]

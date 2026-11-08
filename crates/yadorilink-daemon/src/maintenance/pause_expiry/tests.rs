@@ -132,10 +132,9 @@ async fn pausing_again_replaces_the_deadline_and_an_invalid_deadline_is_refused(
         Arc::new(LinkRuntimeController::new(state.clone())),
     );
 
-    adapter.pause("/tmp/a", PauseDuration::ThirtyMinutes, None).unwrap();
+    adapter.pause("/tmp/a", PauseDuration::TwoHours, None).unwrap();
     let first = links.paused_until("/tmp/a").unwrap().expect("a deadline");
-    // One hour, not until tomorrow: midnight can be nearer than 30 minutes.
-    adapter.pause("/tmp/a", PauseDuration::OneHour, None).unwrap();
+    adapter.pause("/tmp/a", PauseDuration::EightHours, None).unwrap();
     assert!(links.paused_until("/tmp/a").unwrap().unwrap() > first);
     adapter.pause("/tmp/a", PauseDuration::UntilResumed, None).unwrap();
     assert!(is_paused(&state, "/tmp/a"));

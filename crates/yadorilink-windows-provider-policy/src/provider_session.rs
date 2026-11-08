@@ -13,12 +13,14 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
+use crate::namespace_policy::PinWish;
 pub use crate::provider_client::Connect;
 use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_ipc_proto::shellipc::shell_ipc_message::Payload;
 use yadorilink_ipc_proto::shellipc::{
-    DomainEvidence, EvictResult, ProviderDomainState, ProviderEvictDone,
-    ProviderMaterializedReport, ProviderSignalDone, ShellIpcMessage,
+    DomainEvidence, EvictResult, PinChoice, PinResult, ProviderDomainState, ProviderEvictDone,
+    ProviderMaterializedReport, ProviderPinDone, ProviderPinObserved, ProviderSignalDone,
+    ShellIpcMessage,
 };
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
@@ -34,6 +36,11 @@ pub enum SessionEvent {
     Changed { root: Vec<u8>, revision: u64, request_id: Vec<u8> },
     /// Drop the operating system's copy of `item`.
     Evict { root: Vec<u8>, item: Vec<u8>, request_id: Vec<u8>, require_shown_version: Vec<u8> },
+    /// Apply the person's keep-on-this-device choice to `item` (empty: the folder itself).
+    Pin { root: Vec<u8>, item: Vec<u8>, request_id: Vec<u8>, wish: PinWish },
+    /// The pins the daemon's rules ask for in `root` (item, empty for the folder itself): make the
+    /// operating system agree.
+    PinPlan { root: Vec<u8>, entries: Vec<(Vec<u8>, PinWish)> },
     /// The latest handoff sequence of `root` changed.
     EvidenceTick { root: Vec<u8>, seq: u64 },
     /// The daemon's answer to a materialized-set report.
@@ -77,6 +84,28 @@ impl Session {
         }));
     }
 
+    pub fn pin_done(&self, root: &[u8], request_id: &[u8], result: PinResult, error: &str) {
+        self.send(Payload::ProviderPinDone(ProviderPinDone {
+            root_id: root.to_vec(),
+            request_id: request_id.to_vec(),
+            result: result as i32,
+            error: error.to_string(),
+        }));
+    }
+
+    /// Tells the daemon the pin mark of `item` changed in the operating system without the host's doing.
+    pub fn pin_observed(&self, root: &[u8], item: &[u8], wish: PinWish) {
+        self.send(Payload::ProviderPinObserved(ProviderPinObserved {
+            root_id: root.to_vec(),
+            item_id: item.to_vec(),
+            choice: match wish {
+                PinWish::Keep => PinChoice::Keep,
+                PinWish::OnlineOnly => PinChoice::OnlineOnly,
+                PinWish::Clear => PinChoice::Clear,
+            } as i32,
+        }));
+    }
+
     /// Reports the materialized set (see `provider_report`).
     pub fn materialized(&self, report: ProviderMaterializedReport) {
         self.send(Payload::ProviderMaterializedReport(report));
@@ -84,6 +113,16 @@ impl Session {
 
     fn send(&self, payload: Payload) {
         let _ = self.commands.send(ShellIpcMessage { payload: Some(payload) });
+    }
+}
+
+/// What a wire pin choice asks for. An unset or unknown choice asks for nothing to be pinned
+/// either way.
+fn pin_wish(choice: i32) -> PinWish {
+    match PinChoice::try_from(choice) {
+        Ok(PinChoice::Keep) => PinWish::Keep,
+        Ok(PinChoice::OnlineOnly) => PinWish::OnlineOnly,
+        _ => PinWish::Clear,
     }
 }
 
@@ -100,6 +139,20 @@ pub fn event_of(payload: Payload) -> Option<SessionEvent> {
             item: evict.item_id,
             request_id: evict.request_id,
             require_shown_version: evict.require_shown_version,
+        }),
+        Payload::ProviderPinRequest(pin) => Some(SessionEvent::Pin {
+            root: pin.root_id,
+            item: pin.item_id,
+            request_id: pin.request_id,
+            wish: pin_wish(pin.choice),
+        }),
+        Payload::ProviderPinPlan(plan) => Some(SessionEvent::PinPlan {
+            root: plan.root_id,
+            entries: plan
+                .entries
+                .into_iter()
+                .map(|entry| (entry.item_id, pin_wish(entry.choice)))
+                .collect(),
         }),
         Payload::ProviderEvidenceTick(tick) => {
             Some(SessionEvent::EvidenceTick { root: tick.root_id, seq: tick.evidence_seq })
@@ -245,6 +298,57 @@ mod tests {
                 }
             )),
             Some(SessionEvent::ReportAck { root: vec![1], epoch: 4, needs_full: true })
+        );
+        let pin = event_of(Payload::ProviderPinRequest(
+            yadorilink_ipc_proto::shellipc::ProviderPinRequest {
+                root_id: vec![1],
+                item_id: vec![2],
+                request_id: vec![3],
+                choice: PinChoice::Keep as i32,
+            },
+        ));
+        assert_eq!(
+            pin,
+            Some(SessionEvent::Pin {
+                root: vec![1],
+                item: vec![2],
+                request_id: vec![3],
+                wish: PinWish::Keep
+            })
+        );
+        let wish = |choice: PinChoice| match event_of(Payload::ProviderPinRequest(
+            yadorilink_ipc_proto::shellipc::ProviderPinRequest {
+                choice: choice as i32,
+                ..Default::default()
+            },
+        )) {
+            Some(SessionEvent::Pin { wish, .. }) => wish,
+            other => panic!("not a pin event: {other:?}"),
+        };
+        assert_eq!(wish(PinChoice::OnlineOnly), PinWish::OnlineOnly);
+        assert_eq!(wish(PinChoice::Clear), PinWish::Clear);
+        // An unset choice asks for nothing to be pinned either way.
+        assert_eq!(wish(PinChoice::Unspecified), PinWish::Clear);
+        let plan =
+            event_of(Payload::ProviderPinPlan(yadorilink_ipc_proto::shellipc::ProviderPinPlan {
+                root_id: vec![1],
+                entries: vec![
+                    yadorilink_ipc_proto::shellipc::ProviderPinPlanEntry {
+                        item_id: vec![2],
+                        choice: PinChoice::Keep as i32,
+                    },
+                    yadorilink_ipc_proto::shellipc::ProviderPinPlanEntry {
+                        item_id: vec![],
+                        choice: PinChoice::OnlineOnly as i32,
+                    },
+                ],
+            }));
+        assert_eq!(
+            plan,
+            Some(SessionEvent::PinPlan {
+                root: vec![1],
+                entries: vec![(vec![2], PinWish::Keep), (vec![], PinWish::OnlineOnly)],
+            })
         );
         assert_eq!(event_of(Payload::StatusPush(Default::default())), None);
     }

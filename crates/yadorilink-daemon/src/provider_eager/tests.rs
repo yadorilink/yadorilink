@@ -510,7 +510,7 @@ async fn an_on_demand_root_downloads_only_what_is_kept_on_this_device() {
     let in_folder = fx.item("docs/a.bin", 20);
     let in_folder2 = fx.item("docs/sub/b.bin", 10);
     let sibling = fx.item("docs2/c.bin", 1);
-    let pins = fx.state.replica_coordinator.pinned_item_repository();
+    let pins = fx.state.replica_coordinator.retention_rules();
 
     // Nothing kept: nothing is driven.
     let response = fx.query(&[], 2);
@@ -563,7 +563,7 @@ async fn a_pin_on_a_non_ascii_folder_covers_its_descendants_only() {
     let inside = fx.item("資料/日本.bin", 3);
     let _sibling = fx.item("資料集/日本.bin", 1);
     let _other = fx.item("資.bin", 2);
-    fx.state.replica_coordinator.pinned_item_repository().pin(GROUP, "資料").unwrap();
+    fx.state.replica_coordinator.retention_rules().pin(GROUP, "資料").unwrap();
     assert_eq!(Fx::offered(&fx.query(&[], 2)), vec![inside.to_vec()]);
 }
 
@@ -703,25 +703,30 @@ async fn prefetch_offers_one_folder_at_a_time_and_only_when_idle() {
     fx.item("a/f.bin", 1);
     fx.item("b/f.bin", 1);
     let scheduler = PrefetchScheduler::new(PrefetchConfig::default());
-    let repo = fx.repo();
     let t0 = Instant::now();
 
-    let first = scheduler.tick(&fx.root, repo, true, t0);
+    let first = scheduler.tick(&fx.root, &fx.state.replica_coordinator, true, t0);
     let Some(Action::Hint { hint_id, .. }) = first.first() else { panic!("no hint: {first:?}") };
     assert_eq!(first.len(), 1);
-    assert!(scheduler.tick(&fx.root, repo, true, t0).is_empty(), "two hints were outstanding");
     assert!(
-        scheduler.tick(&fx.root, repo, false, t0).is_empty(),
+        scheduler.tick(&fx.root, &fx.state.replica_coordinator, true, t0).is_empty(),
+        "two hints were outstanding"
+    );
+    assert!(
+        scheduler.tick(&fx.root, &fx.state.replica_coordinator, false, t0).is_empty(),
         "a root that is not ready was warmed"
     );
 
     scheduler.on_done(&fx.root, *hint_id, PrefetchResult::Done, t0);
     assert!(scheduler.on_activity(&fx.root, b"user", ActivityKind::Fetch, t0));
     assert!(
-        scheduler.tick(&fx.root, repo, true, t0 + Duration::from_secs(1)).is_empty(),
+        scheduler
+            .tick(&fx.root, &fx.state.replica_coordinator, true, t0 + Duration::from_secs(1))
+            .is_empty(),
         "offered while the user is active"
     );
-    let resumed = scheduler.tick(&fx.root, repo, true, t0 + Duration::from_secs(6));
+    let resumed =
+        scheduler.tick(&fx.root, &fx.state.replica_coordinator, true, t0 + Duration::from_secs(6));
     assert!(matches!(resumed.first(), Some(Action::Resume(_))), "{resumed:?}");
     assert!(matches!(resumed.get(1), Some(Action::Hint { .. })), "{resumed:?}");
 }
@@ -737,29 +742,33 @@ async fn a_skipped_prefetch_is_retried_and_only_done_moves_on() {
     fx.item("a/f.bin", 1);
     fx.item("b/f.bin", 1);
     let scheduler = PrefetchScheduler::new(PrefetchConfig::default());
-    let repo = fx.repo();
     let t0 = Instant::now();
     let folder_of = |actions: &[Action]| match actions.first() {
         Some(Action::Hint { folder, hint_id, .. }) => (folder.clone(), *hint_id),
         other => panic!("no hint: {other:?}"),
     };
 
-    let (first, id) = folder_of(&scheduler.tick(&fx.root, repo, true, t0));
+    let (first, id) = folder_of(&scheduler.tick(&fx.root, &fx.state.replica_coordinator, true, t0));
     scheduler.on_done(&fx.root, id, PrefetchResult::Skipped, t0);
     assert!(
-        scheduler.tick(&fx.root, repo, true, t0 + Duration::from_secs(10)).is_empty(),
+        scheduler
+            .tick(&fx.root, &fx.state.replica_coordinator, true, t0 + Duration::from_secs(10))
+            .is_empty(),
         "no back-off"
     );
     let later = t0 + Duration::from_secs(120);
-    let (again, id) = folder_of(&scheduler.tick(&fx.root, repo, true, later));
+    let (again, id) =
+        folder_of(&scheduler.tick(&fx.root, &fx.state.replica_coordinator, true, later));
     assert_eq!(again, first, "a skipped folder was dropped from the session");
     scheduler.on_done(&fx.root, id, PrefetchResult::Done, later);
-    let (next, id) = folder_of(&scheduler.tick(&fx.root, repo, true, later));
+    let (next, id) =
+        folder_of(&scheduler.tick(&fx.root, &fx.state.replica_coordinator, true, later));
     assert_ne!(next, first, "a finished folder was offered again");
     // A FAILED answer is retried after the back-off just like a skip, never skipped for the session.
     scheduler.on_done(&fx.root, id, PrefetchResult::Failed, later);
     let much_later = later + Duration::from_secs(120);
-    let (retried, _) = folder_of(&scheduler.tick(&fx.root, repo, true, much_later));
+    let (retried, _) =
+        folder_of(&scheduler.tick(&fx.root, &fx.state.replica_coordinator, true, much_later));
     assert_eq!(retried, next, "a failed folder was dropped from the session");
 }
 
@@ -779,7 +788,6 @@ async fn the_prefetch_budget_is_spent_by_real_children_and_only_on_done() {
     // Room for the three-file folder and the one-file folder (4), and nothing after them.
     let scheduler =
         PrefetchScheduler::new(PrefetchConfig { items: 4, ..PrefetchConfig::default() });
-    let repo = fx.repo();
     let mut now = Instant::now();
     let hint =
         |actions: Vec<Action>| match actions.into_iter().find(|a| matches!(a, Action::Hint { .. }))
@@ -789,20 +797,23 @@ async fn the_prefetch_budget_is_spent_by_real_children_and_only_on_done() {
         };
 
     // Skipped four times: no budget burned, still on the same folder, still offered.
-    let first = hint(scheduler.tick(&fx.root, repo, true, now));
+    let first = hint(scheduler.tick(&fx.root, &fx.state.replica_coordinator, true, now));
     scheduler.on_done(&fx.root, first, PrefetchResult::Skipped, now);
     for _ in 0..3 {
         now += Duration::from_secs(120);
-        let id = hint(scheduler.tick(&fx.root, repo, true, now));
+        let id = hint(scheduler.tick(&fx.root, &fx.state.replica_coordinator, true, now));
         scheduler.on_done(&fx.root, id, PrefetchResult::Skipped, now);
     }
     now += Duration::from_secs(120);
-    let id = hint(scheduler.tick(&fx.root, repo, true, now));
+    let id = hint(scheduler.tick(&fx.root, &fx.state.replica_coordinator, true, now));
     scheduler.on_done(&fx.root, id, PrefetchResult::Done, now); // a: 3 children spent
-    let b = hint(scheduler.tick(&fx.root, repo, true, now));
+    let b = hint(scheduler.tick(&fx.root, &fx.state.replica_coordinator, true, now));
     scheduler.on_done(&fx.root, b, PrefetchResult::Done, now); // b: 1 more, 4 of 4
     assert!(
-        !scheduler.tick(&fx.root, repo, true, now).iter().any(|a| matches!(a, Action::Hint { .. })),
+        !scheduler
+            .tick(&fx.root, &fx.state.replica_coordinator, true, now)
+            .iter()
+            .any(|a| matches!(a, Action::Hint { .. })),
         "the budget was not spent by real child counts"
     );
 }
@@ -817,12 +828,11 @@ async fn a_folder_that_never_finishes_is_given_up_after_a_bound() {
     fx.item("a/f.bin", 1);
     fx.item("b/g.bin", 1);
     let scheduler = PrefetchScheduler::new(PrefetchConfig::default());
-    let repo = fx.repo();
     let mut now = Instant::now();
     let mut offered = Vec::new();
     for _ in 0..8 {
         if let Some(Action::Hint { hint_id, folder, .. }) = scheduler
-            .tick(&fx.root, repo, true, now)
+            .tick(&fx.root, &fx.state.replica_coordinator, true, now)
             .into_iter()
             .find(|a| matches!(a, Action::Hint { .. }))
         {
@@ -887,4 +897,80 @@ async fn unreadable_holds_and_policy_are_not_done() {
         fault.restore();
         assert_eq!(fx.driver.status(&fx.inputs(), &fx.root).unwrap().state, DriverState::Done);
     }
+}
+
+/// One definition of "wanted" on an Eager root: a file under an online-only rule is never offered,
+/// never held as outstanding and never counted as remaining, an exception kept under it is wanted
+/// again, and clearing the rule brings the file back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_eager_root_never_offers_settles_or_counts_a_file_an_online_only_rule_frees() {
+    use yadorilink_sync_sqlite::Rule;
+    let fx = Fx::new();
+    let top = fx.item("top.bin", 40);
+    let freed = fx.item("docs/free/a.bin", 1);
+    let freed2 = fx.item("docs/free/deeper/b.bin", 2);
+    let exception = fx.item("docs/free/keep.bin", 3);
+    let rules = fx.state.replica_coordinator.retention_rules();
+
+    // Without a rule an Eager root wants everything, smallest first; what it offers is in flight.
+    assert_eq!(Fx::offered(&fx.query(&[], 2)), vec![freed.to_vec(), freed2.to_vec()]);
+    assert_eq!(fx.driver.status(&fx.inputs(), &fx.root).unwrap().hydrating, 2);
+
+    rules.set(GROUP, "docs/free", Some(Rule::OnlineOnly)).unwrap();
+    // Offered: only what is not freed.
+    assert_eq!(Fx::offered(&fx.query(&[], 2)), vec![top.to_vec()]);
+    // Outstanding: a freed item the app still lists settles at once (it frees its slot).
+    let settled = fx.query(&[freed, freed2], 2);
+    assert_eq!(settled.settled_item_ids, vec![freed.to_vec(), freed2.to_vec()]);
+    // Counted: the status sees one remaining file, not four, and only that one in flight (the
+    // freed files that were offered before the rule are no download in progress).
+    assert_eq!(fx.driver.status(&fx.inputs(), &fx.root).unwrap().hydrating, 1);
+    let status = fx.driver.status(&fx.inputs(), &fx.root).unwrap();
+    assert_eq!(status.remote, 1, "only top.bin is remaining");
+    // Done: once the wanted file is present nothing is left, however many freed files are remote.
+    fx.make_present(&[top]);
+    let done = fx.query(&[], 2);
+    assert!(done.downloads.is_empty());
+    assert_eq!(Fx::state_of(&done), DriverState::Done);
+    assert_eq!(fx.driver.status(&fx.inputs(), &fx.root).unwrap().remote, 0);
+
+    // A kept exception under the online-only folder is wanted again (a nearer rule wins).
+    rules.pin(GROUP, "docs/free/keep.bin").unwrap();
+    assert_eq!(Fx::offered(&fx.query(&[], 2)), vec![exception.to_vec()]);
+
+    // Clearing the rules brings everything back.
+    rules.unpin(GROUP, "docs/free/keep.bin").unwrap();
+    rules.set(GROUP, "docs/free", None).unwrap();
+    assert_eq!(Fx::offered(&fx.query(&[], 2)), vec![freed.to_vec(), freed2.to_vec()]);
+}
+
+/// An On-Demand root: a kept folder with an online-only exception downloads everything kept
+/// except the exception, and an online-only rule shadowed by a nearer keep is wanted again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_on_demand_root_follows_the_nearest_rule_between_keep_and_online_only() {
+    use yadorilink_sync_sqlite::Rule;
+    let fx = Fx::new();
+    fx.state
+        .replica_coordinator
+        .link_repository()
+        .set_materialization_policy("/provider/p", MaterializationPolicy::OnDemand)
+        .unwrap();
+    let a = fx.item("docs/a.bin", 1);
+    let freed = fx.item("docs/free/b.bin", 2);
+    let back = fx.item("docs/free/back/c.bin", 3);
+    let other = fx.item("other.bin", 4);
+    let rules = fx.state.replica_coordinator.retention_rules();
+    rules.set(GROUP, "docs", Some(Rule::Keep)).unwrap();
+    rules.pin(GROUP, "docs/free").unwrap();
+    rules.set(GROUP, "docs/free", Some(Rule::OnlineOnly)).unwrap();
+    rules.pin(GROUP, "docs/free/back").unwrap();
+
+    let offered = Fx::offered(&fx.query(&[], 2));
+    assert_eq!(
+        offered,
+        vec![a.to_vec(), back.to_vec()],
+        "keep, minus the exception, plus its exception"
+    );
+    let settled = fx.query(&[freed, other], 2);
+    assert_eq!(settled.settled_item_ids, vec![freed.to_vec(), other.to_vec()]);
 }

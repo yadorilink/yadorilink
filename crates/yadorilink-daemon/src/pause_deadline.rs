@@ -19,43 +19,30 @@
 
 use chrono::{DateTime, Duration, TimeZone};
 
-/// Longer than any deadline [`PauseDuration::resume_at`] produces (the next
-/// local midnight is at most a day and an hour away across a clock change).
-pub(crate) const MAX_TIMED_PAUSE_SECS: i64 = 26 * 60 * 60;
+/// Longer than any deadline [`PauseDuration::resume_at`] produces (the longest
+/// pause is 24 hours; an hour of slack).
+pub(crate) const MAX_TIMED_PAUSE_SECS: i64 = 25 * 60 * 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PauseDuration {
     /// No deadline: paused until the user resumes.
     UntilResumed,
-    ThirtyMinutes,
-    OneHour,
-    /// Until the next local midnight.
-    UntilTomorrow,
+    TwoHours,
+    EightHours,
+    TwentyFourHours,
 }
 
 impl PauseDuration {
     /// The Unix time the pause ends, or `None` for [`Self::UntilResumed`].
-    /// `now` carries the zone whose midnight "tomorrow" means.
     pub(crate) fn resume_at<Tz: TimeZone>(self, now: DateTime<Tz>) -> Option<i64> {
         let ends = match self {
             Self::UntilResumed => return None,
-            Self::ThirtyMinutes => now + Duration::minutes(30),
-            Self::OneHour => now + Duration::hours(1),
-            Self::UntilTomorrow => next_midnight(&now),
+            Self::TwoHours => now + Duration::hours(2),
+            Self::EightHours => now + Duration::hours(8),
+            Self::TwentyFourHours => now + Duration::hours(24),
         };
         Some(ends.timestamp())
     }
-}
-
-fn next_midnight<Tz: TimeZone>(now: &DateTime<Tz>) -> DateTime<Tz> {
-    let midnight = now
-        .date_naive()
-        .succ_opt()
-        .and_then(|day| day.and_hms_opt(0, 0, 0))
-        .and_then(|local| now.timezone().from_local_datetime(&local).earliest());
-    // A date past the calendar's end or a midnight skipped by a clock
-    // change: a day from now is close enough and never earlier.
-    midnight.unwrap_or_else(|| now.clone() + Duration::hours(24))
 }
 
 /// The newest deadline that can still be genuine at `now_unix`.

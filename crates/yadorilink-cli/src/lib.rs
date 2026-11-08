@@ -3,6 +3,7 @@
 
 pub mod commands;
 pub mod error;
+pub(crate) mod i18n;
 
 // The daemon control-socket client and the config directory live in
 // `yadorilink-client-core`, shared with the desktop app; the commands that

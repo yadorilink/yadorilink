@@ -329,7 +329,7 @@ impl MaterializationStateRepository {
                    AND NOT EXISTS ( \
                        SELECT 1 FROM materialization_intents i \
                         WHERE i.group_id = files.group_id AND i.path = files.path \
-                          AND i.kind = 'write' \
+                          AND i.kind IN ('write', 'delete') \
                    ) \
                    AND EXISTS ( \
                        SELECT 1 FROM path_materialized_generations g \
@@ -353,7 +353,7 @@ impl MaterializationStateRepository {
                        EXISTS ( \
                            SELECT 1 FROM materialization_intents i \
                             WHERE i.group_id = files.group_id AND i.path = files.path \
-                              AND i.kind = 'write' \
+                              AND i.kind IN ('write', 'delete') \
                        ) \
                        AND files.deleted = 0 \
                        AND ( \
@@ -1044,7 +1044,9 @@ impl MaterializationStateRepository {
         since_unix_nanos: i64,
     ) -> Result<(), SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
-            let affected = conn.execute_cached(
+            let tx = conn.transaction()?;
+            let before = held_reason_in_tx(&tx, group_id, path)?;
+            let affected = tx.execute_cached(
                 "UPDATE files SET held_reason = ?1, held_since_unix_nanos = ?2, held_key = NULL \
                  WHERE group_id = ?3 AND path = ?4 AND state = 'current'",
                 rusqlite::params![reason, since_unix_nanos, group_id, path],
@@ -1052,6 +1054,11 @@ impl MaterializationStateRepository {
             if affected == 0 {
                 return Err(SyncSqliteError::NotFound(format!("file {group_id}/{path}")));
             }
+            // The badge is the held state's; it changes only when the state really does.
+            if before.as_deref() != Some(reason) {
+                crate::provider::note_badge_changed_in_tx(&tx, group_id, path)?;
+            }
+            tx.commit()?;
             Ok(())
         })
     }
@@ -1070,7 +1077,9 @@ impl MaterializationStateRepository {
         key: Option<&str>,
     ) -> Result<(), SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
-            let affected = conn.execute_cached(
+            let tx = conn.transaction()?;
+            let before = held_reason_in_tx(&tx, group_id, path)?;
+            let affected = tx.execute_cached(
                 "UPDATE files SET held_reason = ?1, held_since_unix_nanos = ?2, held_key = ?3 \
                  WHERE group_id = ?4 AND path = ?5 AND state = 'current'",
                 rusqlite::params![reason, since_unix_nanos, key, group_id, path],
@@ -1078,6 +1087,10 @@ impl MaterializationStateRepository {
             if affected == 0 {
                 return Err(SyncSqliteError::NotFound(format!("file {group_id}/{path}")));
             }
+            if before.as_deref() != Some(reason) {
+                crate::provider::note_badge_changed_in_tx(&tx, group_id, path)?;
+            }
+            tx.commit()?;
             Ok(())
         })
     }
@@ -1132,12 +1145,9 @@ impl MaterializationStateRepository {
     /// record don't first need to check whether it was ever held.
     pub fn clear_held(&self, group_id: &str, path: &str) -> Result<(), SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
-            conn.execute_cached(
-                "UPDATE files SET held_reason = NULL, held_since_unix_nanos = NULL, \
-                 held_key = NULL \
-                 WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
-                rusqlite::params![group_id, path],
-            )?;
+            let tx = conn.transaction()?;
+            clear_held_row(&tx, group_id, path)?;
+            tx.commit()?;
             Ok(())
         })
     }
@@ -1151,13 +1161,7 @@ impl MaterializationStateRepository {
         group_id: &str,
         path: &str,
     ) -> Result<(), SyncSqliteError> {
-        tx.execute_cached(
-            "UPDATE files SET held_reason = NULL, held_since_unix_nanos = NULL, \
-             held_key = NULL \
-             WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
-            rusqlite::params![group_id, path],
-        )?;
-        Ok(())
+        clear_held_row(tx, group_id, path)
     }
 
     /// Records the identity of the exact on-disk object a `write_placeholder`
@@ -1592,3 +1596,40 @@ mod repair_candidates_tests;
 
 #[cfg(test)]
 mod live_set_tests;
+
+/// The held reason of the current row at `path`, if it is held.
+fn held_reason_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    group_id: &str,
+    path: &str,
+) -> Result<Option<String>, SyncSqliteError> {
+    Ok(tx
+        .query_row_cached(
+            "SELECT held_reason FROM files \
+             WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
+            rusqlite::params![group_id, path],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// Clears the held state of the current row at `path`. A file that was not held keeps its badge:
+/// no event; one that was held tells the OS its badge changed.
+fn clear_held_row(
+    tx: &rusqlite::Transaction<'_>,
+    group_id: &str,
+    path: &str,
+) -> Result<(), SyncSqliteError> {
+    let before = held_reason_in_tx(tx, group_id, path)?;
+    tx.execute_cached(
+        "UPDATE files SET held_reason = NULL, held_since_unix_nanos = NULL, \
+         held_key = NULL \
+         WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
+        rusqlite::params![group_id, path],
+    )?;
+    if before.is_some() {
+        crate::provider::note_badge_changed_in_tx(tx, group_id, path)?;
+    }
+    Ok(())
+}

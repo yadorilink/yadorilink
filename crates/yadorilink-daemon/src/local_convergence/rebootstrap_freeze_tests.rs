@@ -454,7 +454,7 @@ async fn a_newly_ignored_path_keeps_its_index_row_while_frozen() {
     let h = Harness::new(false);
     captured(&h, "d/p", b"captured before it became ignored").await;
     freeze(&h);
-    std::fs::write(h.path(".yadorilinkignore"), "d/p\n").unwrap();
+    h.rules.write(GROUP, "d/p\n").unwrap();
 
     h.scan();
 
@@ -510,7 +510,7 @@ async fn an_eviction_in_a_frozen_group_leaves_its_row_alone() {
 
     let opened = h.state.open_eviction(GROUP, "d/p", &permit);
 
-    assert!(opened.is_err() || opened.is_ok_and(|inner| inner.is_err()), "an eviction opened");
+    assert!(opened.is_err(), "an eviction opened");
     assert_eq!(state_of(&h), before, "the eviction marked a frozen row");
 }
 

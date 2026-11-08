@@ -81,6 +81,20 @@ pub fn open_for_flush(path: &std::path::Path) -> io::Result<File> {
     }
 }
 
+/// Whether this platform can make the directory entry of a file it did not create durable.
+///
+/// Unix can: `fsync` of the directory. Windows cannot: the only documented way to make a
+/// namespace entry durable there is a move of that entry that `durable_dir` makes durable
+/// (a rename on a held handle and a flush of the parent directories, validated per volume), and
+/// `FlushFileBuffers` on a directory handle has no documented contract of its own. A write-through move of a user's file would mean
+/// renaming it out of and back into its name, so a file the product did not publish itself has no
+/// way to be confirmed durable by name. Anything that needs "this existing file will still be
+/// there after a power cut" (capturing a file without copying it into the block store) is
+/// therefore offered only where this is `true`.
+pub const fn can_flush_directory_entries() -> bool {
+    cfg!(unix)
+}
+
 /// [`sync`] of an open directory.
 pub fn sync_directory(dir: &File) -> io::Result<()> {
     sync(dir, Target::Directory)

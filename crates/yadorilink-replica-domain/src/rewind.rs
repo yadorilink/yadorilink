@@ -133,6 +133,9 @@ pub enum RewindUnavailableReason {
     /// The version that held then was not kept because the disk was nearly
     /// full when it was replaced.
     NotKeptLowSpace,
+    /// The version that held then was dropped because the older versions kept on this device
+    /// outgrew the space set aside for them.
+    NotKeptOverBudget,
     /// This device dropped its record of the path when the path was
     /// excluded from sync, then indexed it again.
     ExcludedFromSync,
@@ -157,6 +160,10 @@ impl RewindUnavailableReason {
             }
             Self::NotKeptLowSpace => {
                 "the version from that time was not kept: the disk was nearly full"
+            }
+            Self::NotKeptOverBudget => {
+                "the version from that time was not kept: the space set aside for older \
+                 versions was full"
             }
             Self::ExcludedFromSync => {
                 "this device dropped its earlier record when the path was excluded from sync"

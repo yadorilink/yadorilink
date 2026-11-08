@@ -129,6 +129,8 @@ pub struct ReplicationEnv {
     pub counters: Arc<ReplicationCounters>,
     /// This device's id, naming whose join timeline a milestone belongs to.
     pub local_device_id: String,
+    /// The peer this connection is to.
+    pub peer_device_id: String,
     /// Whether `group` is hosted here and shared with this peer.
     pub shares_group: Arc<SharesGroup>,
     pub key_for: Arc<KeyLookup>,
@@ -163,7 +165,14 @@ const MAX_ASSEMBLIES: usize = 4;
 const MAX_REQUEST_BYTES: usize = 256 * 1024 * 1024;
 const MAX_ASSEMBLING_BYTES: usize = 512 * 1024 * 1024;
 /// How long a group waits before asking the same peer for recovery again.
+/// How many times a read that needs the namespace root patches it again after a writer got in.
+const NAMESPACE_FLUSH_ATTEMPTS: u32 = 4;
 const RECOVERY_COOLDOWN: Duration = Duration::from_secs(60);
+/// How soon this side asks again after the peer said it could not seal (the state it holds is not
+/// sealable yet, for instance while it is still importing): the wait doubles with each refusal in a
+/// row, up to [`RECOVERY_COOLDOWN`]. A refusal used to re-arm the ask at once, so a cold joiner
+/// asked again as soon as it was told no, and every ask made the peer load its whole state.
+const RECOVERY_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 /// How soon this side serves the same group's recovery to the same peer again.
 /// Sealing takes the writer gate and a coordination round trip, so a member
 /// (a viewer included) must not be able to make it repeat without limit; it is
@@ -188,6 +197,8 @@ struct Outstanding {
 pub struct RecoveryState {
     assembling: std::sync::Mutex<std::collections::HashMap<([u8; 16], String), Partial>>,
     asked: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// How many asks in a row, per group, the peer refused: the backoff before the next one.
+    refusals: std::sync::Mutex<std::collections::HashMap<String, u32>>,
     /// When this side last began sealing a group's state for this peer.
     served: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
     /// The requests this connection issued: a chunk is accepted only for one of
@@ -242,6 +253,8 @@ impl RecoveryState {
         }
         let partial = assembling.remove(&key)?;
         outstanding.remove(&key.0);
+        // The peer sealed: the next refusal starts the backoff over.
+        self.refusals.lock().unwrap_or_else(|p| p.into_inner()).remove(&chunk.group_id.0);
         Some((chunk.group_id, partial.chunks.into_values().flatten().collect()))
     }
 
@@ -290,6 +303,36 @@ impl RecoveryState {
         self.served.lock().unwrap_or_else(|p| p.into_inner()).remove(&group.0);
     }
 
+    /// The peer accepted the ask and then said it could not seal. The ask comes back after a
+    /// backoff that doubles with each refusal in a row, not at once and not after the whole
+    /// cooldown: what made the peer unable to seal (evidence it does not hold yet) can end in
+    /// seconds, but every ask costs the peer a pass over its state.
+    fn refused(&self, request_id: protocol5::RequestId) {
+        let issued =
+            self.outstanding.lock().unwrap_or_else(|p| p.into_inner()).remove(&request_id.0);
+        if let Some(issued) = issued {
+            let failures = {
+                let mut refusals = self.refusals.lock().unwrap_or_else(|p| p.into_inner());
+                let count = refusals.entry(issued.group.clone()).or_default();
+                *count = count.saturating_add(1);
+                *count
+            };
+            let wait = RECOVERY_RETRY_BACKOFF
+                .saturating_mul(1u32 << (failures - 1).min(8))
+                .min(RECOVERY_COOLDOWN);
+            // `asked` holds when the last ask was made, and an ask is allowed once the cooldown has
+            // passed since: back-dating it by the cooldown less the wait leaves exactly the wait.
+            let back_dated = std::time::Instant::now()
+                .checked_sub(RECOVERY_COOLDOWN - wait)
+                .unwrap_or_else(std::time::Instant::now);
+            self.asked.lock().unwrap_or_else(|p| p.into_inner()).insert(issued.group, back_dated);
+        }
+        self.assembling
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|key, _| key.0 != request_id.0);
+    }
+
     /// Forgets a request that will not be answered.
     /// The ask that never reached an answer does not count against the cooldown: the next
     /// reconcile round may ask again at once.
@@ -315,10 +358,13 @@ impl ReplicationEnv {
             policy_point: &*self.policy_point,
         };
         let message = protocol5::decode_message(bytes)?;
+        // Ticketed on receipt: the write below runs later, and in no fixed order.
+        let ticket = yadorilink_sync_sqlite::peer_progress::request_ticket();
+        let progress = self.peer_progress_of(&message);
         // Only a delta batch writes. Everything else is answered from one read
         // snapshot, so a peer's request (whose cost grows with what it names)
         // never holds the writer gate other work waits on.
-        if session::answer_writes(&message) {
+        let answered = if session::answer_writes(&message) {
             // The closure may run again: the database retries a transient lock, and
             // `to_sqlite` keeps such an error recognisable for exactly that.
             self.db
@@ -327,11 +373,66 @@ impl ReplicationEnv {
                 })
                 .map_err(ReplicationError::Storage)
         } else {
-            self.db
-                .read_snapshot(|conn| {
+            // A summary carries the namespace root, which is patched from the heads that changed
+            // when it is wanted: the writes that changed them only noted their paths. A writer that
+            // commits between the patch and the snapshot leaves a path pending in it; patching again
+            // answers that.
+            let mut attempts = 0;
+            loop {
+                yadorilink_sync_sqlite::native_namespace::flush_all(&self.db)
+                    .map_err(ReplicationError::Storage)?;
+                let answered = self.db.read_snapshot(|conn| {
                     session::answer_message(conn, &access, message.clone()).map_err(to_sqlite)
-                })
-                .map_err(ReplicationError::Storage)
+                });
+                attempts += 1;
+                match answered {
+                    Err(yadorilink_sync_sqlite::SyncSqliteError::NamespaceBehind)
+                        if attempts < NAMESPACE_FLUSH_ATTEMPTS => {}
+                    other => break other.map_err(ReplicationError::Storage),
+                }
+            }
+        };
+        // Recorded after the answer is built and off this thread: the write waits for the writer
+        // gate, which the peer's round must not.
+        if let (true, Some(progress), Ok(handle)) =
+            (answered.is_ok(), progress, tokio::runtime::Handle::try_current())
+        {
+            let env = self.clone();
+            handle.spawn_blocking(move || env.record_peer_progress(progress, ticket));
+        }
+        answered
+    }
+
+    /// What a frontier-diff request says about how much of this device's own history the peer
+    /// holds: the group and the sum, over this device's own authors, of the sequences it names.
+    /// `None` for any other message, and for a group not shared with the peer.
+    fn peer_progress_of(&self, message: &Message) -> Option<(String, u64)> {
+        let Message::FrontierDiffRequest { group_id, since, .. } = message else { return None };
+        if !(self.shares_group)(group_id) {
+            return None;
+        }
+        // The first entry per author counts, as in the diff the peer is answered with; the
+        // figures are the peer's to choose, so the sum saturates instead of overflowing.
+        let mut seen = std::collections::HashSet::new();
+        let acked = since
+            .iter()
+            .filter(|entry| entry.author.device.0 == self.local_device_id)
+            .filter(|entry| seen.insert(&entry.author))
+            .fold(0u64, |sum, entry| sum.saturating_add(entry.seq.get()));
+        Some((group_id.0.clone(), acked))
+    }
+
+    /// Stores the figure from [`Self::peer_progress_of`]. Best effort: a failed write costs a
+    /// stale count, never the answer.
+    fn record_peer_progress(&self, (group, acked): (String, u64), ticket: u64) {
+        let peer = self.peer_device_id.clone();
+        let result = self.db.write(|conn| {
+            yadorilink_sync_sqlite::peer_progress::record_peer_progress(
+                conn, &group, &peer, acked, ticket,
+            )
+        });
+        if let Err(error) = result {
+            tracing::warn!(%error, "native replication: could not record the peer's progress");
         }
     }
 }
@@ -420,7 +521,7 @@ async fn serve_stream(
         }
     }
     if let Some(request_id) = answer.recovery_refused {
-        env.recovery_state.abandon(request_id);
+        env.recovery_state.refused(request_id);
         return;
     }
     if let Some(chunk) = answer.recovery_chunk {
@@ -770,14 +871,26 @@ async fn reconcile_group_within(
     );
     let (db, group_owned) = (env.db.clone(), group.clone());
     let compared = tokio::task::spawn_blocking(move || {
-        // Matching roots do not mean complete: a head whose content version
-        // never arrived leaves the roots equal, so such a group is asked again.
-        let in_sync = db.read(|conn| {
-            let matches =
-                session::summary_matches(conn, &group_owned, &response).map_err(to_sqlite)?;
-            let unresolved = native_replication::unresolved_head_positions(conn, &group_owned)?;
-            Ok::<_, yadorilink_sync_sqlite::SyncSqliteError>(matches && unresolved.is_empty())
-        })?;
+        // The local root is patched from the heads that changed when it is wanted (again if a
+        // writer committed between the patch and the read).
+        let mut attempts = 0;
+        let in_sync = loop {
+            yadorilink_sync_sqlite::native_namespace::flush_all(&db)?;
+            // Matching roots do not mean complete: a head whose content version
+            // never arrived leaves the roots equal, so such a group is asked again.
+            let compared = db.read(|conn| {
+                let matches =
+                    session::summary_matches(conn, &group_owned, &response).map_err(to_sqlite)?;
+                let unresolved = native_replication::unresolved_head_positions(conn, &group_owned)?;
+                Ok::<_, yadorilink_sync_sqlite::SyncSqliteError>(matches && unresolved.is_empty())
+            });
+            attempts += 1;
+            match compared {
+                Err(yadorilink_sync_sqlite::SyncSqliteError::NamespaceBehind)
+                    if attempts < NAMESPACE_FLUSH_ATTEMPTS => {}
+                other => break other?,
+            }
+        };
         if in_sync {
             return Ok(None);
         }

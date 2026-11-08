@@ -268,7 +268,7 @@ impl HandoffRoot {
             fail_directory_sync: std::sync::atomic::AtomicBool::new(false),
         };
         prepare_layout(root)?;
-        this.sweep_after_restart();
+        this.sweep_after_restart()?;
         this.sweep_ingest(None);
         Ok(Arc::new(this))
     }
@@ -476,12 +476,18 @@ impl HandoffRoot {
         self.delivered.lock().unwrap_or_else(|p| p.into_inner()).values().map(Vec::len).sum()
     }
 
-    fn sweep_after_restart(&self) {
-        remove_entries(&self.staging, |_| true);
-        let lifetime = self.lifetime;
-        remove_entries(&self.handoff, |handed_over| {
-            SystemTime::now().duration_since(handed_over).is_ok_and(|age| age >= lifetime)
-        });
+    /// A restart removes every staging and handoff file. A handoff file that outlives the process
+    /// can no longer be taken back (`delivered` is in memory), so a newer version of its item could
+    /// be announced while the OS still holds the right to take the old bytes. The extension asks
+    /// again: every read is a fresh fetch request from the OS.
+    ///
+    /// A handoff file that cannot be removed (another process holds it open) fails the open: the
+    /// root then stays closed, publications wait and the open is tried again, because a surviving
+    /// file could still be consumed after a newer version was announced. A staging leftover is a
+    /// partial copy nothing reads, so its removal is best effort.
+    fn sweep_after_restart(&self) -> std::io::Result<()> {
+        let _ = remove_all_entries(&self.staging);
+        remove_all_entries(&self.handoff)
     }
 }
 
@@ -498,10 +504,10 @@ fn sync_directory(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// When a handoff file entered `handoff/`: its status-change time (the rename into the directory
-/// sets it, and user space cannot set it), never its modification time, which carries the
-/// replicated mtime of the content and can be anything, including the future. Where there is no
-/// such time the entry counts as stale at the next start.
+/// When a copy arrived: its status-change time (the rename or write sets it, and user space cannot
+/// set it), never its modification time, which carries the replicated mtime of the content and
+/// can be anything, including the future. `None` where the file system has no such time.
+#[cfg(not(windows))]
 fn handed_over_at(metadata: &std::fs::Metadata) -> Option<SystemTime> {
     #[cfg(unix)]
     {
@@ -532,21 +538,29 @@ fn copied_at(metadata: &std::fs::Metadata) -> Option<SystemTime> {
     }
 }
 
-/// Removes the entries of `dir` whose handoff time `stale` accepts (an unreadable time counts as
-/// stale: nothing in these directories is worth keeping across a restart).
-fn remove_entries(dir: &Path, stale: impl Fn(SystemTime) -> bool) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+/// Removes every entry of `dir`: nothing in these directories is worth keeping across a restart.
+/// Reports the first entry that could not be removed, after trying all of them.
+fn remove_all_entries(dir: &Path) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let mut first_error = None;
     for entry in entries.flatten() {
-        let at = entry.metadata().ok().and_then(|m| handed_over_at(&m));
-        if at.is_none_or(&stale) {
-            let path = entry.path();
-            let _ = if path.is_dir() {
-                std::fs::remove_dir_all(&path)
-            } else {
-                std::fs::remove_file(&path)
-            };
+        let path = entry.path();
+        let removed = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        if let Err(error) = removed {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                first_error.get_or_insert(error);
+            }
         }
     }
+    first_error.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]

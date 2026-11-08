@@ -11,6 +11,9 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
 use crate::error::StorageError;
 use crate::io_diag::{self, Op};
 use crate::segment_store::format::{
@@ -144,7 +147,49 @@ impl SegmentWriter {
         write_end: u64,
     ) -> Result<Self, StorageError> {
         let path = segment_path(root, segment_id);
-        let file = OpenOptions::new().write(true).read(true).open(path)?;
+        // Recovery truncates through this handle, so it must be the segment file itself: a link at
+        // the segment's name is never followed to a file elsewhere.
+        #[cfg(unix)]
+        let file = {
+            let mut options = OpenOptions::new();
+            options.write(true).read(true);
+            std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NOFOLLOW);
+            options.open(&path)?
+        };
+        // Windows: the name is first opened as the object it names (`FILE_FLAG_OPEN_REPARSE_POINT`)
+        // and refused when that is a symlink or junction; a file kept by a storage filter
+        // (deduplication, a cloud placeholder, compression) is still a regular file and is then
+        // opened normally, through its filter. The two handles must be the same object, so a name
+        // swapped between the two opens is refused.
+        #[cfg(windows)]
+        let file = {
+            let mut inspect = OpenOptions::new();
+            inspect.read(true);
+            std::os::windows::fs::OpenOptionsExt::custom_flags(
+                &mut inspect,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+            );
+            let named = inspect.open(&path)?;
+            if !named.metadata()?.file_type().is_file() {
+                return Err(StorageError::CorruptStore(format!(
+                    "segment {segment_id} is not a regular file"
+                )));
+            }
+            let file = OpenOptions::new().write(true).read(true).open(&path)?;
+            if yadorilink_fs_platform::fs_identity::FileIdentity::observe_handle(&named)?
+                != yadorilink_fs_platform::fs_identity::FileIdentity::observe_handle(&file)?
+            {
+                return Err(StorageError::CorruptStore(format!(
+                    "segment {segment_id} changed while it was being opened"
+                )));
+            }
+            file
+        };
+        if !file.metadata()?.file_type().is_file() {
+            return Err(StorageError::CorruptStore(format!(
+                "segment {segment_id} is not a regular file"
+            )));
+        }
         Ok(Self { segment_id, file, write_end })
     }
 

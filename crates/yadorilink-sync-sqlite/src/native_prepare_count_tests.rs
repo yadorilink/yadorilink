@@ -89,7 +89,10 @@ fn author_id() -> AuthorId {
 }
 
 fn put(i: usize) -> PreparedLocalMutation {
-    let path = format!("dir/file-{i:06}");
+    put_at(i, format!("dir/file-{i:06}"))
+}
+
+fn put_at(i: usize, path: String) -> PreparedLocalMutation {
     let mtime = i as i64 + 1;
     let version = FileVersion::new(
         Vec::new(),
@@ -191,6 +194,70 @@ fn commit_counted(n: usize, drop_triggers: bool) -> Counted {
     Counted { per_text, wall }
 }
 
+/// Wall time of a 100k-file import through the production batch commit, in batches of 1000: the
+/// stored namespace trie's cost on the sender's import path. Release profile:
+/// `cargo test -p yadorilink-sync-sqlite --release --lib -- --ignored bulk_import_wall_100k
+/// --nocapture`.
+#[test]
+#[ignore = "100k-file measurement; run explicitly"]
+fn bulk_import_wall_100k() {
+    // `YL_BENCH_DB_DIR` names a directory for a file-backed database (synchronous = FULL, as the
+    // daemon runs), where the cost of the rows written shows; unset, the database is in memory.
+    let db: std::sync::Arc<SyncDatabase> = match std::env::var_os("YL_BENCH_DB_DIR") {
+        Some(dir) => {
+            let path = std::path::Path::new(&dir).join(format!("bulk-{}.db", std::process::id()));
+            std::sync::Arc::new(
+                SyncDatabase::open(path, |conn| {
+                    crate::replica_tables::init_for_tests(conn).map_err(|e| {
+                        yadorilink_sqlite_runtime::DatabaseError::CorruptSchema(e.to_string())
+                    })
+                })
+                .expect("open the file-backed benchmark database"),
+            )
+        }
+        None => crate::replica_tables::open_for_tests(),
+    };
+    let repo = FileIndexRepository::new(db.clone());
+    let key = SigningKey::from_bytes(&[3u8; 32]);
+    let local = LocalAuthor { author: author_id(), signing_key: &key, capture: None };
+    let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    const FLUSH_EVERY: usize = 5;
+    let mut flushing = std::time::Duration::ZERO;
+    let total = std::time::Instant::now();
+    let mut marks = Vec::new();
+    for batch in 0..100usize {
+        // Paths scattered over 4000 directories, as a real import's are, so that the files of one
+        // batch do not share a subtree.
+        let mutations: Vec<_> = (batch * 1000..(batch + 1) * 1000)
+            .map(|i| put_at(i, format!("d{:04}/f{i:06}.dat", i.wrapping_mul(2654435761) % 4000)))
+            .collect();
+        let started = std::time::Instant::now();
+        repo.commit_local_mutations_batch(
+            "g1",
+            &mutations,
+            &[],
+            "device-a",
+            SignedEmissionContext { author: &local, permit: &permit },
+        )
+        .unwrap();
+        if [0, 24, 49, 74, 99].contains(&batch) {
+            marks.push((batch + 1, started.elapsed()));
+        }
+        // A summary exchange every `FLUSH_EVERY` batches patches the trie from the paths the
+        // commits noted. (Absent from the baseline build, which has no stored trie.)
+        if (batch + 1) % FLUSH_EVERY == 0 {
+            let started = std::time::Instant::now();
+            crate::native_namespace::flush_all(&db).unwrap();
+            flushing += started.elapsed();
+        }
+    }
+    eprintln!(
+        "100k files in {:?} (of which patching the trie {flushing:?}); batch times {marks:?}",
+        total.elapsed()
+    );
+}
+
 fn one_line(sql: &str) -> String {
     let flat = sql.split_whitespace().collect::<Vec<_>>().join(" ");
     flat.chars().take(330).collect()
@@ -257,7 +324,9 @@ fn bulk_capture_executions_per_file_are_bounded_and_do_not_grow_with_the_batch()
         large.per_text.iter().take(5).map(|(s, e, _)| (one_line(s), *e)).collect::<Vec<_>>()
     );
     assert!(
-        per_large <= per_small + 0.5,
+        // The stored namespace trie is read one node per level it descends, so the per-file reads grow
+        // with the log of the group (about 0.8 more at four times the files), not with the batch.
+        per_large <= per_small + 1.5,
         "executions/file grew with the batch: {per_small:.2} at 1000, {per_large:.2} at 4000"
     );
 }

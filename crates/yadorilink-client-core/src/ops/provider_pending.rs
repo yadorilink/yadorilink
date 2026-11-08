@@ -158,6 +158,7 @@ pub(crate) fn is_definitive_rejection(error: &crate::CoreError) -> bool {
     matches!(
         error,
         crate::CoreError::DaemonCommand {
+            drive: None,
             code: Code::PreparationRejected
                 | Code::InviteExpired
                 | Code::InviteAlreadyUsed
@@ -184,6 +185,7 @@ mod tests {
     fn a_refused_invite_is_definitive_and_an_ambiguous_one_is_not() {
         use yadorilink_ipc_proto::daemonctl::ApplicationErrorCode as Code;
         let error = |code| crate::CoreError::DaemonCommand {
+            drive: None,
             code,
             message: String::new(),
             group_ids: Vec::new(),
@@ -314,6 +316,7 @@ mod tests {
     fn only_a_definitive_refusal_counts_as_terminal() {
         use yadorilink_ipc_proto::daemonctl::ApplicationErrorCode as Code;
         let command = |code| crate::CoreError::DaemonCommand {
+            drive: None,
             code,
             message: String::new(),
             group_ids: Vec::new(),

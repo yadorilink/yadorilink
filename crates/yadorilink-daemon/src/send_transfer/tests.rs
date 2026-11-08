@@ -522,3 +522,24 @@ async fn two_grants_for_one_sender_key_are_both_found_by_their_own_offer() {
     assert!(verdict("grant-a", "nonce-b").await.contains("invalid"), "a nonce of another grant");
     assert!(verdict("grant-c", "nonce-a").await.contains("no pending"));
 }
+
+/// A Send link whose file list does not open is a typed refusal an app can tell from a generic
+/// failure, not a plain message.
+#[test]
+fn an_unverifiable_preview_is_a_typed_refusal() {
+    use crate::coordination_client::{SendLinkCallError, SendLinkCallKind};
+    use crate::send_transfer::SendFailure;
+    use yadorilink_ipc_proto::daemonctl::ApplicationErrorCode;
+    let failure = SendFailure::from(SendLinkCallError {
+        kind: SendLinkCallKind::PreviewUnverified,
+        message: "the list could not be verified".to_string(),
+    });
+    assert_eq!(failure.code, Some(ApplicationErrorCode::SendPreviewUnverified));
+    assert_eq!(failure.message, "the list could not be verified");
+    // A generic failure stays untyped.
+    let other = SendFailure::from(SendLinkCallError {
+        kind: SendLinkCallKind::Other,
+        message: "odd".to_string(),
+    });
+    assert_eq!(other.code, None);
+}

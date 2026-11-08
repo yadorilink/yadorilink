@@ -211,6 +211,9 @@ pub struct LinkRegistry {
     link_watch_stop_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// local_path -> Degraded (disk-pressure) state for that link.
     degraded_links: Mutex<HashMap<String, DegradedLinkInfo>>,
+    /// Notified when a link becomes Degraded with a re-check to schedule, so the re-check job can
+    /// sleep until one is due instead of polling.
+    degraded_scheduled: tokio::sync::Notify,
     /// local_path -> its OS file-watch-limit condition, if one was ever hit.
     watch_limits: Mutex<HashMap<String, WatchLimitEntry>>,
     /// Links whose start was refused because the folder is missing or off
@@ -267,6 +270,7 @@ impl LinkRegistry {
             link_lifecycle_notify: tokio::sync::Notify::new(),
             link_watch_stop_locks: Mutex::new(HashMap::new()),
             degraded_links: Mutex::new(HashMap::new()),
+            degraded_scheduled: tokio::sync::Notify::new(),
             watch_limits: Mutex::new(HashMap::new()),
             awaiting_volume: Mutex::new(HashSet::new()),
             volume_probes: Mutex::new(HashSet::new()),
@@ -572,6 +576,23 @@ impl LinkRegistry {
                 cause,
             },
         );
+        self.degraded_scheduled.notify_one();
+    }
+
+    /// When the earliest pending disk-pressure re-check is due (unix seconds), or `None` while no
+    /// link has one. Terminal marks are never re-checked.
+    pub fn next_degraded_recheck_unix(&self) -> Option<i64> {
+        self.lock_degraded()
+            .values()
+            .filter(|info| !info.terminal)
+            .map(|info| info.next_recheck_unix)
+            .min()
+    }
+
+    /// Completes when a link has been marked Degraded since the last time this completed (a
+    /// notification made while nobody waited is kept for the next call).
+    pub async fn degraded_scheduled(&self) {
+        self.degraded_scheduled.notified().await;
     }
 
     /// Marks `local_path` terminally OwnershipLost. Returns true only on the
@@ -694,12 +715,64 @@ mod no_change_source_tests {
     fn the_no_watcher_source_refuses_instead_of_running_without_changes() {
         use yadorilink_filesystem_sync::watcher::{FolderWatchSource, NoWatchSource};
         let dir = tempfile::tempdir().unwrap();
-        let ignore = Arc::new(
-            yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet::load_for_link_root(
-                dir.path(),
-            )
-            .unwrap(),
-        );
+        let ignore =
+            Arc::new(yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet::defaults_only());
         assert!(NoWatchSource.watch(dir.path(), ignore).is_err());
+    }
+}
+
+#[cfg(test)]
+mod degraded_recheck_schedule_tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    fn degrade(links: &LinkRegistry, path: &str, now: i64, delay: i64) {
+        links.mark_degraded(
+            path,
+            "disk pressure".into(),
+            DegradedCause::WaitingForDiskSpace,
+            now,
+            |_| delay,
+        );
+    }
+
+    /// Nothing is scheduled while no link is Degraded, and a terminal mark is not a re-check.
+    #[test]
+    fn only_a_pending_recheck_is_scheduled() {
+        let links = LinkRegistry::new();
+        assert_eq!(links.next_degraded_recheck_unix(), None);
+        links.mark_ownership_lost("/terminal", 100);
+        assert_eq!(links.next_degraded_recheck_unix(), None, "a terminal mark is never re-checked");
+        degrade(&links, "/a", 100, 30);
+        degrade(&links, "/b", 100, 10);
+        assert_eq!(links.next_degraded_recheck_unix(), Some(110), "the earliest one");
+        links.clear_degraded("/b");
+        assert_eq!(links.next_degraded_recheck_unix(), Some(130));
+        links.clear_degraded("/a");
+        assert_eq!(links.next_degraded_recheck_unix(), None);
+    }
+
+    /// The re-check job parks while nothing is degraded and wakes when a link is: also when the mark
+    /// was made just before the job started waiting (the notification is kept).
+    #[tokio::test(start_paused = true)]
+    async fn a_waiter_wakes_when_a_link_degrades() {
+        let links = Arc::new(LinkRegistry::new());
+        let parked =
+            tokio::time::timeout(Duration::from_secs(3600), links.degraded_scheduled()).await;
+        assert!(parked.is_err(), "nothing degraded: nothing wakes it, however long it waits");
+
+        let waiter = tokio::spawn({
+            let links = links.clone();
+            async move { links.degraded_scheduled().await }
+        });
+        tokio::task::yield_now().await;
+        degrade(&links, "/a", 100, 30);
+        tokio::time::timeout(Duration::from_secs(1), waiter).await.expect("woken").unwrap();
+
+        degrade(&links, "/b", 100, 30);
+        tokio::time::timeout(Duration::from_secs(1), links.degraded_scheduled())
+            .await
+            .expect("a mark made before the wait started is not lost");
     }
 }

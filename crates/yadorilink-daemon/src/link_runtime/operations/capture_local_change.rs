@@ -659,11 +659,7 @@ impl LinkFlushHandle {
             return Err("this group's deletions are withheld until its roots are reconciled".into());
         }
         self.flush_all_pending_local_changes(group_id).await?;
-        let ignore_set =
-            yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet::load_for_link_root(
-                &self.root,
-            )
-            .map_err(|e| e.to_string())?;
+        let ignore_set = deps.ignore_rules.load(group_id).map_err(|e| e.to_string())?;
         let outcome = self
             .processor
             .process_flush_with_ignore(
@@ -717,6 +713,23 @@ impl LinkFlushHandle {
     ) -> Option<Result<Vec<FileRecord>, yadorilink_local_capture::LocalCaptureError>> {
         let _op = self.root_lease.begin_operation().ok()?;
         Some(self.processor.reconcile_added_files(group_id, &self.root))
+    }
+
+    /// The drift detector's per-link look: checks that this link's `RootLease` still admits
+    /// operations, then compares the disk with the index by size and time (nothing is written).
+    /// `None` means the lease refused admission (the link is stopping); the next pass covers it.
+    pub(crate) fn detect_drift_from_disk(
+        &self,
+        group_id: &str,
+        options: yadorilink_local_capture::DriftOptions,
+    ) -> Option<
+        Result<yadorilink_local_capture::DriftReport, yadorilink_local_capture::LocalCaptureError>,
+    > {
+        // Admission is checked and released at once: the walk only reads and may take many minutes at
+        // its rate cap, and an operation held that long would block a safe stop or an unlink's drain.
+        // Every path it finds is captured through an operation of its own.
+        drop(self.root_lease.begin_operation().ok()?);
+        Some(self.processor.detect_drift(group_id, &self.root, options))
     }
 
     /// The debounce-accumulator flush above (`FlushPathRequest`) only ever

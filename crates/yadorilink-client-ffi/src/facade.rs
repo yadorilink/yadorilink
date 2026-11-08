@@ -68,6 +68,9 @@ impl ClientCore {
                 default_device_name: String::new(),
                 has_linked_folders: None,
                 start_over_pending: false,
+                email: None,
+                sign_in_provider: None,
+                display_name: None,
             }
         })
     }
@@ -211,11 +214,11 @@ impl ClientCore {
         let core = self.inner.clone();
         bridge(async move { core.resume_folder(local_path, expected_group_id).await }).await
     }
-    pub async fn pause_all(&self, duration: PauseDuration) -> Result<(), DesktopError> {
+    pub async fn pause_all(&self, duration: PauseDuration) -> Result<u32, DesktopError> {
         let core = self.inner.clone();
         bridge(async move { core.pause_all(duration).await }).await
     }
-    pub async fn resume_all(&self) -> Result<(), DesktopError> {
+    pub async fn resume_all(&self) -> Result<u32, DesktopError> {
         let core = self.inner.clone();
         bridge(async move { core.resume_all().await }).await
     }
@@ -335,13 +338,13 @@ impl ClientCore {
         let core = self.inner.clone();
         bridge(async move { core.file_retention(absolute_path).await }).await
     }
-    pub async fn pin_file(&self, absolute_path: String) -> Result<PinOutcome, DesktopError> {
+    pub async fn set_retention_rule(
+        &self,
+        absolute_path: String,
+        rule: RetentionRule,
+    ) -> Result<PinOutcome, DesktopError> {
         let core = self.inner.clone();
-        bridge(async move { core.pin_file(absolute_path).await }).await
-    }
-    pub async fn unpin_file(&self, absolute_path: String) -> Result<FileRetention, DesktopError> {
-        let core = self.inner.clone();
-        bridge(async move { core.unpin_file(absolute_path).await }).await
+        bridge(async move { core.set_retention_rule(absolute_path, rule).await }).await
     }
     pub async fn hydrate_file(&self, absolute_path: String) -> Result<(), DesktopError> {
         let core = self.inner.clone();
@@ -499,6 +502,33 @@ impl ClientCore {
     ) -> Result<SpaceManagement, DesktopError> {
         let core = self.inner.clone();
         bridge(async move { core.set_space_management(enabled).await }).await
+    }
+    pub async fn network_policy(&self) -> Result<NetworkPolicy, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.network_policy().await }).await
+    }
+    pub async fn set_sync_on_metered(&self, enabled: bool) -> Result<NetworkPolicy, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.set_sync_on_metered(enabled).await }).await
+    }
+    pub async fn report_network_cost(
+        &self,
+        cost: NetworkCost,
+    ) -> Result<NetworkPolicy, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.report_network_cost(cost).await }).await
+    }
+    pub async fn ignore_rules_get(&self, group_id: String) -> Result<String, DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.ignore_rules_get(group_id).await }).await
+    }
+    pub async fn ignore_rules_set(
+        &self,
+        group_id: String,
+        text: String,
+    ) -> Result<(), DesktopError> {
+        let core = self.inner.clone();
+        bridge(async move { core.ignore_rules_set(group_id, text).await }).await
     }
     pub async fn preview_space_reclaim(&self) -> Result<SpaceReclaimPreview, DesktopError> {
         let core = self.inner.clone();

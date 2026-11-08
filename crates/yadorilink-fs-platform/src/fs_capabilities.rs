@@ -1293,18 +1293,57 @@ pub fn cached_volume_proves_object_identity(dir: &Path) -> bool {
     proven
 }
 
-/// Whether the filesystem holding the process temp dir can prove object identity (see
-/// [`probe_volume_proves_object_identity`]). Tests whose premise is "the same object is
-/// recognised again" call this first and skip on such a volume instead of failing for an
-/// environment reason. Prints the reason when it answers `false`.
+/// Whether a test that needs an identity-proving filesystem may not be skipped: `CI=true` or
+/// `YADORILINK_REQUIRE_IDENTITY_FS=1`.
+#[cfg(any(test, feature = "test-support"))]
+pub fn identity_fs_required() -> bool {
+    std::env::var("CI").is_ok_and(|v| v == "true")
+        || std::env::var("YADORILINK_REQUIRE_IDENTITY_FS").is_ok_and(|v| v == "1")
+}
+
+/// A test is about to be skipped for want of an identity-proving filesystem: says so on stderr,
+/// naming the test, or panics when skipping is not allowed (`required`).
+#[cfg(any(test, feature = "test-support"))]
+pub fn report_identity_coverage_lost(test: &str, required: bool) {
+    let reason = format!(
+        "{test}: neither the temp filesystem nor the build directory can prove object identity \
+         (e.g. tmpfs); the test is not run"
+    );
+    assert!(!required, "{reason} (CI or YADORILINK_REQUIRE_IDENTITY_FS=1: not allowed to skip)");
+    eprintln!("SKIPPED (coverage lost): {reason}");
+}
+
+/// Makes sure the process temp dir (what `tempfile` and `std::env::temp_dir` use) is on a
+/// filesystem that can prove object identity (see [`probe_volume_proves_object_identity`]), for
+/// a test whose premise is "the same object is recognised again". When the system temp dir
+/// cannot (tmpfs), the process's `TMPDIR` is pointed once at a directory beside the test binary
+/// (on disk wherever the build is), before the test creates its fixtures. Returns `false` only if
+/// no such directory exists either; the caller then skips, which is never silent: the reason and
+/// the test name go to stderr, and with `CI=true` or `YADORILINK_REQUIRE_IDENTITY_FS=1` it panics
+/// instead, so a CI run cannot pass with these tests skipped.
 #[cfg(any(test, feature = "test-support"))]
 pub fn temp_dir_proves_object_identity_for_test() -> bool {
-    let proven = probe_volume_proves_object_identity(&std::env::temp_dir());
+    static SWITCHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let proven = *SWITCHED.get_or_init(|| {
+        if probe_volume_proves_object_identity(&std::env::temp_dir()) {
+            return true;
+        }
+        let beside_binary = std::env::current_exe().ok().and_then(|exe| {
+            let dir = exe.parent()?.parent()?.join("yl-identity-tmp");
+            std::fs::create_dir_all(&dir).ok()?;
+            probe_volume_proves_object_identity(&dir).then_some(dir)
+        });
+        match beside_binary {
+            Some(dir) => {
+                std::env::set_var("TMPDIR", dir);
+                true
+            }
+            None => false,
+        }
+    });
     if !proven {
-        eprintln!(
-            "SKIPPED: the temp filesystem cannot prove object identity (e.g. tmpfs); \
-             set TMPDIR to a disk-backed directory to run this test"
-        );
+        let test = std::thread::current().name().unwrap_or("<unnamed test>").to_owned();
+        report_identity_coverage_lost(&test, identity_fs_required());
     }
     proven
 }

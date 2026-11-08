@@ -50,7 +50,7 @@ impl ReplicaCoordinator {
         }
         // A path the user asked to keep on this device keeps its cached blocks too, even when
         // the pin landed after the lease was taken. A policy that cannot be read frees nothing.
-        if self.pinned_item_repository().retention(custody.group_id(), custody.path())?.policy
+        if self.retention_rules().retention(custody.group_id(), custody.path())?.policy
             == yadorilink_sync_sqlite::RetentionPolicy::Pinned
         {
             return Ok(GcReport::default());
@@ -89,10 +89,7 @@ impl ReplicaCoordinator {
                     .materialization_state_repository()
                     .get_materialization_state(sibling.group_id(), sibling.path())?
                     != Some(MaterializationState::Remote)
-                || self
-                    .pinned_item_repository()
-                    .retention(sibling.group_id(), sibling.path())?
-                    .policy
+                || self.retention_rules().retention(sibling.group_id(), sibling.path())?.policy
                     == yadorilink_sync_sqlite::RetentionPolicy::Pinned
                 || !sibling.confirmation_still_valid()
             {

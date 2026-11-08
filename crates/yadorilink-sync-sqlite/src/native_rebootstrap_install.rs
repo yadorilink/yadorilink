@@ -44,8 +44,8 @@ use yadorilink_replica_domain::ids::{FolderGroupId, VersionHash};
 use crate::error::SyncSqliteError;
 use crate::native_checkpoint_install::{CheckpointError, InstallKind, RebootstrapBarrier};
 use crate::native_rebootstrap::{
-    area_failure, frozen_frontier_unchanged, rebootstrap_status, resume_preserved, set_state,
-    verify_target_in_area, BlockedReason, CaptureBarrier, Crash, InstallAuthority,
+    advance, area_failure, frozen_frontier_unchanged, rebootstrap_status, resume_preserved,
+    verify_target_in_area, BlockedReason, CaptureBarrier, Crash, InstallAuthority, Phase,
     PreservationFailure, PreserveContext, ReassertAuthority, RebootstrapState,
 };
 use crate::native_rebootstrap_recovery::{io_chunk, sha256, Manifest, RecoveryArea};
@@ -418,9 +418,7 @@ pub fn install_rebootstrap(
             status.recovery_id
         )));
     }
-    if !(matches!(status.state, RebootstrapState::Preserved | RebootstrapState::Quarantining)
-        || status.state.is_installed())
-    {
+    if !status.state.has_barrier() {
         return Err(InstallError::NotInstallable(format!("it is {:?}", status.state)));
     }
     let _busy = match crate::native_rebootstrap::acquire(conn, group) {
@@ -528,7 +526,7 @@ fn begin_quarantine(
             )?;
         }
     }
-    set_state(tx, group, "quarantining", now)
+    advance(tx, group, recovery_id, Phase::Preserved, Phase::Quarantining, now)
 }
 
 // --- quarantine --------------------------------------------------------------------------------------------
@@ -970,7 +968,14 @@ fn install_in_tx(
         &mut |step| hook(InstallPoint::InTransaction(step)),
     )
     .map_err(InstallError::from)?;
-    set_state(&tx, group, "catching_up", ctx.preserve.now_unix)?;
+    advance(
+        &tx,
+        group,
+        recovery_id,
+        Phase::Quarantining,
+        Phase::CatchingUp,
+        ctx.preserve.now_unix,
+    )?;
     hook(InstallPoint::InTransaction(InstallStep::Recorded)).map_err(|_| InstallError::Crashed)?;
     tx.commit()?;
     hook(InstallPoint::AfterCommit).map_err(|_| InstallError::Crashed)?;

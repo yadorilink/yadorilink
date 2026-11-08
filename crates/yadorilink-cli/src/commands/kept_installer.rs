@@ -18,8 +18,7 @@ use sha2::{Digest as _, Sha256};
 /// What to do about the kept installer.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Plan {
-    /// No installer was recorded (an install from before bundles carried one, or a platform that
-    /// does not run it yet): print the command, as before.
+    /// No installer was recorded (an install from before bundles carried one): print the command, as before.
     Print,
     /// The verified bytes of the kept installer.
     Run(Vec<u8>),
@@ -29,6 +28,11 @@ pub(crate) enum Plan {
 
 /// Where a user re-runs the installer from when the kept copy cannot be used.
 const REINSTALL: &str = "curl -fsSL https://yadori.link/install.sh | sh";
+
+/// The directory the installer keeps its receipt and kept copy in: `<prefix>/share/yadorilink`.
+pub(crate) fn install_dir(prefix: &Path) -> std::path::PathBuf {
+    prefix.join("share").join("yadorilink")
+}
 
 fn receipt_get(receipt: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}=");
@@ -48,7 +52,7 @@ fn refuse(why: &str) -> Plan {
 }
 
 /// Decides from the receipt under `share` (`<prefix>/share/yadorilink`) and the file it names.
-pub(crate) fn plan(share: &Path) -> Plan {
+pub(crate) fn plan_in(share: &Path) -> Plan {
     let Ok(receipt) = std::fs::read_to_string(share.join("install-receipt")) else {
         return Plan::Print;
     };
@@ -88,9 +92,16 @@ pub(crate) fn plan(share: &Path) -> Plan {
     Plan::Run(bytes)
 }
 
-/// Runs the verified installer bytes with `args`, output and exit status passed through. Returns
+/// How the installer is called: its arguments.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Call {
+    pub args: Vec<String>,
+}
+
+/// Runs the verified installer bytes with `call`, output and exit status passed through. Returns
 /// the status. The script goes to the shell on standard input.
-pub(crate) fn run(script: &[u8], args: &[String]) -> std::io::Result<i32> {
+pub(crate) fn run(script: &[u8], call: &Call) -> std::io::Result<i32> {
+    let args = &call.args;
     let mut child =
         Command::new("sh").arg("-s").arg("--").args(args).stdin(Stdio::piped()).spawn()?;
     if let Some(mut stdin) = child.stdin.take() {

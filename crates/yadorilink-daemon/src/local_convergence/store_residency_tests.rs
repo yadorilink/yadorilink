@@ -120,10 +120,38 @@ async fn a_file_edited_since_its_record_is_journaled_for_capture() {
     let blocks = captured_only_in_its_file(&h, "edited.txt", b"the version on record").await;
     std::fs::write(h.path("edited.txt"), b"an edit nobody has captured, other length").unwrap();
 
-    assert_eq!(bring(&h, "").await, Residency::Pending(vec!["edited.txt".to_owned()]));
+    assert_eq!(bring(&h, "").await, Residency::Pending(vec!["edited.txt".to_owned()], Vec::new()));
 
     assert!(journaled(&h, "edited.txt"), "capture is asked to read the file");
     assert!(!kept(&h, &blocks), "the old version is not in the store: its bytes are gone");
+}
+
+/// A file the operating system refuses to open is reported with that reason, not as one that
+/// only has not settled yet.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_whose_read_is_refused_is_reported_with_the_refusal() {
+    use std::os::unix::fs::PermissionsExt;
+    use yadorilink_local_capture::unreadable::{UnreadableFile, UnreadableReason};
+    let h = Harness::new(true);
+    captured_only_in_its_file(&h, "locked.txt", b"a file nobody may read").await;
+    std::fs::set_permissions(h.path("locked.txt"), std::fs::Permissions::from_mode(0o000)).unwrap();
+    // A superuser is not refused; there is nothing to observe then.
+    if std::fs::File::open(h.path("locked.txt")).is_ok() {
+        return;
+    }
+    let answer = bring(&h, "").await;
+    std::fs::set_permissions(h.path("locked.txt"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(
+        answer,
+        Residency::Pending(
+            vec!["locked.txt".to_owned()],
+            vec![UnreadableFile {
+                path: "locked.txt".to_owned(),
+                reason: UnreadableReason::PermissionDenied
+            }]
+        )
+    );
 }
 
 /// A file that is gone is journaled as removed.
@@ -133,7 +161,7 @@ async fn a_file_that_is_gone_is_journaled_as_removed() {
     captured_only_in_its_file(&h, "gone.txt", b"removed since its record").await;
     std::fs::remove_file(h.path("gone.txt")).unwrap();
 
-    assert_eq!(bring(&h, "").await, Residency::Pending(vec!["gone.txt".to_owned()]));
+    assert_eq!(bring(&h, "").await, Residency::Pending(vec!["gone.txt".to_owned()], Vec::new()));
     assert!(journaled(&h, "gone.txt"));
 }
 
@@ -191,7 +219,10 @@ async fn a_file_still_being_received_is_pending_and_a_placeholder_is_done() {
     set_state(&h, "arriving.txt", MaterializationState::Hydrating);
     set_state(&h, "placeholder.txt", MaterializationState::Remote);
 
-    assert_eq!(bring(&h, "").await, Residency::Pending(vec!["arriving.txt".to_owned()]));
+    assert_eq!(
+        bring(&h, "").await,
+        Residency::Pending(vec!["arriving.txt".to_owned()], Vec::new())
+    );
 
     assert!(!journaled(&h, "arriving.txt"), "nothing to capture: the file is not an edit");
     assert!(!journaled(&h, "placeholder.txt"));
@@ -221,7 +252,7 @@ async fn a_caller_that_does_not_wait_finds_a_held_path_pending() {
     .await
     .expect("not waiting for the lock means not hanging on it")
     .unwrap();
-    assert_eq!(pending, Residency::Pending(vec!["held.txt".to_owned()]));
+    assert_eq!(pending, Residency::Pending(vec!["held.txt".to_owned()], Vec::new()));
     assert!(!kept(&h, &blocks), "nothing was read while the lock was held");
 
     drop(guard);

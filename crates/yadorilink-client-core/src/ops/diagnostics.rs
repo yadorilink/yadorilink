@@ -115,7 +115,7 @@ fn limited_bundle() -> (Value, usize) {
         "yadorilink_version": env!("CARGO_PKG_VERSION"),
         "platform": {
             "os_family": std::env::consts::OS,
-            "os_version_bucket": "unknown",
+            "os_version_bucket": yadorilink_reporting::local_store::environment::os_version_bucket(),
             "arch": std::env::consts::ARCH
         },
         "daemon": {

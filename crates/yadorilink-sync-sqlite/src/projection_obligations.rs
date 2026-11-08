@@ -464,6 +464,77 @@ pub fn next_obligation_wake(conn: &Connection) -> Result<Option<i64>, SyncSqlite
     Ok(wake)
 }
 
+/// Why one projection obligation is not claimable right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObligationBlock {
+    /// Parked at `'ignore_blocked'` until a write re-arms it.
+    Parked,
+    /// A rebootstrap freezes the whole group.
+    GroupFrozen,
+    /// The group is a provider group; the provider projector owns its obligations.
+    ProviderGroup,
+    /// The path is covered by a paused item.
+    Paused,
+    /// The path is held: projecting it would overwrite an edit nobody has captured.
+    Held,
+    /// Pending, but its retry deadline is still ahead of the clock.
+    BackedOff { next_attempt_at: i64 },
+}
+
+/// What [`obligation_runnability`] found for one path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObligationRunnability {
+    /// No admission has ever touched the path.
+    NoObligation,
+    /// [`claim_runnable_obligations`] would claim it, given a window large enough.
+    Runnable,
+    Blocked(ObligationBlock),
+}
+
+/// Read-only explanation of whether [`claim_runnable_obligations`] could claim the obligation of
+/// `path` at `now_unix_nanos`, and if not, the first reason in a fixed order. It evaluates the
+/// same predicates as the claim (the same SQL for paused and held paths, the same freeze and
+/// provider-group checks); it ignores only the claim's window limits.
+pub fn obligation_runnability(
+    conn: &Connection,
+    group_id: &str,
+    path: &str,
+    now_unix_nanos: i64,
+) -> Result<ObligationRunnability, SyncSqliteError> {
+    let Some(row) = lookup_projection_obligation(conn, group_id, path)? else {
+        return Ok(ObligationRunnability::NoObligation);
+    };
+    let blocked = ObligationRunnability::Blocked;
+    if row.state != "pending" {
+        return Ok(blocked(ObligationBlock::Parked));
+    }
+    if crate::native_rebootstrap::group_frozen(conn, group_id)? {
+        return Ok(blocked(ObligationBlock::GroupFrozen));
+    }
+    if is_provider_group(conn, group_id)? {
+        return Ok(blocked(ObligationBlock::ProviderGroup));
+    }
+    let (paused, held): (bool, bool) = conn.query_row(
+        &format!(
+            "SELECT {paused}, {held}",
+            paused = crate::paused_items::covered_by_paused_item_sql("?1", "?2"),
+            held = crate::held_path::held_sql("?1", "?2"),
+        ),
+        rusqlite::params![group_id, path],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if paused {
+        return Ok(blocked(ObligationBlock::Paused));
+    }
+    if held {
+        return Ok(blocked(ObligationBlock::Held));
+    }
+    if row.next_attempt_at > now_unix_nanos {
+        return Ok(blocked(ObligationBlock::BackedOff { next_attempt_at: row.next_attempt_at }));
+    }
+    Ok(ObligationRunnability::Runnable)
+}
+
 /// Whether `group_id` has a provider root (a database without the provider tables has none).
 fn is_provider_group(conn: &Connection, group_id: &str) -> Result<bool, SyncSqliteError> {
     let has_table: bool = conn.query_row_cached("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'provider_roots')",
@@ -934,7 +1005,7 @@ pub enum NonExactProofKind {
     /// lifted hazard hold does, so nothing can tell a fresh admission's own
     /// bump apart from an unrelated one -- deleting the row here would mean
     /// NOTHING durably remembers this path was ever ignore-blocked, and a
-    /// later `.yadorilinkignore` edit un-ignoring it would have no
+    /// later ignore-rules change un-ignoring it would have no
     /// obligation left to re-arm at all. Parking it in `'ignore_blocked'`
     /// instead gives a periodic re-check sweep (`yadorilink-daemon`'s
     /// ignore-recheck loop, mirroring the existing hazard-recheck loop) a

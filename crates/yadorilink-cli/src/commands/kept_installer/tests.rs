@@ -1,5 +1,9 @@
 use super::*;
 
+fn plan(share: &Path) -> Plan {
+    plan_in(share)
+}
+
 fn sha(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -112,7 +116,9 @@ fn the_verified_bytes_run_with_the_arguments_and_the_status_comes_back() {
     let out = tempfile::tempdir().unwrap();
     let file = out.path().join("args.txt");
     std::env::set_var("OUT", &file);
-    let status = run(script, &["--version".into(), "0.3.0".into(), "--yes".into()]).unwrap();
+    let status =
+        run(script, &Call { args: vec!["--version".into(), "0.3.0".into(), "--yes".into()] })
+            .unwrap();
     std::env::remove_var("OUT");
     assert_eq!(status, 7);
     assert_eq!(std::fs::read_to_string(file).unwrap().trim(), "--version 0.3.0 --yes");
@@ -125,4 +131,12 @@ fn only_the_unpinned_key_status_has_a_standing_answer() {
     assert!(text.contains("curl -fsSL https://yadori.link/install.sh | sh"), "{text}");
     assert_eq!(guidance_for(4), None);
     assert_eq!(guidance_for(0), None);
+}
+
+#[test]
+fn the_installer_keeps_its_receipt_and_copy_under_share_yadorilink() {
+    assert_eq!(
+        install_dir(std::path::Path::new("/p")),
+        std::path::Path::new("/p/share/yadorilink")
+    );
 }

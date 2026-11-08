@@ -16,9 +16,10 @@ use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPaylo
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::{
     accept_invite_command_response, create_and_link_command_response,
-    join_and_link_command_response, AcceptInviteCommandRequest, ApplicationCommandError,
-    CreateAndLinkCommandRequest, EnrollmentCommandOutcome, JoinAndLinkCommandRequest,
-    LinkPreflightRequest, LinkRequest, PendingEnrollmentKind,
+    join_and_link_command_response, mint_invite_command_response, AcceptInviteCommandRequest,
+    ApplicationCommandError, CreateAndLinkCommandRequest, EnrollmentCommandOutcome,
+    JoinAndLinkCommandRequest, LinkPreflightRequest, LinkRequest, MintInviteCommandRequest,
+    PendingEnrollmentKind,
 };
 
 use crate::error::ApiError;
@@ -219,6 +220,52 @@ pub async fn accept_invite(
     match r.result {
         Some(accept_invite_command_response::Result::Outcome(o)) => Ok(Json(outcome_json(&o))),
         Some(accept_invite_command_response::Result::Error(e)) => Err(command_error(e)),
+        None => Err(unexpected()),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct MintBody {
+    group_id: String,
+    /// `viewer` or `editor`; absent lets the daemon pick its default.
+    #[serde(default)]
+    role: String,
+    /// Absent lets the daemon pick its default lifetime.
+    #[serde(default)]
+    ttl_secs: u64,
+    #[serde(default)]
+    requires_approval: bool,
+}
+
+/// `POST /api/share/invite` `{"group_id", "role"?, "ttl_secs"?, "requires_approval"?}`
+/// -- `MintInviteCommandRequest`, same as `yadorilink share invite`. The
+/// plaintext code is in this response only; the daemon keeps just its hash.
+pub async fn mint_invite(
+    State(state): State<AppState>,
+    Json(body): Json<MintBody>,
+) -> Result<Json<Value>, ApiError> {
+    let resp = state
+        .control
+        .send_long(ReqPayload::MintInviteCommand(MintInviteCommandRequest {
+            group_id: non_empty(&body.group_id, "group_id")?.to_string(),
+            role: body.role,
+            ttl_secs: body.ttl_secs,
+            requires_approval: body.requires_approval,
+        }))
+        .await?;
+    let Some(RespPayload::MintInviteCommand(r)) = resp.payload else {
+        return Err(unexpected());
+    };
+    match r.result {
+        Some(mint_invite_command_response::Result::Outcome(i)) => Ok(Json(json!({
+            "code": i.code,
+            "invite_id": i.invite_id,
+            "group_id": i.group_id,
+            "role": i.role,
+            "expires_at_unix": i.expires_at_unix,
+            "requires_approval": i.requires_approval,
+        }))),
+        Some(mint_invite_command_response::Result::Error(e)) => Err(command_error(e)),
         None => Err(unexpected()),
     }
 }

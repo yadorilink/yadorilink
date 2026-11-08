@@ -96,6 +96,9 @@ enum Command {
             default_missing_value = "-"
         )]
         code: Option<String>,
+        /// Name this computer is added to your account under (default: its host name).
+        #[arg(long, value_name = "NAME", env = "YADORILINK_DEVICE_NAME")]
+        device_name: Option<String>,
     },
     /// Sign out and revoke this computer's access. This cannot be undone.
     Logout {
@@ -213,9 +216,11 @@ enum Command {
     /// Show whether a file is stored locally or fetched on demand, and whether it is kept.
     MaterializationStatus { local_path: String },
     /// Always keep a file or folder on this device: download it and never free its space.
-    Pin { local_path: String },
-    /// Stop keeping a file or folder on this device. Its content stays until you free it.
-    Unpin { local_path: String },
+    Keep { local_path: String },
+    /// Keep a file or folder online only: free its copies on this device.
+    OnlineOnly { local_path: String },
+    /// Remove the rule set at a file or folder (keep or online only). Nothing is removed from disk.
+    Default { local_path: String },
     /// Control the sync daemon.
     Daemon {
         #[command(subcommand)]
@@ -263,6 +268,11 @@ enum Command {
     Limits {
         #[command(subcommand)]
         action: LimitsAction,
+    },
+    /// Whether syncing may use a metered connection.
+    Network {
+        #[command(subcommand)]
+        action: NetworkAction,
     },
     /// Automatic space management for provider folders.
     Space {
@@ -479,12 +489,14 @@ enum DiagnoseAction {
 
 #[derive(Subcommand)]
 enum IgnoreAction {
-    /// Print the ignore patterns in effect for a linked folder.
-    List { link_path: std::path::PathBuf },
-    /// Check whether a path is ignored.
-    Test { path: std::path::PathBuf },
-    /// Explain which rule ignores a path, and where that rule comes from.
-    Explain { path: std::path::PathBuf },
+    /// Print the ignore patterns in effect for a linked folder (its path or group id).
+    List { folder: String },
+    /// Check whether a path (relative to the folder) is ignored.
+    Test { folder: String, path: String },
+    /// Explain which rule ignores a path (relative to the folder), and where that rule is.
+    Explain { folder: String, path: String },
+    /// Replace the folder's ignore rules with the text of a file (`-` for standard input).
+    Set { folder: String, file: String },
 }
 
 #[derive(Subcommand)]
@@ -519,6 +531,16 @@ enum RetainedAction {
         #[arg(long)]
         group: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum NetworkAction {
+    /// Show whether syncing pauses on a metered connection.
+    Show,
+    /// Keep syncing on a metered connection.
+    SyncOnMetered,
+    /// Pause syncing on a metered connection (the default).
+    PauseOnMetered,
 }
 
 #[derive(Subcommand)]
@@ -857,8 +879,11 @@ enum SendLinkAction {
         ttl: Option<u32>,
     },
     /// Redeem a code someone gave you, choosing which of your devices receives the file.
+    ///
+    /// Leave the code out (or give `-`) to type or pipe it in: a code on the command line is
+    /// visible to other users of this machine and stays in your shell history.
     Redeem {
-        code: String,
+        code: Option<String>,
         /// One of your devices; this device when omitted.
         #[arg(long)]
         device: Option<String>,
@@ -886,10 +911,15 @@ enum DaemonAction {
     /// Start the sync daemon.
     Start,
     /// Stop the sync daemon.
-    Stop,
+    Stop {
+        /// Also remove the entry that starts the daemon at login (made by `daemon start`).
+        /// Nothing is an error here if the daemon was not running.
+        #[arg(long)]
+        disable: bool,
+    },
     /// Pause syncing, until you resume or for a set time.
     Pause {
-        /// How long to pause: 30m, 1h or tomorrow (until local midnight). Omit to pause until resumed.
+        /// How long to pause: 2h, 8h or 24h. Omit to pause until resumed.
         #[arg(long = "for", value_enum)]
         duration: Option<commands::daemon::PauseFor>,
     },
@@ -1014,6 +1044,7 @@ async fn async_main() {
     let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
     let cli = Cli::parse();
     let is_sign_in_command = is_sign_in_command(&cli.command);
+    let may_start_daemon = !is_daemon_command(&cli.command);
     let result = run(cli.command).await;
     if let Err(e) = result {
         eprintln!("error: {e}");
@@ -1027,11 +1058,18 @@ async fn async_main() {
             // failure's, whatever the sign-in does.
             eprintln!("Starting the sign-in. The browser shows the Terms to review and accept.");
             match commands::auth::login_on_stderr(device).await {
-                Ok(()) => eprintln!(
-                    "Signed in. Run the command again; a running daemon can take up to two \
-                     minutes to notice."
-                ),
+                Ok(()) => eprintln!("Signed in. Run the command again."),
                 Err(login_error) => eprintln!("error: {login_error}"),
+            }
+        }
+        if may_start_daemon
+            && commands::daemon::auto_start_plan(&e, commands::auth::TerminalEnv::detect)
+        {
+            // The command did not run, so it is not retried; the exit code stays the failure's.
+            eprintln!("The YadoriLink daemon was not running; starting it.");
+            match commands::daemon::start().await {
+                Ok(()) => eprintln!("Run the command again."),
+                Err(start_error) => eprintln!("error: {start_error}"),
             }
         }
         if let Some(detail) = e.daemon_refusal_detail() {
@@ -1046,6 +1084,20 @@ async fn async_main() {
         }
         std::process::exit(e.exit_code());
     }
+}
+
+/// The commands that must see "the daemon is not running" as it is: the ones that start and stop it,
+/// `status` (the installers read its exit status 4), and the ones that remove or replace it.
+fn is_daemon_command(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Daemon { .. }
+            | Command::Status { .. }
+            | Command::Uninstall { .. }
+            | Command::Update { .. }
+            | Command::SelfUpdate { .. }
+            | Command::Doctor
+    )
 }
 
 /// The commands that are themselves about signing in or out, which must never start another.
@@ -1085,6 +1137,14 @@ async fn run_preserved(action: PreservedAction) -> Result<(), CliError> {
         PreservedAction::Discard { item_id, yes } => {
             commands::preserved::discard(&item_id, yes).await
         }
+    }
+}
+
+async fn run_network(action: NetworkAction) -> Result<(), CliError> {
+    match action {
+        NetworkAction::Show => commands::network::show().await,
+        NetworkAction::SyncOnMetered => commands::network::set_sync_on_metered(true).await,
+        NetworkAction::PauseOnMetered => commands::network::set_sync_on_metered(false).await,
     }
 }
 
@@ -1218,8 +1278,12 @@ async fn run_send_link(action: SendLinkAction) -> Result<(), CliError> {
 
 async fn run(command: Command) -> Result<(), CliError> {
     match command {
-        Command::Login { code: Some(code), .. } => commands::auth::login_with_code(&code).await,
-        Command::Login { device, code: None } => commands::auth::login(device).await,
+        Command::Login { code: Some(code), device_name, .. } => {
+            commands::auth::login_with_code(&code, device_name).await
+        }
+        Command::Login { device, code: None, device_name } => {
+            commands::auth::login(device, device_name).await
+        }
         Command::Logout { yes } => commands::auth::logout(yes).await,
         Command::ForgetLocalCredentials => commands::auth::forget_local_credentials().await,
         Command::Credentials { action: CredentialsAction::Purge } => {
@@ -1279,11 +1343,16 @@ async fn run(command: Command) -> Result<(), CliError> {
         Command::MaterializationStatus { local_path } => {
             commands::materialization::status(local_path).await
         }
-        Command::Pin { local_path } => commands::materialization::pin(local_path).await,
-        Command::Unpin { local_path } => commands::materialization::unpin(local_path).await,
+        Command::Keep { local_path } => commands::materialization::keep(local_path).await,
+        Command::OnlineOnly { local_path } => {
+            commands::materialization::online_only(local_path).await
+        }
+        Command::Default { local_path } => {
+            commands::materialization::default_rule(local_path).await
+        }
         Command::Daemon { action } => match action {
             DaemonAction::Start => commands::daemon::start().await,
-            DaemonAction::Stop => commands::daemon::stop().await,
+            DaemonAction::Stop { disable } => commands::daemon::stop(disable).await,
             DaemonAction::Pause { duration } => commands::daemon::pause(duration).await,
             DaemonAction::Resume => commands::daemon::resume().await,
             DaemonAction::ReleaseToApp {
@@ -1318,15 +1387,17 @@ async fn run(command: Command) -> Result<(), CliError> {
         Command::Gc { dry_run } => commands::gc::run(dry_run).await,
         Command::Preserved { action } => run_preserved(action).await,
         Command::Rewind(command) => run_rewind(command).await,
+        Command::Network { action } => run_network(action).await,
         Command::Space { action } => run_space(action).await,
         Command::Limits { action } => match action {
             LimitsAction::Set { up, down } => commands::limits::set(up, down).await,
             LimitsAction::Show => commands::limits::show().await,
         },
         Command::Ignore { action } => match action {
-            IgnoreAction::List { link_path } => commands::ignore::list(link_path),
-            IgnoreAction::Test { path } => commands::ignore::test(path),
-            IgnoreAction::Explain { path } => commands::ignore::explain(path),
+            IgnoreAction::List { folder } => commands::ignore::list(folder).await,
+            IgnoreAction::Test { folder, path } => commands::ignore::test(folder, path).await,
+            IgnoreAction::Explain { folder, path } => commands::ignore::explain(folder, path).await,
+            IgnoreAction::Set { folder, file } => commands::ignore::set(folder, file).await,
         },
         Command::Report { action } => run_report(action).await,
         Command::Diagnose { action } => match action {

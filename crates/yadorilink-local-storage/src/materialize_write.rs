@@ -11,7 +11,7 @@ use crate::content_ports::BlockContentStore;
 use crate::error::StorageError;
 use crate::fs_ops::{durable_namespace_beside, remove_path, rename_path, LedgerNames};
 use crate::LocallyHashedBlock;
-use yadorilink_fs_platform::durable_dir::Replace;
+use yadorilink_fs_platform::durable_dir::{NsError, Replace};
 use yadorilink_replica_domain::file::BlockInfo;
 
 /// How much of a reconstructed file's durability the writer pays for itself.
@@ -49,7 +49,7 @@ const MAX_TMP_NAME_ATTEMPTS: usize = 8;
 /// A fresh temp path beside `path`: a fixed-length name of 128 random bits that
 /// does not depend on `path`'s own name, so it can neither be predicted nor
 /// outgrow the filesystem's component limit.
-fn random_tmp_path(path: &Path) -> PathBuf {
+pub fn random_tmp_path(path: &Path) -> PathBuf {
     let mut bits = [0u8; 16];
     rand::fill(&mut bits[..]);
     path.with_file_name(format!("{TMP_PREFIX}{}", hex::encode(bits)))
@@ -69,8 +69,9 @@ fn create_recorded_tmp<T>(
     mut next_name: impl FnMut(&Path) -> PathBuf,
     mut create: impl FnMut(&Path) -> std::io::Result<T>,
 ) -> Result<(PathBuf, T), StorageError> {
+    let mut preassigned = ledger.preassigned_name();
     for _ in 0..MAX_TMP_NAME_ATTEMPTS {
-        let tmp_path = next_name(out_path);
+        let tmp_path = preassigned.take().unwrap_or_else(|| next_name(out_path));
         match ledger.record(&tmp_path) {
             Ok(()) => {}
             Err(StorageError::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -137,6 +138,11 @@ pub trait TempFileLedger: Send + Sync {
     /// disk either way, but an unreported one is a silent one, so a failure to
     /// record it is an error for the caller.
     fn strand(&self, dir_path: &Path) -> Result<(), StorageError>;
+    /// A temp name chosen in advance (and already named by the write's intent), which the next
+    /// temp created through this ledger takes as its first candidate. Taken once.
+    fn preassigned_name(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// For writers with no recovery to speak of (a one-shot copy outside any
@@ -777,8 +783,24 @@ pub fn reconstruct_file_in(
     mtime_unix_nanos: i64,
     ledger: &dyn TempFileLedger,
 ) -> Result<(), StorageError> {
+    // What this call may replace is what stands at the path as it starts: a save that lands during
+    // the assembly or at the rename is kept (see `persist_reconstructed_file_checked`).
+    let expected = TargetExpectation::observe(out_path)?;
     let tmp_path = reconstruct_file_to_temp_in(store, out_path, blocks, mtime_unix_nanos, ledger)?;
-    persist_reconstructed_file_in(&tmp_path, out_path, ledger)
+    let published = persist_reconstructed_file_checked(
+        &tmp_path,
+        out_path,
+        ledger,
+        Durability::Full,
+        None,
+        expected,
+    );
+    // A refusal leaves the temp to the caller; this caller has no use for it and keeps no handle
+    // on its name, so it goes here.
+    if matches!(published, Err(StorageError::TargetChanged(_))) {
+        discard_temp_file(&tmp_path, ledger);
+    }
+    published
 }
 
 /// The "assemble" half of [`reconstruct_file`]: reads `blocks` from `store`
@@ -951,6 +973,76 @@ fn reconstruct_file_to_named_temp_with(
     assemble()?;
     cleanup.1 = true;
     Ok(tmp_path)
+}
+
+/// A temp file a crash left, opened and read back against the version's blocks: recovery
+/// finishes a write from it only through this handle.
+///
+/// The file is opened without following a symlink, must be a regular file with one name only (a
+/// second hard link would let someone else write the bytes that were verified, or have their own
+/// file's metadata changed), and is verified through the handle it keeps. Stamping, flushing and
+/// the last check before the rename all go through that handle; the rename is allowed only while
+/// the name still leads to the verified object.
+pub struct VerifiedTemp {
+    path: PathBuf,
+    file: fs::File,
+}
+
+impl VerifiedTemp {
+    /// `None` unless the file at `path` holds exactly the bytes `blocks` describe: its length is
+    /// the record's size and every block range hashes to the block.
+    pub fn open(path: &Path, blocks: &[BlockInfo]) -> Option<Self> {
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NOFOLLOW);
+        let file = options.open(path).ok()?;
+        let temp = Self { path: path.to_path_buf(), file };
+        let meta = temp.file.metadata().ok()?;
+        let expected: u64 = blocks.iter().map(|block| u64::from(block.size)).sum();
+        if !meta.is_file() || meta.len() != expected || !temp.is_still_at_its_path() {
+            return None;
+        }
+        let matches = blocks.iter().all(|block| {
+            let mut data = vec![0u8; block.size as usize];
+            read_exact_at(&temp.file, &mut data, block.offset).is_ok()
+                && LocallyHashedBlock::from_bytes(data).hash().as_bytes()
+                    == hex::encode(&block.hash).as_bytes()
+        });
+        matches.then_some(temp)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Stamps the modification time and flushes the data, both through the verified handle (the
+    /// crash may have come before either).
+    pub fn prepare_for_publish(&self, mtime_unix_nanos: i64) -> Result<(), StorageError> {
+        stamp_mtime(&self.file, mtime_unix_nanos);
+        yadorilink_fs_platform::flush::sync_file(&self.file)?;
+        Ok(())
+    }
+
+    /// Whether the name still leads to the object this handle verified, and that object has one
+    /// name only. `false` where the platform gives no object identity.
+    pub fn is_still_at_its_path(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let (Ok(handle), Ok(named)) = (self.file.metadata(), fs::symlink_metadata(&self.path))
+            else {
+                return false;
+            };
+            named.is_file()
+                && (handle.dev(), handle.ino()) == (named.dev(), named.ino())
+                && handle.nlink() == 1
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
 }
 
 /// A temp file beside its target that a large received file is written into while it arrives: each
@@ -1197,50 +1289,162 @@ fn read_exact_at(file: &fs::File, mut buf: &mut [u8], mut offset: u64) -> std::i
     Ok(())
 }
 
-/// The "publish" half of [`reconstruct_file`]: atomically renames an
-/// already-assembled temp file (from [`reconstruct_file_to_temp`]) into
-/// place at `out_path`, then syncs the parent directory. Fast (one rename,
-/// one directory fsync) and does no network/block-store I/O -- the
-/// intended boundary for a caller that wants to hold a path's lock across
-/// only this short step, not the slower assemble step above.
-///
-/// On any failure, removes `tmp_path` so an interrupted publish leaves the
-/// directory as it found it. `tmp_path` must not be reused after this
-/// returns, whether it succeeds or fails.
-pub fn persist_reconstructed_file(tmp_path: &Path, out_path: &Path) -> Result<(), StorageError> {
+/// The unchecked spellings of the publish, for tests of the publish itself: each observes what
+/// stands at the target as it is called and publishes through
+/// [`persist_reconstructed_file_checked`]. Product code names the expectation it classified.
+#[cfg(test)]
+pub(crate) fn persist_reconstructed_file(
+    tmp_path: &Path,
+    out_path: &Path,
+) -> Result<(), StorageError> {
     persist_reconstructed_file_in(tmp_path, out_path, &NoTempLedger)
 }
 
-/// [`persist_reconstructed_file`] for a temp file recorded in `ledger`: the
-/// record is released once the temp file is renamed away or removed.
-pub fn persist_reconstructed_file_in(
+#[cfg(test)]
+pub(crate) fn persist_reconstructed_file_in(
     tmp_path: &Path,
     out_path: &Path,
     ledger: &dyn TempFileLedger,
 ) -> Result<(), StorageError> {
-    persist_reconstructed_file_durable(tmp_path, out_path, ledger, Durability::Full)
+    persist_reconstructed_file_durable(tmp_path, out_path, ledger, Durability::Full, None)
 }
 
-/// [`persist_reconstructed_file_in`] with the directory flush chosen.
-/// `DeferredToBatch` renames and returns: no parent flush, and the temp name's
-/// ledger record is kept (the caller releases it after
-/// [`flush_received_files`]). Only a Unix volume with durable moves defers; any
-/// other publish is the full one, and the record is then already released --
-/// releasing it again is harmless.
-pub fn persist_reconstructed_file_durable(
+#[cfg(test)]
+pub(crate) fn persist_reconstructed_file_durable(
     tmp_path: &Path,
     out_path: &Path,
     ledger: &dyn TempFileLedger,
     durability: Durability,
+    exec: Option<bool>,
 ) -> Result<(), StorageError> {
-    #[cfg(not(unix))]
-    let _ = durability;
-    // In the deferred modes a failed publish leaves the temp (and its ledger record) to the
-    // caller: it may have recorded the temp's flushed name as a witness that the name was
-    // renamed, and a witness must be withdrawn BEFORE its temp is removed. A caller that cannot
-    // tell the difference removes the temp itself.
+    let expected = TargetExpectation::observe(out_path)?;
+    persist_reconstructed_file_checked(tmp_path, out_path, ledger, durability, exec, expected)
+}
+
+/// What stood at a write's target when the writer decided to replace it (or to write where
+/// nothing stands).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one short-lived value per write; Copy keeps it simple"
+)]
+pub enum TargetExpectation {
+    /// Nothing: the publish must not replace anything that has appeared since.
+    Absent,
+    /// This object, unmodified: the publish replaces it only while the target is still exactly
+    /// this object (same identity, size and modification time).
+    Object(ObjectStamp),
+}
+
+/// One observation of an object, for telling later whether it is the same object, unmodified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectStamp {
+    identity: yadorilink_fs_platform::fs_identity::FileIdentity,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl ObjectStamp {
+    fn observe(path: &Path) -> std::io::Result<Self> {
+        let identity = yadorilink_fs_platform::fs_identity::FileIdentity::observe_path(path)?;
+        let modified = fs::symlink_metadata(path)?.modified().ok();
+        Ok(Self { identity, modified })
+    }
+
+    /// The same object with the same content: identity, size and modification time. The change
+    /// time is left out on purpose: moving the object between names changes it, and the
+    /// verification of an exchanged-out object must not refuse for that.
+    fn unmodified_since(&self, earlier: &Self) -> bool {
+        let (a, b) = (&self.identity, &earlier.identity);
+        a.volume_identity == b.volume_identity
+            && a.object_id == b.object_id
+            && a.object_kind == b.object_kind
+            && a.generation_or_usn == b.generation_or_usn
+            && a.birth_or_creation_time == b.birth_or_creation_time
+            && a.observed_size == b.observed_size
+            && self.modified == earlier.modified
+            && self.modified.is_some()
+    }
+}
+
+impl TargetExpectation {
+    /// Observes `path` now (never following a terminal symlink).
+    pub fn observe(path: &Path) -> std::io::Result<Self> {
+        match fs::symlink_metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::Absent),
+            Err(e) => Err(e),
+            Ok(_) => ObjectStamp::observe(path).map(Self::Object),
+        }
+    }
+
+    /// Whether the object at `path` now is what was expected there.
+    fn holds_at(self, path: &Path) -> bool {
+        match (self, Self::observe(path)) {
+            (Self::Absent, Ok(Self::Absent)) => true,
+            (Self::Object(expected), Ok(Self::Object(now))) => now.unmodified_since(&expected),
+            _ => false,
+        }
+    }
+}
+
+/// [`persist_reconstructed_file_durable`] for a write that decided, earlier, what it may replace:
+/// the target is checked against `expected` immediately before the rename, in the same step. A
+/// target that is no longer what was decided on is left untouched (the temp stays for the caller
+/// and [`StorageError::TargetChanged`] is returned): bytes a user saved meanwhile are never
+/// replaced. `Absent` also publishes without replacing, so a name created between the check and
+/// the rename is kept as well; a replaced `Object` is checked, then renamed over, with no
+/// syscall between that the filesystem could interleave a save into other than the rename's own.
+pub fn persist_reconstructed_file_checked(
+    tmp_path: &Path,
+    out_path: &Path,
+    ledger: &dyn TempFileLedger,
+    durability: Durability,
+    exec: Option<bool>,
+    expected: TargetExpectation,
+) -> Result<(), StorageError> {
     let keep_temp =
         matches!(durability, Durability::DeferredToBatch | Durability::FileFlushedNamesDeferred);
+    persist_reconstructed_file_inner(
+        tmp_path, out_path, ledger, durability, exec, expected, keep_temp,
+    )
+}
+
+/// [`persist_reconstructed_file_checked`] for a temp the caller did not make and may not have
+/// another copy of (one a crashed write left, finished from after it was read back): whatever
+/// fails, the temp stays where it is. Only a success moves it.
+pub fn persist_borrowed_temp_checked(
+    tmp_path: &Path,
+    out_path: &Path,
+    ledger: &dyn TempFileLedger,
+    exec: Option<bool>,
+    expected: TargetExpectation,
+) -> Result<(), StorageError> {
+    persist_reconstructed_file_inner(
+        tmp_path,
+        out_path,
+        ledger,
+        Durability::Full,
+        exec,
+        expected,
+        true,
+    )
+}
+
+fn persist_reconstructed_file_inner(
+    tmp_path: &Path,
+    out_path: &Path,
+    ledger: &dyn TempFileLedger,
+    durability: Durability,
+    exec: Option<bool>,
+    expected: TargetExpectation,
+    keep_temp: bool,
+) -> Result<(), StorageError> {
+    #[cfg(not(unix))]
+    let _ = exec;
+    // With `keep_temp` a failed publish leaves the temp (and its ledger record) to the caller.
+    // In the deferred modes the caller may have recorded the temp's flushed name as a witness
+    // that the name was renamed, and a witness must be withdrawn BEFORE its temp is removed; a
+    // borrowed temp may be the only copy of its bytes. A caller that cannot tell the difference
+    // removes the temp itself.
     let discard = |tmp: &Path| {
         if !keep_temp {
             discard_temp_file(tmp, ledger);
@@ -1253,6 +1457,15 @@ pub fn persist_reconstructed_file_durable(
         discard(tmp_path);
         return Err(error.into());
     }
+    // The carry-over drops every execute bit (they come from the replicated flag), so the flag
+    // is applied after it.
+    #[cfg(unix)]
+    if let Some(exec) = exec {
+        if let Err(error) = apply_exec(tmp_path, exec) {
+            discard(tmp_path);
+            return Err(error);
+        }
+    }
     let namespace = match durable_namespace_beside(out_path) {
         Ok(namespace) => namespace,
         Err(error) => {
@@ -1260,44 +1473,111 @@ pub fn persist_reconstructed_file_durable(
             return Err(error.into());
         }
     };
-    // Only a Unix volume defers the flush.
-    #[cfg(not(unix))]
-    let _ = durability;
-    #[cfg(unix)]
-    if let (Some(ns), Durability::DeferredToBatch | Durability::FileFlushedNamesDeferred) =
-        (&namespace, durability)
-    {
-        let published = crate::io_diag::time(crate::io_diag::Op::Rename, 0, || {
-            ns.publish_without_flush(tmp_path, out_path, Replace::Yes, &LedgerNames(ledger), true)
-        });
-        return published.map_err(|error| StorageError::Io(error.into()));
-    }
-    if let Some(ns) = namespace {
-        // The temp file is flushed; a durable move publishes it and removes the
-        // temp name, and the record is released once that name is gone.
-        let published = crate::io_diag::time(crate::io_diag::Op::Rename, 0, || {
-            ns.publish(tmp_path, out_path, Replace::Yes, &LedgerNames(ledger))
-        });
-        note_directory_sync_inside_the_move(out_path);
-        return published.map_err(|error| StorageError::Io(error.into()));
-    }
-    let publish = || -> Result<(), StorageError> {
-        crate::io_diag::time(crate::io_diag::Op::Rename, 0, || rename_path(tmp_path, out_path))?;
-        tracing::debug!("phase T_recv_rename_done: temp-file-to-final-path rename complete");
-        sync_parent_directory(out_path)?;
-        // On Unix this is a real parent-directory fsync (see `sync_parent_
-        // directory`'s own doc comment); on non-Unix it is a documented
-        // no-op, so this line still fires there but measures nothing real
-        // -- a phase-log reader on a non-Unix capture should read this
-        // span as "step skipped," not "step free."
-        tracing::debug!(
-            "phase T_recv_dir_fsync_done: parent-directory fsync complete (or skipped, non-Unix)"
-        );
-        Ok(())
+    // The decision is re-checked after everything slow, inside the move, immediately before
+    // the rename, and a changed target leaves the temp and the target as they are (the temp
+    // may be the only copy of the bytes).
+    publish_checked(tmp_path, out_path, ledger, durability, namespace, expected, keep_temp)
+}
+
+/// The publish of [`persist_reconstructed_file_checked`]: renames `tmp_path` to `out_path` only
+/// while the target is still what `expected` says. `Absent` never replaces anything (an atomic
+/// no-replace rename), so a name created at any moment is kept; a replaced `Object` is re-checked
+/// inside the move, after the volume and directory handling, the instant before the rename. A
+/// rename cannot compare what it replaces, so where the file system has an atomic exchange the
+/// replaced object is not checked and then renamed over: the two names are exchanged, the
+/// captured object is verified, and the exchange is undone if it is not the expected one (see
+/// `DurableNamespace::replace_if_unchanged`), so no save is ever replaced. Only where there is no
+/// exchange does the few-instruction window between check and rename remain. Every refusal
+/// returns [`StorageError::TargetChanged`] with the temp untouched; any other failure discards the
+/// temp as the unchecked publish does.
+fn publish_checked(
+    tmp_path: &Path,
+    out_path: &Path,
+    ledger: &dyn TempFileLedger,
+    durability: Durability,
+    namespace: Option<yadorilink_fs_platform::durable_dir::DurableNamespace>,
+    expected: TargetExpectation,
+    keep_temp: bool,
+) -> Result<(), StorageError> {
+    let changed = || StorageError::TargetChanged(out_path.to_path_buf());
+    let deferred =
+        matches!(durability, Durability::DeferredToBatch | Durability::FileFlushedNamesDeferred);
+    let fail = |error: StorageError| {
+        if !keep_temp {
+            discard_temp_file(tmp_path, ledger);
+        }
+        error
     };
-    if let Err(e) = publish() {
-        discard(tmp_path);
-        return Err(e);
+    if let Some(ns) = namespace {
+        // Only a Unix volume defers the flush; elsewhere the move is the full one.
+        let flush = !(cfg!(unix) && deferred);
+        let moved = crate::io_diag::time(crate::io_diag::Op::Rename, 0, || match expected {
+            TargetExpectation::Absent => {
+                ns.move_if(tmp_path, out_path, Replace::No, flush, &|| expected.holds_at(out_path))
+            }
+            TargetExpectation::Object(_) => {
+                ns.replace_if_unchanged(tmp_path, out_path, flush, &|captured| {
+                    expected.holds_at(captured)
+                })
+            }
+        });
+        return match moved {
+            Ok(()) => {
+                if flush {
+                    ledger.release(tmp_path);
+                    note_directory_sync_inside_the_move(out_path);
+                }
+                Ok(())
+            }
+            Err(NsError::Refused | NsError::AlreadyExists) => Err(changed()),
+            // A simulated crash leaves the temp and its record as they are.
+            Err(error) if error.is_simulated_crash() => Err(StorageError::Io(error.into())),
+            Err(error) => Err(fail(StorageError::Io(error.into()))),
+        };
+    }
+    // No durable move on this volume: the plain rename. An absent target still never replaces
+    // (where the platform has an atomic no-replace rename); a replaced object is checked just
+    // before the rename.
+    let moved = crate::io_diag::time(crate::io_diag::Op::Rename, 0, || match expected {
+        TargetExpectation::Absent => match rename_no_replace(tmp_path, out_path) {
+            // No atomic no-replace rename on this platform or volume: absence is checked just
+            // before the rename (the window of the object case, without a durable move).
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                if expected.holds_at(out_path) {
+                    rename_path(tmp_path, out_path)
+                } else {
+                    Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+                }
+            }
+            other => other,
+        },
+        TargetExpectation::Object(_) => {
+            match yadorilink_fs_platform::durable_dir::swap_in_if(
+                tmp_path,
+                out_path,
+                &|captured| expected.holds_at(captured),
+            )? {
+                yadorilink_fs_platform::durable_dir::SwapIn::Replaced => Ok(()),
+                yadorilink_fs_platform::durable_dir::SwapIn::Refused => {
+                    Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+                }
+                yadorilink_fs_platform::durable_dir::SwapIn::Unsupported => {
+                    if expected.holds_at(out_path) {
+                        rename_path(tmp_path, out_path)
+                    } else {
+                        Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+                    }
+                }
+            }
+        }
+    });
+    match moved {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(changed()),
+        Err(e) => return Err(fail(StorageError::Io(e))),
+    }
+    if let Err(e) = sync_parent_directory(out_path) {
+        return Err(fail(e));
     }
     ledger.release(tmp_path);
     Ok(())
@@ -1748,43 +2028,38 @@ pub fn apply_file_metadata(path: &Path, exec: bool) -> Result<(), StorageError> 
 /// regular-file materialization already gives.
 #[cfg(unix)]
 pub fn materialize_symlink(out_path: &Path, target: &[u8]) -> Result<(), StorageError> {
-    materialize_symlink_in(out_path, target, &NoTempLedger)
+    let expected = TargetExpectation::observe(out_path)?;
+    materialize_symlink_in(out_path, target, &NoTempLedger, expected)
 }
 
-/// [`materialize_symlink`] with its temp link recorded in `ledger`.
+/// [`materialize_symlink`] with its temp link recorded in `ledger`, replacing only what
+/// `expected` says stands at `out_path` (see [`persist_reconstructed_file_checked`]): a changed
+/// target is [`StorageError::TargetChanged`], with the target untouched and the temp link removed.
 #[cfg(unix)]
 pub fn materialize_symlink_in(
     out_path: &Path,
     target: &[u8],
     ledger: &dyn TempFileLedger,
+    expected: TargetExpectation,
 ) -> Result<(), StorageError> {
     require_parent_directory(out_path)?;
     let link_target = yadorilink_fs_platform::fs_identity::bytes_to_target(target);
     let (tmp_path, ()) = create_recorded_tmp(out_path, ledger, random_tmp_path, |tmp| {
         std::os::unix::fs::symlink(&link_target, tmp)
     })?;
-    if let Some(ns) = durable_namespace_beside(out_path)? {
-        // Published by a durable move: the link is not reported as present
-        // before its name is on disk.
-        return ns
-            .publish(&tmp_path, out_path, Replace::Yes, &LedgerNames(ledger))
-            .map_err(|error| StorageError::Io(error.into()));
-    }
-    match rename_path(&tmp_path, out_path) {
-        Ok(()) => {
-            // The same directory holds the new name and the gone temp name.
-            // The link is published only once that entry is durable: a failed
-            // flush is an error, not a link the caller may record as present
-            // (the temp record stays, to be cleaned by the ledger's sweep).
-            sync_parent_directory(out_path)?;
-            ledger.release(&tmp_path);
-            Ok(())
-        }
-        Err(e) => {
+    let namespace = match durable_namespace_beside(out_path) {
+        Ok(namespace) => namespace,
+        Err(error) => {
             discard_temp_file(&tmp_path, ledger);
-            Err(e.into())
+            return Err(error.into());
         }
+    };
+    let published =
+        publish_checked(&tmp_path, out_path, ledger, Durability::Full, namespace, expected, false);
+    if matches!(published, Err(StorageError::TargetChanged(_))) {
+        discard_temp_file(&tmp_path, ledger);
     }
+    published
 }
 
 /// Windows per-link opt-in symlink materialization: the default Windows
@@ -1814,7 +2089,8 @@ pub fn materialize_symlink_in(
 /// unverified until run on real Windows.
 #[cfg(windows)]
 pub fn materialize_symlink_windows(out_path: &Path, target: &[u8]) -> Result<(), StorageError> {
-    materialize_symlink_windows_in(out_path, target, &NoTempLedger)
+    let expected = TargetExpectation::observe(out_path)?;
+    materialize_symlink_windows_in(out_path, target, &NoTempLedger, expected)
 }
 
 /// [`materialize_symlink_windows`] with its temp link recorded in `ledger`.
@@ -1823,6 +2099,7 @@ pub fn materialize_symlink_windows_in(
     out_path: &Path,
     target: &[u8],
     ledger: &dyn TempFileLedger,
+    expected: TargetExpectation,
 ) -> Result<(), StorageError> {
     // `target` is `target_to_bytes`'s own little-endian UTF-16 output (see
     // `fs_identity::bytes_to_target`'s doc) for any target this crate itself
@@ -1868,17 +2145,12 @@ pub fn materialize_symlink_windows_in(
             return Err(error.into());
         }
     };
-    if let Some(ns) = namespace {
-        return ns
-            .publish(&tmp_path, out_path, Replace::Yes, &LedgerNames(ledger))
-            .map_err(|error| StorageError::Io(error.into()));
-    }
-    if let Err(e) = rename_path(&tmp_path, out_path) {
+    let published =
+        publish_checked(&tmp_path, out_path, ledger, Durability::Full, namespace, expected, false);
+    if matches!(published, Err(StorageError::TargetChanged(_))) {
         discard_temp_file(&tmp_path, ledger);
-        return Err(e.into());
     }
-    release_once_gone_is_durable(&tmp_path, ledger);
-    Ok(())
+    published
 }
 
 #[cfg(test)]

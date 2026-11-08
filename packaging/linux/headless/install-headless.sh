@@ -320,7 +320,6 @@ cat <<EOF2
 Installed. $UNIT_NAME is enabled but NOT started: sign in first.
 Next steps (see packaging/linux/README.md ("Always-on headless install")):
   sudo yadorilink-svc login --device
-  sudo yadorilink-svc device register --name "$(hostname 2>/dev/null || echo nas)"
   sudo systemctl start $UNIT_NAME
   # wait until 'sudo yadorilink-svc status' shows connected / policy loaded, then:
   sudo yadorilink-svc share create <group> --path $FOLDERS_DIR/<group>

@@ -10,6 +10,9 @@ use crate::queries::link_status::{FetchAvailability, LinkTransferView};
 
 fn view(group_id: &str) -> LinkStatusView {
     LinkStatusView {
+        folder_blockers: Vec::new(),
+        pending_local_changes: 0,
+        last_change_origin_device_id: None,
         local_path: format!("/data/{group_id}"),
         provider: None,
         group_id: group_id.to_owned(),
@@ -31,6 +34,10 @@ fn view(group_id: &str) -> LinkStatusView {
         total_bytes: 0,
         online_only_bytes: 0,
         requested_content_count: 0,
+        pinned_pending_count: 0,
+        pinned_pending_error: String::new(),
+        pinned_pending_retry_secs: 0,
+        retention: Default::default(),
         held_files: Vec::new(),
         skipped_symlink_count: 0,
         stranded_directory_count: 0,

@@ -112,6 +112,19 @@ impl SharedAddressBook {
     }
 }
 
+impl SharedAddressBook {
+    /// This book as what the local network announced, for
+    /// [`NetworkConfig::with_lan_source_for_tests`]: multicast is not something a test host
+    /// reliably delivers, so the book stands in for mDNS and the authorization filter in front of
+    /// it stays the production one.
+    pub fn as_lan_source(&self) -> std::sync::Arc<dyn iroh::address_lookup::AddressLookup> {
+        std::sync::Arc::new(crate::directory::DirectoryLookup::new(
+            std::sync::Arc::new(self.clone()),
+            crate::peer::PeerId::from_bytes([0; 32]),
+        ))
+    }
+}
+
 impl crate::directory::AddressDirectory for SharedAddressBook {
     fn publish(
         &self,

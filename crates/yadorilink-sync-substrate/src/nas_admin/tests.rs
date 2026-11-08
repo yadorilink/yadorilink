@@ -16,7 +16,7 @@ fn every_status_round_trips_through_its_byte_and_no_other_byte_decodes() {
 
 #[test]
 fn the_alpn_names_the_service_and_its_version_and_nothing_else() {
-    assert_eq!(YADORI_NAS_ADMIN_ALPN, b"yadorilink/nas-admin/v1");
+    assert_eq!(YADORI_NAS_ADMIN_ALPN, b"yadorilink/nas-admin/v2");
 }
 
 /// The module that answers this protocol must never open a socket of its

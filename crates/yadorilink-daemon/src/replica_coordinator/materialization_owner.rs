@@ -35,8 +35,6 @@ mod structural;
 
 #[cfg(test)]
 pub(crate) use hydration::HydrationAttempt;
-#[cfg(test)]
-pub(crate) use repair::set_test_fail_repair_reconstruct_proof_commit;
 
 impl ReplicaCoordinator {
     /// Records the placeholder identity a placeholder write reported for

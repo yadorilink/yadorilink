@@ -12,6 +12,7 @@ fn root() -> ProviderRoot {
         error_description: None,
         namespace_ready: false,
         latest_evidence_seq: 0,
+        publish_only: false,
     }
 }
 
@@ -181,4 +182,65 @@ fn the_sync_root_folder_comes_from_what_the_host_registered() {
     assert_eq!(sync_root_text(&registered, "abcdef0123456789"), "C:\\Users\\a\\YadoriLink\\Photos");
     assert_eq!(sync_root_text(&registered, "0000000000000000"), "");
     assert_eq!(sync_root_text(&Default::default(), "abcdef0123456789"), "");
+}
+
+/// A ready root whose publication has been held a minute for the handoff folder says why; an
+/// error keeps its own words, a short wait stays "ready", and no hold changes nothing.
+#[test]
+fn a_root_whose_updates_wait_for_the_handoff_folder_says_so() {
+    let line =
+        |readiness: &str| ProviderRootStatus { readiness: readiness.into(), ..Default::default() };
+    for held in [60_000, 61_000] {
+        let mut waiting = line("ready");
+        apply_handoff_root_wait(&mut waiting, Some(held));
+        assert_eq!(waiting.readiness, HANDOFF_ROOT_WAIT_TEXT, "{held} ms");
+    }
+
+    for (mut unchanged, held) in [
+        (line("ready"), None),
+        (line("ready"), Some(59_999)),
+        (line("enable File Provider"), Some(61_000)),
+    ] {
+        let before = unchanged.readiness.clone();
+        apply_handoff_root_wait(&mut unchanged, held);
+        assert_eq!(unchanged.readiness, before);
+    }
+}
+
+/// The wait is not a reason to ask the user for attention.
+#[test]
+#[cfg(feature = "process-model")]
+fn waiting_for_the_handoff_folder_is_not_an_attention_reason() {
+    let response = yadorilink_ipc_proto::daemonctl::StatusResponse {
+        provider_roots: vec![ProviderRootStatus {
+            root_id: "r1".into(),
+            readiness: HANDOFF_ROOT_WAIT_TEXT.into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let reasons = crate::status_report::attention_reasons_for_tests(&response);
+    assert!(!reasons.iter().any(|r| r.starts_with("provider_not_ready")), "{reasons:?}");
+}
+
+#[test]
+fn a_provider_folders_counts_follow_what_the_os_holds_and_never_exceed_the_files_there_are() {
+    use super::{provider_file_counts, OsFileCounts};
+    let counts = |total, held, opening| provider_file_counts(total, OsFileCounts { held, opening });
+    // 32 files, none on this PC: all online only (the table's own reading).
+    assert_eq!(counts(32, 0, 0), (0, 32, 0));
+    // One of them read completely, and one being fetched now.
+    assert_eq!(counts(32, 1, 1), (1, 30, 1));
+    // Everything on this PC.
+    assert_eq!(counts(32, 32, 0), (32, 0, 0));
+    // A report a moment ahead of the index (more held than files known): clamped, never negative.
+    assert_eq!(counts(3, 5, 0), (3, 0, 0));
+    // More opens than files left to open: only the files not already on this PC can be fetching.
+    assert_eq!(counts(4, 3, 9), (3, 0, 1));
+    assert_eq!(counts(0, 2, 2), (0, 0, 0));
+    // The three always add up to the total.
+    for (total, held, opening) in [(10, 4, 3), (7, 7, 7), (0, 0, 0), (5, 0, 9)] {
+        let (a, b, c) = counts(total, held, opening);
+        assert_eq!(a + b + c, total, "{total} {held} {opening}");
+    }
 }

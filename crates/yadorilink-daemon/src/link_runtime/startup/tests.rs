@@ -45,6 +45,7 @@ fn test_deps() -> Arc<LinkRuntimeDependencies> {
             tokio::sync::broadcast::channel(16).0,
         )),
         device_id: "device-a".to_string(),
+        ignore_rules: crate::test_support::peer_session_fixture::scratch_ignore_rules(),
         host: Arc::new(NoopHost),
     })
 }

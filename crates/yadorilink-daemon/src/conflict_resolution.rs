@@ -290,8 +290,25 @@ async fn keep_both(
         // that version, and without it a copy another device authored is never removed
         // there, so the two devices differ for good.
         bump_fence(state, group_id, &target)?;
+        // A user's choice moves a file the daemon already holds under a new name: no row, intent
+        // or proof is written here (capture authors the rows from the journaled paths below), so
+        // the steps recorded are the fence bump and the move.
+        crate::write_op::trace::emit_at(group_id, &target, crate::write_op::StepEvent::Prepared);
+        write_op_failpoint(crate::write_op::failpoint::WriteOpFailpoint::AfterPrepare, &target)?;
         match durable_dir::move_durably(copy_abs, &target_abs, Replace::No) {
             Ok(()) => {
+                crate::write_op::trace::emit_at(
+                    group_id,
+                    &target,
+                    crate::write_op::StepEvent::Published {
+                        names_deferred: false,
+                        landed_marked: false,
+                    },
+                );
+                write_op_failpoint(
+                    crate::write_op::failpoint::WriteOpFailpoint::AfterPublish,
+                    &target,
+                )?;
                 let coordinator = &state.replica_coordinator;
                 coordinator.journal_uncaptured_local_edit(group_id, copy_path, false, &permit)?;
                 coordinator.journal_uncaptured_local_edit(group_id, &target, true, &permit)?;
@@ -302,6 +319,15 @@ async fn keep_both(
         }
     }
     unreachable!("the name counter does not run out before a free name")
+}
+
+/// A test-armed failure at a transition of the keep-both move (nothing in a production build).
+fn write_op_failpoint(
+    point: crate::write_op::failpoint::WriteOpFailpoint,
+    path: &str,
+) -> Result<(), ResolveConflictError> {
+    crate::write_op::failpoint::hit(point, path)
+        .map_err(|error| SyncError::CorruptState(error.to_string()).into())
 }
 
 fn bump_fence(

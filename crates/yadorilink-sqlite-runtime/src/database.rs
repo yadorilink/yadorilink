@@ -945,6 +945,49 @@ fn new_immediate_write_transaction(
 #[cfg(test)]
 mod tests;
 
+/// An open database does no scheduled work on its pool's worker threads (Linux: reads the threads'
+/// own wakeup counters).
+#[cfg(all(test, target_os = "linux"))]
+mod idle_tests {
+    use super::*;
+
+    /// Voluntary context switches of this process's `r2d2-worker-*` threads, summed.
+    fn worker_wakeups() -> u64 {
+        let mut total = 0;
+        for task in std::fs::read_dir("/proc/self/task").unwrap().flatten() {
+            let comm = std::fs::read_to_string(task.path().join("comm")).unwrap_or_default();
+            if !comm.trim().starts_with("r2d2-worker") {
+                continue;
+            }
+            let status = std::fs::read_to_string(task.path().join("status")).unwrap_or_default();
+            total += status
+                .lines()
+                .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))
+                .and_then(|n| n.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+        }
+        total
+    }
+
+    /// r2d2 runs its idle-connection reaper every 30 s on the pool's workers when an idle timeout
+    /// or a maximum lifetime is set; with neither, nothing is ever scheduled on them. A window
+    /// longer than the reaper period catches it.
+    #[test]
+    #[ignore = "real time: about 40 s"]
+    fn an_idle_pool_wakes_none_of_its_workers() {
+        let _db = SyncDatabase::open_in_memory(|conn| {
+            conn.execute_batch("CREATE TABLE t (x INTEGER);")?;
+            Ok(())
+        })
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(3)); // the pool fills its idle connection
+        let before = worker_wakeups();
+        std::thread::sleep(std::time::Duration::from_secs(35));
+        let during = worker_wakeups() - before;
+        assert_eq!(during, 0, "the pool's workers woke {during} times while idle");
+    }
+}
+
 #[cfg(test)]
 mod data_change_tests {
     use super::*;

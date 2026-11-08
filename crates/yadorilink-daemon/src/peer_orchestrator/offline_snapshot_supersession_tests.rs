@@ -262,7 +262,7 @@ async fn the_first_live_netmap_withdraws_a_restored_peer_it_does_not_name() {
 
     // A real link to the peer about to be withdrawn, so the teardown has
     // something to tear down.
-    restarted.peer_connectivity.record_link_up(REMOVED_PEER, None);
+    restarted.peer_connectivity.record_link_up(REMOVED_PEER, None, 0);
     assert!(
         restarted.peer_connectivity.reachability(REMOVED_PEER).is_some(),
         "sanity check: the peer is reachable before the netmap withdraws it"

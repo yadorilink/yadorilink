@@ -82,6 +82,11 @@ pub use recovery::RecoveryReport;
 use coordinator::{ensure_segments_directory, raw_hash, DurabilityCoordinator};
 use format::RAW_HASH_LEN;
 use index::{BlockIndex, BlockLocation};
+
+/// The refusal text of [`StorageError::AnotherLayout`].
+pub(crate) fn index_refusal_text(detail: &str, layout: &str, expected: i64) -> String {
+    index::another_layout_refusal(detail, layout, expected)
+}
 use segment::{read_record_payload, segment_path, RecordReadError};
 
 /// The human-readable marker file. The authority on format is the index's
@@ -1034,9 +1039,23 @@ fn refuse_a_store_of_another_layout(root: &Path) -> Result<(), StorageError> {
         Ok(found) => {
             let version_line = found.lines().nth(1).unwrap_or_default();
             if version_line.starts_with("format_version=") && version_line != expected_line {
-                return Err(StorageError::CorruptStore(index::another_layout_refusal(&format!(
-                    "the block store's marker ({version_line})"
-                ))));
+                let detail = format!("the block store's marker ({version_line})");
+                let found =
+                    version_line.strip_prefix("format_version=").and_then(index::plain_version);
+                return Err(index::older_layout(
+                    found,
+                    index::SHIPPED_STORE_FORMATS,
+                    index::STORE_FORMAT_VERSION,
+                    "block store format",
+                    &detail,
+                )
+                .unwrap_or_else(|| {
+                    StorageError::CorruptStore(index::another_layout_refusal(
+                        &detail,
+                        "block store format",
+                        index::STORE_FORMAT_VERSION,
+                    ))
+                }));
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1054,9 +1073,22 @@ fn refuse_a_store_of_another_layout(root: &Path) -> Result<(), StorageError> {
         }
         if let Some(layout) = format::declared_segment_layout(&header) {
             if layout != format::SEGMENT_FORMAT_VERSION {
-                return Err(StorageError::CorruptStore(index::another_layout_refusal(&format!(
-                    "segment {segment_id} (segment layout v{layout})"
-                ))));
+                let detail = format!("segment {segment_id} (segment layout v{layout})");
+                let expected = i64::from(format::SEGMENT_FORMAT_VERSION);
+                return Err(index::older_layout(
+                    Some(i64::from(layout)),
+                    index::SHIPPED_SEGMENT_LAYOUTS,
+                    expected,
+                    "segment layout",
+                    &detail,
+                )
+                .unwrap_or_else(|| {
+                    StorageError::CorruptStore(index::another_layout_refusal(
+                        &detail,
+                        "segment layout",
+                        expected,
+                    ))
+                }));
             }
         }
     }
@@ -1093,6 +1125,80 @@ fn system_time_to_unix_nanos(when: SystemTime) -> i64 {
 
 #[cfg(test)]
 mod older_store_tests;
+
+#[cfg(test)]
+mod reopen_tests {
+    use super::*;
+
+    /// Recovery truncates through the reopened handle, so a link at the segment's name must not be
+    /// followed to a file elsewhere, and only a regular file is reopened.
+    #[test]
+    fn reopening_a_segment_does_not_follow_a_link_or_open_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, b"not a segment").unwrap();
+        let root = dir.path().join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = segment::segment_path(&root, 7);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_file(&outside, &path).is_err() {
+            return; // creating a symlink needs a privilege this user lacks
+        }
+        assert!(segment::SegmentWriter::reopen(&root, 7, 13).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"not a segment");
+        std::fs::create_dir(segment::segment_path(&root, 8)).unwrap();
+        assert!(segment::SegmentWriter::reopen(&root, 8, 0).is_err());
+        segment::SegmentWriter::create(&root, 9).unwrap();
+        assert!(segment::SegmentWriter::reopen(&root, 9, format::SEGMENT_HEADER_LEN).is_ok());
+    }
+
+    /// A segment kept by a storage filter (here Windows compression, `compact.exe /exe:xpress16k`,
+    /// which is WOF-backed) is a regular file: recovery reopens it and cuts its uncommitted tail.
+    /// Needs `compact.exe` and NTFS, so it runs on demand (`--ignored`).
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs compact.exe on an NTFS volume"]
+    fn a_wof_compressed_segment_reopens_and_is_truncated() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let path = segment::segment_path(&root, 11);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let header_len = format::SEGMENT_HEADER_LEN;
+        segment::SegmentWriter::create(&root, 11).unwrap();
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&vec![0xABu8; 256 * 1024]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let header_before = std::fs::read(&path).unwrap()[..header_len as usize].to_vec();
+
+        let status = std::process::Command::new("compact.exe")
+            .args(["/c", "/exe:xpress16k"])
+            .arg(&path)
+            .output()
+            .expect("compact.exe runs");
+        assert!(status.status.success(), "{}", String::from_utf8_lossy(&status.stdout));
+        let listing =
+            std::process::Command::new("compact.exe").arg("/q").arg(&path).output().unwrap();
+        assert!(
+            String::from_utf8_lossy(&listing.stdout).contains("1 are compressed"),
+            "the file is not compressed: {}",
+            String::from_utf8_lossy(&listing.stdout)
+        );
+
+        let len = std::fs::metadata(&path).unwrap().len();
+        let mut writer =
+            segment::SegmentWriter::reopen(&root, 11, len).expect("reopens a compressed segment");
+        writer.truncate(header_len).expect("truncates a compressed segment");
+        drop(writer);
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(after.len() as u64, header_len);
+        assert_eq!(after, header_before);
+    }
+}
 
 #[cfg(test)]
 mod drop_unreadable_tests {

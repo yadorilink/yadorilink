@@ -13,15 +13,17 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE};
 use windows_sys::Win32::Storage::CloudFilters::{
-    CfConvertToPlaceholder, CfDehydratePlaceholder, CfGetPlaceholderInfo, CfRevertPlaceholder,
-    CfSetInSyncState, CfUpdatePlaceholder, CF_CONVERT_FLAG_MARK_IN_SYNC, CF_DEHYDRATE_FLAG_NONE,
-    CF_FS_METADATA, CF_IN_SYNC_STATE_IN_SYNC, CF_PLACEHOLDER_BASIC_INFO, CF_PLACEHOLDER_INFO_BASIC,
-    CF_REVERT_FLAG_NONE, CF_SET_IN_SYNC_FLAG_NONE, CF_UPDATE_FLAG_DEHYDRATE,
-    CF_UPDATE_FLAG_MARK_IN_SYNC, CF_UPDATE_FLAG_VERIFY_IN_SYNC,
+    CfConvertToPlaceholder, CfDehydratePlaceholder, CfGetPlaceholderInfo, CfHydratePlaceholder,
+    CfRevertPlaceholder, CfSetInSyncState, CfSetPinState, CfUpdatePlaceholder,
+    CF_CONVERT_FLAG_MARK_IN_SYNC, CF_DEHYDRATE_FLAG_NONE, CF_FS_METADATA, CF_HYDRATE_FLAG_NONE,
+    CF_IN_SYNC_STATE_IN_SYNC, CF_PIN_STATE_PINNED, CF_PIN_STATE_UNPINNED, CF_PIN_STATE_UNSPECIFIED,
+    CF_PLACEHOLDER_BASIC_INFO, CF_PLACEHOLDER_INFO_BASIC, CF_REVERT_FLAG_NONE,
+    CF_SET_IN_SYNC_FLAG_NONE, CF_SET_PIN_FLAG_NONE, CF_SET_PIN_FLAG_RECURSE,
+    CF_UPDATE_FLAG_DEHYDRATE, CF_UPDATE_FLAG_MARK_IN_SYNC, CF_UPDATE_FLAG_VERIFY_IN_SYNC,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FlushFileBuffers, FILE_ATTRIBUTE_DIRECTORY, FILE_BASIC_INFO,
@@ -36,16 +38,12 @@ use crate::provider_authoring::AdoptError;
 use crate::stage_ledger::StageLedger;
 use yadorilink_fs_platform::durable_dir::DurableNamespace;
 pub use yadorilink_windows_provider_policy::namespace_policy::{
-    choose_root_path, valid_component, windows_name_key, EvictOutcome, PlaceholderInfo, ShownItem,
-    ShownItems,
+    choose_root_path, valid_component, windows_name_key, EvictOutcome, PinOutcome, PinWish,
+    PlaceholderInfo, ShownItem, ShownItems,
 };
 use yadorilink_windows_provider_policy::namespace_policy::{
     keep_subtree, needs_update, read_usn, unix_nanos_to_ticks, usn_guard,
 };
-
-/// `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS` and `FILE_ATTRIBUTE_RECALL_ON_OPEN`: the attributes of
-/// a placeholder whose content is not on the disk.
-const RECALL_ATTRIBUTES: u32 = 0x0040_0000 | 0x0004_0000;
 
 const DELETE: u32 = 0x0001_0000;
 
@@ -166,7 +164,7 @@ fn placeholder_info_of(handle: &Handle) -> Option<PlaceholderInfo> {
         size: (u64::from(file.nFileSizeHigh) << 32) | u64::from(file.nFileSizeLow),
         mtime_ticks: (u64::from(file.ftLastWriteTime.dwHighDateTime) << 32)
             | u64::from(file.ftLastWriteTime.dwLowDateTime),
-        dehydrated: attributes & RECALL_ATTRIBUTES != 0,
+        dehydrated: yadorilink_fs_platform::cloud_files::content_is_remote(attributes),
     })
 }
 
@@ -396,12 +394,23 @@ fn sync_directory(
         }
         match placeholder_info(&path) {
             None if path.symlink_metadata().is_ok() => {
-                // The user's own file or folder holds the name.
-                eprintln!(
-                    "yadorilink-cfapi-host: {:?} is occupied by a local item; leaving it",
-                    path.display()
-                );
-                continue;
+                // What holds the name carries no identity: the user's own file or folder, or what
+                // the operating system left of an item when the registration went (a downloaded
+                // file becomes a plain file, a folder keeps no identity). The daemon's item of the
+                // same name is bound to it when it is the same thing (a folder, or a file with
+                // the item's size and content); anything else is the user's and is left alone.
+                if bind_existing(&path, item, directory_item) {
+                    eprintln!(
+                        "yadorilink-cfapi-host: {} is the item it is named after; bound",
+                        path.display()
+                    );
+                } else {
+                    eprintln!(
+                        "yadorilink-cfapi-host: {:?} is occupied by a local item; leaving it",
+                        path.display()
+                    );
+                    continue;
+                }
             }
             None => {
                 if let Err(error) = create_item_placeholder(
@@ -486,6 +495,65 @@ fn sync_directory(
             sync_directory(walk, &path, &item.item_id, shown, complete);
         }
     }
+}
+
+/// Binds the plain file or folder at `path` to `item` when it is that item: a folder is, a file is
+/// when its size and SHA-256 equal the item's content version (the first 32 bytes of the
+/// 40-byte identifier are the content hash). The file is bound under the change-journal position
+/// it was read at, so a write since the read leaves it unbound and judged again next pass.
+fn bind_existing(path: &Path, item: &ProviderItem, directory_item: bool) -> bool {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let Ok(meta) = path.symlink_metadata() else { return false };
+    if meta.file_type().is_symlink() {
+        return false;
+    }
+    let Some(id) = file_id(path) else { return false };
+    if directory_item {
+        return meta.is_dir() && bind_to_item(path, &item.item_id, id, None).is_ok();
+    }
+    if meta.is_dir() || meta.len() != item.size {
+        return false;
+    }
+    let Some(version) = item.content_version.get(..32) else { return false };
+    // The change-journal position the bytes are read at is the guard of the bind: without one (no
+    // journal, or it cannot be read) nothing proves the bytes are still what was read, so the file
+    // is left alone.
+    let Some(usn) = Handle::open(path, FILE_READ_ATTRIBUTES | GENERIC_READ)
+        .ok()
+        .and_then(|handle| file_usn(handle.0).ok().flatten())
+    else {
+        return false;
+    };
+    // A file already read and found different is not read again until it is written to (its
+    // position moves) or the item's version changes.
+    let key = (id, usn, item.content_version.clone());
+    if not_the_item().lock().unwrap().contains(&key) {
+        return false;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else { return false };
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buffer[..n]),
+            Err(_) => return false,
+        }
+    }
+    if hasher.finalize().as_slice() != version {
+        not_the_item().lock().unwrap().insert(key);
+        return false;
+    }
+    bind_to_item(path, &item.item_id, id, Some(usn)).is_ok()
+}
+
+/// Plain files whose content was read against an item's version and was not that item's, by file
+/// identity, change-journal position and version: they are not read again while unchanged.
+type NotTheItem = std::sync::Mutex<std::collections::HashSet<(u128, i64, Vec<u8>)>>;
+fn not_the_item() -> &'static NotTheItem {
+    static CACHE: std::sync::OnceLock<NotTheItem> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
 }
 
 /// Removes `path` when it is a placeholder of an item other than `keep`, untouched by the user.
@@ -769,10 +837,191 @@ pub fn evict(path: &Path, item_id: &[u8]) -> Result<(), EvictOutcome> {
     }
 }
 
+/// Whether `attributes` describe an item whose content is wanted on this PC and is not there yet:
+/// pinned, with the content remote. An item marked online only (unpinned) beneath a kept folder is an
+/// exception the person chose and is never fetched.
+fn wanted_and_remote(attributes: u32) -> bool {
+    use yadorilink_fs_platform::cloud_files::{content_is_remote, pin_mark, PinMark};
+    content_is_remote(attributes) && pin_mark(attributes) == PinMark::Pinned
+}
+
+/// Whether any item beneath the directory `dir` is wanted on this PC and not there yet. Stops at the
+/// first one; an entry that cannot be read counts as not wanted (the pin itself was checked).
+fn any_wanted_beneath(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else { return false };
+    entries.filter_map(Result::ok).any(|entry| {
+        let path = entry.path();
+        yadorilink_fs_platform::cloud_files::attributes_of(&path).is_some_and(wanted_and_remote)
+            || (entry.file_type().is_ok_and(|t| t.is_dir()) && any_wanted_beneath(&path))
+    })
+}
+
+/// Removes a path from the set of paths being fetched when its fetch ends, however it ends.
+struct Release<'a>(&'a std::sync::Mutex<Vec<PathBuf>>, PathBuf);
+
+impl Drop for Release<'_> {
+    fn drop(&mut self) {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).retain(|p| *p != self.1);
+    }
+}
+
+/// Asks the platform to fetch the content of `path` (a file) or of every file beneath it (a
+/// folder) that is not on this PC. Runs on its own thread: a large file or folder takes far longer
+/// than the daemon waits for the pin's answer. A failure is logged and leaves the item as it was
+/// (still remote, still pinned), which is what the local state reports.
+fn hydrate_in_background(path: PathBuf) {
+    /// The paths being fetched now: the daemon repeats its pin plan, and a second fetch of the
+    /// same path must not start while the first runs (a failed one is tried again by the next plan).
+    static FETCHING: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    {
+        let mut fetching = FETCHING.lock().unwrap_or_else(|p| p.into_inner());
+        if fetching.contains(&path) {
+            return;
+        }
+        fetching.push(path.clone());
+    }
+    let key = path.clone();
+    let key_for_failure = path.clone();
+    let spawned =
+        std::thread::Builder::new().name("yadorilink-pin-hydrate".into()).spawn(move || {
+            let _release = Release(&FETCHING, key);
+            let mut pending = vec![path];
+            while let Some(path) = pending.pop() {
+                let Ok(metadata) = std::fs::symlink_metadata(&path) else { continue };
+                if metadata.is_dir() {
+                    if let Ok(entries) = std::fs::read_dir(&path) {
+                        pending.extend(entries.filter_map(Result::ok).map(|e| e.path()));
+                    }
+                    continue;
+                }
+                // Read now, not when the pin was set: an exception marked online only after the
+                // folder's pin must not be fetched.
+                if !yadorilink_fs_platform::cloud_files::attributes_of(&path)
+                    .is_some_and(wanted_and_remote)
+                {
+                    continue;
+                }
+                let handle = match Handle::open(&path, GENERIC_READ) {
+                    Ok(handle) => handle,
+                    Err(e) => {
+                        eprintln!(
+                            "yadorilink-cfapi-host: cannot open {} to fetch it: {e}",
+                            path.display()
+                        );
+                        continue;
+                    }
+                };
+                let length = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+                // SAFETY: `handle` is open for reading for the lifetime of the call.
+                let result = unsafe {
+                    CfHydratePlaceholder(
+                        handle.0,
+                        0,
+                        length,
+                        CF_HYDRATE_FLAG_NONE,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if result < 0 {
+                    eprintln!(
+                        "yadorilink-cfapi-host: fetching {} failed: HRESULT {result:#x}",
+                        path.display()
+                    );
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        // No thread will release the path: do it here, or no later plan could ever fetch it.
+        FETCHING.lock().unwrap_or_else(|p| p.into_inner()).retain(|p| *p != key_for_failure);
+        eprintln!("yadorilink-cfapi-host: cannot start the fetch of a kept item: {e}");
+    }
+}
+
+/// Applies the person's choice to the item at `path` in the operating system: a keep pins it (a
+/// folder: everything beneath it) and starts fetching what is not on this PC, online only marks it
+/// unpinned, and a clear sets neither. The result is read back through
+/// [`yadorilink_fs_platform::cloud_files`], the same mapping the daemon reads, so a pin that did not
+/// take is an error rather than a report of success. `item_id` is checked against the placeholder's
+/// identity when given (`None`: the sync root itself); the check, the pin and the read-back all use
+/// one open handle, so they describe one object even if the name is replaced meanwhile.
+pub fn pin(path: &Path, item_id: Option<&[u8]>, wish: PinWish) -> PinOutcome {
+    use yadorilink_fs_platform::cloud_files::{self, PinMark};
+    let handle = match Handle::open(path, FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES) {
+        Ok(handle) => handle,
+        Err(e) => return PinOutcome::Error(format!("{}: {e}", path.display())),
+    };
+    if let Some(item_id) = item_id {
+        match placeholder_info_of(&handle) {
+            Some(info) if info.item_id.as_deref() == Some(item_id) => {}
+            Some(_) => {
+                return PinOutcome::Error(format!(
+                    "{} is not the placeholder of the requested item",
+                    path.display()
+                ));
+            }
+            None => {
+                return PinOutcome::Error(format!("{} is not a placeholder", path.display()));
+            }
+        }
+    }
+    let Some(before) = handle_information(&handle) else {
+        return PinOutcome::Error(format!("{} cannot be read", path.display()));
+    };
+    let directory = before.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+    let (state, expected) = match wish {
+        PinWish::Keep => (CF_PIN_STATE_PINNED, PinMark::Pinned),
+        PinWish::OnlineOnly => (CF_PIN_STATE_UNPINNED, PinMark::Unpinned),
+        PinWish::Clear => (CF_PIN_STATE_UNSPECIFIED, PinMark::Unset),
+    };
+    // The item already carries the mark that was asked for: its pin is not set again. For a folder
+    // that matters: setting a pin recursively overwrites the marks of everything beneath it, including
+    // the exceptions the person chose (an item marked online only under a kept folder), which would
+    // be pinned for a moment and fetched by the background fetch before their own entries restore them.
+    // The daemon repeats its plan after each namespace change, so this must stay cheap as well.
+    if cloud_files::pin_mark(before.dwFileAttributes) == expected {
+        if wish != PinWish::Keep {
+            return PinOutcome::Done;
+        }
+        if wanted_and_remote(before.dwFileAttributes) || (directory && any_wanted_beneath(path)) {
+            hydrate_in_background(path.to_path_buf());
+            return PinOutcome::Downloading;
+        }
+        return PinOutcome::Done;
+    }
+    let flags = if directory { CF_SET_PIN_FLAG_RECURSE } else { CF_SET_PIN_FLAG_NONE };
+    // SAFETY: `handle` is open on the item for the lifetime of the call.
+    let result = unsafe { CfSetPinState(handle.0, state, flags, std::ptr::null_mut()) };
+    if result < 0 {
+        return PinOutcome::Error(format!("CfSetPinState: HRESULT {result:#x}"));
+    }
+    let Some(after) = handle_information(&handle) else {
+        return PinOutcome::Error(format!("{} cannot be read back", path.display()));
+    };
+    if cloud_files::pin_mark(after.dwFileAttributes) != expected {
+        return PinOutcome::Error(format!(
+            "the pin did not take on {} (attributes {:#x})",
+            path.display(),
+            after.dwFileAttributes
+        ));
+    }
+    if wish != PinWish::Keep {
+        return PinOutcome::Done;
+    }
+    // A folder has no content of its own: it is downloading while anything beneath it is remote.
+    let remote =
+        wanted_and_remote(after.dwFileAttributes) || (directory && any_wanted_beneath(path));
+    if remote {
+        hydrate_in_background(path.to_path_buf());
+        PinOutcome::Downloading
+    } else {
+        PinOutcome::Done
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cfapi::{StageStep, STAGE_FAILPOINT};
+    use crate::cfapi::{StageFailpoint, STAGE_FAILPOINT};
     use std::path::PathBuf;
     use yadorilink_fs_platform::durable_dir::{NameLedger, NoLedger};
 
@@ -1094,6 +1343,52 @@ mod tests {
         assert!(shown.contains_key(&b"c"[..]));
     }
 
+    /// What the operating system leaves of the items when the registration goes (plain files and
+    /// folders without identity) is bound to the daemon's items of the same names when it is the
+    /// same thing: a folder, a file with the item's size and content. A file with other content,
+    /// or of another size, stays the user's and is left alone (no placeholder, no overwrite).
+    #[test]
+    #[ignore = "real Cloud Files state; run on a Windows machine"]
+    fn plain_items_that_are_the_daemons_items_are_bound_and_others_are_left() {
+        use sha2::{Digest, Sha256};
+        let root = SyncRoot::new("bind-existing");
+        std::fs::create_dir(root.0.join("docs")).unwrap();
+        std::fs::write(root.0.join("same.txt"), b"abc").unwrap();
+        std::fs::write(root.0.join("other.txt"), b"xyz").unwrap();
+        std::fs::write(root.0.join("short.txt"), b"ab").unwrap();
+        let mut version = Sha256::digest(b"abc").to_vec();
+        version.extend_from_slice(&[0u8; 8]);
+        let with_version = |mut item: ProviderItem, version: &[u8]| {
+            item.content_version = version.to_vec();
+            item
+        };
+        let source = FakeSource(HashMap::from([
+            (
+                vec![],
+                vec![
+                    provider_item(b"d", b"", "docs", true, 0),
+                    with_version(provider_item(b"s", b"", "same.txt", false, 3), &version),
+                    with_version(provider_item(b"o", b"", "other.txt", false, 3), &[9; 40]),
+                    with_version(provider_item(b"t", b"", "short.txt", false, 3), &version),
+                ],
+            ),
+            (b"d".to_vec(), vec![provider_item(b"c", b"d", "c.txt", false, 3)]),
+        ]));
+        let shown = walk(&root.0, &source, &ShownItems::new()).expect("a confirmed walk");
+        let identity = |name: &str| placeholder_info(&root.0.join(name)).and_then(|i| i.item_id);
+        assert_eq!(identity("docs").as_deref(), Some(&b"d"[..]), "the folder was not bound");
+        assert_eq!(identity("same.txt").as_deref(), Some(&b"s"[..]), "the same file was not bound");
+        assert!(placeholder_info(&root.0.join("same.txt")).unwrap().in_sync);
+        assert_eq!(std::fs::read(root.0.join("same.txt")).unwrap(), b"abc");
+        assert_eq!(identity("other.txt"), None, "a file with other content was bound");
+        assert_eq!(std::fs::read(root.0.join("other.txt")).unwrap(), b"xyz");
+        assert_eq!(identity("short.txt"), None, "a file of another size was bound");
+        assert!(shown.contains_key(&b"d"[..]) && shown.contains_key(&b"s"[..]));
+        assert!(!shown.contains_key(&b"o"[..]) && !shown.contains_key(&b"t"[..]));
+        assert!(shown.contains_key(&b"c"[..]), "the bound folder was not walked");
+        assert_eq!(names(&root.0.join("docs")), ["c.txt"]);
+    }
+
     /// Another folder moved onto the name of a protected one is not the daemon's folder: its
     /// content is not walked as that folder's.
     #[test]
@@ -1169,7 +1464,7 @@ mod tests {
     }
 
     /// The Stage step killed at `point`, as a crashed process leaves it.
-    fn killed_at(point: StageStep, root: &Path, name: &str, item: &[u8]) {
+    fn killed_at(point: StageFailpoint, root: &Path, name: &str, item: &[u8]) {
         STAGE_FAILPOINT.with(|armed| armed.set(Some(point)));
         let result = create_item_placeholder(&ledger_of(root), root, name, item, 5, MTIME, false);
         STAGE_FAILPOINT.with(|armed| armed.set(None));
@@ -1183,7 +1478,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("yl-ns-rec-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        killed_at(StageStep::Recorded, &dir, "a.txt", b"f");
+        killed_at(StageFailpoint::Recorded, &dir, "a.txt", b"f");
         assert_eq!(records(&dir), 1);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "no Stage name in the tree");
         let ledger = ledger_of(&dir);
@@ -1201,7 +1496,7 @@ mod tests {
     #[ignore = "real Cloud Files state; run on a Windows machine"]
     fn a_walk_retires_the_recorded_stage_placeholder_a_kill_after_the_create_left() {
         let root = SyncRoot::new("walk-leftover");
-        killed_at(StageStep::Created, &root.0, "a.txt", b"f");
+        killed_at(StageFailpoint::Created, &root.0, "a.txt", b"f");
         assert_eq!(records(&root.0), 1);
         assert_eq!(names(&root.0).len(), 1, "the Stage placeholder exists");
         let source = FakeSource(HashMap::from([(
@@ -1254,7 +1549,7 @@ mod tests {
     #[ignore = "real Cloud Files state; run on a Windows machine"]
     fn a_kill_after_the_move_leaves_a_record_of_an_absent_stage() {
         let root = SyncRoot::new("kill-after-move");
-        killed_at(StageStep::Moved, &root.0, "a.txt", b"f");
+        killed_at(StageFailpoint::Moved, &root.0, "a.txt", b"f");
         assert_eq!(names(&root.0), ["a.txt"]);
         assert_eq!(records(&root.0), 1);
         let source = FakeSource(HashMap::from([(

@@ -55,8 +55,8 @@ pub fn record_severe_error(
 }
 
 /// Records ONE bounded,
-/// redacted, unsent candidate for an unhandled panic. The `message`,
-/// `location`, and `backtrace` are free text that may carry paths or other
+/// redacted, unsent candidate for an unhandled panic. The
+/// `location` and `backtrace` are free text that may carry paths or other
 /// sensitive strings, so they are threaded through `log_lines`/`.backtrace`,
 /// both of which `ErrorPayloadBuilder::build` runs through the redaction
 /// pass — nothing here bypasses redaction, and no network submission occurs
@@ -67,13 +67,15 @@ pub fn record_severe_error(
 /// what lets it run safely from inside a panic hook.
 pub fn record_panic(
     storage: &ReportingStorage,
-    message: &str,
     location: Option<&str>,
     backtrace: &str,
 ) -> Option<String> {
     let consent = storage.consent_or_default();
     let env = environment::current(&consent);
-    let mut log_lines = vec![format!("panic: {message}")];
+    // The panic message is not recorded: it can echo any value the failing
+    // code held, including a name the user chose, which redaction cannot
+    // recognise. The source location and backtrace identify the failure.
+    let mut log_lines = Vec::new();
     if let Some(loc) = location {
         log_lines.push(format!("location: {loc}"));
     }
@@ -101,15 +103,9 @@ pub fn install_panic_hook(storage: std::sync::Arc<ReportingStorage>) {
         // panic info and *append* a bounded artifact; there is no shared
         // invariant a caught unwind here could leave broken.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let payload = info.payload();
-            let message = payload
-                .downcast_ref::<&str>()
-                .map(|s| s.to_string())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "non-string panic payload".to_string());
             let location = info.location().map(|l| format!("{}:{}", l.file(), l.line()));
             let backtrace = std::backtrace::Backtrace::force_capture().to_string();
-            record_panic(&storage, &message, location.as_deref(), &backtrace);
+            record_panic(&storage, location.as_deref(), &backtrace);
         }));
         // Preserve the default behavior: we only ADD a bounded local artifact,
         // never replace or block the normal panic path.

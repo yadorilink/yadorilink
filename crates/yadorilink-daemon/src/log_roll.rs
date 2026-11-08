@@ -82,7 +82,14 @@ fn default_log_file(
     if config_dir_overridden || stderr_is_terminal {
         return None;
     }
-    home.map(|h| PathBuf::from(h).join("Library/Logs/yadorilink/daemon.log"))
+    // The log directory follows the build's state directory name, so a staging daemon never
+    // appends to (or rotates) the installed product's log.
+    home.map(|h| {
+        PathBuf::from(h)
+            .join("Library/Logs")
+            .join(yadorilink_fs_platform::state_dir::STATE_DIR_NAME)
+            .join("daemon.log")
+    })
 }
 
 fn windows_default_log_file(
@@ -147,7 +154,11 @@ mod tests {
         let home = || Some(OsString::from("/Users/u"));
         assert_eq!(
             default_log_file(home(), false, false),
-            Some(PathBuf::from("/Users/u/Library/Logs/yadorilink/daemon.log"))
+            Some(
+                PathBuf::from("/Users/u/Library/Logs")
+                    .join(yadorilink_fs_platform::state_dir::STATE_DIR_NAME)
+                    .join("daemon.log")
+            )
         );
         assert_eq!(
             default_log_file(home(), true, false),

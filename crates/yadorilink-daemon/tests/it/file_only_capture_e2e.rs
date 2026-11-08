@@ -87,7 +87,7 @@ async fn sender_records_other_than(node: &TopologyNode, path: &str, before: &[Ve
 async fn a_large_file_is_not_copied_into_the_senders_store_unless_it_is_pinned() {
     setup();
     let (sender, receiver) = sender_and_receiver().await;
-    sender.state.replica_coordinator.pinned_item_repository().pin(GROUP, "pinned").unwrap();
+    sender.state.replica_coordinator.retention_rules().pin(GROUP, "pinned").unwrap();
     let plain = payload(1);
     let kept = payload(2);
 

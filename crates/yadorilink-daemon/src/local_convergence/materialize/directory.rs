@@ -59,6 +59,15 @@ impl super::super::LocalConvergenceExecutor {
             yadorilink_sync_sqlite::retention::Retention::Proofs(proofs),
             root_commit_permit,
         )?;
+        crate::write_op::trace::emit_at(
+            group_id,
+            &record.path,
+            crate::write_op::StepEvent::Prepared,
+        );
+        crate::write_op::failpoint::hit(
+            crate::write_op::failpoint::WriteOpFailpoint::AfterPrepare,
+            &record.path,
+        )?;
         let created = create_explicit_directory(
             &out_path,
             &canonical_root,
@@ -68,17 +77,34 @@ impl super::super::LocalConvergenceExecutor {
         // the user's. One that was already there was not made durable by this call (its name may
         // be an unflushed one), so it is not marked. A mark that cannot be recorded fails the
         // attempt and leaves the intent open.
-        if created == yadorilink_local_storage::ExplicitDirectoryCreation::Created {
+        let landed_marked = if created
+            == yadorilink_local_storage::ExplicitDirectoryCreation::Created
+        {
             self.state
                 .materialization_intent_repository()
                 .mark_write_landed(group_id, &record.path, mutation_generation, root_commit_permit)
-                .map_err(crate::sync_error::SyncError::from)?;
-        }
+                .map_err(crate::sync_error::SyncError::from)?
+        } else {
+            false
+        };
+        crate::write_op::trace::emit_at(
+            group_id,
+            &record.path,
+            crate::write_op::StepEvent::Published { names_deferred: false, landed_marked },
+        );
+        crate::write_op::failpoint::hit(
+            crate::write_op::failpoint::WriteOpFailpoint::AfterPublish,
+            &record.path,
+        )?;
         #[cfg(test)]
         crate::local_convergence::placed_hook::run(&out_path);
         // The commit clears the intent; dropping the guard uncleared is
         // inert, and on a refused commit it is what keeps the intent open.
         drop(intent_guard);
+        crate::write_op::failpoint::hit(
+            crate::write_op::failpoint::WriteOpFailpoint::BeforeProve,
+            &record.path,
+        )?;
         if !self.state.settle_directory_write(
             group_id,
             &record.path,
@@ -89,6 +115,19 @@ impl super::super::LocalConvergenceExecutor {
         )? {
             return Ok(MaterializeResult::RetryRequired.into());
         }
+        crate::write_op::trace::emit_at(
+            group_id,
+            &record.path,
+            crate::write_op::StepEvent::Proven {
+                outcome: crate::write_op::ProofOutcome::Exact,
+                intent: crate::write_op::IntentSettlement::Cleared,
+                obligation_closed: false,
+            },
+        );
+        crate::write_op::failpoint::hit(
+            crate::write_op::failpoint::WriteOpFailpoint::AfterProve,
+            &record.path,
+        )?;
         match self.exact_object_evidence_after_write(
             group_id,
             &record.path,

@@ -425,6 +425,7 @@ async fn a_folder_that_cannot_be_joined_keeps_the_start_over_open_for_a_retry() 
     assert!(!report.complete);
     assert_eq!(report.rejoined, ["/data/docs"]);
     assert_eq!(report.not_rejoined[0].local_path, "/data/photos");
+    assert_eq!(report.not_rejoined[0].reason, RejoinReason::JoinFailed);
     assert!(pending_in(fake.dir.path()));
 
     *fake.failing_group.lock().unwrap() = None;
@@ -454,6 +455,7 @@ async fn a_group_the_account_does_not_own_is_reported_and_does_not_block_the_res
     assert_eq!(report.rejoined, ["/data/docs"]);
     assert_eq!(report.not_rejoined.len(), 1);
     assert_eq!(report.not_rejoined[0].group_id, "g2");
+    assert_eq!(report.not_rejoined[0].reason, RejoinReason::NotGroupOwner);
     assert!(report.complete, "nothing a retry can fix");
     assert!(!pending_in(fake.dir.path()));
     // The report is gone after a restart; the daemon's link state keeps the folder visible.
@@ -658,6 +660,7 @@ async fn a_provider_folder_is_reported_and_does_not_keep_the_start_over_open() {
     assert!(report.complete);
     assert_eq!(report.not_rejoined.len(), 1);
     assert_eq!(report.not_rejoined[0].local_path, "provider://token-1");
+    assert_eq!(report.not_rejoined[0].reason, RejoinReason::ProviderFolder);
     assert!(!fake.calls().iter().any(|c| c.starts_with("rejoin") && c.contains("provider://")));
     assert_eq!(*fake.marked.lock().unwrap(), ["provider://token-1"]);
     assert!(!pending_in(fake.dir.path()));

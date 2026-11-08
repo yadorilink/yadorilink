@@ -1,8 +1,6 @@
 //! Shared fixtures for the native replication tests: a device's local native
 //! deltas and a fake coordination plane that issues real signed checkpoints.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Mutex;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -72,6 +70,8 @@ pub(crate) struct FakeSource {
     pub(crate) signer_key_id: [u8; 32],
     pub(crate) next_seq: Mutex<u64>,
     pub(crate) refuse: bool,
+    /// With `refuse`: answer that the device may not publish, instead of not answering.
+    pub(crate) not_authorized: bool,
 }
 
 impl FakeSource {
@@ -81,6 +81,7 @@ impl FakeSource {
             signer_key_id: [0u8; 32],
             next_seq: Mutex::new(0),
             refuse: false,
+            not_authorized: false,
         }
     }
 }
@@ -102,11 +103,14 @@ impl CheckpointSource for FakeSource {
         merkle_root: [u8; 32],
         leaf_count: u64,
         _purpose: crate::checkpoint_source::CheckpointPurpose,
-    ) -> Pin<Box<dyn Future<Output = Option<(AuthorizationCheckpoint, [u8; 64])>> + Send + 'a>>
-    {
+    ) -> crate::checkpoint_source::CheckpointFuture<'a> {
         Box::pin(async move {
             if self.refuse {
-                return None;
+                return Err(if self.not_authorized {
+                    crate::checkpoint_source::CheckpointRefusal::NotAuthorized
+                } else {
+                    crate::checkpoint_source::CheckpointRefusal::Unreachable
+                });
             }
             let mut seq = self.next_seq.lock().unwrap();
             *seq += 1;
@@ -124,7 +128,7 @@ impl CheckpointSource for FakeSource {
                 issued_at_unix: 1,
             };
             let signature = sign_checkpoint(&checkpoint, &self.authority_key);
-            Some((checkpoint, signature))
+            Ok((checkpoint, signature))
         })
     }
 }

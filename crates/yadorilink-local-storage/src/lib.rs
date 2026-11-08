@@ -75,7 +75,7 @@ pub use materialize_write::{
     apply_exec, apply_file_metadata, create_dir_all_never_through_a_symlink,
     create_explicit_directory, create_or_defer_placeholder, discard_temp_file,
     exec_already_matches_disk, mint_windows_placeholder_generation, mtime_already_matches_disk,
-    persist_reconstructed_file, persist_reconstructed_file_durable, persist_reconstructed_file_in,
+    persist_borrowed_temp_checked, persist_reconstructed_file_checked, random_tmp_path,
     reconstruct_file, reconstruct_file_in, reconstruct_file_to_temp, reconstruct_file_to_temp_in,
     reconstruct_file_to_temp_observed, reconstruct_file_to_temp_observed_durable,
     remove_evicted_object, rename_no_replace, resolve_read_path_without_traversal,
@@ -83,7 +83,7 @@ pub use materialize_write::{
     verify_delete_target_within_root, verify_write_target_within_canonical_root,
     verify_write_target_within_root, Durability, ExplicitDirectoryCreation, NoTempLedger,
     PlaceholderDiskIdentity, PlaceholderIdentityToRecord, StagedFile, StructuralDirectoryLedger,
-    TempFileLedger, WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
+    TargetExpectation, TempFileLedger, VerifiedTemp, WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
 };
 #[cfg(unix)]
 pub use materialize_write::{exec_from_mode, mode_with_exec};

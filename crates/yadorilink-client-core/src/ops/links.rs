@@ -178,6 +178,7 @@ pub async fn send_unlink_key(
 fn classify_unlink_refusal(error: CoreError) -> CoreError {
     match error {
         CoreError::DaemonCommand {
+            drive: None,
             code: ApplicationErrorCode::NotProtected,
             message,
             group_ids,
@@ -202,6 +203,7 @@ mod tests {
 
     fn refusal(code: ApplicationErrorCode) -> CoreError {
         CoreError::DaemonCommand {
+            drive: None,
             code,
             message: "refusing to unlink /f/Docs: no other complete copy; use --force".into(),
             group_ids: vec!["group-1".into()],

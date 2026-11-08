@@ -78,6 +78,7 @@ use crate::sync_adapter::address_directory::CoordinationAddressDirectory;
 pub use address_report::report_own_address;
 pub(crate) use peer_sessions::keep_peer_sessions;
 pub(crate) use reachability::peers_with_replaced;
+pub use reachability::VersionSkew;
 use reachability::{LinkId, LinkReachability};
 
 /// The `YADORILINK_SYNC_RELAYS` value that means "no relays, direct only".
@@ -270,8 +271,18 @@ impl PeerConnectivityRuntime {
         self.links().is_incompatible(device_id)
     }
 
-    pub(crate) fn record_version_incompatible(&self, device_id: &str) {
-        self.links().mark_incompatible(device_id);
+    /// Which end has to update, when a live connection to `device_id` is marked incompatible.
+    pub fn version_skew(&self, device_id: &str) -> Option<VersionSkew> {
+        self.links().version_skew(device_id)
+    }
+
+    pub(crate) fn record_version_incompatible(
+        &self,
+        device_id: &str,
+        connection: usize,
+        skew: VersionSkew,
+    ) {
+        self.links().mark_incompatible(device_id, connection, skew);
     }
 
     pub(crate) fn record_dial_started(&self, device_id: &str, peer: PeerId) {
@@ -282,9 +293,14 @@ impl PeerConnectivityRuntime {
         self.links().dial_failed(peer, why);
     }
 
-    pub(crate) fn record_link_up(&self, device_id: &str, carrier: Option<Carrier>) -> LinkId {
+    pub(crate) fn record_link_up(
+        &self,
+        device_id: &str,
+        carrier: Option<Carrier>,
+        connection: usize,
+    ) -> LinkId {
         self.last_seen.session_up(device_id);
-        self.links().link_up(device_id, carrier)
+        self.links().link_up(device_id, carrier, connection)
     }
 
     pub(crate) fn record_carrier(&self, device_id: &str, link: LinkId, carrier: Option<Carrier>) {
@@ -351,7 +367,7 @@ impl PeerConnectivityRuntime {
     /// counting as reachable rather than be kept open by being watched.
     fn follow_link(self: &Arc<Self>, device: String, link: &PeerLink) {
         let mut changes = link.carrier_changes();
-        let id = self.record_link_up(&device, link.carrier());
+        let id = self.record_link_up(&device, link.carrier(), link.connection_id());
         let runtime = self.clone();
         tokio::spawn(async move {
             while let Some(carrier) = changes.next().await {
@@ -426,6 +442,7 @@ impl PeerConnectivityRuntime {
         authority: &Arc<PeerAuthorityState>,
         track_send: Arc<dyn PeerAdmission>,
         nas_admin: Option<Arc<dyn yadorilink_sync_substrate::NasAdminAuthorizer>>,
+        network_policy: &Arc<crate::network_policy::NetworkPolicy>,
         config: NetworkConfig,
     ) -> Result<(IrohEndpoint, mpsc::Receiver<PeerLink>), yadorilink_sync_substrate::SubstrateError>
     {
@@ -453,9 +470,14 @@ impl PeerConnectivityRuntime {
         // alive. It refuses once every strong `Arc<PeerAuthorityState>` is
         // gone -- `DaemonState`'s and LAN discovery's -- which is the correct
         // answer in any case.
+        //
+        // A metered connection the user has not allowed sync on admits nobody: the connection is
+        // refused before anything is served, whichever protocol it carries.
         let peers = Arc::downgrade(authority);
+        let policy = network_policy.subscribe();
         let peer_admission = yadorilink_sync_substrate::AdmitWhen::new(move |peer: &PeerId| {
-            peers.upgrade().is_some_and(|authority| admits(&authority, peer))
+            policy.borrow().peer_traffic_allowed()
+                && peers.upgrade().is_some_and(|authority| admits(&authority, peer))
         });
 
         // Which endpoints a local-network announcement may be used for, when
@@ -513,6 +535,7 @@ impl PeerConnectivityRuntime {
         // only thing that can end it later.
         let open = Arc::new(OpenConnections {
             authority: Arc::downgrade(authority),
+            policy: network_policy.subscribe(),
             directory: directory.clone(),
             links: Mutex::new(Vec::new()),
             held: tokio::sync::Notify::new(),
@@ -523,7 +546,7 @@ impl PeerConnectivityRuntime {
         });
         self.endpoints.lock().unwrap_or_else(|p| p.into_inner()).push(Arc::downgrade(&open));
         let (inbound_tx, inbound) = mpsc::channel(ACCEPTED_QUEUE);
-        let links = Arc::new(link_cache::LinkCache::default());
+        let links = Arc::new(link_cache::LinkCache::new(node.peer_id()));
         let _ = open.cache.set(Arc::downgrade(&links));
         {
             let open = open.clone();
@@ -718,6 +741,8 @@ struct OpenConnections {
     /// Weak for the same reason as the admission policy: this does not keep
     /// the authority state alive, and admits nobody once it is gone.
     authority: Weak<PeerAuthorityState>,
+    /// The network policy: a connection arriving while peer traffic is paused is not held.
+    policy: tokio::sync::watch::Receiver<crate::network_policy::PolicyState>,
     directory: Arc<CoordinationAddressDirectory>,
     /// Clones of connections that are already kept open elsewhere -- by the
     /// link cache, or by the substrate for as long as an accepted connection
@@ -743,8 +768,11 @@ impl OpenConnections {
         self.cache.get()?.upgrade()
     }
 
+    /// Whether a connection from `peer` may be held: the device is still pinned, and the
+    /// network policy has not paused peer traffic since it was admitted.
     fn admits(&self, peer: &PeerId) -> bool {
-        self.authority.upgrade().is_some_and(|authority| admits(&authority, peer))
+        self.policy.borrow().peer_traffic_allowed()
+            && self.authority.upgrade().is_some_and(|authority| admits(&authority, peer))
     }
 
     /// Hold `link` so a later revocation reaches it. Returns `false`, having
@@ -871,6 +899,17 @@ pub(crate) type NasAdminInbound = (
 );
 
 impl IrohEndpoint {
+    /// A live connection to `device_id` if one is held, without dialling.
+    pub(crate) fn live_link(&self, device_id: &str) -> Option<Arc<PeerLink>> {
+        self.links.live_link(device_id)
+    }
+
+    /// Closes the connections held to `device_id`, a peer that stopped answering: the session
+    /// keeper sees them go, ends the session, and dials afresh.
+    pub(crate) fn drop_links(&self, device_id: &str) {
+        self.links.drop_links(device_id);
+    }
+
     /// The running node, for the reconciliation runtime layered on it. A
     /// clone shares the same endpoint and router.
     pub(crate) fn node(&self) -> SubstrateNode {
@@ -936,6 +975,12 @@ impl IrohEndpoint {
     /// `SubstrateNode::watch_home_relay_connected`.
     pub(crate) fn watch_home_relay_connected(&self) -> watch::Receiver<bool> {
         self.node.watch_home_relay_connected()
+    }
+
+    /// Reports that the machine woke up and the network may have changed; see
+    /// [`crate::wake_detector`].
+    pub(crate) fn network_resumed(&self) {
+        self.node.network_resumed();
     }
 
     /// The network-arrival view redial loops wait on; see `redial_pacing`.

@@ -241,7 +241,16 @@ pub(crate) fn build_pool(
     // exactly the same reason `open`'s bootstrap step exists: fewer
     // concurrent openers is strictly safer than more, even once the
     // specific WAL-switch race is closed.
-    Ok(Pool::builder().min_idle(Some(1)).thread_pool(worker_pool()).build(manager)?)
+    // No idle timeout and no maximum lifetime: with either set, r2d2 schedules a reaper on the pool's
+    // worker threads every 30 seconds for the pool's whole life, which wakes the process (a worker, and
+    // the scheduler thread behind it) once per pool every 30 s forever for nothing it can use: a
+    // daemon's few SQLite connections are cheap to keep open, and nothing here can go stale.
+    Ok(Pool::builder()
+        .min_idle(Some(1))
+        .idle_timeout(None)
+        .max_lifetime(None)
+        .thread_pool(worker_pool())
+        .build(manager)?)
 }
 
 /// The background workers of one pool: the same three named threads r2d2

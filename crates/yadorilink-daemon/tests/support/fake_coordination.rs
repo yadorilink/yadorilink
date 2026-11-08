@@ -104,6 +104,8 @@ struct Inner {
     device_accounts: HashMap<String, String>,
     /// Cross-account Send links -- see `FakeSendLink`. link_id -> record.
     send_links: HashMap<String, FakeSendLink>,
+    /// Every raw request body a send-link route received, for asserting what never reached the service.
+    send_link_bodies: Vec<String>,
     /// While set, a Track Send grant's push to the receiver is parked instead of delivered:
     /// the plane has answered the sender, but the receiver's event stream has not caught up.
     hold_send_pushes: bool,
@@ -231,14 +233,15 @@ struct FakeSendAuthorization {
 /// `test/send-links.test.ts`.
 #[derive(Clone)]
 struct FakeSendLink {
-    code: String,
+    lookup_id: String,
+    token_hash: String,
     sender_device_id: String,
     receiver_device_id: Option<String>,
     state: &'static str,
     expired: bool,
     grant_id: Option<String>,
-    /// (name, size) of the files the sender attached for the preview.
-    files: Vec<(String, u64)>,
+    /// The sealed file list, opaque here as it is to the real service.
+    preview_blob: Option<String>,
 }
 
 /// A handle to the running fake. Cloneable; every clone shares one server.
@@ -793,6 +796,11 @@ impl FakeCoordination {
 
     /// Makes a Send link past its expiry, as the clock would.
     #[allow(dead_code)]
+    /// Every raw request body the send-link routes received, in order.
+    pub fn send_link_request_bodies(&self) -> Vec<String> {
+        self.inner.lock().unwrap().send_link_bodies.clone()
+    }
+
     pub fn expire_send_link(&self, link_id: &str) {
         if let Some(link) = self.inner.lock().unwrap().send_links.get_mut(link_id) {
             link.expired = true;
@@ -1968,6 +1976,15 @@ fn parse_send_link_target(method: &str, target: &str) -> Option<SendLinkRoute> {
 /// The Worker's `/send/links*` routes, mirrored for the daemon-side E2E: one
 /// use per code, a grant only after redeem and only once, nothing after
 /// cancel or expiry, and every redeem failure the same 404.
+/// The service's hash of a presented token (mirrors the Worker's `sendLinkTokenHash`).
+fn fake_token_hash(token: &str) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(format!("yadorilink-send-link-v2:{token}").as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 async fn serve_send_link(
     mut stream: TcpStream,
     head: &str,
@@ -1976,6 +1993,7 @@ async fn serve_send_link(
     inner: Arc<Mutex<Inner>>,
 ) -> std::io::Result<()> {
     let body = read_body(&mut stream, head, leftover).await?;
+    inner.lock().unwrap().send_link_bodies.push(String::from_utf8_lossy(&body).into_owned());
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
     let text = |key: &str| json.get(key).and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let not_found = r#"{"error":"send link is invalid, expired, or already used"}"#;
@@ -1986,47 +2004,56 @@ async fn serve_send_link(
             if !inner.lock().unwrap().devices.contains_key(&sender) {
                 return respond_json(&mut stream, 404, "Not Found", r#"{"error":"device"}"#).await;
             }
-            let (link_id, code) = (uuid_like("link"), uuid_like("code"));
+            if json.get("files").is_some() {
+                return respond_json(
+                    &mut stream,
+                    400,
+                    "Bad Request",
+                    r#"{"error":"files are not accepted"}"#,
+                )
+                .await;
+            }
+            let link_id = text("linkId");
+            let lookup_id = text("lookupId");
+            let taken = inner
+                .lock()
+                .unwrap()
+                .send_links
+                .iter()
+                .any(|(id, l)| *id == link_id || l.lookup_id == lookup_id);
+            if taken {
+                return respond_json(&mut stream, 409, "Conflict", r#"{"error":"in use"}"#).await;
+            }
             inner.lock().unwrap().send_links.insert(
                 link_id.clone(),
                 FakeSendLink {
-                    code: code.clone(),
+                    lookup_id,
+                    token_hash: text("tokenHash"),
                     sender_device_id: sender,
                     receiver_device_id: None,
                     state: "open",
                     expired: false,
                     grant_id: None,
-                    files: json
-                        .get("files")
-                        .and_then(|f| f.as_array())
-                        .map(|files| {
-                            files
-                                .iter()
-                                .filter_map(|f| {
-                                    Some((
-                                        f.get("name")?.as_str()?.to_string(),
-                                        f.get("size")?.as_u64()?,
-                                    ))
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default(),
+                    preview_blob: json
+                        .get("previewBlob")
+                        .and_then(|b| b.as_str())
+                        .map(str::to_string),
                 },
             );
-            let body = serde_json::json!({
-                "linkId": link_id, "code": code, "expiresAt": unix_now() + 3600
-            });
+            let body = serde_json::json!({ "linkId": link_id, "expiresAt": unix_now() + 3600 });
             respond_json(&mut stream, 200, "OK", &body.to_string()).await
         }
         SendLinkRoute::Redeem => {
-            let (code, receiver) = (text("code"), text("receiverDeviceId"));
+            let (lookup_id, token, receiver) =
+                (text("lookupId"), text("token"), text("receiverDeviceId"));
+            let token_hash = fake_token_hash(&token);
             let redeemed = {
                 let mut inner = inner.lock().unwrap();
                 let known = inner.devices.contains_key(&receiver);
                 inner
                     .send_links
                     .iter_mut()
-                    .find(|(_, l)| l.code == code)
+                    .find(|(_, l)| l.lookup_id == lookup_id && l.token_hash == token_hash)
                     .filter(|(_, l)| {
                         known && l.state == "open" && !l.expired && l.sender_device_id != receiver
                     })
@@ -2050,26 +2077,30 @@ async fn serve_send_link(
             }
         }
         SendLinkRoute::Preview => {
-            let code = text("code");
+            let (lookup_id, token) = (text("lookupId"), text("token"));
+            let token_hash = fake_token_hash(&token);
             let link = inner
                 .lock()
                 .unwrap()
                 .send_links
-                .values()
-                .find(|l| l.code == code && l.state == "open" && !l.expired)
-                .cloned();
+                .iter()
+                .find(|(_, l)| {
+                    l.lookup_id == lookup_id
+                        && l.token_hash == token_hash
+                        && l.state == "open"
+                        && !l.expired
+                })
+                .map(|(id, l)| (id.clone(), l.clone()));
             match link {
-                Some(l) => {
-                    let files: Vec<_> = l
-                        .files
-                        .iter()
-                        .map(|(name, size)| serde_json::json!({ "name": name, "size": size }))
-                        .collect();
-                    let body = serde_json::json!({
+                Some((link_id, l)) => {
+                    let mut body = serde_json::json!({
+                        "linkId": link_id,
                         "senderName": l.sender_device_id,
                         "expiresAt": unix_now() + 3600,
-                        "files": files,
                     });
+                    if let Some(blob) = l.preview_blob {
+                        body["previewBlob"] = serde_json::Value::String(blob);
+                    }
                     respond_json(&mut stream, 200, "OK", &body.to_string()).await
                 }
                 None => respond_json(&mut stream, 404, "Not Found", not_found).await,

@@ -46,7 +46,6 @@ use yadorilink_sync_sqlite::handoff_lease::HandoffLeaseState;
 use crate::change_policy::GroupPolicyState;
 use crate::governance_config::GovernanceConfigStore;
 use crate::reporting::ReportingStorage;
-use crate::supervise;
 
 mod offline_authorization;
 pub(crate) use offline_authorization::is_within_offline_horizon;
@@ -538,6 +537,8 @@ pub struct DaemonState {
     /// comment). Opening this never writes anything to disk by itself,
     /// mirroring `reporting`'s "safe for every existing call site" property.
     pub governance_config: Arc<GovernanceConfigStore>,
+    /// Whether peer traffic may flow on the connection the host reports; see `network_policy`.
+    pub network_policy: Arc<crate::network_policy::NetworkPolicy>,
     /// The state directory this state's configuration, credentials, reports and recovery areas
     /// live in. Everything the engine persists outside the database and block store is placed
     /// under it, so one process can run engines over different directories.
@@ -566,7 +567,7 @@ pub struct DaemonState {
     disk_headroom_enforcement_enabled: std::sync::atomic::AtomicBool,
     /// The directory whose volume decides when a Degraded provider link has room again. A
     /// provider link's key is a locator, not a path, so it cannot be measured itself.
-    degraded_volume_probes: Mutex<HashMap<String, std::path::PathBuf>>,
+    pub(crate) degraded_volume_probes: Mutex<HashMap<String, std::path::PathBuf>>,
     /// Test-only headroom reserve for the link preflight's free-space reading, so a test does not
     /// depend on how full the host's disk is. Production passes no override.
     #[cfg(any(test, feature = "test-support"))]
@@ -829,6 +830,9 @@ impl DaemonState {
             block_store: self.block_store.clone(),
             telemetry: self.telemetry.clone(),
             device_id: self.device_id.clone(),
+            ignore_rules: yadorilink_fs_platform::ignore_patterns::IgnoreRulesStore::new(
+                self.config_dir(),
+            ),
             host: self.clone() as Arc<dyn crate::link_runtime::dependencies::LinkRuntimeHostPort>,
         })
     }
@@ -1213,6 +1217,7 @@ impl DaemonState {
                 &config_dir,
             ))),
             governance_config: Arc::new(governance_config),
+            network_policy: Arc::new(crate::network_policy::NetworkPolicy::open(&config_dir)),
             config_dir: config_dir.clone(),
             rate_limiters,
             disk_headroom_enforcement_enabled: std::sync::atomic::AtomicBool::new(false),
@@ -1349,87 +1354,6 @@ impl DaemonState {
     /// has built and published one yet.
     pub fn send_service(&self) -> Option<Arc<yadorilink_send::SendService>> {
         self.send_service.get().cloned()
-    }
-
-    /// Marks `local_path` Degraded for `cause` (`reason` is human detail only), scheduling its
-    /// next re-check via `BackoffConfig::DEGRADED_LINK_RECHECK` — a link already degraded has
-    /// its backoff attempt count bumped (spacing repeated pressure further
-    /// apart, "not a tight retry loop") rather than reset, and
-    /// keeps its original `since_unix` onset time.
-    pub fn mark_link_degraded(
-        &self,
-        local_path: &str,
-        cause: crate::link_registry::DegradedCause,
-        reason: String,
-    ) {
-        self.links.mark_degraded(local_path, reason, cause, now_unix(), |backoff_attempt| {
-            supervise::BackoffConfig::DEGRADED_LINK_RECHECK.next(backoff_attempt).as_secs() as i64
-        });
-    }
-
-    /// Marks a link as waiting for free disk space, with `detail` as its human text only.
-    pub(crate) fn mark_link_waiting_for_disk_space(&self, local_path: &str, detail: String) {
-        self.mark_link_degraded(
-            local_path,
-            crate::link_registry::DegradedCause::WaitingForDiskSpace,
-            detail,
-        );
-    }
-
-    /// Marks a provider link as waiting for disk space on the volume of `probe_dir`, the place
-    /// its reads are staged. The link's key is not a path, so the re-check measures `probe_dir`.
-    pub(crate) fn mark_link_degraded_on_volume(
-        &self,
-        link_key: &str,
-        probe_dir: &std::path::Path,
-        reason: String,
-    ) {
-        self.degraded_volume_probes
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(link_key.to_string(), probe_dir.to_path_buf());
-        self.mark_link_waiting_for_disk_space(link_key, reason);
-    }
-
-    /// The path whose volume is measured to decide whether `link_key` has room again.
-    fn space_probe_path(&self, link_key: &str) -> std::path::PathBuf {
-        self.degraded_volume_probes
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(link_key)
-            .cloned()
-            .unwrap_or_else(|| std::path::PathBuf::from(link_key))
-    }
-
-    /// Terminal OwnershipLost for `local_path`; true on the first transition only.
-    pub fn mark_link_ownership_lost(&self, local_path: &str) -> bool {
-        self.links.mark_ownership_lost(local_path, now_unix())
-    }
-
-    /// Clears `local_path`'s Degraded state, if any — a no-op if it wasn't
-    /// degraded.
-    pub fn clear_link_degraded(&self, local_path: &str) {
-        self.links.clear_degraded(local_path);
-        self.degraded_volume_probes.lock().unwrap_or_else(|p| p.into_inner()).remove(local_path);
-    }
-
-    /// Clears `local_path`'s Degraded state if its volume is no longer Critical. An
-    /// undeterminable volume stays degraded. True when it cleared.
-    pub(crate) fn clear_link_degraded_if_space_recovered(&self, local_path: &str) -> bool {
-        if !self.links.is_degraded(local_path) {
-            return false;
-        }
-        let headroom_override = self.governance_config.load_or_default().headroom_override_bytes;
-        match yadorilink_local_storage::free_space::classify_volume(
-            &self.space_probe_path(local_path),
-            headroom_override,
-        ) {
-            Ok(space) if space.recovered() => {
-                self.clear_link_degraded(local_path);
-                true
-            }
-            _ => false,
-        }
     }
 
     pub fn is_link_degraded(&self, local_path: &str) -> bool {
@@ -1657,14 +1581,14 @@ impl DaemonState {
             match space {
                 Ok(space) if space.recovered() => {
                     tracing::info!(local_path = %local_path, "disk-pressure re-check succeeded; clearing Degraded state");
-                    self.clear_link_degraded(&local_path);
+                    self.recover_link(&local_path);
                 }
                 _ => {
                     // Still under pressure (or undeterminable) — reschedule
                     // with a bumped backoff rather than leaving a stale
                     // `next_recheck_unix` in the past (which would make
                     // this a hot loop at the 2s poll interval).
-                    self.mark_link_degraded(&local_path, info.cause, info.reason);
+                    self.degrade_link(&local_path, info.cause, info.reason);
                 }
             }
         }
@@ -1902,6 +1826,45 @@ impl DaemonState {
             signing_key,
             &HashSet::new(),
             &HashSet::new(),
+            offline_authorization::SnapshotMirror::AfterThisNetmapPassSettles,
+        );
+    }
+
+    /// [`seed_netmap_peer_identity`](Self::seed_netmap_peer_identity) for a netmap pass that is about
+    /// to validate the peer's groups again. A peer whose authorization was last settled under this
+    /// very key keeps what it holds while the pass validates, narrowed to what the netmap still
+    /// offers it (`offered_*`); anything the netmap no longer lists is withdrawn at once.
+    ///
+    /// Withholding everything for that interval changed nothing a reader could use (the settling
+    /// call restores it a moment later) but moved the membership generation twice per peer per
+    /// push, and every custody confirmation is stale regardless of its age once that generation
+    /// moves: the folder's protection read unknown after each push until the next sweep, with no
+    /// fact changed. A new or changed key and a replaced device still start with nothing. A group
+    /// the local validation (not the netmap) withdraws is withdrawn at the settling call.
+    pub(crate) fn seed_netmap_peer_identity_keeping_settled(
+        &self,
+        device_id: &str,
+        signing_key: Option<[u8; 32]>,
+        offered_groups: &HashSet<String>,
+        offered_full_replica_groups: &HashSet<String>,
+    ) {
+        let Some((held, held_full)) =
+            self.authority.settled_authorization_under(device_id, signing_key)
+        else {
+            self.seed_netmap_peer_identity(device_id, signing_key);
+            return;
+        };
+        let keep: HashSet<String> = held.intersection(offered_groups).cloned().collect();
+        let keep_full: HashSet<String> = held_full
+            .intersection(offered_full_replica_groups)
+            .filter(|group| keep.contains(*group))
+            .cloned()
+            .collect();
+        self.apply_peer_netmap_metadata(
+            device_id,
+            signing_key,
+            &keep,
+            &keep_full,
             offline_authorization::SnapshotMirror::AfterThisNetmapPassSettles,
         );
     }
@@ -3348,7 +3311,7 @@ impl DaemonState {
             .await
         {
             Ok(crate::store_residency::Residency::InStore) => {}
-            Ok(crate::store_residency::Residency::Pending(paths)) => {
+            Ok(crate::store_residency::Residency::Pending(paths, _)) => {
                 // Left to expire: the request stays in force, so the capture of these paths that
                 // the journal now asks for goes into the store.
                 hold.leave_to_expire();
@@ -4068,6 +4031,28 @@ impl DaemonState {
         !matches!(self.resolve_group_policy(group_id), GroupPolicyResolution::Withhold)
     }
 
+    /// Whether [`Self::group_is_servable_ignoring_peer`] answers the same for every peer.
+    pub(crate) fn group_servability_is_peer_independent(&self, group_id: &str) -> bool {
+        self.authority.group_policy_is_settled(group_id)
+    }
+
+    /// [`Self::group_is_servable`] for the netmap validation of one peer: the peer's own current
+    /// authorization is not counted as evidence that the group has been introduced. Without this
+    /// the validation answered differently depending on whether the peer had been withdrawn a
+    /// moment earlier (which is how the two-phase pass of a push used to arrange it).
+    pub(crate) fn group_is_servable_ignoring_peer(
+        &self,
+        group_id: &str,
+        peer_device_id: &str,
+    ) -> bool {
+        !matches!(
+            self.authority.resolve_group_policy_ignoring(group_id, Some(peer_device_id), || {
+                self.group_is_linked(group_id)
+            }),
+            GroupPolicyResolution::Withhold
+        )
+    }
+
     /// Graceful shutdown: blocks until no `on_local_native_commit`
     /// call is in flight, or `timeout` elapses,
     /// whichever comes first — best-effort draining rather than a hard
@@ -4370,10 +4355,42 @@ impl DaemonState {
                         checkpoint_seq,
                         "native checkpoint flush: published pending batch"
                     );
-                    (Some(flushed.published), false)
+                    // A backlog longer than one batch is published over several flushes: go on.
+                    if flushed.pending == 0 {
+                        self.telemetry.clear_unpublished(group_id);
+                    }
+                    (Some(flushed.published), flushed.pending > 0)
                 }
-                crate::checkpoint_source::FlushOutcome::Refused => (None, true),
-                _ => (None, false),
+                crate::checkpoint_source::FlushOutcome::Unreachable => {
+                    self.telemetry.set_unpublished(
+                        group_id,
+                        crate::runtime_telemetry::UnpublishedReason::ServiceUnreachable,
+                        flushed.pending as u64,
+                    );
+                    (None, true)
+                }
+                crate::checkpoint_source::FlushOutcome::NotAuthorized => {
+                    self.telemetry.set_unpublished(
+                        group_id,
+                        crate::runtime_telemetry::UnpublishedReason::NotAuthorized,
+                        flushed.pending as u64,
+                    );
+                    // Retried in case the role is restored; waiting is not expected to help.
+                    (None, true)
+                }
+                crate::checkpoint_source::FlushOutcome::Rejected => {
+                    self.telemetry.set_unpublished(
+                        group_id,
+                        crate::runtime_telemetry::UnpublishedReason::Rejected,
+                        flushed.pending as u64,
+                    );
+                    (None, true)
+                }
+                crate::checkpoint_source::FlushOutcome::NothingPending => {
+                    self.telemetry.clear_unpublished(group_id);
+                    (None, false)
+                }
+                crate::checkpoint_source::FlushOutcome::Interrupted => (None, false),
             },
             Err(e) => {
                 tracing::warn!(group_id, error = %e, "native checkpoint flush failed");
@@ -4473,6 +4490,7 @@ impl DaemonState {
                 // executor is built per call.
                 override_bytes: self.governance_config.load_or_default().headroom_override_bytes,
             },
+            yadorilink_fs_platform::ignore_patterns::IgnoreRulesStore::new(self.config_dir()),
         );
         executor.attach_transfer_progress(self.telemetry.transfer_progress_handle());
         executor

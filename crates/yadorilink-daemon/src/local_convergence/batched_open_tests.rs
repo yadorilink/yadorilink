@@ -56,6 +56,7 @@ fn open_item(
         authoring: None,
         meta: crate::replica_coordinator::plain_file_columns(),
         retention_proofs: yadorilink_sync_sqlite::retention::RetentionProofs::new(),
+        tmp_path: None,
         now: 1,
         lane_check,
         row_check,

@@ -523,13 +523,9 @@ async fn an_unconsumed_handoff_file_is_swept_after_its_lifetime() {
     assert!(fx.dir.path().join("elsewhere").exists(), "a consumed file was touched");
 }
 
-/// A restart removes what a crashed run left: every staging file and the stale handoff files,
-/// while a fresh handoff file (a response that just went out) is kept.
-// Unix only: the age of a handoff file is its status-change time (ctime), which the rename into
-// `handoff/` sets and user space cannot move. Windows has no such time, so a Windows daemon keeps
-// no handoff file across a restart at all; `a_windows_restart_removes_every_leftover` states that
-// expectation.
-#[cfg(unix)]
+/// A restart removes what a crashed run left: every staging file and every handoff file,
+/// including one whose response just went out (nothing tracks it any more, so it could not be
+/// taken back; the extension asks again).
 #[test]
 fn a_restart_sweeps_leftovers_of_a_crashed_run() {
     let dir = tempfile::tempdir().unwrap();
@@ -539,12 +535,11 @@ fn a_restart_sweeps_leftovers_of_a_crashed_run() {
     std::fs::write(dir.path().join("staging/half.partial"), b"half").unwrap();
     std::fs::write(dir.path().join("staging/half.partial.tmp1"), b"half").unwrap();
     std::fs::write(dir.path().join("handoff/stale"), b"old").unwrap();
-    std::thread::sleep(Duration::from_millis(400));
     std::fs::write(dir.path().join("handoff/fresh"), b"new").unwrap();
 
-    let _root = HandoffRoot::open_with_lifetime(dir.path(), Duration::from_millis(300)).unwrap();
+    let _root = HandoffRoot::open_with_lifetime(dir.path(), Duration::from_secs(60)).unwrap();
     assert!(names_in(&dir.path().join("staging")).is_empty());
-    assert_eq!(names_in(&dir.path().join("handoff")), ["fresh"]);
+    assert!(names_in(&dir.path().join("handoff")).is_empty());
 }
 
 /// A request that cannot be served says why, and builds nothing.
@@ -754,37 +749,6 @@ async fn a_directory_sync_failure_after_the_rename_leaves_no_handoff_file() {
     assert!(fx.handoff_names().is_empty(), "an untracked handoff file stayed");
     assert!(names_in(&fx.staging()).is_empty());
     assert!(fx.repo().handoff(&fx.root, &item).unwrap().is_none());
-}
-
-/// The startup sweep ages a handoff file by when it entered `handoff/`, never by the replicated
-/// modification time it carries: an old mtime on a fresh file and a future mtime on a stale one
-/// are both judged by the handoff time.
-// Unix only, for the same reason as `a_restart_sweeps_leftovers_of_a_crashed_run`: the handoff
-// time is the Unix ctime; on Windows nothing ages and every leftover is removed at start.
-#[cfg(unix)]
-#[test]
-fn the_startup_sweep_ignores_the_replicated_mtime() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(dir.path().join("handoff")).unwrap();
-    std::fs::create_dir_all(dir.path().join("staging")).unwrap();
-    let set_mtime = |name: &str, at: std::time::SystemTime| {
-        std::fs::write(dir.path().join("handoff").join(name), b"x").unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(dir.path().join("handoff").join(name))
-            .unwrap()
-            .set_modified(at)
-            .unwrap();
-    };
-    let long_ago = std::time::SystemTime::now() - Duration::from_secs(3600 * 24 * 365);
-    let far_future = std::time::SystemTime::now() + Duration::from_secs(3600 * 24 * 365);
-    set_mtime("fresh-old-mtime", long_ago);
-    set_mtime("stale-future-mtime", far_future);
-    // The second one becomes stale (by its handoff time) while the first is created later.
-    std::thread::sleep(Duration::from_millis(400));
-    set_mtime("fresh-old-mtime", long_ago);
-    let _root = HandoffRoot::open_with_lifetime(dir.path(), Duration::from_millis(300)).unwrap();
-    assert_eq!(names_in(&dir.path().join("handoff")), ["fresh-old-mtime"]);
 }
 
 /// A cancel and the completion compete for ONE terminal transition: when the cancel wins while
@@ -1123,27 +1087,6 @@ async fn the_response_pairs_the_bytes_with_the_hash_and_generation_of_the_handof
         })
         .unwrap();
     assert_eq!(response.content_version[32..], (generation as u64).to_be_bytes());
-}
-
-/// Windows: the handoff time cannot be read from the file system, so an entry that a crashed run
-/// left in `handoff/` or `staging/` is removed at the next start whatever its age or modification
-/// time. A response that just went out is not at risk: the host takes its file before any restart
-/// matters, and the live sweep (by name, after the lifetime) is unchanged.
-#[cfg(windows)]
-#[test]
-fn a_windows_restart_removes_every_leftover() {
-    let dir = tempfile::tempdir().unwrap();
-    for sub in ["staging", "handoff"] {
-        std::fs::create_dir_all(dir.path().join(sub)).unwrap();
-    }
-    std::fs::write(dir.path().join("staging/half.partial"), b"half").unwrap();
-    std::fs::write(dir.path().join("handoff/fresh"), b"new").unwrap();
-    std::fs::write(dir.path().join("handoff/older"), b"old").unwrap();
-    let root = HandoffRoot::open_with_lifetime(dir.path(), Duration::from_secs(1)).unwrap();
-    assert!(!dir.path().join("staging/half.partial").exists());
-    assert!(!dir.path().join("handoff/fresh").exists());
-    assert!(!dir.path().join("handoff/older").exists());
-    drop(root);
 }
 
 // ---- ranged requests ----------------------------------------------------------------------
@@ -1983,4 +1926,51 @@ async fn a_read_on_a_full_volume_is_refused_as_low_disk_and_works_once_space_ret
     fx.state.block_store.set_headroom_override_bytes(Some(0));
     let response = fx.ask(b"req-room", &item).await;
     assert!(response.ok, "{}", response.error);
+}
+
+// ---- the order of a hand-off's durable steps ----------------------------------------------
+
+use crate::write_op::trace::StepTrace;
+use crate::write_op::StepEvent;
+
+/// A whole-version hand-off: staged, the served record, the name, the response, the evidence.
+/// The served record precedes the name; the evidence row follows the response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_whole_version_handoff_goes_staged_may_serve_named_responded_evidence() {
+    let mut fx = Fx::new().await;
+    let item = fx.published_item("trace-whole.bin", &data_of(61, 20_000));
+    let response = fx.ask(b"req-trace-whole", &item).await;
+    assert!(response.ok, "{}", response.error);
+    // The event follows the committed row, so the trace is what is awaited.
+    eventually("the evidence event", || StepTrace::of(&fx.root, &response.handoff_name).len() == 5)
+        .await;
+
+    assert_eq!(
+        StepTrace::of(&fx.root, &response.handoff_name),
+        [
+            StepEvent::ProviderStaged,
+            StepEvent::ProviderMayServeRecorded,
+            StepEvent::ProviderHandoffNamed,
+            StepEvent::ProviderResponded,
+            StepEvent::ProviderEvidenceRecorded,
+        ]
+    );
+}
+
+/// A window records no served content and no evidence row: it is staged, named and answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_window_goes_staged_named_responded() {
+    let mut fx = Fx::new().await;
+    let (item, version) = fx.ranged_item("trace-window.bin");
+    let served = fx.ask_range(b"win-trace", &item, &version, 10, 20).await;
+    assert!(served.ok && served.ranged, "{}", served.error);
+    eventually("the window to be recorded", || {
+        fx.repo().window_serve(&fx.root, &item).unwrap().is_some()
+    })
+    .await;
+
+    assert_eq!(
+        StepTrace::of(&fx.root, &served.handoff_name),
+        [StepEvent::ProviderStaged, StepEvent::ProviderHandoffNamed, StepEvent::ProviderResponded]
+    );
 }

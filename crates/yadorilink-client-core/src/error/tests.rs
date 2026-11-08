@@ -8,6 +8,7 @@ fn command_error(code: i32, operation_id: &str) -> ApplicationCommandError {
         message: "refused".into(),
         group_ids: vec!["group-1".into()],
         operation_id: operation_id.into(),
+        ..Default::default()
     }
 }
 
@@ -64,6 +65,7 @@ fn command(code: ApplicationErrorCode) -> CoreError {
         message: "daemon says no".into(),
         group_ids: vec!["group-1".into()],
         operation_id: "op-7".into(),
+        ..Default::default()
     })
 }
 
@@ -118,8 +120,11 @@ fn network_failures_carry_their_kind() {
         (command(ApplicationErrorCode::CoordinationAmbiguous), NetworkErrorKind::Unreachable),
         (command(ApplicationErrorCode::TicketUnavailable), NetworkErrorKind::Unreachable),
         (
-            CoreError::LimitExceeded { message: "slow down".into(), kind: LimitKind::RateLimited },
-            NetworkErrorKind::RateLimited,
+            CoreError::LimitExceeded {
+                message: "slow down".into(),
+                kind: LimitKind::RateLimited { retry_after_secs: Some(7) },
+            },
+            NetworkErrorKind::RateLimited { retry_after_secs: Some(7) },
         ),
         (
             command(ApplicationErrorCode::ActivationAmbiguous),
@@ -271,6 +276,7 @@ fn link_and_invite_refusals_carry_their_typed_reason() {
         (ApplicationErrorCode::SendInterrupted, RefusalReason::SendInterrupted),
         (ApplicationErrorCode::SendLocalNetworkBlocked, RefusalReason::SendLocalNetworkBlocked),
         (ApplicationErrorCode::SendLinksDisabled, RefusalReason::SendLinksDisabled),
+        (ApplicationErrorCode::SendPreviewUnverified, RefusalReason::SendPreviewUnverified),
     ];
     for (code, reason) in cases {
         assert_eq!(
@@ -510,5 +516,43 @@ fn a_send_without_a_sign_in_is_not_signed_in() {
     assert!(matches!(
         desktop(command(ApplicationErrorCode::LocalIdentityUnavailable)),
         DesktopError::NotSignedIn { .. }
+    ));
+}
+
+#[test]
+fn an_unsupported_drive_refusal_reaches_the_front_end_as_a_reason_key() {
+    use yadorilink_ipc_proto::daemonctl::UnsupportedDriveReason as Wire;
+    let refused = |reason: Wire, file_system: &str| {
+        DesktopError::from_core(
+            CoreError::from_command_error(ApplicationCommandError {
+                code: ApplicationErrorCode::UnsupportedDrive as i32,
+                message: "link refused: this drive (ReFS / Dev Drive) is not supported yet".into(),
+                drive_reason: reason as i32,
+                file_system: file_system.into(),
+                ..Default::default()
+            }),
+            false,
+        )
+    };
+    for (wire, expected) in [
+        (Wire::Refs, UnsupportedDriveReason::Refs),
+        (Wire::Exfat, UnsupportedDriveReason::ExFat),
+        (Wire::Fat, UnsupportedDriveReason::Fat),
+        (Wire::NotLocalFixed, UnsupportedDriveReason::NotLocalFixed),
+        (Wire::Other, UnsupportedDriveReason::Other),
+    ] {
+        match refused(wire, "ReFS") {
+            DesktopError::UnsupportedDrive { reason, file_system, message } => {
+                assert_eq!(reason, expected);
+                assert_eq!(file_system, "ReFS");
+                assert!(message.contains("not supported yet"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    // A daemon that named no reason is still a refused path.
+    assert!(matches!(
+        refused(Wire::Unspecified, ""),
+        DesktopError::Refused { reason: RefusalReason::PathNotAllowed, .. }
     ));
 }

@@ -370,6 +370,7 @@ fn slow_writing_sign_in(
         LoginOptions {
             flow: yadorilink_client_core::dto::LoginFlow::DeviceCode,
             overall_timeout: None,
+            device_name: None,
         },
         Box::new(|| Ok(())),
         Box::new(move |_sink| {
@@ -385,6 +386,9 @@ fn slow_writing_sign_in(
                     default_device_name: String::new(),
                     has_linked_folders: None,
                     start_over_pending: false,
+                    email: None,
+                    sign_in_provider: None,
+                    display_name: None,
                 })
             })
         }),

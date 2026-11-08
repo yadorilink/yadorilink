@@ -1169,7 +1169,7 @@ async fn a_large_file_is_flushed_in_steps_while_it_fills() {
             sink.write_block(&record, &verified).await.unwrap();
         }
         let before_final = sink.staged.data_flushes();
-        sink.finalize(h.convergence.store.clone(), &record).await.unwrap();
+        sink.finalize(h.convergence.store.clone(), &record, None).await.unwrap();
         (before_final, sink.staged.tmp_path().to_path_buf(), sink)
     };
     let (before_final, tmp, sink) = probe;
@@ -1189,7 +1189,7 @@ async fn single_pass_commits_a_pinned_small_files_blocks_to_the_store() {
     let h = Harness::new(false);
     single_pass(&h, true);
     let (names, contents) = one_block_paths(&h, 2);
-    h.state.pinned_item_repository().pin(GROUP, &names[0]).unwrap();
+    h.state.retention_rules().pin(GROUP, &names[0]).unwrap();
     let peer = Arc::new(FakePeer::serving(&contents.iter().collect::<Vec<_>>()));
     let driver: Arc<dyn ConvergenceDriver> = peer.clone();
 
@@ -1218,7 +1218,7 @@ async fn single_pass_commits_a_pinned_large_files_blocks_to_the_store() {
     let plain = Content::of(&other_bodies.iter().map(Vec::as_slice).collect::<Vec<_>>());
     published(&h, "big-pinned", &pinned);
     published(&h, "big-plain", &plain);
-    h.state.pinned_item_repository().pin(GROUP, "big-pinned").unwrap();
+    h.state.retention_rules().pin(GROUP, "big-pinned").unwrap();
     let peer = Arc::new(FakePeer::serving(&[&pinned, &plain]));
     let driver: Arc<dyn ConvergenceDriver> = peer.clone();
 
@@ -1252,7 +1252,7 @@ async fn a_block_shared_with_an_unpinned_file_still_reaches_the_store_for_a_pinn
     // The unpinned one sorts first, so it is fetched (and kept in memory) before the pinned one.
     published(&h, "a-plain", &content);
     published(&h, "b-pinned", &content);
-    h.state.pinned_item_repository().pin(GROUP, "b-pinned").unwrap();
+    h.state.retention_rules().pin(GROUP, "b-pinned").unwrap();
     let peer = Arc::new(FakePeer::serving(&[&content]));
     let driver: Arc<dyn ConvergenceDriver> = peer.clone();
 
@@ -1306,7 +1306,7 @@ async fn the_already_fetched_shortcut_does_not_skip_a_block_a_pinned_path_needs_
     let content = Content::one("a body fetched for the unpinned file first");
     published(&h, "a-plain", &content);
     published(&h, "b-pinned", &content);
-    h.state.pinned_item_repository().pin(GROUP, "b-pinned").unwrap();
+    h.state.retention_rules().pin(GROUP, "b-pinned").unwrap();
     let peer = Arc::new(FakePeer::serving(&[&content]));
     let driver: Arc<dyn ConvergenceDriver> = peer.clone();
     let paths = BTreeSet::from(["a-plain".to_owned(), "b-pinned".to_owned()]);
@@ -1340,7 +1340,7 @@ async fn a_pinned_path_whose_store_commit_failed_is_not_settled_from_a_neighbour
     let content = Content::one("a body both files need");
     published(&h, "a-plain", &content);
     published(&h, "b-pinned", &content);
-    h.state.pinned_item_repository().pin(GROUP, "b-pinned").unwrap();
+    h.state.retention_rules().pin(GROUP, "b-pinned").unwrap();
     // The store refuses every write from here: the pinned path's commit fails.
     h.store.set_headroom_enforced(true);
     h.store.set_headroom_override_bytes(Some(u64::MAX / 2));
@@ -1377,7 +1377,7 @@ async fn an_old_provenance_row_does_not_stand_in_for_a_store_copy_of_a_pinned_pa
     let content = Content::one("a body stored once and reclaimed");
     published(&h, "a-plain", &content);
     published(&h, "b-pinned", &content);
-    h.state.pinned_item_repository().pin(GROUP, "b-pinned").unwrap();
+    h.state.retention_rules().pin(GROUP, "b-pinned").unwrap();
     h.state.record_block_provenance(GROUP, &[content.hash(0)]).unwrap();
     h.store.set_headroom_enforced(true);
     h.store.set_headroom_override_bytes(Some(u64::MAX / 2));
@@ -1433,7 +1433,7 @@ async fn a_ready_temp_does_not_stand_for_a_path_pinned_before_the_settle() {
         "an unpinned path is satisfied by its ready temp"
     );
 
-    h.state.pinned_item_repository().pin(GROUP, "big").unwrap();
+    h.state.retention_rules().pin(GROUP, "big").unwrap();
 
     assert!(
         h.convergence.content_missing_for_settle(GROUP, &record, &version).unwrap(),
@@ -1471,7 +1471,7 @@ async fn another_groups_memory_block_does_not_satisfy_a_pinned_path() {
         "an unpinned path is satisfied by what the executor's store answers"
     );
 
-    h.state.pinned_item_repository().pin(GROUP, "pinned.bin").unwrap();
+    h.state.retention_rules().pin(GROUP, "pinned.bin").unwrap();
 
     assert!(
         h.convergence.blocks_missing_locally(GROUP, &record).unwrap(),
@@ -1491,7 +1491,7 @@ async fn admission_asks_the_store_itself_for_a_pinned_path() {
     single_pass(&h, true);
     let content = Content::one("a block another pass holds in memory");
     published(&h, "pinned.bin", &content);
-    h.state.pinned_item_repository().pin(GROUP, "pinned.bin").unwrap();
+    h.state.retention_rules().pin(GROUP, "pinned.bin").unwrap();
     h.state.record_block_provenance(GROUP, &[content.hash(0)]).unwrap();
     let mut other =
         WindowBlocksHold::new(Arc::clone(&h.convergence.window_blocks), "another-group");
@@ -1565,7 +1565,7 @@ async fn a_ready_temp_is_not_taken_for_a_path_pinned_meanwhile() {
         h.convergence.filled_temps.holds(GROUP, "big", &version),
         "fixture: a ready temp again"
     );
-    h.state.pinned_item_repository().pin(GROUP, "big").unwrap();
+    h.state.retention_rules().pin(GROUP, "big").unwrap();
 
     assert!(h.convergence.take_ready_temp(GROUP, "big", &version).is_err());
     assert!(!h.convergence.filled_temps.holds(GROUP, "big", &version), "the temp is gone");
@@ -1900,17 +1900,6 @@ async fn a_receive_dropped_while_it_waits_for_barrier_one_never_leaves_a_witness
     task.abort();
     let _ = task.await;
     releaser.join().unwrap();
-    let witness = h
-        .state
-        .database()
-        .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
-            Ok(yadorilink_sync_sqlite::write_removal_facts(conn, GROUP, &names[0])?
-                .and_then(|facts| facts.temp_witness))
-        })
-        .unwrap();
-    if let Some(witness) = witness {
-        assert!(h.path(&witness).exists(), "a witness names a temp that is gone: {witness}");
-    }
     // The temp the drop left behind is an ordinary stray once the intent is gone.
     let _ = leftover_temps(&h, &names[0]);
 }
@@ -1990,6 +1979,69 @@ async fn a_user_edit_over_the_previous_version_is_kept_by_the_repair_after_a_fai
     assert!(kept, "the user's bytes are preserved: {report:?}");
 }
 
+/// The same cut, with the new version's blocks in the store and no temp to finish from: the
+/// untouched previous version is this device's own write, so it is replaced in place, not moved
+/// aside as a conflict copy of itself.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_untouched_previous_version_is_replaced_not_quarantined_when_the_blocks_are_here() {
+    let h = Harness::new(false);
+    single_pass(&h, true);
+    deferred(&h);
+    let (v1, v2) = (Content::one("v1"), Content::one("v2"));
+    let _peer = replaced_with_a_failed_barrier_one(&h, &v1, &v2).await;
+    for temp in leftover_temps(&h, "f00") {
+        std::fs::remove_file(h.path(&temp)).unwrap();
+    }
+    h.convergence.store.put(&v2.blocks[0].1).unwrap();
+
+    let report = super::receive_deferred_flush_tests::startup(&h);
+
+    assert!(report.quarantined_dirty.is_empty(), "{report:?}");
+    assert_eq!(report.reconstructed, vec!["f00".to_string()], "{report:?}");
+    assert_eq!(std::fs::read(h.path("f00")).unwrap(), v2.blocks[0].1.to_vec());
+    let authored: BTreeSet<String> = h.scan().into_iter().map(|r| r.path).collect();
+    assert!(authored.is_empty(), "no conflict copy of the previous version: {authored:?}");
+}
+
+/// A user edits the untouched previous version in the instant between repair deciding to replace
+/// it in place and the rename: the edit is not replaced; the next pass finds bytes that are not
+/// the device's own write and keeps them as a conflict copy.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_edit_landing_before_the_in_place_replace_is_kept() {
+    use yadorilink_filesystem_sync::repair_failpoint::{interleave, RepairFailpoint};
+    let h = Harness::new(false);
+    single_pass(&h, true);
+    deferred(&h);
+    let (v1, v2) = (Content::one("v1"), Content::one("v2"));
+    let _peer = replaced_with_a_failed_barrier_one(&h, &v1, &v2).await;
+    for temp in leftover_temps(&h, "f00") {
+        std::fs::remove_file(h.path(&temp)).unwrap();
+    }
+    h.convergence.store.put(&v2.blocks[0].1).unwrap();
+    let users_words = b"edited while the repair was assembling the new version";
+
+    let report = {
+        let target = h.path("f00");
+        let _edit = interleave(RepairFailpoint::BeforePublish, move || {
+            std::fs::write(&target, users_words).unwrap();
+        });
+        super::receive_deferred_flush_tests::startup(&h)
+    };
+
+    assert!(report.reconstructed.is_empty(), "{report:?}");
+    assert_eq!(std::fs::read(h.path("f00")).unwrap(), users_words);
+    let next = super::receive_deferred_flush_tests::startup(&h);
+    assert_eq!(std::fs::read(h.path("f00")).unwrap(), v2.blocks[0].1.to_vec(), "{next:?}");
+    let kept = std::fs::read_dir(h.path(""))
+        .unwrap()
+        .flatten()
+        .filter_map(|e| std::fs::read(e.path()).ok())
+        .any(|bytes| bytes == users_words);
+    assert!(kept, "the user's edit is kept as a conflict copy: {next:?}");
+}
+
 /// A file that replaces a received one, whose barrier 1 failed and whose process then restarted,
 /// is not turned into a "local-recovered" conflict copy of the old version by startup repair, and
 /// the next pass places the new version. Repair finds the open intent over the untouched previous
@@ -2030,12 +2082,13 @@ async fn a_replacement_whose_barrier_one_failed_survives_a_restart_without_a_con
     assert_eq!(std::fs::read(h.path(&name)).unwrap(), v2.blocks[0].1.to_vec());
 }
 
-/// The same cut for a file that replaces a received one: the previous version stays at the name,
-/// repair stands the write down instead of quarantining it, and the next pass places the new
-/// version with no conflict copy.
+/// The same cut for a file that replaces a received one: the previous version stays at the name
+/// until restart, where repair finishes the write from the temp its intent names (the untouched
+/// previous version is replaced, not quarantined), with no fetch and no conflict copy.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn gate_a_cut_between_barrier_one_and_the_rename_of_a_replacement_keeps_the_old_version() {
+async fn gate_a_cut_between_barrier_one_and_the_rename_of_a_replacement_is_finished_from_its_temp()
+{
     let h = Harness::new(false);
     single_pass(&h, true);
     deferred(&h);
@@ -2060,7 +2113,7 @@ async fn gate_a_cut_between_barrier_one_and_the_rename_of_a_replacement_keeps_th
 
     let report = super::receive_deferred_flush_tests::startup(&h);
     assert!(report.quarantined_dirty.is_empty(), "{report:?}");
-    assert_eq!(std::fs::read(h.path(&name)).unwrap(), v1.blocks[0].1.to_vec());
+    assert_eq!(std::fs::read(h.path(&name)).unwrap(), v2.blocks[0].1.to_vec());
     let driver: Arc<dyn ConvergenceDriver> = peer.clone();
     h.convergence
         .reconcile_paths_directly(&driver, GROUP, BTreeSet::from([name.clone()]))
@@ -2100,7 +2153,7 @@ async fn a_settled_file_only_path_is_not_fetched_again_by_a_later_pass() {
     assert_eq!(peer.requests_for(&content.hash(0)), first, "the settled path was fetched again");
 
     // A path that has to be in the store still gets its content there.
-    h.state.pinned_item_repository().pin(GROUP, "settled").unwrap();
+    h.state.retention_rules().pin(GROUP, "settled").unwrap();
     let wanted = h.convergence.content_missing_locally_from_native(GROUP, &paths_again()).unwrap();
     assert_eq!(wanted.len(), 1, "a pinned path is fetched into the store");
 }

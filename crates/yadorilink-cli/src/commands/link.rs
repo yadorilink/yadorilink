@@ -6,6 +6,7 @@ use yadorilink_local_storage::link_preflight::LinkPreflightReport;
 use yadorilink_client_core::ops::links as ops;
 
 use crate::error::CliError;
+use crate::i18n::{tr, trf};
 
 /// The ` skipped_symlinks=N` suffix appended to a link's summary line
 /// in `link list` — empty (no suffix) when the link has none, matching
@@ -50,18 +51,37 @@ pub async fn link(
     print_preflight_report(&preflight);
 
     if dry_run {
-        println!(
-            "dry run: no link registered ({})",
-            if preflight.is_risky() { "risky conditions found" } else { "looks safe to link" }
-        );
+        let verdict = if preflight.is_risky() {
+            tr("risky conditions found")
+        } else {
+            tr("looks safe to link")
+        };
+        println!("{}", trf!("dry run: no link registered ({verdict})", verdict = verdict));
         return Ok(());
     }
 
     let acknowledged = acknowledge_if_risky(&preflight, yes)?;
     ops::link_to_named_group(absolute, &group_name, on_demand, acknowledged).await?;
-    println!("Linked {local_path} to {group_name}{}", if on_demand { " (on-demand)" } else { "" },);
+    let linked = if on_demand {
+        trf!(
+            "Linked {local_path} to {group_name} (on-demand)",
+            local_path = local_path,
+            group_name = group_name
+        )
+    } else {
+        trf!(
+            "Linked {local_path} to {group_name}",
+            local_path = local_path,
+            group_name = group_name
+        )
+    };
+    println!("{linked}");
+    println!("{CHECK_PROGRESS}");
     Ok(())
 }
+
+/// What follows a folder being linked: where to see it start syncing.
+pub(crate) const CHECK_PROGRESS: &str = "Check progress with `yadorilink status`.";
 
 /// Preflight a local path and resolve the risk acknowledgement, printing the
 /// report. The shared front half of establishing a link, exposed so a caller
@@ -155,8 +175,8 @@ fn acknowledge_if_risky(report: &LinkPreflightReport, yes: bool) -> Result<bool,
 /// `commands::report::confirm_with_reader` is: the prompt-reading itself is
 /// unit-testable without a real terminal.
 fn confirm_risky_with_reader(warnings: &[String], reader: &mut impl BufRead) -> bool {
-    println!("This link has {} risk(s) listed above.", warnings.len());
-    print!("Proceed with this risky link anyway? [y/N] ");
+    println!("{}", trf!("This link has {count} risk(s) listed above.", count = warnings.len()));
+    print!("{} ", tr("Proceed with this risky link anyway? [y/N]"));
     let _ = std::io::stdout().flush();
     let mut line = String::new();
     if reader.read_line(&mut line).is_err() {
@@ -183,13 +203,14 @@ fn confirm_risky(warnings: &[String]) -> bool {
 pub async fn unlink(local_path: String, force: bool) -> Result<(), CliError> {
     if force {
         eprintln!(
-            "warning: --force set -- if this device is the sole complete copy for this \
-             folder's group with no other confirmed-ready complete copy, unlinking anyway may \
-             permanently lose the only copy of that data"
+            "{}",
+            tr("warning: --force set -- if this device is the sole complete copy for this \
+                folder's group with no other confirmed-ready complete copy, unlinking anyway may \
+                permanently lose the only copy of that data")
         );
     }
     let handoff_result = ops::send_unlink(&local_path, force).await?;
-    println!("Unlinked {local_path}");
+    println!("{}", trf!("Unlinked {local_path}", local_path = local_path));
     if let Some(result) = handoff_result {
         println!("{}", handoff_line(&result));
     }
@@ -198,7 +219,13 @@ pub async fn unlink(local_path: String, force: bool) -> Result<(), CliError> {
 
 pub async fn readopt(local_path: String) -> Result<(), CliError> {
     ops::readopt_volume(&local_path).await?;
-    println!("Confirmed the disk at {local_path} as this folder's disk; it syncs again.");
+    println!(
+        "{}",
+        trf!(
+            "Confirmed the disk at {local_path} as this folder's disk; it syncs again.",
+            local_path = local_path
+        )
+    );
     Ok(())
 }
 

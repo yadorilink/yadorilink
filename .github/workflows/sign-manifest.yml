@@ -5,7 +5,7 @@ name: Sign manifest
 # reach it. Three jobs with three responsibilities:
 #
 #   build-signer  no environment, no secret: builds the signing tool from this commit.
-#   sign          bound to the release-signing Environment. Its required reviewer must
+#   sign          bound to the manifest-signing Environment. Its required reviewer must
 #                 approve the run before any secret is released; the Environment is also
 #                 restricted to main. It checks the request against the digest the approver
 #                 was shown, signs, and writes the bundle.
@@ -97,7 +97,7 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    environment: release-signing
+    environment: manifest-signing
     permissions:
       contents: read
     outputs:

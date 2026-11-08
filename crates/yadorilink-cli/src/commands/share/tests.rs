@@ -218,7 +218,11 @@ fn joinable_lines_are_pinned_verbatim() {
         vec!["No joinable folder groups. Create one with `yadorilink share create`.".to_string()]
     );
     assert_eq!(
-        joinable_lines(&[GroupSummary { group_id: "g-1".into(), name: "photos".into() }]),
+        joinable_lines(&[GroupSummary {
+            group_id: "g-1".into(),
+            name: "photos".into(),
+            created_by_device: None
+        }]),
         vec!["photos  (g-1)".to_string()]
     );
 }

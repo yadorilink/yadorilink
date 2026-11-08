@@ -325,7 +325,7 @@ fn removable_by_us(kind: Kind, definition: &Path, home: &Path) -> bool {
     match kind {
         Kind::WindowsTask => true,
         Kind::LaunchAgent | Kind::SystemdUserUnit => definition.starts_with(home),
-        Kind::BundledLaunchAgent | Kind::SystemdSystemUnit => false,
+        Kind::BundledLaunchAgent | Kind::SystemdSystemUnit | Kind::PackagedStartupTask => false,
     }
 }
 
@@ -869,6 +869,11 @@ pub async fn rollback<H: Host>(host: &H, ctx: &Context) -> Result<Outcome, Hando
     }
 }
 
+/// What a script install's file credential store keeps in the state directory: the document,
+/// its rotation lock and its entry claim.
+const SCRIPT_INSTALL_CREDENTIAL_FILES: [&str; 3] =
+    ["credentials.json", "credentials.lock", "credentials.json.entry-lock"];
+
 /// The app's daemon runs and the app is satisfied: checks that the data area is the app's and
 /// closes the hand-off by removing the journal.
 ///
@@ -916,8 +921,19 @@ pub async fn commit<H: Host>(host: &H, ctx: &Context) -> Result<Outcome, Handoff
         Ok(())
     };
     verify.await.map_err(|reason| HandoffError::Refused(Refused::VerificationFailed(reason)))?;
+    // The hand-off is closed first: from here no roll-back can restore the script install.
     journal::remove(&ctx.config_dir)
         .map_err(|e| HandoffError::Refused(Refused::Unusable(e.to_string())))?;
+    // The app keeps its sign-in in the keychain and never reads the file a script install
+    // keeps it in. Credentials are not copied between stores: the user signs in once in the
+    // app. The files go after the journal so that no crash can leave a roll-back to a script
+    // install whose sign-in is already deleted; a crash in between leaves an unused file
+    // that the app ignores.
+    crash(host, "committed").map_err(into_error)?;
+    for name in SCRIPT_INSTALL_CREDENTIAL_FILES {
+        yadorilink_fs_platform::durable_dir::remove_file_durably(&ctx.config_dir.join(name))
+            .map_err(|e| HandoffError::Refused(Refused::Unusable(e.to_string())))?;
+    }
     Ok(Outcome::Committed)
 }
 

@@ -33,6 +33,8 @@ use yadorilink_sync_sqlite::exact_materialized_commit::{
 
 use super::super::ReplicaCoordinator;
 use crate::sync_error::SyncError;
+use crate::write_op::failpoint::WriteOpFailpoint;
+use crate::write_op::{trace, IntentSettlement, ProofOutcome, StepEvent};
 
 /// Whether `object` is a native provider's placeholder rather than
 /// materialized content. Only Windows has one (CfAPI: offline / recall-on-
@@ -51,18 +53,16 @@ fn is_native_placeholder(_object: &std::path::Path) -> bool {
 
 impl ReplicaCoordinator {
     /// Open half of an eviction to a placeholder, after the lane's
-    /// revalidation: mark the row `Evicting` (tx; its error fails the
-    /// eviction outright), then bump the fence for the
-    /// `eviction_to_placeholder` write (tx). The bump's own result is
-    /// returned inside, for the lane to chain into the placeholder write
-    /// and handle exactly like a failure of that write: either way the
-    /// lane closes the row with [`Self::abandon_eviction`].
+    /// revalidation: mark the row `Evicting` and bump the fence for the
+    /// `eviction_to_placeholder` write, in one tx. An error fails the
+    /// eviction with nothing touched; once this returns, the lane closes the
+    /// row on any failure with [`Self::abandon_eviction`].
     pub(crate) fn open_eviction(
         &self,
         group_id: &str,
         path: &str,
         permit: &RootCommitPermit<'_>,
-    ) -> Result<Result<i64, MaterializationExecutionError>, MaterializationExecutionError> {
+    ) -> Result<(), MaterializationExecutionError> {
         // Before the row is touched: marking a frozen group's row `Evicting` is a write
         // of it, and the fence would refuse the lane only afterwards.
         if self.held_path_repository().group_frozen(group_id).map_err(SyncError::from)? {
@@ -70,15 +70,22 @@ impl ReplicaCoordinator {
                 "{group_id}/{path} is frozen by a rebootstrap"
             )));
         }
-        self.materialization_state_repository()
-            .set_materialization_state(group_id, path, MaterializationState::Evicting, permit)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        self.database
+            .write_immediate::<_, yadorilink_sync_sqlite::SyncSqliteError>(|tx| {
+                permit.verify()?;
+                yadorilink_sync_sqlite::content_write_open::open_eviction_in_tx(
+                    tx, group_id, path, now,
+                )?;
+                permit.verify()?;
+                Ok(())
+            })
             .map_err(SyncError::from)?;
-        Ok(MaterializationExecutionPort::dag_bump_mutation_fence(
-            self,
-            group_id,
-            path,
-            "eviction_to_placeholder",
-        ))
+        trace::emit_at(group_id, path, StepEvent::Prepared);
+        Ok(())
     }
 
     /// Settle half of an eviction, after the placeholder write: CAS the
@@ -93,6 +100,14 @@ impl ReplicaCoordinator {
         placeholder: PlaceholderIdentityToRecord,
         permit: &RootCommitPermit<'_>,
     ) -> Result<bool, MaterializationExecutionError> {
+        // The placeholder is on disk by now.
+        trace::emit_at(
+            group_id,
+            path,
+            StepEvent::Published { names_deferred: false, landed_marked: false },
+        );
+        write_failpoint(WriteOpFailpoint::AfterPublish, path)?;
+        write_failpoint(WriteOpFailpoint::BeforeProve, path)?;
         if !self
             .materialization_state_repository()
             .transition_materialization_state(
@@ -107,6 +122,16 @@ impl ReplicaCoordinator {
             return Ok(false);
         }
         self.record_placeholder_identity(group_id, path, placeholder, permit)?;
+        trace::emit_at(
+            group_id,
+            path,
+            StepEvent::Proven {
+                outcome: ProofOutcome::Placeholder,
+                intent: IntentSettlement::Cleared,
+                obligation_closed: false,
+            },
+        );
+        write_failpoint(WriteOpFailpoint::AfterProve, path)?;
         Ok(true)
     }
 
@@ -308,42 +333,6 @@ impl ReplicaCoordinator {
         }
     }
 
-    /// Withdraws the witness of every open write intent of `group_id` whose target directory is
-    /// not there (under `root`). A witnessed temp can only vouch for a missing name if the
-    /// directory it was flushed in is itself still there: one lost with the cut makes every
-    /// entry in it look gone, and anything that re-creates it (a rebuild, a restore, a receive)
-    /// leaves it empty. This runs FIRST at link start, before any step that can create a
-    /// directory, so that every later repair pass, scheduled ones included, sees no witness and
-    /// rebuilds. Returns how many were withdrawn.
-    ///
-    /// A directory that cannot be looked at (a volume that is not mounted yet, a permission
-    /// error) counts as missing: the witness is gone for good and a later genuine delete in
-    /// that directory is rebuilt rather than kept, the safe direction. The landed mark is not
-    /// withdrawn here; it relies on the repair pass's own start-of-pass check.
-    pub fn withdraw_witnesses_without_their_directory(
-        &self,
-        group_id: &str,
-        root: &Path,
-    ) -> Result<usize, yadorilink_sync_sqlite::SyncSqliteError> {
-        let witnessed =
-            self.database.read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
-                yadorilink_sync_sqlite::list_temp_witnesses(conn, group_id)
-            })?;
-        let mut withdrawn = 0;
-        for (path, _) in witnessed {
-            let directory_stands = root
-                .join(&path)
-                .parent()
-                .and_then(|parent| std::fs::symlink_metadata(parent).ok())
-                .is_some_and(|meta| meta.is_dir());
-            if !directory_stands {
-                self.materialization_intent_repository().clear_temp_witness(group_id, &path)?;
-                withdrawn += 1;
-            }
-        }
-        Ok(withdrawn)
-    }
-
     /// Link start: removes the temp files a crash left under `root`, which
     /// are exactly the ones `materialization_tmp_files` names -- written
     /// before each was created, deleted after each was renamed away or
@@ -354,8 +343,8 @@ impl ReplicaCoordinator {
     /// non-recursive `rmdir` (a Stage directory a crash left, or a directory
     /// moved aside to be removed); a directory with anything inside is never
     /// touched and keeps its record. A path outside `root` is not touched. A
-    /// removal that fails keeps its record for the next start. Returns what was
-    /// removed.
+    /// removal that fails keeps its record for the next start. A temp that an open
+    /// write intent names is left alone (see below). Returns what was removed.
     pub fn remove_recorded_temp_files(
         &self,
         group_id: &str,
@@ -363,26 +352,15 @@ impl ReplicaCoordinator {
     ) -> Result<Vec<std::path::PathBuf>, yadorilink_sync_sqlite::SyncSqliteError> {
         let ledger = self.temp_ledger(group_id);
         let mut removed = Vec::new();
-        // A temp an open write intent names as its witness (see
-        // `materialization_intents.temp_witness`) is evidence for the repair that follows: whether
-        // it is still there says whether the rename of a now-missing name was lost. It is kept,
-        // with its record, until the intent is gone.
-        let witnessed: std::collections::HashSet<std::path::PathBuf> = self
-            .database
-            .read::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
-                yadorilink_sync_sqlite::list_temp_witnesses(conn, group_id)
-            })?
-            .into_iter()
-            .map(|(path, name)| {
-                let target = root.join(&path);
-                target.with_file_name(name)
-            })
-            .collect();
+        // A temp an open write intent names is the repair's to finish the write from (or to
+        // discard when it cannot): the sweep after repair finds it unnamed by then.
+        let named_by_intent =
+            self.materialization_intent_repository().write_intent_tmp_paths(group_id)?;
         for recorded in ledger.list()? {
-            let path = std::path::PathBuf::from(&recorded);
-            if witnessed.contains(&path) {
+            if named_by_intent.contains(&recorded) {
                 continue;
             }
+            let path = std::path::PathBuf::from(&recorded);
             // Resolved without walking through a symlinked directory, so a
             // component swapped for a link while stopped cannot aim the removal
             // outside the root. A name that cannot be resolved that way is not
@@ -423,10 +401,35 @@ impl ReplicaCoordinator {
         Ok(removed)
     }
 
+    /// Prepares one repair write (one tx): opens the write intent naming
+    /// `target_version_hash` and bumps the path's fence for `mutation_kind`,
+    /// and returns the bumped fence (the epoch the write's proof is published
+    /// under) with the open intent. A crash leaves both or neither.
+    pub(crate) fn open_repair_write<'a>(
+        &'a self,
+        group_id: &'a str,
+        path: &'a str,
+        target_version_hash: &[u8],
+        mutation_kind: &str,
+        permit: &'a RootCommitPermit<'a>,
+    ) -> Result<(i64, Box<dyn OpenMaterializationIntent + Send + 'a>), MaterializationExecutionError>
+    {
+        let mutation_generation = self
+            .materialization_intent_repository()
+            .open_write_and_bump_fence(group_id, path, target_version_hash, mutation_kind, permit)
+            .map_err(SyncError::from)?;
+        Ok((
+            mutation_generation,
+            Box::new(crate::materialization_intent::MaterializationIntentGuard::opened(
+                self, group_id, path, permit,
+            )),
+        ))
+    }
+
     /// Open half of the repair sweep's quarantine of divergent on-disk
     /// bytes, for a row whose file is present: open the intent naming the
-    /// content the path will be rebuilt to (tx), BEFORE bumping the fence
-    /// for the quarantine rename (tx). The intent is what keeps the path,
+    /// content the path will be rebuilt to and bump the fence for the
+    /// quarantine rename, in one tx. The intent is what keeps the path,
     /// once the rename has moved its bytes aside, from reading as an
     /// offline delete; the lane holds it across the rename and drops it
     /// uncleared.
@@ -437,21 +440,14 @@ impl ReplicaCoordinator {
         target_version_hash: &[u8],
         permit: &'a RootCommitPermit<'a>,
     ) -> Result<Box<dyn OpenMaterializationIntent + Send + 'a>, MaterializationExecutionError> {
-        let quarantine_intent_guard =
-            MaterializationExecutionPort::open_materialization_intent_guard(
-                self,
-                group_id,
-                path,
-                target_version_hash,
-                permit,
-            )?;
-        MaterializationExecutionPort::dag_bump_mutation_fence(
-            self,
+        let (_, intent) = self.open_repair_write(
             group_id,
             path,
+            target_version_hash,
             "repair_quarantine_dirty_disk_file",
+            permit,
         )?;
-        Ok(quarantine_intent_guard)
+        Ok(intent)
     }
 
     /// Open half of a lane's disk write under a path it owns the lock of:
@@ -567,16 +563,16 @@ impl ReplicaCoordinator {
                 );
                 false
             }
-            // Test-only: a proof commit that fails after the lane's bytes
-            // and metadata already landed, the way a crash between the two
-            // would leave it.
-            #[cfg(test)]
-            Some(_) if repair_reconstruct_proof_commit_fails_for(group_id, path) => {
-                tracing::warn!(
-                    group_id,
-                    path = %path,
-                    "test-injected failure of the repair reconstruct proof commit"
-                );
+            // Test-only: a proof commit that fails after the lane's bytes and metadata already
+            // landed, the way a crash between the two would leave it.
+            Some(_)
+                if crate::write_op::failpoint::hit(
+                    crate::write_op::failpoint::WriteOpFailpoint::BeforeProve,
+                    path,
+                )
+                .is_err() =>
+            {
+                tracing::warn!(group_id, path = %path, "an armed failpoint failed the repair proof commit");
                 false
             }
             Some(version) => match FileIdentity::observe_path(out_path) {
@@ -658,16 +654,19 @@ impl ReplicaCoordinator {
                 );
             }
         }
+        if proof_published {
+            emit_repair_proven(group_id, path);
+        }
         proof_published
     }
 
     /// Open half of the repair sweep's journaled rebuild of a single object
     /// with no block content (a symlink, an explicit directory), after the
-    /// lane's eligibility and target checks: bump the fence for the rebuild
-    /// (tx), then open the intent naming `target_version_hash` (tx), both
-    /// propagating errors. Returns the fence value the rebuild's proof is
-    /// published under and the intent, which the lane drops uncleared once
-    /// the object is written: the settle commit is what clears it.
+    /// lane's eligibility and target checks: open the intent naming
+    /// `target_version_hash` and bump the fence for the rebuild, in one tx.
+    /// Returns the fence value the rebuild's proof is published under and
+    /// the intent, which the lane drops uncleared once the object is
+    /// written: the settle commit is what clears it.
     pub(crate) fn open_repair_object_rebuild<'a>(
         &'a self,
         group_id: &'a str,
@@ -677,23 +676,18 @@ impl ReplicaCoordinator {
         permit: &'a RootCommitPermit<'a>,
     ) -> Result<(i64, Box<dyn OpenMaterializationIntent + Send + 'a>), MaterializationExecutionError>
     {
-        let mutation_generation = MaterializationExecutionPort::dag_bump_mutation_fence(
-            self,
+        let opened = self.open_repair_write(
             group_id,
             path,
+            target_version_hash,
             match kind {
                 RecordKind::Directory => "repair_reconstruct_directory",
                 _ => "repair_reconstruct_symlink",
             },
-        )?;
-        let intent_guard = MaterializationExecutionPort::open_materialization_intent_guard(
-            self,
-            group_id,
-            path,
-            target_version_hash,
             permit,
         )?;
-        Ok((mutation_generation, intent_guard))
+        trace::emit_at(group_id, path, StepEvent::Prepared);
+        Ok(opened)
     }
 
     /// Settle half of the repair sweep's journaled rebuild of a `kind`
@@ -718,7 +712,7 @@ impl ReplicaCoordinator {
         permit: &RootCommitPermit<'_>,
     ) -> Result<bool, MaterializationExecutionError> {
         let identity = FileIdentity::observe_path(out_path).ok();
-        self.commit_repair_write(
+        let published = self.commit_repair_write(
             group_id,
             path,
             &ExactMaterializedState::Object { kind, version, identity: Box::new(identity) },
@@ -728,7 +722,11 @@ impl ReplicaCoordinator {
                 expected_version: Some(&version),
             }),
             permit,
-        )
+        )?;
+        if published {
+            emit_repair_proven(group_id, path);
+        }
+        Ok(published)
     }
 
     /// Restore-journal recovery's preservation of bytes the journal cannot
@@ -805,38 +803,31 @@ impl ReplicaCoordinator {
     }
 }
 
-/// Test-only failure injection for `settle_repair_reconstruct`'s proof
-/// commit, keyed by `(group_id, path)` so tests running in parallel never
-/// see each other's arming.
-#[cfg(test)]
-static TEST_FAIL_REPAIR_RECONSTRUCT_PROOF_COMMIT: std::sync::Mutex<
-    Option<std::collections::HashSet<(String, String)>>,
-> = std::sync::Mutex::new(None);
-
-#[cfg(test)]
-fn repair_reconstruct_proof_commit_fails_for(group_id: &str, path: &str) -> bool {
-    TEST_FAIL_REPAIR_RECONSTRUCT_PROOF_COMMIT
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .as_ref()
-        .is_some_and(|armed| armed.contains(&(group_id.to_owned(), path.to_owned())))
+/// The proof of a repair rebuild committed: the intent was cleared with it, and no obligation is
+/// involved.
+fn emit_repair_proven(group_id: &str, path: &str) {
+    // A probe, not a fault: the proof is already committed, so an injected failure is dropped
+    // and a test reads `Armed::fired` and the settled state.
+    let _ = crate::write_op::failpoint::hit(
+        crate::write_op::failpoint::WriteOpFailpoint::AfterProve,
+        path,
+    );
+    trace::emit_at(
+        group_id,
+        path,
+        StepEvent::Proven {
+            outcome: ProofOutcome::Exact,
+            intent: IntentSettlement::Cleared,
+            obligation_closed: false,
+        },
+    );
 }
 
-/// Test-only: makes (or stops making) every repair reconstruct proof commit
-/// for `(group_id, path)` fail as if the commit itself had been refused.
-#[cfg(test)]
-pub(crate) fn set_test_fail_repair_reconstruct_proof_commit(
-    group_id: &str,
+/// A test-armed failure at a transition of an eviction (nothing in a production build).
+fn write_failpoint(
+    point: WriteOpFailpoint,
     path: &str,
-    armed: bool,
-) {
-    let mut guard =
-        TEST_FAIL_REPAIR_RECONSTRUCT_PROOF_COMMIT.lock().unwrap_or_else(|p| p.into_inner());
-    let paths = guard.get_or_insert_with(std::collections::HashSet::new);
-    let key = (group_id.to_owned(), path.to_owned());
-    if armed {
-        paths.insert(key);
-    } else {
-        paths.remove(&key);
-    }
+) -> Result<(), MaterializationExecutionError> {
+    crate::write_op::failpoint::hit(point, path)
+        .map_err(|error| MaterializationExecutionError::CorruptState(error.to_string()))
 }

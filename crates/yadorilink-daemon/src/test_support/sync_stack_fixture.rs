@@ -257,8 +257,6 @@ pub fn file_version(size: u32, seed: u8) -> FileVersion {
 // over RBSR, so a scenario that captures a local write and stops there has
 // built something the peer can never receive.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Mutex;
 
 use yadorilink_local_capture::LocalChangeProcessor;
@@ -347,8 +345,7 @@ impl CheckpointSource for FixtureCheckpointSource {
         merkle_root: [u8; 32],
         leaf_count: u64,
         _purpose: crate::checkpoint_source::CheckpointPurpose,
-    ) -> Pin<Box<dyn Future<Output = Option<(AuthorizationCheckpoint, [u8; 64])>> + Send + 'a>>
-    {
+    ) -> crate::checkpoint_source::CheckpointFuture<'a> {
         Box::pin(async move {
             let seq = {
                 let mut next = self.next_seq.lock().expect("checkpoint seq lock");
@@ -370,7 +367,7 @@ impl CheckpointSource for FixtureCheckpointSource {
                 issued_at_unix: 1,
             };
             let signature = sign_checkpoint(&checkpoint, &authority);
-            Some((checkpoint, signature))
+            Ok((checkpoint, signature))
         })
     }
 }

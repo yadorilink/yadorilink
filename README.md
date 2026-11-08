@@ -17,7 +17,7 @@ YadoriLink coordinates them, but does not store your files.
 - Direct encrypted sync between your devices
 - Account-based sharing, permissions, and revocation
 - Versions and conflict copies ([what is kept, and for how long](docs/VERSION_HISTORY.md))
-- On-demand storage, through the desktop apps (not part of the engine-only release)
+- On-demand storage: files can stay online and download when you open them (macOS and Windows desktop apps; not part of the engine-only release)
 
 Supported platforms: macOS 27 (Apple silicon), Windows 11 25H2+ (x64), and Linux x86_64 (experimental).
 
@@ -27,19 +27,22 @@ Supported platforms: macOS 27 (Apple silicon), Windows 11 25H2+ (x64), and Linux
 |---|---|
 | Engine (`yadorilink` command line and daemon) for macOS, Windows and Linux | Available in this repository's releases |
 | Linux `.deb` package | Available |
-| macOS desktop app (signed, notarized DMG with in-app updates) | In development, not released yet |
-| Windows desktop app (Microsoft Store; on-demand files fetch a whole file when it is opened, never part of one) | In development, not released yet |
-| One-line command-line installer, apt repository, Homebrew, WinGet | Planned |
+| macOS desktop app (signed, notarized DMG with in-app updates through Sparkle) | Public beta: download at [yadori.link/download](https://yadori.link/download/) |
+| Windows desktop app (Microsoft Store; files can stay online and download when you open them, always as a whole file, never part of one) | Beta; the Microsoft Store release is pending |
+| One-line command-line installer (`install.sh`; macOS and Linux) | Available at yadori.link |
+| Homebrew formula (engine only; macOS arm64, Linux x86_64) | Available from the project's tap, `yadorilink/homebrew-yadorilink`, which is updated by hand after each release, so it can lag |
+| APT repository | Tooling and tests exist, but publishing is skipped until the APT signing key is configured, so there is no repository to add yet: install the `.deb` |
+| WinGet | Planned |
 
 ## Get YadoriLink
 
 This repository contains the **engine**: the sync daemon and the
 `yadorilink` command line, plus the Linux package and the Windows Explorer
 integration, and a container image for a NAS or server (see Installing). The macOS and
-Windows desktop apps are released separately, not from this repository, and
-are not available yet.
-Watch [yadori.link](https://yadori.link/) for their release; the app will set
-up the engine for you.
+Windows desktop apps are released separately, not from this repository. The
+macOS app is in public beta (download at [yadori.link/download](https://yadori.link/download/));
+the Windows app is in beta and its Microsoft Store release is pending. Watch
+[yadori.link](https://yadori.link/); the app sets up the engine for you.
 
 The engine on its own (command line and daemon, no desktop app) is available
 for every platform from
@@ -54,12 +57,6 @@ Each file has a `.sha256` checksum next to it. The layout of each engine
 bundle is described in
 [`.github/release/engine-bundle-layout.md`](.github/release/engine-bundle-layout.md).
 
-**Windows, long-offline devices:** a Windows device that was offline so long
-that it can no longer catch up, and would need its synced history rebuilt,
-is not supported yet. YadoriLink refuses to start the rebuild (the log says
-"rebootstrap is blocked") and leaves the folder as it was. Devices that stay
-reasonably in sync are not affected.
-
 ### Installing
 
 - **Linux (Debian/Ubuntu):** download the `.deb` from GitHub Releases, verify its
@@ -71,14 +68,19 @@ reasonably in sync are not affected.
   version as the tag.
 - **Any platform, engine only:** unpack the engine bundle for your platform and
   put `yadorilink` and `yadorilink-daemon` on your `PATH`.
-- **Planned (not released yet):** a one-line installer for the command line
-  (`curl -fsSL https://yadori.link/install.sh | sh` on macOS and Linux, a
-  PowerShell equivalent on Windows) that installs under your home directory
-  without administrator rights and checks every download against the signed
-  release manifest before using it, and an apt repository, a Homebrew formula
-  with prebuilt binaries, and WinGet as alternatives. Whichever
-  way you install, that tool is the one that updates it. Until these ship, use
-  the options above.
+- **One-line installer (macOS Apple silicon, Linux x86_64):**
+  `curl -fsSL https://yadori.link/install.sh | sh`. It
+  installs under your home directory without administrator rights and checks
+  every download against the signed release manifest before using it.
+- **Homebrew (engine only; macOS arm64, Linux x86_64):**
+  `brew install yadorilink/yadorilink/yadorilink` from the project's tap. The
+  tap is updated by hand after each release, so it can lag the latest version.
+- **APT repository:** not published. The tooling exists, but the release
+  workflow skips publishing until the APT signing key is configured; today
+  install the `.deb` (above).
+- **WinGet:** planned, not published.
+
+  Whichever way you install, that tool is the one that updates it.
 
 Install steps, first run, updates, and uninstalling for Linux are in the
 [Linux README](packaging/linux/README.md).
@@ -95,10 +97,11 @@ automatically. To use a different coordination service, set
 
 ## First run
 
-Until the desktop apps are released, use the command line below on every
-platform. Once a desktop app is available (macOS, Windows), install and open
-the app, sign in with Google in your browser, and choose the folder to sync;
-follow the instructions that come with the app.
+On macOS, install and open the app (public beta), sign in with Google in your
+browser, and choose the folder to sync; follow the instructions that come with
+the app. The Windows app works the same way once you have it (its Microsoft Store
+release is pending). On every other platform, and whenever you prefer it, use the
+command line below.
 
 Linux has no desktop app. The command line works the same way on every
 platform.
@@ -113,7 +116,6 @@ yadorilink-daemon`; elsewhere run `yadorilink daemon start`. Then:
 
 ```bash
 yadorilink login
-yadorilink device register --name "my-device"
 yadorilink share create my-share --path ~/some/folder
 yadorilink status
 ```
@@ -149,9 +151,10 @@ yadorilink rewind <folder> --at 2h           # preview rewinding a folder to two
 yadorilink rewind <folder> --at 2h --execute # confirm the counts, then run exactly that plan
 ```
 
-Choose what is not synchronised with a `.yadorilinkignore` file in the folder;
-`yadorilink ignore list|test|explain` shows which patterns apply and why a
-path is ignored.
+Choose what is not synchronised with the folder's ignore rules (one pattern per line,
+kept by YadoriLink on this device, never synchronised): `yadorilink ignore set <folder> <file>`
+replaces them, and `yadorilink ignore list|test|explain <folder>` shows which patterns apply
+and why a path is ignored. A line YadoriLink cannot use is refused with its line number.
 
 Send files to another of your devices, or to someone on another account:
 

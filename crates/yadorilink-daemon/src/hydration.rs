@@ -9,6 +9,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use crate::sync_error::SyncError;
+use crate::write_op::{
+    self, IntentSettlement, OpKind, ProofOutcome, Retention, StepEvent, TargetObject, WriteSpec,
+};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use sha2::{Digest, Sha256};
 use yadorilink_filesystem_sync::materialization_eviction::{evict_file, MaterializationContext};
@@ -816,6 +819,7 @@ async fn fetch_blocks_from_sessions(
     recent_errors: crate::recent_errors::RecentErrorLog,
     stall: Option<Arc<HydrationStallTracker>>,
     stop: LaneStop,
+    sink: Option<BlockSinkTarget>,
 ) -> Result<Dispatched, SyncError> {
     if missing.is_empty() || candidates.is_empty() {
         return Ok(Dispatched { remaining: missing, declined_everywhere: HashSet::new() });
@@ -863,6 +867,7 @@ async fn fetch_blocks_from_sessions(
             let recent_errors = recent_errors.clone();
             let fatal = fatal.clone();
             let stall = stall.clone();
+            let sink = sink.clone();
             let mut stop_rx = stop.subscribe();
             let persist = BlockPersistContext {
                 block_store: block_store.clone(),
@@ -874,6 +879,7 @@ async fn fetch_blocks_from_sessions(
                 recent_errors: recent_errors.clone(),
                 fatal: fatal.clone(),
                 stall: stall.clone(),
+                sink: sink.clone(),
             };
             workers.push(tokio::spawn(async move {
             // Durability tickets this lane has handed off but not yet
@@ -885,6 +891,12 @@ async fn fetch_blocks_from_sessions(
             let mut in_flight = DurabilityPipeline::new();
             loop {
                 if dispatch_has_failed(&fatal) || *stop_rx.borrow() {
+                    break;
+                }
+                // A peer that stopped answering is not asked again: its blocks go to the other
+                // candidates, or the read reports them unreachable now rather than after
+                // another dial.
+                if session.is_unreachable() {
                     break;
                 }
                 // `PoppedBlock::pop_for` takes its own lock, held only
@@ -938,7 +950,17 @@ async fn fetch_blocks_from_sessions(
                 progress.observe_block_fetch_seconds(fetch_started.elapsed().as_secs_f64());
                 match outcome {
                     Ok(Ok(BlockFetchAnswer::Found(data))) => {
-                        if !block_data_matches(&block, &data) {
+                        // A block bound for a sink is checked once, into the type the sink takes;
+                        // one bound for the store is checked here and again by the store.
+                        let for_sink = persist
+                            .sink
+                            .as_ref()
+                            .map(|_| yadorilink_local_storage::VerifiedBlock::check(&data, &block.hash, block.size));
+                        let matches = match &for_sink {
+                            Some(checked) => checked.is_ok(),
+                            None => block_data_matches(&block, &data),
+                        };
+                        if !matches {
                             tracing::warn!(
                                 peer = %peer_id,
                                 file_path = %file_path,
@@ -973,10 +995,15 @@ async fn fetch_blocks_from_sessions(
                         // alternating with it -- and several blocks are in
                         // the store's queue at once, which is what lets one
                         // group commit cover them all.
-                        in_flight.push(
-                            bytes,
-                            tokio::spawn(persist_fetched_block(persist.clone(), guard, data)),
-                        );
+                        let ticket = match for_sink {
+                            Some(Ok(verified)) => tokio::spawn(write_fetched_block_into_sink(
+                                persist.clone(),
+                                guard,
+                                verified,
+                            )),
+                            _ => tokio::spawn(persist_fetched_block(persist.clone(), guard, data)),
+                        };
+                        in_flight.push(bytes, ticket);
                         if let Some(join_error) = in_flight.settle_to_bound().await {
                             record_dispatch_fatal(
                                 &fatal,
@@ -1211,6 +1238,71 @@ struct BlockPersistContext {
     recent_errors: crate::recent_errors::RecentErrorLog,
     fatal: Arc<StdMutex<Option<BlockDispatchFatal>>>,
     stall: Option<Arc<HydrationStallTracker>>,
+    /// Where the blocks of a whole file go when they are written into the file being assembled
+    /// instead of the block store.
+    sink: Option<BlockSinkTarget>,
+}
+
+/// The file a whole-file assembly writes its fetched blocks into, as they arrive, in place of the
+/// block store: no store copy and no provenance exist for these blocks, so nothing that reads the
+/// store can mistake them for held. The file is complete only when [`LargeFileSink::finalize`] has
+/// run; a block counts as fetched here once it is written, not once the file is whole.
+#[derive(Clone)]
+struct BlockSinkTarget {
+    sink: Arc<tokio::sync::Mutex<crate::local_convergence::large_file_sink::LargeFileSink>>,
+    record: Arc<yadorilink_replica_domain::file::FileRecord>,
+    /// Told the bytes of each block written, for the requester's progress.
+    written: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+}
+
+/// Writes one fetched, verified block into the file being assembled and resolves its work item.
+/// The counterpart of [`persist_fetched_block`] for a sink: the block is verified by the caller, no
+/// provenance is recorded, and a write failure is a local storage failure, never the peer's.
+async fn write_fetched_block_into_sink(
+    persist: BlockPersistContext,
+    guard: PoppedBlock,
+    block: yadorilink_local_storage::VerifiedBlock,
+) -> u64 {
+    let BlockPersistContext {
+        group_id,
+        file_path,
+        peer_id,
+        progress,
+        recent_errors,
+        fatal,
+        stall,
+        sink,
+        ..
+    } = persist;
+    let bytes = block.bytes().len() as u64;
+    let Some(target) = sink else { unreachable!("only a lane with a sink hands a block to it") };
+    let written = target.sink.lock().await.write_block(&target.record, &block).await;
+    match written {
+        Ok(()) => {
+            if let Some(stall) = &stall {
+                stall.record_progress(bytes);
+            }
+            if let Some(written) = &target.written {
+                written(bytes);
+            }
+            progress.record_block_done(&group_id, &file_path, bytes, &peer_id);
+            guard.resolve_fetched()
+        }
+        Err(crate::local_convergence::large_file_sink::SinkError::Io(error)) => {
+            tracing::error!(
+                error = %error,
+                file_path = %file_path,
+                "a fetched block could not be written into the file being assembled"
+            );
+            recent_errors.record("storage", "hydration_local_persist");
+            record_dispatch_fatal(
+                &fatal,
+                BlockDispatchFatal::Storage(yadorilink_local_storage::StorageError::Io(error)),
+            );
+            drop(guard);
+        }
+    }
+    bytes
 }
 
 /// Makes one fetched block durable, records this group's provenance for
@@ -1252,6 +1344,7 @@ where
         recent_errors,
         fatal,
         stall,
+        sink: _,
     } = persist;
     let block = guard.block().clone();
     let data_len = data.as_ref().len() as u64;
@@ -1507,20 +1600,24 @@ pub(crate) async fn materialize_path(
 /// reached the proof commit (nothing was published, so nothing is in flight any more), left open
 /// by [`IntentScope::disarm`] when the commit cleared it itself or deliberately keeps it for the
 /// retry, and left open when the process dies (nothing runs then, which is the point) or panics.
+/// A test-armed failure at a transition of the hydration write (nothing in a production build).
+fn write_failpoint(
+    point: write_op::failpoint::WriteOpFailpoint,
+    path: &str,
+) -> Result<(), SyncError> {
+    write_op::failpoint::hit(point, path).map_err(|error| {
+        tracing::warn!(%path, %error, "an armed failpoint failed the hydration write");
+        SyncError::HydrationFailed(path.to_string())
+    })
+}
+
 struct IntentScope<'a> {
     guard: Option<crate::materialization_intent::MaterializationIntentGuard<'a>>,
 }
 
 impl<'a> IntentScope<'a> {
-    fn open(
-        coordinator: &'a crate::replica_coordinator::ReplicaCoordinator,
-        group_id: &'a str,
-        path: &'a str,
-        target: &[u8],
-        permit: &'a yadorilink_root_authority::root_commit::RootCommitPermit<'a>,
-    ) -> Result<Self, SyncError> {
-        let guard = coordinator.open_hydration_write_intent(group_id, path, target, permit)?;
-        Ok(Self { guard: Some(guard) })
+    fn new(guard: crate::materialization_intent::MaterializationIntentGuard<'a>) -> Self {
+        Self { guard: Some(guard) }
     }
 
     fn disarm(&mut self) {
@@ -1697,6 +1794,9 @@ async fn assemble_to_temp(
     use crate::application::ports::{TempAssembly, TempOutcome};
     let _write_activity = state.begin_write_activity();
     let coordinator = state.replica_coordinator.as_ref();
+    // A staging file an abandoned fetch left holds its disk reservation: let go of the ones that
+    // are too old whenever any request comes in.
+    coordinator.hydration_partial_temps().purge_expired();
     let path_lock = state.replica_coordinator.path_lock_registry().path_lock(group_id, path);
     let _path_guard = match request.range {
         Some(_) => None,
@@ -1761,25 +1861,20 @@ async fn assemble_to_temp(
         let assembled_len = window
             .as_ref()
             .map_or(size, |window| window.window_len().saturating_add(window.served.len));
-        let staging_dir =
-            request.staging_file.parent().unwrap_or_else(|| std::path::Path::new("."));
-        let headroom = if state.disk_headroom_enforcement_enabled() {
-            let headroom_override =
-                state.governance_config.load_or_default().headroom_override_bytes;
-            Some(Arc::new(
-                crate::local_convergence::reserve_volume_headroom(
-                    staging_dir,
-                    request.staging_file,
-                    assembled_len,
-                    headroom_override,
-                )
-                .map_err(|error| {
-                    note_provider_disk_pressure(state, group_id, staging_dir, &error);
-                    SyncError::from(error)
-                })?,
-            ))
+        // A whole large file is written into its staging file while it arrives, when this device
+        // receives in place and the item need not be in the block store: the bytes are then
+        // written once. A staging file an interrupted attempt of this version left goes on, with
+        // the reservation it already holds (asking again for the whole size would count it twice).
+        let in_place =
+            window.is_none() && writes_in_place(state, group_id, path, canonical.snapshot.size);
+        let resumed = if in_place {
+            take_parked_provider_sink(state, group_id, path, &target, &canonical.snapshot).await
         } else {
             None
+        };
+        let headroom = match &resumed {
+            Some(resumed) => Some(resumed.reservation.clone()),
+            None => provider_headroom(state, group_id, request, assembled_len)?,
         };
         // Bound to this version: the row is `Hydrating` for exactly as long as the attempt runs,
         // and goes back to what it was when the guard drops.
@@ -1795,8 +1890,32 @@ async fn assemble_to_temp(
             };
             Some(attempt)
         };
-        let still_missing =
-            resolve_blocks_local_first(state, group_id, path, &blocks, stall).await?;
+        // The sink removes its temp on every way out that does not reach `keep`, or parks it for
+        // the next attempt.
+        let mut sink = if in_place {
+            Some(
+                open_provider_sink(
+                    state,
+                    group_id,
+                    path,
+                    &target,
+                    &canonical.snapshot,
+                    request,
+                    &headroom,
+                    resumed,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let still_missing = match &sink {
+            Some(sink) => {
+                resolve_blocks_into_sink(state, group_id, path, &blocks, stall, sink.target())
+                    .await?
+            }
+            None => resolve_blocks_local_first(state, group_id, path, &blocks, stall).await?,
+        };
         if !still_missing.is_empty() {
             return Err(SyncError::HydrationFailed(path.to_string()));
         }
@@ -1810,7 +1929,11 @@ async fn assemble_to_temp(
         // Assembled beside the staging file, fsynced, never visible to the extension. The
         // assembly removes its own temp file if this future is dropped (a cancel). A window of
         // no bytes needs no assembly at all.
-        let assembled = if blocks.is_empty() && window.is_some() {
+        let written_in_place = sink.is_some();
+        let assembled = if let Some(sink) = sink.as_mut() {
+            finalize_assembly_sink(state, sink, path).await?;
+            Some(keep_assembly_sink(sink).await.0)
+        } else if blocks.is_empty() && window.is_some() {
             None
         } else {
             Some(
@@ -1838,7 +1961,8 @@ async fn assemble_to_temp(
         if let Some(assembled) = &assembled {
             assembled_hook(group_id, path, assembled.path()).await;
         }
-        if let Some(assembled) = &assembled {
+        // A file written in place was read back against its blocks before it was completed.
+        if let Some(assembled) = assembled.as_ref().filter(|_| !written_in_place) {
             let verified = {
                 let (assembled, blocks) = (assembled.path().to_path_buf(), blocks.clone());
                 let observer = progress_observer(request.progress.as_ref());
@@ -1889,6 +2013,292 @@ async fn assemble_to_temp(
         }));
     }
     Ok(TempOutcome::VersionOutOfDate)
+}
+
+/// The sink a whole-file assembly writes into, with what keeps it for the next attempt if this one
+/// ends before the file is whole. Dropping it unfinished (an error, a stall deadline, a cancel)
+/// parks the partly written staging file under (group, path, version); the next attempt of that
+/// version reads each claimed block back before counting it and fetches only the rest.
+struct AssemblySink {
+    target: BlockSinkTarget,
+    temps: Arc<crate::local_convergence::filled_temps::PartialTemps>,
+    key: crate::local_convergence::filled_temps::FilledKey,
+    done: bool,
+}
+
+impl AssemblySink {
+    fn target(&self) -> BlockSinkTarget {
+        self.target.clone()
+    }
+}
+
+impl Drop for AssemblySink {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        if let Ok(sink) = self.target.sink.try_lock() {
+            if let Some(parked) = sink.parked_copy() {
+                self.temps.park(self.key.clone(), parked);
+            }
+            return;
+        }
+        // A block write still holds the sink: parked once it lets go (the writes already started
+        // finish on their own; what they add after the copy is simply fetched again).
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let (target, temps, key) = (self.target.clone(), self.temps.clone(), self.key.clone());
+            runtime.spawn(async move {
+                if let Some(parked) = target.sink.lock().await.parked_copy() {
+                    temps.park(key, parked);
+                }
+            });
+        }
+    }
+}
+
+/// The disk headroom a provider assembly of `assembled_len` bytes reserves beside its staging
+/// file; `None` when the engine does not enforce headroom.
+fn provider_headroom(
+    state: &Arc<DaemonState>,
+    group_id: &str,
+    request: &crate::application::ports::TempMaterialization<'_>,
+    assembled_len: u64,
+) -> Result<Option<Arc<crate::local_convergence::HeadroomReservation>>, SyncError> {
+    if !state.disk_headroom_enforcement_enabled() {
+        return Ok(None);
+    }
+    let staging_dir = request.staging_file.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let headroom_override = state.governance_config.load_or_default().headroom_override_bytes;
+    crate::local_convergence::reserve_volume_headroom(
+        staging_dir,
+        request.staging_file,
+        assembled_len,
+        headroom_override,
+    )
+    .map(|reservation| Some(Arc::new(reservation)))
+    .map_err(|error| {
+        note_provider_disk_pressure(state, group_id, staging_dir, &error);
+        SyncError::from(error)
+    })
+}
+
+/// Whether a whole-file assembly writes into its staging file as the blocks arrive, instead of
+/// going through the block store: the device receives in place (not Windows), the file is large,
+/// and the item need not be in the store (not pinned, not leased, group not asked to store).
+fn writes_in_place(state: &Arc<DaemonState>, group_id: &str, path: &str, size: u64) -> bool {
+    state.tuning().file_mode.receives_in_place()
+        && size > crate::local_convergence::large_file_sink::LARGE_FILE_MIN_BYTES
+        && !crate::ingest_policy::KeepInStore::for_group(
+            state.replica_coordinator.as_ref(),
+            group_id,
+        )
+        .keeps(path)
+}
+
+/// The staging file an interrupted attempt of exactly this version left, if it is still the file
+/// at its name and the blocks it claims read back right.
+async fn take_parked_sink(
+    state: &Arc<DaemonState>,
+    group_id: &str,
+    path: &str,
+    kind: SinkKind,
+    version: &yadorilink_replica_domain::ids::VersionHash,
+    snapshot: &yadorilink_sync_sqlite::CurrentVersionSnapshot,
+) -> Option<crate::local_convergence::large_file_sink::LargeFileSink> {
+    let key = parked_key(group_id, path, kind, version);
+    let parked = state.replica_coordinator.hydration_partial_temps().take(&key)?;
+    if !parked.staged.is_still_at_its_path() {
+        return None;
+    }
+    let mut resumed = crate::local_convergence::large_file_sink::LargeFileSink::resume(parked);
+    resumed.verify_claims(&file_record_of(path, snapshot)).await.then_some(resumed)
+}
+
+/// [`take_parked_sink`] for a provider fetch.
+async fn take_parked_provider_sink(
+    state: &Arc<DaemonState>,
+    group_id: &str,
+    path: &str,
+    version: &yadorilink_replica_domain::ids::VersionHash,
+    snapshot: &yadorilink_sync_sqlite::CurrentVersionSnapshot,
+) -> Option<crate::local_convergence::large_file_sink::LargeFileSink> {
+    take_parked_sink(state, group_id, path, SinkKind::ProviderStaging, version, snapshot).await
+}
+
+fn file_record_of(
+    path: &str,
+    snapshot: &yadorilink_sync_sqlite::CurrentVersionSnapshot,
+) -> yadorilink_replica_domain::file::FileRecord {
+    yadorilink_replica_domain::file::FileRecord {
+        path: path.to_string(),
+        size: snapshot.size,
+        mtime_unix_nanos: snapshot.mtime_unix_nanos,
+        blocks: snapshot.blocks.clone(),
+        deleted: false,
+    }
+}
+
+/// Whether the root is still the adopted folder and `out_path` resolves inside it (no symlinked
+/// component), checked before a temp is created beside the target: the temp now exists before the
+/// commit step's own checks, so a refusal here sends the file down the store route, whose checks
+/// refuse it properly. The root is verified first: the second check creates missing directories.
+fn folder_write_target_ok(
+    state: &Arc<DaemonState>,
+    group_id: &str,
+    root: &std::path::Path,
+    out_path: &std::path::Path,
+) -> bool {
+    let coordinator = state.replica_coordinator.as_ref();
+    yadorilink_root_authority::root_identity::VerifiedRoot::verify(root, group_id, coordinator)
+        .is_ok()
+        && yadorilink_local_storage::verify_write_target_within_root(
+            out_path,
+            root,
+            &yadorilink_filesystem_sync::materialization_execution::GroupStructuralLedger::new(
+                coordinator,
+                group_id,
+            ),
+        )
+        .is_ok()
+}
+
+/// Which assembly a sink belongs to. A staging file of a provider fetch and the sibling temp of an
+/// in-place hydration are not interchangeable (another directory, another ledger), so a file
+/// parked by one is never taken by the other.
+#[derive(Clone, Copy)]
+enum SinkKind {
+    ProviderStaging,
+    FolderTemp,
+}
+
+fn parked_key(
+    group_id: &str,
+    path: &str,
+    kind: SinkKind,
+    version: &yadorilink_replica_domain::ids::VersionHash,
+) -> crate::local_convergence::filled_temps::FilledKey {
+    let kind = match kind {
+        SinkKind::ProviderStaging => "provider",
+        SinkKind::FolderTemp => "folder",
+    };
+    (group_id.to_string(), path.to_string(), format!("{kind}:{}", version.to_hex()))
+}
+
+/// Where a new sink's temp goes and what records it.
+struct SinkFile {
+    /// The name the temp is created beside.
+    beside: std::path::PathBuf,
+    ledger: Arc<dyn yadorilink_local_storage::TempFileLedger>,
+    progress: Option<Arc<crate::application::ports::AssemblyProgress>>,
+}
+
+/// The sink a whole-file assembly writes into (see [`writes_in_place`]): `resumed`, or a new
+/// temp beside `file.beside`, sized up front, whose space is the reservation already taken.
+#[allow(clippy::too_many_arguments)]
+async fn open_assembly_sink(
+    state: &Arc<DaemonState>,
+    group_id: &str,
+    path: &str,
+    kind: SinkKind,
+    version: &yadorilink_replica_domain::ids::VersionHash,
+    snapshot: &yadorilink_sync_sqlite::CurrentVersionSnapshot,
+    file: SinkFile,
+    headroom: &Option<Arc<crate::local_convergence::HeadroomReservation>>,
+    resumed: Option<crate::local_convergence::large_file_sink::LargeFileSink>,
+) -> Result<AssemblySink, SyncError> {
+    use crate::local_convergence::large_file_sink::LargeFileSink;
+    let sink = match resumed {
+        Some(sink) => sink,
+        None => {
+            let (beside, size, ledger) = (file.beside, snapshot.size, file.ledger);
+            let staged = tokio::task::spawn_blocking(move || {
+                yadorilink_local_storage::StagedFile::create(&beside, size, ledger)
+            })
+            .await
+            .map_err(|error| SyncError::HydrationFailed(format!("{path}: {error}")))?
+            .map_err(|error| SyncError::HydrationFailed(format!("{path}: {error}")))?;
+            let reservation = headroom.clone().unwrap_or_else(|| {
+                Arc::new(crate::local_convergence::HeadroomReservation::unreserved())
+            });
+            LargeFileSink::new(staged, reservation)
+        }
+    };
+    let target = BlockSinkTarget {
+        sink: Arc::new(tokio::sync::Mutex::new(sink)),
+        record: Arc::new(file_record_of(path, snapshot)),
+        written: progress_observer(file.progress.as_ref()),
+    };
+    Ok(AssemblySink {
+        target,
+        temps: state.replica_coordinator.hydration_partial_temps().clone(),
+        key: parked_key(group_id, path, kind, version),
+        done: false,
+    })
+}
+
+/// [`open_assembly_sink`] for a provider fetch: the temp is created beside the staging file the
+/// requester named, and nothing records it (a provider's staging directory is not a linked folder
+/// that start recovers).
+#[allow(clippy::too_many_arguments)]
+async fn open_provider_sink(
+    state: &Arc<DaemonState>,
+    group_id: &str,
+    path: &str,
+    version: &yadorilink_replica_domain::ids::VersionHash,
+    snapshot: &yadorilink_sync_sqlite::CurrentVersionSnapshot,
+    request: &crate::application::ports::TempMaterialization<'_>,
+    headroom: &Option<Arc<crate::local_convergence::HeadroomReservation>>,
+    resumed: Option<crate::local_convergence::large_file_sink::LargeFileSink>,
+) -> Result<AssemblySink, SyncError> {
+    let file = SinkFile {
+        beside: request.staging_file.to_path_buf(),
+        ledger: Arc::new(yadorilink_local_storage::NoTempLedger),
+        progress: request.progress.clone(),
+    };
+    open_assembly_sink(
+        state,
+        group_id,
+        path,
+        SinkKind::ProviderStaging,
+        version,
+        snapshot,
+        file,
+        headroom,
+        resumed,
+    )
+    .await
+}
+
+/// Completes a sink once every block the peers had to supply is in it: the blocks the store held
+/// are read from the store and written, the data is flushed, and every range is read back against
+/// its hash.
+async fn finalize_assembly_sink(
+    state: &Arc<DaemonState>,
+    assembly: &AssemblySink,
+    path: &str,
+) -> Result<(), SyncError> {
+    let target = assembly.target();
+    let store: Arc<dyn yadorilink_local_storage::BlockContentStore> = Arc::new(
+        crate::adapters::block_store_ports::BlockStorePortsAdapter::new(state.block_store.clone()),
+    );
+    // The local half of the work (copying blocks the store held, the flush, the read back) is
+    // bounded by the same gate as every other file assembly.
+    let _permit =
+        crate::local_convergence::receive_write_gate::admit(state.receive_write_gate()).await;
+    let mut sink = target.sink.lock().await;
+    sink.finalize(store, &target.record, target.written.clone())
+        .await
+        .map_err(|error| SyncError::HydrationFailed(format!("{path}: {error}")))
+}
+
+/// The finished temp's path, which the caller now owns (and removes unless it is renamed away).
+async fn keep_assembly_sink(
+    assembly: &mut AssemblySink,
+) -> (std::path::PathBuf, Arc<yadorilink_local_storage::StagedFile>) {
+    let staged = Arc::clone(&assembly.target.sink.lock().await.staged);
+    let (tmp_path, _ledger) = staged.keep();
+    assembly.done = true;
+    (tmp_path, staged)
 }
 
 /// Proves the link root is still the adopted folder immediately before an
@@ -2048,9 +2458,17 @@ async fn hydrate_inner(
     // content, e.g. `multi_peer_hydration.rs`).
     // The reservation is held until this function returns, through every write
     // below (they run on this task, so nothing can outlive it).
-    let _headroom = if state.disk_headroom_enforcement_enabled() {
+    let _headroom: Option<Arc<crate::local_convergence::HeadroomReservation>> = if state
+        .disk_headroom_enforcement_enabled()
+    {
         let headroom_override = state.governance_config.load_or_default().headroom_override_bytes;
-        Some(preflight_disk_pressure(state, path, &root, initial_record.size, headroom_override)?)
+        Some(Arc::new(preflight_disk_pressure(
+            state,
+            path,
+            &root,
+            initial_record.size,
+            headroom_override,
+        )?))
     } else {
         None
     };
@@ -2164,6 +2582,9 @@ async fn hydrate_inner(
     let initial_lstat = std::fs::symlink_metadata(&out_path).ok();
     let initial_disk_identity =
         initial_lstat.as_ref().map(|meta| disk_identity_of(meta, &out_path));
+    // The same moment as the baseline above, as what the final replacement may replace: the
+    // publish replaces nothing else, whatever lands between the checks below and the rename.
+    let expected_target = yadorilink_local_storage::TargetExpectation::observe(&out_path)?;
     // Idempotent fast path: `hydrate` must be safe to call on a path that is
     // already materialized. Its only production caller (the shell IPC
     // `HydrateRequest` handler) tracks no per-path hydration state and has no
@@ -2372,11 +2793,64 @@ async fn hydrate_inner(
     // own doc comment). When present, its budget grows to cover the real
     // missing-block sizes once they're known, and every durably-completed
     // block resets it.
-    let (still_missing, fetched) =
-        resolve_blocks_local_first_reporting(state, group_id, path, &record.blocks, stall).await?;
+    // A large file is written into its sibling temp while it arrives, when this device receives
+    // in place and the item need not be in the block store. The temp is complete (flushed, read
+    // back against the record) before the intent opens; a path that ends here parks it for the
+    // next attempt of this version.
+    let mut folder_sink = None;
+    let (still_missing, fetched) = if writes_in_place(state, group_id, path, record.size)
+        && folder_write_target_ok(state, group_id, &root, &out_path)
+    {
+        let resumed = take_parked_sink(
+            state,
+            group_id,
+            path,
+            SinkKind::FolderTemp,
+            &target_version,
+            &canonical.snapshot,
+        )
+        .await;
+        let assembly = open_assembly_sink(
+            state,
+            group_id,
+            path,
+            SinkKind::FolderTemp,
+            &target_version,
+            &canonical.snapshot,
+            SinkFile {
+                beside: out_path.clone(),
+                ledger: Arc::new(state.replica_coordinator.temp_ledger(group_id)),
+                progress: None,
+            },
+            // The reservation above belongs to this attempt and is released when it returns. A
+            // parked temp holds none: a retry asks for its own first, and a parked file's
+            // reservation would be counted against it a second time. What was written is real
+            // disk use the next free-space check sees; the sparse remainder is not allocated.
+            &None,
+            resumed,
+        )
+        .await?;
+        let resolved = resolve_blocks_local_first_reporting(
+            state,
+            group_id,
+            path,
+            &record.blocks,
+            stall,
+            Some(assembly.target()),
+        )
+        .await?;
+        folder_sink = Some(assembly);
+        resolved
+    } else {
+        resolve_blocks_local_first_reporting(state, group_id, path, &record.blocks, stall, None)
+            .await?
+    };
 
     if !still_missing.is_empty() {
         return Err(SyncError::HydrationFailed(path.to_string()));
+    }
+    if let Some(assembly) = &folder_sink {
+        finalize_assembly_sink(state, assembly, path).await?;
     }
     // Receiver-side phase marker: every block this file's record
     // lists is now present (already-local or freshly fetched-and-committed)
@@ -2472,20 +2946,30 @@ async fn hydrate_inner(
             // Past the bump the standing proof is stale, so the guard's
             // revert target becomes `Remote`: an abandoned attempt
             // must not restore a `Present` claim nothing can vouch for.
-            // A durable write intent is opened BEFORE the fence bump and kept through the proof
-            // commit (which clears it). A crash anywhere after the bump leaves the old bytes
+            // A durable write intent is opened together with the fence bump and kept through the
+            // proof commit (which clears it). A crash anywhere after the bump leaves the old bytes
             // under a stale proof; the open intent is what lets capture and repair read them as
             // the pre-image of an unfinished write instead of as a local edit.
-            let mut intent = IntentScope::open(
-                state.replica_coordinator.as_ref(),
-                group_id,
-                path,
+            //
+            // The intent and the bump are one transaction: no crash leaves an open intent over
+            // an unbumped fence, or a bumped fence with no intent.
+            let (intent_guard, mutation_generation) = hydration_state.prepare_physical_write(
                 &yadorilink_local_storage::intent_target_hash(&record.blocks),
                 &root_commit_permit,
             )?;
-            let mutation_generation = hydration_state.begin_physical_write().map_err(|e| {
-                SyncError::CorruptState(format!("{path}: mutation fence bump failed: {e}"))
-            })?;
+            let mut intent = IntentScope::new(intent_guard);
+            let spec = WriteSpec {
+                kind: OpKind::Materialize,
+                group_id: group_id.to_owned(),
+                path: path.to_owned(),
+                target: TargetObject::Content(target_version),
+                // The version this write replaces was accounted for when the sync superseded
+                // its row, not here.
+                retention: Retention::DecidedAtSupersession,
+                claimed: false,
+            };
+            write_op::trace::emit(&spec, StepEvent::Prepared);
+            write_failpoint(write_op::failpoint::WriteOpFailpoint::AfterPrepare, path)?;
             // Assembled into a temp file first and published by rename only
             // after the local-edit guards are asked again. The commit
             // decision above is taken before the assemble, which reads and
@@ -2496,17 +2980,24 @@ async fn hydrate_inner(
             // and report `Present`. What stays unguarded is the gap
             // between this re-check and the rename itself, not the assemble.
             let temp_ledger = state.replica_coordinator.temp_ledger(group_id);
-            let tmp_path = run_blocking_sweep_offloaded(|| {
-                yadorilink_local_storage::reconstruct_file_to_temp_in(
-                    &crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
-                        state.block_store.clone(),
-                    ),
-                    &out_path,
-                    &record.blocks,
-                    record.mtime_unix_nanos,
-                    &temp_ledger,
-                )
-            })?;
+            let mut verified_source = None;
+            let tmp_path = if let Some(assembly) = folder_sink.as_mut() {
+                let (tmp_path, staged) = keep_assembly_sink(assembly).await;
+                verified_source = Some(staged);
+                tmp_path
+            } else {
+                run_blocking_sweep_offloaded(|| {
+                    yadorilink_local_storage::reconstruct_file_to_temp_in(
+                        &crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
+                            state.block_store.clone(),
+                        ),
+                        &out_path,
+                        &record.blocks,
+                        record.mtime_unix_nanos,
+                        &temp_ledger,
+                    )
+                })?
+            };
             let untouched = (|| -> Result<bool, SyncError> {
                 Ok(!journal_local_edit_seen_by_hydration(
                     state,
@@ -2532,8 +3023,9 @@ async fn hydrate_inner(
             }
             #[cfg(test)]
             swap_gap_hook(&out_path);
-            // Placing the bytes is a replacing rename. A write that lands between the last check
-            // above and this rename is not noticed; that window is a known limitation. The write
+            // Placing the bytes replaces the object the baseline named, and only that one: the
+            // publish checks the target against it inside the replacement itself, so a write
+            // that lands after the checks above is kept, not replaced. The write
             // intent stays open from here on, through any failure, until an exact proof commits
             // (which clears it) or repair settles the path: clearing it would leave bytes under a
             // stale proof with nothing saying an unfinished write put them there.
@@ -2546,21 +3038,50 @@ async fn hydrate_inner(
                 intent.disarm();
                 return Err(error);
             }
+            // A temp written in place was verified through the handle that wrote it: the rename
+            // takes the name only while it still leads to that object.
+            if verified_source.as_ref().is_some_and(|staged| !staged.is_still_at_its_path()) {
+                intent.disarm();
+                yadorilink_local_storage::discard_temp_file(&tmp_path, &temp_ledger);
+                return Err(SyncError::HydrationFailed(path.to_string()));
+            }
+            // The execute flag the payload names goes onto the temp before the rename, so the
+            // file is published with its final mode.
             let placed = run_blocking_sweep_offloaded(|| {
-                yadorilink_local_storage::persist_reconstructed_file_in(
+                yadorilink_local_storage::persist_reconstructed_file_checked(
                     &tmp_path,
                     &out_path,
                     &temp_ledger,
+                    yadorilink_local_storage::Durability::Full,
+                    Some(canonical.snapshot.exec),
+                    expected_target,
                 )
             });
             intent.disarm();
+            if matches!(placed, Err(yadorilink_local_storage::StorageError::TargetChanged(_))) {
+                // Someone wrote to the path after the last check: nothing was replaced. The
+                // edit is journaled for capture, as the check above would have done.
+                yadorilink_local_storage::discard_temp_file(&tmp_path, &temp_ledger);
+                state.replica_coordinator.journal_uncaptured_local_edit(
+                    group_id,
+                    path,
+                    std::fs::symlink_metadata(&out_path).is_ok(),
+                    &root_commit_permit,
+                )?;
+                tracing::warn!(
+                    %path,
+                    "the file changed on disk as its hydrated content was being placed; \
+                     leaving the local edit in place and publishing nothing"
+                );
+                return Err(SyncError::HydrationFailed(path.to_string()));
+            }
             placed?;
             // The rename reached stable storage (`Durability::Full`): from here a missing name
             // is the user's doing, which the open intent alone cannot tell from a crash before
             // the rename. Recorded before anything else happens to the file, and a mark that
             // cannot be recorded fails the attempt: the intent stays open and the path stays
             // unsettled, rather than leaving a window in which a delete reads as a crash.
-            state
+            let landed_marked = state
                 .replica_coordinator
                 .materialization_intent_repository()
                 .mark_write_landed(group_id, path, mutation_generation, &root_commit_permit)
@@ -2569,30 +3090,22 @@ async fn hydrate_inner(
                         "{path}: could not record the write landed: {e}"
                     ))
                 })?;
+            write_op::trace::emit(
+                &spec,
+                StepEvent::Published { names_deferred: false, landed_marked },
+            );
+            write_failpoint(write_op::failpoint::WriteOpFailpoint::AfterPublish, path)?;
             #[cfg(test)]
             if fail_after_place(&out_path) {
                 return Err(SyncError::HydrationFailed(path.to_string()));
             }
-            // Metadata is part of the on-disk state the proof below
-            // vouches for, so it has to land BEFORE that state is
-            // observed. This used to run after the generation was already
-            // published, which meant the recorded identity described the
-            // file as it was before this same attempt set its own mode and
-            // xattrs -- a proof of a state the attempt itself immediately
-            // superseded.
-            //
-            // Without the mode call an executable file's exec bit was
-            // silently lost on every daemon-side on-demand hydration: the
-            // index kept the correct bit, but disk never got it applied
-            // after `reconstruct_file`.
-            //
-            // The flag comes from the one row read this attempt took under the
-            // path lock, not from a fresh read here. `target_version` bakes it
-            // into its hash, so re-reading it on this side of the block fetch
-            // would apply one incarnation's metadata and then claim the other's
-            // version for it. If the row has moved, this write is stale, and the
-            // commit below is where that is decided.
-            yadorilink_local_storage::apply_file_metadata(&out_path, canonical.snapshot.exec)?;
+            // The metadata is part of the on-disk state the proof below vouches for, and it was
+            // already applied: the execute flag went onto the temp before the rename (above), so
+            // the identity observed next describes the file as published. The flag comes from the
+            // one row read this attempt took under the path lock, not from a fresh read:
+            // `target_version` bakes it into its hash, so re-reading it on this side of the block
+            // fetch would apply one incarnation's metadata and then claim the other's version for
+            // it. If the row has moved, this write is stale, and the commit below decides that.
             // The proof for the write this device just performed, observed
             // once the file is in its final state.
             //
@@ -2641,12 +3154,24 @@ async fn hydrate_inner(
             // take seconds -- so it is a snapshot from an earlier
             // transaction exactly like repair's, and the guard's commit
             // checks it explicitly rather than assuming it.
+            write_failpoint(write_op::failpoint::WriteOpFailpoint::BeforeProve, path)?;
             match hydration_state.commit_exact_file(
                 identity,
                 mutation_generation,
                 &root_commit_permit,
             )? {
-                InternalMaterializedCommit::Published(_) => intent.disarm(),
+                InternalMaterializedCommit::Published(_) => {
+                    intent.disarm();
+                    write_op::trace::emit(
+                        &spec,
+                        StepEvent::Proven {
+                            outcome: ProofOutcome::Exact,
+                            intent: IntentSettlement::Cleared,
+                            obligation_closed: false,
+                        },
+                    );
+                    write_failpoint(write_op::failpoint::WriteOpFailpoint::AfterProve, path)?;
+                }
                 InternalMaterializedCommit::FenceLost { live_mutation_generation } => {
                     intent.disarm();
                     tracing::warn!(
@@ -2695,7 +3220,7 @@ async fn hydrate_inner(
     // volume currently has headroom, so a stale Degraded entry (if any)
     // can clear immediately rather than waiting out the next scheduled
     // re-check. A no-op if the link wasn't degraded.
-    state.clear_link_degraded(&root.to_string_lossy());
+    state.recover_link(&root.to_string_lossy());
     Ok(fetched)
 }
 
@@ -2730,7 +3255,7 @@ fn preflight_disk_pressure(
                 available_bytes,
                 headroom_bytes,
             };
-            state.mark_link_waiting_for_disk_space(
+            state.wait_for_disk_space(
                 &root.to_string_lossy(),
                 crate::link_registry::waiting_for_disk_space_reason(
                     &root.display().to_string(),
@@ -2764,7 +3289,7 @@ fn note_provider_disk_pressure(
     if let Ok(Some(key)) =
         state.replica_coordinator.link_repository().live_link_key_for_group(group_id)
     {
-        state.mark_link_degraded_on_volume(
+        state.wait_for_disk_space_on_volume(
             &key,
             staging_dir,
             crate::link_registry::waiting_for_disk_space_reason(
@@ -2782,7 +3307,7 @@ fn note_provider_read_succeeded(state: &DaemonState, group_id: &str) {
     if let Ok(Some(key)) =
         state.replica_coordinator.link_repository().live_link_key_for_group(group_id)
     {
-        state.clear_link_degraded_if_space_recovered(&key);
+        state.recover_link_if_space_recovered(&key);
     }
 }
 
@@ -2935,29 +3460,37 @@ fn materialize_restored_symlink(
     group_id: &str,
     out_path: &std::path::Path,
     target: &[u8],
-) -> Result<(), SyncError> {
+    expected_target: yadorilink_local_storage::TargetExpectation,
+) -> Result<(), yadorilink_local_storage::StorageError> {
     #[cfg(unix)]
     {
         yadorilink_local_storage::materialize_symlink_in(
             out_path,
             target,
             &state.replica_coordinator.temp_ledger(group_id),
+            expected_target,
         )?;
     }
     #[cfg(windows)]
     {
         // Not opted in: writes nothing, same as `materialize_symlink_at`'s own policy skip.
-        if state.replica_coordinator.link_repository().windows_symlink_opt_in_for_group(group_id)? {
+        if state
+            .replica_coordinator
+            .link_repository()
+            .windows_symlink_opt_in_for_group(group_id)
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+        {
             yadorilink_local_storage::materialize_symlink_windows_in(
                 out_path,
                 target,
                 &state.replica_coordinator.temp_ledger(group_id),
+                expected_target,
             )?;
         }
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (state, group_id, out_path, target);
+        let _ = (state, group_id, out_path, target, expected_target);
     }
     Ok(())
 }
@@ -3082,6 +3615,7 @@ async fn restore_content_inner(
     // replaces whatever is there, so it may only do so over the file this
     // baseline names; see `restore_would_destroy_local_state`.
     let initial_disk_identity = disk_identity(&out_path)?;
+    let expected_target = yadorilink_local_storage::TargetExpectation::observe(&out_path)?;
 
     // A version restore is the same kind of block-fetch transfer as an
     // ordinary hydration: it resolves the version's blocks through the exact
@@ -3286,6 +3820,11 @@ async fn restore_content_inner(
         .replica_coordinator
         .dag_bump_mutation_fence(group_id, path, "restore_write")
         .map_err(|e| SyncError::CorruptState(format!("{path}: mutation fence bump failed: {e}")))?;
+    // A restore keeps its own crash journal (`restore_operations`, written with the native
+    // delta it authored and settled with the row commit) in place of a write intent, so these
+    // are the steps it reports.
+    write_op::trace::emit_at(group_id, path, StepEvent::Prepared);
+    write_failpoint(write_op::failpoint::WriteOpFailpoint::AfterPrepare, path)?;
     // A restored version carries its own `record_kind`/`unix_mode`/
     // `symlink_target` (captured per-row, not just for the `current` row
     // -- see `VersionRecord::record_kind`'s own doc comment); calling
@@ -3351,17 +3890,58 @@ async fn restore_content_inner(
                 return Err(SyncError::PathChangedLocally(format!("{group_id}/{path}")));
             }
             verify_root_before_publish(state, group_id, &root, &tmp_path, &temp_ledger)?;
-            run_blocking_sweep_offloaded(|| {
-                yadorilink_local_storage::persist_reconstructed_file_in(
+            #[cfg(test)]
+            run_restore_before_publish_hook(&out_path);
+            let placed = run_blocking_sweep_offloaded(|| {
+                yadorilink_local_storage::persist_reconstructed_file_checked(
                     &tmp_path,
                     &out_path,
                     &temp_ledger,
+                    yadorilink_local_storage::Durability::Full,
+                    Some(version.exec),
+                    expected_target,
                 )
-            })?;
-            yadorilink_local_storage::apply_file_metadata(&out_path, version.exec)?;
+            });
+            if matches!(placed, Err(yadorilink_local_storage::StorageError::TargetChanged(_))) {
+                // A save landed after the checks above: nothing was replaced. As for a save the
+                // checks saw, the path is journaled for capture and the restore is refused.
+                yadorilink_local_storage::discard_temp_file(&tmp_path, &temp_ledger);
+                state.replica_coordinator.journal_uncaptured_local_edit(
+                    group_id,
+                    path,
+                    std::fs::symlink_metadata(&out_path).is_ok(),
+                    &root_commit_permit,
+                )?;
+                state.replica_coordinator.abandon_restore_operation(&operation_id)?;
+                return Err(SyncError::PathChangedLocally(format!("{group_id}/{path}")));
+            }
+            placed?;
         }
         yadorilink_replica_domain::file::RecordKind::Symlink => match &version.symlink_target {
-            Some(target) => materialize_restored_symlink(state, group_id, &out_path, target)?,
+            Some(target) => {
+                match materialize_restored_symlink(
+                    state,
+                    group_id,
+                    &out_path,
+                    target,
+                    expected_target,
+                ) {
+                    Ok(()) => {}
+                    Err(yadorilink_local_storage::StorageError::TargetChanged(_)) => {
+                        // A save landed after the checks above: nothing was replaced. The path
+                        // is journaled for capture and the restore is refused.
+                        state.replica_coordinator.journal_uncaptured_local_edit(
+                            group_id,
+                            path,
+                            std::fs::symlink_metadata(&out_path).is_ok(),
+                            &root_commit_permit,
+                        )?;
+                        state.replica_coordinator.abandon_restore_operation(&operation_id)?;
+                        return Err(SyncError::PathChangedLocally(format!("{group_id}/{path}")));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
             None => {
                 // No target recorded for this version -- nothing safe to
                 // create on disk, matching `materialize_symlink_at`'s own
@@ -3393,6 +3973,13 @@ async fn restore_content_inner(
             )?;
         }
     }
+    write_op::trace::emit_at(
+        group_id,
+        path,
+        StepEvent::Published { names_deferred: false, landed_marked: false },
+    );
+    write_failpoint(write_op::failpoint::WriteOpFailpoint::AfterPublish, path)?;
+    write_failpoint(write_op::failpoint::WriteOpFailpoint::BeforeProve, path)?;
     // Marks the journal entry disk-committed, observes what the write
     // above left on disk (so the proof describes what a reader would now
     // find; `None` for the one arm that writes nothing), and commits.
@@ -3402,7 +3989,18 @@ async fn restore_content_inner(
         wrote_under_mutation_generation,
         &root_commit_permit,
     )? {
-        yadorilink_replica_domain::session_state::RestoreCommitOutcome::Committed(_) => {}
+        yadorilink_replica_domain::session_state::RestoreCommitOutcome::Committed(_) => {
+            write_op::trace::emit_at(
+                group_id,
+                path,
+                StepEvent::Proven {
+                    outcome: ProofOutcome::Exact,
+                    intent: IntentSettlement::Cleared,
+                    obligation_closed: false,
+                },
+            );
+            write_failpoint(write_op::failpoint::WriteOpFailpoint::AfterProve, path)?;
+        }
         yadorilink_replica_domain::session_state::RestoreCommitOutcome::Missing => {
             return Err(SyncError::CorruptState(format!(
                 "restore operation disappeared before index commit: {operation_id}"
@@ -3504,6 +4102,26 @@ type RestoreHooks = Vec<(String, Box<dyn FnOnce(&std::path::Path) + Send>)>;
 #[cfg(test)]
 pub(crate) static RESTORE_BEFORE_PERSIST_HOOK: std::sync::Mutex<RestoreHooks> =
     std::sync::Mutex::new(Vec::new());
+
+/// Test-only, one-shot, keyed by path: runs after a restore's last local-edit check, immediately
+/// before the final replacement.
+#[cfg(test)]
+pub(crate) static RESTORE_BEFORE_PUBLISH_HOOK: std::sync::Mutex<RestoreHooks> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn run_restore_before_publish_hook(out_path: &std::path::Path) {
+    let hook = {
+        let mut hooks = RESTORE_BEFORE_PUBLISH_HOOK.lock().unwrap_or_else(|p| p.into_inner());
+        hooks
+            .iter()
+            .position(|(key, _)| *key == out_path.display().to_string())
+            .map(|i| hooks.remove(i).1)
+    };
+    if let Some(hook) = hook {
+        hook(out_path);
+    }
+}
 
 #[cfg(test)]
 fn run_restore_before_persist_hook(out_path: &std::path::Path) {
@@ -3701,9 +4319,39 @@ async fn resolve_blocks_local_first(
     blocks: &[BlockInfo],
     stall: Option<&Arc<HydrationStallTracker>>,
 ) -> Result<Vec<BlockInfo>, SyncError> {
-    resolve_blocks_local_first_reporting(state, group_id, path, blocks, stall)
+    resolve_blocks_local_first_reporting(state, group_id, path, blocks, stall, None)
         .await
         .map(|(still_missing, _)| still_missing)
+}
+
+/// Like [`resolve_blocks_local_first`], but the blocks that have to come from peers are written
+/// into `sink` as they arrive and never enter the block store. Blocks the store already holds stay
+/// where they are: the sink's `finalize` reads them from there.
+async fn resolve_blocks_into_sink(
+    state: &DaemonState,
+    group_id: &str,
+    path: &str,
+    blocks: &[BlockInfo],
+    stall: Option<&Arc<HydrationStallTracker>>,
+    sink: BlockSinkTarget,
+) -> Result<Vec<BlockInfo>, SyncError> {
+    resolve_blocks_local_first_reporting(state, group_id, path, blocks, stall, Some(sink))
+        .await
+        .map(|(still_missing, _)| still_missing)
+}
+
+/// Brings the blocks of one version into the block store, with the group's provenance, without
+/// placing an OS copy or touching any materialization state: the store-only fetch of a retention
+/// rule. Returns how many blocks are still unavailable (none: the version is complete here).
+pub(crate) async fn fill_store(
+    state: &DaemonState,
+    group_id: &str,
+    path: &str,
+    blocks: &[BlockInfo],
+) -> Result<usize, SyncError> {
+    resolve_blocks_local_first(state, group_id, path, blocks, None)
+        .await
+        .map(|missing| missing.len())
 }
 
 /// [`resolve_blocks_local_first`], also saying whether any block was requested from peers.
@@ -3713,6 +4361,7 @@ async fn resolve_blocks_local_first_reporting(
     path: &str,
     blocks: &[BlockInfo],
     stall: Option<&Arc<HydrationStallTracker>>,
+    sink: Option<BlockSinkTarget>,
 ) -> Result<(Vec<BlockInfo>, bool), SyncError> {
     let hashes: Vec<String> = blocks.iter().map(|b| hex::encode(&b.hash)).collect();
     let present = state.block_store.present_blocks(&hashes)?;
@@ -3748,6 +4397,13 @@ async fn resolve_blocks_local_first_reporting(
         }
     }
 
+    // Blocks an earlier attempt already wrote into the file being assembled (and that were read
+    // back before this attempt counted them) are not fetched again.
+    if let Some(target) = &sink {
+        let sink = target.sink.lock().await;
+        missing.retain(|block| !sink.has_written(&block.hash));
+    }
+
     // What this attempt has to fetch is known now, also when it is nothing: the requester is told
     // how much of the content was already here (`AssemblyProgress::resumed_from`).
     let bytes_total: u64 = missing.iter().map(|b| b.size as u64).sum();
@@ -3756,6 +4412,16 @@ async fn resolve_blocks_local_first_reporting(
     }
     if missing.is_empty() {
         return Ok((Vec::new(), false));
+    }
+    // Content that is not here is wanted. A peer of this folder with no session is a keeper
+    // that may be waiting out a reconnect backoff: it must dial now, not when its timer ends.
+    let a_peer_is_missing = state
+        .authority
+        .peers_authorized_for_group(group_id)
+        .iter()
+        .any(|peer| *peer != state.device_id && !state.peers.has_session(peer));
+    if candidates.is_empty() || a_peer_is_missing {
+        state.peers.demand_connections(group_id);
     }
 
     // Registers this file as an active transfer for the *missing* blocks
@@ -3799,8 +4465,13 @@ async fn resolve_blocks_local_first_reporting(
         state.telemetry.recent_errors_handle(),
         stall.cloned(),
         LaneStop::new(),
+        sink,
     )
     .await?;
+    if !unresolved.remaining.is_empty() {
+        // The sessions there were could not supply it: the person waits on a better connection.
+        state.peers.demand_connections(group_id);
+    }
     Ok((unresolved.remaining, true))
 }
 

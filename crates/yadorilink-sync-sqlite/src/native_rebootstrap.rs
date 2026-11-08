@@ -382,10 +382,47 @@ impl RebootstrapState {
         matches!(self, Self::Quarantining | Self::CatchingUp | Self::Replaying)
     }
 
+    /// The durability barrier holds: the recovery area is the basis (preserved, or later).
+    pub fn has_barrier(&self) -> bool {
+        matches!(self, Self::Preserved) || self.root_modified()
+    }
+
     /// The target is installed.
     pub fn is_installed(&self) -> bool {
         matches!(self, Self::CatchingUp | Self::Replaying)
     }
+
+    /// What a machine that finds the journal in this state does: the one answer both a restart
+    /// and the driver of the machine act on.
+    pub fn resume(&self) -> Resume {
+        match self {
+            Self::Planning => Phase::Planning.resume(),
+            Self::Capturing => Phase::Capturing.resume(),
+            Self::Preserving => Phase::Preserving.resume(),
+            Self::Preserved => Phase::Preserved.resume(),
+            Self::Quarantining => Phase::Quarantining.resume(),
+            Self::CatchingUp => Phase::CatchingUp.resume(),
+            Self::Replaying => Phase::Replaying.resume(),
+            Self::Blocked(_) => Resume::Blocked,
+        }
+    }
+}
+
+/// How a journal in a given state is continued.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resume {
+    /// The barrier was never written: nothing durable is owed, the attempt is discarded and the
+    /// old state stays authoritative.
+    BeforeBarrier,
+    /// The barrier holds and the target is not installed: install it from the stored target.
+    Install,
+    /// The target is installed: run the catch-up again with a fresh bound.
+    CatchUp,
+    /// The catch-up is over: the replay continues from its cursor.
+    Replay,
+    /// Blocked before the root was touched: it waits for the area to read back or for an
+    /// explicit discard.
+    Blocked,
 }
 
 /// What `share status` and the diagnostics report of a group's rebootstrap.
@@ -485,13 +522,7 @@ pub fn rebootstrap_status(
         ),
     };
     let state = match state.as_str() {
-        "planning" => RebootstrapState::Planning,
-        "capturing" => RebootstrapState::Capturing,
-        "preserving" => RebootstrapState::Preserving,
-        "preserved" => RebootstrapState::Preserved,
-        "quarantining" => RebootstrapState::Quarantining,
-        "catching_up" => RebootstrapState::CatchingUp,
-        "replaying" => RebootstrapState::Replaying,
+        phase if Phase::parse(phase).is_some() => Phase::parse(phase).expect("parsed").state(),
         "blocked" => RebootstrapState::Blocked(
             BlockedReason::decode(
                 code.as_deref().unwrap_or_default(),
@@ -950,29 +981,142 @@ pub fn finish_rebootstrap(
     group: &FolderGroupId,
     recovery_id: &str,
 ) -> Result<bool, SyncSqliteError> {
-    match rebootstrap_status(conn, group)? {
-        Some(status)
-            if status.state == RebootstrapState::Replaying
-                && status.recovery_id == recovery_id
-                && crate::native_rebootstrap_replay::outstanding_steps(conn, group)? == 0 =>
-        {
-            delete_rows(conn, group)?;
-            Ok(true)
+    atomically(conn, || {
+        // A journal that cannot be read is an error, not an absent or unfinished one.
+        rebootstrap_status(conn, group)?;
+        if crate::native_rebootstrap_replay::outstanding_steps(conn, group)? != 0 {
+            return Ok(false);
         }
-        _ => Ok(false),
+        // The edge out of the machine: the journal row goes only if it is still `Replaying`
+        // under this id, decided by the delete itself, and the rows that belong to it go with
+        // it in the same step.
+        let finished = conn.execute(
+            "DELETE FROM native_rebootstrap_journal \
+             WHERE group_id = ?1 AND recovery_id = ?2 AND state = ?3",
+            rusqlite::params![group.as_str(), recovery_id, Phase::Replaying.as_str()],
+        )?;
+        if finished == 0 {
+            return Ok(false);
+        }
+        delete_rows(conn, group)?;
+        Ok(true)
+    })
+}
+
+/// The stages of a rebootstrap's journal that the machine moves through, in order. The
+/// spelling in the `state` column is defined here and nowhere else (`blocked` is a side
+/// state, see [`RebootstrapState::Blocked`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Phase {
+    Planning,
+    Capturing,
+    Preserving,
+    Preserved,
+    Quarantining,
+    CatchingUp,
+    Replaying,
+}
+
+impl Phase {
+    #[cfg(test)]
+    pub(crate) const ALL: [Phase; 7] = [
+        Phase::Planning,
+        Phase::Capturing,
+        Phase::Preserving,
+        Phase::Preserved,
+        Phase::Quarantining,
+        Phase::CatchingUp,
+        Phase::Replaying,
+    ];
+
+    /// How a journal at this stage is continued: the single table behind the restart and the
+    /// driver of the machine.
+    pub(crate) fn resume(self) -> Resume {
+        match self {
+            Self::Planning | Self::Capturing | Self::Preserving => Resume::BeforeBarrier,
+            Self::Preserved | Self::Quarantining => Resume::Install,
+            Self::CatchingUp => Resume::CatchUp,
+            Self::Replaying => Resume::Replay,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Planning => "planning",
+            Self::Capturing => "capturing",
+            Self::Preserving => "preserving",
+            Self::Preserved => "preserved",
+            Self::Quarantining => "quarantining",
+            Self::CatchingUp => "catching_up",
+            Self::Replaying => "replaying",
+        }
+    }
+
+    fn state(self) -> RebootstrapState {
+        match self {
+            Self::Planning => RebootstrapState::Planning,
+            Self::Capturing => RebootstrapState::Capturing,
+            Self::Preserving => RebootstrapState::Preserving,
+            Self::Preserved => RebootstrapState::Preserved,
+            Self::Quarantining => RebootstrapState::Quarantining,
+            Self::CatchingUp => RebootstrapState::CatchingUp,
+            Self::Replaying => RebootstrapState::Replaying,
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        Some(match text {
+            "planning" => Self::Planning,
+            "capturing" => Self::Capturing,
+            "preserving" => Self::Preserving,
+            "preserved" => Self::Preserved,
+            "quarantining" => Self::Quarantining,
+            "catching_up" => Self::CatchingUp,
+            "replaying" => Self::Replaying,
+            _ => return None,
+        })
     }
 }
 
-pub(crate) fn set_state(
+/// The edges `advance` may take. Entry (none to planning), the barrier write
+/// (preserving to preserved, which also records the manifest), blocking and the end of the
+/// machine are written by their own functions.
+pub(crate) const ADVANCES: [(Phase, Phase); 5] = [
+    (Phase::Planning, Phase::Capturing),
+    (Phase::Capturing, Phase::Preserving),
+    (Phase::Preserved, Phase::Quarantining),
+    (Phase::Quarantining, Phase::CatchingUp),
+    (Phase::CatchingUp, Phase::Replaying),
+];
+
+/// Moves the journal of `recovery_id` from `from` to `to`, only if it is exactly there and
+/// the pair is a listed edge. Anything else is an error and changes nothing.
+pub(crate) fn advance(
     conn: &Connection,
     group: &FolderGroupId,
-    state: &str,
+    recovery_id: &str,
+    from: Phase,
+    to: Phase,
     now: i64,
 ) -> Result<(), SyncSqliteError> {
-    conn.execute(
-        "UPDATE native_rebootstrap_journal SET state = ?2, updated_at = ?3 WHERE group_id = ?1",
-        (group.as_str(), state, now),
+    if !ADVANCES.contains(&(from, to)) {
+        return Err(SyncSqliteError::CorruptState(format!(
+            "rebootstrap: {} to {} is not a transition",
+            from.as_str(),
+            to.as_str()
+        )));
+    }
+    let changed = conn.execute(
+        "UPDATE native_rebootstrap_journal SET state = ?4, updated_at = ?5 \
+         WHERE group_id = ?1 AND recovery_id = ?2 AND state = ?3",
+        (group.as_str(), recovery_id, from.as_str(), to.as_str(), now),
     )?;
+    if changed != 1 {
+        return Err(SyncSqliteError::CorruptState(format!(
+            "rebootstrap: the journal is not at {} for this rebootstrap",
+            from.as_str()
+        )));
+    }
     Ok(())
 }
 
@@ -1013,12 +1157,7 @@ fn clear_block(conn: &Connection, group: &FolderGroupId) -> Result<(), SyncSqlit
 /// modified for may be deleted.
 fn delete_journal(conn: &Connection, group: &FolderGroupId) -> Result<(), SyncSqliteError> {
     if let Some(status) = rebootstrap_status(conn, group)? {
-        if matches!(
-            status.state,
-            RebootstrapState::Quarantining
-                | RebootstrapState::CatchingUp
-                | RebootstrapState::Replaying
-        ) {
+        if status.state.root_modified() {
             return Err(SyncSqliteError::CorruptState(
                 "a rebootstrap whose root has been modified is never deleted".into(),
             ));
@@ -1561,12 +1700,7 @@ fn discard(
     recovery_id: &str,
 ) -> Result<(), SyncSqliteError> {
     if let Some(status) = rebootstrap_status(conn, group)? {
-        if matches!(
-            status.state,
-            RebootstrapState::Quarantining
-                | RebootstrapState::CatchingUp
-                | RebootstrapState::Replaying
-        ) {
+        if status.state.root_modified() {
             // The originals of the quarantined changes are in this area and nowhere
             // else.
             return Err(SyncSqliteError::CorruptState(
@@ -1732,6 +1866,30 @@ fn candidate_replaces(
 /// Re-checks that the area of a journal that is not `Preserved` any more because it
 /// was blocked is still a complete, valid area, and if so makes it `Preserved`
 /// again: a block never discards an area that holds the user's data.
+/// The edge out of a block before the root was touched: `blocked` becomes `preserved` under the
+/// same recovery id, decided by the update itself, and only for a journal that recorded its
+/// barrier.
+fn lift_block(
+    conn: &Connection,
+    group: &FolderGroupId,
+    recovery_id: &str,
+    now: i64,
+) -> Result<(), SyncSqliteError> {
+    let changed = conn.execute(
+        "UPDATE native_rebootstrap_journal SET state = ?4, updated_at = ?3 \
+         WHERE group_id = ?1 AND recovery_id = ?2 AND state = 'blocked' \
+           AND manifest_sha256 IS NOT NULL",
+        rusqlite::params![group.as_str(), recovery_id, now, Phase::Preserved.as_str()],
+    )?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(SyncSqliteError::CorruptState(
+            "a blocked rebootstrap changed under its own check".into(),
+        ))
+    }
+}
+
 fn unblock_if_area_holds(
     conn: &Connection,
     recovery_root: &Path,
@@ -1747,18 +1905,20 @@ fn unblock_if_area_holds(
     if !complete {
         return Ok(false);
     }
-    // Judged as the barrier would judge it, from a journal that says so.
-    conn.execute(
-        "UPDATE native_rebootstrap_journal SET state = 'preserved', updated_at = ?2 \
-         WHERE group_id = ?1 AND manifest_sha256 IS NOT NULL",
-        (group.as_str(), now),
-    )?;
-    match resume_preserved(conn, recovery_root, group) {
+    // Judged as the barrier would judge it, against the journal as it is: the journal says
+    // `preserved` only once everything has held.
+    let verified = if status.manifest_sha256.is_none() {
+        Err(BlockedReason::ManifestInconsistent { detail: "no preserved rebootstrap".into() })
+    } else {
+        verify_preserved(recovery_root, group, &status)
+    };
+    match verified {
         Ok(preserved) => {
             // A blocked journal does not freeze the group: if anything was admitted or
             // authored meanwhile, the barrier no longer protects what is there, and only an
             // explicit discard resolves it.
             if frozen_frontier_unchanged(conn, group, &preserved.manifest_sha256)? {
+                lift_block(conn, group, &status.recovery_id, now)?;
                 return Ok(true);
             }
             let reason = BlockedReason::ManifestInconsistent {
@@ -1857,12 +2017,7 @@ pub fn begin_rebootstrap(
                 return Err(BeginError::Blocked(reason));
             }
         }
-        if matches!(
-            old.state,
-            RebootstrapState::Quarantining
-                | RebootstrapState::CatchingUp
-                | RebootstrapState::Replaying
-        ) {
+        if old.state.root_modified() {
             // The root has been modified (or is about to be): the recorded target
             // is the only target, whatever a peer offers now.
             return Err(BeginError::TargetFixed(old.recovery_id));
@@ -1931,12 +2086,7 @@ pub(crate) fn start_journal_and_preserve(
     hook: &mut dyn FnMut(Failpoint) -> Result<(), Crash>,
 ) -> Result<Preserved, BeginError> {
     if let Some(old) = rebootstrap_status(conn, group)? {
-        if matches!(
-            old.state,
-            RebootstrapState::Quarantining
-                | RebootstrapState::CatchingUp
-                | RebootstrapState::Replaying
-        ) {
+        if old.state.root_modified() {
             return Err(BeginError::TargetFixed(old.recovery_id));
         }
     }
@@ -1978,7 +2128,7 @@ fn capture_pass(
     recovery_id: &str,
     hook: &mut dyn FnMut(Failpoint) -> Result<(), Crash>,
 ) -> Result<(), BeginError> {
-    set_state(conn, group, "capturing", ctx.now_unix)?;
+    advance(conn, group, recovery_id, Phase::Planning, Phase::Capturing, ctx.now_unix)?;
     let authority = Arc::new(CaptureAuthority::issue(conn, group, own_device, recovery_id)?);
     hook(Failpoint::BeforeCapture).map_err(|_| BeginError::Crashed)?;
     let barrier = ctx.final_capture.capture(&authority);
@@ -2042,7 +2192,7 @@ fn preserve(
     check_space(&plan, stored, ctx).map_err(block)?;
     let area = RecoveryArea::create(ctx.recovery_root, group, recovery_id, ctx.sync_roots)
         .map_err(|e| block(area_failure(e)))?;
-    set_state(conn, group, "preserving", ctx.now_unix)?;
+    advance(conn, group, recovery_id, Phase::Capturing, Phase::Preserving, ctx.now_unix)?;
     write_target(conn, group, &area, stored, ctx.now_unix).map_err(block)?;
     hook(Failpoint::AfterTargetDurable).map_err(|_| BeginError::Crashed)?;
     let versions = copy_items(conn, group, &area, &plan, ctx, hook)?;
@@ -2063,7 +2213,7 @@ fn preserve(
     // Every file and directory of the area was published by a durable move, the
     // manifest last, so the names that lead to them are on disk already.
     hook(Failpoint::AfterManifest).map_err(|_| BeginError::Crashed)?;
-    set_preserved(conn, group, &manifest_sha256, ctx.now_unix)?;
+    set_preserved(conn, group, recovery_id, &manifest_sha256, ctx.now_unix)?;
     hook(Failpoint::AtPreserved).map_err(|_| BeginError::Crashed)?;
     Ok(Preserved {
         recovery_id: recovery_id.to_owned(),
@@ -2167,9 +2317,12 @@ fn save_remote_only(
     Ok(entries)
 }
 
-fn set_preserved(
+/// The barrier: preserving to preserved, recording the manifest and the frozen frontier in the
+/// same statement. Refused unless the journal is at `preserving` under `recovery_id`.
+pub(crate) fn set_preserved(
     conn: &Connection,
     group: &FolderGroupId,
+    recovery_id: &str,
     manifest_sha256: &[u8; 32],
     now: i64,
 ) -> Result<(), SyncSqliteError> {
@@ -2179,12 +2332,25 @@ fn set_preserved(
         |row| row.get(0),
     )?;
     let frontier_hash = frozen_frontier_hash(conn, group, manifest_sha256, capture_high_seq)?;
-    conn.execute(
+    let changed = conn.execute(
         "UPDATE native_rebootstrap_journal \
-         SET state = 'preserved', manifest_sha256 = ?2, frozen_frontier_hash = ?4, \
-             updated_at = ?3 WHERE group_id = ?1",
-        (group.as_str(), manifest_sha256.as_slice(), now, frontier_hash.as_slice()),
+         SET state = ?5, manifest_sha256 = ?2, frozen_frontier_hash = ?4, \
+             updated_at = ?3 WHERE group_id = ?1 AND recovery_id = ?6 AND state = ?7",
+        (
+            group.as_str(),
+            manifest_sha256.as_slice(),
+            now,
+            frontier_hash.as_slice(),
+            Phase::Preserved.as_str(),
+            recovery_id,
+            Phase::Preserving.as_str(),
+        ),
     )?;
+    if changed != 1 {
+        return Err(SyncSqliteError::CorruptState(
+            "rebootstrap: the journal is not at preserving for this rebootstrap".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -2523,13 +2689,21 @@ pub fn resume_preserved(
 ) -> Result<Preserved, BlockedReason> {
     let status = rebootstrap_status(conn, group)
         .map_err(|e| BlockedReason::ManifestInconsistent { detail: e.to_string() })?
-        .filter(|s| {
-            matches!(s.state, RebootstrapState::Preserved | RebootstrapState::Quarantining)
-                || s.state.is_installed()
-        })
+        .filter(|s| s.state.has_barrier())
         .ok_or_else(|| BlockedReason::ManifestInconsistent {
             detail: "no preserved rebootstrap".into(),
         })?;
+    verify_preserved(recovery_root, group, &status)
+}
+
+/// What the recovery area holds, judged against the journal row `status` describes, whatever
+/// stage that row is at: the area must be the one the barrier recorded and its target must verify.
+/// Reads only; it moves nothing.
+fn verify_preserved(
+    recovery_root: &Path,
+    group: &FolderGroupId,
+    status: &RebootstrapStatus,
+) -> Result<Preserved, BlockedReason> {
     let inconsistent = |detail: String| BlockedReason::ManifestInconsistent { detail };
     let area = RecoveryArea::open_existing(recovery_root, group, &status.recovery_id)
         .map_err(|e| inconsistent(e.to_string()))?;
@@ -2564,7 +2738,7 @@ pub fn resume_preserved(
         ));
     }
     Ok(Preserved {
-        recovery_id: status.recovery_id,
+        recovery_id: status.recovery_id.clone(),
         dir: area.dir().to_path_buf(),
         manifest_sha256,
         checkpoint_hash: verified.checkpoint_hash(),
@@ -2604,35 +2778,37 @@ pub fn recover_after_restart(
     let status = rebootstrap_status(conn, group)?;
     let outcome = match &status {
         None => RestartOutcome::Idle,
-        Some(s) => match &s.state {
-            RebootstrapState::Planning
-            | RebootstrapState::Capturing
-            | RebootstrapState::Preserving => {
+        Some(s) => match s.state.resume() {
+            Resume::BeforeBarrier => {
                 discard(conn, recovery_root, group, &s.recovery_id)?;
                 RestartOutcome::Abandoned { recovery_id: s.recovery_id.clone() }
             }
-            RebootstrapState::Blocked(reason) => RestartOutcome::Blocked(reason.clone()),
-            RebootstrapState::Preserved
-            | RebootstrapState::Quarantining
-            | RebootstrapState::CatchingUp
-            | RebootstrapState::Replaying => match resume_preserved(conn, recovery_root, group) {
-                Ok(preserved) => {
-                    clear_block(conn, group)?;
-                    // A crash between the barrier and the sweep of the area it
-                    // replaced leaves that area behind.
-                    sweep_superseded(conn, recovery_root, group)?;
-                    match s.state {
-                        RebootstrapState::Quarantining => RestartOutcome::Quarantining(preserved),
-                        RebootstrapState::CatchingUp => RestartOutcome::CatchingUp(preserved),
-                        RebootstrapState::Replaying => RestartOutcome::Replaying(preserved),
-                        _ => RestartOutcome::Preserved(preserved),
+            Resume::Blocked => match &s.state {
+                RebootstrapState::Blocked(reason) => RestartOutcome::Blocked(reason.clone()),
+                _ => unreachable!("only a blocked journal resumes as blocked"),
+            },
+            Resume::Install | Resume::CatchUp | Resume::Replay => {
+                match resume_preserved(conn, recovery_root, group) {
+                    Ok(preserved) => {
+                        clear_block(conn, group)?;
+                        // A crash between the barrier and the sweep of the area it
+                        // replaced leaves that area behind.
+                        sweep_superseded(conn, recovery_root, group)?;
+                        match (s.state.resume(), &s.state) {
+                            (Resume::Install, RebootstrapState::Quarantining) => {
+                                RestartOutcome::Quarantining(preserved)
+                            }
+                            (Resume::Install, _) => RestartOutcome::Preserved(preserved),
+                            (Resume::CatchUp, _) => RestartOutcome::CatchingUp(preserved),
+                            _ => RestartOutcome::Replaying(preserved),
+                        }
+                    }
+                    Err(reason) => {
+                        set_blocked(conn, group, &reason, s.updated_at)?;
+                        RestartOutcome::Blocked(reason)
                     }
                 }
-                Err(reason) => {
-                    set_blocked(conn, group, &reason, s.updated_at)?;
-                    RestartOutcome::Blocked(reason)
-                }
-            },
+            }
         },
     };
     // An area without a manifest never reached the barrier, whatever the journal

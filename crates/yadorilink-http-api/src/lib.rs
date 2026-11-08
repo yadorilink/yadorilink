@@ -361,13 +361,12 @@ pub async fn run(handle: HttpApiHandle) -> Result<(), Box<dyn std::error::Error 
     } = handle;
     let _port_file = PortFileGuard { path: port_path, contents: port_file };
     let mut tasks = tokio::task::JoinSet::new();
-    // Ends only with `run`: when `run` returns or is dropped, this task and
-    // its receiver go with it, which is what tells the daemon the dashboard
-    // stopped (`PeerStreams::is_serving`).
-    tasks.spawn(async move {
-        peer::serve(peer_queue, peer_router).await;
-        Ok(())
-    });
+    // Polled inside this future, not spawned: when `run` returns or is dropped, the receiver goes
+    // with it at that moment, which is what tells the daemon the dashboard stopped
+    // (`PeerStreams::is_serving`). A spawned task is cancelled only when the runtime next gets to
+    // it, and until then the daemon would keep handing streams to a dashboard that has stopped.
+    let peer_serving = peer::serve(peer_queue, peer_router);
+    tokio::pin!(peer_serving);
     for listener in listeners {
         let router = router.clone();
         // Every accepted connection on every listener shares one
@@ -377,10 +376,20 @@ pub async fn run(handle: HttpApiHandle) -> Result<(), Box<dyn std::error::Error 
         let listener = ConnLimitedListener::new(listener, conn_slots.clone());
         tasks.spawn(async move { axum::serve(listener, router).await });
     }
-    while let Some(res) = tasks.join_next().await {
-        res??;
+    loop {
+        tokio::select! {
+            () = &mut peer_serving => {}
+            res = tasks.join_next() => match res {
+                Some(res) => res??,
+                // No listener left to serve: the peer side still runs, as it did while it was a
+                // task of this set.
+                None => {
+                    peer_serving.await;
+                    return Ok(());
+                }
+            },
+        }
     }
-    Ok(())
 }
 
 /// Bounds how many requests this adapter is concurrently processing at
@@ -436,11 +445,21 @@ fn build_router(state: AppState) -> Router {
         .route("/links", get(handlers::reads::links))
         .route("/conflicts", get(handlers::reads::conflicts))
         .route("/connections", get(handlers::reads::connections))
+        .route("/devices", get(handlers::reads::devices))
+        .route("/preserved", get(handlers::reads::preserved))
+        .route("/trash", get(handlers::reads::trash))
+        .route("/retained", get(handlers::reads::retained))
+        .route("/shares", get(handlers::reads::shares))
+        .route("/transfers", get(handlers::reads::transfers))
         .route("/versions", get(handlers::reads::versions))
         .route("/materialization", get(handlers::reads::materialization))
         .route("/events", get(handlers::events::events))
         .route("/pause", post(handlers::writes::pause))
         .route("/resume", post(handlers::writes::resume))
+        .route("/conflicts/resolve", post(handlers::writes::resolve_conflict))
+        .route("/trash/restore", post(handlers::writes::trash_restore))
+        .route("/preserved/action", post(handlers::writes::preserved_action))
+        .route("/unlink", post(handlers::writes::unlink))
         .route("/readopt", post(handlers::writes::readopt))
         .route("/evict", post(handlers::writes::evict))
         .route("/restore", post(handlers::writes::restore))
@@ -448,6 +467,13 @@ fn build_router(state: AppState) -> Router {
         .route("/link/preflight", post(handlers::linking::preflight))
         .route("/link", post(handlers::linking::link))
         .route("/share/create", post(handlers::linking::create))
+        .route("/share/invite", post(handlers::linking::mint_invite))
+        .route("/share/delete", post(handlers::writes::delete_group))
+        .route("/retained/free", post(handlers::writes::release_retained))
+        .route("/share/revoke", post(handlers::writes::revoke_member))
+        .route("/transfers/cancel", post(handlers::writes::cancel_transfer))
+        .route("/transfers/retry", post(handlers::writes::retry_transfer))
+        .route("/devices/remove", post(handlers::writes::remove_device))
         .route("/share/join", post(handlers::linking::join))
         .route("/invite/accept", post(handlers::linking::accept_invite))
         .route_layer(axum::middleware::from_fn_with_state(

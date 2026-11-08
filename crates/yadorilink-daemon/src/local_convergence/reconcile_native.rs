@@ -5,8 +5,9 @@
 //!
 //! What a pass over a seed set does:
 //!
-//! 1. Plans the levels the seeds and their ancestors live on.
-//! 2. Orders the work: at each depth the directories, then the entries;
+//! 1. Reads the plan of the levels the seeds and their ancestors live on, and
+//!    derives the pass's work, order and static gate from them
+//!    ([`plan_pass`]): at each depth the directories, then the entries;
 //!    deletions last, deepest first. A path that gives up content another path
 //!    still holds waits until that path has it (the displacement guard).
 //! 3. Gives each node the shape the plan requires, and projects entries
@@ -26,43 +27,17 @@ use futures_util::stream::{self, StreamExt};
 
 use yadorilink_peer_session::peer_session::*;
 use yadorilink_peer_session::PeerSessionError;
+use yadorilink_replica_domain::convergence_plan::{
+    interesting_names, levels_of, plan_pass, LevelRead, Observation, PassInput, PlannedGate,
+    PlannedWork,
+};
 use yadorilink_replica_domain::file::FileRecord;
 use yadorilink_replica_domain::ids::SyncPath;
-use yadorilink_replica_domain::native_plan::{NativeLevelPlan, NativePlannedNode};
+use yadorilink_replica_domain::native_plan::NativePlannedNode;
 use yadorilink_replica_domain::session_state::LinkGate;
 
 use super::namespace_steps::{parent_of, proper_ancestors, DirectoryVerdict};
 use super::types::*;
-
-/// One unit of work of a pass.
-enum Work {
-    Node(NativePlannedNode),
-    /// A seed the plan holds nothing for.
-    Absent,
-}
-
-/// Position in a pass: shallow first; directories, then entries; deletions
-/// after everything, deep first.
-fn rank(path: &str, work: &Work) -> (u8, usize, u8) {
-    let depth = path.matches('/').count();
-    match work {
-        Work::Absent => (1, usize::MAX - depth, 0),
-        Work::Node(
-            NativePlannedNode::StructuralDirectory | NativePlannedNode::ExplicitDirectory { .. },
-        ) => (0, depth, 0),
-        Work::Node(NativePlannedNode::Entry { .. }) => (0, depth, 1),
-    }
-}
-
-/// Whether a pass may settle a path at all.
-enum Gate {
-    Open,
-    /// Excluded by this device's ignore set: settled without work.
-    Ignored,
-    /// Paused, in a frozen group, or below a directory that could not be
-    /// shaped: left for a later attempt.
-    Declined,
-}
 
 /// A file or symlink the plan puts at its own path.
 fn is_plain_entry(node: &NativePlannedNode) -> bool {
@@ -210,20 +185,6 @@ pub(crate) fn parse_receive_write_concurrency(raw: Option<&str>) -> usize {
 }
 
 impl super::LocalConvergenceExecutor {
-    /// The levels a pass over `seeds` has to read: each seed's, and its
-    /// ancestors' (a head landing below a path can turn the path into a
-    /// directory that displaces its own winner).
-    fn native_levels_of(&self, seeds: &BTreeSet<String>) -> BTreeSet<String> {
-        let mut levels = BTreeSet::new();
-        for path in seeds {
-            levels.insert(parent_of(path).to_owned());
-            for ancestor in proper_ancestors(path) {
-                levels.insert(parent_of(ancestor).to_owned());
-            }
-        }
-        levels
-    }
-
     /// Whether a rebootstrap freezes `group_id`: nothing is settled, written, removed
     /// or moved in it until the rebootstrap finishes.
     fn group_frozen(&self, group_id: &str) -> Result<bool, PeerSessionError> {
@@ -277,14 +238,9 @@ impl super::LocalConvergenceExecutor {
         // ancestors, and whatever stands for them. A level whose names cannot be planned (a
         // live head whose version this replica does not hold) fails closed: every seed that
         // needs it retries; nothing is taken as absent.
-        let interesting: BTreeSet<&str> = seed_paths
-            .iter()
-            .map(String::as_str)
-            .chain(seed_paths.iter().flat_map(|p| proper_ancestors(p)))
-            .collect();
-        let mut plans: BTreeMap<String, NativeLevelPlan> = BTreeMap::new();
-        let mut unplannable: BTreeSet<String> = BTreeSet::new();
-        for level in self.native_levels_of(&seed_paths) {
+        let interesting = interesting_names(&seed_paths);
+        let mut levels: BTreeMap<String, LevelRead> = BTreeMap::new();
+        for level in levels_of(&seed_paths) {
             let started = std::time::Instant::now();
             let on_level: BTreeSet<String> = interesting
                 .iter()
@@ -293,66 +249,58 @@ impl super::LocalConvergenceExecutor {
                 .collect();
             match self.state.native_plan_for_names(group_id, &level, &on_level) {
                 Ok(plan) => {
-                    plans.insert(level, plan);
+                    levels.insert(level, LevelRead::Planned(plan));
                 }
                 Err(yadorilink_sync_sqlite::SyncSqliteError::NotFound(_)) => {
-                    unplannable.insert(level);
+                    levels.insert(level, LevelRead::Unplannable);
                 }
                 Err(error) => return Err(crate::sync_error::SyncError::from(error).into()),
             }
             call_timer.add_dag_resolution(started.elapsed());
         }
 
-        // A contested path is not planned: it and everything below it wait for
-        // the loser's author to rename its head. Nothing is created, replaced
-        // or removed at or below it.
-        let contested: BTreeSet<String> = plans
-            .values()
-            .flat_map(|plan| plan.contested.iter().map(|path| path.as_str().to_owned()))
-            .collect();
-
-        // The work: every node of a planned level that a seed (or the
-        // ancestor of one) is, and every seed the plan holds nothing for.
-        let mut work: BTreeMap<String, Work> = BTreeMap::new();
-        for plan in plans.values() {
-            for (path, node) in &plan.nodes {
-                if interesting.contains(path.as_str()) {
-                    work.insert(path.as_str().to_owned(), Work::Node(node.clone()));
-                }
-            }
-        }
-        for path in &seed_paths {
-            if work.contains_key(path) {
-                continue;
-            }
-            if contested.contains(path) {
-                retry.insert(path.clone());
-                continue;
-            }
-            if unplannable.contains(parent_of(path)) {
-                retry.insert(path.clone());
-            } else {
-                work.insert(path.clone(), Work::Absent);
-            }
-        }
-
-        let mut order: Vec<&String> = work.keys().collect();
-        order.sort_by_key(|path| (rank(path, &work[*path]), (*path).clone()));
+        // The work, its order and the part of the gate that depends only on what the device
+        // observes. A contested path is not planned: it and everything below it wait for the
+        // loser's author to rename its head. Nothing is created, replaced or removed at or
+        // below it.
+        let frozen = self.group_frozen(group_id)?;
+        let plan = plan_pass(&PassInput {
+            seeds: &seed_paths,
+            levels: &levels,
+            observation: Observation {
+                frozen,
+                ignored: &|path| self.is_locally_ignored(group_id, path),
+                paused: &|path| {
+                    yadorilink_sync_sqlite::paused_items::path_is_covered(&paused, path)
+                },
+            },
+        });
+        retry.extend(plan.retry.iter().cloned());
+        let work: BTreeMap<String, PlannedWork> =
+            plan.actions.iter().map(|a| (a.path.clone(), a.work.clone())).collect();
 
         if let Some(started) = plan_started {
             call_timer.add_window_plan(started.elapsed());
         }
         let settle_started = crate::receive_diag::clock();
-        let frozen = self.group_frozen(group_id)?;
-        let mut unshaped: BTreeSet<String> = contested.clone();
+        let mut unshaped: BTreeSet<String> = plan.contested.clone();
         let mut pressure: Option<super::types::DiskPressureWait> = None;
         let limit = self.receive_write_concurrency();
         let mut run: Vec<RunEntry<'_>> = Vec::new();
         let mut independence = RunIndependence::default();
-        for path in order {
+        for action in &plan.actions {
+            let path = &action.path;
             let item = &work[path];
-            let gate = self.pass_gate(group_id, path, &paused, frozen, &unshaped);
-            if let (Gate::Open, Work::Node(node)) = (&gate, item) {
+            // What the plan could not know: a directory this pass failed to shape.
+            let gate = match action.gate {
+                PlannedGate::Open
+                    if proper_ancestors(path).any(|ancestor| unshaped.contains(ancestor)) =>
+                {
+                    PlannedGate::Declined
+                }
+                ref gate => gate.clone(),
+            };
+            if let (PlannedGate::Open, PlannedWork::Settle(node)) = (&gate, item) {
                 if is_plain_entry(node) {
                     if independence.conflicts_with_run(path) {
                         self.settle_plain_run(
@@ -393,21 +341,21 @@ impl super::LocalConvergenceExecutor {
             .await;
             independence.clear();
             match gate {
-                Gate::Ignored => {
+                PlannedGate::Ignored => {
                     settled.insert(path.clone(), SettlementEvidence::IgnoreExcluded);
                     continue;
                 }
-                Gate::Declined => {
+                PlannedGate::Declined => {
                     retry.insert(path.clone());
                     continue;
                 }
-                Gate::Open => {}
+                PlannedGate::Open => {}
             }
             let outcome = match item {
-                Work::Absent => {
+                PlannedWork::SettleAbsent => {
                     self.native_settle_absent(group_id, path, policy, origin_device_id).await
                 }
-                Work::Node(node) => {
+                PlannedWork::Settle(node) => {
                     let claim = claim_for(claims, path, &retry);
                     let skippable = claim.is_none() && !seed_paths.contains(path);
                     self.settle_or_skip_node(
@@ -483,28 +431,6 @@ impl super::LocalConvergenceExecutor {
             .map_or(0, |version| version.size)
     }
 
-    fn pass_gate(
-        &self,
-        group_id: &str,
-        path: &str,
-        paused: &[String],
-        frozen: bool,
-        unshaped: &BTreeSet<String>,
-    ) -> Gate {
-        if self.is_locally_ignored(group_id, path) {
-            return Gate::Ignored;
-        }
-        // Nothing is settled in a group a rebootstrap freezes: settling would write,
-        // remove or move an object while the rebootstrap holds the group still.
-        if yadorilink_sync_sqlite::paused_items::path_is_covered(paused, path)
-            || frozen
-            || proper_ancestors(path).any(|ancestor| unshaped.contains(ancestor))
-        {
-            return Gate::Declined;
-        }
-        Gate::Open
-    }
-
     /// How many own-name entries of a pass are settled at once. Read fresh per
     /// pass, so a measurement can A/B it with no rebuild; `1` is the serial
     /// order.
@@ -536,7 +462,7 @@ impl super::LocalConvergenceExecutor {
 
     /// Whether the files of a run hand their completion transaction to a
     /// shared queue (see [`super::completion_window`]) instead of each
-    /// committing its own. Read fresh per pass, so a measurement can A/B it.
+    /// committing its own. Always on outside tests that pin it.
     fn batch_completion(&self) -> bool {
         #[cfg(any(test, feature = "test-support"))]
         match self.batch_completion_override.load(std::sync::atomic::Ordering::Relaxed) {
@@ -544,7 +470,7 @@ impl super::LocalConvergenceExecutor {
             2 => return false,
             _ => {}
         }
-        self.state.tuning().batch_completion
+        true
     }
 
     /// Whether the blocks of small received files are held in memory for the pass instead of being
@@ -556,11 +482,11 @@ impl super::LocalConvergenceExecutor {
             2 => return false,
             _ => {}
         }
-        self.state.tuning().single_pass
+        self.state.tuning().file_mode.receives_in_place()
     }
 
     /// Whether the files of a run queue the open of their write in the same
-    /// window. Read fresh per pass, so a measurement can A/B it.
+    /// window. Always on outside tests that pin it.
     fn batch_open(&self) -> bool {
         #[cfg(any(test, feature = "test-support"))]
         match self.batch_open_override.load(std::sync::atomic::Ordering::Relaxed) {
@@ -568,7 +494,7 @@ impl super::LocalConvergenceExecutor {
             2 => return false,
             _ => {}
         }
-        self.state.tuning().batch_open
+        true
     }
 
     /// How a pass flushes the files it received, when it does not do so one by
@@ -643,7 +569,7 @@ impl super::LocalConvergenceExecutor {
         &self,
         group_id: &str,
         path: &String,
-        item: &Work,
+        item: &PlannedWork,
         outcome: Result<MaterializeResult, PeerSessionError>,
         (settled, retry, unshaped, pressure): (
             &mut BTreeMap<String, SettlementEvidence>,
@@ -657,7 +583,7 @@ impl super::LocalConvergenceExecutor {
                 settled.insert(path.clone(), evidence);
             }
             Ok(MaterializeResult::RetryRequired) => {
-                if matches!(item, Work::Node(node) if !matches!(node, NativePlannedNode::Entry { .. }))
+                if matches!(item, PlannedWork::Settle(node) if !matches!(node, NativePlannedNode::Entry { .. }))
                     && !self.directory_on_disk(group_id, path)
                 {
                     unshaped.insert(path.clone());
@@ -696,7 +622,7 @@ impl super::LocalConvergenceExecutor {
         &self,
         group_id: &str,
         run: Vec<RunEntry<'_>>,
-        work: &BTreeMap<String, Work>,
+        work: &BTreeMap<String, PlannedWork>,
         policy: yadorilink_replica_domain::session_state::MaterializationPolicy,
         prefetched: &HashMap<String, BlockRequirement>,
         limit: usize,

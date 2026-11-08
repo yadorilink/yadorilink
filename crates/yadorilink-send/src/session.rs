@@ -244,6 +244,10 @@ pub struct InboxEntry {
     pub link_id: String,
     /// Bytes on disk so far while receiving; `total_size` once completed; 0 otherwise.
     pub received_bytes: u64,
+    /// Files fully on disk so far while receiving; every file once completed; 0 otherwise.
+    pub files_done: u32,
+    /// How many files the offer holds.
+    pub files_total: u32,
     /// The folder chosen for the files, once a receive chose one.
     pub destination_dir: Option<String>,
 }
@@ -262,6 +266,9 @@ pub struct SentEntry {
     pub status: &'static str,
     /// A closed code from [`failure`] when it stopped with a reason worth showing.
     pub failure: Option<String>,
+    /// Bytes of the offer the receiver has been served so far while "accepted" (live: it starts
+    /// again from nothing when the engine restarts); `total_size` once "completed"; 0 otherwise.
+    pub bytes_sent: u64,
     /// Whether `retry_sent_transfer` is offered for it.
     pub can_retry: bool,
 }
@@ -433,6 +440,12 @@ pub struct SendService {
     /// [`Self::test_park_next_serve`].
     #[cfg(any(test, feature = "test-support"))]
     serve_gate: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    /// Per sent transfer and file index, how many bytes the receiver has been served in order so
+    /// far (the furthest point any pull reached; a resumed pull does not count twice). Live
+    /// progress for the sender's list: it starts again from nothing when the engine restarts,
+    /// and is dropped once the transfer is no longer being served.
+    serve_progress:
+        std::sync::Mutex<std::collections::HashMap<String, std::collections::HashMap<u32, u64>>>,
     /// How long one chunk write may stall; see [`SERVE_WRITE_TIMEOUT`].
     serve_write_timeout: std::sync::Mutex<Duration>,
     /// See [`OFFER_ADMISSION_WINDOW`].
@@ -497,6 +510,7 @@ impl SendService {
             chunk_abort: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
             serve_gate: std::sync::Mutex::new(None),
+            serve_progress: std::sync::Mutex::default(),
             serve_write_timeout: std::sync::Mutex::new(SERVE_WRITE_TIMEOUT),
             offer_admission_window: std::sync::Mutex::new(OFFER_ADMISSION_WINDOW),
             timing: std::sync::Mutex::new(Timing::default()),
@@ -875,6 +889,10 @@ impl SendService {
                             | OutboundStatus::Canceled
                     );
                 let mut failure = self.store.failure(&row.transfer_id)?;
+                // A canceled transfer with no other reason on record is the sender's own stop.
+                if failure.is_none() && row.status == OutboundStatus::Canceled {
+                    failure = Some(failure::SENDER_CANCELED.to_string());
+                }
                 if failure.is_none() && under_link && row.status == OutboundStatus::Acked {
                     // A link's receiver fetches by itself, right after accepting. One that has
                     // fetched nothing for this long (killed, offline, gone) is not coming back
@@ -888,7 +906,27 @@ impl SendService {
                         failure = Some(failure::RECEIVER_STOPPED.to_string());
                     }
                 }
+                let bytes_sent = match row.status {
+                    OutboundStatus::Completed => {
+                        self.serve_progress
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&row.transfer_id);
+                        row.manifest.total_size
+                    }
+                    OutboundStatus::Acked => {
+                        self.served_bytes(&row.transfer_id, row.manifest.total_size)
+                    }
+                    _ => {
+                        self.serve_progress
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&row.transfer_id);
+                        0
+                    }
+                };
                 Ok(SentEntry {
+                    bytes_sent,
                     failure,
                     transfer_id: row.transfer_id,
                     target_device_id: row.target_device_id,
@@ -905,6 +943,21 @@ impl SendService {
                 })
             })
             .collect()
+    }
+
+    /// Bytes served so far for an accepted transfer, never more than the offer's size.
+    fn served_bytes(&self, transfer_id: &str, total_size: u64) -> u64 {
+        let progress = self.serve_progress.lock().unwrap_or_else(|p| p.into_inner());
+        let served: u64 = progress.get(transfer_id).map_or(0, |files| files.values().sum());
+        served.min(total_size)
+    }
+
+    /// Notes that `file_index` of `transfer_id` has been served through `bytes`.
+    fn note_served(&self, transfer_id: &str, file_index: u32, bytes: u64) {
+        let mut progress = self.serve_progress.lock().unwrap_or_else(|p| p.into_inner());
+        let through =
+            progress.entry(transfer_id.to_owned()).or_default().entry(file_index).or_default();
+        *through = (*through).max(bytes);
     }
 
     /// Stops a transfer this device sent. Idempotent: one already canceled, declined or
@@ -1011,15 +1064,18 @@ impl SendService {
         let rows = self.store.list_inbound_recent(FINISHED_HISTORY_LIMIT)?;
         rows.into_iter()
             .map(|row| {
-                let received_bytes = match row.status {
-                    InboundStatus::Completed => row.manifest.total_size,
-                    InboundStatus::InProgress => self.present_bytes(&row.manifest)?,
-                    _ => 0,
+                let files_total = u32::try_from(row.manifest.files.len()).unwrap_or(u32::MAX);
+                let (received_bytes, files_done) = match row.status {
+                    InboundStatus::Completed => (row.manifest.total_size, files_total),
+                    InboundStatus::InProgress => self.present_progress(&row.manifest)?,
+                    _ => (0, 0),
                 };
                 Ok(InboxEntry {
                     failure: self.store.failure(&row.transfer_id)?,
                     link_id: row.manifest.link_id.clone(),
                     received_bytes,
+                    files_done,
+                    files_total,
                     destination_dir: row.destination_dir.clone(),
                     transfer_id: row.transfer_id,
                     sender_device_id: row.sender_device_id,
@@ -1037,23 +1093,29 @@ impl SendService {
             .collect()
     }
 
-    /// Bytes of `manifest` already in this device's block store: what a receive in progress has
-    /// pulled so far.
-    fn present_bytes(&self, manifest: &SendManifest) -> Result<u64> {
-        let mut total = 0u64;
+    /// What of `manifest` is already in this device's block store: the bytes a receive in progress
+    /// has pulled so far, and how many files are complete (every chunk present; an empty file
+    /// has none to wait for).
+    fn present_progress(&self, manifest: &SendManifest) -> Result<(u64, u32)> {
+        let mut bytes = 0u64;
+        let mut files_done = 0u32;
         for entry in &manifest.files {
             if entry.chunk_hashes.is_empty() {
+                files_done += 1;
                 continue;
             }
             let hex_hashes: Vec<String> = entry.chunk_hashes.iter().map(hex::encode).collect();
             let present = self.block_store.present_blocks(&hex_hashes)?;
             for (idx, here) in present.iter().enumerate() {
                 if *here {
-                    total += u64::from(crate::manifest::chunk_byte_size(entry, idx)?);
+                    bytes += u64::from(crate::manifest::chunk_byte_size(entry, idx)?);
                 }
             }
+            if present.iter().all(|here| *here) {
+                files_done += 1;
+            }
         }
-        Ok(total)
+        Ok((bytes, files_done))
     }
 
     /// `yadorilink receive <transfer_id> [--to <dir>]` -- the explicit
@@ -1838,8 +1900,9 @@ impl SendService {
         if pull.start_chunk_index >= num_chunks {
             return self.reject_pull(connection, send, "start chunk index out of range").await;
         }
-        let served =
-            self.serve_chunks(send, &pull.transfer_id, entry, pull.start_chunk_index).await;
+        let served = self
+            .serve_chunks(send, &pull.transfer_id, pull.file_index, entry, pull.start_chunk_index)
+            .await;
         self.note_serve_outcome(&pull.transfer_id, &served);
         if !served? {
             // Stopped between two chunks, so the rejection is a whole message of its own.
@@ -1856,6 +1919,7 @@ impl SendService {
         &self,
         send: &mut TrackSendWriter,
         transfer_id: &str,
+        file_index: u32,
         entry: &SendFileEntry,
         start_chunk_index: u32,
     ) -> Result<bool> {
@@ -1903,6 +1967,8 @@ impl SendService {
             let stall = false;
             let timeout = *self.serve_write_timeout.lock().unwrap_or_else(|p| p.into_inner());
             write_chunk_bounded(send, &header, &body, timeout, stall).await?;
+            let through = (u64::from(chunk_index) + 1).saturating_mul(u64::from(entry.chunk_size));
+            self.note_served(transfer_id, file_index, through.min(entry.size));
         }
         Ok(true)
     }

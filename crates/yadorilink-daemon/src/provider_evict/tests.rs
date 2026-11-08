@@ -552,7 +552,7 @@ async fn a_pinned_item_is_not_evicted_and_nothing_is_asked_of_the_host() {
         let fx = Fx::new();
         let blocks = fx.commit("dir/a.bin", 1, &[&data_of(1, 4096)]);
         fx.held_item("dir/a.bin");
-        fx.state.replica_coordinator.pinned_item_repository().pin(GROUP, pin).unwrap();
+        fx.state.replica_coordinator.retention_rules().pin(GROUP, pin).unwrap();
 
         let result = evictor(&fx, fx.reclaim()).evict(GROUP, "dir/a.bin").await;
 
@@ -576,7 +576,7 @@ async fn an_unpinned_item_is_evicted_as_before() {
     let fx = Fx::new();
     fx.commit("a.bin", 1, &[&data_of(1, 4096)]);
     fx.held_item("a.bin");
-    let pins = fx.state.replica_coordinator.pinned_item_repository();
+    let pins = fx.state.replica_coordinator.retention_rules();
     pins.pin(GROUP, "a.bin").unwrap();
     pins.unpin(GROUP, "a.bin").unwrap();
 
@@ -676,4 +676,233 @@ async fn an_eviction_for_another_item_at_the_path_leaves_it_alone() {
     assert_eq!(outcome.retained, Some(Retained::VersionMoved));
     assert!(log(&fx).is_empty());
     assert!(fx.cached(&blocks[0]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pin_choice_asks_the_host_about_the_item_and_returns_what_it_answered() {
+    use crate::provider_host_link::PinAnswer;
+    use yadorilink_ipc_proto::shellipc::PinChoice;
+    let fx = Fx::new();
+    fx.commit("a.bin", 1, &[&data_of(1, 4096)]);
+    let item = fx.held_item("a.bin");
+    let evictor = evictor(&fx, fx.reclaim());
+
+    for answer in [
+        PinAnswer::Done,
+        PinAnswer::Downloading,
+        PinAnswer::Unsupported,
+        PinAnswer::Error("no".into()),
+    ] {
+        *fx.host.pin_answer.lock().unwrap() = answer.clone();
+        assert_eq!(evictor.apply_pin(GROUP, "a.bin", PinChoice::Keep).await.unwrap(), answer);
+    }
+    assert_eq!(
+        evictor.apply_pin(GROUP, "a.bin", PinChoice::OnlineOnly).await.unwrap(),
+        PinAnswer::Error("no".into())
+    );
+    let asked = fx.host.pins.lock().unwrap().clone();
+    assert_eq!(asked.len(), 5);
+    assert!(asked.iter().all(|(asked_item, _)| *asked_item == Some(item)));
+    assert_eq!(asked[0].1, PinChoice::Keep);
+    assert_eq!(asked[4].1, PinChoice::OnlineOnly);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pin_choice_for_the_folder_names_the_root_and_one_for_an_unknown_path_asks_nothing() {
+    use crate::provider_host_link::PinAnswer;
+    use yadorilink_ipc_proto::shellipc::PinChoice;
+    let fx = Fx::new();
+    fx.commit("a.bin", 1, &[&data_of(1, 4096)]);
+    let evictor = evictor(&fx, fx.reclaim());
+
+    // The folder itself: no item, the host pins the whole root.
+    evictor.apply_pin(GROUP, "", PinChoice::Keep).await.unwrap();
+    assert_eq!(fx.host.pins.lock().unwrap().clone(), vec![(None, PinChoice::Keep)]);
+
+    // A path that is no item of the folder: nothing is asked, nothing is guessed.
+    assert_eq!(
+        evictor.apply_pin(GROUP, "missing.bin", PinChoice::Keep).await.unwrap(),
+        PinAnswer::NotFound
+    );
+    assert_eq!(fx.host.pins.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn the_pin_follows_the_retention_that_holds_and_the_rules_beneath_are_set_again_after_a_folder() {
+    use yadorilink_ipc_proto::shellipc::PinChoice::{Clear, Keep, OnlineOnly};
+    use yadorilink_sync_sqlite::{Rule, RuleSet};
+    let rules = |rows: &[(&str, Rule)]| {
+        RuleSet::new(rows.iter().map(|(path, rule)| ((*path).to_owned(), *rule)))
+    };
+    let plan = |rules: &RuleSet, path: &str| pin_plan(rules, path);
+
+    // No rule anywhere: the folder itself is cleared, nothing else is asked.
+    assert_eq!(plan(&rules(&[]), ""), vec![(String::new(), Clear)]);
+
+    // A file set to default beneath a kept folder is still kept by inheritance: the pin is the one
+    // that holds, not the one the word "default" suggests.
+    let kept_folder = rules(&[("Photos", Rule::Keep)]);
+    assert_eq!(plan(&kept_folder, "Photos/a.jpg"), vec![("Photos/a.jpg".to_owned(), Keep)]);
+
+    // A folder's pin overwrites its children, so the rules below it follow, shallowest first.
+    let mixed = rules(&[
+        ("Photos", Rule::Keep),
+        ("Photos/raw/deep", Rule::Keep),
+        ("Photos/raw", Rule::OnlineOnly),
+        ("Photos/tmp", Rule::OnlineOnly),
+    ]);
+    assert_eq!(
+        plan(&mixed, "Photos"),
+        vec![
+            ("Photos".to_owned(), Keep),
+            ("Photos/raw".to_owned(), OnlineOnly),
+            ("Photos/tmp".to_owned(), OnlineOnly),
+            ("Photos/raw/deep".to_owned(), Keep),
+        ]
+    );
+
+    // Default on a folder with no rule above it clears it, and the explicit rules below it stay.
+    let below = rules(&[("a/keep", Rule::Keep)]);
+    assert_eq!(plan(&below, "a"), vec![("a".to_owned(), Clear), ("a/keep".to_owned(), Keep)]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_pin_plan_lists_the_rules_with_their_items_and_leaves_out_those_without_one() {
+    use yadorilink_ipc_proto::shellipc::PinChoice::{Keep, OnlineOnly};
+    use yadorilink_sync_sqlite::Rule;
+    let fx = Fx::new();
+    fx.commit("a.bin", 1, &[&data_of(1, 4096)]);
+    fx.commit("b.bin", 1, &[&data_of(2, 4096)]);
+    let a = fx.held_item("a.bin");
+    let b = fx.held_item("b.bin");
+    let evictor = evictor(&fx, fx.reclaim());
+
+    // No rule: nothing is asked of the host, and nothing is sent.
+    assert!(evictor.pin_plan_for_group(GROUP).unwrap().is_empty());
+    evictor.push_pin_plan(&fx.root);
+    assert!(fx.host.plans.lock().unwrap().is_empty());
+
+    let rules = fx.state.replica_coordinator.retention_rules();
+    rules.set(GROUP, "b.bin", Some(Rule::OnlineOnly)).unwrap();
+    rules.set(GROUP, "a.bin", Some(Rule::Keep)).unwrap();
+    // A rule for a path that is no item of the folder (yet) is left out until it is one.
+    rules.set(GROUP, "ghost.bin", Some(Rule::Keep)).unwrap();
+    assert_eq!(
+        evictor.pin_plan_for_group(GROUP).unwrap(),
+        vec![(Some(a), Keep), (Some(b), OnlineOnly)]
+    );
+
+    // A rule on the folder itself replaces the rules beneath it (that is what setting does), so the
+    // plan is just the folder; rules set beneath it afterwards come after it.
+    rules.set(GROUP, "", Some(Rule::Keep)).unwrap();
+    assert_eq!(evictor.pin_plan_for_group(GROUP).unwrap(), vec![(None, Keep)]);
+    rules.set(GROUP, "b.bin", Some(Rule::OnlineOnly)).unwrap();
+    rules.set(GROUP, "a.bin", Some(Rule::Keep)).unwrap();
+    assert_eq!(
+        evictor.pin_plan_for_group(GROUP).unwrap(),
+        vec![(None, Keep), (Some(a), Keep), (Some(b), OnlineOnly)]
+    );
+
+    // What is sent to the host is that plan, for the root that owns the group.
+    evictor.push_pin_plan(&fx.root);
+    assert_eq!(
+        fx.host.plans.lock().unwrap().clone(),
+        vec![vec![(None, Keep), (Some(a), Keep), (Some(b), OnlineOnly)]]
+    );
+    // An unknown root is told nothing.
+    evictor.push_pin_plan(&hex::encode([9u8; 16]));
+    assert_eq!(fx.host.plans.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_host_serves_a_group_only_when_it_reported_that_root_registered() {
+    let fx = Fx::new();
+    let evictor = evictor(&fx, fx.reclaim());
+    assert!(evictor.host_serves_group(GROUP));
+    // The host is attached but does not serve this root.
+    fx.host.serves.store(false, Ordering::SeqCst);
+    assert!(!evictor.host_serves_group(GROUP));
+    // A group that is no provider root is not served by any host.
+    fx.host.serves.store(true, Ordering::SeqCst);
+    assert!(!evictor.host_serves_group("not-a-provider-group"));
+}
+
+#[test]
+fn an_observed_pin_mark_sets_a_rule_only_where_the_rules_do_not_already_say_it() {
+    use crate::application::ports::RuleChoice::{Default as Unset, Keep as K, OnlineOnly as O};
+    use yadorilink_ipc_proto::shellipc::PinChoice::{Clear, Keep, OnlineOnly, Unspecified};
+    use yadorilink_sync_sqlite::Rule;
+    // (what holds at the item: set at exactly this item?, which), what the OS shows, what to do.
+    let table = [
+        (None, Keep, Some(K)),
+        (None, OnlineOnly, Some(O)),
+        (None, Clear, None),
+        (Some((true, Rule::Keep)), Keep, None),
+        (Some((false, Rule::Keep)), Keep, None), // inherited keep: already kept
+        (Some((true, Rule::Keep)), OnlineOnly, Some(O)),
+        (Some((false, Rule::Keep)), OnlineOnly, Some(O)), // an exception under a kept folder
+        (Some((true, Rule::OnlineOnly)), OnlineOnly, None),
+        (Some((false, Rule::OnlineOnly)), OnlineOnly, None),
+        (Some((false, Rule::OnlineOnly)), Keep, Some(K)), // an exception under an online-only folder
+        (Some((true, Rule::OnlineOnly)), Keep, Some(K)),
+        (Some((true, Rule::Keep)), Clear, Some(Unset)), // the person took back its own choice
+        (Some((true, Rule::OnlineOnly)), Clear, Some(Unset)),
+        (Some((false, Rule::Keep)), Clear, None), // merely inheriting: no choice of its own to take back
+        (Some((false, Rule::OnlineOnly)), Clear, None),
+        (None, Unspecified, None),
+        (Some((true, Rule::Keep)), Unspecified, None),
+    ];
+    for (nearest, observed, want) in table {
+        assert_eq!(rule_for_observed_pin(nearest, observed), want, "{nearest:?} then {observed:?}");
+    }
+}
+
+#[test]
+fn the_pin_the_engine_sends_comes_back_as_an_observation_that_changes_nothing() {
+    use yadorilink_sync_sqlite::Rule;
+    // Every rule the engine can hold, pinned the way the engine pins it, seen again in the file
+    // manager: the rules already say it, so no rule is set and no pin is sent in answer.
+    for rule in [Rule::Keep, Rule::OnlineOnly] {
+        for exact in [true, false] {
+            assert_eq!(rule_for_observed_pin(Some((exact, rule)), pin_of_rule(rule)), None);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_observed_pin_is_decided_from_the_rules_of_the_item_and_only_for_a_served_root() {
+    use crate::application::ports::RuleChoice;
+    use yadorilink_ipc_proto::shellipc::PinChoice::{Clear, Keep, OnlineOnly};
+    use yadorilink_sync_sqlite::Rule;
+    let fx = Fx::new();
+    fx.commit("a.bin", 1, &[&data_of(1, 4096)]);
+    let item = fx.held_item("a.bin");
+    let evictor = evictor(&fx, fx.reclaim());
+    let decide = |observed| evictor.rule_for_observed(&fx.root, Some(&item), observed).unwrap();
+
+    // No rule yet: a pin asks for keep, an unpin for online only, a clear for nothing.
+    assert_eq!(decide(Keep), Some((GROUP.to_owned(), "a.bin".to_owned(), RuleChoice::Keep)));
+    assert_eq!(decide(OnlineOnly).map(|d| d.2), Some(RuleChoice::OnlineOnly));
+    assert_eq!(decide(Clear), None);
+
+    // Once the rule says keep, seeing the pin changes nothing, and taking it back removes it.
+    let rules = fx.state.replica_coordinator.retention_rules();
+    rules.set(GROUP, "a.bin", Some(Rule::Keep)).unwrap();
+    assert_eq!(decide(Keep), None);
+    assert_eq!(decide(Clear).map(|d| d.2), Some(RuleChoice::Default));
+
+    // A root the attached host does not serve, and an item the namespace does not have: nothing.
+    fx.host.serves.store(false, Ordering::SeqCst);
+    assert_eq!(decide(OnlineOnly), None);
+    fx.host.serves.store(true, Ordering::SeqCst);
+    assert_eq!(evictor.rule_for_observed(&fx.root, Some(&[0xee; 16]), Keep).unwrap(), None);
+    assert_eq!(
+        evictor.rule_for_observed(&hex::encode([9u8; 16]), Some(&item), Keep).unwrap(),
+        None
+    );
+    // The sync root itself (no item): its rule sits at the empty path.
+    assert_eq!(
+        evictor.rule_for_observed(&fx.root, None, Keep).unwrap(),
+        Some((GROUP.to_owned(), String::new(), RuleChoice::Keep))
+    );
 }

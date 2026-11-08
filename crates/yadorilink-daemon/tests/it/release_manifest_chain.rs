@@ -14,7 +14,8 @@
 //! a key other than the one that signed it.
 //!
 //! Unix only: the release jobs that run this pipeline are Linux jobs.
-//! Needs `bash`, `python3` and the Python `cryptography` package.
+//! Needs `bash` and Python 3.10+ with the `cryptography` package (`python3`, or the
+//! interpreter named by `YADORILINK_TEST_PYTHON`).
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
@@ -72,13 +73,24 @@ fn run(cmd: &mut Command) -> Output {
     cmd.current_dir(repo_root()).output().expect("spawn")
 }
 
+/// The interpreter the release scripts run under: `YADORILINK_TEST_PYTHON`, else `python3`.
+/// The scripts need Python 3.10 or newer (macOS ships 3.9), which
+/// `require_python_cryptography` checks up front instead of failing inside a script.
+fn python_command() -> Command {
+    Command::new(std::env::var("YADORILINK_TEST_PYTHON").unwrap_or_else(|_| "python3".to_owned()))
+}
+
 fn require_python_cryptography() {
-    let out = run(Command::new("python3").args(["-c", "import cryptography"]));
+    let out = run(python_command().args([
+        "-c",
+        "import sys; assert sys.version_info >= (3, 10), 'Python ' + sys.version.split()[0]; \
+         import cryptography",
+    ]));
     assert!(
         out.status.success(),
-        "the release manifest verifier needs the Python `cryptography` package \
-         (python3 -m pip install cryptography): {}",
-        describe("import cryptography", &out)
+        "the release scripts need Python 3.10+ with the `cryptography` package; set \
+         YADORILINK_TEST_PYTHON to such an interpreter (default `python3`): {}",
+        describe("python version and `import cryptography`", &out)
     );
 }
 
@@ -88,7 +100,7 @@ fn build_stand_in_artifact(dist: &Path) -> PathBuf {
     let artifact = dist.join(ARTIFACT);
     let bytes: Vec<u8> = (0..10_007u32).map(|i| (i % 251) as u8).collect();
     std::fs::write(&artifact, bytes).unwrap();
-    let out = run(Command::new("python3")
+    let out = run(python_command()
         .arg(".github/release/generate-release-checksums.py")
         .arg("--sidecars")
         .arg(&artifact));
@@ -133,10 +145,7 @@ fn build_manifest_for(
 }
 
 fn verify_with_script(envelope: &Path, extra: &[&str]) -> Output {
-    run(Command::new("python3")
-        .arg(".github/release/verify-update-manifest.py")
-        .arg(envelope)
-        .args(extra))
+    run(python_command().arg(".github/release/verify-update-manifest.py").arg(envelope).args(extra))
 }
 
 /// Signs `body` with the real signer, which refuses a body the client could
@@ -509,7 +518,7 @@ fn rotation_and_revocation_with_the_real_signer_verify_in_client_and_script() {
 
     // The signer preflight: only currently trusted ids may sign.
     let check = |id: &str| {
-        run(Command::new("python3")
+        run(python_command()
             .arg(".github/release/verify-update-manifest.py")
             .args(["--key-id", KEY_ID, "--public-key-hex", &root.public_hex])
             .args(["--trust-chain", chain2.to_str().unwrap(), "--check-signer-id", id]))

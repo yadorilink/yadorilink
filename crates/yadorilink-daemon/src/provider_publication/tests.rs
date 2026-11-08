@@ -1003,7 +1003,7 @@ async fn an_announced_version_survives_retention() {
     yadorilink_sync_sqlite::file_index::FileIndexRepository::new(
         fx.state.replica_coordinator.database().clone(),
     )
-    .expire_superseded_and_trashed_versions(GROUP, i64::MAX / 2, &Default::default())
+    .expire_superseded_and_trashed_versions(GROUP, i64::MAX / 2)
     .unwrap();
     // The announced V2 is not current any more, so nothing is shown from it by the changes feed,
     // but its record is still in the version store (the published/announced pin).

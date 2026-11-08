@@ -146,7 +146,7 @@ fn launch_owner(launch: &DaemonLaunch, cli_exe: &std::path::Path) -> Owner {
 
 /// Refuses to launch a daemon of `owner` over a data area recorded as another owner's, or whose
 /// record cannot be read. A data area with no record is launched over: the daemon records itself.
-fn gate_launch(config_dir: &std::path::Path, owner: Owner) -> Result<(), CoreError> {
+pub(crate) fn gate_launch(config_dir: &std::path::Path, owner: Owner) -> Result<(), CoreError> {
     if let Some(refusal) = yadorilink_local_storage::handoff::start_refusal(config_dir) {
         // The only refusal a hand-off journal gives is an unfinished hand-off.
         return Err(CoreError::ManagedElsewhere(refusal.message(config_dir))
@@ -276,7 +276,7 @@ pub(crate) fn launch_steps(launch: &DaemonLaunch, uid: u32) -> Vec<LaunchStep> {
 }
 
 /// `schtasks.exe` under the system directory, so no PATH entry can stand in for it.
-fn schtasks_path(system_root: Option<std::ffi::OsString>) -> PathBuf {
+pub(crate) fn schtasks_path(system_root: Option<std::ffi::OsString>) -> PathBuf {
     PathBuf::from(system_root.unwrap_or_else(|| "C:\\Windows".into()))
         .join("System32")
         .join("schtasks.exe")
@@ -317,10 +317,28 @@ fn no_console_window(command: &mut std::process::Command) {
 /// It gets no stdin and, on Unix, its own process group, so a terminal's
 /// Ctrl-C aimed at the starter does not reach it. A thread waits for it, so
 /// when it exits it is reaped instead of staying a zombie of a long-lived
-/// starter such as the app. Its stdout and stderr stay the starter's, where
-/// a daemon started from a terminal logs.
+/// starter such as the app. On Unix its stdout and stderr stay the starter's, where
+/// a daemon started from a terminal logs. On Windows they are discarded instead: the daemon logs to a file there, and an
+/// inherited pipe handle would keep a caller that reads the starter's output waiting for end-of-file for as long as the daemon runs.
 fn spawn_detached(mut command: std::process::Command) -> std::io::Result<()> {
     command.stdin(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+        };
+        // Windows hands every inheritable handle to the child, whatever its stdio is set to, so
+        // a pipe the starter writes to must stop being inheritable as well as unused.
+        for which in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: both calls take only values; an absent or invalid handle makes them fail
+            // harmlessly.
+            unsafe {
+                SetHandleInformation(GetStdHandle(which), HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+        command.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    }
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
     let mut child = command.spawn()?;
@@ -474,7 +492,7 @@ pub use yadorilink_local_storage::daemon_lock::SUPERVISED_ENV;
 
 /// Whether something restarts the daemon by itself whenever it exits cleanly, so that a command
 /// line that stopped it must wait for the replacement and not start a second one.
-fn supervised_by_environment() -> bool {
+pub fn supervised_by_environment() -> bool {
     std::env::var_os(SUPERVISED_ENV).is_some_and(|v| !v.is_empty())
 }
 

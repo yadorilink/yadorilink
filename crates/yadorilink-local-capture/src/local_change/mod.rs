@@ -16,12 +16,14 @@ use std::sync::Arc;
 
 use crate::error::LocalCaptureError;
 use crate::reconcile_gate::ReconcileGate;
+use yadorilink_fs_platform::ignore_patterns::{EffectiveIgnoreSet, IgnoreRulesStore};
 use yadorilink_replica_domain::file::FileRecord;
 use yadorilink_sync_sqlite::dag_store::LocalAuthorKey;
 
 mod directory_capture;
 mod dirty_journal;
 mod disk_observation;
+mod drift;
 mod event_ingest;
 mod flush;
 mod path_policy;
@@ -31,6 +33,7 @@ mod scan;
 mod semantic_delete;
 
 pub use disk_observation::cfapi_placeholder_untouched;
+pub use drift::{DriftCandidate, DriftKind, DriftOptions, DriftReport};
 pub(crate) use scan::ReconcileMode;
 pub use semantic_delete::SemanticDelete;
 
@@ -161,6 +164,9 @@ pub struct LocalChangeProcessor {
     /// Whether a file's blocks are put into the store or only hashed. Every file goes into the
     /// store unless the owner of the processor supplies another policy.
     ingest_policy: Arc<dyn crate::ingest::IngestPolicy>,
+    /// Where the ignore rules of each group are stored (see [`Self::with_ignore_rules`]); `None`
+    /// applies the built-in defaults only.
+    ignore_rules: Option<IgnoreRulesStore>,
     /// Test-only: makes every disk observation report no unix mode, as a
     /// platform without permission bits (Windows) always does.
     #[cfg(test)]
@@ -186,6 +192,7 @@ impl LocalChangeProcessor {
             retained_handoffs: std::sync::Mutex::default(),
             directory_capture: true,
             ingest_policy: Arc::new(crate::ingest::AlwaysIngest),
+            ignore_rules: None,
             #[cfg(test)]
             modes_unobservable: std::sync::atomic::AtomicBool::new(false),
         }
@@ -197,6 +204,26 @@ impl LocalChangeProcessor {
     pub fn with_ingest_policy(mut self, policy: Arc<dyn crate::ingest::IngestPolicy>) -> Self {
         self.ingest_policy = policy;
         self
+    }
+
+    /// Reads each group's ignore rules from `rules`, for the entry points that load them
+    /// themselves.
+    #[must_use]
+    pub fn with_ignore_rules(mut self, rules: IgnoreRulesStore) -> Self {
+        self.ignore_rules = Some(rules);
+        self
+    }
+
+    /// The ignore rules of `group_id`: the stored ones, or the built-in defaults when this
+    /// processor has no rules storage or the group has no rules.
+    ///
+    /// # Errors
+    /// The stored rules could not be read or have an unusable line.
+    pub fn ignore_set_for(&self, group_id: &str) -> Result<EffectiveIgnoreSet, LocalCaptureError> {
+        match &self.ignore_rules {
+            Some(rules) => Ok(rules.load(group_id).map_err(std::io::Error::from)?),
+            None => Ok(EffectiveIgnoreSet::defaults_only()),
+        }
     }
 
     /// Reports unreadable files into `ledger` (the daemon's, so status can read it) instead of a
@@ -498,7 +525,7 @@ mod cfapi_placeholder_untouched_windows_tests {
 #[cfg(test)]
 mod tests;
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod file_only_capture_tests;
 
 /// The scan computes a path's version when it reads the bytes, and commits
@@ -515,6 +542,8 @@ mod file_only_capture_tests;
 /// that identity and confirms; nothing downstream can notice.
 #[cfg(test)]
 mod disk_observation_gate_tests;
+#[cfg(test)]
+mod drift_tests;
 
 #[cfg(test)]
 mod remote_absence_tests;

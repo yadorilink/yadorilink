@@ -296,6 +296,27 @@ fn unavailable_now_renders_its_own_suffix() {
     assert_eq!(fetch_availability_suffix(&link), "  waiting for a device");
 }
 
+/// Pinned items that are not downloaded yet get one `--details` line; the raw error shows only
+/// while a device could supply the content, otherwise it reads "waiting for a device".
+#[test]
+fn pinned_pending_has_a_details_line() {
+    let mut link = base_link();
+    assert!(pinned_pending_detail_lines(&link).is_empty());
+    link.pinned_pending_count = 2;
+    link.pinned_pending_error = "disk error".into();
+    link.pinned_pending_retry_secs = 40;
+    link.fetch_availability = FetchAvailability::AvailableNow as i32;
+    assert_eq!(
+        pinned_pending_detail_lines(&link),
+        vec!["  pinned: 2 item(s) not downloaded yet, last error: disk error, next try in 40s"]
+    );
+    link.fetch_availability = FetchAvailability::UnavailableNow as i32;
+    assert_eq!(
+        pinned_pending_detail_lines(&link),
+        vec!["  pinned: 2 item(s) not downloaded yet, waiting for a device, next try in 40s"]
+    );
+}
+
 /// `Unknown`, and an unset value,
 /// must never render as available.
 #[test]
@@ -346,6 +367,13 @@ fn base_status() -> StatusResponse {
 #[test]
 fn no_update_available_renders_no_new_output() {
     assert_eq!(update_summary_lines(&base_status()), Vec::<String>::new());
+    assert!(metered_pause_lines(&base_status()).is_empty());
+    let paused = StatusResponse { paused_on_metered: true, ..base_status() };
+    let lines = metered_pause_lines(&paused);
+    assert_eq!(lines.len(), 1);
+    assert!(
+        lines[0].contains("metered") && lines[0].contains("yadorilink network sync-on-metered")
+    );
 }
 
 /// spec "Status surfaces available update": an available, non-mandatory
@@ -489,7 +517,7 @@ fn base_peer() -> PeerStatus {
         reachability: PeerReachability::Connected as i32,
         unreachable_category: UnreachableCategory::Unspecified as i32,
         route_kind: RouteKind::Direct as i32,
-        version_incompatible: false,
+        version_skew: VersionSkew::Unspecified as i32,
         replaced_by_device_id: String::new(),
         last_connected_unix: 0,
     }
@@ -588,6 +616,54 @@ fn block_store_summary_line_reports_usage_and_gc_health() {
     assert!(line.contains("5.0 MiB used"));
     assert!(line.contains("last GC: never"));
     assert!(line.contains("~1.0 KiB reclaimable"));
+}
+
+#[test]
+fn kept_versions_line_shows_the_bytes_against_the_allowance() {
+    let mut status = base_status();
+    assert_eq!(kept_history_summary_line(&status), None, "nothing is claimed when unread");
+
+    status.kept_history_bytes = Some(3 * 1024 * 1024);
+    status.kept_history_budget_bytes = Some(20 * 1024 * 1024 * 1024);
+    assert_eq!(
+        kept_history_summary_line(&status).as_deref(),
+        Some("Kept history: 3.0 MiB of 20.0 GiB allowed")
+    );
+
+    status.kept_history_bytes = Some(20 * 1024 * 1024 * 1024);
+    let full = kept_history_summary_line(&status).unwrap();
+    assert!(full.contains("full: the oldest are removed first"), "{full}");
+}
+
+#[test]
+fn unpublished_edits_say_which_reason_and_how_many() {
+    let mut status = base_status();
+    assert!(unpublished_edits_lines(&status).is_empty(), "nothing waiting, nothing said");
+
+    status.unpublished_edits_service_unreachable = 3;
+    assert_eq!(
+        unpublished_edits_lines(&status),
+        vec![
+            "Service unreachable: 3 change(s) are only on this device, they will sync when it is back"
+                .to_string()
+        ]
+    );
+
+    status.unpublished_edits_service_unreachable = 0;
+    status.unpublished_edits_not_authorized = 2;
+    assert_eq!(
+        unpublished_edits_lines(&status),
+        vec![
+            "This device is not allowed to publish edits here: 2 change(s) are only on this device"
+                .to_string()
+        ]
+    );
+
+    status.unpublished_edits_not_authorized = 0;
+    status.unpublished_edits_rejected = 1;
+    let lines = unpublished_edits_lines(&status);
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains("did not accept publishing") && lines[0].contains("1 change(s)"));
 }
 
 // --- progress + recent-error rendering ---
@@ -985,11 +1061,9 @@ fn every_known_reason_code_has_a_sentence_and_a_next_step() {
         "degraded:g",
         "waiting_for_disk_space:g",
         "file_watch_limit:g",
-        "ownership_lost:g",
-        "not_joined:g",
+        "folder_needs_relink:g",
         "ambiguous:g",
         "durability_at_risk:g",
-        "durability_unknown:g",
         "fetch_unavailable:g",
         "fetch_availability_unknown:g",
         "conflict:g",
@@ -1042,17 +1116,6 @@ fn an_unknown_reason_falls_back_and_shows_the_code_only_when_verbose() {
         reasons::explain_reason("brand_new:x", "", true),
         "Needs attention (code: brand_new:x)"
     );
-}
-
-#[test]
-fn durability_unknown_names_the_folder_not_the_group_id() {
-    let mut status = base_status();
-    status.overall_state = "attention".into();
-    status.attention_reasons = vec!["durability_unknown:group-1".into()];
-    status.links = vec![base_link()];
-    let lines = overall_state_lines(&status, &DeviceNames::default(), false);
-    assert!(lines[1].starts_with("  - This folder cannot confirm it is safely stored on disk yet."));
-    assert!(lines[1].contains("/tmp/photos") && !lines[1].contains("group-1"), "{lines:?}");
 }
 
 #[test]
@@ -1124,8 +1187,17 @@ fn a_version_mismatched_peer_reads_update_required_not_offline() {
     let mut incompatible = base_peer();
     incompatible.device_id = "nas-1".into();
     incompatible.reachability = PeerReachability::Connected as i32;
-    incompatible.version_incompatible = true;
-    assert_eq!(peer_connectivity_label(&incompatible), "reachable, update required");
+    incompatible.version_skew = VersionSkew::PeerNewer as i32;
+    assert_eq!(
+        peer_connectivity_label(&incompatible),
+        "reachable, runs a newer version: update this device"
+    );
+    let mut older = incompatible.clone();
+    older.version_skew = VersionSkew::PeerOlder as i32;
+    assert_eq!(
+        peer_connectivity_label(&older),
+        "reachable, runs an older version: update that device"
+    );
 
     let mut link = base_link();
     link.full_replica_device_ids = vec!["nas-1".into(), "nas-2".into()];
@@ -1137,7 +1209,7 @@ fn a_version_mismatched_peer_reads_update_required_not_offline() {
     assert_eq!(
         lines,
         vec![
-            "    configured full copy: nas-1  (update required)".to_string(),
+            "    configured full copy: nas-1  (newer version: update this device)".to_string(),
             "    configured full copy: nas-2  (offline)".to_string(),
         ]
     );
@@ -1182,16 +1254,21 @@ fn the_unreadable_files_reason_names_the_folder_and_the_next_step() {
 
 #[test]
 fn the_unconfirmed_replacement_reasons_say_the_cause_and_the_next_step() {
-    let waiting = reasons::explain_reason("replacement_unconfirmed", "", false);
-    assert!(waiting.contains("replaced another one") && !waiting.starts_with("Needs attention"));
+    let confirming = reasons::explain_reason("replacement_unconfirmed", "", false);
+    assert!(
+        confirming.contains("replaced another one") && !confirming.starts_with("Needs attention")
+    );
     let why = reasons::explain_reason(
-        "replacement_unconfirmed_waiting:g1: not linked on this device",
+        "replacement_unconfirmed:waiting:g1: not linked on this device",
         "g1: not linked on this device",
         false,
     );
     assert!(why.contains("[g1: not linked on this device]") && !why.starts_with("Needs attention"));
-    let sign_in = reasons::explain_reason("replacement_unconfirmed_sign_in_required", "", false);
+    let sign_in = reasons::explain_reason("replacement_unconfirmed:sign_in", "", false);
     assert!(sign_in.contains("signed out") && sign_in.contains("Next: yadorilink login"));
+    let acknowledge = reasons::explain_reason("replacement_unconfirmed:acknowledge", "", false);
+    assert!(acknowledge.contains("Next: yadorilink device acknowledge-replacement"));
+    assert!(acknowledge.contains("Acknowledge") && !acknowledge.starts_with("Needs attention"));
 }
 
 fn named() -> DeviceNames {
@@ -1340,8 +1417,37 @@ fn details_say_update_required_for_a_reachable_incompatible_holder() {
         &["old"],
     );
     let lines = dimension_detail_lines(&link, &DeviceNames::default());
-    assert_eq!(lines[0], "    availability: update required on old before this can sync (0 of 1 other devices available)");
+    assert_eq!(lines[0], "    availability: update old (older version) before this can sync (0 of 1 other devices available)");
     assert_eq!(lines[1], "    protection: pending (waiting for old to confirm)");
+}
+
+#[test]
+fn details_say_to_update_this_device_when_the_holder_is_newer() {
+    let mut link = dimension_link(
+        ProductAvailability::UpdateRequired,
+        DataProtection::Pending,
+        &[],
+        &[],
+        &["new"],
+        &["new"],
+    );
+    link.availability_newer_peer_device_ids = vec!["new".into()];
+    let lines = dimension_detail_lines(&link, &DeviceNames::default());
+    assert_eq!(
+        lines[0],
+        "    availability: update this device (new runs a newer version) before this can sync (0 of 1 other devices available)"
+    );
+}
+
+#[test]
+fn the_update_instruction_names_each_side_that_has_to_update() {
+    let label = |ids: &[String]| ids.join(", ");
+    let both = vec!["new".to_string(), "old".to_string()];
+    assert_eq!(
+        summary::update_instruction(&both, &["new".to_string()], &label),
+        "update this device (new runs a newer version); update old (older version)"
+    );
+    assert_eq!(summary::update_instruction(&both, &[], &label), "update new, old (older version)");
 }
 
 #[test]
@@ -1380,6 +1486,23 @@ fn as_sent(mut status: StatusResponse) -> StatusResponse {
 
 fn summary_of(status: StatusResponse) -> Vec<String> {
     status_lines(&as_sent(status), &DeviceNames::default(), false)
+}
+
+#[test]
+fn a_folder_that_is_not_up_to_date_says_when_it_last_was() {
+    let mut status = as_sent(StatusResponse { links: vec![base_link()], ..Default::default() });
+    status.links[0].product.as_mut().unwrap().state =
+        yadorilink_ipc_proto::daemonctl::product_status::State::Syncing as i32;
+    status.links[0].product.as_mut().unwrap().last_synced_unix = Some(1_700_000_000);
+    let row = status_lines(&status, &DeviceNames::default(), false)
+        .into_iter()
+        .find(|l| l.contains("Syncing") && l.contains("last synced"));
+    assert!(row.is_some(), "no last synced on the folder row");
+    status.links[0].product.as_mut().unwrap().state =
+        yadorilink_ipc_proto::daemonctl::product_status::State::UpToDate as i32;
+    assert!(!status_lines(&status, &DeviceNames::default(), false)
+        .iter()
+        .any(|l| l.contains("last synced")));
 }
 
 #[test]
@@ -1537,4 +1660,27 @@ fn a_waiting_folder_with_no_named_cause_claims_none() {
     link.availability = ProductAvailability::Unknown as i32;
     let lines = summary_of(StatusResponse { links: vec![link], ..base_status() });
     assert!(lines.contains(&"  /tmp/photos   Waiting".to_string()), "{lines:?}");
+}
+
+#[test]
+fn online_only_rules_have_a_details_line_that_names_what_was_left() {
+    use yadorilink_ipc_proto::daemonctl::RetentionApplyState;
+    let mut link = LinkStatus::default();
+    assert!(online_only_detail_lines(&link).is_empty());
+    link.retention_apply_state = RetentionApplyState::None as i32;
+    assert!(online_only_detail_lines(&link).is_empty());
+    link.retention_apply_state = RetentionApplyState::Pending as i32;
+    link.retention_done_count = 12;
+    link.retention_retryable_count = 2;
+    assert_eq!(
+        online_only_detail_lines(&link),
+        vec!["  online only: freeing, 12 freed, 2 to retry"]
+    );
+    link.retention_apply_state = RetentionApplyState::Done as i32;
+    link.retention_retryable_count = 0;
+    link.retention_skipped_count = 3;
+    assert_eq!(
+        online_only_detail_lines(&link),
+        vec!["  online only: done, 12 freed, 3 left on purpose (unsynced changes or in use)"]
+    );
 }

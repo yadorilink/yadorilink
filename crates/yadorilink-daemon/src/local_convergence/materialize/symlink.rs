@@ -32,6 +32,8 @@ impl super::super::LocalConvergenceExecutor {
         // symlink as a concurrent change instead of vanishing. A link
         // already holding the payload's target has nothing to replace.
         let out_path = self.local_file_path(group_id, &record.path)?;
+        let expected_target = yadorilink_local_storage::TargetExpectation::observe(&out_path)
+            .map_err(|error| PeerSessionError::HydrationFailed(error.to_string()))?;
         let already_this_link =
             payload.version().meta.symlink_target.as_deref().is_some_and(|target| {
                 std::fs::read_link(&out_path).is_ok_and(|on_disk| {
@@ -141,6 +143,7 @@ impl super::super::LocalConvergenceExecutor {
                 authoring,
                 retention: yadorilink_sync_sqlite::retention::Retention::Proofs(proofs),
                 permit: root_commit_permit,
+                expected_target,
             },
             record,
             payload.version(),
@@ -198,6 +201,11 @@ impl super::super::LocalConvergenceExecutor {
                     MaterializationState::Remote,
                     root_commit_permit,
                 )?;
+                Ok(MaterializeResult::RetryRequired.into())
+            }
+            SymlinkMaterializeOutcome::TargetChanged => {
+                // A save landed after the check above: nothing was replaced, the path is
+                // journaled, the intent stays open. The retry meets the save as a captured change.
                 Ok(MaterializeResult::RetryRequired.into())
             }
             SymlinkMaterializeOutcome::CommitRejected => {

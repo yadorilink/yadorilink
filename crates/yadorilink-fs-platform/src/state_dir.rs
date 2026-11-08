@@ -108,6 +108,17 @@ pub enum StateDirError {
     )]
     UnderAppDataWhilePackaged { dir: PathBuf, default: PathBuf },
     #[error(
+        "this build keeps its own data in a directory named {name:?}, but {what} points to {path}, \
+         which is the installed product's {production}. A build with its own identity (a staging \
+         app) never opens the product's data: unset {what} or point it somewhere of its own."
+    )]
+    NamedBuildOverridesProduction {
+        name: &'static str,
+        what: &'static str,
+        path: PathBuf,
+        production: PathBuf,
+    },
+    #[error(
         "{variable} points to {path}, which is under AppData. A packaged app cannot keep data \
          there: Windows stores such files in a per-app copy that is deleted when the app is \
          uninstalled and that other programs cannot see. Unset {variable} or point it outside \
@@ -118,14 +129,19 @@ pub enum StateDirError {
 
 /// The state directory for `env`, ignoring the packaged-placement rule.
 pub fn resolve(env: &Env) -> Result<PathBuf, StateDirError> {
+    resolve_for(STATE_DIR_NAME, env)
+}
+
+fn resolve_for(name: &'static str, env: &Env) -> Result<PathBuf, StateDirError> {
     if let Some(dir) = &env.config_dir {
         let dir = PathBuf::from(dir);
         // A relative override would name a different place in each process's working directory.
         #[cfg(windows)]
         let dir = std::path::absolute(&dir).unwrap_or(dir);
+        refuse_production_area(name, env, &dir, "YADORILINK_CONFIG_DIR")?;
         return Ok(dir);
     }
-    default_dir(env)
+    default_dir_named(env, cfg!(windows), name)
 }
 
 /// The directory used when `YADORILINK_CONFIG_DIR` is not set.
@@ -133,10 +149,40 @@ pub fn default_dir(env: &Env) -> Result<PathBuf, StateDirError> {
     default_dir_for(env, cfg!(windows))
 }
 
+/// The name of the state directory: `yadorilink` unless the build names another through
+/// `YADORILINK_STATE_DIR_NAME`. A build that carries its own app identity (a staging app) names its
+/// own directory, so it never opens the data of the installed product.
+pub const STATE_DIR_NAME: &str = match option_env!("YADORILINK_STATE_DIR_NAME") {
+    Some(name) => name,
+    None => "yadorilink",
+};
+
+/// The state directory name of the installed product.
+pub const PRODUCT_STATE_DIR_NAME: &str = "yadorilink";
+
+// A build-time name must name one directory: an empty one would make the state directory its
+// parent (all of Application Support), and a separator would nest or escape it.
+const _: () = {
+    let bytes = STATE_DIR_NAME.as_bytes();
+    assert!(!bytes.is_empty(), "YADORILINK_STATE_DIR_NAME must not be empty");
+    let mut i = 0;
+    while i < bytes.len() {
+        assert!(
+            bytes[i] != b'/' && bytes[i] != b'\\',
+            "YADORILINK_STATE_DIR_NAME must be one directory name"
+        );
+        i += 1;
+    }
+};
+
 fn default_dir_for(env: &Env, windows: bool) -> Result<PathBuf, StateDirError> {
+    default_dir_named(env, windows, STATE_DIR_NAME)
+}
+
+fn default_dir_named(env: &Env, windows: bool, name: &str) -> Result<PathBuf, StateDirError> {
     if windows {
         let profile = env.userprofile.as_ref().ok_or(StateDirError::NoHome)?;
-        return Ok(PathBuf::from(profile).join(".yadorilink"));
+        return Ok(PathBuf::from(profile).join(format!(".{name}")));
     }
     let home = env.home.as_ref().ok_or(StateDirError::NoHome)?;
     let home = PathBuf::from(home);
@@ -147,7 +193,7 @@ fn default_dir_for(env: &Env, windows: bool) -> Result<PathBuf, StateDirError> {
     } else {
         home
     };
-    Ok(base.join("yadorilink"))
+    Ok(base.join(name))
 }
 
 /// Refuses a state directory under AppData for a process with package identity.
@@ -351,10 +397,86 @@ pub fn state_dir() -> Result<PathBuf, StateDirError> {
     checked_state_dir(&Env::from_process())
 }
 
+/// The places the installed product keeps its data by default: its state directory and, on macOS,
+/// its install witness and log directories.
+fn production_areas(env: &Env) -> Vec<PathBuf> {
+    let mut areas = Vec::new();
+    if let Ok(dir) = default_dir_named(env, cfg!(windows), PRODUCT_STATE_DIR_NAME) {
+        areas.push(dir);
+    }
+    if cfg!(target_vendor = "apple") {
+        if let Some(home) = &env.home {
+            let library = PathBuf::from(home).join("Library");
+            areas.push(library.join("Caches").join("YadoriLink"));
+            areas.push(library.join("Logs").join(PRODUCT_STATE_DIR_NAME));
+        }
+    }
+    areas
+}
+
+/// A build that names its own state directory (`name` is not the product's) does not open the
+/// product's data by mistake: `path`, spelled in any case and through any existing symbolic link, may not be
+/// one of the product's default areas or inside one. The product build (`name` is the product's)
+/// is not restricted. This is a guard against a launch configuration that points the wrong
+/// build at the product's data, not against someone who sets out to defeat it: it works from
+/// the environment it is given (a different `HOME` moves what it protects), does not follow
+/// hard links or bind mounts, and a path validated here can still be swapped afterwards.
+fn refuse_production_area(
+    name: &'static str,
+    env: &Env,
+    path: &Path,
+    what: &'static str,
+) -> Result<(), StateDirError> {
+    if name.eq_ignore_ascii_case(PRODUCT_STATE_DIR_NAME) {
+        return Ok(());
+    }
+    let resolved = existing_prefix_resolved(path);
+    for area in production_areas(env) {
+        if is_within(path, &area) || is_within(&resolved, &existing_prefix_resolved(&area)) {
+            return Err(StateDirError::NamedBuildOverridesProduction {
+                name,
+                what,
+                path: path.to_path_buf(),
+                production: area,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// `path` with its longest existing prefix resolved through symbolic links (a path that does not
+/// exist yet keeps its spelled tail), for comparing where two spellings really point.
+fn existing_prefix_resolved(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut tail = Vec::new();
+    let mut current = absolute.clone();
+    loop {
+        if let Ok(resolved) = std::fs::canonicalize(&current) {
+            return tail.iter().rev().fold(resolved, |acc, name| acc.join(name));
+        }
+        match (current.file_name().map(ToOwned::to_owned), current.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                current = parent.to_path_buf();
+            }
+            _ => return absolute,
+        }
+    }
+}
+
 /// The usable path of a per-path override, `None` when it is not set.
 pub fn checked_override(env: &Env, which: PathOverride) -> Result<Option<PathBuf>, StateDirError> {
+    checked_override_for(STATE_DIR_NAME, env, which)
+}
+
+fn checked_override_for(
+    name: &'static str,
+    env: &Env,
+    which: PathOverride,
+) -> Result<Option<PathBuf>, StateDirError> {
     let Some(value) = &env.overrides[which.index()] else { return Ok(None) };
     let path = PathBuf::from(value);
+    refuse_production_area(name, env, &path, which.variable())?;
     if check_placement(env, &path).is_err() {
         return Err(StateDirError::OverrideUnderAppDataWhilePackaged {
             variable: which.variable(),

@@ -121,6 +121,25 @@ impl EngineCommands {
         crate::provider_stage::discard_staged(handoff.ingest_dir(), ingest_name).map_err(refused)
     }
 
+    /// Marks a provider folder publish-only on this device, or clears it. Takes effect for the
+    /// next change; one already past its refusal check still commits.
+    ///
+    /// # Errors
+    /// [`CommandError`] for an unknown root or an unreadable index.
+    pub fn set_publish_only(&self, root_id: &[u8], publish_only: bool) -> Result<(), CommandError> {
+        let found = self
+            .shell
+            .replica_coordinator
+            .provider_repository()
+            .set_publish_only(&hex::encode(root_id), publish_only)
+            .map_err(|e| CommandError::from_error(&e))?;
+        if found {
+            Ok(())
+        } else {
+            Err(CommandError::failed("unknown provider root"))
+        }
+    }
+
     /// For each item this device authored, whether a device that keeps a full replica holds
     /// exactly that version now. Asked afresh every time; see the module `provider_delivery`.
     ///

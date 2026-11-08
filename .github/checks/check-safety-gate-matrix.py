@@ -46,7 +46,7 @@ WATCHED_ENUMS = (
     ("crates/yadorilink-daemon/src/install_witness.rs", "Restored"),
     ("crates/yadorilink-daemon/src/update/manifest.rs", "VersionRefusal"),
 )
-AUTO_ENUM = re.compile(r"\bpub enum (\w*(?:Failpoint|CommitPoint))\b")
+AUTO_ENUM = re.compile(r"\bpub(?:\(crate\))? enum (\w*(?:Failpoint|CommitPoint))\b")
 SEAM_FN = re.compile(r"\bpub(?:\(crate\))? fn ((?:arm|inject|set|fail)_\w*)\s*[(<]")
 SEAM_WORDS = {"fail", "failpoint", "failures", "fault", "crash", "inject", "race", "refusal"}
 
@@ -195,6 +195,9 @@ def self_test() -> int:
     assert seams_in("pub fn set_fail_after_rename_for_test(a: bool) {}") == [
         "set_fail_after_rename_for_test"
     ]
+    assert AUTO_ENUM.findall("pub(crate) enum StageFailpoint {\n}") == ["StageFailpoint"]
+    assert AUTO_ENUM.findall("pub enum NsFailpoint {\n}") == ["NsFailpoint"]
+    assert not AUTO_ENUM.findall("enum PrivateFailpoint {\n}")
     assert not seams_in("pub fn arm(x: u8) {}\npub fn set_default_interval_for_tests() {}")
     rows, problems = parse_table(
         "case | a.b | 2.1 | Demo::A | text\n"

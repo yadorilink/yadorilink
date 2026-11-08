@@ -2,6 +2,7 @@
 
 use super::*;
 use yadorilink_ipc_proto::daemonctl::DegradedCause as Cause;
+use yadorilink_ipc_proto::daemonctl::ProductStatus;
 
 /// A link with every status axis in its healthiest state (`Protected`,
 /// `AvailableNow`) and nothing else wrong -- the baseline every test
@@ -255,19 +256,22 @@ fn an_unreachable_peer_is_never_a_reason() {
     assert_eq!(overall_status(&response), (OverallState::Healthy, Vec::new()));
 }
 
-/// A peer that is reachable but on another version is "update required", never "offline"; a
-/// genuinely unreachable peer next to it is still offline.
+/// A peer that is reachable but on another version is "update required", never "offline", and
+/// the reason names which side updates: a newer peer means this device, an older one that peer.
+/// A genuinely unreachable peer next to them is still offline.
 #[test]
-fn version_mismatched_peer_is_update_required_never_offline() {
-    use yadorilink_ipc_proto::daemonctl::PeerReachability;
+fn version_mismatched_peer_names_the_side_to_update_never_offline() {
+    use yadorilink_ipc_proto::daemonctl::{PeerReachability, VersionSkew};
+    let connected = |id: &str, skew: VersionSkew| PeerStatus {
+        device_id: id.into(),
+        reachability: PeerReachability::Connected as i32,
+        version_skew: skew as i32,
+        ..Default::default()
+    };
     let response = StatusResponse {
         peers: vec![
-            PeerStatus {
-                device_id: "device-old".into(),
-                reachability: PeerReachability::Connected as i32,
-                version_incompatible: true,
-                ..Default::default()
-            },
+            connected("device-newer", VersionSkew::PeerNewer),
+            connected("device-older", VersionSkew::PeerOlder),
             PeerStatus {
                 device_id: "device-gone".into(),
                 reachability: PeerReachability::Unreachable as i32,
@@ -278,7 +282,13 @@ fn version_mismatched_peer_is_update_required_never_offline() {
     };
     let (state, reasons) = overall_status(&response);
     assert_eq!(state, OverallState::Attention);
-    assert_eq!(reasons, vec!["peer_update_required:device-old".to_string()]);
+    assert_eq!(
+        reasons,
+        vec![
+            "peer_newer:device-newer".to_string(),
+            "peer_update_required:device-older".to_string()
+        ]
+    );
 }
 
 /// A client below the manifest's minimum supported version needs attention with the same
@@ -379,7 +389,7 @@ fn an_ambiguous_link_makes_the_rollup_degraded() {
     assert_eq!(reasons, vec!["ambiguous:group-1".to_string()]);
 }
 
-/// A link whose sync-root lock sidecar is gone reports the terminal `ownership_lost` reason.
+/// A link whose sync-root lock sidecar is gone reports `folder_needs_relink`.
 #[test]
 fn an_ownership_lost_link_reports_its_own_reason() {
     let response = StatusResponse {
@@ -393,7 +403,7 @@ fn an_ownership_lost_link_reports_its_own_reason() {
     };
     let (state, reasons) = overall_status(&response);
     assert_eq!(state, OverallState::Degraded);
-    assert_eq!(reasons, vec!["ownership_lost:group-1".to_string()]);
+    assert_eq!(reasons, vec!["folder_needs_relink:group-1".to_string()]);
 }
 
 /// Every typed cause has its own rollup code, whatever the detail text says, and the text alone
@@ -402,8 +412,8 @@ fn an_ownership_lost_link_reports_its_own_reason() {
 fn every_degraded_cause_has_its_own_rollup_code_and_text_never_picks_one() {
     for (cause, code) in [
         (Cause::FileWatchLimit, "file_watch_limit"),
-        (Cause::OwnershipLost, "ownership_lost"),
-        (Cause::NotJoined, "not_joined"),
+        (Cause::OwnershipLost, "folder_needs_relink"),
+        (Cause::NotJoined, "folder_needs_relink"),
         (Cause::Unspecified, "degraded"),
     ] {
         let link = LinkStatus {
@@ -612,60 +622,43 @@ fn the_reported_protection_and_the_rollup_agree() {
 #[test]
 fn an_unconfirmed_replacement_is_attention_with_its_reason_appended() {
     let (mut state, mut reasons) = overall_status(&StatusResponse::default());
-    apply_replacement_unconfirmed(false, &mut state, &mut reasons);
+    apply_replacement_unconfirmed(false, true, true, None, &mut state, &mut reasons);
     assert_eq!((state, reasons.as_slice()), (OverallState::Healthy, &[][..]));
 
     let mut reasons = vec!["held:g1".to_owned()];
     let mut state = OverallState::Attention;
-    apply_replacement_unconfirmed(true, &mut state, &mut reasons);
+    apply_replacement_unconfirmed(true, false, false, None, &mut state, &mut reasons);
     assert_eq!(state, OverallState::Attention);
     assert_eq!(reasons, ["held:g1", "replacement_unconfirmed"]);
 
     let (mut state, mut reasons) = overall_status(&StatusResponse::default());
-    apply_replacement_unconfirmed(true, &mut state, &mut reasons);
+    apply_replacement_unconfirmed(true, false, false, None, &mut state, &mut reasons);
     assert_eq!((state, reasons), (OverallState::Attention, vec!["replacement_unconfirmed".into()]));
 }
 
-/// The sign-in request is one more reason after the others and nothing at all when not needed.
+/// One reason, one step: what the person has to do outranks a wait, a wait outranks the plain
+/// "not confirmed yet".
 #[test]
-fn a_replacement_needing_sign_in_appends_its_reason_last() {
-    let mut reasons = vec!["held:g1".to_owned(), "replacement_unconfirmed".to_owned()];
-    apply_replacement_sign_in(false, &mut reasons);
-    assert_eq!(reasons, ["held:g1", "replacement_unconfirmed"]);
-    apply_replacement_sign_in(true, &mut reasons);
+fn a_replacement_reports_one_step_by_priority() {
+    let step = |sign_in, acknowledge, waiting: Option<&str>| {
+        let (mut state, mut reasons) = overall_status(&StatusResponse::default());
+        apply_replacement_unconfirmed(
+            true,
+            sign_in,
+            acknowledge,
+            waiting.map(str::to_owned),
+            &mut state,
+            &mut reasons,
+        );
+        reasons
+    };
+    assert_eq!(step(true, true, Some("w")), ["replacement_unconfirmed:acknowledge"]);
+    assert_eq!(step(true, false, Some("w")), ["replacement_unconfirmed:sign_in"]);
     assert_eq!(
-        reasons,
-        ["held:g1", "replacement_unconfirmed", "replacement_unconfirmed_sign_in_required"]
+        step(false, false, Some("g1: not linked on this device")),
+        ["replacement_unconfirmed:waiting:g1: not linked on this device"]
     );
-}
-
-/// The acknowledgement request is one more reason after the others and nothing when not needed.
-#[test]
-fn a_replacement_awaiting_acknowledgement_appends_its_reason_last() {
-    let mut reasons = vec!["replacement_unconfirmed".to_owned()];
-    apply_replacement_acknowledgement(false, &mut reasons);
-    assert_eq!(reasons, ["replacement_unconfirmed"]);
-    apply_replacement_acknowledgement(true, &mut reasons);
-    assert_eq!(
-        reasons,
-        ["replacement_unconfirmed", "replacement_unconfirmed_acknowledgement_required"]
-    );
-}
-
-/// The wait reason is one more reason after the others, carrying the text, and nothing without one.
-#[test]
-fn a_replacement_waiting_appends_its_reason_text_last() {
-    let mut reasons = vec!["replacement_unconfirmed".to_owned()];
-    apply_replacement_waiting(None, &mut reasons);
-    assert_eq!(reasons, ["replacement_unconfirmed"]);
-    apply_replacement_waiting(Some("g1: not linked on this device".into()), &mut reasons);
-    assert_eq!(
-        reasons,
-        [
-            "replacement_unconfirmed",
-            "replacement_unconfirmed_waiting:g1: not linked on this device"
-        ]
-    );
+    assert_eq!(step(false, false, None), ["replacement_unconfirmed"]);
 }
 
 /// A request waiting on the owner is attention (never degraded) naming the folder group.
@@ -873,4 +866,58 @@ fn reasons_are_folded_one_per_cause() {
         ..Default::default()
     });
     assert_eq!(alone, vec!["recent_error:disk_pressure".to_string()], "nothing explains it");
+}
+
+fn product_in(
+    state: yadorilink_ipc_proto::daemonctl::product_status::State,
+) -> Option<ProductStatus> {
+    Some(ProductStatus { state: state as i32, ..Default::default() })
+}
+
+fn reply(state: yadorilink_ipc_proto::daemonctl::product_status::State) -> StatusResponse {
+    use yadorilink_ipc_proto::daemonctl::product_status::State;
+    let mut link = protected_link("g");
+    link.local_path = "/a".to_owned();
+    link.product = product_in(state);
+    StatusResponse {
+        links: vec![link],
+        product: product_in(if state == State::UpToDate { State::UpToDate } else { state }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn last_synced_is_stamped_while_up_to_date_and_kept_after() {
+    use yadorilink_ipc_proto::daemonctl::product_status::State;
+    let clock = LastSynced::default();
+
+    let mut first = reply(State::Syncing);
+    clock.stamp(&mut first, 100, false);
+    assert_eq!(first.links[0].product.as_ref().unwrap().last_synced_unix, None);
+
+    let mut up = reply(State::UpToDate);
+    clock.stamp(&mut up, 200, false);
+    assert_eq!(up.links[0].product.as_ref().unwrap().last_synced_unix, Some(200));
+    assert_eq!(up.product.as_ref().unwrap().last_synced_unix, Some(200));
+
+    let mut later = reply(State::Syncing);
+    clock.stamp(&mut later, 300, false);
+    assert_eq!(later.links[0].product.as_ref().unwrap().last_synced_unix, Some(200));
+}
+
+#[test]
+fn a_stale_reply_does_not_claim_a_sync_and_a_removed_folder_is_forgotten() {
+    use yadorilink_ipc_proto::daemonctl::product_status::State;
+    let clock = LastSynced::default();
+    let mut stale = reply(State::UpToDate);
+    clock.stamp(&mut stale, 100, true);
+    assert_eq!(stale.links[0].product.as_ref().unwrap().last_synced_unix, None);
+
+    let mut up = reply(State::UpToDate);
+    clock.stamp(&mut up, 200, false);
+    let mut gone = StatusResponse::default();
+    clock.stamp(&mut gone, 210, false);
+    let mut back = reply(State::Syncing);
+    clock.stamp(&mut back, 220, false);
+    assert_eq!(back.links[0].product.as_ref().unwrap().last_synced_unix, None);
 }

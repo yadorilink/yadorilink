@@ -155,7 +155,7 @@ impl LocalChangeProcessor {
         root: &Path,
         flush: DebounceFlush,
     ) -> Result<FlushOutcome, LocalCaptureError> {
-        let ignore_set = EffectiveIgnoreSet::load_for_link_root(root)?;
+        let ignore_set = self.ignore_set_for(group_id)?;
         // `true`: this convenience entry point has no caller-supplied
         // fail-closed gate to respect, so it reproduces the historical
         // (pre-gating) behavior exactly -- every real production caller

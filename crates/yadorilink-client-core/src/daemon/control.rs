@@ -89,9 +89,12 @@ fn is_read_only(payload: &ReqPayload) -> bool {
             | ReqPayload::ListConflicts(_)
             | ReqPayload::ListInbox(_)
             | ReqPayload::ListPreserved(_)
+            | ReqPayload::ListShareEdges(_)
             | ReqPayload::ListProviderPending(_)
             | ReqPayload::ListRetainedOriginals(_)
             | ReqPayload::GetSpaceManagement(_)
+            | ReqPayload::GetNetworkPolicy(_)
+            | ReqPayload::IgnoreRulesGet(_)
             | ReqPayload::RewindStatus(_)
     )
 }
@@ -231,7 +234,6 @@ fn reply_budget(payload: &ReqPayload) -> Option<Duration> {
         | ReqPayload::ListTrash(_)
         | ReqPayload::ListVersions(_)
         | ReqPayload::MaterializationStatus(_)
-        | ReqPayload::UnpinItem(_)
         | ReqPayload::LimitsShow(_)
         | ReqPayload::UpdateStatus(_)
         | ReqPayload::ReportingStatus(_)
@@ -303,23 +305,29 @@ async fn connect() -> std::io::Result<tokio::net::UnixStream> {
     tokio::net::UnixStream::connect(crate::coordination::device_config::control_socket_path()).await
 }
 
-/// On Windows, the daemon's `windows_transport`
-/// pre-creates the next pipe instance before handing off each connection,
-/// so a fresh instance should almost always be waiting — but a burst of
-/// concurrent client invocations can still race it, so a busy pipe
-/// (`ERROR_PIPE_BUSY`, raw OS error 231) gets a few short retries rather
-/// than failing immediately.
+/// `ERROR_PIPE_BUSY`: every instance of the daemon's pipe is connected to someone and the next
+/// one is not listening yet. It says the daemon is there, only momentarily without a free instance.
+#[cfg_attr(not(windows), allow(dead_code))]
+const ERROR_PIPE_BUSY: i32 = 231;
+
+/// Whether a failure to open the pipe is the momentary "all instances busy" that is waited out.
+/// Any other failure (no such pipe: the daemon is not running; access refused) is final.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_pipe_busy(raw_os_error: Option<i32>) -> bool {
+    raw_os_error == Some(ERROR_PIPE_BUSY)
+}
+
+/// On Windows the daemon keeps several pipe instances listening, but a burst of concurrent
+/// clients can still outnumber them for as long as it takes to create the next one, so a busy pipe
+/// is waited out: retried every [`PIPE_BUSY_RETRY`] until the caller's [`CONNECT_BUDGET`] runs out
+/// (the callers wrap this in that timeout and report `DaemonUnresponsive`). It used to give up
+/// after 250 ms and report the daemon as not running, though it was up.
 #[cfg(windows)]
 async fn connect() -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
     use tokio::net::windows::named_pipe::ClientOptions;
     use windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
 
-    const ERROR_PIPE_BUSY: i32 = 231;
-    const MAX_ATTEMPTS: u32 = 5;
-    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
-
     let pipe_name = crate::coordination::device_config::control_pipe_name();
-    let mut attempt = 0;
     loop {
         match ClientOptions::new().security_qos_flags(SECURITY_IDENTIFICATION).open(&pipe_name) {
             Ok(client) => {
@@ -328,12 +336,30 @@ async fn connect() -> std::io::Result<tokio::net::windows::named_pipe::NamedPipe
                 yadorilink_ipc_proto::pipe_peer::verify_pipe_server_is_current_user(&client)?;
                 return Ok(client);
             }
-            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && attempt < MAX_ATTEMPTS => {
-                attempt += 1;
-                tokio::time::sleep(RETRY_DELAY).await;
+            Err(e) if is_pipe_busy(e.raw_os_error()) => {
+                tokio::time::sleep(PIPE_BUSY_RETRY).await;
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+/// How often a busy pipe is tried again.
+#[cfg(windows)]
+const PIPE_BUSY_RETRY: Duration = Duration::from_millis(50);
+
+#[cfg(test)]
+mod pipe_busy_tests {
+    use super::*;
+
+    /// Only the momentary "all instances busy" is waited out; a missing pipe (the daemon is not
+    /// running) and a refusal are final, immediately.
+    #[test]
+    fn only_a_busy_pipe_is_waited_out() {
+        assert!(is_pipe_busy(Some(231)));
+        assert!(!is_pipe_busy(Some(2)), "no such pipe: the daemon is not running");
+        assert!(!is_pipe_busy(Some(5)), "access denied");
+        assert!(!is_pipe_busy(None));
     }
 }
 

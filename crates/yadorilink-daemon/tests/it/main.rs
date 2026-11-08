@@ -17,6 +17,7 @@ mod chaos_coordination_unreachable;
 mod checkpoint_fake_mesh_merge;
 mod conflict_burst_restart_e2e;
 mod conflict_keep_both_converges;
+mod conflict_loser_offline_converges;
 mod conflict_resolution;
 mod custody_evict_e2e;
 mod dst_fidelity_lint;

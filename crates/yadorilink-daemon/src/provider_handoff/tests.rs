@@ -152,3 +152,54 @@ fn the_reported_app_group_container_is_adopted_once_and_validated() {
     assert!(slot.get().is_some());
     assert!(configured.is_dir() && !container.join("provider").join("x").exists());
 }
+
+/// The in-memory record of delivered files is the only way to take back a handoff file the OS
+/// has not consumed. A restart loses it, so a file that outlives the restart can no longer be
+/// revoked: the OS could take an old version after a newer one was announced. A restart leaves
+/// no handoff file; the extension asks again.
+#[test]
+fn a_restart_leaves_no_handoff_file_the_daemon_can_no_longer_revoke() {
+    let (dir, first) = root(Duration::from_secs(60));
+    let name = first.name_for(b"req").unwrap();
+    std::fs::write(first.handoff_file(&name), b"old version").unwrap();
+    first.note_delivered("root", ITEM, &name);
+    drop(first);
+
+    let second = HandoffRoot::open_with_lifetime(dir.path(), Duration::from_secs(60)).unwrap();
+
+    assert!(
+        !second.handoff_file(&name).exists(),
+        "the file survived the restart but nothing tracks it, so a newer version cannot take it back"
+    );
+    assert_eq!(second.revoke_unconsumed("root", &ITEM).unwrap(), 0);
+}
+
+/// A handoff file the restart sweep cannot remove (here: inside a directory that cannot be
+/// written to; on Windows, a file another process holds open) must keep the root closed. Opening
+/// anyway would cache a root that tracks nothing while the old file can still be consumed after a
+/// newer version is announced; the open is refused and tried again later.
+#[cfg(unix)]
+#[test]
+fn a_root_does_not_open_while_a_handoff_leftover_cannot_be_removed() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let stuck = dir.path().join("handoff/stuck");
+    std::fs::create_dir_all(&stuck).unwrap();
+    std::fs::write(stuck.join("old"), b"old version").unwrap();
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let writable_anyway = std::fs::remove_file(stuck.join("probe")).is_ok()
+        || std::fs::File::create(stuck.join("probe")).is_ok();
+    if writable_anyway {
+        // Running with privileges that ignore the mode: the failure cannot be produced.
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o700)).unwrap();
+        return;
+    }
+
+    let refused = HandoffRoot::open_with_lifetime(dir.path(), Duration::from_secs(60));
+    std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(refused.is_err(), "the root opened over a handoff file that survived the sweep");
+
+    let opened = HandoffRoot::open_with_lifetime(dir.path(), Duration::from_secs(60));
+    assert!(opened.is_ok(), "the retry removes it and opens");
+    assert!(!stuck.exists());
+}

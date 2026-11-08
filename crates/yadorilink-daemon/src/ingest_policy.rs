@@ -136,7 +136,7 @@ impl Drop for StoreModeHold<'_> {
 /// yes for every path.
 pub(crate) struct KeepInStore {
     everything: bool,
-    pinned: Vec<String>,
+    pinned: yadorilink_sync_sqlite::RuleSet,
     leased: std::collections::HashSet<String>,
 }
 
@@ -144,13 +144,13 @@ impl KeepInStore {
     pub(crate) fn for_group(coordinator: &ReplicaCoordinator, group_id: &str) -> Self {
         let everything = |_| Self {
             everything: true,
-            pinned: Vec::new(),
+            pinned: yadorilink_sync_sqlite::RuleSet::default(),
             leased: std::collections::HashSet::new(),
         };
         if coordinator.store_mode_requests().requested(group_id) {
             return everything(());
         }
-        let Ok(pinned) = coordinator.pinned_item_repository().list(group_id) else {
+        let Ok(pinned) = coordinator.retention_rules().rules(group_id) else {
             return everything(());
         };
         let now_unix_seconds = std::time::SystemTime::now()
@@ -173,14 +173,8 @@ impl KeepInStore {
     /// Whether the versions of `path` have to be in the block store: the item is pinned (itself, or
     /// by a folder above), a custody lease names it, or the group has been asked to store.
     pub(crate) fn keeps(&self, path: &str) -> bool {
-        self.everything
-            || crate::ingest_policy::path_is_pinned(&self.pinned, path)
-            || self.leased.contains(path)
+        self.everything || self.pinned.is_kept(path) || self.leased.contains(path)
     }
-}
-
-fn path_is_pinned(pinned: &[String], path: &str) -> bool {
-    yadorilink_sync_sqlite::pinned_items::path_is_covered(pinned, path)
 }
 
 /// Whether the versions of `path` have to be in the block store: the item is pinned, a custody
@@ -211,7 +205,7 @@ impl IngestPolicy for FileFirstIngest {
 
 /// The policy of a device: every file goes into the store unless serving from files is on.
 pub(crate) fn ingest_policy_for(coordinator: &Arc<ReplicaCoordinator>) -> Arc<dyn IngestPolicy> {
-    if coordinator.tuning().file_block_source {
+    if coordinator.tuning().file_mode.serves_from_files() {
         Arc::new(FileFirstIngest { coordinator: coordinator.clone() })
     } else {
         Arc::new(AlwaysIngest)

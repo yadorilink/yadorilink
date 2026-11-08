@@ -71,11 +71,13 @@ impl NasAdminAuthorizer for Account {
 struct Service {
     target: Option<SocketAddr>,
     delivered: AtomicUsize,
+    /// The session secret each delivered stream carried.
+    secrets: std::sync::Mutex<Vec<Option<[u8; 32]>>>,
 }
 
 impl Service {
     fn at(target: Option<SocketAddr>) -> Arc<Self> {
-        Arc::new(Self { target, delivered: AtomicUsize::new(0) })
+        Arc::new(Self { target, delivered: AtomicUsize::new(0), secrets: Default::default() })
     }
 }
 
@@ -86,6 +88,7 @@ impl NasAdminEndpoint for Service {
 
     fn deliver(&self, mut stream: NasAdminStream) {
         self.delivered.fetch_add(1, Ordering::SeqCst);
+        self.secrets.lock().unwrap().push(stream.secret().copied());
         let Some(target) = self.target else { return };
         tokio::spawn(async move {
             let Ok(mut tcp) = tokio::net::TcpStream::connect(target).await else { return };
@@ -223,7 +226,9 @@ async fn dial(
 async fn open(
     connection: &yadorilink_sync_substrate::NasAdminConnection,
 ) -> Result<NasAdminStream, NasAdminError> {
-    tokio::time::timeout(STEP, connection.open_stream()).await.expect("open settles in time")
+    tokio::time::timeout(STEP, connection.open_stream(&[7u8; 32]))
+        .await
+        .expect("open settles in time")
 }
 
 fn direct(book: &SharedAddressBook) -> NetworkConfig {
@@ -237,9 +242,15 @@ async fn a_device_on_the_same_account_gets_http_bytes_through_untouched() {
     let mac_id = peer_of(&mac_key);
     let account = Account::with([mac_id]);
     let service = Service::at(Some(http_server().await));
-    let nas =
-        spawn_nas(nas_key, direct(&book), Arc::new(AdmitNone), account.clone(), service, limits())
-            .await;
+    let nas = spawn_nas(
+        nas_key,
+        direct(&book),
+        Arc::new(AdmitNone),
+        account.clone(),
+        service.clone(),
+        limits(),
+    )
+    .await;
     let mac = spawn_plain(mac_key, direct(&book)).await;
 
     let connection = dial(&mac, &nas.node).await.expect("a same-account device connects");
@@ -256,6 +267,10 @@ async fn a_device_on_the_same_account_gets_http_bytes_through_untouched() {
         !asked.is_empty() && asked.iter().all(|peer| *peer == mac_id),
         "the authorizer is asked about the identity the handshake proved, and only that"
     );
+    // The dialler's session secret reaches the local service with every stream.
+    let secrets = service.secrets.lock().unwrap().clone();
+    assert_eq!(secrets.len(), 2);
+    assert!(secrets.iter().all(|s| *s == Some([7u8; 32])), "{secrets:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

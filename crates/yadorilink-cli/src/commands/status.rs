@@ -1,7 +1,7 @@
 use yadorilink_ipc_proto::daemonctl::{
     DataProtection, FetchAvailability, GroupDurabilityStatus, LinkStatus, LocalStorageState,
     PeerReachability, PeerStatus, ProductAvailability, RouteKind, StatusResponse,
-    UnreachableCategory, VolumeFreeSpace,
+    UnreachableCategory, VersionSkew, VolumeFreeSpace,
 };
 
 use crate::commands::device_names::DeviceNames;
@@ -161,11 +161,18 @@ fn complete_copies_detail_lines(
         .map(|device_id| {
             let reachability =
                 peers.iter().find(|p| &p.device_id == device_id).map(|p| p.reachability());
-            let incompatible =
-                peers.iter().any(|p| &p.device_id == device_id && p.version_incompatible);
+            let skew = peers
+                .iter()
+                .find(|p| &p.device_id == device_id)
+                .map_or(VersionSkew::Unspecified, |p| p.version_skew());
             let state = match reachability {
                 // Online, but not a copy this device can use until the versions match.
-                Some(PeerReachability::Connected) if incompatible => "update required",
+                Some(PeerReachability::Connected) if skew == VersionSkew::PeerNewer => {
+                    "newer version: update this device"
+                }
+                Some(PeerReachability::Connected) if skew == VersionSkew::PeerOlder => {
+                    "older version: update it"
+                }
                 Some(PeerReachability::Connected) => "available",
                 Some(PeerReachability::Unreachable) => "offline",
                 _ => "unknown",
@@ -289,6 +296,47 @@ fn fetch_availability_suffix(link: &LinkStatus) -> String {
     }
 }
 
+/// The `--details` line for pinned items that are not downloaded yet. The daemon keeps trying
+/// by itself; the folder already reads Waiting or Syncing because the items are wanted content.
+/// While no device can supply content it says so in the words of the availability suffix; the
+/// daemon's own error stays on this line only.
+fn pinned_pending_detail_lines(link: &LinkStatus) -> Vec<String> {
+    if link.pinned_pending_count == 0 {
+        return Vec::new();
+    }
+    let cause = if link.fetch_availability() == FetchAvailability::UnavailableNow {
+        "waiting for a device".to_string()
+    } else {
+        format!("last error: {}", link.pinned_pending_error)
+    };
+    vec![format!(
+        "  pinned: {} item(s) not downloaded yet, {cause}, next try in {}s",
+        link.pinned_pending_count, link.pinned_pending_retry_secs
+    )]
+}
+
+/// The `--details` line for online-only rules: whether their clean-up has finished and what it left.
+/// Files skipped on purpose (unsynced edits, open, held) are named, never hidden in the totals.
+fn online_only_detail_lines(link: &LinkStatus) -> Vec<String> {
+    use yadorilink_ipc_proto::daemonctl::RetentionApplyState;
+    let state = link.retention_apply_state();
+    if !matches!(state, RetentionApplyState::Pending | RetentionApplyState::Done) {
+        return Vec::new();
+    }
+    let mut parts = vec![format!("{} freed", link.retention_done_count)];
+    if link.retention_skipped_count > 0 {
+        parts.push(format!(
+            "{} left on purpose (unsynced changes or in use)",
+            link.retention_skipped_count
+        ));
+    }
+    if link.retention_retryable_count > 0 {
+        parts.push(format!("{} to retry", link.retention_retryable_count));
+    }
+    let head = if state == RetentionApplyState::Pending { "freeing" } else { "done" };
+    vec![format!("  online only: {head}, {}", parts.join(", "))]
+}
+
 fn device_list(ids: &[String], names: &DeviceNames) -> String {
     ids.iter().map(|id| device_label(names, id, true)).collect::<Vec<_>>().join(", ")
 }
@@ -317,8 +365,10 @@ fn dimension_detail_lines(link: &LinkStatus, names: &DeviceNames) -> Vec<String>
             format!("waiting for a device that has this version{counts}")
         }
         ProductAvailability::UpdateRequired => format!(
-            "update required on {} before this can sync{counts}",
-            device_list(update, names)
+            "{} before this can sync{counts}",
+            summary::update_instruction(update, &link.availability_newer_peer_device_ids, &|ids| {
+                device_list(ids, names)
+            })
         ),
         ProductAvailability::Unknown | ProductAvailability::Unspecified => {
             "unknown (cannot be confirmed now)".to_string()
@@ -401,10 +451,8 @@ fn reason_subject(
         | "waiting_for_disk_space"
         | "file_watch_limit"
         | "ambiguous"
-        | "ownership_lost"
-        | "not_joined"
+        | "folder_needs_relink"
         | "durability_at_risk"
-        | "durability_unknown"
         | "fetch_unavailable"
         | "fetch_availability_unknown"
         | "conflict"
@@ -424,7 +472,11 @@ fn reason_subject(
             .find(|r| r.root_id == arg)
             .map(|r| format!("{} (File Provider)", r.display_name))
             .unwrap_or_default(),
-        "peer_disconnected" | "peer_update_required" => device_label(names, arg, verbose),
+        "peer_disconnected" | "peer_update_required" | "peer_newer" => {
+            device_label(names, arg, verbose)
+        }
+        // The text after the step: the reason a wait gives.
+        "replacement_unconfirmed" => arg.strip_prefix("waiting:").unwrap_or_default().to_owned(),
         "provider_orphan_domain" => {
             if verbose {
                 arg.to_string()
@@ -610,8 +662,16 @@ fn limits_summary_line(status: &StatusResponse) -> String {
 /// "unknown".
 fn peer_connectivity_label(peer: &PeerStatus) -> String {
     // Online but on another version: never "cannot connect", the fix is to update.
-    if peer.version_incompatible && peer.reachability() == PeerReachability::Connected {
-        return "reachable, update required".to_string();
+    if peer.reachability() == PeerReachability::Connected {
+        match peer.version_skew() {
+            VersionSkew::PeerNewer => {
+                return "reachable, runs a newer version: update this device".to_string();
+            }
+            VersionSkew::PeerOlder => {
+                return "reachable, runs an older version: update that device".to_string();
+            }
+            VersionSkew::Unspecified => {}
+        }
     }
     match peer.reachability() {
         PeerReachability::Connected if peer.route_kind() == RouteKind::Relay => {
@@ -706,6 +766,39 @@ fn block_store_summary_line(status: &StatusResponse) -> String {
     )
 }
 
+/// The earlier versions kept on this device against the most they may take, when the daemon
+/// could read both. Past the limit the oldest are removed, so a full history says so.
+fn kept_history_summary_line(status: &StatusResponse) -> Option<String> {
+    let (used, limit) = (status.kept_history_bytes?, status.kept_history_budget_bytes?);
+    let note = if used >= limit { " (full: the oldest are removed first)" } else { "" };
+    Some(format!("Kept history: {} of {} allowed{note}", format_bytes(used), format_bytes(limit)))
+}
+
+/// Edits saved on this device that are not published, one line per reason (the service did not
+/// answer; this device may no longer publish). Empty when nothing is waiting.
+fn unpublished_edits_lines(status: &StatusResponse) -> Vec<String> {
+    let mut lines = Vec::new();
+    let unreachable = status.unpublished_edits_service_unreachable;
+    if unreachable > 0 {
+        lines.push(format!(
+            "Service unreachable: {unreachable} change(s) are only on this device, they will sync when it is back"
+        ));
+    }
+    let refused = status.unpublished_edits_not_authorized;
+    if refused > 0 {
+        lines.push(format!(
+            "This device is not allowed to publish edits here: {refused} change(s) are only on this device"
+        ));
+    }
+    let rejected = status.unpublished_edits_rejected;
+    if rejected > 0 {
+        lines.push(format!(
+            "The service did not accept publishing (sign in again, or check for an update): {rejected} change(s) are only on this device"
+        ));
+    }
+    lines
+}
+
 /// This link's active-transfer headline — empty unless
 /// `has_active_transfer` (this file's established "empty unless
 /// applicable" discipline, matching `degraded_suffix`/
@@ -796,6 +889,18 @@ fn recent_errors_summary_lines(status: &StatusResponse) -> Vec<String> {
             )
         })
         .collect()
+}
+
+/// The line naming a pause because the connection is metered, with the way out; empty when sync
+/// is not paused for that reason.
+fn metered_pause_lines(status: &StatusResponse) -> Vec<String> {
+    if !status.paused_on_metered {
+        return Vec::new();
+    }
+    vec![
+        "Sync is paused: this connection is metered. Run `yadorilink network sync-on-metered` to sync anyway."
+            .to_string(),
+    ]
 }
 
 /// Concise update-state lines for `yadorilink status`, only rendered
@@ -944,7 +1049,10 @@ fn names_a_device(status: &StatusResponse) -> bool {
             .iter()
             .any(|l| !l.full_replica_device_ids.is_empty() || !l.protection_device_ids.is_empty())
         || status.attention_reasons.iter().any(|r| {
-            matches!(reasons::split_code(r).0, "peer_disconnected" | "peer_update_required")
+            matches!(
+                reasons::split_code(r).0,
+                "peer_disconnected" | "peer_update_required" | "peer_newer"
+            )
         })
 }
 
@@ -1043,6 +1151,8 @@ fn detailed_status_lines(
         }
         lines.extend(held_file_detail_lines(link, verbose));
         lines.extend(unreadable_file_detail_lines(link));
+        lines.extend(pinned_pending_detail_lines(link));
+        lines.extend(online_only_detail_lines(link));
         lines.extend(complete_copies_detail_lines(link, &status.peers, names, verbose));
         if verbose {
             lines.extend(dimension_detail_lines(link, names));
@@ -1071,12 +1181,20 @@ fn detailed_status_lines(
     lines.push(String::new());
     lines.push(limits_summary_line(status));
     lines.push(block_store_summary_line(status));
+    lines.extend(kept_history_summary_line(status));
+    lines.extend(unpublished_edits_lines(status));
 
     if !status.volumes.is_empty() {
         lines.push("Volumes:".to_string());
         for volume in &status.volumes {
             lines.push(volume_line(volume));
         }
+    }
+
+    let metered = metered_pause_lines(status);
+    if !metered.is_empty() {
+        lines.push(String::new());
+        lines.extend(metered);
     }
 
     let update_lines = update_summary_lines(status);

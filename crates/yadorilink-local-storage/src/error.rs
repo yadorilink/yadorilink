@@ -47,6 +47,12 @@ pub enum StorageError {
         headroom_bytes: u64,
     },
 
+    /// A write was about to replace whatever stood at its target, and what stands there is no
+    /// longer what the writer decided to replace (an editor saved to the path meanwhile). Nothing
+    /// was replaced.
+    #[error("the target {0:?} changed after the write decided to replace it; left as it is")]
+    TargetChanged(std::path::PathBuf),
+
     /// A materialization write/delete target resolved outside its
     /// designated root (a symlinked intermediate path component, planted
     /// locally or raced in) -- defense-in-depth, distinct from `InvalidPath`
@@ -89,6 +95,13 @@ pub enum StorageError {
     #[error("block store is corrupt: {0}")]
     CorruptStore(String),
 
+    /// The store was written in another on-disk layout than this build's: `found` and `expected` are the
+    /// format versions (the marker's, or the segment layout's); `detail` names what carried the
+    /// version. Nothing was read or changed; there is no migration. Callers branch on this variant,
+    /// never on the wording.
+    #[error("{}", crate::segment_store::index_refusal_text(detail, layout, *expected))]
+    AnotherLayout { found: i64, expected: i64, layout: &'static str, detail: String },
+
     /// Removing bytes was refused because the volume holding them is not known to offer durable
     /// namespace changes. Nothing was removed.
     #[error("byte deletion refused: {0}")]
@@ -128,12 +141,21 @@ impl StorageError {
             }
             StorageError::WriterLease(message) => StorageError::WriterLease(message.clone()),
             StorageError::PathEscapesRoot(path) => StorageError::PathEscapesRoot(path.clone()),
+            StorageError::TargetChanged(path) => StorageError::TargetChanged(path.clone()),
             StorageError::Hex(error) => StorageError::Hex(*error),
             StorageError::Chunking(message) => StorageError::Chunking(message.clone()),
             StorageError::Index(message) => StorageError::Index(message.clone()),
             StorageError::CorruptStore(message) => StorageError::CorruptStore(message.clone()),
             StorageError::DeletionRefused(message) => {
                 StorageError::DeletionRefused(message.clone())
+            }
+            StorageError::AnotherLayout { found, expected, layout, detail } => {
+                StorageError::AnotherLayout {
+                    found: *found,
+                    expected: *expected,
+                    layout,
+                    detail: detail.clone(),
+                }
             }
         }
     }

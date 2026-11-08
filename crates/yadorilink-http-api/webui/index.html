@@ -182,6 +182,62 @@
       <div id="conflicts-table"></div>
     </div>
 
+    <div class="card" id="retained-card" hidden>
+      <h2>Originals kept</h2>
+      <div class="note">These files were kept as they were because it could not be proved safe to remove them. Free them up once nothing is writing to them; one that changed meanwhile is saved first.</div>
+      <div id="retained-table"></div>
+      <div id="retained-note" class="empty" role="status"></div>
+    </div>
+
+    <div class="card" id="preserved-card" hidden>
+      <h2>Kept aside for review</h2>
+      <div class="empty">These were set aside when a folder was set up again. Nothing is deleted unless you discard it.</div>
+      <div id="preserved-table"></div>
+    </div>
+
+    <div class="card">
+      <h2>Deleted items</h2>
+      <div id="trash-table"></div>
+    </div>
+
+    <div class="card">
+      <h2>File versions</h2>
+      <div class="row">
+        <input id="versions-path" type="text" placeholder="/srv/yadorilink/Photos/notes.txt" autocomplete="off" spellcheck="false">
+        <button class="action" id="versions-list">Show versions</button>
+      </div>
+      <div id="versions-table"></div>
+    </div>
+
+    <div class="card" id="transfers-card" hidden>
+      <h2>File transfers</h2>
+      <div id="transfers-table"></div>
+      <div id="transfers-note" class="empty" role="status"></div>
+    </div>
+
+    <div class="card">
+      <h2>Shared with</h2>
+      <div id="shares-table"></div>
+      <div id="shares-note" class="empty" role="status"></div>
+    </div>
+
+    <div class="card">
+      <h2>Invite to a folder</h2>
+      <div class="row">
+        <select id="invite-group"></select>
+        <select id="invite-role"><option value="editor">can edit</option><option value="viewer">view only</option></select>
+        <label><input type="checkbox" id="invite-approval"> I approve who joins</label>
+        <button class="action" id="invite-mint">Create invite</button>
+      </div>
+      <div id="invite-result" class="note"></div>
+    </div>
+
+    <div class="card">
+      <h2>Your devices</h2>
+      <div id="devices-table"></div>
+      <div id="devices-note" class="empty" role="status"></div>
+    </div>
+
     <div class="card">
       <h2>Connections</h2>
       <div id="connections-table"></div>
@@ -199,7 +255,19 @@
   // a page opened through the YadoriLink app is authorized by its device and
   // never sends it anywhere.
   let useToken = false;
+  // A page opened by managing another device carries its session secret in
+  // the URL fragment, which no server ever sees. It is kept in memory only
+  // (never stored), taken off the address bar, and sent as the bearer on every
+  // call: the managed device refuses requests that do not present it.
+  let sessionSecret = "";
+  (function takeFragmentSecret() {
+    const fragment = (window.location.hash || "").replace(/^#/, "");
+    if (!fragment) return;
+    sessionSecret = fragment;
+    try { window.history.replaceState(null, "", window.location.pathname + window.location.search); } catch (e) { /* the secret is already in memory */ }
+  })();
   function authHeaders() {
+    if (sessionSecret) return { "Authorization": "Bearer " + sessionSecret };
     return useToken ? { "Authorization": "Bearer " + getToken() } : {};
   }
 
@@ -285,6 +353,14 @@
   // Plain words for the daemon's attention codes ("kind:subject"). The page
   // names the subject (a folder) when it can; an unknown code reads as a
   // generic line, never as the raw code.
+  // Device names, from the account list when it was readable; until then (or
+  // headless, signed out) a device is its short id, never nothing.
+  let deviceNames = {};
+  let lastStatus = null;
+  function deviceLabel(id) {
+    return deviceNames[id] || "device " + String(id).slice(0, 8);
+  }
+
   function attentionText(code, links) {
     const i = String(code).indexOf(":");
     const kind = i < 0 ? code : code.slice(0, i);
@@ -295,7 +371,6 @@
       case "low_disk": return "Free space is running low.";
       case "low_disk_critical": return "The disk is almost full. Syncing may stop until space is freed.";
       case "durability_at_risk": return folder + " has no other confirmed copy yet.";
-      case "durability_unknown": return "Can't confirm another copy of " + folder + " right now.";
       case "conflict": return folder + " has conflicting edits to review.";
       case "approval_pending": return "A device is waiting for your approval to join " + folder + ".";
       case "conflict_pending": return folder + " has conflicting edits waiting to be merged.";
@@ -304,10 +379,14 @@
       case "volume_changed": return "The disk for " + folder + " isn't available. Reconnect it to keep the copy.";
       case "waiting_for_disk_space": return folder + " is waiting for free disk space. Syncing resumes by itself once there is room.";
       case "file_watch_limit": return "The system's limit on watched files is reached, so changes in " + folder + " arrive late or not at all. Raise the limit.";
-      case "degraded": case "ownership_lost": case "not_joined": case "ambiguous": return folder + " is not syncing.";
+      case "degraded": case "ambiguous": return folder + " is not syncing.";
+      case "folder_needs_relink": return folder + " is no longer linked, so it is not syncing. Link the folder again.";
+      case "replacement_unconfirmed": return "The replacement of an earlier device is not confirmed yet. Run yadorilink status for the step to take.";
       case "fetch_unavailable": return "Files in " + folder + " can't be downloaded right now.";
       case "peer_disconnected": return "A device can't be reached right now.";
-      case "peer_update_required": case "update_required": return "Update required: a device runs a different version, so syncing with it is paused until every device is updated.";
+      case "peer_update_required": return "Update " + deviceLabel(subject) + " to sync: it runs an older version, so syncing with it is paused until it is updated.";
+      case "peer_newer": return "Update this device to sync with " + deviceLabel(subject) + ": it runs a newer version, so syncing with it is paused until this device is updated.";
+      case "update_required": return "Update this device: it is older than the minimum supported version, so syncing is paused until it is updated.";
       case "update_failed": return "The last update check failed.";
       case "provider_registry_restored": return "The record of the Windows sync folders was damaged and an older copy was used.";
       case "recent_error": return "A recent sync error was recorded.";
@@ -439,11 +518,13 @@
         ? '<button class="action" data-action="resume" data-path="' + path + '">Resume</button>'
         : '<select class="action" data-pause-length="' + path + '" aria-label="Pause length">' +
             '<option value="">until resumed</option>' +
-            '<option value="PAUSE_DURATION_THIRTY_MINUTES">30 minutes</option>' +
-            '<option value="PAUSE_DURATION_ONE_HOUR">1 hour</option>' +
-            '<option value="PAUSE_DURATION_UNTIL_TOMORROW">until tomorrow</option>' +
+            '<option value="PAUSE_DURATION_TWO_HOURS">2 hours</option>' +
+            '<option value="PAUSE_DURATION_EIGHT_HOURS">8 hours</option>' +
+            '<option value="PAUSE_DURATION_TWENTY_FOUR_HOURS">24 hours</option>' +
           "</select> " +
-          '<button class="action" data-action="pause" data-path="' + path + '">Pause</button>');
+          '<button class="action" data-action="pause" data-path="' + path + '">Pause</button>') +
+        ' <button class="action" data-action="unlink" data-path="' + path + '" data-group="' + esc(l.group_id) + '">Unlink</button>' +
+        ' <button class="action" data-action="delete-group" data-path="' + path + '" data-group="' + esc(l.group_id) + '">Delete group</button>';
       return "<tr>" +
         "<td>" + path + "<div class=\"empty\">" + esc(l.group_id) + "</div></td>" +
         "<td>" + pill(stateLabel, stateKind) + pausedUntil + "</td>" +
@@ -471,6 +552,24 @@
           btn.disabled = false;
           return;
         }
+        if (action === "unlink") {
+          if (!confirm("Stop syncing " + path + " on this device? Files already in the folder stay where they are.")) {
+            btn.disabled = false;
+            return;
+          }
+          body.group_id = btn.getAttribute("data-group") || "";
+        }
+        if (action === "delete-group") {
+          try {
+            await deleteGroup(btn.getAttribute("data-group"), path);
+            await refreshOnce();
+          } catch (e) {
+            alert(e.message);
+          } finally {
+            btn.disabled = false;
+          }
+          return;
+        }
         if (action === "pause") {
           const sel = Array.prototype.find.call(
             el.querySelectorAll("select[data-pause-length]"),
@@ -487,6 +586,24 @@
         }
       });
     });
+  }
+
+  // Deleting a folder group is final for every member. The plane refuses a group
+  // with members on other accounts until that is acknowledged: the refusal is
+  // shown, and only a second, explicit confirmation sends the acknowledgement.
+  async function deleteGroup(groupId, path) {
+    if (!confirm("Delete the shared folder group for " + path + " for every member? Their access is removed for good; " +
+        "files already on each device stay on its disk.")) return;
+    const send = function (ack) {
+      return api("/api/share/delete", { method: "POST", body: JSON.stringify({ group_id: groupId, acknowledge_cross_account_members: ack }) });
+    };
+    try {
+      await send(false);
+    } catch (e) {
+      if (!/acknowledge|cross.account/i.test(e.message)) throw e;
+      if (!confirm(e.message + "\n\nMembers on other accounts lose access too. Delete anyway?")) return;
+      await send(true);
+    }
   }
 
   function bytes(n) {
@@ -532,9 +649,33 @@
     const el = document.getElementById("conflicts-table");
     if (!data.conflicts.length) { el.innerHTML = '<div class="empty">No conflicts.</div>'; return; }
     let rows = data.conflicts.map(function (c) {
-      return "<tr><td>" + esc(c.path) + "</td><td>" + esc(c.local_path) + "</td><td>" + c.size + "</td></tr>";
+      const abs = esc(c.absolute_path);
+      const actions = c.resolvable
+        ? '<button class="action" data-resolve="keep_this" data-copy="' + abs + '">Keep this</button> ' +
+          '<button class="action" data-resolve="keep_both" data-copy="' + abs + '">Keep both</button>'
+        : "";
+      return "<tr><td>" + esc(c.path) + "</td><td>" + esc(c.local_path) + "</td><td>" + c.size + "</td><td>" + actions + "</td></tr>";
     }).join("");
-    el.innerHTML = "<table><thead><tr><th>Conflicted copy</th><th>Folder</th><th>Size</th></tr></thead><tbody>" + rows + "</tbody></table>";
+    el.innerHTML = "<table><thead><tr><th>Conflicted copy</th><th>Folder</th><th>Size</th><th></th></tr></thead><tbody>" + rows + "</tbody></table>";
+    el.querySelectorAll("button[data-resolve]").forEach(function (btn) {
+      btn.addEventListener("click", async function () {
+        const how = btn.getAttribute("data-resolve");
+        if (how === "keep_this" && !confirm(
+            "Replace the original file with this copy? The original stays in the file's version history.")) return;
+        btn.disabled = true;
+        try {
+          await api("/api/conflicts/resolve", {
+            method: "POST",
+            body: JSON.stringify({ path: btn.getAttribute("data-copy"), resolution: how })
+          });
+          await refreshOnce();
+        } catch (e) {
+          alert(e.message);
+        } finally {
+          btn.disabled = false;
+        }
+      });
+    });
   }
 
   function renderConnections(peers) {
@@ -543,15 +684,17 @@
     let rows = peers.map(function (p) {
       let reach = p.reachability.replace("PEER_REACHABILITY_", "").toLowerCase();
       // Online but on another version: not "unreachable", and not healthy either.
-      if (reach === "connected" && p.version_incompatible) reach = "update required";
+      if (reach === "connected" && p.version_skew === "VERSION_SKEW_PEER_NEWER") reach = "newer version: update this device";
+      else if (reach === "connected" && p.version_skew === "VERSION_SKEW_PEER_OLDER") reach = "older version: update " + deviceLabel(p.device_id);
       const kind = reach === "connected" ? "ok" : reach === "unreachable" ? "bad" : "warn";
-      return "<tr><td>" + esc(p.device_id) + "</td><td>" + pill(reach, kind) + "</td>" +
+      return "<tr><td>" + esc(deviceLabel(p.device_id)) + "</td><td>" + pill(reach, kind) + "</td>" +
         "<td>" + esc(p.route_kind.replace("ROUTE_KIND_", "").toLowerCase()) + "</td></tr>";
     }).join("");
     el.innerHTML = "<table><thead><tr><th>Device</th><th>Reachability</th><th>Route</th></tr></thead><tbody>" + rows + "</tbody></table>";
   }
 
   function renderStatus(status) {
+    lastStatus = status;
     renderOverall(status);
     renderAppliance(status);
     // Re-rendering mid-selection would reset a pause-length choice.
@@ -690,11 +833,332 @@
   document.getElementById("add-submit").addEventListener("click", submitAdd);
   updateAddTarget();
 
+  function renderTrash(data) {
+    const el = document.getElementById("trash-table");
+    if (!data.files.length) { el.innerHTML = '<div class="empty">Nothing deleted recently.</div>'; return; }
+    const rows = data.files.map(function (f) {
+      const abs = esc(f.absolute_path);
+      const whole = f.deleted_by_operation
+        ? ' <button class="action" data-trash="whole" data-abs="' + abs + '">Restore whole folder</button>' : "";
+      return "<tr><td>" + esc(f.path) + "</td><td>" + esc(f.local_path) + "</td><td>" + bytes(f.size) +
+        "</td><td>" + esc(when(f.deleted_at_unix_nanos / 1e9)) + "</td><td>" +
+        '<button class="action" data-trash="one" data-abs="' + abs + '">Restore</button>' + whole + "</td></tr>";
+    }).join("");
+    el.innerHTML = '<div class="table-wrap"><table><thead><tr><th>Item</th><th>Folder</th><th>Size</th><th>Deleted</th><th></th></tr></thead><tbody>' + rows + "</tbody></table></div>";
+    el.querySelectorAll("button[data-trash]").forEach(function (btn) {
+      btn.addEventListener("click", async function () {
+        btn.disabled = true;
+        try {
+          const r = await api("/api/trash/restore", {
+            method: "POST",
+            body: JSON.stringify({ path: btn.getAttribute("data-abs"), whole_operation: btn.getAttribute("data-trash") === "whole" })
+          });
+          if (r.restored_paths && ((r.failed && r.failed.length) || r.partial)) {
+            alert(r.restored_paths.length + " item(s) restored, " + (r.failed ? r.failed.length : 0) + " could not be restored" +
+              (r.failed && r.failed.length ? " (" + r.failed.map(function (x) { return x.path + ": " + x.error; }).join("; ") + ")" : "") +
+              (r.partial ? ". Part of the delete has not reached this device yet, so the rest could not be restored here." : "."));
+          }
+          await refreshOnce();
+        } catch (e) {
+          alert(e.message);
+        } finally {
+          btn.disabled = false;
+        }
+      });
+    });
+  }
+
+  function renderPreserved(data) {
+    const card = document.getElementById("preserved-card");
+    const el = document.getElementById("preserved-table");
+    card.hidden = !data.items.length;
+    if (!data.items.length) { el.innerHTML = ""; return; }
+    const rows = data.items.map(function (i) {
+      const own = i.kind === "own_unit";
+      const label = own
+        ? "Your changes held back (" + (i.paths && i.paths.length ? i.paths.length + " item(s)" : "recovery " + i.recovery_id) + ")"
+        : (i.path || (i.paths && i.paths.length ? i.paths.length + " items" : i.kind));
+      const attrs = ' data-group="' + esc(i.group_id) + '" data-item="' + esc(i.item_id) + '"';
+      const usable = i.content === "complete";
+      const primary = own
+        ? '<button class="action" data-preserved="retry"' + attrs + ">Retry</button> "
+        : usable ? '<button class="action" data-preserved="restore"' + attrs + ">Restore</button> "
+        : '<span class="empty">content not available</span> ';
+      return "<tr><td>" + esc(label) + "</td><td>" + esc(i.kind) + "</td><td>" + (own ? "" : bytes(i.size)) + "</td><td>" +
+        primary + '<button class="action" data-preserved="discard"' + attrs + ">Discard</button></td></tr>";
+    }).join("");
+    el.innerHTML = '<div class="table-wrap"><table><thead><tr><th>Item</th><th>Kind</th><th>Size</th><th></th></tr></thead><tbody>' + rows + "</tbody></table></div>";
+    el.querySelectorAll("button[data-preserved]").forEach(function (btn) {
+      btn.addEventListener("click", async function () {
+        const action = btn.getAttribute("data-preserved");
+        if (action === "discard" && !confirm("Delete this item for good? It may be the only copy kept on this device.")) return;
+        btn.disabled = true;
+        try {
+          await api("/api/preserved/action", {
+            method: "POST",
+            body: JSON.stringify({ group_id: btn.getAttribute("data-group"), item_id: btn.getAttribute("data-item"), action: action })
+          });
+          await refreshOnce();
+        } catch (e) {
+          alert(e.message);
+          btn.disabled = false;
+        }
+      });
+    });
+  }
+
+  const FREE_WORDS = {
+    removed: "freed up",
+    gone: "nothing was left to free up",
+    still_retained: "kept: it may still be written to, or it changed; try again later",
+    saved_then_removed: "it had changed: the new bytes are saved (see kept-aside items), then it was freed up",
+    saved_still_retained: "it had changed: the new bytes are saved (see kept-aside items); the original is still kept"
+  };
+
+  function renderRetained(data) {
+    const card = document.getElementById("retained-card");
+    const el = document.getElementById("retained-table");
+    card.hidden = !data.items.length;
+    if (!data.items.length) { el.innerHTML = ""; return; }
+    const groups = [];
+    data.items.forEach(function (i) { if (groups.indexOf(i.group_id) < 0) groups.push(i.group_id); });
+    const rows = data.items.map(function (i) {
+      return "<tr><td>" + esc(i.path) + "</td><td>" + esc(i.group_id) + (i.group_removed ? " (group removed)" : "") + "</td><td>" +
+        (i.reachable ? bytes(i.size) : "size unknown (the folder is not watched)") + "</td></tr>";
+    }).join("");
+    el.innerHTML = '<div class="table-wrap"><table><thead><tr><th>File</th><th>Folder group</th><th>Size</th></tr></thead><tbody>' + rows + "</tbody></table></div>" +
+      groups.map(function (g) {
+        return '<button class="action" data-free-group="' + esc(g) + '">Free up the originals of ' + esc(g) + "</button> ";
+      }).join("");
+    el.querySelectorAll("button[data-free-group]").forEach(function (btn) {
+      btn.addEventListener("click", async function () {
+        btn.disabled = true;
+        try {
+          const r = await api("/api/retained/free", { method: "POST", body: JSON.stringify({ group_id: btn.getAttribute("data-free-group") }) });
+          document.getElementById("retained-note").textContent = r.results.length
+            ? r.results.map(function (x) { return x.path + ": " + (FREE_WORDS[x.outcome] || (x.outcome === "left" ? "left as it is: " + x.detail : x.outcome + " " + x.detail)); }).join("; ")
+            : "Nothing to free up.";
+          await refreshOnce();
+        } catch (e) {
+          alert(e.message);
+        } finally {
+          btn.disabled = false;
+        }
+      });
+    });
+  }
+
+  async function showVersions() {
+    const path = document.getElementById("versions-path").value.trim();
+    const el = document.getElementById("versions-table");
+    if (!path) return;
+    try {
+      const data = await api("/api/versions?path=" + encodeURIComponent(path));
+      if (!data.versions.length) { el.innerHTML = '<div class="empty">No versions recorded.</div>'; return; }
+      const rows = data.versions.map(function (v, i) {
+        return "<tr><td>" + esc(when(v.mtime_unix_nanos / 1e9)) + "</td><td>" + bytes(v.size) + "</td><td>" + esc(v.origin_device_id) +
+          "</td><td>" + (v.state === "current" ? "current" : '<button class="action" data-version="' + v.version_seq + '">Restore</button> ' + esc(v.state)) + "</td></tr>";
+      }).join("");
+      el.innerHTML = '<div class="table-wrap"><table><thead><tr><th>Modified</th><th>Size</th><th>From device</th><th></th></tr></thead><tbody>' + rows + "</tbody></table></div>";
+      el.querySelectorAll("button[data-version]").forEach(function (btn) {
+        btn.addEventListener("click", async function () {
+          if (!confirm("Replace the current file with this version? The current one stays in the history.")) return;
+          btn.disabled = true;
+          try {
+            await api("/api/restore", { method: "POST", body: JSON.stringify({ path: path, version_seq: Number(btn.getAttribute("data-version")) }) });
+            await showVersions();
+          } catch (e) {
+            alert(e.message);
+            btn.disabled = false;
+          }
+        });
+      });
+    } catch (e) {
+      el.innerHTML = '<div class="empty">' + esc(e.message) + "</div>";
+    }
+  }
+  document.getElementById("versions-list").addEventListener("click", showVersions);
+
+  function fillInviteGroups(links) {
+    const sel = document.getElementById("invite-group");
+    const current = sel.value;
+    sel.innerHTML = links.map(function (l) {
+      return '<option value="' + esc(l.group_id) + '">' + esc(l.local_path) + "</option>";
+    }).join("");
+    if (current) sel.value = current;
+  }
+
+  document.getElementById("invite-mint").addEventListener("click", async function () {
+    const out = document.getElementById("invite-result");
+    const group = document.getElementById("invite-group").value;
+    if (!group) { out.textContent = "Link a folder first."; return; }
+    try {
+      const r = await api("/api/share/invite", {
+        method: "POST",
+        body: JSON.stringify({
+          group_id: group,
+          role: document.getElementById("invite-role").value,
+          requires_approval: document.getElementById("invite-approval").checked
+        })
+      });
+      out.textContent = "Invite code (shown once, expires " + when(r.expires_at_unix) + "): " + r.code;
+    } catch (e) {
+      out.textContent = e.message;
+    }
+  });
+
+  function renderDevices(data) {
+    deviceNames = {};
+    data.devices.forEach(function (d) { if (d.device_name) deviceNames[d.device_id] = d.device_name; });
+    // The status text names devices: redraw it now that the names are known.
+    if (lastStatus) renderStatus(lastStatus);
+    const el = document.getElementById("devices-table");
+    if (!data.devices.length) { el.innerHTML = '<div class="empty">No devices.</div>'; return; }
+    const rows = data.devices.map(function (d) {
+      const action = d.is_this_device ? "this device"
+        : '<button class="action" data-remove-device="' + esc(d.device_id) + '" data-name="' + esc(d.device_name) + '">Remove</button>';
+      return "<tr><td>" + esc(d.device_name || "unnamed device") + '<div class="empty">' + esc(d.device_id) + "</div></td><td>" +
+        pill(d.online ? "online" : "offline", d.online ? "ok" : "warn") + "</td><td>" + action + "</td></tr>";
+    }).join("");
+    el.innerHTML = '<div class="table-wrap"><table><thead><tr><th>Device</th><th>State</th><th></th></tr></thead><tbody>' + rows + "</tbody></table></div>";
+    el.querySelectorAll("button[data-remove-device]").forEach(function (btn) {
+      btn.addEventListener("click", async function () {
+        const name = btn.getAttribute("data-name") || btn.getAttribute("data-remove-device");
+        if (!confirm("Remove " + name + " (" + btn.getAttribute("data-remove-device") + ") from your account? It stops syncing all your folders. If you are using this page through that device, it will lose access.")) return;
+        btn.disabled = true;
+        try {
+          const done = await api("/api/devices/remove", { method: "POST", body: JSON.stringify({ device_id: btn.getAttribute("data-remove-device") }) });
+          // Folders that would have lost their only complete copy were handed
+          // to another device first: say which, so the removal is not silent.
+          const handoffs = (done && done.handoffs) || [];
+          document.getElementById("devices-note").textContent = handoffs.length
+            ? "Removed " + name + ". Kept a complete copy of " + handoffs.length + " folder" + (handoffs.length === 1 ? "" : "s") + " on another device: " +
+              handoffs.map(function (h) { return h.group_id + " on " + (deviceNames[h.target_device_id] || h.target_device_id); }).join(", ") + "."
+            : "Removed " + name + ".";
+          loadDevices();
+          await refreshOnce();
+        } catch (e) {
+          alert(e.message);
+          btn.disabled = false;
+        }
+      });
+    });
+  }
+
+  // Members of the account's folder groups. Like device names this asks the
+  // account service, so it is loaded on page load and after a change only.
+  function renderShares(data, links) {
+    const el = document.getElementById("shares-table");
+    const folder = {};
+    (links || []).forEach(function (l) { folder[l.group_id] = l.local_path; });
+    const edges = data.edges.filter(function (e) { return folder[e.group_id]; });
+    if (!edges.length) { el.innerHTML = '<div class="empty">No one else has access to your folders.</div>'; return; }
+    const rows = edges.map(function (e) {
+      const waiting = e.state !== "active";
+      const label = e.state === "pending_approval" ? "Deny" : "Revoke";
+      return "<tr><td>" + esc(folder[e.group_id]) + "</td><td>" + esc(deviceLabel(e.device_id)) + '<div class="empty">' + esc(e.device_id) + "</div></td><td>" +
+        pill(e.state.replace("_", " "), waiting ? "warn" : "ok") + "</td><td>" +
+        '<button class="action" data-revoke-group="' + esc(e.group_id) + '" data-revoke-device="' + esc(e.device_id) + '">' + label + "</button></td></tr>";
+    }).join("");
+    el.innerHTML = '<div class="table-wrap"><table><thead><tr><th>Folder</th><th>Device</th><th>State</th><th></th></tr></thead><tbody>' + rows + "</tbody></table></div>";
+    el.querySelectorAll("button[data-revoke-group]").forEach(function (btn) {
+      btn.addEventListener("click", async function () {
+        const device = btn.getAttribute("data-revoke-device");
+        if (!confirm(btn.textContent + " " + deviceLabel(device) + " (" + device + ") for " + folder[btn.getAttribute("data-revoke-group")] +
+            "? It will no longer sync this folder. Files already on that device stay on its disk.")) return;
+        btn.disabled = true;
+        try {
+          const done = await api("/api/share/revoke", { method: "POST", body: JSON.stringify({ group_id: btn.getAttribute("data-revoke-group"), device_id: device }) });
+          const handoffs = (done && done.handoffs) || [];
+          loadShares();
+          document.getElementById("shares-note").textContent = handoffs.length
+            ? "Done. Kept a complete copy of " + handoffs.length + " folder" + (handoffs.length === 1 ? "" : "s") + " on another device."
+            : "Done.";
+        } catch (e) {
+          alert(e.message);
+          btn.disabled = false;
+        }
+      });
+    });
+  }
+
+  function loadShares() {
+    api("/api/shares").then(function (d) { renderShares(d, lastStatus && lastStatus.links); }).catch(function (e) {
+      document.getElementById("shares-table").innerHTML = '<div class="empty">' + esc(e.message) + "</div>";
+    });
+  }
+
+  // Track Send: files offered to this device and files it sent. Stopping and
+  // retrying are the only actions here; accepting an offer stays on the command line.
+  const TRANSFER_ACTIVE = { pending: 1, in_progress: 1, offered: 1, accepted: 1 };
+  let transfersTimer = null;
+
+  function renderTransfers(data) {
+    const card = document.getElementById("transfers-card");
+    const el = document.getElementById("transfers-table");
+    const items = data.received.map(function (t) { return Object.assign({ dir: "received" }, t); })
+      .concat(data.sent.map(function (t) { return Object.assign({ dir: "sent" }, t); }));
+    card.hidden = !items.length;
+    if (!items.length) { el.innerHTML = ""; }
+    const rows = items.map(function (t) {
+      const active = !!TRANSFER_ACTIVE[t.status];
+      const canRetry = t.dir === "sent" ? t.can_retry : (t.status === "failed" || t.status === "canceled");
+      const names = t.files.length === 1 ? t.files[0].path : t.files.length + " files";
+      const progress = t.status === "in_progress" || t.status === "accepted"
+        ? " (" + bytes(t.bytes_done) + " of " + bytes(t.total_size) + ")" : "";
+      const attrs = ' data-transfer="' + esc(t.transfer_id) + '" data-dir="' + t.dir + '"';
+      return "<tr><td>" + (t.dir === "sent" ? "To " : "From ") + esc(deviceLabel(t.device_id)) + "</td><td>" + esc(names) +
+        "</td><td>" + bytes(t.total_size) + "</td><td>" + pill(t.status.replace("_", " ") + progress, t.status === "failed" ? "bad" : active ? "warn" : "ok") +
+        (t.failure ? '<div class="empty">' + esc(t.failure.replace(/_/g, " ")) + "</div>" : "") + "</td><td>" +
+        (canRetry ? '<button class="action" data-transfer-action="retry"' + attrs + ">Retry</button> " : "") +
+        (active ? '<button class="action" data-transfer-action="cancel"' + attrs + ">Cancel</button>" : "") + "</td></tr>";
+    }).join("");
+    if (items.length) {
+      el.innerHTML = '<div class="table-wrap"><table><thead><tr><th>Device</th><th>Files</th><th>Size</th><th>State</th><th></th></tr></thead><tbody>' + rows + "</tbody></table></div>";
+    }
+    el.querySelectorAll("button[data-transfer-action]").forEach(function (btn) {
+      btn.addEventListener("click", async function () {
+        const action = btn.getAttribute("data-transfer-action");
+        if (action === "cancel" && !confirm("Stop this transfer?")) return;
+        btn.disabled = true;
+        try {
+          await api("/api/transfers/" + action, { method: "POST", body: JSON.stringify({
+            transfer_id: btn.getAttribute("data-transfer"), direction: btn.getAttribute("data-dir") }) });
+          document.getElementById("transfers-note").textContent = action === "cancel" ? "Stopped." : "Retrying.";
+        } catch (e) {
+          alert(e.message);
+        }
+        loadTransfers();
+      });
+    });
+    // Progress is only fresh while something is going: poll then, and only then.
+    clearTimeout(transfersTimer);
+    if (items.some(function (t) { return TRANSFER_ACTIVE[t.status]; })) transfersTimer = setTimeout(loadTransfers, 5000);
+  }
+
+  function loadTransfers() {
+    api("/api/transfers").then(renderTransfers).catch(function () { /* the card stays as it was */ });
+  }
+
+  // Names come from the account service, which can be slow or unreachable:
+  // asked on load and after a removal only, never as part of a refresh, and
+  // never awaited by anything else on the page.
+  function loadDevices() {
+    api("/api/devices").then(renderDevices).catch(function (e) {
+      document.getElementById("devices-table").innerHTML = '<div class="empty">' + esc(e.message) + "</div>";
+    });
+  }
+
   async function refreshOnce() {
     const status = await api("/api/status");
     renderStatus(status);
+    fillInviteGroups(status.links || []);
     const conflicts = await api("/api/conflicts");
     renderConflicts(conflicts);
+    renderTrash(await api("/api/trash"));
+    renderPreserved(await api("/api/preserved"));
+    renderRetained(await api("/api/retained"));
+
   }
 
   // Not the native `EventSource` API: it has no way to attach a header, and
@@ -751,6 +1215,9 @@
     document.getElementById("app").hidden = false;
     try {
       await refreshOnce();
+      loadDevices();
+      loadShares();
+      loadTransfers();
     } catch (e) {
       if (e.unauthorized) {
         if (!useToken && getToken()) { useToken = true; return boot(); }

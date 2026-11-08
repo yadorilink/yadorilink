@@ -380,11 +380,13 @@ async fn a_late_dial_error_does_not_beat_an_accepted_link() {
     );
 }
 
-/// Both sides dial each other at once. Whichever connection each side ends up
-/// using, neither may close the one the other uses: both links stay up and
-/// carry a lane each way.
+/// Both sides dial each other at once. Whichever connection each side uses
+/// at first, neither closes the one the other uses: both links carry a lane
+/// each way. Once the loser's grace ends, the two sides use one connection
+/// (one dialled it, the other accepted it) and it is the one the lower
+/// endpoint id dialled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn simultaneous_dials_from_both_sides_leave_both_links_up() {
+async fn simultaneous_dials_from_both_sides_settle_on_one_connection() {
     for _ in 0..10 {
         let fx = bob_with_alice_dialling_in().await;
         let (to_bob_seen, mut at_bob) = tokio::sync::mpsc::unbounded_channel();
@@ -413,6 +415,27 @@ async fn simultaneous_dials_from_both_sides_leave_both_links_up() {
         tokio::time::timeout(STEP, at_bob.recv()).await.expect("bob serves alice's lane");
         tokio::time::timeout(STEP, at_alice.recv()).await.expect("alice serves bob's lane");
         assert!(alice_link.is_alive() && bob_link.is_alive(), "neither side closed the other's");
+
+        // The grace ends: the higher id closes its duplicate, the lower id never closes one.
+        fx.alice.endpoint().links.expire_retired_for_tests(BOB);
+        fx.bob.endpoint().links.expire_retired_for_tests(ALICE);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let alice_peer = fx.alice.endpoint().peer_id_of(BOB).unwrap();
+        let bob_peer = fx.bob.endpoint().peer_id_of(ALICE).unwrap();
+        let (a, b) = tokio::join!(
+            tokio::time::timeout(STEP, fx.alice.link_to(BOB)),
+            tokio::time::timeout(STEP, fx.bob.link_to(ALICE)),
+        );
+        let (alice_link, bob_link) = (a.unwrap().unwrap(), b.unwrap().unwrap());
+        assert!(alice_link.is_alive() && bob_link.is_alive());
+        assert_ne!(
+            alice_link.dialled_here(),
+            bob_link.dialled_here(),
+            "both sides use the same connection"
+        );
+        // bob's id is `alice_peer`; alice's is `bob_peer`.
+        let lower_dialled = if alice_peer < bob_peer { &bob_link } else { &alice_link };
+        assert!(lower_dialled.dialled_here(), "the lower id's dial is the one kept");
     }
 }
 
@@ -715,4 +738,27 @@ async fn a_queued_link_that_closed_is_not_announced_as_the_peer_reconnecting() {
     let live = runtime.connect(peer).await.expect("a link");
     fx.bob.endpoint().links.offer_accepted(ALICE, &live);
     assert!(matches!(heard.try_recv(), Ok(device) if device == ALICE));
+}
+
+/// A peer that stopped answering: its connections are closed and forgotten, so the next caller
+/// dials afresh instead of being handed a link that only looks alive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropping_a_silent_peers_links_closes_them_and_the_next_caller_dials() {
+    let fx = bob_with_alice_dialling_in().await;
+    let first = tokio::time::timeout(STEP, fx.bob.link_to(ALICE)).await.unwrap().unwrap();
+    assert!(first.is_alive());
+
+    fx.bob.endpoint().drop_links(ALICE);
+    assert!(!first.is_alive(), "the connection to the silent peer is closed");
+
+    let dials = Arc::new(AtomicUsize::new(0));
+    let next = fx
+        .bob
+        .endpoint()
+        .link_to(ALICE, counted_dial(&fx.bob, &dials))
+        .await
+        .unwrap()
+        .expect("pinned");
+    assert!(next.is_alive());
+    assert_eq!(dials.load(Ordering::SeqCst), 1, "a fresh dial, not the dropped link");
 }

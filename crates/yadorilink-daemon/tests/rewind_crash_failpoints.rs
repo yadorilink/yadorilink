@@ -1295,6 +1295,35 @@ async fn a_rewind_with_no_peer_online_uses_the_ordinary_path_and_the_peer_conver
         started.elapsed()
     );
 
+    // The projection writes a path's disk object before it records the path's new current
+    // row, so a disk that matches the target does not yet mean every row has landed (a CI
+    // run read the last tombstone's row in between). Wait on the rows themselves.
+    let rows_pending = || -> Vec<String> {
+        let rows = current_rows(&mesh.nas.state);
+        setup
+            .changed
+            .iter()
+            .filter(|path| {
+                !rows
+                    .get(*path)
+                    .zip(rows_before.get(*path))
+                    .is_some_and(|(now, before)| now.0 > before.0)
+            })
+            .cloned()
+            .collect()
+    };
+    wait_until_with_context(
+        || rows_pending().is_empty(),
+        Duration::from_secs(300),
+        || {
+            format!(
+                "the NAS never recorded the rewind's version rows; pending: {:?}",
+                rows_pending()
+            )
+        },
+    )
+    .await;
+
     // One signed op per changed path, none elsewhere.
     let ops_after = ops_by(&mesh.nas.state, &nas_id);
     let authored: BTreeMap<&String, usize> = ops_after

@@ -7,10 +7,13 @@
 //! daemon holds, and are served by the same router as the TCP listener with
 //! two differences, both in `security.rs`:
 //!
-//! - No bearer token. The daemon's device authentication is the authority
-//!   for these requests; the token exists to tell local OS users apart on
-//!   the TCP listener, and a stream that arrived here did not come from one.
-//!   Nothing on the TCP listener changes: it still requires the token.
+//! - The bearer token is the stream's session secret, not this run's token.
+//!   The device key says which machine manages this one, not which program
+//!   on it: the managing device's browser talks to a loopback listener any
+//!   local OS user can reach. So the dialler's per-session secret arrives
+//!   with each stream ([`PeerStreams::offer`]) and `/api/*` requires it as
+//!   `Authorization: Bearer <hex secret>`. The shell page is served without
+//!   it (it holds no data), exactly as on the TCP listener.
 //! - The browser on the managing device talks to a loopback listener of its
 //!   own, on a port this adapter cannot know, so `Host` may name any port on
 //!   a loopback name. It must still be a loopback name (DNS rebinding), an
@@ -34,11 +37,22 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> PeerIo for T {}
 /// never dropped for want of room.
 const PEER_QUEUE: usize = 32;
 
+/// The session secret a stream arrived with, as the bearer value the page
+/// presents: lower-case hex. Never printed.
+#[derive(Clone)]
+pub(crate) struct SessionBearer(pub(crate) String);
+
+impl std::fmt::Debug for SessionBearer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionBearer(..)")
+    }
+}
+
 /// The daemon's handle for offering authorized streams to the dashboard.
 /// Cheap to clone.
 #[derive(Clone, Debug)]
 pub struct PeerStreams {
-    tx: mpsc::Sender<Box<dyn PeerIo>>,
+    tx: mpsc::Sender<(Box<dyn PeerIo>, SessionBearer)>,
 }
 
 impl PeerStreams {
@@ -48,10 +62,11 @@ impl PeerStreams {
         !self.tx.is_closed()
     }
 
-    /// Offers one stream. `false` (and the stream dropped) when the
-    /// dashboard has stopped or is not keeping up.
-    pub fn offer(&self, io: Box<dyn PeerIo>) -> bool {
-        self.tx.try_send(io).is_ok()
+    /// Offers one stream with the session `secret` its dialler sent.
+    /// `false` (and the stream dropped) when the dashboard has stopped or is
+    /// not keeping up.
+    pub fn offer(&self, io: Box<dyn PeerIo>, secret: [u8; 32]) -> bool {
+        self.tx.try_send((io, SessionBearer(hex::encode(secret)))).is_ok()
     }
 }
 
@@ -62,7 +77,7 @@ pub(crate) fn channel() -> (PeerStreams, PeerQueue) {
 
 /// The receiving end, served by `run`.
 pub(crate) struct PeerQueue {
-    rx: mpsc::Receiver<Box<dyn PeerIo>>,
+    rx: mpsc::Receiver<(Box<dyn PeerIo>, SessionBearer)>,
 }
 
 /// Serves every offered stream with `router` until this future is dropped.
@@ -76,12 +91,16 @@ pub(crate) async fn serve(mut queue: PeerQueue, router: axum::Router) {
     loop {
         tokio::select! {
             offered = queue.rx.recv() => {
-                let Some(io) = offered else {
+                let Some((io, bearer)) = offered else {
                     // The daemon dropped its handle; serve what is open.
                     while connections.join_next().await.is_some() {}
                     return std::future::pending().await;
                 };
-                let service = hyper_util::service::TowerToHyperService::new(router.clone());
+                // The secret reaches the token check as a request extension of
+                // this connection only.
+                let service = hyper_util::service::TowerToHyperService::new(
+                    router.clone().layer(axum::Extension(bearer)),
+                );
                 let io = hyper_util::rt::TokioIo::new(crate::conn_limit::LimitedIo::idle_only(io));
                 connections.spawn(async move {
                     let _ = hyper::server::conn::http1::Builder::new()

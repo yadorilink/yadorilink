@@ -792,7 +792,7 @@ fn retention_does_not_take_the_published_version_away() {
     .unwrap();
 
     let expired = crate::file_index::FileIndexRepository::new(db.clone())
-        .expire_superseded_and_trashed_versions(GROUP, i64::MAX / 2, &Default::default())
+        .expire_superseded_and_trashed_versions(GROUP, i64::MAX / 2)
         .unwrap();
     assert!(expired > 0, "the sweep removed nothing: the test did not exercise retention");
 
@@ -1646,8 +1646,19 @@ fn versions_without_an_admission_time_are_bounded_by_the_count_cap() {
         set_row(&db, "n.txt", seq, 10 + seq, 100);
     }
     let expired = crate::file_index::FileIndexRepository::new(db.clone())
-        .expire_superseded_and_trashed_versions(GROUP, 0, &Default::default())
+        .expire_superseded_and_trashed_versions(GROUP, 0)
         .unwrap();
     // 13 superseded rows, ten kept by count.
     assert_eq!(expired, 3);
+}
+
+/// The publish-only choice belongs to the folder, so it follows the folder to its new root.
+#[test]
+fn a_rebootstrap_keeps_the_publish_only_choice() {
+    let (_db, repo, root_id) = declared();
+    assert!(!root(&repo).publish_only);
+    assert!(repo.set_publish_only(&root_id, true).unwrap());
+    let new_root = repo.rebootstrap_root(GROUP).unwrap();
+    assert_ne!(new_root, root_id);
+    assert!(root(&repo).publish_only);
 }

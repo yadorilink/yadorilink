@@ -684,7 +684,7 @@ async fn gc_never_collects_a_block_while_a_marked_flush_pending_intent_is_open()
         .database()
         .write::<_, yadorilink_sync_sqlite::SyncSqliteError>(|conn| {
             conn.execute(
-                "UPDATE materialization_intents SET mutation_generation = 5 \
+                "UPDATE materialization_intents SET phase = 'flush_pending', mutation_generation = 5 \
                  WHERE group_id = 'group-a' AND path = 'marked.txt'",
                 [],
             )?;

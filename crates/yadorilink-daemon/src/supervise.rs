@@ -117,6 +117,13 @@ impl BackoffConfig {
     /// `daemon_state`'s Degraded-link re-check scheduling can reuse this
     /// exact doubling+jitter+cap schedule instead of a second, independent
     /// backoff implementation.
+    /// The longest `next(attempt)` can be (jitter at +25%), for tests that pin timelines.
+    #[cfg(test)]
+    pub fn max_delay_for_tests(&self, attempt: u32) -> Duration {
+        let scale = 1u64 << attempt.min(20);
+        self.initial.saturating_mul(scale as u32).min(self.max).mul_f64(1.25)
+    }
+
     pub fn next(&self, attempt: u32) -> Duration {
         let scale = 1u64 << attempt.min(20); // avoid overflow on a long-lived task
         let backed_off = self.initial.saturating_mul(scale as u32).min(self.max);

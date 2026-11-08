@@ -1,9 +1,7 @@
 //! COM registration for the four overlay
 //! identifier CLSIDs, driven by `regsvr32.exe` calling `DllRegisterServer`
 //! / `DllUnregisterServer` (the standard COM DLL registration contract —
-//! no separate installer script is needed beyond `regsvr32`, though a
-//! thin wrapper script is still useful for end users; see the repo's
-//! `windows/install.ps1`).
+//! no separate installer script is needed beyond `regsvr32`).
 //!
 //! Registers under `HKEY_LOCAL_MACHINE\SOFTWARE\Classes` (system-wide,
 //! all users) rather than `HKEY_CURRENT_USER` — `ShellIconOverlayIdentifiers`

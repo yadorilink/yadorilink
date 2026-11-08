@@ -54,7 +54,10 @@ use yadorilink_ipc_proto::shellipc as wire;
 use crate::{CallFailure, CancelHandle, MobileHost};
 
 fn unexpected(command: &str, output: &host::CommandOutput) -> CallFailure {
-    CallFailure::Failed { message: format!("{command} returned {output:?}") }
+    CallFailure::Failed {
+        reason: crate::FailureReason::Unspecified,
+        message: format!("{command} returned {output:?}"),
+    }
 }
 
 // ---- stage ---------------------------------------------------------------------------------
@@ -270,6 +273,8 @@ pub enum WriteRefusal {
     /// A restore's version is not retained any more, or no reachable device holds its bytes.
     /// Nothing was authored; try again when a device that has the file is online.
     VersionUnavailable,
+    /// The folder is publish-only on this device: a modify or delete is refused, nothing changed.
+    PublishOnly,
 }
 
 impl From<wire::ProviderApplyFailure> for WriteRefusal {
@@ -294,6 +299,7 @@ impl From<wire::ProviderApplyFailure> for WriteRefusal {
             F::StaleOperation => Self::StaleOperation,
             F::StaleView => Self::StaleView,
             F::VersionUnavailable => Self::VersionUnavailable,
+            F::PublishOnly => Self::PublishOnly,
         }
     }
 }
@@ -802,6 +808,51 @@ impl MobileHost {
         }
     }
 
+    /// Brings back everything the folder delete or rename that removed the deleted entry at
+    /// `path` (a listed entry's `path`) removed. Each entry that fails is named; the rest are
+    /// still restored. One deleted file or folder is brought back with `apply_change`.
+    ///
+    /// # Errors
+    /// `Failed` for an unknown root, a path that is not deleted, or one deleted on its own rather
+    /// than by a folder operation; the other [`CallFailure`] cases.
+    pub fn restore_deleted_operation(
+        &self,
+        root_id: Vec<u8>,
+        path: String,
+        cancel: &CancelHandle,
+        deadline_ms: Option<u64>,
+    ) -> Result<FolderRestore, CallFailure> {
+        let command = host::Command::RestoreDeletedOperation { root_id, path };
+        match self.run(command, cancel, deadline_ms)? {
+            host::CommandOutput::FolderRestored(outcome) => Ok(outcome.into()),
+            other => Err(unexpected("restore_deleted_operation", &other)),
+        }
+    }
+
+    /// Marks a provider folder publish-only on this device, or clears it. A publish-only folder
+    /// takes new files but refuses (`PublishOnly`) every modify and delete this device would
+    /// author, so a bug of the app cannot remove what it backed up. Changes from other devices
+    /// still arrive. Persisted.
+    ///
+    /// # Errors
+    /// `Failed` for an unknown root; the other [`CallFailure`] cases.
+    pub fn set_publish_only(
+        &self,
+        root_id: Vec<u8>,
+        publish_only: bool,
+        cancel: &CancelHandle,
+        deadline_ms: Option<u64>,
+    ) -> Result<(), CallFailure> {
+        match self.run(
+            host::Command::SetPublishOnly { root_id, publish_only },
+            cancel,
+            deadline_ms,
+        )? {
+            host::CommandOutput::Done => Ok(()),
+            other => Err(unexpected("set_publish_only", &other)),
+        }
+    }
+
     /// For each item, whether a device that keeps a full replica holds exactly that version now.
     /// At most 256 items per call. Read-only; asked afresh every time, so a version that a
     /// device lost reads `NotDelivered` again.
@@ -819,6 +870,37 @@ impl MobileHost {
         match self.run(command, cancel, deadline_ms)? {
             host::CommandOutput::Delivery(outcome) => Ok(delivery_report(*outcome)),
             other => Err(unexpected("version_delivery", &other)),
+        }
+    }
+}
+
+/// What a folder restore from the deleted items brought back.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FolderRestore {
+    /// Relative to the folder root, in path order.
+    pub restored_paths: Vec<String>,
+    pub failed: Vec<FolderRestoreFailure>,
+    /// Not every part of the operation has reached this device, so what it removed elsewhere
+    /// could not be restored here.
+    pub partial: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FolderRestoreFailure {
+    pub path: String,
+    pub error: String,
+}
+
+impl From<host::dto::FolderRestoreOutcome> for FolderRestore {
+    fn from(outcome: host::dto::FolderRestoreOutcome) -> Self {
+        Self {
+            restored_paths: outcome.restored_paths,
+            failed: outcome
+                .failed
+                .into_iter()
+                .map(|f| FolderRestoreFailure { path: f.path, error: f.error })
+                .collect(),
+            partial: outcome.partial,
         }
     }
 }

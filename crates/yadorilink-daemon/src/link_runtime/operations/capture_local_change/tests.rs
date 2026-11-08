@@ -91,6 +91,7 @@ async fn a_flush_that_authors_nothing_still_reports_capture_settled() {
         block_store,
         telemetry: Arc::new(crate::runtime_telemetry::RuntimeTelemetry::new(status_push_tx)),
         device_id: "device-a".to_string(),
+        ignore_rules: crate::test_support::peer_session_fixture::scratch_ignore_rules(),
         host: host.clone(),
     });
 
@@ -132,6 +133,7 @@ fn test_deps() -> Arc<LinkRuntimeDependencies> {
         block_store,
         telemetry: Arc::new(crate::runtime_telemetry::RuntimeTelemetry::new(status_push_tx)),
         device_id: "device-a".to_string(),
+        ignore_rules: crate::test_support::peer_session_fixture::scratch_ignore_rules(),
         host: Arc::new(NoopHost),
     })
 }

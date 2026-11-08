@@ -7,6 +7,7 @@ use super::*;
 
 fn command(code: ApplicationErrorCode) -> CoreError {
     CoreError::DaemonCommand {
+        drive: None,
         code,
         message: "daemon says no".into(),
         group_ids: vec!["group-1".into()],
@@ -33,7 +34,7 @@ fn every_core_error_maps_to_the_historical_message_and_exit_code() {
             7,
         ),
         (
-            CoreError::LimitExceeded { message: "slow down".into(), kind: LimitKind::RateLimited },
+            CoreError::LimitExceeded { message: "slow down".into(), kind: LimitKind::RateLimited { retry_after_secs: None } },
             "slow down",
             7,
         ),
@@ -269,6 +270,7 @@ fn access_denied_names_the_cause_and_only_this_systems_remedy() {
     let detail =
         "failed to open sync-root lock sidecar /srv/x/.yadorilink-root.lock: Permission denied";
     let cli = CliError::from(CoreError::DaemonCommand {
+        drive: None,
         code: ApplicationErrorCode::AccessDenied,
         message: detail.into(),
         group_ids: Vec::new(),
@@ -288,4 +290,27 @@ fn access_denied_names_the_cause_and_only_this_systems_remedy() {
         assert!(text.contains("PUID") && text.contains("chown"), "{text}");
         assert!(!text.contains("macOS") && !text.contains("Windows"), "{text}");
     }
+}
+
+#[test]
+fn an_unregistered_computer_is_told_the_register_command() {
+    let cmd = "yadorilink device register --name \"box\"";
+    assert_eq!(
+        super::local_identity_message_for("x".into(), true, cmd),
+        "this computer is signed in but not registered as a device yet; run `yadorilink device \
+         register --name \"box\"` first"
+    );
+}
+
+#[test]
+fn a_registered_computer_keeps_the_daemons_words() {
+    let cmd = "yadorilink device register --name \"box\"";
+    assert_eq!(
+        super::local_identity_message_for("sign in again".into(), false, cmd),
+        "sign in again"
+    );
+    assert_eq!(
+        super::local_identity_message_for(String::new(), false, cmd),
+        "local device identity is unavailable"
+    );
 }

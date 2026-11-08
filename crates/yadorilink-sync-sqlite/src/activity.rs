@@ -245,6 +245,32 @@ pub(crate) fn mark_restored_in_tx(
 }
 
 impl FileIndexRepository {
+    /// The author of `group_id`'s newest logged event: `None` when the group has no event, and
+    /// `Some(None)` when its newest event carries no author (a local write). One read of the newest
+    /// row, not a scan.
+    ///
+    /// The log is a bounded view ([`MAX_EVENTS`] rows across all folders, [`MAX_AGE_DAYS`] days), so
+    /// this answers "who made the newest change *still logged*": a folder quiet for longer, or one
+    /// whose events were pruned by busier folders, has none and names nobody. Only file events are
+    /// logged; a directory-only change is not one.
+    ///
+    /// # Errors
+    /// Database failures.
+    pub fn newest_activity_origin(
+        &self,
+        group_id: &str,
+    ) -> Result<Option<Option<String>>, SyncSqliteError> {
+        self.database().read::<_, SyncSqliteError>(|conn| {
+            Ok(conn
+                .prepare_cached(
+                    "SELECT origin_device_id FROM activity_events WHERE group_id = ?1 \
+                     ORDER BY id DESC LIMIT 1",
+                )?
+                .query_row(params![group_id], |r| r.get::<_, Option<String>>(0))
+                .optional()?)
+        })
+    }
+
     /// Events newest first, honoring `query`. `local_device_id` decides what
     /// "this device" means for [`ActivityOrigin`].
     ///

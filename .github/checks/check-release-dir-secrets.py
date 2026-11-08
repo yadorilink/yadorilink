@@ -6,7 +6,7 @@ Usage: check-release-dir-secrets.py [--root DIR]
 
 .github/release is part of the published tree, and its scripts run in
 unprivileged jobs as well as protected ones. A file there that references
-`secrets.*` or the `release-signing` environment is either wired into the
+`secrets.*` or the `release-signing` or `manifest-signing` environment is either wired into the
 wrong job or quietly widening what a release script can see. The only file
 allowed to name them is the gate checker, which exists to police the workflow.
 Adding another allowlist entry is a deliberate, reviewed change to this file.
@@ -22,7 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 RELEASE_DIR = ".github/release"
 ALLOWLIST = frozenset({"check-release-gates.py", "check-signing-workflow.py"})
-PATTERN = re.compile(r"secrets\.|release-signing")
+PATTERN = re.compile(r"secrets\.|release-signing|environment:\s*manifest-signing|manifest-signing Environment")
 
 
 def problems(root: Path) -> list[str]:
@@ -40,7 +40,7 @@ def problems(root: Path) -> list[str]:
             continue  # binary file: nothing to scan
         for number, line in enumerate(text.splitlines(), 1):
             if PATTERN.search(line):
-                out.append(f"{RELEASE_DIR}/{rel}:{number} references secrets or release-signing; not allowed here")
+                out.append(f"{RELEASE_DIR}/{rel}:{number} references secrets or a signing environment; not allowed here")
     return out
 
 
@@ -55,6 +55,7 @@ def self_test() -> int:
         for label, name, body in [
             ("secret", "new.sh", "x=${{ secrets.TOKEN }}\n"),
             ("environment", "new.yml", "environment: release-signing\n"),
+            ("manifest environment", "new2.yml", "environment: manifest-signing\n"),
             ("nested", "sub/new.py", "# secrets.FOO\n"),
         ]:
             target = base / name

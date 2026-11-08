@@ -225,6 +225,16 @@ class LedgerRules(unittest.TestCase):
     def test_version_below_generation_floor(self):
         has(self, problems_of(ledger({"script": "0.2.0"}), records("0.2.0")), "older than 0.3.0")
 
+    def test_version_below_a_prerelease_floor(self):
+        recs = records("0.3.0-beta.8")
+        has(self, problems_of(ledger({"script": "0.3.0-beta.8"}), recs, floor="0.3.0-beta.9"),
+            "older than 0.3.0-beta.9")
+
+    def test_minimum_below_a_prerelease_floor_is_tolerated_within_the_core(self):
+        recs = records("0.3.0-beta.9")
+        led = ledger({"script": "0.3.0-beta.9"}, minimum="0.3.0-beta.1")
+        self.assertEqual(problems_of(led, recs, floor="0.3.0-beta.9"), [])
+
     def test_minimum_above_live_version_of_previous_ledger(self):
         prev = ledger({"script": "0.4.1", "app_bundle": "0.4.1", "microsoft_store": "0.4.1"})
         led = ledger(minimum="0.4.2")
@@ -241,7 +251,8 @@ class LedgerRules(unittest.TestCase):
         led = ledger({"script": "0.3.0-beta.3"}, minimum="0.3.0-beta.3")
         led["history"]["script"] = ["0.3.0-beta.2", "0.3.0-beta.3"]
         prev["history"]["script"] = ["0.3.0-beta.2"]
-        has(self, problems_of(led, records("0.3.0-beta.2", "0.3.0-beta.3"), previous_ledger=prev), "already live")
+        has(self, problems_of(led, records("0.3.0-beta.2", "0.3.0-beta.3"), previous_ledger=prev,
+                                  floor="0.3.0-beta.1"), "already live")
 
     def test_history_may_only_gain_the_version_now_served(self):
         prev = ledger({"script": "0.4.2"})

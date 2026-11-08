@@ -1,7 +1,6 @@
 # Command-line installers
 
-`install.sh` (macOS on Apple silicon, Linux x86_64) and `install.ps1` (Windows
-x64) install the engine (`yadorilink`, `yadorilink-daemon`) under the user's
+`install.sh` (macOS on Apple silicon, Linux x86_64) installs the engine (`yadorilink`, `yadorilink-daemon`) under the user's
 home directory, after checking the signed release manifest and every hash. User
 documentation is in [`INSTALL_FAQ.md`](../../docs/INSTALL_FAQ.md); the header comment of each
 script is the option reference.
@@ -11,10 +10,8 @@ script is the option reference.
 | What | How | Programs |
 |---|---|---|
 | Installer behaviour, refusals, exit codes (macOS/Linux) | `sh tests/run-tests.sh` | stand-in scripts that print a version |
-| Same for Windows | `tests/windows/Run-Tests.ps1` | stand-in console exe |
 | Acceptance with the real programs (macOS/Linux) | `sh tests/acceptance.sh --bin-dir DIR` | real `yadorilink`, `yadorilink-daemon` |
 | Same in a clean Debian/Ubuntu container | `sh tests/acceptance-container.sh IMAGE DIR` | real |
-| Acceptance with the real programs (Windows) | `tests/windows/Run-Acceptance.ps1 -BinDir DIR` | real |
 
 Everything runs against a local fixture release (`tests/build-fixture.py`, signed
 with a throw-away test key, served from `127.0.0.1` by `tests/serve.py`) under a
@@ -28,8 +25,7 @@ record, `yadorilink self-update` judges versions against the daemon's verified
 manifest, a tampered archive or manifest, a manifest signed by another key, a
 withdrawn or kill-switched version, a replayed manifest and a downgrade (even with an explicit
 `--version`; downgrading an existing install is unsupported) are all
-refused with the existing install unchanged, and `yadorilink uninstall` (Windows:
-`install.ps1 -Uninstall`) removes the programs and keeps the user's data.
+refused with the existing install unchanged, and `yadorilink uninstall` removes the programs and keeps the user's data.
 
 ### The existing data is checked before anything is installed
 

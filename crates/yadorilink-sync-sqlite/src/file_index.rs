@@ -70,13 +70,100 @@ fn now_unix_nanos() -> i64 {
     now_unix_nanos_checked().unwrap_or(0)
 }
 
+/// What the index holds about a path that a comparison with the disk by size and time needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedStatRow {
+    pub path: String,
+    pub kind: RecordKind,
+    pub size: u64,
+    pub mtime_unix_nanos: i64,
+    pub deleted: bool,
+}
+
 pub struct FileIndexRepository {
     database: Arc<SyncDatabase>,
+    block_lists: std::sync::Mutex<BlockListCache>,
 }
+
+/// A path's current record with its block list shared, not copied: what block serving reads once per
+/// request (see [`FileIndexRepository::get_file_shared`]).
+#[derive(Clone, Debug)]
+pub struct SharedFileRecord {
+    pub size: u64,
+    pub mtime_unix_nanos: i64,
+    pub blocks: Arc<Vec<BlockInfo>>,
+    pub deleted: bool,
+}
+
+/// Decoded block lists of recently served paths, each kept with the stored text it was decoded from.
+/// A lookup reads the stored text again and uses the decoded list only when the text is equal, so
+/// a changed row can never be answered from an older list.
+/// The stored text of a block list and what it decoded to.
+type DecodedBlockList = (String, Arc<Vec<BlockInfo>>);
+
+#[derive(Default)]
+struct BlockListCache {
+    entries: std::collections::HashMap<(String, String), DecodedBlockList>,
+}
+
+/// Paths whose decoded block list is kept: one big file needs one entry for all its block requests.
+const BLOCK_LIST_CACHE_PATHS: usize = 64;
 
 impl FileIndexRepository {
     pub fn new(database: Arc<SyncDatabase>) -> Self {
-        Self { database }
+        Self { database, block_lists: Default::default() }
+    }
+
+    /// [`get_file`](Self::get_file) for block serving: the same row, the block list shared. A request for
+    /// a block of a file with hundreds of blocks used to decode the whole stored list (a JSON array of
+    /// numbers per hash) twice per request; the decoded list is now reused while the stored text is
+    /// byte-identical, and a different text is decoded fresh.
+    pub fn get_file_shared(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<SharedFileRecord>, SyncSqliteError> {
+        let row: Option<(u64, i64, String, i64)> =
+            self.database.read::<_, SyncSqliteError>(|conn| {
+                Ok(conn
+                    .query_row_cached(
+                        "SELECT size, mtime_unix_nanos, blocks_json, deleted
+                     FROM files WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
+                        rusqlite::params![group_id, path],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    )
+                    .optional()?)
+            })?;
+        let Some((size, mtime_unix_nanos, blocks_json, deleted)) = row else { return Ok(None) };
+        let key = (group_id.to_owned(), path.to_owned());
+        let cached = {
+            let cache = self.block_lists.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache
+                .entries
+                .get(&key)
+                .filter(|(text, _)| *text == blocks_json)
+                .map(|(_, blocks)| Arc::clone(blocks))
+        };
+        let blocks = match cached {
+            Some(blocks) => blocks,
+            None => {
+                let record =
+                    row_to_record(path.to_string(), size, mtime_unix_nanos, &blocks_json, deleted)?;
+                let blocks = Arc::new(record.blocks);
+                let mut cache =
+                    self.block_lists.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if cache.entries.len() >= BLOCK_LIST_CACHE_PATHS
+                    && !cache.entries.contains_key(&key)
+                {
+                    if let Some(victim) = cache.entries.keys().next().cloned() {
+                        cache.entries.remove(&victim);
+                    }
+                }
+                cache.entries.insert(key, (blocks_json, Arc::clone(&blocks)));
+                blocks
+            }
+        };
+        Ok(Some(SharedFileRecord { size, mtime_unix_nanos, blocks, deleted: deleted != 0 }))
     }
 
     pub(crate) fn database(&self) -> &Arc<SyncDatabase> {
@@ -504,7 +591,7 @@ impl FileIndexRepository {
     /// Deletes every version row for one path -- not a tombstone, an
     /// erasure of this device's local index entry. Every caller says why
     /// ([`ErasureReason`]): the ignore sweep, for a path that has just become
-    /// `.yadorilinkignore`d (sync must stop considering it, but nothing about
+    /// ignored (sync must stop considering it, but nothing about
     /// it is deleted for anyone else), or the retirement of a purely local
     /// artifact that no admitted change ever touched.
     ///
@@ -773,6 +860,42 @@ impl FileIndexRepository {
             for row in rows {
                 let (path, record_kind) = row?;
                 out.push((path, RecordKind::from_db_str(&record_kind)));
+            }
+            Ok(out)
+        })
+    }
+
+    /// The path, kind, size, modification time and tombstone mark of every current row of
+    /// `group_id`, without reading the rows' content columns (block lists): what a metadata-only
+    /// comparison against the disk needs, for the periodic drift check.
+    pub fn list_indexed_stat_rows(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<IndexedStatRow>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT path, record_kind, size, mtime_unix_nanos, deleted FROM files \
+                 WHERE group_id = ?1 AND state = 'current'",
+            )?;
+            let rows = stmt.query_map([group_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (path, record_kind, size, mtime_unix_nanos, deleted) = row?;
+                out.push(IndexedStatRow {
+                    path,
+                    kind: RecordKind::from_db_str(&record_kind),
+                    size: size.max(0) as u64,
+                    mtime_unix_nanos,
+                    deleted: deleted != 0,
+                });
             }
             Ok(out)
         })
@@ -1800,6 +1923,28 @@ impl FileIndexRepository {
         })
     }
 
+    /// The device that authored the *live* current version of `path`: `None` when the path has no
+    /// current row, its current row is a tombstone (nobody holds the path), or the author was not
+    /// recorded. One indexed row read, for callers that name who holds a path now.
+    pub fn get_live_origin_device_id(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<String>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            let origin: Option<String> = conn
+                .query_row_cached(
+                    "SELECT origin_device_id FROM files WHERE group_id = ?1 AND path = ?2 AND \
+                     state = 'current' AND deleted = 0",
+                    rusqlite::params![group_id, path],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            Ok(origin.filter(|device| !device.is_empty()))
+        })
+    }
+
     /// Every live current file at or below the directory `prefix` (`""`
     /// is the link root), in path order: what a directory's eviction or
     /// hydration acts on.
@@ -1946,20 +2091,16 @@ impl FileIndexRepository {
     /// excludes it, matching the rule that the current live version is never
     /// subject to retention expiry. Returns the number of rows deleted.
     ///
-    /// `pinned` is the `(path, version_seq)` set an outstanding handoff lease
-    /// still protects (see `HandoffLease`'s doc comment) — resolved by
-    /// `SyncState::expire_superseded_and_trashed_versions` via
-    /// `HandoffLeaseRepository::leased_version_keys_for_group` and passed in
-    /// as a parameter, since `handoff_leases` is not `files`-table state and
-    /// therefore not this repository's own concern to read (mirrors
-    /// `upsert_file_emitting_change`'s already-resolved-`ChangeAuth`
-    /// parameter pattern). A pinned row is retained past both bounds until
-    /// the lease is confirmed/released/expires.
+    /// The `(path, version_seq)` set an outstanding handoff lease still
+    /// protects (see `HandoffLease`'s doc comment) is read inside the same
+    /// transaction as the deletes, so a lease granted while the sweep runs
+    /// either is seen or makes the sweep's write fail on its stale snapshot;
+    /// it can never lose its pinned rows. A pinned row is retained past both
+    /// bounds until the lease is confirmed/released/expires.
     pub fn expire_superseded_and_trashed_versions(
         &self,
         group_id: &str,
         now_unix_nanos: i64,
-        pinned: &HashSet<(String, i64)>,
     ) -> Result<usize, SyncSqliteError> {
         // Opens its own DEFERRED transaction (rather than going through
         // `write_immediate`, which is always IMMEDIATE) on purpose: this
@@ -1970,11 +2111,17 @@ impl FileIndexRepository {
         // choice here, preserved unchanged by this conversion.
         self.database.write::<_, SyncSqliteError>(|conn| {
             let tx = conn.transaction()?;
+            let pinned = crate::handoff_lease::leased_version_keys_all_groups(
+                &tx,
+                now_unix_nanos / 1_000_000_000,
+            )?
+            .remove(group_id)
+            .unwrap_or_default();
             let expired = expire_superseded_and_trashed_versions_in_tx(
                 &tx,
                 group_id,
                 now_unix_nanos,
-                pinned,
+                &pinned,
             )?;
             tx.commit()?;
             Ok(expired)
@@ -2041,10 +2188,29 @@ pub(crate) fn expire_superseded_and_trashed_versions_in_tx(
             .filter(|key| !pinned.contains(key))
             .collect()
     };
-    // What is dropped is recorded first, in this transaction, so a version the index no longer
-    // holds is never without its record (see `history_freed`).
+    drop_versions_in_tx(
+        tx,
+        group_id,
+        &candidates,
+        crate::history_freed::FreedReason::Expired,
+        now_unix_nanos,
+    )?;
+    crate::history_freed::prune(tx, group_id, now_unix_nanos)?;
+    Ok(candidates.len())
+}
+
+/// Drops the kept versions `keys` of `group_id` from the index, recording each path's dropped
+/// runs in `history_freed` first, in this transaction, so a version the index no longer holds is
+/// never without its record. The bytes are not touched: the GC frees them once no row names them.
+pub(crate) fn drop_versions_in_tx(
+    tx: &Connection,
+    group_id: &str,
+    keys: &[(String, i64)],
+    reason: crate::history_freed::FreedReason,
+    now_unix_nanos: i64,
+) -> Result<(), SyncSqliteError> {
     let mut dropped_by_path: HashMap<&str, HashSet<i64>> = HashMap::new();
-    for (path, version_seq) in &candidates {
+    for (path, version_seq) in keys {
         dropped_by_path.entry(path.as_str()).or_default().insert(*version_seq);
     }
     for (path, dropped) in &dropped_by_path {
@@ -2058,24 +2224,15 @@ pub(crate) fn expire_superseded_and_trashed_versions_in_tx(
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
-        crate::history_freed::record(
-            tx,
-            group_id,
-            path,
-            &rows,
-            dropped,
-            crate::history_freed::FreedReason::Expired,
-            now_unix_nanos,
-        )?;
+        crate::history_freed::record(tx, group_id, path, &rows, dropped, reason, now_unix_nanos)?;
     }
-    for (path, version_seq) in &candidates {
+    for (path, version_seq) in keys {
         tx.execute_cached(
             "DELETE FROM files WHERE group_id = ?1 AND path = ?2 AND version_seq = ?3",
             rusqlite::params![group_id, path, version_seq],
         )?;
     }
-    crate::history_freed::prune(tx, group_id, now_unix_nanos)?;
-    Ok(candidates.len())
+    Ok(())
 }
 
 /// The most ops one part of a recursive operation carries. Each part is
@@ -2860,7 +3017,7 @@ pub fn upsert_file_in_tx(
 /// that merely once existed. With no such head nothing is recorded and the
 /// authoring trigger refuses the row.
 pub(crate) fn record_native_authoring_witness(
-    tx: &rusqlite::Transaction,
+    tx: &Connection,
     group_id: &str,
     identity: &yadorilink_replica_domain::native_plan::NativeRowIdentity,
 ) -> Result<(), SyncSqliteError> {
@@ -4149,6 +4306,9 @@ pub(crate) fn row_to_record(
 }
 
 /// The trash and conflict listings report each row's own kind.
+#[cfg(test)]
+mod shared_block_list_tests;
+
 #[cfg(test)]
 mod entry_kind_listing_tests;
 

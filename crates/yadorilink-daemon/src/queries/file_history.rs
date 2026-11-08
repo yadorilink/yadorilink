@@ -25,6 +25,7 @@ pub(crate) struct TrashedFileView {
 /// (both read `list_live_conflict_copies`).
 #[derive(Debug, Clone)]
 pub(crate) struct ConflictedFileView {
+    pub(crate) group_id: String,
     pub(crate) local_path: String,
     pub(crate) path: String,
     pub(crate) size: u64,
@@ -85,6 +86,8 @@ pub(crate) fn content_of_versions(
 /// One recent-activity event, tagged with its link's `local_path`.
 #[derive(Debug, Clone)]
 pub(crate) struct ActivityView {
+    /// For a conflict event, the device whose version holds the original path now (read at listing).
+    pub(crate) other_origin_device_id: Option<String>,
     pub(crate) cursor: i64,
     pub(crate) local_path: String,
     pub(crate) event: yadorilink_sync_sqlite::activity::ActivityEvent,
@@ -136,6 +139,7 @@ pub(crate) fn activity_view_to_proto(
             ActivityKind::Restored => Wire::Restored,
         } as i32,
         origin_device_id: view.event.origin_device_id.unwrap_or_default(),
+        other_origin_device_id: view.other_origin_device_id.unwrap_or_default(),
         is_this_device: view.is_this_device,
         at_unix_nanos: view.event.at_unix_nanos,
     }
@@ -179,6 +183,13 @@ impl FileHistoryQueryService {
         Self { sync_state, paths, device_id, block_store }
     }
 
+    /// The device that authored the current version of `path`, when the path has one and its author is
+    /// known here. A read error says nothing rather than a wrong name.
+    fn current_origin_device_id(&self, group_id: &str, path: &str) -> Option<String> {
+        // A deleted path's current row is its tombstone: nobody holds the path. One row read.
+        self.sync_state.file_index_repository().get_live_origin_device_id(group_id, path).ok()?
+    }
+
     /// Recent activity across every linked folder, newest first.
     pub(crate) fn list_activity(
         &self,
@@ -197,7 +208,29 @@ impl FileHistoryQueryService {
                 let local_path = local_paths.get(&event.group_id)?.clone();
                 let is_this_device =
                     event.origin_device_id.as_deref().is_none_or(|origin| origin == self.device_id);
-                Some(ActivityView { cursor: event.id, local_path, event, is_this_device })
+                // A conflict event's other side: whoever authored the version that holds the original path
+                // now. A path that no longer exists, or whose author is not known, names nobody.
+                // A copy of a copy carries more than one marker and its name no longer says which
+                // path it was made from, so only a singly marked name is followed to its original.
+                let other_origin_device_id = (event.kind
+                    == yadorilink_sync_sqlite::activity::ActivityKind::Conflict
+                    && event.path.matches("(conflicted copy").count() == 1)
+                    .then(|| {
+                        self.current_origin_device_id(
+                            &event.group_id,
+                            &yadorilink_replica_domain::conflict::conflict_copy_source_path(
+                                &event.path,
+                            ),
+                        )
+                    })
+                    .flatten();
+                Some(ActivityView {
+                    cursor: event.id,
+                    local_path,
+                    event,
+                    is_this_device,
+                    other_origin_device_id,
+                })
             })
             .collect())
     }
@@ -297,6 +330,7 @@ impl FileHistoryQueryService {
                     })
                     .and_then(|version| version.origin_device_id);
                 out.push(ConflictedFileView {
+                    group_id: link.group_id.clone(),
                     local_path: link.key().to_string(),
                     path: file.path,
                     size: file.size,

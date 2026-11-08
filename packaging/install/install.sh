@@ -20,7 +20,9 @@
 #      version stays on disk until the next upgrade. Any failure before this
 #      step leaves an existing install untouched.
 # It never uses sudo, never runs anything from the bundle before the checks
-# pass (then only `yadorilink --version`), and never starts the daemon.
+# pass (then only `yadorilink --version`), and never starts the daemon. It does stop a running
+# daemon of the install it replaces (that install's own `yadorilink daemon stop`) before switching,
+# so the old daemon never outlives its programs.
 #
 # Options:
 #   --prefix DIR       install under DIR (default: $HOME/.local; programs in DIR/bin)
@@ -35,6 +37,7 @@
 #                      manifest is reachable it must not withdraw the version;
 #                      if it is not, a loud warning says withdrawal was not checked
 #   --no-modify-path   do not edit a shell profile
+#   --no-start         do not start the daemon at the end (the default starts it)
 #   --yes, -y          do not ask for confirmation
 #   --force            reinstall even if this version is already installed
 #   --uninstall        remove what this script installed
@@ -73,7 +76,7 @@ set -eu
 #   MIN_MANIFEST_GENERATED_AT  the oldest channel manifest this installer
 #              accepts (a replay floor for a first install; empty = none).
 # >>> PINS >>>
-TRUST_SET="yadorilink-release-2026-10:cdaf6fbf36a6fa5c8c894fc5012a80bb6c6a73407c9285ac8623d572e9894bd8 yadorilink-release-spare-2026-10:c678beb39cff5e2cf8c4b9530eb8fee31c808dff7dfcf3b4d908221480dad2ad"
+TRUST_SET="yadorilink-release-2026-11:ee25c354773766289f46e0dc2837b017538e9b08c710655450f938dc297581df"
 VERIFIER_SHA_macos_aarch64="6f116f81a2735c49baba41e89b93b5573bce8fc19d2c9c7a8d0278812df4ee56"
 VERIFIER_SHA_linux_x86_64="75d60676afc6797e0f60f93b16ac663218c14f6e3763a17e7fa03168fb0def75"
 VERIFIER_BASE="https://github.com/yadorilink/yadorilink/releases/download/verifier-1"
@@ -117,6 +120,7 @@ WANT_VERSION=${YADORILINK_VERSION:-}
 FROM_FILE=""
 FROM_DIR=""
 MODIFY_PATH=1
+START_DAEMON=1
 ASSUME_YES=0
 FORCE=0
 ACTION=install
@@ -127,11 +131,98 @@ die() { err "$*"; exit 1; }
 # refuse CODE MESSAGE: print the reason and exit with CODE (see "Exit status" above).
 refuse() { code=$1; shift; err "$*"; exit "$code"; }
 
+# Human text goes through t/tf so the language of the environment (LC_ALL, LC_MESSAGES, LANG: ja
+# selects Japanese, anything else English) applies; English is the source text and the fallback.
+# Output a script reads (exit codes, the "yadorilink-install:" prefix, commands) stays English.
+tr_language() {
+    tl=${LC_ALL:-}; [ -n "$tl" ] || tl=${LC_MESSAGES:-}; [ -n "$tl" ] || tl=${LANG:-}
+    case $tl in ja|ja_*|ja.*|ja@*) LANGUAGE_JA=1 ;; *) LANGUAGE_JA=0 ;; esac
+}
+# t ENGLISH: the template in the language in use.
+t() {
+    if [ "$LANGUAGE_JA" = 1 ] && tt=$(ja_text "$1") && [ -n "$tt" ]; then printf '%s' "$tt"; else printf '%s' "$1"; fi
+}
+# tf ENGLISH ARGS...: the template filled in (printf conversions are %s only, in English order).
+# shellcheck disable=SC2059 # the template is the message, chosen by language
+tf() { tf_template=$(t "$1"); shift; printf -- "$tf_template" "$@"; }
+tsay() { tf "$@"; printf '\n'; }
+terr() { { printf 'yadorilink-install: error: '; tf "$@"; printf '\n'; } >&2; }
+tdie() { terr "$@"; exit 1; }
+trefuse() { code=$1; shift; terr "$@"; exit "$code"; }
+tr_language
+
+# ja_text ENGLISH: its Japanese template (same %s conversions in the same order), or nothing.
+ja_text() {
+    case $1 in
+        'HOME is not set') printf '%s' 'HOME が設定されていません' ;;
+        'need sha256sum, shasum or openssl to check downloads') printf '%s' 'ダウンロードの検証には sha256sum、shasum、openssl のいずれかが必要です' ;;
+        'this is the macOS/Linux installer. On Windows, install YadoriLink from the Microsoft Store.') printf '%s' 'これは macOS/Linux 用のインストーラーです。Windows では Microsoft Store から YadoriLink をインストールしてください。' ;;
+        'no YadoriLink engine bundle for %s yet (available: macos-aarch64, linux-x86_64). Nothing was installed.') printf '%s' '%s 用の YadoriLink エンジンバンドルはまだありません(提供中: macos-aarch64、linux-x86_64)。何もインストールされていません。' ;;
+        'note: the running YadoriLink daemon was stopped before this failure. Start it again with: yadorilink daemon start') printf '%s' '注意: この失敗の前に、実行中の YadoriLink デーモンを停止しました。次のコマンドでもう一度起動してください: yadorilink daemon start' ;;
+        'another yadorilink install is starting, or left %s/.lock behind; remove that directory if no install is running') printf '%s' '別の yadorilink のインストールが開始中か、%s/.lock が残っています。インストールが実行中でなければ、そのディレクトリを削除してください' ;;
+        'another yadorilink install is running (pid %s)') printf '%s' '別の yadorilink のインストールが実行中です(pid %s)' ;;
+        'cannot take the install lock in %s') printf '%s' '%s でインストールのロックを取得できません' ;;
+        'warning: could not tell whether a YadoriLink daemon is running (yadorilink status exited %s); continuing.') printf '%s' '警告: YadoriLink デーモンが動作中かどうかを判断できませんでした(yadorilink status の終了コード %s)。続行します。' ;;
+        'Stopping the running YadoriLink daemon, so it does not keep the old program after the switch...') printf '%s' '切り替え後に古いプログラムが残らないよう、実行中の YadoriLink デーモンを停止しています...' ;;
+        'The running YadoriLink daemon could not be stopped. Run: yadorilink daemon stop   (then run this installer again). Nothing was changed.') printf '%s' '実行中の YadoriLink デーモンを停止できませんでした。yadorilink daemon stop を実行してから、このインストーラーをもう一度実行してください。何も変更されていません。' ;;
+        'The YadoriLink daemon did not stop within 30 seconds. Run: yadorilink daemon stop   (then run this installer again). Nothing was changed.') printf '%s' 'YadoriLink デーモンが 30 秒以内に停止しませんでした。yadorilink daemon stop を実行してから、このインストーラーをもう一度実行してください。何も変更されていません。' ;;
+        'Nothing to uninstall: no YadoriLink install found under %s.') printf '%s' 'アンインストールするものがありません。%s に YadoriLink のインストールが見つかりません。' ;;
+        'cancelled') printf '%s' 'キャンセルしました' ;;
+        'Removed. Your sync data and sign-in are untouched (a running daemon was stopped);') printf '%s' '削除しました。同期データとサインインはそのまま残っています(実行中のデーモンは停止しました)。' ;;
+        'remove its data directory yourself if you want it gone.') printf '%s' 'データディレクトリが不要な場合は、ご自身で削除してください。' ;;
+        'curl is required') printf '%s' 'curl が必要です' ;;
+        'unzip is required') printf '%s' 'unzip が必要です' ;;
+        'cannot write to %s (read-only or no permission). Use --prefix with a directory you own. Nothing was installed.') printf '%s' '%s に書き込めません(読み取り専用か権限がありません)。--prefix で自分が所有するディレクトリを指定してください。何もインストールされていません。' ;;
+        'cannot create %s') printf '%s' '%s を作成できません' ;;
+        'The live %s manifest does not withdraw %s.') printf '%s' '公開中の %s のマニフェストでは、%s は取り下げられていません。' ;;
+        'WARNING: %s could not be reached (offline?), so it was NOT checked whether version %s has been withdrawn. Withdrawal not checked.') printf '%s' '警告: %s に接続できなかった(オフライン?)ため、バージョン %s が取り下げられていないかは確認していません。取り下げの確認なし。' ;;
+        'Checking %s channel (%s)...') printf '%s' '%s チャンネル(%s)を確認しています...' ;;
+        'No release is published yet on the %s channel (no update manifest at %s).') printf '%s' '%s チャンネルにはまだリリースが公開されていません(%s にアップデートのマニフェストがありません)。' ;;
+        'Nothing was installed. Check https://yadori.link/ for the first release.') printf '%s' '何もインストールされていません。最初のリリースについては https://yadori.link/ をご確認ください。' ;;
+        'could not reach %s. Check your network connection. Nothing was installed.') printf '%s' '%s に接続できませんでした。ネットワーク接続を確認してください。何もインストールされていません。' ;;
+        'unexpected HTTP status %s from %s. Nothing was installed.') printf '%s' 'HTTP ステータス %s が %s から返されました。何もインストールされていません。' ;;
+        'version %s has no published manifest (%s). Nothing was installed.') printf '%s' 'バージョン %s には公開されたマニフェストがありません(%s)。何もインストールされていません。' ;;
+        'YadoriLink %s is already installed and up to date. (--force reinstalls.)') printf '%s' 'YadoriLink %s は既にインストールされており、最新です。(--force で再インストールできます。)' ;;
+        'installed version %s is newer than %s on the %s channel; not downgrading. Nothing was changed.') printf '%s' 'インストール済みのバージョン %s は %s(%s チャンネル)より新しいため、ダウングレードしません。何も変更されていません。' ;;
+        '%s/%s already exists and was not installed by this script. Remove it or choose another --prefix. Nothing was changed.') printf '%s' '%s/%s は既に存在し、このスクリプトでインストールされたものではありません。削除するか、別の --prefix を指定してください。何も変更されていません。' ;;
+        'Using %s (%s) from %s...') printf '%s' '%s(%s)を %s から使用しています...' ;;
+        'cannot copy %s/%s. Nothing was installed.') printf '%s' '%s/%s をコピーできません。何もインストールされていません。' ;;
+        'Downloading %s (%s)...') printf '%s' '%s(%s)をダウンロードしています...' ;;
+        'download failed or was interrupted (%s). Nothing was installed.') printf '%s' 'ダウンロードに失敗したか中断されました(%s)。何もインストールされていません。' ;;
+        'could not unpack the bundle') printf '%s' 'バンドルを展開できませんでした' ;;
+        'the new yadorilink does not run on this system (--version failed). Nothing was changed.') printf '%s' '新しい yadorilink はこのシステムでは動作しません(--version が失敗しました)。何も変更されていません。' ;;
+        'could not write the install receipt beside the binaries. Nothing was changed.') printf '%s' 'バイナリの隣にインストール記録を書き込めませんでした。何も変更されていません。' ;;
+        'could not switch %s/yadorilink-daemon. The previous install was kept.') printf '%s' '%s/yadorilink-daemon を切り替えられませんでした。以前のインストールはそのまま残しました。' ;;
+        'could not switch %s/yadorilink. The previous install was restored.') printf '%s' '%s/yadorilink を切り替えられませんでした。以前のインストールに戻しました。' ;;
+        'could not write the install receipt. The previous install was restored.') printf '%s' 'インストール記録を書き込めませんでした。以前のインストールに戻しました。' ;;
+        'Installed YadoriLink %s (%s, %s) in %s.') printf '%s' 'YadoriLink %s(%s、%s)を %s にインストールしました。' ;;
+        'Release notes: %s') printf '%s' 'リリースノート: %s' ;;
+        'Next: sign in with') printf '%s' '次の手順: 次のコマンドでサインインしてください' ;;
+        'Upgrade later by running the installer again. Remove with: install.sh --uninstall') printf '%s' 'アップグレードするには、後でもう一度インストーラーを実行してください。削除するには: install.sh --uninstall' ;;
+        'The daemon was not started (--no-start). Start it with: yadorilink daemon start') printf '%s' 'デーモンは起動していません(--no-start)。起動するには: yadorilink daemon start' ;;
+        'YadoriLink is running.') printf '%s' 'YadoriLink は実行中です。' ;;
+        'The old daemon was stopped; the new one is running.') printf '%s' '古いデーモンを停止し、新しいデーモンが実行中です。' ;;
+        'The YadoriLink daemon could not be started. Start it with: yadorilink daemon start') printf '%s' 'YadoriLink デーモンを起動できませんでした。起動するには: yadorilink daemon start' ;;
+        'Added %s to your PATH in %s. Open a new terminal, or run:') printf '%s' '%s を %s の PATH に追加しました。新しいターミナルを開くか、次を実行してください:' ;;
+        '%s is not on your PATH. Add it, for example:') printf '%s' '%s は PATH に含まれていません。たとえば次のように追加してください:' ;;
+        'could not switch %s/yadorilink-daemon. Nothing was changed.') printf '%s' '%s/yadorilink-daemon を切り替えられませんでした。何も変更されていません。' ;;
+        'could not switch %s/yadorilink. The current version was restored.') printf '%s' '%s/yadorilink を切り替えられませんでした。現在のバージョンに戻しました。' ;;
+        'could not write the install receipt. The current version was restored.') printf '%s' 'インストール記録を書き込めませんでした。現在のバージョンに戻しました。' ;;
+        'Rolled back to YadoriLink %s (from %s).') printf '%s' 'YadoriLink %s にロールバックしました(%s から)。' ;;
+        'The running daemon was stopped. Start it again: yadorilink daemon start') printf '%s' '実行中のデーモンを停止しました。もう一度起動するには: yadorilink daemon start' ;;
+        'No daemon was running. Start it with: yadorilink daemon start') printf '%s' 'デーモンは実行されていませんでした。起動するには: yadorilink daemon start' ;;
+        'Upgrade YadoriLink %s -> %s under %s?') printf '%s' 'YadoriLink を %s から %s にアップグレードしますか?(%s)' ;;
+        'Remove the YadoriLink install under %s?') printf '%s' '%s の YadoriLink のインストールを削除しますか?' ;;
+        'Install YadoriLink %s under %s?') printf '%s' 'YadoriLink %s を %s にインストールしますか?' ;;
+        *) return 1 ;;
+    esac
+}
+
 usage() {
     # Print the header comment block (everything up to the first blank line
     # after "Options:").
     awk 'NR==1{next} /^set -eu/{exit} /^#/{sub(/^# ?/,""); print}' "$0" 2>/dev/null ||
-        say "usage: install.sh [--prefix DIR] [--channel beta|nightly] [--version X.Y.Z] [--from FILE] [--no-modify-path] [--yes] [--force] [--uninstall]"
+        say "usage: install.sh [--prefix DIR] [--channel beta|nightly] [--version X.Y.Z] [--from FILE] [--no-modify-path] [--no-start] [--yes] [--force] [--uninstall]"
 }
 
 # parse_args and derive paths. All work happens in main, called on the last
@@ -148,6 +239,7 @@ setup() {
             --from) [ $# -ge 2 ] || refuse 2 "--from needs a file"; FROM_FILE=$2; shift 2 ;;
             --from=*) FROM_FILE=${1#--from=}; shift ;;
             --no-modify-path) MODIFY_PATH=0; shift ;;
+            --no-start) START_DAEMON=0; shift ;;
             --yes|-y) ASSUME_YES=1; shift ;;
             --force) FORCE=1; shift ;;
             --uninstall) ACTION=uninstall; shift ;;
@@ -164,7 +256,7 @@ setup() {
     esac
     WANT_VERSION=${WANT_VERSION#v}
 
-    [ -n "${HOME:-}" ] || die "HOME is not set"
+    [ -n "${HOME:-}" ] || tdie 'HOME is not set'
     [ -n "$PREFIX" ] || PREFIX=$HOME/.local
     case $PREFIX in
         /*) ;;
@@ -185,7 +277,7 @@ sha256_of() {
     if have sha256sum; then sha256sum "$1" | awk '{print $1}'
     elif have shasum; then shasum -a 256 "$1" | awk '{print $1}'
     elif have openssl; then openssl dgst -sha256 "$1" | awk '{print $NF}'
-    else die "need sha256sum, shasum or openssl to check downloads"
+    else tdie 'need sha256sum, shasum or openssl to check downloads'
     fi
 }
 
@@ -469,8 +561,24 @@ check_not_managed_elsewhere() {
     unreadable="the ownership record $rec cannot be read, so who manages YadoriLink here is unknown. Nothing was installed. Fix or remove that file only if you know no other YadoriLink install uses this data."
     rec_owner=$(id_field "$rec" owner) || refuse 19 "$unreadable"
     rec_source=$(id_field "$rec" install_source) || refuse 19 "$unreadable"
-    [ "$rec_owner" != gui ] || refuse 19 "YadoriLink is managed by the app ($rec_source); the yadorilink command is already available from the app. Nothing was installed."
-    [ "$rec_source" = script ] || refuse 19 "this machine's YadoriLink data belongs to another installation ($rec_source), which has its own updater. Nothing was installed."
+    switch="To use this installer instead: $(remove_how "$rec_source"), delete $rec, then run the installer again."
+    [ "$rec_owner" != gui ] || refuse 19 "YadoriLink is managed by the app ($rec_source), which already provides the yadorilink command. Nothing was installed. $switch"
+    [ "$rec_source" = script ] || refuse 19 "this machine's YadoriLink data belongs to another installation ($rec_source). Nothing was installed. $switch"
+}
+
+# remove_how SOURCE: how the installation named by an ownership record's install_source is
+# removed (mirrors ownership::uninstaller_elsewhere).
+remove_how() {
+    case $1 in
+        app_bundle) printf '%s' "quit YadoriLink and move YadoriLink.app to the Trash" ;;
+        app_store) printf '%s' "quit YadoriLink and delete it from Applications" ;;
+        microsoft_store) printf '%s' "uninstall YadoriLink in Settings > Apps > Installed apps" ;;
+        homebrew) printf '%s' "run brew uninstall yadorilink" ;;
+        apt) printf '%s' "run sudo apt remove yadorilink" ;;
+        winget) printf '%s' "run winget uninstall yadorilink" ;;
+        container) printf '%s' "stop and remove the container" ;;
+        *) printf '%s' "run yadorilink daemon stop and delete the binaries you placed by hand (a standalone copy has no installer or updater)" ;;
+    esac
 }
 
 # ---- platform ---------------------------------------------------------------
@@ -482,7 +590,7 @@ detect_target() {
         Darwin|macos) PLATFORM=macos ;;
         Linux|linux) PLATFORM=linux ;;
         MINGW*|MSYS*|CYGWIN*|windows)
-            refuse 5 "this is the macOS/Linux installer. On Windows use PowerShell: irm https://yadori.link/install.ps1 | iex" ;;
+            trefuse 5 'this is the macOS/Linux installer. On Windows, install YadoriLink from the Microsoft Store.' ;;
         *) refuse 5 "unsupported operating system '$os'. YadoriLink engine bundles exist for macOS (Apple silicon), Linux (x86_64) and Windows (x86_64)." ;;
     esac
     case $machine in
@@ -498,7 +606,7 @@ detect_target() {
     TARGET=$PLATFORM-$ARCH
     case $TARGET in
         macos-aarch64|linux-x86_64) ;;
-        *) refuse 5 "no YadoriLink engine bundle for $TARGET yet (available: macos-aarch64, linux-x86_64, windows-x86_64). Nothing was installed." ;;
+        *) trefuse 5 'no YadoriLink engine bundle for %s yet (available: macos-aarch64, linux-x86_64). Nothing was installed.' "$TARGET" ;;
     esac
     # The Linux bundle is built for glibc. Without glibc's dynamic loader (Alpine and other musl
     # systems, NixOS) it cannot run, so refuse before downloading ~70 MB for nothing.
@@ -518,6 +626,9 @@ cleanup() {
     if [ -n "${STAGE:-}" ] && [ -d "$STAGE" ]; then rm -rf "$STAGE"; fi
     if [ -n "${LOCKDIR:-}" ] && [ -d "$LOCKDIR" ] && [ "$(cat "$LOCKDIR/pid" 2>/dev/null)" = "$$" ]; then rm -rf "$LOCKDIR"; fi
     if [ -n "$WORK" ] && [ -d "$WORK" ]; then rm -rf "$WORK"; fi
+    if [ "$status" != 0 ] && [ "${STOPPED_DAEMON:-0}" = 1 ]; then
+        terr 'note: the running YadoriLink daemon was stopped before this failure. Start it again with: yadorilink daemon start'
+    fi
     exit "$status"
 }
 
@@ -528,14 +639,14 @@ take_lock() {
         if [ -z "$other" ]; then sleep 1; other=$(cat "$LOCKDIR/pid" 2>/dev/null || true); fi
         if [ -z "$other" ] && [ -d "$LOCKDIR" ]; then
             LOCKDIR=""
-            die "another yadorilink install is starting, or left $SHARE/.lock behind; remove that directory if no install is running"
+            tdie 'another yadorilink install is starting, or left %s/.lock behind; remove that directory if no install is running' "$SHARE"
         fi
         if [ -n "$other" ] && kill -0 "$other" 2>/dev/null; then
             LOCKDIR=""
-            die "another yadorilink install is running (pid $other)"
+            tdie 'another yadorilink install is running (pid %s)' "$other"
         fi
         rm -rf "$LOCKDIR"
-        mkdir "$LOCKDIR" 2>/dev/null || { LOCKDIR=""; die "cannot take the install lock in $SHARE"; }
+        mkdir "$LOCKDIR" 2>/dev/null || { LOCKDIR=""; tdie 'cannot take the install lock in %s' "$SHARE"; }
     fi
     printf '%s\n' "$$" > "$LOCKDIR/pid"
 }
@@ -585,6 +696,43 @@ write_receipt() {
     mv -f "$SHARE/receipt.new.$$" "$RECEIPT"
 }
 
+# stop_old_daemon: a daemon that keeps running while its programs are replaced is left running the old
+# version, and the new command line cannot talk to it (it reports a protocol version mismatch and cannot
+# stop it). So before the programs are switched, the CURRENT install's own command line stops its daemon.
+# `yadorilink status` exits 0 when a daemon answers and 4 when none is running. Anything that cannot be
+# stopped, or cannot be told apart, refuses with the exact next step, before anything has been changed.
+stop_old_daemon() {
+    old_cli=$BIN/yadorilink
+    is_ours "$old_cli" && [ -x "$old_cli" ] || return 0
+    sd_rc=0
+    sd_out=$("$old_cli" status 2>&1 </dev/null) || sd_rc=$?
+    # Exit 4 is "no daemon running"; an older command line may say so in words instead.
+    case $sd_rc in 0|4) ;; *) case $sd_out in *"not running"*) sd_rc=4 ;; esac ;; esac
+    case $sd_rc in
+        4) return 0 ;;
+        0) ;;
+        *) case $sd_out in
+               *mismatch*) refuse 1 "A YadoriLink daemon is running that its own command line cannot reach ($sd_out). Stop it (end the yadorilink-daemon process), then run this installer again. Nothing was changed." ;;
+               *) tsay 'warning: could not tell whether a YadoriLink daemon is running (yadorilink status exited %s); continuing.' "$sd_rc" ; return 0 ;;
+           esac ;;
+    esac
+    tsay 'Stopping the running YadoriLink daemon, so it does not keep the old program after the switch...'
+    "$old_cli" daemon stop >/dev/null 2>&1 </dev/null ||
+        trefuse 1 'The running YadoriLink daemon could not be stopped. Run: yadorilink daemon stop   (then run this installer again). Nothing was changed.'
+    sd_n=0
+    while [ "$sd_n" -lt 60 ]; do
+        sd_rc=0; sd_out=$("$old_cli" status 2>&1 </dev/null) || sd_rc=$?
+        # Only "no daemon running" counts as stopped; any other failure may be a daemon that is still up.
+        [ "$sd_rc" = 4 ] && break
+        case $sd_out in *"not running"*) sd_rc=4; break ;; esac
+        sleep 0.5 2>/dev/null || sleep 1
+        sd_n=$((sd_n + 1))
+    done
+    [ "$sd_rc" = 4 ] ||
+        trefuse 1 'The YadoriLink daemon did not stop within 30 seconds. Run: yadorilink daemon stop   (then run this installer again). Nothing was changed.'
+    STOPPED_DAEMON=1
+}
+
 # is_ours LINK: true when LINK is a symlink into $SHARE.
 is_ours() {
     [ -L "$1" ] || return 1
@@ -618,11 +766,17 @@ remove_path_block() { # FILE
 
 do_uninstall() {
     if [ ! -d "$SHARE" ]; then
-        say "Nothing to uninstall: no YadoriLink install found under $PREFIX."
+        tsay 'Nothing to uninstall: no YadoriLink install found under %s.' "$PREFIX"
         return 0
     fi
-    confirm "Remove the YadoriLink install under $PREFIX?" || die "cancelled"
+    confirm "$(tf 'Remove the YadoriLink install under %s?' "$PREFIX")" || tdie 'cancelled'
     take_lock
+    # The start-at-login entry `daemon start` made; an older command line has no such flag and
+    # made no entry, so a failure here is not one.
+    if is_ours "$BIN/yadorilink" && [ -x "$BIN/yadorilink" ]; then
+        "$BIN/yadorilink" daemon stop --disable >/dev/null 2>&1 </dev/null || true
+    fi
+    stop_old_daemon
     for name in yadorilink yadorilink-daemon; do
         if is_ours "$BIN/$name"; then rm -f "$BIN/$name"; fi
     done
@@ -630,8 +784,8 @@ do_uninstall() {
     [ -z "$profile" ] || remove_path_block "$profile"
     rm -rf "$SHARE"
     rmdir "$BIN" 2>/dev/null || true
-    say "Removed. Your sync data and sign-in are untouched; stop the daemon first with"
-    say "'yadorilink daemon stop' if it is running, and remove its data directory yourself if you want it gone."
+    tsay 'Removed. Your sync data and sign-in are untouched (a running daemon was stopped);'
+    tsay 'remove its data directory yourself if you want it gone.'
 }
 
 # ---- manifests ----------------------------------------------------------------
@@ -772,18 +926,18 @@ take_live() { LIVE_VERSION=$M_VERSION; LIVE_KILL=$M_KILL; LIVE_MIN=$M_MIN; LIVE_
 do_install() {
     detect_target
     check_not_managed_elsewhere
-    have curl || die "curl is required"
-    have unzip || have bsdtar || die "unzip is required"
+    have curl || tdie 'curl is required'
+    have unzip || have bsdtar || tdie 'unzip is required'
 
     # Create the state directory first, so a read-only prefix fails now,
     # before anything is downloaded.
     if ! mkdir -p "$SHARE" "$BIN" 2>/dev/null || [ ! -w "$SHARE" ] || [ ! -w "$BIN" ]; then
-        refuse 7 "cannot write to $PREFIX (read-only or no permission). Use --prefix with a directory you own. Nothing was installed."
+        trefuse 7 'cannot write to %s (read-only or no permission). Use --prefix with a directory you own. Nothing was installed.' "$PREFIX"
     fi
     take_lock
     STAGE=$SHARE/.staging.$$
     rm -rf "$STAGE"
-    mkdir "$STAGE" || die "cannot create $STAGE"
+    mkdir "$STAGE" || tdie 'cannot create %s' "$STAGE"
     chmod 700 "$STAGE"
     WORK=$STAGE/work
     mkdir "$WORK"
@@ -822,20 +976,20 @@ do_install() {
             check_not_expired
             take_live
             check_live_allows "$VERSION"
-            say "The live $CHANNEL manifest does not withdraw $VERSION."
+            tsay 'The live %s manifest does not withdraw %s.' "$CHANNEL" "$VERSION"
         else
-            err "WARNING: $live_url could not be reached (offline?), so it was NOT checked whether version $VERSION has been withdrawn. Withdrawal not checked."
+            terr 'WARNING: %s could not be reached (offline?), so it was NOT checked whether version %s has been withdrawn. Withdrawal not checked.' "$live_url" "$VERSION"
         fi
     else
-        say "Checking $CHANNEL channel ($TARGET)..."
+        tsay 'Checking %s channel (%s)...' "$CHANNEL" "$TARGET"
         fetch_envelope "$live_url" "$WORK/envelope.json" && rc=0 || rc=$?
         case $rc in
             0) ;;
-            1) say "No release is published yet on the $CHANNEL channel (no update manifest at $live_url)."
-               say "Nothing was installed. Check https://yadori.link/ for the first release."
+            1) tsay 'No release is published yet on the %s channel (no update manifest at %s).' "$CHANNEL" "$live_url"
+               tsay 'Nothing was installed. Check https://yadori.link/ for the first release.'
                exit 1 ;;
-            3) refuse 3 "could not reach $live_url. Check your network connection. Nothing was installed." ;;
-            *) refuse 3 "unexpected HTTP status $HTTP_CODE from $live_url. Nothing was installed." ;;
+            3) trefuse 3 'could not reach %s. Check your network connection. Nothing was installed.' "$live_url" ;;
+            *) trefuse 3 'unexpected HTTP status %s from %s. Nothing was installed.' "$HTTP_CODE" "$live_url" ;;
         esac
         UNPINNED_STATUS=22
         verify_envelope "$WORK/envelope.json" "$WORK/manifest.json"
@@ -853,9 +1007,9 @@ do_install() {
             fetch_envelope "$snap_url" "$WORK/snapshot-envelope.json" && rc=0 || rc=$?
             case $rc in
                 0) ;;
-                1) die "version $WANT_VERSION has no published manifest ($snap_url). Nothing was installed." ;;
-                3) refuse 3 "could not reach $snap_url. Check your network connection. Nothing was installed." ;;
-                *) refuse 3 "unexpected HTTP status $HTTP_CODE from $snap_url. Nothing was installed." ;;
+                1) tdie 'version %s has no published manifest (%s). Nothing was installed.' "$WANT_VERSION" "$snap_url" ;;
+                3) trefuse 3 'could not reach %s. Check your network connection. Nothing was installed.' "$snap_url" ;;
+                *) trefuse 3 'unexpected HTTP status %s from %s. Nothing was installed.' "$HTTP_CODE" "$snap_url" ;;
             esac
             verify_envelope "$WORK/snapshot-envelope.json" "$WORK/snapshot.json"
             read_manifest "$WORK/snapshot.json"
@@ -876,25 +1030,25 @@ do_install() {
     if [ -n "$installed" ]; then
         rel=$(semver_cmp "$VERSION" "$installed")
         if [ "$rel" = 0 ] && [ "$FORCE" != 1 ] && [ "$(receipt_get channel)" = "$CHANNEL" ]; then
-            say "YadoriLink $installed is already installed and up to date. (--force reinstalls.)"
+            tsay 'YadoriLink %s is already installed and up to date. (--force reinstalls.)' "$installed"
             setup_path
             return 0
         fi
         if [ "$rel" = -1 ]; then
-            refuse 6 "installed version $installed is newer than $VERSION on the $CHANNEL channel; not downgrading. Nothing was changed."
+            trefuse 6 'installed version %s is newer than %s on the %s channel; not downgrading. Nothing was changed.' "$installed" "$VERSION" "$CHANNEL"
         fi
     fi
 
     for name in yadorilink yadorilink-daemon; do
         if [ -e "$BIN/$name" ] || [ -L "$BIN/$name" ]; then
-            is_ours "$BIN/$name" || die "$BIN/$name already exists and was not installed by this script. Remove it or choose another --prefix. Nothing was changed."
+            is_ours "$BIN/$name" || tdie '%s/%s already exists and was not installed by this script. Remove it or choose another --prefix. Nothing was changed.' "$BIN" "$name"
         fi
     done
 
     if [ -n "$installed" ]; then
-        confirm "Upgrade YadoriLink $installed -> $VERSION under $PREFIX?" || die "cancelled"
+        confirm "$(tf 'Upgrade YadoriLink %s -> %s under %s?' "$installed" "$VERSION" "$PREFIX")" || tdie 'cancelled'
     else
-        confirm "Install YadoriLink $VERSION under $PREFIX?" || die "cancelled"
+        confirm "$(tf 'Install YadoriLink %s under %s?' "$VERSION" "$PREFIX")" || tdie 'cancelled'
     fi
 
     # 2. Bundle download and hashes against the signed manifest.
@@ -902,13 +1056,13 @@ do_install() {
     ZIP=$STAGE/$zip_name
     if [ -n "$FROM_FILE" ]; then
         [ -f "$FROM_DIR/$zip_name" ] || refuse 2 "--from needs the engine bundle $zip_name next to $FROM_FILE. Nothing was installed."
-        say "Using $zip_name ($VERSION) from $FROM_DIR..."
-        cp "$FROM_DIR/$zip_name" "$ZIP" || die "cannot copy $FROM_DIR/$zip_name. Nothing was installed."
+        tsay 'Using %s (%s) from %s...' "$zip_name" "$VERSION" "$FROM_DIR"
+        cp "$FROM_DIR/$zip_name" "$ZIP" || tdie 'cannot copy %s/%s. Nothing was installed.' "$FROM_DIR" "$zip_name"
     else
-        say "Downloading $zip_name ($VERSION)..."
+        tsay 'Downloading %s (%s)...' "$zip_name" "$VERSION"
         curl -sSL -f --max-redirs 5 --proto "$CURL_PROTO" --proto-redir "$CURL_PROTO" --tlsv1.2 --connect-timeout 15 --max-time 900 \
             --max-filesize "$WANT_SIZE" -o "$ZIP" "$URL" ||
-            refuse 3 "download failed or was interrupted ($URL). Nothing was installed."
+            trefuse 3 'download failed or was interrupted (%s). Nothing was installed.' "$URL"
     fi
     [ "$(file_size "$ZIP")" = "$WANT_SIZE" ] || refuse 4 "downloaded bundle has the wrong size (expected $WANT_SIZE bytes). Refusing. Nothing was installed."
     [ "$(sha256_of "$ZIP")" = "$WANT_SHA" ] || refuse 4 "downloaded bundle SHA-256 does not match the signed manifest. Refusing. Nothing was installed."
@@ -923,8 +1077,8 @@ do_install() {
     fi
     printf '%s\n' "$names" | awk '/^\// || /\\/ || /(^|\/)\.\.(\/|$)/ { bad = 1 } END { exit bad }' ||
         refuse 4 "bundle contains unsafe paths. Refusing. Nothing was installed."
-    if have unzip; then unzip -q -o "$ZIP" -d "$EXTRACT" || die "could not unpack the bundle"
-    else bsdtar -xf "$ZIP" -C "$EXTRACT" || die "could not unpack the bundle"; fi
+    if have unzip; then unzip -q -o "$ZIP" -d "$EXTRACT" || tdie 'could not unpack the bundle'
+    else bsdtar -xf "$ZIP" -C "$EXTRACT" || tdie 'could not unpack the bundle'; fi
     [ -z "$(find "$EXTRACT" -type l | head -n 1)" ] || refuse 4 "bundle contains symbolic links. Refusing. Nothing was installed."
 
     for f in SHA256SUMS engine-identity.json LICENSE SOURCE.txt THIRD-PARTY-LICENSES; do
@@ -962,7 +1116,7 @@ do_install() {
         chmod 755 "$EXTRACT/$BIN_SUBDIR$name"
     done
     "$EXTRACT/${BIN_SUBDIR}yadorilink" --version >/dev/null 2>&1 ||
-        die "the new yadorilink does not run on this system (--version failed). Nothing was changed."
+        tdie 'the new yadorilink does not run on this system (--version failed). Nothing was changed.'
 
     # The installer in the bundle was listed in SHA256SUMS and hashed above with everything else, so
     # this is the hash the signed chain vouches for.
@@ -988,9 +1142,10 @@ do_install() {
     # version tree, so it follows the binaries and is removed with them. Written
     # after verification; failing to write it aborts before anything is switched.
     printf '{"source":"script","version":"%s","channel":"%s"}\n' "$VERSION" "$CHANNEL" > "$EXTRACT/${BIN_SUBDIR}install-receipt.json" ||
-        die "could not write the install receipt beside the binaries. Nothing was changed."
+        tdie 'could not write the install receipt beside the binaries. Nothing was changed.'
 
-    # 4. Activate: move the verified tree into place, then switch the links.
+    # 4. Activate: stop the current install's daemon, move the verified tree into place, then switch the links.
+    stop_old_daemon
     VDIR=versions/$VERSION.$(date +%s).$$
     mkdir -p "$SHARE/versions"
     mv "$EXTRACT" "$SHARE/$VDIR" || die "cannot move the verified bundle into place. Nothing was changed."
@@ -1011,11 +1166,11 @@ do_install() {
         else rm -f "$BIN/yadorilink"; fi
     }
     set_link "$SHARE/$VDIR/${BIN_SUBDIR}yadorilink-daemon" "$BIN/yadorilink-daemon" ||
-        { rm -rf "${SHARE:?}/$VDIR"; die "could not switch $BIN/yadorilink-daemon. The previous install was kept."; }
+        { rm -rf "${SHARE:?}/$VDIR"; tdie 'could not switch %s/yadorilink-daemon. The previous install was kept.' "$BIN"; }
     if ! set_link "$SHARE/$VDIR/${BIN_SUBDIR}yadorilink" "$BIN/yadorilink"; then
         restore_links
         rm -rf "${SHARE:?}/$VDIR"
-        die "could not switch $BIN/yadorilink. The previous install was restored."
+        tdie 'could not switch %s/yadorilink. The previous install was restored.' "$BIN"
     fi
 
     # The receipt is what uninstall and the next upgrade trust. If it cannot be
@@ -1025,7 +1180,7 @@ do_install() {
         restore_links
         rm -rf "${SHARE:?}/$VDIR"
         rmdir "$SHARE/versions" 2>/dev/null || true
-        die "could not write the install receipt. The previous install was restored."
+        tdie 'could not write the install receipt. The previous install was restored.'
     fi
 
     # Drop only the version tree the previous receipt recorded as "previous"
@@ -1039,14 +1194,27 @@ do_install() {
     esac
 
     say ""
-    say "Installed YadoriLink $VERSION ($CHANNEL, $TARGET) in $PREFIX."
-    [ -z "$NOTES" ] || say "Release notes: $NOTES"
+    tsay 'Installed YadoriLink %s (%s, %s) in %s.' "$VERSION" "$CHANNEL" "$TARGET" "$PREFIX"
+    [ -z "$NOTES" ] || tsay 'Release notes: %s' "$NOTES"
     setup_path
     say ""
-    say "Next steps:"
-    say "  yadorilink daemon start"
+    start_daemon_or_say_how
+    say ""
+    tsay 'Next: sign in with'
     say "  yadorilink login"
-    say "Upgrade later by running the installer again. Remove with: install.sh --uninstall"
+    tsay 'Upgrade later by running the installer again. Remove with: install.sh --uninstall'
+}
+
+# Starts the daemon of the install just made, so the only step left is signing in. A start that
+# does not take is not an install failure: the command that starts it is said instead.
+start_daemon_or_say_how() {
+    [ "$START_DAEMON" = 1 ] || { tsay 'The daemon was not started (--no-start). Start it with: yadorilink daemon start'; return 0; }
+    if "$BIN/yadorilink" daemon start >/dev/null 2>&1; then
+        if [ "${STOPPED_DAEMON:-0}" = 0 ]; then tsay 'YadoriLink is running.'
+        else tsay 'The old daemon was stopped; the new one is running.'; fi
+    else
+        tsay 'The YadoriLink daemon could not be started. Start it with: yadorilink daemon start'
+    fi
 }
 
 setup_path() {
@@ -1065,9 +1233,9 @@ setup_path() {
         fi
         PROFILE_VALUE=$profile awk '/^path_profile=/ { print "path_profile=" ENVIRON["PROFILE_VALUE"]; next } { print }' "$RECEIPT" > "$RECEIPT.new.$$" &&
             mv -f "$RECEIPT.new.$$" "$RECEIPT"
-        say "Added $BIN to your PATH in $profile. Open a new terminal, or run:"
+        tsay 'Added %s to your PATH in %s. Open a new terminal, or run:' "$BIN" "$profile"
     else
-        say "$BIN is not on your PATH. Add it, for example:"
+        tsay '%s is not on your PATH. Add it, for example:' "$BIN"
     fi
     say "  export PATH=\"$BIN:\$PATH\""
 }
@@ -1080,6 +1248,9 @@ do_rollback() {
     [ -f "$RECEIPT" ] || refuse 1 "nothing to roll back: no install receipt under $SHARE (this is not a script install). Nothing was changed."
     detect_target
     check_not_managed_elsewhere
+    # Everything below is read and checked under the lock, so an upgrade cannot replace or prune
+    # the trees between the checks and the switch.
+    take_lock
     cur_dir=$(receipt_get dir || true)
     prev_dir=$(receipt_get previous_dir || true)
     cur_version=$(receipt_get version || true)
@@ -1130,16 +1301,16 @@ do_rollback() {
     { [ -f "$prev_dir/${bin_sub}yadorilink" ] && [ -f "$prev_dir/${bin_sub}yadorilink-daemon" ]; } ||
         refuse 4 "the previous version lacks its programs. Refusing. Nothing was changed."
 
-    take_lock
+    stop_old_daemon
     daemon_old=""
     if [ -L "$BIN/yadorilink-daemon" ]; then daemon_old=$(readlink "$BIN/yadorilink-daemon"); fi
     cli_old=""
     if [ -L "$BIN/yadorilink" ]; then cli_old=$(readlink "$BIN/yadorilink"); fi
     set_link "$prev_dir/${bin_sub}yadorilink-daemon" "$BIN/yadorilink-daemon" ||
-        die "could not switch $BIN/yadorilink-daemon. Nothing was changed."
+        tdie 'could not switch %s/yadorilink-daemon. Nothing was changed.' "$BIN"
     if ! set_link "$prev_dir/${bin_sub}yadorilink" "$BIN/yadorilink"; then
         if [ -n "$daemon_old" ]; then set_link "$daemon_old" "$BIN/yadorilink-daemon" || true; fi
-        die "could not switch $BIN/yadorilink. The current version was restored."
+        tdie 'could not switch %s/yadorilink. The current version was restored.' "$BIN"
     fi
     # The values go in through the environment so a path with awk-special characters stays literal.
     if ! {
@@ -1154,10 +1325,11 @@ do_rollback() {
         rm -f "$SHARE/receipt.new.$$"
         if [ -n "$daemon_old" ]; then set_link "$daemon_old" "$BIN/yadorilink-daemon" || true; fi
         if [ -n "$cli_old" ]; then set_link "$cli_old" "$BIN/yadorilink" || true; fi
-        die "could not write the install receipt. The current version was restored."
+        tdie 'could not write the install receipt. The current version was restored.'
     fi
-    say "Rolled back to YadoriLink $prev_version (from $cur_version)."
-    say "A running daemon keeps running the old program until it is restarted: yadorilink daemon stop, then yadorilink daemon start."
+    tsay 'Rolled back to YadoriLink %s (from %s).' "$prev_version" "$cur_version"
+    if [ "${STOPPED_DAEMON:-0}" = 1 ]; then tsay 'The running daemon was stopped. Start it again: yadorilink daemon start'
+    else tsay 'No daemon was running. Start it with: yadorilink daemon start'; fi
 }
 
 main() {

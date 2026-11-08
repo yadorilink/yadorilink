@@ -73,6 +73,7 @@ fn update_state(raw: &str) -> UpdateState {
         "checking" => UpdateState::Checking,
         "available" => UpdateState::Available,
         "held_back" => UpdateState::HeldBack,
+        "state_incompatible" => UpdateState::StateIncompatible,
         "kill_switched" => UpdateState::KillSwitched,
         "downloading" => UpdateState::Downloading,
         "downloaded" => UpdateState::Downloaded,
@@ -137,7 +138,7 @@ pub fn status_snapshot(
             .iter()
             .map(|l| folder_summary(l, &response.volumes, &response.provider_roots))
             .collect(),
-        product: product_summary(&product),
+        product: product_summary(&product, response.product.as_ref()),
         availability: availability_summary(product.availability),
         protection: protection_summary(product.protection),
         peers: response.peers.iter().map(peer_summary).collect(),
@@ -172,6 +173,8 @@ pub fn status_snapshot(
             reclaimable_estimate_bytes: response.gc_reclaimable_estimate_bytes,
         },
         update: update_badge(response),
+        paused_on_metered: response.paused_on_metered,
+        network_cost_known: response.network_cost_known,
         recent_errors: response
             .recent_errors
             .iter()
@@ -246,12 +249,25 @@ pub fn attention_reason(
             (raw.split_once(':').map_or_else(String::new, |(_, s)| s.to_owned()), false)
         }
     };
+    // A start-over follow-up is about its step, not a subject: the step is the argument, and the
+    // reason a wait gives (if any) is a second one.
+    let step = attention.item.step();
+    let subject = match step {
+        Some(step) => step.to_owned(),
+        None => subject,
+    };
     let folder_local_path =
         if folder_scoped { folder_path_of(links, &subject).map(str::to_owned) } else { None };
     // What the sentence is about: the subject by its kind, and the folder's place when linked here.
     // A code this build does not know has no subject worth naming.
     let mut args = Vec::new();
-    if attention.item != view::AttentionItem::Unrecognized && !subject.is_empty() {
+    if let Some(step) = step {
+        args.push(AttentionArg { name: "step".to_owned(), value: step.to_owned() });
+        // `replacement_unconfirmed:waiting:<why>`
+        if let Some(why) = raw.splitn(3, ':').nth(2).filter(|why| !why.is_empty()) {
+            args.push(AttentionArg { name: "reason".to_owned(), value: why.to_owned() });
+        }
+    } else if attention.item != view::AttentionItem::Unrecognized && !subject.is_empty() {
         args.push(AttentionArg { name: arg_name.to_owned(), value: subject.clone() });
     }
     if let Some(path) = &folder_local_path {
@@ -297,7 +313,10 @@ fn folder_product(link: &LinkStatus) -> view::ProductStatusSummary {
 }
 
 /// The product state, counts and next action, as the shells receive them.
-fn product_summary(summary: &view::ProductStatusSummary) -> ProductSummary {
+fn product_summary(
+    summary: &view::ProductStatusSummary,
+    wire: Option<&yadorilink_ipc_proto::daemonctl::ProductStatus>,
+) -> ProductSummary {
     ProductSummary {
         state: match summary.state {
             view::ProductState::UpToDate => ProductState::UpToDate,
@@ -312,6 +331,10 @@ fn product_summary(summary: &view::ProductStatusSummary) -> ProductSummary {
         waiting_count: summary.waiting_count,
         bytes_remaining: summary.bytes_remaining,
         next_action: summary.next_action.map(product_action),
+        last_synced: wire
+            .and_then(|w| w.last_synced_unix)
+            .and_then(|secs| u64::try_from(secs).ok())
+            .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs)),
     }
 }
 
@@ -353,6 +376,12 @@ pub fn start_over_progress(
                         local_path: f.local_path,
                         group_id: f.group_id,
                         message: f.message,
+                        reason: match f.reason {
+                            op::RejoinReason::ProviderFolder => RejoinReason::ProviderFolder,
+                            op::RejoinReason::HostCannotRejoin => RejoinReason::HostCannotRejoin,
+                            op::RejoinReason::NotGroupOwner => RejoinReason::NotGroupOwner,
+                            op::RejoinReason::JoinFailed => RejoinReason::JoinFailed,
+                        },
                     })
                     .collect(),
                 complete: report.complete,
@@ -367,7 +396,6 @@ fn attention_category(item: view::AttentionItem) -> AttentionCategory {
     match item {
         I::FolderStopped => AttentionCategory::Degraded,
         I::NoSafeCopy => AttentionCategory::DurabilityAtRisk,
-        I::SafeCopyUnconfirmed => AttentionCategory::DurabilityUnknown,
         I::ContentUnavailable => AttentionCategory::FetchUnavailable,
         I::ContentAvailabilityUnknown => AttentionCategory::FetchAvailabilityUnknown,
         I::ConflictNeedsReview => AttentionCategory::Conflict,
@@ -378,9 +406,10 @@ fn attention_category(item: view::AttentionItem) -> AttentionCategory {
         I::PeerUnavailable => AttentionCategory::PeerDisconnected,
         I::RetryableFailure => AttentionCategory::RecentError,
         I::UpdateFailed => AttentionCategory::UpdateFailed,
-        I::UpdateRequired => AttentionCategory::UpdateRequired,
+        I::UpdateRequired | I::UpdateThisDevice => AttentionCategory::UpdateRequired,
         I::LinkedTwice => AttentionCategory::Ambiguous,
-        I::OwnershipLost => AttentionCategory::OwnershipLost,
+        // Both causes (marker gone, not joined) are one item; the shell category is the old one.
+        I::FolderNeedsRelink => AttentionCategory::OwnershipLost,
         I::VolumeChanged => AttentionCategory::VolumeChanged,
         I::VolumeUnconfirmed => AttentionCategory::VolumeUnconfirmed,
         I::ProviderNotReady => AttentionCategory::ProviderNotReady,
@@ -396,13 +425,13 @@ fn attention_category(item: view::AttentionItem) -> AttentionCategory {
         | I::WaitingForDiskSpace
         | I::ReplacementUnconfirmed
         | I::ReplacementWaiting
+        | I::ReplacementAcknowledge
         | I::ReplacementSignInRequired
         | I::TermsConsentRequired
         | I::SignInRequired
         | I::AccountDeletionRequested
         | I::AccountDeletionPending
         | I::AccountDeletionUrgent
-        | I::NotJoined
         | I::FileWatchLimit
         | I::UnreadableFiles
         | I::IndexDamaged
@@ -420,6 +449,20 @@ fn degraded_cause(cause: view::DegradedCause) -> DegradedCause {
         view::DegradedCause::FileWatchLimit => DegradedCause::FileWatchLimit,
         view::DegradedCause::OwnershipLost => DegradedCause::OwnershipLost,
         view::DegradedCause::NotJoined => DegradedCause::NotJoined,
+    }
+}
+
+/// Names the device each folder's newest change came from, from the account's device list. A device
+/// the list does not have stays unnamed.
+pub fn name_last_change_devices(
+    folders: &mut [FolderSummary],
+    device_names: &std::collections::HashMap<String, String>,
+) {
+    for folder in folders {
+        folder.last_change_origin_device_name = folder
+            .last_change_origin_device_id
+            .as_deref()
+            .and_then(|id| device_names.get(id).cloned());
     }
 }
 
@@ -450,6 +493,10 @@ pub fn folder_summary(
         paused: derived.paused,
         paused_until: if derived.paused { unix_secs(link.paused_until_unix) } else { None },
         conflict_count: derived.conflict_count,
+        pending_local_changes: derived.pending_local_changes,
+        last_change_origin_device_id: text(&link.last_change_origin_device_id),
+        // Named by the caller, which has the account's device list (see `name_last_change_devices`).
+        last_change_origin_device_name: None,
         hydrated_file_count: derived.files_hydrated,
         placeholder_file_count: derived.files_placeholder,
         hydrating_file_count: derived.files_hydrating,
@@ -494,7 +541,7 @@ pub fn folder_summary(
         },
         availability: availability_summary(view::AvailabilitySummary::from_link(link)),
         protection: protection_summary(view::ProtectionSummary::from_link(link)),
-        product: product_summary(&folder_product(link)),
+        product: product_summary(&folder_product(link), link.product.as_ref()),
         full_replica_device_ids: derived.full_replica_device_ids,
         policy_stale: derived.policy_stale,
         ambiguous: derived.ambiguous,
@@ -509,6 +556,25 @@ pub fn folder_summary(
         reclaimable_bytes: link.reclaimable_bytes,
         unreadable_files,
         unreadable_files_more,
+        retention: retention_apply(link),
+    }
+}
+
+/// The retention rules' state as the daemon reports it. A daemon that does not say (state unset) reads
+/// as nothing to show.
+fn retention_apply(link: &LinkStatus) -> RetentionApplySummary {
+    RetentionApplySummary {
+        rule_count: link.retention_rule_count,
+        state: match link.retention_apply_state() {
+            wire::RetentionApplyState::Pending => RetentionApplyState::Pending,
+            wire::RetentionApplyState::Done => RetentionApplyState::Done,
+            wire::RetentionApplyState::None | wire::RetentionApplyState::Unspecified => {
+                RetentionApplyState::None
+            }
+        },
+        freed: link.retention_done_count,
+        left_on_purpose: link.retention_skipped_count,
+        to_retry: link.retention_retryable_count,
     }
 }
 
@@ -609,6 +675,7 @@ pub fn status_dimensions_json(response: &StatusResponse) -> serde_json::Value {
             "reachable_device_ids": summary.reachable_device_ids,
             "offline_device_ids": summary.offline_device_ids,
             "update_required_device_ids": summary.update_required_device_ids,
+            "newer_peer_device_ids": summary.newer_peer_device_ids,
         })
     }
     fn protection(summary: &view::ProtectionSummary) -> serde_json::Value {
@@ -639,6 +706,8 @@ pub fn status_dimensions_json(response: &StatusResponse) -> serde_json::Value {
         .collect();
     serde_json::json!({
         "overall_state": response.overall_state,
+        "paused_on_metered": response.paused_on_metered,
+        "network_cost_known": response.network_cost_known,
         "availability": availability(&overall.availability),
         "protection": protection(&overall.protection),
         "folders": folders,
@@ -657,6 +726,7 @@ fn availability_summary(summary: view::AvailabilitySummary) -> AvailabilitySumma
         reachable_device_ids: summary.reachable_device_ids,
         offline_device_ids: summary.offline_device_ids,
         update_required_device_ids: summary.update_required_device_ids,
+        newer_peer_device_ids: summary.newer_peer_device_ids,
     }
 }
 
@@ -774,6 +844,7 @@ pub fn activity_page(
                 wire::ActivityKind::Restored => ActivityKind::Restored,
             };
             let origin_device_id = text(&event.origin_device_id);
+            let other_origin_device_id = text(&event.other_origin_device_id);
             Some(ActivityEvent {
                 cursor: event.cursor,
                 local_path: event.local_path.clone(),
@@ -783,6 +854,10 @@ pub fn activity_page(
                     .as_deref()
                     .and_then(|id| device_names.get(id).cloned()),
                 origin_device_id,
+                other_origin_device_name: other_origin_device_id
+                    .as_deref()
+                    .and_then(|id| device_names.get(id).cloned()),
+                other_origin_device_id,
                 is_this_device: event.is_this_device,
                 at: unix_nanos(event.at_unix_nanos),
             })
@@ -894,7 +969,8 @@ pub fn file_availability(status: &MaterializationStatusResponse) -> FileAvailabi
                 Ok(wire::FileAction::Download) => Some(FileAction::Download),
                 Ok(wire::FileAction::FreeUpSpace) => Some(FileAction::FreeUpSpace),
                 Ok(wire::FileAction::KeepOnDevice) => Some(FileAction::KeepOnDevice),
-                Ok(wire::FileAction::StopKeeping) => Some(FileAction::StopKeeping),
+                Ok(wire::FileAction::OnlineOnly) => Some(FileAction::OnlineOnly),
+                Ok(wire::FileAction::Default) => Some(FileAction::Default),
                 Ok(wire::FileAction::Unspecified) | Err(_) => None,
             })
             .collect(),
@@ -908,11 +984,14 @@ pub fn file_retention(retention: Option<&wire::RetentionState>) -> FileRetention
         Some(state) if state.policy() == wire::RetentionPolicy::Pinned => {
             FileRetention { policy: RetentionPolicy::Pinned, inherited: !state.explicit }
         }
+        Some(state) if state.policy() == wire::RetentionPolicy::OnlineOnly => {
+            FileRetention { policy: RetentionPolicy::OnlineOnly, inherited: !state.explicit }
+        }
         _ => FileRetention { policy: RetentionPolicy::Reclaimable, inherited: false },
     }
 }
 
-pub fn pin_outcome(response: &wire::PinItemResponse) -> PinOutcome {
+pub fn pin_outcome(response: &wire::SetRetentionRuleResponse) -> PinOutcome {
     PinOutcome {
         retention: file_retention(response.retention.as_ref()),
         download_error: Some(response.download_error.clone()).filter(|e| !e.is_empty()),
@@ -1095,9 +1174,6 @@ fn preflight_issues(report: &LinkPreflightReport) -> Vec<PreflightIssue> {
         return vec![PreflightIssue::PathMissing];
     }
     let mut issues = Vec::new();
-    if report.ignore_rules_unreadable {
-        issues.push(PreflightIssue::IgnoreRulesUnreadable);
-    }
     if !report.is_empty_folder() {
         issues.push(PreflightIssue::NotEmpty {
             entry_count: report.entry_count,
@@ -1193,6 +1269,7 @@ pub fn send_link_status(
         state,
         receiver_device_name: Some(status.receiver_device_name).filter(|n| !n.is_empty()),
         transfer_id: Some(status.transfer_id).filter(|id| !id.is_empty()),
+        failure: transfer_failure(&status.failure),
     })
 }
 
@@ -1219,6 +1296,8 @@ pub fn incoming_transfer(transfer: &InboxTransfer) -> IncomingTransfer {
         can_retry: matches!(transfer.status.as_str(), "failed" | "canceled"),
         link_id: (!transfer.link_id.is_empty()).then(|| transfer.link_id.clone()),
         received_bytes: transfer.received_bytes,
+        files_done: transfer.files_done,
+        files_total: transfer.files_total,
         destination_dir: (!transfer.destination_dir.is_empty())
             .then(|| transfer.destination_dir.clone()),
     }
@@ -1268,6 +1347,7 @@ pub fn outgoing_transfer(
         },
         failure: transfer_failure(&transfer.failure),
         can_retry: transfer.can_retry,
+        bytes_sent: transfer.bytes_sent,
     }
 }
 
@@ -1298,6 +1378,19 @@ pub fn retained_release(
             _ => RetainedReleaseOutcome::Unknown,
         },
         detail: done.detail.clone(),
+    }
+}
+
+pub fn network_policy(policy: &yadorilink_ipc_proto::daemonctl::NetworkPolicy) -> NetworkPolicy {
+    use yadorilink_ipc_proto::daemonctl::NetworkCost as Wire;
+    NetworkPolicy {
+        sync_on_metered: policy.sync_on_metered,
+        cost: match Wire::try_from(policy.cost) {
+            Ok(Wire::Unmetered) => NetworkCost::Unmetered,
+            Ok(Wire::Metered) => NetworkCost::Metered,
+            Ok(Wire::Unknown) | Err(_) => NetworkCost::Unknown,
+        },
+        paused_on_metered: policy.paused_on_metered,
     }
 }
 

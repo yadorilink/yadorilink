@@ -106,6 +106,10 @@ pub struct NativeReplicationHub {
     contest_waits: Mutex<std::collections::HashMap<String, u32>>,
     /// Groups with a retry of their fork pass already waiting to run.
     contest_retries: Mutex<std::collections::HashSet<String>>,
+    /// Contested paths whose local version could not be read into the store, per group. Same
+    /// classification as the scan's unreadable files; see [`Self::contest_blocked_files`].
+    contest_blocked: yadorilink_local_capture::unreadable::UnreadableFileLedger,
+    contest_blocked_update: Mutex<()>,
     /// Test-only: stops the rebootstrap machine at chosen points.
     #[cfg(any(test, feature = "test-support"))]
     rebootstrap_hook: Mutex<Option<crate::native_rebootstrap::Hook>>,
@@ -231,6 +235,32 @@ impl NativeReplicationHub {
         let delay = Duration::from_secs(2u64 << (*count).min(5)).min(Duration::from_secs(60));
         *count = count.saturating_add(1);
         delay
+    }
+
+    /// A fork pass of `group_id` ended and could not settle `blocked`: those paths now stand
+    /// for the group, replacing what an earlier pass listed. One synchronous step under a lock,
+    /// so passes of one group that overlap cannot interleave their updates.
+    pub(crate) fn contest_pass_blocked(
+        &self,
+        group_id: &str,
+        blocked: &[(String, yadorilink_local_capture::unreadable::UnreadableReason)],
+        now: std::time::Instant,
+    ) {
+        let _one_at_a_time = self.contest_blocked_update.lock().unwrap_or_else(|p| p.into_inner());
+        self.contest_blocked.begin_pass(group_id);
+        for (path, reason) in blocked {
+            self.contest_blocked.record_failure(group_id, path, *reason, now);
+        }
+        self.contest_blocked.settle_full_pass(group_id, |_| false);
+    }
+
+    /// The contested paths that have kept the group's forks waiting long enough to need the
+    /// person (the scan's rule for a read that keeps failing).
+    pub(crate) fn contest_blocked_files(
+        &self,
+        group_id: &str,
+    ) -> Vec<yadorilink_local_capture::unreadable::UnreadableFile> {
+        self.contest_blocked.needing_user(group_id)
     }
 
     /// Every contested version of `group_id` is in the store: the next wait starts over.
@@ -963,6 +993,7 @@ pub fn env_for_peer(state: &Arc<DaemonState>, device: &str) -> ReplicationEnv {
         db,
         counters: state.telemetry.replication_counters(),
         local_device_id: state.device_id.clone(),
+        peer_device_id: device.clone(),
         shares_group: Arc::new(shares_group),
         key_for: Arc::new(key_for),
         authority_key: Arc::new(authority_key),
@@ -1403,6 +1434,55 @@ mod ingest_quiet_tests {
 }
 
 #[cfg(test)]
+mod contest_blocked_tests {
+    use super::*;
+    use std::time::Instant;
+    use yadorilink_local_capture::unreadable::UnreadableReason;
+
+    /// A refused read is listed by the first pass; an empty pass (a skipped or unlinked group)
+    /// clears it.
+    #[test]
+    fn a_refused_read_is_listed_at_once_and_an_empty_pass_clears_it() {
+        let hub = NativeReplicationHub::default();
+        let at = Instant::now();
+        let refused = [("a.txt".to_owned(), UnreadableReason::PermissionDenied)];
+        hub.contest_pass_blocked("g", &refused, at);
+        let listed = hub.contest_blocked_files("g");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].reason, UnreadableReason::PermissionDenied);
+        hub.contest_pass_blocked("g", &[], at);
+        assert!(hub.contest_blocked_files("g").is_empty());
+    }
+
+    /// A contested path that keeps failing to enter the store is listed once it has failed long
+    /// enough, stays listed while later passes block on it, and leaves with the first pass that
+    /// does not.
+    #[test]
+    fn a_path_that_keeps_blocking_the_forks_is_listed_until_a_pass_settles_it() {
+        let hub = NativeReplicationHub::default();
+        let t0 = Instant::now();
+        let pass = |at: Instant, blocked: bool| {
+            let paths = if blocked {
+                vec![("a.txt".to_owned(), UnreadableReason::ReadFailed)]
+            } else {
+                Vec::new()
+            };
+            hub.contest_pass_blocked("g", &paths, at);
+        };
+        pass(t0, true);
+        assert!(hub.contest_blocked_files("g").is_empty(), "a first failure is passing");
+        pass(t0 + Duration::from_secs(200), true);
+        pass(t0 + Duration::from_secs(400), true);
+        let listed = hub.contest_blocked_files("g");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].path, "a.txt");
+        assert!(hub.contest_blocked_files("other").is_empty());
+        pass(t0 + Duration::from_secs(460), false);
+        assert!(hub.contest_blocked_files("g").is_empty(), "a settled pass clears the reason");
+    }
+}
+
+#[cfg(test)]
 mod no_answer_tests {
     use super::*;
     use crate::sync_adapter::sync_stack::SyncStack;
@@ -1538,6 +1618,19 @@ mod no_answer_tests {
             alice.clone(),
             alice_stack.clone(),
         ));
+        // What a peer that stopped answering costs is closing all its connections, through this
+        // hook. Counted instead of carried out: the property under test is that the no-answer on
+        // the closed connection does not reach it. Whether the newer connection survives is not a
+        // fact about that: this side's keeper dials a replacement by itself when the first
+        // connection ends before the second is attached (the peer's close can land first), and
+        // that replacement closes the second.
+        let recycled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        alice.native_replication.on_unresponsive(Arc::new({
+            let recycled = recycled.clone();
+            move |_device: &str| {
+                recycled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }));
         let step = Duration::from_secs(20);
         assert!(
             within(step, || alice.native_replication.is_attached(BOB)
@@ -1556,8 +1649,14 @@ mod no_answer_tests {
             .await
             .expect("a second native connection");
         assert!(matches!(attach_dialed(&alice, BOB, second), DialOutcome::Attached));
-        let newer = alice.native_replication.attached_connection(BOB).unwrap();
-        assert!(first.closed_locally(), "the first connection was closed by its replacement");
+        // Either side may be the one whose close lands first: the peer closes its copy of the
+        // first connection as soon as it attaches the second, and under load that close can
+        // reach this side before this side's own attach runs.
+        assert!(
+            first.closed_locally() || first.closed_by_peer(),
+            "the first connection was closed by its replacement: {:?}",
+            first.close_reason()
+        );
 
         // The round that was still running on the first connection finds it closed.
         let env = env_for_peer(&alice, BOB);
@@ -1565,11 +1664,11 @@ mod no_answer_tests {
         assert!(matches!(round, GroupRound::NoAnswer), "{round:?}");
         note_no_answer(&Arc::downgrade(&alice.native_replication), BOB, &first);
 
-        // The newer connection was not taken down with it.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        assert!(
-            !newer.closed_locally(),
-            "the newer connection was closed for the older one's failure"
+        // The peer was not recycled for it: the newer connection is not taken down with the older.
+        assert_eq!(
+            recycled.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the peer's connections were closed for the older connection's failure"
         );
         // Either way the pair is attached with its sessions within seconds.
         assert!(
@@ -1580,5 +1679,71 @@ mod no_answer_tests {
             .await,
             "the pair did not return to attached native replication with sessions"
         );
+    }
+}
+
+#[cfg(test)]
+mod lan_reconnect_tests {
+    use super::*;
+    use crate::sync_adapter::driver::PeerSessionDriver;
+    use crate::sync_adapter::sync_stack::SyncStack;
+    use crate::test_support::sync_stack_fixture::{device, pin};
+    use yadorilink_sync_substrate::testing::SharedAddressBook;
+    use yadorilink_sync_substrate::{AddressDirectory, NetworkConfig};
+
+    /// Two devices that already know each other (pinned and authorized, as after a restart that
+    /// restored the last verified netmap) and have no address directory at all, as when the
+    /// coordination service is unreachable: the session keepers find each other through local
+    /// network discovery alone and attach native replication beside their sessions.
+    ///
+    /// That the authorization itself survives a restart taken with the service unreachable is
+    /// `offline_authorization_tests`' subject; this test starts from the state that leaves
+    /// behind and shows it is enough to reconnect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pinned_peers_reconnect_over_the_lan_without_a_directory() {
+        // The smaller endpoint id is the native dialer.
+        let mut keys: Vec<(u8, [u8; 32])> = (1u8..=12)
+            .map(|b| {
+                (b, ed25519_dalek::SigningKey::from_bytes(&[b; 32]).verifying_key().to_bytes())
+            })
+            .collect();
+        keys.sort_by_key(|(_, public)| *public);
+        let (alice_key, bob_key) = (keys[0].0, keys[1].0);
+        let (alice, _alice_dir) = device("device-alice", alice_key);
+        let (bob, _bob_dir) = device("device-bob", bob_key);
+        pin(&alice, "device-bob", bob_key);
+        pin(&bob, "device-alice", alice_key);
+
+        let lan = SharedAddressBook::new();
+        let on_lan = || NetworkConfig::direct_only().with_lan_source_for_tests(lan.as_lan_source());
+        let alice_stack = Arc::new(SyncStack::spawn(alice.clone(), on_lan()).await.unwrap());
+        let bob_stack = Arc::new(SyncStack::spawn(bob.clone(), on_lan()).await.unwrap());
+        // Each announces itself on the LAN; the coordination directory is told nothing.
+        for stack in [&alice_stack, &bob_stack] {
+            let address = stack.local_address();
+            lan.publish(address.peer(), address.direct_addrs().copied().collect(), Vec::new());
+        }
+        bob.install_peer_session_driver(PeerSessionDriver::start(bob.clone(), bob_stack));
+        alice.install_peer_session_driver(PeerSessionDriver::start(alice.clone(), alice_stack));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let up = alice.native_replication.is_attached("device-bob")
+                && bob.native_replication.is_attached("device-alice")
+                && alice.peers.has_session("device-bob")
+                && bob.peers.has_session("device-alice");
+            if up {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no reconnect over the LAN: alice->bob attached={} session={}, bob->alice attached={} session={}",
+                alice.native_replication.is_attached("device-bob"),
+                alice.peers.has_session("device-bob"),
+                bob.native_replication.is_attached("device-alice"),
+                bob.peers.has_session("device-alice"),
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 }

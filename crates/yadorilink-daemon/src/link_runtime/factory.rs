@@ -34,7 +34,6 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 use yadorilink_filesystem_sync::debounce;
 use yadorilink_filesystem_sync::watcher::FolderWatchSource;
-use yadorilink_fs_platform::ignore_patterns::EffectiveIgnoreSet;
 
 use crate::error::DaemonError;
 use crate::link_runtime::dependencies::LinkRuntimeDependencies;
@@ -142,14 +141,6 @@ impl LinkRuntimeFactory {
         // unlink/relink for the same path. Runs while this link's `LinkSlot` is
         // still `Starting` -- visible (so a racing `stop_link_watch` waits for
         // it via `LinkSlotStartingGuard`) but not yet serving anything.
-        // First, before any step below can create a directory: a witnessed temp vouches for a
-        // missing name only if its directory is there. The order matters (the restore check
-        // below creates missing parents) and is exercised by
-        // `a_lost_parent_directory_is_not_read_as_the_users_delete`, which withdraws, re-creates
-        // the directory and only then repairs.
-        deps.replica_coordinator
-            .withdraw_witnesses_without_their_directory(&group_id, Path::new(&local_path))
-            .map_err(crate::sync_error::SyncError::from)?;
         let stale_root_tmp = deps
             .replica_coordinator
             .remove_recorded_temp_files(&group_id, Path::new(&local_path))
@@ -293,7 +284,7 @@ impl LinkRuntimeFactory {
         // executor task doesn't consume the flushes it produces until after
         // the scan below completes — matching the original ordering guarantee
         // even though accumulation and scanning now happen concurrently.
-        let ignore_set = Arc::new(EffectiveIgnoreSet::load_for_link_root(Path::new(&local_path))?);
+        let ignore_set = Arc::new(deps.ignore_rules.load(&group_id).map_err(std::io::Error::from)?);
         let watcher = watcher_source
             .watch(Path::new(&local_path), ignore_set.clone())
             .map_err(crate::sync_error::SyncError::from)?;

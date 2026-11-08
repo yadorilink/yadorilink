@@ -235,7 +235,8 @@ mod against_a_daemon {
 
     fn linked_state_at(root: &str) -> Arc<DaemonState> {
         let store = Arc::new(SegmentBlockStore::new(tempfile::tempdir().unwrap().keep()).unwrap());
-        let state = DaemonState::build(
+        let state = DaemonState::build_in(
+            tempfile::tempdir().unwrap().keep(),
             "device-a".into(),
             Arc::new(ReplicaCoordinator::open_in_memory().unwrap()),
             store,
@@ -371,13 +372,15 @@ mod against_a_daemon {
         );
     }
 
-    /// The same erased file while the folder's ignore file still excludes
+    /// The same erased file while the folder's ignore rules still exclude
     /// it: outside the plan, like any ignored path, so the rewind can start.
     #[tokio::test]
     async fn an_erased_file_that_is_still_ignored_stays_outside_the_plan() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join(".yadorilinkignore"), "steady.txt\n").unwrap();
         let state = linked_state_at(root.path().to_str().unwrap());
+        yadorilink_fs_platform::ignore_patterns::IgnoreRulesStore::new(state.config_dir())
+            .write(GROUP, "steady.txt\n")
+            .unwrap();
         erase_like_the_ignore_sweep(&state, "steady.txt");
 
         let preview = preview_rewind(state.clone(), GROUP.into(), 500, true).await.unwrap();

@@ -1,6 +1,6 @@
 //! Ignoring a path is local, and relaying is not.
 //!
-//! `.yadorilinkignore` says what this device projects onto its own disk. It
+//! The device's ignore rules say what this device projects onto its own disk. It
 //! says nothing about what the group holds, and nothing about what this device
 //! owes its other peers. A device in the middle of a chain that dropped an
 //! ignored peer's Change instead of relaying it would silently partition the
@@ -31,6 +31,7 @@ use std::time::Duration;
 use support::wait_until_with_context;
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
+use yadorilink_fs_platform::ignore_patterns::IgnoreRulesStore;
 use yadorilink_local_storage::SegmentBlockStore;
 
 const GROUP: &str = "ignored-relay-group";
@@ -100,7 +101,7 @@ async fn a_path_one_device_ignores_still_reaches_the_peers_behind_it() {
     // Written before the link starts so the pattern is in force from the
     // first scan — a file adopted first and ignored second is a different
     // property (`ignore_pattern_rescan.rs` states that one).
-    std::fs::write(device_b.path(".yadorilinkignore"), "*.log\n").unwrap();
+    IgnoreRulesStore::new(device_b.state.config_dir()).write(GROUP, "*.log\n").unwrap();
 
     start_watching(&device_a);
     start_watching(&device_b);
@@ -205,7 +206,7 @@ async fn incoming_explicit_directory_on_locally_ignored_path_follows_file_rule()
     let device_a = setup_device("device-a");
     let device_b = setup_device("device-b");
     let device_c = setup_device("device-c");
-    std::fs::write(device_b.path(".yadorilinkignore"), "build/\n").unwrap();
+    IgnoreRulesStore::new(device_b.state.config_dir()).write(GROUP, "build/\n").unwrap();
 
     start_watching(&device_a);
     start_watching(&device_b);

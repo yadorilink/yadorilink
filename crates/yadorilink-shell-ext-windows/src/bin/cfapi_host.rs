@@ -7,14 +7,11 @@
 //! Usage:
 //!  yadorilink-cfapi-host            run the host (default)
 //!  yadorilink-cfapi-host --unregister-all
-//!                                   unregister every sync root this host has registered (the
-//!                                   uninstall path), then exit; does not need the daemon
+//!                                   unregister every sync root this host has registered ("Remove
+//!                                   from this PC"), then exit; does not need the daemon
 //!  yadorilink-cfapi-host --unregister-legacy-roots
 //!                                   the same for the record an earlier build left in
 //!                                   %LOCALAPPDATA%\yadorilink (on request only)
-//!  yadorilink-cfapi-host --guard-package-removal <package family> <host pid>
-//!                                   started by the running host itself (see `package_removal`);
-//!                                   not for people
 //!
 //! Both unregister commands exit 1 when a recorded root could not be unregistered, so the answer
 //! can be relied on.
@@ -45,11 +42,12 @@ use yadorilink_ipc_proto::shellipc::{ProviderFolder, ProviderRemoval};
 use yadorilink_shell_ext::dir_watch;
 use yadorilink_shell_ext::host_paths;
 use yadorilink_shell_ext::provider_authoring::{self, Authoring, WindowsLocal};
-use yadorilink_shell_ext::provider_namespace::{EvictOutcome, ShownItems};
+use yadorilink_shell_ext::provider_namespace::{EvictOutcome, PinOutcome, PinWish, ShownItems};
 use yadorilink_shell_ext::provider_session::{self, SessionEvent};
 use yadorilink_windows_provider_policy::host::{
-    encode_shown_record, hex, read_shown_at, unregister_recorded, Backend, Host, HostEvent,
-    LoadedShown, POLL_INTERVAL,
+    encode_pins_record, encode_shown_record, encode_untrusted_pins_record, hex, read_pins_at,
+    read_shown_at, unregister_recorded, Backend, Host, HostEvent, LoadedShown, Registration,
+    POLL_INTERVAL,
 };
 
 /// `--unregister-legacy-roots`: the same cleanup against the record an earlier build left in
@@ -58,7 +56,7 @@ use yadorilink_windows_provider_policy::host::{
 fn unregister_legacy_roots() -> bool {
     use yadorilink_fs_platform::state_dir::{legacy_sync_roots_record, Env};
     match legacy_sync_roots_record(&Env::from_process()) {
-        Some(file) => unregister_recorded_roots(&file, Unregister::Everything),
+        Some(file) => unregister_recorded_roots(&file),
         None => {
             println!("yadorilink-cfapi-host: LOCALAPPDATA is not set; nothing to unregister");
             true
@@ -68,7 +66,7 @@ fn unregister_legacy_roots() -> bool {
 
 fn unregister_all() -> bool {
     let file = host_paths::roots_registry_file();
-    let gone = unregister_recorded_roots(&file, Unregister::Everything);
+    let gone = unregister_recorded_roots(&file);
     use yadorilink_fs_platform::state_dir::{
         legacy_sync_roots_notice, legacy_sync_roots_record_in_use, Env,
     };
@@ -79,22 +77,9 @@ fn unregister_all() -> bool {
     gone
 }
 
-/// Which recorded roots an unregister run may unregister, and what happens to the record.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Unregister {
-    /// Every recorded root; the record is retired, so the roots are forgotten.
-    Everything,
-    /// The cleanup after the package was uninstalled. Not a root that holds an item whose content
-    /// is not on this PC (without a provider that item cannot be read, so the root stays
-    /// registered for a reinstall to serve). The record is kept: a reinstall finds it and puts
-    /// each root back on the folder where it was, which holds the user's files, instead of
-    /// starting a second folder next to it.
-    AfterUninstall,
-}
-
-/// `true`: every recorded root is unregistered (or was not registered any more) and, for
-/// [`Unregister::Everything`], the record is retired; or there was no record.
-fn unregister_recorded_roots(file: &Path, which: Unregister) -> bool {
+/// `true`: every recorded root is unregistered (or was not registered any more), and the record is
+/// retired so the roots are forgotten; or there was no record.
+fn unregister_recorded_roots(file: &Path) -> bool {
     let file = file.to_path_buf();
     let contents = match generation::read_latest(&file, |text| unseal(text).map(str::to_string)) {
         generation::Latest::Loaded { value, .. } => value,
@@ -110,16 +95,9 @@ fn unregister_recorded_roots(file: &Path, which: Unregister) -> bool {
     let gone = unregister_recorded(
         &contents,
         &mut yadorilink_shell_ext::cfapi::registered_root_identity,
-        &mut |path| {
-            if which == Unregister::AfterUninstall
-                && yadorilink_shell_ext::package_removal::holds_online_only_items(path)
-            {
-                return Err("it holds items that are only online (or cannot be read to the end); left registered".into());
-            }
-            yadorilink_shell_ext::cfapi::unregister(path).map_err(|e| format!("{e:?}"))
-        },
+        &mut |path| yadorilink_shell_ext::cfapi::unregister(path).map_err(|e| format!("{e:?}")),
     );
-    if gone && which == Unregister::Everything {
+    if gone {
         if let Err(e) = generation::remove_all(&file) {
             // Not retired: the record stays as the newest it was, and the next run starts from it.
             eprintln!("yadorilink-cfapi-host: cannot retire {}: {e}", file.display());
@@ -127,60 +105,6 @@ fn unregister_recorded_roots(file: &Path, which: Unregister) -> bool {
         }
     }
     gone
-}
-
-/// One line of the guardian's own record, `<state dir>\host\guardian.log` (it has no console; the
-/// file is what tells why a root stayed registered after an uninstall). Kept
-/// short: it restarts when it grows past 16 KiB. Best effort.
-fn guardian_log(line: &str) {
-    use std::io::Write;
-    let file = host_paths::container().join("guardian.log");
-    let keep = std::fs::metadata(&file).is_ok_and(|m| m.len() < 16 * 1024);
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    if let Ok(mut out) = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(keep)
-        .truncate(!keep)
-        .open(&file)
-    {
-        let _ = writeln!(out, "{stamp} {line}");
-    }
-}
-
-/// The guardian the running host starts (see `package_removal`): it has no package identity and
-/// outlives the package. Once the host has ended it watches the package family; if the package was
-/// uninstalled it unregisters the roots.
-fn guard_package_removal(family: &str, host_pid: u32) -> bool {
-    use yadorilink_shell_ext::package_removal::{
-        family_installed, removal_confirmed, remove_helper, wait_for_exit, GRACE, POLL, STABLE,
-    };
-    wait_for_exit(host_pid);
-    guardian_log(&format!("host {host_pid} ended; watching {family} for {GRACE:?}"));
-    let removed =
-        removal_confirmed(&mut || family_installed(family), POLL, GRACE, STABLE, &mut || {
-            std::thread::sleep(POLL)
-        });
-    let clean = if removed {
-        println!("yadorilink-cfapi-host: {family} was uninstalled; unregistering its sync roots");
-        let clean = unregister_recorded_roots(
-            &host_paths::roots_registry_file(),
-            Unregister::AfterUninstall,
-        );
-        guardian_log(&format!("{family} was uninstalled; roots unregistered cleanly: {clean}"));
-        clean
-    } else {
-        guardian_log(&format!(
-            "{family} is still installed after the grace period; nothing touched"
-        ));
-        true
-    };
-    if let Ok(exe) = std::env::current_exe() {
-        remove_helper(&exe);
-    }
-    clean
 }
 
 /// `ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT` as an `HRESULT`: the path is not a sync root.
@@ -230,6 +154,35 @@ fn write_shown(root_id: &[u8], shown: &ShownItems) -> bool {
     written.is_ok()
 }
 
+/// Forgets what was recorded of a root whose registration was lost: the items it showed, the pin
+/// marks, and the journal of an operation that was sent and not answered. The last matters as much
+/// as the others: it was authored against the old registration, and replaying it after the root is
+/// registered again could commit a delete the person never made.
+fn forget_authoring_state(dir: &Path) -> bool {
+    // A root that was never served has no state directory yet: there is nothing to forget (the
+    // durable removals below cannot identify the volume of a directory that is not there).
+    if !dir.exists() {
+        return true;
+    }
+    let mut forgotten = true;
+    for name in ["shown", "pins"] {
+        if let Err(e) = generation::remove_all(&dir.join(name)) {
+            eprintln!("yadorilink-cfapi-host: could not forget the {name} record: {e}");
+            forgotten = false;
+        }
+    }
+    // Durably: a removal that a crash could bring back would replay the delete.
+    match yadorilink_fs_platform::durable_dir::remove_file_durably(&dir.join("pending")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            eprintln!("yadorilink-cfapi-host: could not forget the unanswered operation: {e}");
+            forgotten = false;
+        }
+    }
+    forgotten
+}
+
 fn authoring_state_dir(root_id: &[u8]) -> PathBuf {
     host_paths::container().join("authoring").join(hex(root_id))
 }
@@ -243,6 +196,20 @@ impl Backend for RealBackend {
     fn register_and_connect(&mut self, root_id: &[u8], path: &Path) -> Result<(), String> {
         yadorilink_shell_ext::cfapi::register_and_connect_provider(root_id, path)
             .map_err(|e| format!("{e:?}"))
+    }
+
+    fn root_registration(&mut self, root_id: &[u8], path: &Path) -> Registration {
+        match yadorilink_shell_ext::cfapi::registered_root_identity(path) {
+            Ok(Some(identity)) if identity == root_id => Registration::Ours,
+            // Not a sync root any more, or one registered with another identity.
+            Ok(_) => Registration::Lost,
+            // Another provider's root, or a reading that failed: not this host's to judge.
+            Err(_) => Registration::Unknown,
+        }
+    }
+
+    fn forget_root_state(&mut self, root_id: &[u8]) -> bool {
+        forget_authoring_state(&authoring_state_dir(root_id))
     }
 
     fn unregister(&mut self, path: &Path) -> Result<(), String> {
@@ -267,6 +234,19 @@ impl Backend for RealBackend {
 
     fn evict(&mut self, path: &Path, item_id: &[u8]) -> Result<(), EvictOutcome> {
         yadorilink_shell_ext::provider_namespace::evict(path, item_id)
+    }
+
+    fn pin(&mut self, path: &Path, item_id: Option<&[u8]>, wish: PinWish) -> PinOutcome {
+        yadorilink_shell_ext::provider_namespace::pin(path, item_id, wish)
+    }
+
+    fn pin_mark(&mut self, path: &Path) -> Option<PinWish> {
+        use yadorilink_fs_platform::cloud_files::{attributes_of, pin_mark, PinMark};
+        attributes_of(path).map(|attributes| match pin_mark(attributes) {
+            PinMark::Pinned => PinWish::Keep,
+            PinMark::Unpinned => PinWish::OnlineOnly,
+            PinMark::Unset => PinWish::Clear,
+        })
     }
 
     fn materialized(&mut self, shown: &ShownItems) -> HashSet<Vec<u8>> {
@@ -300,6 +280,28 @@ impl Backend for RealBackend {
 
     fn save_shown(&mut self, root_id: &[u8], shown: &ShownItems) -> bool {
         write_shown(root_id, shown)
+    }
+
+    fn load_pins(&mut self, root_id: &[u8]) -> Option<std::collections::HashMap<Vec<u8>, PinWish>> {
+        read_pins_at(&authoring_state_dir(root_id).join("pins"))
+    }
+
+    fn save_pins(
+        &mut self,
+        root_id: &[u8],
+        marks: Option<&std::collections::HashMap<Vec<u8>, PinWish>>,
+    ) -> bool {
+        // A new sealed generation, published before it replaces the previous one (the same way
+        // the shown record is): a record torn by a crash is never read as marks.
+        let file = authoring_state_dir(root_id).join("pins");
+        let written = generation::publish_next(
+            &file,
+            &marks.map_or_else(encode_untrusted_pins_record, encode_pins_record),
+        );
+        if let Err(e) = &written {
+            eprintln!("yadorilink-cfapi-host: could not record the pin marks: {e}");
+        }
+        written.is_ok()
     }
 
     fn volume_identified(&mut self, path: &Path) -> Result<(), String> {
@@ -427,31 +429,7 @@ fn main() {
     if args.iter().any(|a| a == "--unregister-all") {
         std::process::exit(i32::from(!unregister_all()));
     }
-    if let Some(at) =
-        args.iter().position(|a| a == yadorilink_shell_ext::package_removal::GUARD_FLAG)
-    {
-        let (Some(family), Some(pid)) =
-            (args.get(at + 1), args.get(at + 2).and_then(|p| p.parse::<u32>().ok()))
-        else {
-            eprintln!(
-                "yadorilink-cfapi-host: {} needs the package family and the host process id",
-                args[at]
-            );
-            std::process::exit(2);
-        };
-        std::process::exit(i32::from(!guard_package_removal(family, pid)));
-    }
-
     println!("yadorilink-cfapi-host: starting (poll interval {POLL_INTERVAL:?})");
-    // The guardian that unregisters the sync roots if the package is uninstalled while this runs.
-    match yadorilink_shell_ext::package_removal::watch() {
-        Ok(true) => {
-            println!("yadorilink-cfapi-host: will unregister its sync roots if the package is uninstalled")
-        }
-        Ok(false) => {}
-        // The host still serves the roots; only the cleanup at uninstall is missing.
-        Err(e) => eprintln!("yadorilink-cfapi-host: no cleanup at uninstall: {e}"),
-    }
     spawn_dehydrate_server();
     let (events, inbox) = std::sync::mpsc::channel::<HostEvent>();
     let session = provider_session::spawn(events.clone());
@@ -488,6 +466,12 @@ fn main() {
                 require_shown_version,
             })) => {
                 host.on_evict(&root, &item, &request_id, &require_shown_version);
+            }
+            Ok(HostEvent::Session(SessionEvent::Pin { root, item, request_id, wish })) => {
+                host.on_pin(&root, &item, &request_id, wish);
+            }
+            Ok(HostEvent::Session(SessionEvent::PinPlan { root, entries })) => {
+                host.on_pin_plan(&root, &entries);
             }
             Ok(HostEvent::Session(SessionEvent::EvidenceTick { root, seq })) => {
                 host.on_evidence(&root, seq);
@@ -578,6 +562,68 @@ mod tests {
     }
 
     /// Real Cloud Files: the identity stored at registration is what `--unregister-all` checks.
+    #[test]
+    fn forgetting_a_lost_root_removes_its_records_and_its_unanswered_operation() {
+        let dir = temp_dir("forget-state");
+        generation::publish_next(&dir.join("shown"), "shown record").unwrap();
+        generation::publish_next(&dir.join("shown"), "shown record 2").unwrap();
+        generation::publish_next(&dir.join("pins"), "pins record").unwrap();
+        std::fs::write(dir.join("pending"), "a journaled delete").unwrap();
+        std::fs::write(dir.join("unrelated"), "x").unwrap();
+
+        assert!(forget_authoring_state(&dir));
+        assert!(matches!(read_shown_at(&dir.join("shown")), LoadedShown::Missing));
+        assert_eq!(read_pins_at(&dir.join("pins")), None);
+        assert!(!dir.join("pending").exists(), "an unanswered delete survived to be replayed");
+        assert!(dir.join("unrelated").exists());
+        // Idempotent: nothing there is not a failure.
+        assert!(forget_authoring_state(&dir));
+        // A root that was never served has no state directory at all.
+        assert!(forget_authoring_state(&dir.join("never-served")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Real Cloud Files: unregistering a sync root takes its unhydrated placeholders with it (the
+    /// operating system deletes them), and the host's registration check then reads the root as lost.
+    /// What the host sees as "the files are gone" is therefore not the person deleting them.
+    #[test]
+    #[ignore = "real Cloud Files state; run on a Windows machine"]
+    fn an_unregistered_root_loses_its_placeholders_and_the_host_reads_the_registration_as_lost() {
+        let dir = temp_dir("registration-lost-real");
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let id = vec![0x6b; 16];
+        yadorilink_shell_ext::cfapi::register_and_connect_provider(&id, &root).unwrap();
+        for (n, name) in ["free1.bin", "free2.bin", "keep1.bin"].iter().enumerate() {
+            yadorilink_shell_ext::cfapi::create_item_placeholder(
+                &yadorilink_fs_platform::durable_dir::NoLedger,
+                &root,
+                name,
+                format!("item-{n}").as_bytes(),
+                1 << 30,
+                0,
+                false,
+            )
+            .unwrap();
+        }
+        let mut backend = RealBackend { events: std::sync::mpsc::channel().0 };
+        assert_eq!(backend.root_registration(&id, &root), Registration::Ours);
+        assert_eq!(
+            backend.root_registration(&[1; 16], &root),
+            Registration::Lost,
+            "another identity"
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 3);
+
+        // The registration goes (the lab's experiment did this): the placeholders go with it.
+        yadorilink_shell_ext::cfapi::unregister(&root).unwrap();
+        let left = std::fs::read_dir(&root).map(|d| d.count()).unwrap_or(0);
+        println!("REGISTRATION-LOST placeholders left after unregister: {left}");
+        assert_eq!(left, 0, "unhydrated placeholders survived the unregistration");
+        assert_eq!(backend.root_registration(&id, &root), Registration::Lost);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     #[ignore = "real Cloud Files state; run on a Windows machine"]
     fn a_registered_root_tells_its_identity_and_a_plain_folder_does_not() {

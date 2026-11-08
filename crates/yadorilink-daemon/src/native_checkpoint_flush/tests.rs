@@ -69,7 +69,7 @@ async fn one_flush_publishes_every_incarnation_of_the_device_and_a_second_finds_
 }
 
 #[tokio::test]
-async fn a_refusing_source_leaves_the_batch_pending_for_the_same_retry() {
+async fn an_unreachable_source_leaves_the_batch_pending_for_the_same_retry() {
     let c = db();
     let delta = author_delta(&c, 1, "a.txt");
     let mut source = FakeSource::new();
@@ -87,7 +87,31 @@ async fn a_refusing_source_leaves_the_batch_pending_for_the_same_retry() {
     .unwrap()
     .outcome;
 
-    assert_eq!(outcome, FlushOutcome::Refused);
+    assert_eq!(outcome, FlushOutcome::Unreachable);
+    assert!(!published(&c, &delta));
+}
+
+#[tokio::test]
+async fn a_source_that_says_the_device_may_not_publish_is_told_apart_from_an_unreachable_one() {
+    let c = db();
+    let delta = author_delta(&c, 1, "a.txt");
+    let mut source = FakeSource::new();
+    source.refuse = true;
+    source.not_authorized = true;
+
+    let flush = flush_pending_native_checkpoint(
+        &c,
+        &source,
+        GROUP,
+        DEVICE,
+        &device_vk(),
+        &resolver_for(&source),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(flush.outcome, FlushOutcome::NotAuthorized);
+    assert_eq!(flush.pending, 1);
     assert!(!published(&c, &delta));
 }
 

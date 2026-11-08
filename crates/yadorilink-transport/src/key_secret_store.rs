@@ -599,9 +599,24 @@ pub enum KeyMirror {
 impl KeyMirror {
     /// The desktop mapping of the process environment: `YADORILINK_DISABLE_OS_KEYRING=1`
     /// disables the mirror, anything else (or unset) keeps it.
+    ///
+    /// On macOS an executable outside the signed app bundle cannot use the keychain (it cannot
+    /// carry the entitlement; every access fails with `-34018`), so there the mirror is off by
+    /// the same location rule that makes the file the default credential store. Left on, every
+    /// delete of the mirror (logout, purge, uninstall) would fail forever.
     #[must_use]
     pub fn from_env() -> Self {
-        Self::from_disable_flag(std::env::var("YADORILINK_DISABLE_OS_KEYRING").ok().as_deref())
+        let mirror =
+            Self::from_disable_flag(std::env::var("YADORILINK_DISABLE_OS_KEYRING").ok().as_deref());
+        // apple-cfg: macos-only the keychain entitlement is a macOS app-bundle matter
+        if cfg!(target_os = "macos") {
+            let exe = std::env::current_exe().unwrap_or_default();
+            let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+            if !yadorilink_fs_platform::app_bundle::is_app_bundle_path(&exe) {
+                return Self::Disabled;
+            }
+        }
+        mirror
     }
 
     /// The value of the disable flag, already read.

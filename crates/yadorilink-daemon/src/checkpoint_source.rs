@@ -53,10 +53,32 @@ pub trait CheckpointSource: Send + Sync {
     ) -> CheckpointFuture<'a>;
 }
 
+/// Why no checkpoint was obtained. The two cases are told apart because they need different words
+/// and different hope: an unreachable service is waited out, a device that is no longer allowed to
+/// publish is not helped by waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointRefusal {
+    /// The service did not answer, or answered with something that is not a decision (a server
+    /// error, a bad response, a rejected credential): nothing was decided.
+    Unreachable,
+    /// The service answered 403: this device may not publish in the group (a viewer, a revoked
+    /// device, or a device the account does not own).
+    NotAuthorized,
+    /// The service answered, and not with a decision or a refusal of this device's role: the
+    /// Terms are not accepted, the credential was refused, the route or request is not accepted,
+    /// the answer could not be read. Waiting does not by itself help; a sign-in or an update may.
+    Rejected,
+}
+
 /// What [`CheckpointSource::request_authorization_checkpoint`] resolves to: the signed checkpoint and
-/// its signature, or `None` when none could be obtained.
-pub type CheckpointFuture<'a> =
-    Pin<Box<dyn Future<Output = Option<(AuthorizationCheckpoint, [u8; 64])>> + Send + 'a>>;
+/// its signature, or why none was obtained.
+pub type CheckpointFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<(AuthorizationCheckpoint, [u8; 64]), CheckpointRefusal>>
+            + Send
+            + 'a,
+    >,
+>;
 
 /// Resolves the authority key for a checkpoint's `(key_id, policy_head)`.
 pub type AuthorityKeyResolver<'a> =
@@ -138,18 +160,23 @@ pub enum FlushOutcome {
     /// A checkpoint was obtained (or replayed), verified against every
     /// Change it covers, and evidence attached for all of them.
     Flushed { batch_size: usize, checkpoint_seq: u64 },
-    /// The source refused or was unreachable — e.g. not currently a
-    /// writer. The pending set is unchanged; a later call will retry the
-    /// SAME batch (assuming nothing new was captured meanwhile) via the
+    /// The source did not answer (or did not decide). The pending set is unchanged; a later
+    /// call will retry the SAME batch (assuming nothing new was captured meanwhile) via the
     /// same deterministic `request_id`.
-    Refused,
+    Unreachable,
+    /// The source answered that this device may not publish in this group. The pending set is
+    /// unchanged and stays local; it is retried in case the role is restored.
+    NotAuthorized,
+    /// The source answered, but not with a decision about the role (see
+    /// [`CheckpointRefusal::Rejected`]). The pending set is unchanged and is retried.
+    Rejected,
     /// Shutdown began while the batch was being verified. Nothing was
     /// attached; the next flush redoes the same batch.
     Interrupted,
 }
 
 /// Everything that can stop a flush from attaching evidence. Distinct
-/// from [`FlushOutcome::Refused`] on purpose: a refusal is an EXPECTED
+/// from [`FlushOutcome::Unreachable`] and [`FlushOutcome::NotAuthorized`] on purpose: a refusal is an EXPECTED
 /// outcome (not currently a writer, transient network failure) a caller
 /// retries later exactly as-is; [`FlushError::CheckpointDidNotVerify`] is
 /// NOT expected under normal operation — it means the coordination plane

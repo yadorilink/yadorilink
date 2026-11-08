@@ -11,10 +11,12 @@ use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_ipc_proto::shellipc::shell_ipc_message::Payload;
 use yadorilink_ipc_proto::shellipc::{
     DomainEvidence, EvictResult, ListProviderFoldersRequest, NextProviderDownloadsRequest,
-    NextProviderDownloadsResponse, ProviderDomainState, ProviderEvictDone, ProviderFolder,
-    ProviderMaterializedReport, ProviderRemoval, ProviderSignalDone, ShellIpcMessage,
+    NextProviderDownloadsResponse, PinResult, ProviderDomainState, ProviderEvictDone,
+    ProviderFolder, ProviderMaterializedReport, ProviderPinDone, ProviderRemoval,
+    ProviderSignalDone, ShellIpcMessage,
 };
 use yadorilink_windows_provider_policy::host::{HostEvent, Reports};
+use yadorilink_windows_provider_policy::namespace_policy::PinWish;
 use yadorilink_windows_provider_policy::provider_client::{runtime, Connect};
 use yadorilink_windows_provider_policy::provider_session::{event_of, SessionEvent};
 
@@ -90,6 +92,19 @@ impl Reports for Link {
             result: result as i32,
             error: error.to_string(),
         }));
+    }
+
+    fn pin_done(&self, root: &[u8], request_id: &[u8], result: PinResult, error: &str) {
+        self.send(Payload::ProviderPinDone(ProviderPinDone {
+            root_id: root.to_vec(),
+            request_id: request_id.to_vec(),
+            result: result as i32,
+            error: error.to_string(),
+        }));
+    }
+
+    fn pin_observed(&self, _root: &[u8], _item: &[u8], _wish: PinWish) {
+        // This host has no pin marks to observe.
     }
 
     fn materialized(&self, report: ProviderMaterializedReport) {

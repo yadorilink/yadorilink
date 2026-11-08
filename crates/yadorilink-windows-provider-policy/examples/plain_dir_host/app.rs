@@ -148,6 +148,12 @@ pub fn run() {
                 request_id,
                 require_shown_version,
             })) => host.on_evict(&root, &item, &request_id, &require_shown_version),
+            Ok(HostEvent::Session(SessionEvent::Pin { root, item, request_id, wish })) => {
+                host.on_pin(&root, &item, &request_id, wish);
+            }
+            Ok(HostEvent::Session(SessionEvent::PinPlan { root, entries })) => {
+                host.on_pin_plan(&root, &entries);
+            }
             Ok(HostEvent::Session(SessionEvent::EvidenceTick { root, seq })) => {
                 host.on_evidence(&root, seq);
             }

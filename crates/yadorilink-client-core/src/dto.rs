@@ -21,13 +21,14 @@ pub use convert::{
     appcast_item_check, attention_reason, conflict_summary, daemon_identity, file_availability,
     file_retention, file_version, file_versions, folder_detail, folder_restore_outcome,
     folder_summary, gc_report, handoff_summary, incoming_transfer, invite_summary, member_summary,
-    membership_outcome, outgoing_transfer, pending_approval_summary, pending_invite_summary,
-    pin_outcome, preflight_result, primary_transfer_accepted, primary_transfer_summary,
-    received_transfer, retained_original, retained_release, rewind_preview, rewind_run,
-    rewind_run_missing, rewind_start, safe_stop_outcome, send_link, send_link_preview,
-    send_link_status, sent_transfer, share_summary, space_management, space_reclaim_preview,
-    start_over_progress, status_dimensions_json, status_snapshot, trashed_file, update_config,
-    update_download_guidance, update_status, RUN_MISSING_MESSAGE,
+    membership_outcome, name_last_change_devices, network_policy, outgoing_transfer,
+    pending_approval_summary, pending_invite_summary, pin_outcome, preflight_result,
+    primary_transfer_accepted, primary_transfer_summary, received_transfer, retained_original,
+    retained_release, rewind_preview, rewind_run, rewind_run_missing, rewind_start,
+    safe_stop_outcome, send_link, send_link_preview, send_link_status, sent_transfer,
+    share_summary, space_management, space_reclaim_preview, start_over_progress,
+    status_dimensions_json, status_snapshot, trashed_file, update_config, update_download_guidance,
+    update_status, RUN_MISSING_MESSAGE,
 };
 
 // ---- construction -------------------------------------------------------
@@ -106,6 +107,15 @@ pub struct AccountStatus {
     /// A start over as a new device was begun and is not finished: sign in if signed out, then
     /// call `start_over_as_new_device` again to register and join the folders again.
     pub start_over_pending: bool,
+    /// The signed-in account's email, as the coordination service reports it. `None` when signed
+    /// out, when the service did not answer, or when the provider gave none.
+    pub email: Option<String>,
+    /// Which provider the account signs in with: `"google"` or `"apple"`. `None` when signed out,
+    /// when the service did not answer, or for a service that does not say. Signing in with the
+    /// other provider is a separate account: the apps show this so that is not a surprise.
+    pub sign_in_provider: Option<String>,
+    /// The name the provider delivered at the first sign-in (Apple); `None` otherwise.
+    pub display_name: Option<String>,
 }
 
 /// How far `start_over_as_new_device` got.
@@ -140,7 +150,24 @@ pub struct StartOverReport {
 pub struct NotRejoined {
     pub local_path: String,
     pub group_id: String,
+    /// The English sentence, for the command line and the log; a front end words `reason`.
     pub message: String,
+    pub reason: RejoinReason,
+}
+
+/// Why a linked folder was not joined to its group again after a start over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum RejoinReason {
+    /// A provider folder: it is joined again from the provider folder list.
+    ProviderFolder,
+    /// This host does not join a folder again by itself: accept an invite to its group again,
+    /// or unlink the folder.
+    HostCannotRejoin,
+    /// This account does not own the folder group: accept a new invite to it.
+    NotGroupOwner,
+    /// Joining the group again failed; start over again retries it.
+    JoinFailed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -230,6 +257,11 @@ pub struct LoginOptions {
     /// Ends the flow with a network failure when it has not finished in
     /// time. `None` waits as long as each step allows.
     pub overall_timeout: Option<Duration>,
+    /// The name this computer is registered under when the sign-in registers it (a first
+    /// sign-in); `None`, or a blank name, keeps the computer's own name. A re-sign-in of an
+    /// installation that already has a device ignores it.
+    #[cfg_attr(feature = "ffi", uniffi(default = None))]
+    pub device_name: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -416,6 +448,9 @@ pub struct ProductSummary {
     /// The one action to offer for `state`: resume when paused, the most severe problem's
     /// action when something needs the user, otherwise none.
     pub next_action: Option<ProductAction>,
+    /// When the daemon last found this scope up to date (now while it is). `None` until it has
+    /// been found so since the daemon started; show it only when present, never as "never synced".
+    pub last_synced: Option<SystemTime>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -545,6 +580,9 @@ pub struct AvailabilitySummary {
     pub offline_device_ids: Vec<String>,
     /// Online devices that hold a copy but run another protocol version; in neither list above.
     pub update_required_device_ids: Vec<String>,
+    /// The members of `update_required_device_ids` that run a newer version than this device:
+    /// update this device. The others are older: update them.
+    pub newer_peer_device_ids: Vec<String>,
 }
 
 /// Whether the data is still elsewhere if this device is lost. Independent of [`Availability`]:
@@ -617,6 +655,16 @@ pub struct FolderSummary {
     /// When a timed pause ends by itself; `None` when not paused or paused until resumed.
     pub paused_until: Option<SystemTime>,
     pub conflict_count: u64,
+    /// Changes made on this device that no other device is known to hold yet: what a menu bar
+    /// shows as "N pending changes" while offline. Counts changes, not files; 0 when the folder
+    /// has no other device.
+    pub pending_local_changes: u64,
+    /// The device the folder's newest recorded change came from, when it is another device (`None`
+    /// when that change was made on this device, or its author is not known here): the 'from MacBook
+    /// Air' beside the time of the last sync. The front end shows it as it is and derives nothing.
+    pub last_change_origin_device_id: Option<String>,
+    /// Its name, from the account's device list; `None` when the list could not be read.
+    pub last_change_origin_device_name: Option<String>,
     pub hydrated_file_count: u64,
     pub placeholder_file_count: u64,
     pub hydrating_file_count: u64,
@@ -667,6 +715,37 @@ pub struct FolderSummary {
     /// How many more unreadable files exist than `unreadable_files` names. The total is
     /// `unreadable_files.len() + unreadable_files_more`.
     pub unreadable_files_more: u64,
+    /// This device's retention rules for the folder and how far the online-only ones have been applied.
+    pub retention: RetentionApplySummary,
+}
+
+/// Whether the folder's online-only rules have been carried out on this device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum RetentionApplyState {
+    /// No online-only rule applies, or the daemon does not say: there is nothing to show.
+    None,
+    /// At least one online-only rule is still being applied or waits for a retry.
+    Pending,
+    /// Every online-only rule has been applied.
+    Done,
+}
+
+/// The folder's retention rules on this device. The counts are the daemon's: a front end shows them
+/// as they are and derives nothing from them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct RetentionApplySummary {
+    /// How many explicit rules of either kind the folder has.
+    pub rule_count: u64,
+    pub state: RetentionApplyState,
+    /// Files the online-only rules freed, or found already without a local copy.
+    pub freed: u64,
+    /// Files left as they are on purpose (unsynced edits, held or conflicted, open). Shown, never
+    /// hidden in the totals.
+    pub left_on_purpose: u64,
+    /// Files not tried yet because the host was not ready; the rule retries by itself.
+    pub to_retry: u64,
 }
 
 /// Most unreadable files a folder summary names; `unreadable_files_more` counts the rest.
@@ -881,6 +960,29 @@ pub struct SpaceManagement {
     pub enabled: bool,
 }
 
+/// What the host says the connection is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum NetworkCost {
+    /// Not reported, or the host cannot tell; read as not metered.
+    Unknown,
+    Unmetered,
+    /// Cellular or otherwise metered.
+    Metered,
+}
+
+/// Whether sync with peers may use the connection the host reported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct NetworkPolicy {
+    /// The user's setting: sync even on a metered connection. Off by default.
+    pub sync_on_metered: bool,
+    /// What the host last reported (`Unknown` until it does and after a daemon restart).
+    pub cost: NetworkCost,
+    /// Sync with peers is paused right now because the connection is metered.
+    pub paused_on_metered: bool,
+}
+
 /// What automatic space management says about one downloaded item.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
@@ -953,6 +1055,8 @@ pub enum UpdateState {
     Checking,
     Available,
     HeldBack,
+    /// The new version cannot open this device's data.
+    StateIncompatible,
     KillSwitched,
     Downloading,
     Downloaded,
@@ -961,7 +1065,9 @@ pub enum UpdateState {
     Failed,
     Deferred,
     UpToDate,
-    Unknown { raw: String },
+    Unknown {
+        raw: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1009,6 +1115,12 @@ pub struct StatusSnapshot {
     pub volumes: Vec<VolumeSummary>,
     pub storage: StorageSummary,
     pub update: UpdateBadge,
+    /// Sync with peers is paused because the connection is metered and the user has not allowed
+    /// sync on a metered connection.
+    pub paused_on_metered: bool,
+    /// The host has reported the network cost since the engine started. False after an engine
+    /// restart until it reports again: the host reports again when it sees false.
+    pub network_cost_known: bool,
     pub recent_errors: Vec<RecentError>,
 }
 
@@ -1127,6 +1239,13 @@ pub struct ActivityEvent {
     pub origin_device_id: Option<String>,
     /// Its name, when the account's device list could be read.
     pub origin_device_name: Option<String>,
+    /// For a conflict: the device whose version holds the original path now, the other side of the
+    /// conflict (`origin_device_id` is the device whose version became the conflict copy). Read when the
+    /// page is listed, not stored: if the original was edited since, it names whoever holds it now.
+    /// `None` for any other event, when the original no longer exists, or its author is not known here.
+    pub other_origin_device_id: Option<String>,
+    /// Its name, when the account's device list could be read.
+    pub other_origin_device_name: Option<String>,
     /// Made on this device (or by a write that carries no author).
     pub is_this_device: bool,
     pub at: Option<SystemTime>,
@@ -1257,7 +1376,19 @@ pub enum FileAction {
     Download,
     FreeUpSpace,
     KeepOnDevice,
-    StopKeeping,
+    /// Keep nothing of the item in the folder; its content stays available online.
+    OnlineOnly,
+    /// Remove the rule set at exactly this item.
+    Default,
+}
+
+/// What a person chooses for an item's copy on this device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
+pub enum RetentionRule {
+    Keep,
+    OnlineOnly,
+    Default,
 }
 
 /// Whether local space for a file or folder may be reclaimed, apart from whether its content is
@@ -1268,13 +1399,16 @@ pub enum RetentionPolicy {
     Reclaimable,
     /// "Always keep on this device".
     Pinned,
+    /// "Online only": the folder holds no copy; content is downloaded when it is opened.
+    OnlineOnly,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "ffi", derive(uniffi::Record))]
 pub struct FileRetention {
     pub policy: RetentionPolicy,
-    /// Pinned only because a folder above is; unpinning this path alone changes nothing.
+    /// The rule comes from a folder above rather than this path; setting a rule here makes an
+    /// exception to it.
     pub inherited: bool,
 }
 
@@ -1301,6 +1435,12 @@ pub struct EvictOutcome {
     /// "file_replaced", "differs_from_synced", "volume_not_durable", "in_use", or another the daemon names); `None` when
     /// it was freed or the daemon does not say. A front end words it for itself.
     pub not_freed_reason: Option<String>,
+    /// Why the daemon kept its cached blocks of the file although the OS copy was dropped (or would have been): a stable
+    /// code such as "custody_not_acquired" (no device that keeps a full copy was online to confirm this version) or
+    /// "custody_required". With `evicted` true and no bytes reclaimed this is the answer to "why was nothing freed?";
+    /// `None` when nothing was kept back or the daemon does not say. A front end words it for itself
+    /// (`ops::files::evict_refusal` has the CLI's wording).
+    pub retained_reason: Option<String>,
     /// Whether asking again a moment later can work without the person doing anything else: only "path_changing" and
     /// "not_present" (only meaningful with a reason).
     pub retry_later: bool,
@@ -1374,6 +1514,18 @@ pub struct MembershipOutcome {
 pub struct GroupSummary {
     pub group_id: String,
     pub name: String,
+    /// The device the group was created on; `None` for a group created before it was recorded.
+    pub created_by_device: Option<GroupCreatorDevice>,
+}
+
+/// The device a group was created on, as the account's own devices are named to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Record))]
+pub struct GroupCreatorDevice {
+    pub device_id: String,
+    /// `None` once that device was removed: only its id is then known.
+    pub name: Option<String>,
+    pub platform: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1585,7 +1737,6 @@ pub enum NestedLinkRelation {
 #[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
 pub enum PreflightIssue {
     PathMissing,
-    IgnoreRulesUnreadable,
     NotEmpty { entry_count: u64, scan_truncated: bool },
     LowFreeSpace { available_bytes: u64, headroom_bytes: u64 },
     CriticalFreeSpace { available_bytes: u64, headroom_bytes: u64 },
@@ -1687,14 +1838,25 @@ impl SendLinkTtl {
     }
 }
 
-/// A Send link just created. The code is shown once: the service keeps only its hash.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A Send link just created. The code is shown once and its secret half never reaches the service.
+#[derive(Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "ffi", derive(uniffi::Record))]
 pub struct SendLink {
     pub link_id: String,
     /// What the sender hands to the recipient (on any account).
     pub code: String,
     pub expires_at: Option<SystemTime>,
+}
+
+impl std::fmt::Debug for SendLink {
+    /// Names no part of the code: it unlocks the link's file list.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendLink")
+            .field("link_id", &self.link_id)
+            .field("code", &"..")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 /// What a signed-in holder of a code sees before redeeming it. Nothing was consumed.
@@ -1738,6 +1900,10 @@ pub struct SendLinkStatus {
     /// The transfer under this link, when this device started one since its engine last
     /// restarted; match it against `list_sent_transfers` for progress.
     pub transfer_id: Option<String>,
+    /// Why an `Interrupted` link stopped, when the engine has it on record. `SenderCanceled` is
+    /// this device's own stop, so an app that restarted can tell it from the receiver stopping or
+    /// the connection dropping.
+    pub failure: Option<TransferFailure>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1810,10 +1976,9 @@ pub enum IncomingTransferStatus {
 pub enum PauseDuration {
     /// Until the user resumes.
     UntilResumed,
-    ThirtyMinutes,
-    OneHour,
-    /// Until the next local midnight.
-    UntilTomorrow,
+    TwoHours,
+    EightHours,
+    TwentyFourHours,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1835,6 +2000,10 @@ pub struct IncomingTransfer {
     pub link_id: Option<String>,
     /// Bytes written so far while `InProgress`; `total_size` once `Completed`; 0 otherwise.
     pub received_bytes: u64,
+    /// Files fully received so far while `InProgress`; `files_total` once `Completed`; 0 otherwise.
+    pub files_done: u32,
+    /// How many files the offer holds.
+    pub files_total: u32,
     /// The folder the files are received into, once a receive chose one.
     pub destination_dir: Option<String>,
 }
@@ -1872,6 +2041,9 @@ pub struct OutgoingTransfer {
     /// Whether `retry_sent_transfer` is offered. A retry checks the offered files are unchanged
     /// and asks for a new authorization; it never reuses an old one.
     pub can_retry: bool,
+    /// Bytes of the offer the receiver has been served so far while `Accepted` (live: it starts
+    /// again from nothing when the engine restarts); `total_size` once `Completed`; 0 otherwise.
+    pub bytes_sent: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -61,6 +61,16 @@ async fn a_peer_on_another_protocol_version_is_incompatible_and_still_reachable(
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        let expected = if theirs > PROTOCOL_VERSION {
+            crate::peer_connectivity_runtime::VersionSkew::PeerNewer
+        } else {
+            crate::peer_connectivity_runtime::VersionSkew::PeerOlder
+        };
+        assert_eq!(
+            alice.peer_connectivity.version_skew(BOB),
+            Some(expected),
+            "the skew names the older end (hello version {theirs})"
+        );
         // The path a fresh connection uses is selected a moment after it opens, so for that
         // moment the peer reads "connecting"; it must reach "connected" and never "unreachable".
         let connected_by = tokio::time::Instant::now() + STEP;
@@ -84,6 +94,10 @@ async fn a_peer_on_another_protocol_version_is_incompatible_and_still_reachable(
 async fn an_unreachable_peer_is_not_marked_incompatible() {
     let (alice, _dir) = device(ALICE, 11);
     pin(&alice, BOB, 22);
-    alice.peer_connectivity.record_version_incompatible(BOB);
+    alice.peer_connectivity.record_version_incompatible(
+        BOB,
+        0,
+        crate::peer_connectivity_runtime::VersionSkew::PeerNewer,
+    );
     assert!(!alice.peer_connectivity.is_version_incompatible(BOB), "no connection, no verdict");
 }

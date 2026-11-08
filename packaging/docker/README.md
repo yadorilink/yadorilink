@@ -19,8 +19,7 @@ PGID=1000
 
 ```sh
 docker compose up -d
-docker compose exec yadorilink yadorilink login --device
-docker compose exec yadorilink yadorilink device register --name my-nas
+docker compose exec yadorilink yadorilink login --device --device-name my-nas
 docker compose exec yadorilink yadorilink share create my-share --path /srv/yadorilink
 ```
 

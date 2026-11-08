@@ -9,9 +9,14 @@
 //! 2. availability is checked by opening one stream, expecting `Ready`, and
 //!    dropping it;
 //! 3. a listener is bound on `127.0.0.1:0`, and its address is the page
-//!    address handed back;
+//!    address handed back, with a random session secret in the `#fragment`
+//!    (a fragment is never sent to any server; the page reads it and sends
+//!    it as `Authorization: Bearer` on its API calls);
 //! 4. every TCP connection the browser makes there gets one management
-//!    stream, and bytes are copied both ways. Nothing here reads HTTP:
+//!    stream, which opens by sending the session secret to the managed
+//!    device; that device's dashboard refuses API requests that do not
+//!    present it, so another program that reaches the loopback port gets the
+//!    page shell and nothing else. Bytes are copied both ways. Nothing here reads HTTP:
 //!    keep-alive, WebSocket and server-sent events pass through.
 //!
 //! The listener belongs to the session. The session ends when whoever asked
@@ -33,7 +38,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
-use yadorilink_sync_substrate::{NasAdminConnection, NasAdminError, PeerId};
+use yadorilink_sync_substrate::{NasAdminConnection, NasAdminError, PeerId, NAS_ADMIN_SECRET_LEN};
 
 use crate::daemon_state::DaemonState;
 
@@ -162,6 +167,26 @@ pub(crate) struct BridgeSession {
     connection: NasAdminConnection,
     listener: TcpListener,
     limits: BridgeLimits,
+    secret: Secret,
+}
+
+/// The session secret: sent to the managed device with every stream and
+/// handed to the page in the URL fragment. Never printed.
+#[derive(Clone, Copy)]
+pub(crate) struct Secret([u8; NAS_ADMIN_SECRET_LEN]);
+
+impl Secret {
+    fn random() -> Self {
+        let mut bytes = [0u8; NAS_ADMIN_SECRET_LEN];
+        rand::fill(bytes.as_mut_slice());
+        Self(bytes)
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(..)")
+    }
 }
 
 impl BridgeSession {
@@ -177,7 +202,8 @@ impl BridgeSession {
             .unwrap_or(Err(NasAdminError::Unreachable))?;
         // The availability check: one stream that must answer `Ready`,
         // dropped at once.
-        let checked = tokio::time::timeout(limits.step, connection.open_stream())
+        let secret = Secret::random();
+        let checked = tokio::time::timeout(limits.step, connection.open_stream(&secret.0))
             .await
             .unwrap_or(Err(NasAdminError::Failed));
         if let Err(error) = checked {
@@ -192,13 +218,14 @@ impl BridgeSession {
                 return Err(OpenFailure::CouldNotOpen);
             }
         };
-        Ok(Self { connection, listener, limits })
+        Ok(Self { connection, listener, limits, secret })
     }
 
-    /// The page address while the session lives. Carries no secret.
+    /// The page address while the session lives. The fragment is the session
+    /// secret: treat the whole URL as a credential (do not log it).
     pub(crate) fn local_url(&self) -> String {
         let port = self.listener.local_addr().map(|addr| addr.port()).unwrap_or(0);
-        format!("http://127.0.0.1:{port}/")
+        format!("http://127.0.0.1:{port}/#{}", hex::encode(self.secret.0))
     }
 
     #[cfg(test)]
@@ -212,8 +239,8 @@ impl BridgeSession {
     /// every bridged connection is ended and the device connection is
     /// closed.
     pub(crate) async fn serve(self, until: impl Future<Output = ()>) {
-        let Self { connection, listener, limits } = self;
-        serve_on(connection, listener, limits, until).await;
+        let Self { connection, listener, limits, secret } = self;
+        serve_on(connection, listener, limits, secret, until).await;
     }
 }
 
@@ -237,6 +264,7 @@ async fn serve_on(
     connection: NasAdminConnection,
     listener: impl Accept,
     limits: BridgeLimits,
+    secret: Secret,
     until: impl Future<Output = ()>,
 ) {
     let mut bridged = JoinSet::new();
@@ -278,7 +306,7 @@ async fn serve_on(
                     // A stream the device will not open (busy, stopped,
                     // refused) or does not answer in time ends this
                     // browser connection, nothing more.
-                    let opened = tokio::time::timeout(limits.stream_open, connection.open_stream()).await;
+                    let opened = tokio::time::timeout(limits.stream_open, connection.open_stream(&secret.0)).await;
                     if let Ok(Ok(stream)) = opened {
                         pump(tcp, stream, limits.connection_idle).await;
                     }

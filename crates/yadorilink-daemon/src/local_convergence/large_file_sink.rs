@@ -92,6 +92,21 @@ impl LargeFileSink {
         })
     }
 
+    /// The same temp kept for a later attempt while this sink goes on being shared (a sink behind
+    /// a lock that a dropped future may still hold), or `None` when nothing was written into it.
+    /// Flushes still running are not waited for: the next attempt reads every claim back.
+    pub(crate) fn parked_copy(&self) -> Option<ParkedTemp> {
+        if self.written.is_empty() {
+            return None;
+        }
+        Some(ParkedTemp {
+            staged: Arc::clone(&self.staged),
+            reservation: Arc::clone(&self.reservation),
+            written: self.written.clone(),
+            parked_at: std::time::Instant::now(),
+        })
+    }
+
     /// Whether the block is already in the file (and, after [`Self::verify_claims`], read back).
     pub(crate) fn has_written(&self, hash: &[u8]) -> bool {
         self.written.contains(hash)
@@ -201,6 +216,7 @@ impl LargeFileSink {
         &mut self,
         store: Arc<dyn BlockContentStore>,
         record: &FileRecord,
+        written: Option<Arc<dyn Fn(u64) + Send + Sync>>,
     ) -> Result<(), StorageError> {
         let missing: Vec<(Vec<u8>, Vec<u64>)> = {
             let mut seen = HashSet::new();
@@ -229,7 +245,10 @@ impl LargeFileSink {
         let blocks = record.blocks.clone();
         let mtime = record.mtime_unix_nanos;
         let staged = Arc::clone(&self.staged);
+        // The space stays reserved until this job is done, whatever happens to the future awaiting it.
+        let reservation = Arc::clone(&self.reservation);
         tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
+            let _reservation = reservation;
             for (hash, offsets) in missing {
                 let hash_hex = hex::encode(&hash);
                 // `get` checks what it reads against the block's hash (the store verifies at
@@ -239,8 +258,16 @@ impl LargeFileSink {
                 for offset in offsets {
                     staged.write_at(offset, &data)?;
                 }
+                if let Some(written) = &written {
+                    written(data.len() as u64);
+                }
             }
-            staged.finish(&blocks, mtime)
+            staged.finish(&blocks, mtime)?;
+            // The read back is the verification half of the plan.
+            if let Some(written) = &written {
+                written(blocks.iter().map(|block| u64::from(block.size)).sum());
+            }
+            Ok(())
         })
         .await
         .map_err(|error| StorageError::Io(std::io::Error::other(error.to_string())))?

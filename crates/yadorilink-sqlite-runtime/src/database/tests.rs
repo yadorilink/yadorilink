@@ -166,11 +166,54 @@ fn schema_initialization_is_idempotent() {
     let _second = open_test_db(&path);
 }
 
+/// The split instrument is process-wide: one flag and one site map shared by every database in
+/// the test binary, and tests run on parallel threads. A test that arms or disarms it holds this
+/// for its whole length, so no other test arms it inside its disarmed window (it would otherwise
+/// see a write recorded that its own flag said not to record). Dropping the guard disarms the
+/// instrument, so a failing test leaves it off.
+struct SplitInstrument(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+static SPLIT_INSTRUMENT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+impl SplitInstrument {
+    fn exclusive() -> Self {
+        Self(SPLIT_INSTRUMENT_LOCK.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// `None` while another test holds the instrument.
+    fn try_exclusive() -> Option<Self> {
+        match SPLIT_INSTRUMENT_LOCK.try_lock() {
+            Ok(guard) => Some(Self(guard)),
+            Err(std::sync::TryLockError::Poisoned(p)) => Some(Self(p.into_inner())),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+}
+
+impl Drop for SplitInstrument {
+    fn drop(&mut self) {
+        writer_gate_stats::set_split_enabled(false);
+    }
+}
+
+/// The guard the split tests depend on: a second holder is refused while one holds the
+/// instrument, and letting go disarms it.
+#[test]
+fn the_split_instrument_has_one_holder_at_a_time_and_is_disarmed_when_let_go() {
+    let first = SplitInstrument::exclusive();
+    writer_gate_stats::set_split_enabled(true);
+    assert!(SplitInstrument::try_exclusive().is_none(), "a second test got the instrument");
+    drop(first);
+    assert!(!writer_gate_stats::split_enabled(), "letting go left the instrument armed");
+    assert!(SplitInstrument::try_exclusive().is_some(), "the instrument was not released");
+}
+
 /// Armed, `write_immediate` records one body/commit split against its own
 /// call site, and the commit is a separately timed, non-zero step. A
 /// disarmed instrument records nothing for the same call.
 #[test]
 fn split_stats_record_body_and_commit_for_an_armed_write_immediate() {
+    let _instrument = SplitInstrument::exclusive();
     let dir = tempfile::tempdir().expect("tempdir");
     let database = open_test_db(&dir.path().join("split.sqlite3"));
     database
@@ -215,6 +258,7 @@ fn split_stats_record_body_and_commit_for_an_armed_write_immediate() {
 /// `synchronous = FULL` it writes no log frame, so it costs no fsync.
 #[test]
 fn split_stats_tell_a_write_that_changed_a_row_from_one_that_did_not() {
+    let _instrument = SplitInstrument::exclusive();
     let dir = tempfile::tempdir().expect("tempdir");
     let database = open_test_db(&dir.path().join("split-changed.sqlite3"));
     database

@@ -66,7 +66,7 @@ pub fn updater_elsewhere(install_source: &str) -> Option<&'static str> {
     Some(match install_source {
         "app_bundle" => "open YadoriLink and choose Check for Updates",
         "microsoft_store" => "open Store > Library > Updates",
-        "homebrew" => "run `brew upgrade --cask yadorilink`",
+        "homebrew" => "run `brew upgrade yadorilink`",
         "apt" => "run `sudo apt update && sudo apt install --only-upgrade yadorilink`",
         "winget" => "run `winget upgrade yadorilink`",
         "container" => "pull a newer image",
@@ -81,12 +81,29 @@ pub fn uninstaller_elsewhere(install_source: &str) -> Option<&'static str> {
     Some(match install_source {
         "app_bundle" => "quit YadoriLink, then move YadoriLink.app to the Trash",
         "microsoft_store" => "open Settings > Apps > Installed apps > YadoriLink > Uninstall",
-        "homebrew" => "run `brew uninstall --cask yadorilink`",
+        "homebrew" => "run `brew uninstall yadorilink`",
         "apt" => "run `sudo apt remove yadorilink`",
         "winget" => "run `winget uninstall yadorilink`",
         "container" => "stop and remove the container; its data lives in the volume you mounted",
         _ => return None,
     })
+}
+
+/// How the installation an ownership record names is removed, as a step in a sentence. A source
+/// without an uninstaller of its own is a standalone copy: it has no installer or updater.
+fn remove_how(install_source: &str) -> String {
+    if install_source == "script" {
+        return "run `yadorilink uninstall` (or the installer with --uninstall / -Uninstall)"
+            .to_string();
+    }
+    uninstaller_elsewhere(install_source).map_or_else(
+        || {
+            "run `yadorilink daemon stop` and delete the binaries you placed by hand (a \
+             standalone copy has no installer or updater)"
+                .to_string()
+        },
+        str::to_string,
+    )
 }
 
 /// The configured cargo home: `CARGO_HOME` when set and non-empty, else `<home>/.cargo`.
@@ -130,26 +147,7 @@ pub fn unowned_install_steps(exe: &Path, update: bool, cargo_home: Option<&Path>
     }
 }
 
-/// Whether `exe` lies inside a macOS application bundle: some directory named `*.app` directly
-/// followed by `Contents` (the main executable, `Contents/Library/LoginItems/*.app`, `Helpers`).
-#[must_use]
-pub fn is_app_bundle_path(exe: &Path) -> bool {
-    app_bundle_root(exe).is_some()
-}
-
-/// The outermost `*.app` bundle directory `exe` lies in, if it lies in one.
-#[must_use]
-pub fn app_bundle_root(exe: &Path) -> Option<PathBuf> {
-    let components: Vec<_> = exe.components().collect();
-    let index = components.windows(2).position(|pair| {
-        pair[1].as_os_str() == "Contents"
-            && pair[0]
-                .as_os_str()
-                .to_str()
-                .is_some_and(|n| n.len() > ".app".len() && n.ends_with(".app"))
-    })?;
-    Some(components[..=index].iter().collect())
-}
+pub use yadorilink_fs_platform::app_bundle::{app_bundle_root, is_app_bundle_path};
 
 /// Whether `exe` lies in a Windows Store (MSIX) package location.
 #[must_use]
@@ -178,6 +176,36 @@ pub fn store_package_family(path: &str) -> Option<String> {
 #[must_use]
 pub fn is_same_store_package(recorded_root: &str, new_root: &str) -> bool {
     matches!((store_package_family(recorded_root), store_package_family(new_root)),
+        (Some(a), Some(b)) if a == b)
+}
+
+/// The install directory a one-liner (script) install keeps its version trees in: the part of
+/// `root` before `versions/<name>`. `None` when `root` is not inside such a tree.
+fn script_install_dir(root: &str) -> Option<String> {
+    let parts: Vec<&str> = root.split(['/', '\\']).collect();
+    // The version tree is the last `versions/<name>` with at most a `bin` below it, so a parent
+    // directory that happens to be called `versions` does not change what the install directory is.
+    let at = (0..parts.len()).rev().find(|&i| {
+        parts[i] == "versions"
+            && match &parts[i + 1..] {
+                [name] => !name.is_empty(),
+                [name, bin] => !name.is_empty() && *bin == "bin",
+                _ => false,
+            }
+    })?;
+    if parts[..at].iter().all(|p| p.is_empty()) {
+        return None;
+    }
+    Some(parts[..at].join("/"))
+}
+
+/// Whether `new_root` is where the script install that `recorded_root` names runs after a
+/// self-update: both are version trees under the same install directory (an update activates a
+/// new `versions/<name>` and switches the links). A script install in another directory is
+/// another installation and never matches.
+#[must_use]
+pub fn is_same_script_install(recorded_root: &str, new_root: &str) -> bool {
+    matches!((script_install_dir(recorded_root), script_install_dir(new_root)),
         (Some(a), Some(b)) if a == b)
 }
 
@@ -290,12 +318,17 @@ impl Refusal {
                 );
                 match recorded.owner {
                     Owner::Gui => format!(
-                        "{first} Open the YadoriLink app instead. (The owner is recorded in {}.)",
+                        "{first} Open the YadoriLink app instead. To use this install instead: {}, \
+                         then delete {} (the recorded owner) and start again.",
+                        remove_how(&recorded.install_source),
                         record_path.display()
                     ),
                     Owner::Cli => format!(
-                        "{first} Use that install and its own updater. (The owner is recorded \
-                         in {}.)",
+                        "{first} Use that install{}. To use this install instead: {}, then delete \
+                         {} (the recorded owner) and start again.",
+                        updater_elsewhere(&recorded.install_source)
+                            .map_or(String::new(), |how| format!(" (it updates with: {how})")),
+                        remove_how(&recorded.install_source),
                         record_path.display()
                     ),
                 }
@@ -307,11 +340,12 @@ impl Refusal {
             ),
             Refusal::InstallSourceMismatch { recorded, mine } => format!(
                 "this YadoriLink installation ({mine}) is not the one that owns the data on this \
-                 machine: it belongs to the {} installation at {}, which has its own updater; \
-                 nothing was started. Use that installation. To hand the data to this one, stop \
-                 the other installation, then delete {} (nothing else is removed).",
+                 machine: it belongs to the {} installation at {}; nothing was started. Use that \
+                 installation. To hand the data to this one instead: {}, then delete {} (nothing \
+                 else is removed).",
                 recorded.install_source,
                 recorded.install_root,
+                remove_how(&recorded.install_source),
                 record_path.display()
             ),
             Refusal::DescriptorUnusable { problem } => problem.message(),
@@ -382,6 +416,25 @@ pub fn start_verdict_for_installation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refusal_says_how_to_remove_the_recorded_installation_not_that_it_has_an_updater() {
+        let dir = Path::new("/cfg");
+        let store = Refusal::ManagedElsewhere { recorded: record(Owner::Gui, "microsoft_store") }
+            .message(dir);
+        assert!(store.contains("Settings > Apps > Installed apps"), "{store}");
+        let standalone = Refusal::InstallSourceMismatch {
+            recorded: Box::new(record(Owner::Cli, "standalone")),
+            mine: "script".into(),
+        }
+        .message(dir);
+        assert!(standalone.contains("no installer or updater"), "{standalone}");
+        assert!(!standalone.contains("own updater"), "{standalone}");
+        assert!(standalone.contains("install-owner.json"), "{standalone}");
+        let script =
+            Refusal::ManagedElsewhere { recorded: record(Owner::Cli, "script") }.message(dir);
+        assert!(script.contains("yadorilink uninstall") && !script.contains("by hand"), "{script}");
+    }
 
     #[test]
     fn cargo_home_prefers_the_environment_then_the_home_directory() {

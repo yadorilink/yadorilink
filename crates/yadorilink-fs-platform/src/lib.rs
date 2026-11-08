@@ -15,7 +15,9 @@
 //! and root identity live in `yadorilink-root-authority`, which builds on
 //! this crate.
 
+pub mod app_bundle;
 pub mod canonical_fold;
+pub mod cloud_files;
 pub mod durable_dir;
 pub mod flush;
 pub mod folding_scope;
@@ -28,6 +30,7 @@ pub mod long_path;
 pub mod reserved_namespace;
 pub mod state_dir;
 pub mod usn;
+pub mod verified_echo;
 pub mod volume_identity;
 pub mod windows_name;
 pub mod write_exclusion;

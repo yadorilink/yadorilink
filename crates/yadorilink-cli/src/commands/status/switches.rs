@@ -2,7 +2,7 @@
 //! The System Settings switches `yadorilink status` names when one is off. macOS only: elsewhere
 //! there are no such switches and nothing is printed. Asking the system never fails the command.
 //!
-//! The extensions' switches are read from PlugInKit (`pluginkit -mA -i <id>`), the same source the
+//! The extensions' switches are read from PlugInKit (`pluginkit -mAv -i <id>`), the same source the
 //! installer elects through. The daemon is not asked: the app, which could report them, may not be
 //! running, and the state belongs to the system, not to a file of ours.
 
@@ -28,19 +28,36 @@ pub(super) enum SwitchState {
     NotInstalled,
 }
 
-/// The state `pluginkit -mA -i <id>` printed: `+` in the first column is switched on, anything
+/// The state `pluginkit -mAv -i <id>` printed: `+` in the first column is switched on, anything
 /// else (`-` switched off, a blank flag with no vote) is not running, and no line at all means
-/// PlugInKit does not know the extension (not installed).
+/// PlugInKit does not know the extension (not installed). PlugInKit also keeps the registration
+/// of an app that was removed or moved, so a line whose last column names a path that no longer
+/// exists is not an installed extension and is ignored (`path_exists` answers that). A line with
+/// no path column counts as installed.
 #[cfg(target_os = "macos")]
-pub(super) fn parse_pluginkit(output: &str, id: &str) -> SwitchState {
+pub(super) fn parse_pluginkit(
+    output: &str,
+    id: &str,
+    path_exists: impl Fn(&str) -> bool,
+) -> SwitchState {
+    let mut state = SwitchState::NotInstalled;
     for line in output.lines() {
         let mut chars = line.chars();
         let Some(flag) = chars.next() else { continue };
-        if chars.as_str().trim_start().starts_with(id) {
-            return if flag == '+' { SwitchState::On } else { SwitchState::Off };
+        if !chars.as_str().trim_start().starts_with(id) {
+            continue;
         }
+        let mut columns = line.split('\t');
+        let path = columns.nth(3).map(str::trim).filter(|p| !p.is_empty());
+        if path.is_some_and(|p| !path_exists(p)) {
+            continue;
+        }
+        if flag == '+' {
+            return SwitchState::On;
+        }
+        state = SwitchState::Off;
     }
-    SwitchState::NotInstalled
+    state
 }
 
 /// One line per extension that is off, each with where to turn it on.
@@ -96,12 +113,16 @@ pub(super) fn background_service_hint() -> Option<&'static str> {
 #[cfg(target_os = "macos")]
 fn pluginkit_state(id: &str) -> Option<SwitchState> {
     let out = std::process::Command::new("/usr/bin/pluginkit")
-        .args(["-mA", "-i", id])
+        .args(["-mAv", "-i", id])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
-    out.status.success().then(|| parse_pluginkit(&String::from_utf8_lossy(&out.stdout), id))
+    out.status.success().then(|| {
+        parse_pluginkit(&String::from_utf8_lossy(&out.stdout), id, |p| {
+            std::path::Path::new(p).exists()
+        })
+    })
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -113,18 +134,42 @@ mod tests {
     #[test]
     fn the_first_column_decides() {
         assert_eq!(
-            parse_pluginkit(&format!("+    {ID}(1.0)\tUUID\tdate\tpath\n"), ID),
+            parse_pluginkit(&format!("+    {ID}(1.0)\tUUID\tdate\t/app.appex\n"), ID, |_| true),
             SwitchState::On
         );
-        assert_eq!(parse_pluginkit(&format!("-    {ID}(1.0)\tUUID\n"), ID), SwitchState::Off);
-        assert_eq!(parse_pluginkit(&format!("     {ID}(1.0)\tUUID\n"), ID), SwitchState::Off);
+        assert_eq!(
+            parse_pluginkit(&format!("-    {ID}(1.0)\tUUID\n"), ID, |_| true),
+            SwitchState::Off
+        );
+        assert_eq!(
+            parse_pluginkit(&format!("     {ID}(1.0)\tUUID\n"), ID, |_| true),
+            SwitchState::Off
+        );
     }
 
     #[test]
     fn an_unknown_or_other_extension_is_not_installed_and_silent() {
-        assert_eq!(parse_pluginkit("", ID), SwitchState::NotInstalled);
-        assert_eq!(parse_pluginkit("+    com.other.thing(1)\n", ID), SwitchState::NotInstalled);
+        assert_eq!(parse_pluginkit("", ID, |_| true), SwitchState::NotInstalled);
+        assert_eq!(
+            parse_pluginkit("+    com.other.thing(1)\n", ID, |_| true),
+            SwitchState::NotInstalled
+        );
         assert!(off_lines(SwitchState::NotInstalled, SwitchState::NotInstalled).is_empty());
+    }
+
+    #[test]
+    fn a_registration_of_a_removed_app_is_not_installed_and_silent() {
+        let out = format!(
+            "-    {ID}(0.1.0-beta.1)\tU1\td\t/gone/old.appex\n-    {ID}(0.1.0-beta.7)\tU2\td\t/gone/new.appex\n"
+        );
+        assert_eq!(parse_pluginkit(&out, ID, |_| false), SwitchState::NotInstalled);
+        // The registration that still exists decides, whichever line comes first.
+        let out =
+            format!("-    {ID}(1)\tU1\td\t/gone/old.appex\n-    {ID}(2)\tU2\td\t/here/new.appex\n");
+        assert_eq!(parse_pluginkit(&out, ID, |p| p.starts_with("/here")), SwitchState::Off);
+        let out =
+            format!("-    {ID}(1)\tU1\td\t/here/old.appex\n+    {ID}(2)\tU2\td\t/here/new.appex\n");
+        assert_eq!(parse_pluginkit(&out, ID, |_| true), SwitchState::On);
     }
 
     #[test]

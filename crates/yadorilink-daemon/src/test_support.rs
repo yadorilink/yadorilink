@@ -276,7 +276,7 @@ pub fn seed_prior_cycle_proof(
 pub fn file_block_source_for(
     state: &std::sync::Arc<crate::daemon_state::DaemonState>,
 ) -> Option<std::sync::Arc<dyn yadorilink_peer_session::ports::BlockFileSourcePort>> {
-    state.tuning().file_block_source.then(|| {
+    state.tuning().file_mode.serves_from_files().then(|| {
         std::sync::Arc::new(crate::file_block_source::FileBlockSource::new(
             state.replica_coordinator.clone(),
             state.clone(),
@@ -332,7 +332,7 @@ pub async fn pin_item(
 ) -> Result<Option<&'static str>, crate::sync_error::SyncError> {
     use crate::application::ports::MaterializationPort as _;
     crate::adapters::runtime::materialization::DaemonMaterializationAdapter::new(state.clone())
-        .pin(group_id, path)
+        .set_rule(group_id, path, crate::application::ports::RuleChoice::Keep)
         .await
         .map(|outcome| outcome.history_not_kept_reason)
 }
@@ -461,4 +461,55 @@ pub async fn drain_pending_local_changes(
 #[cfg(feature = "test-support")]
 pub fn hold_contest_settling(device_id: &str, held: bool) {
     crate::contest_fork::hold_contest_settling_for_test(device_id, held);
+}
+
+/// What the provider projector does once when it starts: continues every recorded rebootstrap
+/// of a provider group.
+pub fn start_provider_rebootstrap_resume(state: &std::sync::Arc<crate::daemon_state::DaemonState>) {
+    crate::provider_projector::resume_recorded_rebootstraps(state);
+}
+
+/// A linked folder that is watched for real, for tests that drive the daemon
+/// through its control socket: an empty bootstrap policy for the group, a device
+/// signing key, the link, and the link runtime (real watcher and capture). Files
+/// written under `local_path` afterwards are captured as the product captures
+/// them; wait for that with the index (`dag_list_versions`) before acting.
+pub fn watch_link(
+    state: &std::sync::Arc<crate::daemon_state::DaemonState>,
+    local_path: &str,
+    group_id: &str,
+) {
+    use crate::change_policy::{verify_group_policy_log, GroupPolicyLog};
+    if state.device_signing_key().is_none() {
+        state
+            .set_device_signing_key(yadorilink_transport::DeviceSigningKeyPair::generate().signing);
+    }
+    let log = GroupPolicyLog {
+        group_id: group_id.to_string(),
+        current_seq: 0,
+        current_epoch: 0,
+        policy_head: vec![0; 32],
+        records: Vec::new(),
+    };
+    let policy =
+        verify_group_policy_log(&[1u8; 32], &log).expect("empty bootstrap policy verifies");
+    let mut policies = std::collections::HashMap::new();
+    policies.insert(group_id.to_string(), policy);
+    state.authority.replace_group_policy_states(policies);
+    let links = state.replica_coordinator.link_repository();
+    if !links.list_links().unwrap().iter().any(|link| link.group_id == group_id) {
+        links.add_link(local_path, group_id).unwrap();
+    }
+    crate::adapters::runtime::link_runtime_controller::LinkRuntimeController::new(state.clone())
+        .start(local_path.to_string(), group_id.to_string())
+        .unwrap();
+}
+
+/// Points the daemon at a stand-in coordination plane at `addr` (an offline
+/// credential: requests go out without a token), as a device that is signed in.
+pub fn use_coordination(state: &crate::daemon_state::DaemonState, addr: &str) {
+    state.set_coordination_client_config(
+        addr.to_string(),
+        yadorilink_fapi_client::test_support::offline_auth(),
+    );
 }

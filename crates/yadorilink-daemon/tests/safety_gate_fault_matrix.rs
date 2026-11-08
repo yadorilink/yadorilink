@@ -56,7 +56,9 @@ use yadorilink_local_storage::{
     hash_block_bytes, BlockStore, CommitPoint, FaultPlan, GroupCommitLimits, LocallyHashedBlock,
     SegmentBlockStore,
 };
-use yadorilink_sqlite_runtime::{check_replica_schema_generation, DatabaseError, SCHEMA_VERSION};
+use yadorilink_sqlite_runtime::{
+    check_replica_schema_generation, DatabaseError, FIRST_SHIPPED_SCHEMA_VERSION, SCHEMA_VERSION,
+};
 use yadorilink_sync_sqlite::author_incarnation::InstallWitness;
 
 const TABLE: &str = include_str!("safety_gate_fault_matrix.table");
@@ -905,6 +907,8 @@ fn path_escape_case() -> Scenario {
 enum SchemaFault {
     NewerDatabase,
     OlderDatabase,
+    /// A stamp below the first one any shipped build wrote: damage, not an older generation.
+    OlderUnshippedDatabase,
     UnstampedWithTables,
 }
 
@@ -920,6 +924,9 @@ fn schema_case(fault: SchemaFault) -> Scenario {
         SchemaFault::OlderDatabase => {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1).unwrap();
         }
+        SchemaFault::OlderUnshippedDatabase => {
+            conn.pragma_update(None, "user_version", FIRST_SHIPPED_SCHEMA_VERSION - 1).unwrap();
+        }
         SchemaFault::UnstampedWithTables => {
             conn.execute_batch("CREATE TABLE leftovers (x INTEGER);").unwrap();
         }
@@ -931,13 +938,16 @@ fn schema_case(fault: SchemaFault) -> Scenario {
         Err(DatabaseError::UnsupportedSchemaDowngrade { .. }) => {
             Answer::Refused("UnsupportedSchemaDowngrade".into())
         }
+        Err(DatabaseError::SchemaTooOld { .. }) => Answer::Refused("SchemaTooOld".into()),
         Err(DatabaseError::CorruptSchema(_)) => Answer::Refused("CorruptSchema".into()),
         Err(other) => Answer::Refused(name_of(&other)),
     };
     let retry = move || {
         // The matching build, or a fresh database after delete and re-import.
         match fault {
-            SchemaFault::NewerDatabase | SchemaFault::OlderDatabase => {
+            SchemaFault::NewerDatabase
+            | SchemaFault::OlderDatabase
+            | SchemaFault::OlderUnshippedDatabase => {
                 c2.pragma_update(None, "user_version", SCHEMA_VERSION).unwrap();
             }
             SchemaFault::UnstampedWithTables => {
@@ -956,7 +966,10 @@ fn schema_case(fault: SchemaFault) -> Scenario {
     Scenario {
         refusal: match fault {
             SchemaFault::NewerDatabase => "UnsupportedSchemaDowngrade",
-            SchemaFault::OlderDatabase | SchemaFault::UnstampedWithTables => "CorruptSchema",
+            SchemaFault::OlderDatabase => "SchemaTooOld",
+            SchemaFault::OlderUnshippedDatabase | SchemaFault::UnstampedWithTables => {
+                "CorruptSchema"
+            }
         },
         faulted: Box::new(faulted),
         intact: Box::new(intact),
@@ -1372,6 +1385,10 @@ fn cases() -> Vec<(String, Builder)> {
 
     add("schema.newer_database", run_scenario(|| schema_case(SchemaFault::NewerDatabase)));
     add("schema.older_database", run_scenario(|| schema_case(SchemaFault::OlderDatabase)));
+    add(
+        "schema.older_unshipped_database",
+        run_scenario(|| schema_case(SchemaFault::OlderUnshippedDatabase)),
+    );
     add(
         "schema.unstamped_with_tables",
         run_scenario(|| schema_case(SchemaFault::UnstampedWithTables)),

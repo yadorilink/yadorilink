@@ -9,7 +9,6 @@
 
 use yadorilink_filesystem_sync::materialization_execution::MaterializationExecutionError;
 use yadorilink_fs_platform::fs_identity::FileIdentity;
-use yadorilink_peer_session::PeerSessionError;
 use yadorilink_replica_domain::ids::VersionHash;
 use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_root_authority::root_commit::RootCommitPermit;
@@ -84,13 +83,22 @@ impl ReplicaCoordinator {
 }
 
 impl<'a> HydrationAttempt<'a> {
-    /// Bumps this path's mutation fence for the physical write (tx): from that point the
-    /// standing proof is stale. The revert target stays the entry state: `Present` makes no
-    /// claim that the object equals any version, so an object left under a `Present` row after a
-    /// failed attempt needs no demotion, and a path that was empty stays `Remote`. Returns the
-    /// value the commit must still find.
-    pub(crate) fn begin_physical_write(&mut self) -> Result<i64, PeerSessionError> {
-        self.coordinator.dag_bump_mutation_fence(self.group_id, self.path, "hydration_write")
+    /// Prepares the physical write (one tx): opens the write intent for `target` and bumps this
+    /// path's mutation fence together. From that point the standing proof is stale and the open
+    /// intent is what lets capture and repair read the old bytes as the pre-image of an
+    /// unfinished write. The revert target stays the entry state: `Present` makes no claim that
+    /// the object equals any version, so an object left under a `Present` row after a failed
+    /// attempt needs no demotion, and a path that was empty stays `Remote`. Returns the intent's
+    /// guard and the fence value the commit must still find.
+    pub(crate) fn prepare_physical_write<'p>(
+        &mut self,
+        target: &[u8],
+        permit: &'p RootCommitPermit<'p>,
+    ) -> Result<(crate::materialization_intent::MaterializationIntentGuard<'p>, i64), SyncError>
+    where
+        'a: 'p,
+    {
+        self.coordinator.open_hydration_write(self.group_id, self.path, target, permit)
     }
 
     /// Settle: publish this attempt's version with `identity` under `mutation_generation`, stamp

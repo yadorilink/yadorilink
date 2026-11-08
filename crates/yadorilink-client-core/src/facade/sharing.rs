@@ -22,7 +22,11 @@ fn role_name(role: AssignableRole) -> &'static str {
 }
 
 fn group(group: ops::shares::GroupSummary) -> GroupSummary {
-    GroupSummary { group_id: group.group_id, name: group.name }
+    GroupSummary {
+        group_id: group.group_id,
+        name: group.name,
+        created_by_device: group.created_by_device,
+    }
 }
 
 /// The devices holding a full copy of a linked folder. When the daemon cannot say, none do, so no

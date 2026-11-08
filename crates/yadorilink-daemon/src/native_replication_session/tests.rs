@@ -63,6 +63,8 @@ fn answer_on(
     shares: &(dyn Fn(&FolderGroupId) -> bool + Sync),
     bytes: &[u8],
 ) -> Answer {
+    // A summary carries the namespace root, which is patched from the heads that changed first.
+    yadorilink_sync_sqlite::native_namespace::flush_all(c).unwrap();
     with_peer(source, shares, |peer| {
         c.write(|conn| answer(conn, peer, bytes).map_err(to_db)).unwrap()
     })
@@ -78,6 +80,7 @@ fn pull(puller: &SyncDatabase, holder: &SyncDatabase, source: &FakeSource) -> Ve
     let (_, request) = summary_request(&group()).unwrap();
     let response = answer_on(holder, source, &shares_g, &request).reply.unwrap();
     let response = protocol5::decode_message(&response).unwrap();
+    yadorilink_sync_sqlite::native_namespace::flush_all(puller).unwrap();
     if puller.read(|conn| summary_matches(conn, &group(), &response).map_err(to_db)).unwrap() {
         return Vec::new();
     }
@@ -98,6 +101,7 @@ fn pull(puller: &SyncDatabase, holder: &SyncDatabase, source: &FakeSource) -> Ve
 }
 
 fn roots(c: &SyncDatabase) -> native_replication::SummaryRoots {
+    yadorilink_sync_sqlite::native_namespace::flush_all(c).unwrap();
     c.read(|conn| native_replication::summary_roots(conn, &group())).unwrap()
 }
 

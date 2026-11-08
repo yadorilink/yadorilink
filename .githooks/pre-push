@@ -8,6 +8,24 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 export PATH="$HOME/.cargo/bin:$PATH"
 
+# Keep build output off the system disk: without CARGO_TARGET_DIR cargo would fill
+# <worktree>/target. Default to a per-worktree directory (the worktree name without a leading "wt-") under YL_CARGO_TARGET_ROOT
+# (default /Volumes/Dev/cargo-target) when that root exists; otherwise leave cargo alone.
+# A CARGO_TARGET_DIR you set yourself is never overridden.
+if [ -z "${CARGO_TARGET_DIR:-}" ]; then
+  target_root="${YL_CARGO_TARGET_ROOT:-/Volumes/Dev/cargo-target}"
+  if [ -d "$target_root" ]; then
+    worktree="$(basename "$PWD")"
+    export CARGO_TARGET_DIR="$target_root/${worktree#wt-}"
+  fi
+fi
+# Test hook: print the resolved target directory and stop.
+if [ -n "${YL_PREPUSH_PRINT_TARGET:-}" ]; then
+  echo "${CARGO_TARGET_DIR:-}"
+  exit 0
+fi
+export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
+
 # Only an update of the checked-out branch is linted (Clippy needs the sources of what is pushed);
 # deleting a ref, pushing a tag or another branch is skipped, with a note for the last case.
 lint=0

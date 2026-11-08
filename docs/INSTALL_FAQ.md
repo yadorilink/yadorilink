@@ -6,10 +6,11 @@ Answers for installing, updating and uninstalling the YadoriLink engine (the
 `yadorilink` command line and `yadorilink-daemon`). See also the
 [README](../README.md#installing) and the [Linux README](../packaging/linux/README.md).
 
-Status: the current release is engine-only. There is no desktop app yet. The
-one-line installers described below are built and tested but are not
-published yet (see "Planned" in the README), so today you install from the
-Linux package or an engine bundle. This page also describes how the installers
+Status: this repository's releases are engine-only. The one-line installers
+described below are published at yadori.link, and the Homebrew formula is in
+the project's tap (updated by hand after each release, so it can lag). There
+is no APT repository yet: the tooling exists, but publishing is skipped until
+the APT signing key is configured, so on Debian or Ubuntu install the `.deb`. This page also describes how the installers
 behave, so you can read it before you run one. Where a statement has not been
 checked on every operating system it is written as what the software does by
 design, not as a test result.
@@ -20,11 +21,14 @@ design, not as a test result.
 |---|---|---|---|
 | Debian / Ubuntu | the `.deb` from GitHub Releases | installing a newer `.deb` | `sudo apt remove yadorilink` |
 | macOS, Windows or Linux, engine only, today | the engine bundle zip you unpack | you (unpack the newer bundle) | you (delete the folder) |
-| macOS (Apple silicon), Linux x86_64, Windows x64, once published | the one-line installer | `yadorilink self-update`, then the installer command it prints | `yadorilink uninstall` (Windows: `install.ps1 -Uninstall`) |
-| macOS or Windows desktop app (not released yet) | the app | the app | the app's own uninstall |
+| macOS (Apple silicon), Linux x86_64 | the one-line installer | `yadorilink self-update`, then the installer command it prints | `yadorilink uninstall` |
+| NAS or always-on server | the Docker image `ghcr.io/yadorilink/yadorilink:<version>` ([details](../packaging/docker/README.md)) | pull the newer version tag and run `docker compose up -d` | `docker compose down` (the data volume stays until you delete it) |
+| macOS desktop app (public beta) or Windows desktop app (beta; Microsoft Store release pending) | the app | the app (macOS: Sparkle in-app updates) | the app's own uninstall |
 
-A Docker image, an apt repository, Homebrew and WinGet are planned and not
-published yet; nothing on this page depends on them.
+An apt repository is not published (no signing key yet) and WinGet is planned;
+nothing on this page depends on them. A Homebrew install is owned by
+Homebrew: `yadorilink self-update` and `yadorilink uninstall` will refuse it
+and name `brew upgrade yadorilink` and `brew uninstall yadorilink`.
 
 Update every device to the same version. Whichever way you install, that way
 is also the one that updates and removes it. YadoriLink does not update an install that something else owns: the other
@@ -33,12 +37,10 @@ tool's commands refuse and tell you what to use instead (exit code 19).
 ## What does the one-line installer do?
 
 ```sh
-curl -fsSL https://yadori.link/install.sh | sh          # macOS, Linux
-irm https://yadori.link/install.ps1 | iex               # Windows (PowerShell 5.1 or newer)
+curl -fsSL https://yadori.link/install.sh | sh          # macOS, Linux (Windows: Microsoft Store)
 ```
 
-- It installs under your home directory (`~/.local` by default,
-  `%LOCALAPPDATA%\YadoriLink` on Windows). It never uses `sudo` or asks for
+- It installs under your home directory (`~/.local` by default). It never uses `sudo` or asks for
   administrator rights, and it does not start the daemon.
 - It downloads the signed release manifest for the channel (`beta`, or
   `nightly` with `--channel nightly`), checks its signature against release
@@ -47,8 +49,8 @@ irm https://yadori.link/install.ps1 | iex               # Windows (PowerShell 5.
   bundle's own checksums. Only then does it switch `yadorilink` and
   `yadorilink-daemon` in `<prefix>/bin` to the new version. If any check
   fails it stops with a message and changes nothing.
-- It adds `<prefix>/bin` to your shell profile (user PATH on Windows) unless
-  you pass `--no-modify-path` (`-NoModifyPath`).
+- It adds `<prefix>/bin` to your shell profile unless
+  you pass `--no-modify-path`.
 - It needs `curl`, `unzip`, `awk` and `sha256sum` or `shasum`. Other
   operating systems and CPUs (for example Alpine, or 32-bit ARM) are refused
   with exit code 5.
@@ -62,8 +64,11 @@ script lists every option and the exact steps it takes. `sh install.sh
 
 ## How do I install without a network connection, or in CI?
 
-- CI: `sh install.sh --yes --no-modify-path --prefix "$RUNNER_TEMP/yadorilink"`
-  (`-Yes -NoModifyPath -Prefix` on Windows) asks no questions and edits no profile.
+- CI: a GitHub Actions step, `uses: yadorilink/yadorilink/packaging/ci@<tag>` with
+  `version:` (see [`packaging/ci`](../packaging/ci/README.md)), verifies the installer's
+  attestation and then runs it; the same installer, by hand, is
+  `sh install.sh --yes --no-modify-path --prefix "$RUNNER_TEMP/yadorilink"`
+  asks no questions and edits no profile.
 - Offline: `--from FILE` installs from a signed manifest file you downloaded
   earlier, with the engine bundle (and, on macOS and Linux, the signature
   verifier program) next to it. If the live manifest cannot be reached the
@@ -107,7 +112,7 @@ the file you install; releases before 1.0 do not promise that an older version
 can open data a newer one wrote (see the downgrade note below). For the
 one-line installer:
 
-Run the installer with `--version X.Y.Z` (`-Version` on Windows, or the
+Run the installer with `--version X.Y.Z` (or the
 `YADORILINK_VERSION` environment variable). It installs exactly that version
 from the signed per-version manifest, and still refuses it if the live channel
 manifest has withdrawn it or it is below the minimum supported version.
@@ -143,8 +148,12 @@ The data directory is:
 
 `YADORILINK_CONFIG_DIR` moves it. It can be large, because it holds saved
 versions and downloaded content. Your sign-in is kept separately: in the
-macOS Keychain or the Windows Credential Manager, and on Linux in
-`credentials.json` inside the data directory.
+Windows Credential Manager, and in the macOS Keychain for the YadoriLink app.
+On Linux, and on macOS for a script or engine-bundle install (programs outside
+the app, which cannot use the Keychain), it is `credentials.json` inside the
+data directory, readable only by you. `YADORILINK_CREDENTIAL_STORE=file` or
+`keyring` overrides the choice. If you installed with the script before this
+was the rule, no Keychain item was ever created: run `yadorilink login` again.
 
 ## How do I uninstall?
 
@@ -175,8 +184,7 @@ yadorilink uninstall --dry-run      # shows what would be removed, changes nothi
 yadorilink uninstall                # asks first; --yes skips the question
 ```
 
-On Windows, run the installer with `-Uninstall`; `sh install.sh --uninstall`
-works anywhere the shell installer did.
+`sh install.sh --uninstall` works anywhere the shell installer did.
 
 - Removed: the `yadorilink` and `yadorilink-daemon` links, the installed
   program files (`<prefix>/share/yadorilink`), and the PATH lines the
@@ -195,8 +203,8 @@ If the installation record is missing or unreadable, `uninstall` says so and
 removes nothing; `yadorilink doctor` shows the fix. Any other install that
 `yadorilink uninstall` finds (a package manager, an app, a container) is also
 refused with exit code 19 and the owner's own step, for example
-`brew uninstall --cask yadorilink` or `winget uninstall yadorilink`; those
-channels are not published yet.
+`brew uninstall yadorilink` or `winget uninstall yadorilink`; WinGet is not
+published yet.
 
 ## How do I also delete YadoriLink's data?
 
@@ -211,7 +219,7 @@ Only on purpose, and it never deletes your synced folders:
 - Anywhere else (the unpacked bundle, Windows): run `yadorilink daemon stop`,
   then delete the data directory by hand.
 
-On macOS and Windows your sign-in lives outside the data directory.
+On Windows, and in the macOS app, your sign-in lives outside the data directory.
 `yadorilink uninstall --purge-data` removes it along with the data directory
 (if a copy of the device key cannot be removed, it stops before deleting the
 data directory and says what remains). If you delete
